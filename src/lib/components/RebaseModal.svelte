@@ -4,6 +4,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { seedRebasePlan, shouldReseed } from "../rebase/planner";
   import { GitMerge, Check, AlertCircle } from "lucide-svelte";
 
   let {
@@ -32,22 +33,27 @@
     | "Drop"
     | { Reword: string };
 
+  let wasOpen = false;
+  let planDirty = $state(false);
+  let seededSignature = "";
+  const planSignature = (commits: typeof $graphStore.commits) =>
+    commits
+      .slice(0, 12)
+      .map((c) => c.id)
+      .join(",");
+
   $effect(() => {
-    if (isOpen) {
+    const current = planSignature($graphStore.commits);
+    // Rebuild the plan only when it cannot destroy user work: on opening, or
+    // while pristine and the underlying history actually moved.
+    if (shouldReseed({ isOpen, wasOpen, dirty: planDirty, currentSignature: current, seededSignature })) {
       errorMsg = null;
       ontoBranch = $repoStore.defaultBranch || "main";
-      const newestFirst = $graphStore.commits.slice(0, 12);
-      const oldestFirst = [...newestFirst].reverse();
-      if (oldestFirst.length > 0) {
-        items = oldestFirst.map((c) => ({
-          id: c.id,
-          action: "Pick",
-          summary: c.summary,
-        }));
-      } else {
-        items = [];
-      }
+      items = seedRebasePlan($graphStore.commits);
+      seededSignature = current;
+      planDirty = false;
     }
+    wasOpen = isOpen;
   });
 
   async function executeRebase() {
@@ -135,6 +141,7 @@
             <span class="font-mono text-accent w-20 truncate" title={commit.id}>{commit.id.substring(0, 8)}</span>
             <select
               bind:value={commit.action}
+              onchange={() => (planDirty = true)}
               class="bg-surface border border-border/80 rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none focus:border-accent/60 font-medium transition-colors"
             >
               <option value="Pick">pick</option>
@@ -146,6 +153,7 @@
             <input
               type="text"
               bind:value={commit.summary}
+              oninput={() => (planDirty = true)}
               class="flex-1 bg-transparent border-b border-transparent focus:border-border text-xs text-textPrimary focus:outline-none px-1"
             />
           </div>

@@ -12,7 +12,7 @@
 
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// Hard ceiling on a response body. A model server answering a completion in
@@ -118,6 +118,19 @@ pub fn parse_base_url(base_url: &str) -> Result<Endpoint, String> {
     }
 
     let (host, port) = split_host_port(authority)?;
+
+    // Audit F10: the host lands verbatim in the `Host:` request header, so
+    // it is validated exactly like the path — a space, CR/LF or any control
+    // byte here is header smuggling, not a weird machine name. (Before this
+    // check, `http://127.0.0.1\rX:80/` passed the loopback prefix test and
+    // injected a header.)
+    if host.bytes().any(|b| b <= 0x20 || b == 0x7f || b >= 0x80) {
+        return Err(
+            "base URL host contains spaces or control characters and would corrupt the request"
+                .into(),
+        );
+    }
+
     let host_key = host
         .trim_start_matches('[')
         .trim_end_matches(']')
@@ -178,6 +191,30 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// Audit F9: the lexical loopback check in [`parse_base_url`] is not enough —
+/// a hostile or misconfigured resolver can answer `localhost` with any
+/// address, so every candidate the resolver returns must itself be loopback
+/// before this client connects. Pure decision core over the full resolution
+/// result, so the allow/deny line is unit-testable without forcing DNS
+/// off-loopback.
+fn all_loopback(addrs: &[SocketAddr]) -> Result<(), String> {
+    let offender = addrs.iter().find(|addr| !addr.ip().is_loopback());
+    match offender {
+        None => Ok(()),
+        Some(addr) => Err(format!(
+            "refusing non-loopback address {addr}: GitPulse's AI features only ever address \
+             a model server running on this machine"
+        )),
+    }
+}
+
+/// Single-address convenience over [`all_loopback`] for callers holding one
+/// resolved candidate; the decision logic lives in the slice-level function.
+#[cfg_attr(not(test), allow(dead_code))]
+fn ensure_loopback(addr: SocketAddr) -> Result<(), String> {
+    all_loopback(&[addr])
+}
+
 /// One request/response round trip. `body` is JSON for a POST, `None` for GET.
 pub fn request(
     endpoint: &Endpoint,
@@ -186,10 +223,17 @@ pub fn request(
     body: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponse, String> {
-    let addr = (endpoint.host.as_str(), endpoint.port)
+    let candidates: Vec<SocketAddr> = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {}:{}: {}", endpoint.host, endpoint.port, e))?
-        .next()
+        .collect();
+    // Verify EVERY resolved candidate, not just the one we connect to: a
+    // resolver that answers "localhost" with 8.8.8.8 second in line is just
+    // as much an exfiltration route as first.
+    all_loopback(&candidates)?;
+    let addr = candidates
+        .first()
+        .copied()
         .ok_or_else(|| format!("no address for {}:{}", endpoint.host, endpoint.port))?;
 
     let started = Instant::now();
@@ -286,9 +330,15 @@ pub fn read_response<R: Read>(mut reader: BufReader<R>) -> Result<HttpResponse, 
         // No framing headers: the server closes the connection to end the body.
         let mut buf = Vec::new();
         reader
-            .take(MAX_BODY_BYTES as u64)
+            .take((MAX_BODY_BYTES + 1) as u64)
             .read_to_end(&mut buf)
             .map_err(|e| format!("body read failed: {}", e))?;
+        if buf.len() > MAX_BODY_BYTES {
+            return Err(format!(
+                "response body exceeded the {} byte cap",
+                MAX_BODY_BYTES
+            ));
+        }
         buf
     };
 
@@ -411,6 +461,46 @@ mod tests {
         assert!(read_response(BufReader::new(Cursor::new(raw.as_bytes().to_vec()))).is_err());
     }
 
+    /// Audit F9: the connect target is whatever the resolver returns, so the
+    /// decision must cover EVERY resolved address. A loopback address in
+    /// first position with a public address behind it used to be enough to
+    /// pass the old single-address check.
+    #[test]
+    fn all_loopback_decides_on_every_resolved_address() {
+        let v4 = |a: [u8; 4], port: u16| SocketAddr::from((std::net::Ipv4Addr::from(a), port));
+        let v6 = |a: [u16; 8], port: u16| SocketAddr::from((std::net::Ipv6Addr::from(a), port));
+
+        // All-loopback sets pass: 127/8, ::1, and mixed families.
+        assert!(all_loopback(&[v4([127, 0, 0, 1], 11434)]).is_ok());
+        assert!(all_loopback(&[v4([127, 9, 9, 9], 8080)]).is_ok());
+        assert!(
+            all_loopback(&[v4([127, 0, 0, 1], 1), v6([0, 0, 0, 0, 0, 0, 0, 1], 2)]).is_ok(),
+            "::1 is loopback and must be allowed"
+        );
+        assert!(all_loopback(&[]).is_ok(), "nothing to refuse");
+
+        // Any non-loopback candidate anywhere refuses — first, middle, last.
+        for offenders in [
+            vec![v4([8, 8, 8, 8], 53)],
+            vec![v4([127, 0, 0, 1], 1), v4([192, 168, 1, 10], 11434)],
+            vec![
+                v4([127, 0, 0, 1], 1),
+                v4([127, 0, 0, 2], 2),
+                v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 3),
+            ],
+        ] {
+            let err = all_loopback(&offenders).expect_err("non-loopback candidate must refuse");
+            assert!(
+                err.contains("refusing non-loopback address"),
+                "refusal must name the situation, got: {err}"
+            );
+            assert!(
+                err.contains("only ever address"),
+                "refusal must state the policy, got: {err}"
+            );
+        }
+    }
+
     /// Regression (audit M1): framing lines were read with unbounded
     /// read_line, so a peer streaming newline-less bytes allocated without
     /// limit. Status, header and chunk-size lines must be capped.
@@ -519,5 +609,69 @@ mod tests {
                 "{url:?} smuggles into the request head and must be refused"
             );
         }
+    }
+
+    /// Regression (audit F10): the host lands verbatim in the `Host:` header
+    /// but was never charset-validated — `127.0.0.1\r` passed the loopback
+    /// prefix check and injected a header line. Hosts are validated like
+    /// paths now.
+    #[test]
+    fn base_url_host_rejects_control_characters_and_whitespace() {
+        for url in [
+            // CR smuggling past the 127. loopback prefix.
+            "http://127.0.0.1\rX-smuggled: y:11434/",
+            "http://127.0.0.1\n.evil.example:11434/",
+            // Whitespace in the authority.
+            "http://local host:1234",
+            "http://127.0.0.1\t:11434/",
+            "http://[::1\x0b]:8080/",
+        ] {
+            let err = parse_base_url(url).expect_err(&format!(
+                "{url:?} smuggles a Host header and must be refused"
+            ));
+            assert!(
+                err.contains("host"),
+                "refusal should name the host, got: {err}"
+            );
+        }
+        // The clean forms these were derived from must still parse.
+        assert!(parse_base_url("http://127.0.0.1:11434/").is_ok());
+        assert!(parse_base_url("http://[::1]:8080/").is_ok());
+    }
+
+    /// Regression (audit F9): the lexical hostname check ran before DNS, so
+    /// a resolver answering `localhost` with a public address would have
+    /// been connected to. Every resolved candidate must pass an actual
+    /// `is_loopback` check; factored into `ensure_loopback` so this is
+    /// testable without forcing the OS resolver off-loopback.
+    #[test]
+    fn ensure_loopback_refuses_public_and_permits_loopback() {
+        let err = ensure_loopback("8.8.8.8:80".parse().unwrap()).unwrap_err();
+        assert!(
+            err.contains("non-loopback"),
+            "refusal must name the non-loopback address, got: {err}"
+        );
+        assert!(err.contains("8.8.8.8:80"), "got: {err}");
+
+        assert!(ensure_loopback("127.0.0.1:1".parse().unwrap()).is_ok());
+        assert!(ensure_loopback("[::1]:1".parse().unwrap()).is_ok());
+        assert!(ensure_loopback("127.200.0.1:65535".parse().unwrap()).is_ok());
+    }
+
+    /// The connect path consults `ensure_loopback` for every candidate, not
+    /// only the first: exercised here at the seam just below DNS by checking
+    /// a mixed candidate list through the same helper `request` uses.
+    #[test]
+    fn every_resolved_candidate_must_be_loopback() {
+        let mixed = [
+            "127.0.0.1:11434".parse::<SocketAddr>().unwrap(),
+            "8.8.8.8:53".parse::<SocketAddr>().unwrap(),
+        ];
+        let errs: Vec<String> = mixed
+            .iter()
+            .filter_map(|a| ensure_loopback(*a).err())
+            .collect();
+        assert_eq!(errs.len(), 1, "exactly the public candidate refuses");
+        assert!(errs[0].contains("non-loopback"));
     }
 }

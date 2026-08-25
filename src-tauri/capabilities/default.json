@@ -8,6 +8,6 @@
     "core:event:default",
     "core:window:allow-set-title",
     "core:window:allow-set-badge-count",
-    "opener:default"
+    "opener:allow-default-urls"
   ]
 }

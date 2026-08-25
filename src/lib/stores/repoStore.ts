@@ -41,6 +41,9 @@ import {
   STATUS_POLL_INTERVAL_MS,
   shouldRunStatusPoll,
 } from "../repos/statusPoll";
+import { debounce, type Debounced } from "../async/debounce";
+import { beginGeneration } from "../async/guard";
+import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
 /** What a mutating action reports back: whether it ran, and under what verdict. */
@@ -119,6 +122,8 @@ export interface RepoSession {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
+  /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
+  selectedIsStaged: boolean;
   selectedDiff: string | null;
   activeTab: ViewTab;
   searchQuery: string;
@@ -145,6 +150,7 @@ export interface RepoState {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
+  selectedIsStaged: boolean;
   selectedDiff: string | null;
   activeTab: ViewTab;
   isLoading: boolean;
@@ -181,9 +187,32 @@ export interface RepoStoreDeps {
   };
 }
 
+/**
+ * Session generations never restart — not on close+reopen, not on workspace
+ * restore, not on store re-creation. A pre-close in-flight hydrate still
+ * carries its old (session id, generation) pair; if a fresh incarnation drew
+ * generation 1 again, that stale response would pass the guard and overwrite
+ * the new session's data.
+ */
+let sessionGenerationSource = 0;
+function nextSessionGeneration(): number {
+  return ++sessionGenerationSource;
+}
+
 const MENU_RECENT_CAP = 12;
 /** Trailing debounce for localStorage writes and the native-menu rebuild. */
 const PERSIST_DEBOUNCE_MS = 300;
+/**
+ * Upper bound of cmd_branch_stats batches drained per fetch. The backend
+ * computes at most 96 unique uncached tips per call, so 64 batches cover
+ * ~6100 unique tips; past the bound draining stops silently and churn
+ * resumes on the next refresh.
+ */
+export const STATS_DRAIN_MAX_BATCHES = 64;
+/** Publish coalesced stats every N batches (and always on the final drain). */
+export const STATS_PUBLISH_EVERY = 8;
+/** Trailing window that collapses watcher-event storms into one refresh. */
+const WATCHER_REFRESH_DEBOUNCE_MS = 200;
 
 function emptyProjected(): RepoState {
   return {
@@ -199,6 +228,7 @@ function emptyProjected(): RepoState {
     statuses: [],
     selectedCommitId: null,
     selectedFilePath: null,
+    selectedIsStaged: false,
     selectedDiff: null,
     activeTab: "history",
     isLoading: false,
@@ -225,6 +255,7 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     statuses: extras.statuses ?? [],
     selectedCommitId: extras.selectedCommitId ?? null,
     selectedFilePath: extras.selectedFilePath ?? null,
+    selectedIsStaged: extras.selectedIsStaged ?? false,
     selectedDiff: extras.selectedDiff ?? null,
     activeTab: extras.activeTab ?? "history",
     searchQuery: extras.searchQuery ?? "",
@@ -233,7 +264,7 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     isAmending: extras.isAmending ?? false,
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
-    generation: extras.generation ?? 1,
+    generation: extras.generation ?? nextSessionGeneration(),
     statsPending: extras.statsPending ?? false,
   };
 }
@@ -276,6 +307,7 @@ function project(internal: InternalState): RepoState {
     statuses: active?.statuses ?? [],
     selectedCommitId: active?.selectedCommitId ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
+    selectedIsStaged: active?.selectedIsStaged ?? false,
     selectedDiff: active?.selectedDiff ?? null,
     activeTab: active?.activeTab ?? "history",
     isLoading: active?.isLoading ?? false,
@@ -314,9 +346,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let pollInflight = false;
 
+  // Monotonic token source for diff-selection requests. Session `generation`
+  // only moves on tab activation, so it cannot order two rapid selections of
+  // the same tab; this does.
+  const selectionGeneration = beginGeneration();
+
   function ensureStatusPoll() {
     if (pollTimer !== null || typeof setInterval === "undefined") return;
     pollTimer = setInterval(() => void runStatusPoll(), STATUS_POLL_INTERVAL_MS);
+    // Quitting inside the persist debounce window would drop the newest
+    // search query / view tab; `pagehide` fires on close and navigation.
+    if (typeof document !== "undefined") {
+      document.addEventListener("pagehide", flushPersist);
+    }
+  }
+
+  /** Stops the workspace poll; the next activation restarts it lazily. */
+  function stopStatusPoll() {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
 
   async function runStatusPoll() {
@@ -390,7 +439,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const pending = pendingPersist;
     if (!pending) return;
     pendingPersist = null;
-    savePersistedWorkspace(storage, pending.data);
+    if (!savePersistedWorkspace(storage, pending.data)) {
+      // The write did not land (quota, private mode). Restore the payload
+      // and roll the dedup marker back so an identical future state retries
+      // instead of being skipped as "already persisted".
+      pendingPersist = pending;
+      lastPersistedPayload = null;
+      if (typeof setTimeout !== "undefined" && persistTimer === null) {
+        persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+      }
+    }
     const recentsJson = JSON.stringify(pending.recents);
     if (recentsJson !== lastSentRecentsJson) {
       lastSentRecentsJson = recentsJson;
@@ -512,59 +570,116 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return invokeFn<ResolvedRepo>("cmd_resolve_repo", { repoPath: path });
   }
 
+  /**
+   * Ordering token for snapshot fetches. `activateTab` starts a hydrate at
+   * generation N; `refresh()` and watcher events start more at the SAME N
+   * (refresh never bumps). Generation alone cannot order those, so the older
+   * response could resolve last and overwrite fresher data. Only the
+   * latest-started fetch may apply.
+   */
+  const snapshotRuns = new Map<string, number>();
+
   async function hydrate(id: string, path: string, generation: number) {
+    const run = (snapshotRuns.get(id) ?? 0) + 1;
+    snapshotRuns.set(id, run);
     try {
       const snapshot = await loadSnapshot(path);
+      if (snapshotRuns.get(id) !== run) return;
       if (applyToSession(id, generation, { ...snapshot, isLoading: false, error: null })) {
         void fetchBranchStats(id, path, generation);
       }
     } catch (err: unknown) {
+      if (snapshotRuns.get(id) !== run) return;
       applyToSession(id, generation, { isLoading: false, error: String(err) });
     }
   }
 
   // --- progressive branch churn ------------------------------------------
-  // Churn arrives via cmd_branch_stats after the snapshot renders. One fetch
-  // per session at a time: a refresh while one is in flight lets it finish —
+  // Churn arrives via cmd_branch_stats after the snapshot renders. One logical
+  // fetch per session at a time: capped reports re-invoke inside the same
+  // in-flight slot until drained, and a refresh racing one lets it finish —
   // the tip guard keeps stale merges out, and the next refresh fetches again.
   const statsInflight = new Set<string>();
+
+  function branchStatsKey(name: string, isRemote: boolean, remoteName?: string | null): string {
+    return `${isRemote ? "remote" : "local"}:${remoteName ?? ""}:${name}`;
+  }
 
   async function fetchBranchStats(id: string, path: string, generation: number) {
     if (statsInflight.has(id)) return;
     statsInflight.add(id);
     applyToSession(id, generation, { statsPending: true });
+    const start = internal.sessions[id];
+    if (!start || start.generation !== generation) {
+      statsInflight.delete(id);
+      return;
+    }
+    let branches = start.branches;
+    let dirty = false;
+    const flush = (statsPending: boolean) => {
+      if (!dirty) {
+        applyToSession(id, generation, { statsPending });
+        return;
+      }
+      applyToSession(id, generation, { branches, statsPending });
+      dirty = false;
+    };
     try {
-      const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
-      const session = internal.sessions[id];
-      if (!session || session.generation !== generation) return;
-      const updates = new Map(report.updates.map((update) => [update.name, update]));
-      let touched = false;
-      const branches = session.branches.map((branch) => {
-        const update = updates.get(branch.name);
-        // Tip guard: churn computed for another commit is stale; dropping it
-        // means a moved branch can never wear another commit's numbers.
-        if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
-        touched = true;
-        return {
-          ...branch,
-          additions: update.additions,
-          deletions: update.deletions,
-          files_changed: update.files_changed,
-          commits_ahead_of_base: update.commits_ahead_of_base,
-          commits_behind_base: update.commits_behind_base,
-          compared_to: report.compared_to,
-        };
-      });
-      applyToSession(id, generation, touched ? { branches, statsPending: false } : { statsPending: false });
+      for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
+        const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
+        const session = internal.sessions[id];
+        if (!session || session.generation !== generation) return;
+
+        const updates = new Map(
+          report.updates.map((update) => [
+            branchStatsKey(update.name, update.is_remote, update.remote_name),
+            update,
+          ]),
+        );
+        let batchTouched = false;
+        branches = branches.map((branch) => {
+          const update = updates.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
+          if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
+          batchTouched = true;
+          return {
+            ...branch,
+            additions: update.additions,
+            deletions: update.deletions,
+            files_changed: update.files_changed,
+            commits_ahead_of_base: update.commits_ahead_of_base,
+            commits_behind_base: update.commits_behind_base,
+            compared_to: report.compared_to,
+          };
+        });
+        if (batchTouched) dirty = true;
+        const drained = !report.capped;
+        if (dirty && (drained || (batch + 1) % STATS_PUBLISH_EVERY === 0)) {
+          flush(report.capped);
+        }
+        if (drained) break;
+      }
+      flush(false);
     } catch {
-      // Unknown-command rejections from older backends degrade like
-      // cmd_list_tags: churn stays as-is, never an error state.
-      applyToSession(id, generation, { statsPending: false });
+      flush(false);
     } finally {
       statsInflight.delete(id);
     }
   }
   // ------------------------------------------------------------------------
+
+  // --- watcher-storm coalescing -------------------------------------------
+  // One trailing debounce per changed repo path; a later event re-arms the
+  // same timer instead of queueing overlapping refreshes.
+  const watcherRefreshTimers = new Map<string, Debounced<[]>>();
+
+  function scheduleWatcherRefresh(key: string, run: () => void) {
+    let timer = watcherRefreshTimers.get(key);
+    if (!timer) {
+      timer = debounce(run, WATCHER_REFRESH_DEBOUNCE_MS);
+      watcherRefreshTimers.set(key, timer);
+    }
+    timer();
+  }
 
   const store = {
     subscribe,
@@ -689,7 +804,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
               error: resolved ? null : "Repository is unavailable",
-              generation: 1,
             },
           );
       putSession(session);
@@ -749,6 +863,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
       internal = { ...internal, sessions: rest };
+      stopStatusPoll();
       if (session) {
         graph.evict(session.path);
         await unwatch(session.path);
@@ -758,6 +873,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         // Activation-by-close: bump the neighbor so the App-owned graph
         // effect refetches exactly once for it.
         putSession(bumped(next));
+        ensureStatusPoll();
       }
       syncFilterFromSession(activeSession());
       publish();
@@ -775,6 +891,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -782,6 +899,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (internal.workspace.activeId === id) {
         putSession(bumped(keep));
       }
+      ensureStatusPoll();
       syncFilterFromSession(activeSession());
       publish();
       revealGraph(activeSession());
@@ -798,6 +916,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (remaining.has(key)) sessions[key] = session;
       }
       internal = { ...internal, sessions };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -808,10 +927,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // treats it as a fresh activation.
       if (revealed) {
         putSession(bumped(revealed));
+        ensureStatusPoll();
       }
       syncFilterFromSession(activeSession());
       publish();
       revealGraph(activeSession());
+      flushPersist();
     },
     nextTab: async () => {
       if (!beginShortcut()) return;
@@ -864,17 +985,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     },
     handleRepoChanged: async (changedPath?: string | null) => {
+      // Watcher events arrive per file; a checkout or rebase fires many at
+      // once. Each changed path collapses onto its own trailing window so a
+      // storm becomes one refresh; explicit refresh() calls stay undelayed.
       if (!changedPath) {
-        await store.refresh();
+        scheduleWatcherRefresh("", () => void store.refresh());
         return;
       }
       const session = Object.values(internal.sessions).find((item) =>
         sameRepo(item.path, changedPath, options),
       );
       if (!session) return;
-      await store.refresh(session.path);
+      scheduleWatcherRefresh(session.path, () => void store.refresh(session.path));
     },
     restoreWorkspace: async () => {
+      stopStatusPoll();
       const persisted = loadPersistedWorkspace(storage, options);
       replaceWorkspace({
         ...emptyWorkspace(),
@@ -882,7 +1007,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         lastClosed: persisted.lastClosed,
       });
       internal = { ...internal, sessions: {} };
-      for (const tab of persisted.tabs) {
+      // Preserve persisted tab order, but activate the previously-active
+      // session the moment ITS hydration lands — not after every remaining
+      // tab finishes restoring — so the workspace becomes usable without
+      // changing the user's tab arrangement.
+      const ordered = [...persisted.tabs];
+      let activated = false;
+      const isActive = (path: string) =>
+        !!persisted.activePath && sameRepo(path, persisted.activePath, options);
+
+      for (const tab of ordered) {
+        // Always append (activate: false) so restore cannot shuffle tab
+        // order. Present the previously-active session as soon as that
+        // iteration finishes — remaining tabs keep hydrating behind it.
         await store.openRepo(tab.path, {
           allowBroken: true,
           activate: false,
@@ -893,7 +1030,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             selectedBranch: tab.selectedBranch,
           },
         });
+        if (!activated && isActive(tab.path)) {
+          activated = true;
+          const sessionTab = internal.workspace.tabs.find((item) =>
+            sameRepo(item.path, tab.path, options),
+          );
+          if (sessionTab) {
+            await store.activateTab(sessionTab.id, { force: true });
+          }
+        }
       }
+      if (activated) return;
       const desired = persisted.activePath
         ? internal.workspace.tabs.find((tab) => sameRepo(tab.path, persisted.activePath ?? "", options))
         : internal.workspace.tabs[0];
@@ -909,6 +1056,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const token = selectionGeneration.next();
       try {
         const diff = await invokeFn<string>("cmd_get_file_diff", {
           repoPath: session.path,
@@ -916,13 +1064,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           isStaged,
           ignoreWhitespace,
         });
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, {
           selectedFilePath: filePath,
           selectedCommitId: null,
           selectedDiff: diff,
+          selectedIsStaged: isStaged,
           activeTab: "diff",
         });
       } catch (err: unknown) {
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -930,17 +1081,48 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const token = selectionGeneration.next();
       try {
         const diff = await invokeFn<string>("cmd_get_commit_diff", {
           repoPath: session.path,
           commitId,
         });
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, {
           selectedCommitId: commitId,
           selectedFilePath: null,
           selectedDiff: diff,
+          selectedIsStaged: false,
         });
       } catch (err: unknown) {
+        if (!selectionGeneration.isCurrent(token)) return;
+        applyToSession(session.id, generation, { error: String(err) });
+      }
+    },
+    /**
+     * Opens one file of a commit while keeping the commit as the selection owner.
+     */
+    selectCommitFileDiff: async (commitId: string, filePath: string) => {
+      const session = activeSession();
+      if (!session) return;
+      const generation = session.generation;
+      const token = selectionGeneration.next();
+      try {
+        const fileDiff = await invokeFn<string>("cmd_get_commit_file_diff", {
+          repoPath: session.path,
+          commitId,
+          filePath,
+        });
+        if (!selectionGeneration.isCurrent(token)) return;
+        applyToSession(session.id, generation, {
+          selectedCommitId: commitId,
+          selectedFilePath: filePath,
+          selectedDiff: fileDiff,
+          selectedIsStaged: false,
+          activeTab: "diff",
+        });
+      } catch (err: unknown) {
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -948,19 +1130,23 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const token = selectionGeneration.next();
       try {
         const diff = await invokeFn<string>("cmd_get_range_diff", {
           repoPath: session.path,
           from,
           to,
         });
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, {
           selectedFilePath: `${from}...${to}`,
           selectedCommitId: null,
           selectedDiff: diff,
+          selectedIsStaged: false,
           activeTab: "diff",
         });
       } catch (err: unknown) {
+        if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -968,6 +1154,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("stage", filePath, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath })),
     unstageFile: async (filePath: string) =>
       runMutating("unstage", filePath, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath })),
+    stageSelectivePatch: async (filePatch: FilePatch, isStaging: boolean = true) => {
+      if (isStaging) {
+        return runMutating("stage-patch", filePatch.new_path, (path) =>
+          invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch })
+        );
+      } else {
+        return runMutating("unstage-patch", filePatch.new_path, (path) =>
+          invokeFn("cmd_unstage_selective_patch", { repoPath: path, filePatch })
+        );
+      }
+    },
+    stageAll: async () => {
+      const session = activeSession();
+      if (!session) return { ok: false, error: "No active repository" };
+      const unstaged = session.statuses.filter((s) => !s.is_staged);
+      for (const f of unstaged) {
+        await runMutating("stage", f.path, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }));
+      }
+      return { ok: true };
+    },
+    unstageAll: async () => {
+      const session = activeSession();
+      if (!session) return { ok: false, error: "No active repository" };
+      const staged = session.statuses.filter((s) => s.is_staged);
+      for (const f of staged) {
+        await runMutating("unstage", f.path, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath: f.path }));
+      }
+      return { ok: true };
+    },
     discardChanges: async (filePath: string) =>
       runMutating("discard", filePath, (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath })),
     commit: async (message: string, amend: boolean = false) =>
@@ -987,7 +1202,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName })
       ),
     deleteBranch: async (branchName: string, force: boolean = false) =>
-      runMutating(force ? "branch-delete" : "branch-delete", branchName, (path) =>
+      runMutating(force ? "branch-delete-force" : "branch-delete", branchName, (path) =>
         invokeFn("cmd_delete_branch", { repoPath: path, branchName, force })
       ),
     mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
@@ -1026,6 +1241,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, session.generation, { activeTab: tab });
       // The view tab is persisted state: flush so quitting right after a
       // switch does not restore the previous one.
+      flushPersist();
+    },
+    inspectCommitInHistory: (commitId: string) => {
+      const session = activeSession();
+      if (!session || !commitId) return;
+      applyToSession(session.id, session.generation, {
+        selectedCommitId: commitId,
+        selectedFilePath: null,
+        selectedDiff: null,
+        selectedIsStaged: false,
+        activeTab: "history",
+      });
       flushPersist();
     },
     setCommitDraft: (message: string) => {

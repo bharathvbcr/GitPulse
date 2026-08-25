@@ -1,14 +1,41 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatReleaseDate,
   releaseTagSuggestion,
   summarizeCommitReview,
+  summarizeReleases,
   type CommitReviewReport,
+  type ReleaseInfo,
 } from "./model";
 
 describe("MANVI ops helpers", () => {
   it("suggests the next stable patch without being confused by prereleases", () => {
     expect(releaseTagSuggestion(["v1.2.9", "v1.3.0-beta.1", "not-a-release"])).toBe("v1.2.10");
     expect(releaseTagSuggestion([])).toBe("v0.1.0");
+  });
+
+  it("formats release dates gracefully", () => {
+    expect(formatReleaseDate("")).toBe("");
+    expect(formatReleaseDate("2026-08-25T12:00:00Z")).toContain("2026");
+    expect(formatReleaseDate("not-a-date")).toBe("not-a-date");
+  });
+
+  it("summarizes releases with and without capping", () => {
+    expect(summarizeReleases([])).toBe("No releases");
+    const releases: ReleaseInfo[] = [
+      {
+        tag_name: "v1.0.0",
+        name: "v1.0.0",
+        is_draft: false,
+        is_prerelease: false,
+        is_latest: true,
+        published_at: "2026-08-25T12:00:00Z",
+        created_at: "2026-08-25T12:00:00Z",
+        url: "https://github.com/acme/repo/releases/tag/v1.0.0",
+      },
+    ];
+    expect(summarizeReleases(releases, false)).toBe("1 release");
+    expect(summarizeReleases(releases, true)).toBe("1 release (capped)");
   });
 
   it("keeps capped commit review coverage explicit", () => {

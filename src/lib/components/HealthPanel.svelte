@@ -120,12 +120,16 @@
     return formatHealthReport(current, repoPath);
   }
 
+  let copyTimer: number | null = null;
+  let planCopyTimer: number | null = null;
+
   async function copyReport() {
     const text = renderedReport();
     if (!text) return;
     if (await copyText(text)) {
       copied = true;
-      window.setTimeout(() => (copied = false), 1500);
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      copyTimer = window.setTimeout(() => (copied = false), 1500);
     }
   }
 
@@ -158,7 +162,8 @@
     if (!plan?.text) return;
     if (await copyText(plan.text)) {
       planCopied = true;
-      window.setTimeout(() => (planCopied = false), 1500);
+      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
+      planCopyTimer = window.setTimeout(() => (planCopied = false), 1500);
     }
   }
 
@@ -168,6 +173,8 @@
     return () => {
       inflight?.cancel();
       fixInflight?.cancel();
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
     };
   });
 
@@ -191,10 +198,14 @@
   });
 
   async function openExternal(url: string) {
+    // No window.open fallback: inside a Tauri webview it can navigate the
+    // app shell itself, and these URLs come from advisory/GitHub payloads.
+    // If the opener plugin fails, surfacing the failure beats handing the
+    // webview to an arbitrary URL.
     try {
       await openUrl(url);
-    } catch {
-      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      console.error("openUrl failed for", url, err);
     }
   }
 </script>

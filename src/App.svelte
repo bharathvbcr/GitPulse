@@ -62,12 +62,20 @@
   onMount(() => {
     applyPlatformClass();
     const unsubs: Array<() => void> = [];
+    // HMR/unmount can tear the component down while the async subscription
+    // chain is still awaiting; listeners pushed after cleanup must be
+    // unwound immediately instead of leaking past the component.
+    let disposed = false;
+    const track = (unsub: () => void) => {
+      if (disposed) unsub();
+      else unsubs.push(unsub);
+    };
     void (async () => {
       // A failed native-shell subscription must not abort startup: it unwinds
       // its own listeners before rethrowing, and skipping the restore below
       // would lose the persisted session. Log and keep booting.
       try {
-        unsubs.push(
+        track(
           await subscribeNativeShell({
             open: () => void repoStore.pickAndOpenRepo(),
             clone: () => {
@@ -115,7 +123,7 @@
       }
       await syncRecentMenu($repoStore.recentRepos);
       try {
-        unsubs.push(
+        track(
           await listen<{ path?: string }>("repo-changed", (event) => {
             void repoStore.handleRepoChanged(event.payload?.path);
           }),
@@ -125,6 +133,7 @@
       }
     })();
     return () => {
+      disposed = true;
       for (const unsub of unsubs) unsub();
     };
   });
@@ -284,7 +293,7 @@
               {#each $repoStore.recentRepos as repo}
                 <button
                   onclick={() => repoStore.openRepo(repo)}
-                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-sm hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-all duration-150 text-left"
+                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-sm hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
                 >
                   <span class="font-medium truncate">{repo.split("/").pop()}</span>
                   <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{repo}</span>

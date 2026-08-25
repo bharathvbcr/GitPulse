@@ -42,6 +42,8 @@
     }
   }
 
+  let logCopyTimer: number | null = null;
+
   /** The journal as plain text, for pasting into a bug report or notes file. */
   async function copyLog() {
     const lines = $harnessStore.actions.map((action) => {
@@ -55,9 +57,16 @@
     });
     if (await copyText(lines.join("\n"))) {
       logCopied = true;
-      window.setTimeout(() => (logCopied = false), 1500);
+      if (logCopyTimer !== null) window.clearTimeout(logCopyTimer);
+      logCopyTimer = window.setTimeout(() => (logCopied = false), 1500);
     }
   }
+
+  $effect(() => {
+    return () => {
+      if (logCopyTimer !== null) window.clearTimeout(logCopyTimer);
+    };
+  });
 
   function isSelected(endpointUrl: string, model: string): boolean {
     if (preferred) return preferred.base_url === endpointUrl && preferred.model === model;

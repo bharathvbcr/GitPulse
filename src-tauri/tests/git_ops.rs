@@ -15,8 +15,14 @@ struct TestRepo {
 
 impl TestRepo {
     fn init() -> Self {
+        Self::init_with(&[])
+    }
+
+    fn init_with(extra_init_args: &[&str]) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        run_git(dir.path(), &["init", "-b", "main"]);
+        let mut args = vec!["init", "-b", "main"];
+        args.extend_from_slice(extra_init_args);
+        run_git(dir.path(), &args);
         run_git(dir.path(), &["config", "user.email", "test@example.com"]);
         run_git(dir.path(), &["config", "user.name", "Test User"]);
         run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
@@ -57,6 +63,55 @@ fn run_git(cwd: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Regression (NUL-safe record framing): a commit subject containing a raw
+/// 0x01 byte used to be able to split the `log` stream into bogus records
+/// when 0x01 was the record terminator. Framing now terminates records with
+/// %x00 (subjects may legally contain any byte except NUL), so a hostile
+/// subject must never desync the commits that follow it.
+#[test]
+fn history_survives_0x01_byte_inside_commit_subject() {
+    let repo = TestRepo::init();
+    repo.write("src/lib.rs", "fn first() {}\n");
+    repo.commit_all("feat: clean first");
+
+    // Commit whose subject embeds the field separator byte. argv may carry
+    // any byte except NUL, and git accepts it verbatim.
+    let hostile = "feat: \u{1} embedded separator \u{1} end";
+    let output = Command::new("git")
+        .args(["commit", "--allow-empty", "-m", hostile])
+        .current_dir(repo.dir.path())
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("spawn hostile commit");
+    assert!(
+        output.status.success(),
+        "git must accept a 0x01-bearing subject: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A clean commit AFTER the hostile subject is the actual regression:
+    // \x01 record framing used to swallow everything that followed.
+    repo.write("src/lib.rs", "fn after() {}\n");
+    repo.commit_all("feat: clean after");
+
+    let path = repo.path_str();
+    let history = GitReader::read_commit_history(&path, 10, None).expect("history");
+    assert_eq!(
+        history.len(),
+        3,
+        "a 0x01 inside one subject must not fabricate or swallow records: {history:?}"
+    );
+    assert_eq!(history[0].summary, "feat: clean after");
+    assert_eq!(history[1].summary, hostile);
+    assert!(history[1].id.len() == 40 || history[1].id.len() == 64);
+    assert_eq!(history[2].summary, "feat: clean first");
+    assert_ne!(history[0].id, history[1].id);
+    assert_ne!(history[1].id, history[2].id);
 }
 
 #[test]
@@ -505,4 +560,597 @@ fn test_coverage_scan_of_rust_lcov_in_opened_repo() {
     assert!(report.files.iter().any(|f| f.path == "src/lib.rs"));
     assert_eq!(report.overall.lines_found, 2);
     assert_eq!(report.overall.lines_hit, 1);
+}
+
+/// Regression (M1+M11): in porcelain v1 `-z` output a rename record is
+/// `XY <new>\0<old>\0`, and its second NUL field must be consumed or every
+/// later entry desyncs. The unstaged edit staged AFTER the rename proves the
+/// cursor survived the two-field record.
+#[test]
+fn test_get_status_rename_order_and_cursor_alignment() {
+    let repo = TestRepo::init();
+    repo.write("original.txt", "one\ntwo\n");
+    repo.write("other.txt", "stable\n");
+    repo.commit_all("chore: seed");
+
+    run_git(repo.dir.path(), &["mv", "original.txt", "renamed.txt"]);
+    repo.write("other.txt", "stable\nchanged\n");
+
+    let status = GitReader::get_status(&repo.path_str()).expect("status");
+    let renamed = status
+        .iter()
+        .find(|s| s.path == "renamed.txt")
+        .expect("rename keyed on NEW path");
+    assert_eq!(renamed.old_path.as_deref(), Some("original.txt"));
+    assert!(renamed.status_code.starts_with('R'));
+    assert!(renamed.is_staged);
+    assert!(!status
+        .iter()
+        .any(|s| s.old_path.as_deref() == Some("renamed.txt")));
+
+    let after = status
+        .iter()
+        .find(|s| s.path == "other.txt")
+        .expect("record following the rename must still parse");
+    assert!(!after.is_staged, "got: {after:?}");
+    assert!(
+        after.additions >= 1,
+        "numstat churn must join on the parsed path: {after:?}"
+    );
+}
+
+/// Regression (M1+M11, copy half): with `status.renames=copies` and a changed
+/// source, a staged duplicate arrives as `C  <new>\0<orig>\0`; the parser must
+/// consume both fields so the trailing `M` record stays aligned.
+#[test]
+fn test_get_status_copy_record_keeps_cursor_aligned() {
+    let repo = TestRepo::init();
+    repo.write("orig.txt", "same\nlines\n");
+    repo.commit_all("chore: seed");
+    run_git(repo.dir.path(), &["config", "status.renames", "copies"]);
+    fs::copy(
+        repo.dir.path().join("orig.txt"),
+        repo.dir.path().join("dup.txt"),
+    )
+    .unwrap();
+    repo.write("orig.txt", "same\nlines\nplus one\n");
+    run_git(repo.dir.path(), &["add", "-A"]);
+
+    let status = GitReader::get_status(&repo.path_str()).expect("status");
+    let copy = status
+        .iter()
+        .find(|s| s.status_code.starts_with('C'))
+        .expect("copy entry");
+    assert_eq!(copy.path, "dup.txt");
+    assert_eq!(copy.old_path.as_deref(), Some("orig.txt"));
+
+    let modified = status
+        .iter()
+        .find(|s| s.path == "orig.txt")
+        .expect("record following the copy pair must parse");
+    assert_eq!(modified.status_code, "M ");
+}
+
+/// Regression (m2): blame header detection hardcoded SHA-1's 40-char oid and
+/// rejected every record in a SHA-256 repository.
+#[test]
+fn test_get_file_blame_sha256_repo() {
+    let repo = TestRepo::init_with(&["--object-format=sha256"]);
+    repo.write("story.txt", "first line\nsecond line\n");
+    repo.commit_all("feat: sha256 story");
+
+    let blame = GitReader::get_file_blame(&repo.path_str(), "story.txt").expect("blame");
+    assert_eq!(blame.len(), 2);
+    for line in &blame {
+        assert_eq!(
+            line.commit_id.len(),
+            64,
+            "sha256 oids are 64 hex chars: {}",
+            line.commit_id
+        );
+        assert!(line.commit_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+    assert_eq!(blame[0].content, "first line");
+    assert_eq!(blame[1].line_no, 2);
+    assert_eq!(blame[0].author_name, "Test User");
+}
+
+/// Regression (item 5): glob metacharacters in a filename must not widen the
+/// pathspec used by log/diff queries.
+#[test]
+fn test_glob_shaped_paths_match_literally() {
+    let repo = TestRepo::init();
+    repo.write("weird*.txt", "literal star\n");
+    repo.commit_all("chore: literal star file");
+    repo.write("weirdX.txt", "glob sibling\n");
+    repo.commit_all("chore: sibling file");
+    repo.write("weird*.txt", "literal star\nedited\n");
+
+    let path = repo.path_str();
+
+    // A widened glob would match both files' history; literal matches only
+    // the star-named file's single commit.
+    let touching = GitReader::commits_touching_path(&path, "weird*.txt", 10).expect("log pathspec");
+    assert_eq!(
+        touching.len(),
+        1,
+        "pathspec must stay literal: {touching:?}"
+    );
+
+    let diff = GitReader::get_file_diff(&path, "weird*.txt", false, false).expect("diff");
+    assert!(
+        diff.contains("edited"),
+        "must diff the literal file: {diff}"
+    );
+    assert!(!diff.contains("weirdX"), "sibling file leaked into diff");
+
+    // blame treats its <file> argument literally already; it must keep doing
+    // so (and NOT receive pathspec magic, which git rejects there).
+    let blame = GitReader::get_file_blame(&path, "weird*.txt").expect("blame");
+    assert_eq!(blame.len(), 2);
+    assert!(blame
+        .iter()
+        .all(|l| l.content.contains("literal star") || l.content.contains("edited")));
+}
+
+/// Regression (item 6): reader commands resolve paths through symlinks only
+/// while staying inside the repository; a symlinked directory pointing out is
+/// refused before git ever runs.
+#[test]
+fn test_reader_read_paths_refuse_symlink_escape() {
+    let outside = TempDir::new().expect("outside tempdir");
+    fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+
+    let repo = TestRepo::init();
+    repo.write("keep.txt", "inside\n");
+    repo.commit_all("chore: keep");
+    std::os::unix::fs::symlink(outside.path(), repo.dir.path().join("leak")).unwrap();
+
+    let path = repo.path_str();
+    let err = GitReader::get_file_diff(&path, "leak/secret.txt", false, false)
+        .expect_err("symlink escape must fail");
+    assert!(err.contains("escapes the repository"), "got: {err}");
+    assert!(GitReader::commits_touching_path(&path, "leak/secret.txt", 10).is_err());
+    assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
+}
+
+/// Regression (m3c): a failing `git show --numstat` must surface through
+/// get_commit_details instead of reporting silently-empty changed_files.
+#[test]
+fn test_get_commit_details_surfaces_missing_blob_failure() {
+    let repo = TestRepo::init();
+    repo.write("data.bin", "payload\n");
+    repo.commit_all("chore: payload");
+    let path = repo.path_str();
+
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD:data.bin"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("rev-parse");
+    assert!(output.status.success());
+    let blob_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Remove the loose blob backing the committed file; metadata still parses
+    // but the numstat walk cannot read the object any more.
+    let object = repo
+        .dir
+        .path()
+        .join(".git/objects")
+        .join(&blob_sha[0..2])
+        .join(&blob_sha[2..]);
+    fs::remove_file(&object)
+        .unwrap_or_else(|e| panic!("expected loose object at {}: {e}", object.display()));
+
+    let head = GitReader::head_id(&path).expect("head id");
+    let details = GitReader::get_commit_details(&path, &head)
+        .expect_err("missing blob must fail the whole detail report");
+    assert!(!details.is_empty());
+
+    assert!(GitReader::get_commit_files(&path, &head).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Audit fixes: destructive-delete guard, restack fork point, rebase step
+// ancestry, reword body preservation, start-point revisions.
+// ---------------------------------------------------------------------------
+
+fn git_out(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn force_delete_refuses_default_branch() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("chore: first");
+    // Detach so no worktree holds `main`: only the default-branch rule can
+    // refuse the delete (native git would happily run `branch -D main` here).
+    run_git(repo.dir.path(), &["checkout", "--detach"]);
+    let path = repo.path_str();
+
+    let err = GitWriter::delete_branch(&path, "main", true)
+        .expect_err("force-deleting the default branch must be refused");
+    assert!(
+        err.contains("refusing to force-delete") && err.contains("default branch"),
+        "error must name the default-branch refusal: {err}"
+    );
+    // The branch must still exist after the refusal.
+    assert!(git_out(repo.dir.path(), &["rev-parse", "--verify", "main"]).len() == 40);
+}
+
+#[test]
+fn force_delete_refuses_branch_checked_out_in_linked_worktree() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("chore: first");
+
+    let work_parent = TempDir::new().expect("worktree parent");
+    let work_path = work_parent.path().join("linked");
+    run_git(
+        repo.dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            work_path.to_str().unwrap(),
+        ],
+    );
+
+    let path = repo.path_str();
+    let err = GitWriter::delete_branch(&path, "feature", true)
+        .expect_err("force-deleting a branch checked out in a worktree must be refused");
+    assert!(
+        err.contains("checked out"),
+        "error must name the worktree conflict: {err}"
+    );
+    // Non-forced delete keeps git's native safety net and also fails.
+    assert!(GitWriter::delete_branch(&path, "feature", false).is_err());
+}
+
+#[test]
+fn normal_delete_of_merged_branch_still_succeeds() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("chore: first");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feat: g");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    run_git(repo.dir.path(), &["merge", "--ff-only", "feature"]);
+
+    GitWriter::delete_branch(&repo.path_str(), "feature", false)
+        .expect("deleting a merged branch with -d must succeed");
+}
+
+#[test]
+fn restack_after_parent_rewrite_replays_only_new_commits() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "b\n");
+    repo.commit_all("root");
+    repo.write("f.txt", "v1\n");
+    repo.commit_all("commit one");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("commit two");
+
+    // Rewrite the parent branch by amending its tip.
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("f.txt", "v1 changed\n");
+    run_git(repo.dir.path(), &["add", "-A"]);
+    run_git(
+        repo.dir.path(),
+        &["commit", "--amend", "-m", "commit one prime"],
+    );
+
+    GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect("restack over a rewritten parent must succeed");
+
+    let count = git_out(repo.dir.path(), &["rev-list", "--count", "main..feature"]);
+    assert_eq!(
+        count, "1",
+        "only the child's own commit may sit on the rewritten parent"
+    );
+    let tip_parent = git_out(repo.dir.path(), &["rev-parse", "feature^"]);
+    let main_tip = git_out(repo.dir.path(), &["rev-parse", "main"]);
+    assert_eq!(tip_parent, main_tip, "feature must sit directly on main");
+    let subjects = git_out(repo.dir.path(), &["log", "--format=%s", "main..feature"]);
+    assert_eq!(
+        subjects, "commit two",
+        "no stale pre-image commit may remain"
+    );
+}
+
+#[test]
+fn rebase_sequence_refuses_foreign_commit_without_moving_branch() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "b\n");
+    repo.commit_all("root");
+    run_git(repo.dir.path(), &["checkout", "-b", "side"]);
+    repo.write("side.txt", "s\n");
+    repo.commit_all("side commit");
+    let foreign = git_out(repo.dir.path(), &["rev-parse", "side"]);
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("main2.txt", "m\n");
+    repo.commit_all("main work");
+    let onto = git_out(repo.dir.path(), &["rev-parse", "HEAD~1"]);
+    let main_before = git_out(repo.dir.path(), &["rev-parse", "main"]);
+
+    let err = GitWriter::execute_rebase_sequence(
+        &repo.path_str(),
+        &onto,
+        &[RebaseStep {
+            commit_id: foreign.clone(),
+            action: RebaseActionKind::Pick,
+        }],
+    )
+    .expect_err("a commit from another branch must not transplant");
+    assert!(
+        err.contains(&format!("{:.7}", &foreign[..7])) || err.contains(&foreign),
+        "error must name the offending step: {err}"
+    );
+    assert_eq!(
+        git_out(repo.dir.path(), &["rev-parse", "main"]),
+        main_before,
+        "branch must be untouched after refusal"
+    );
+    assert_eq!(
+        git_out(repo.dir.path(), &["symbolic-ref", "--short", "HEAD"]),
+        "main"
+    );
+}
+
+#[test]
+fn rebase_reword_preserves_commit_body() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "b\n");
+    repo.commit_all("root");
+    repo.write("d.txt", "d\n");
+    run_git(repo.dir.path(), &["add", "-A"]);
+    run_git(
+        repo.dir.path(),
+        &["commit", "-m", "subject line", "-m", "body text here"],
+    );
+    let target = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    let root = git_out(repo.dir.path(), &["rev-parse", "HEAD~1"]);
+
+    GitWriter::execute_rebase_sequence(
+        &repo.path_str(),
+        &root,
+        &[RebaseStep {
+            commit_id: target,
+            action: RebaseActionKind::Reword("new subject".into()),
+        }],
+    )
+    .expect("reword sequence must succeed");
+
+    let message = git_out(repo.dir.path(), &["log", "-1", "--format=%B"]);
+    assert_eq!(
+        message, "new subject\n\nbody text here",
+        "reword replaces only the subject; body must survive"
+    );
+}
+
+#[test]
+fn create_branch_accepts_head_ancestor_start_point() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("first");
+    let first = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    repo.write("g.txt", "two\n");
+    repo.commit_all("second");
+
+    GitWriter::create_branch(&repo.path_str(), "backdated", Some("HEAD~1"))
+        .expect("revision-style start points must be accepted");
+    assert_eq!(
+        git_out(repo.dir.path(), &["rev-parse", "backdated"]),
+        first,
+        "branch must point at the resolved start point"
+    );
+}
+
+/// `--numstat -z` round-trip through real git: rename entries must surface
+/// under their post-image path with status R, and non-ASCII filenames must
+/// arrive raw (never C-quoted) because NUL framing needs no escaping.
+#[test]
+fn commit_files_parses_renames_and_unicode_paths_from_real_git() {
+    let repo = TestRepo::init();
+    let unicode_old = "dir/naïve-файл.txt";
+    let unicode_new = "dir/renamed-ünïcode.txt";
+    repo.write(unicode_old, "content\n");
+    repo.write("plain.txt", "one\n");
+    repo.commit_all("chore: seed");
+
+    run_git(repo.dir.path(), &["mv", unicode_old, unicode_new]);
+    repo.write("plain.txt", "two\n");
+    // Binary content so numstat emits "-" counts.
+    std::fs::write(repo.dir.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+    repo.commit_all("feat: rename and edit");
+
+    let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    let files = GitReader::get_commit_files(&repo.path_str(), &head).expect("commit files");
+
+    let renamed = files
+        .iter()
+        .find(|f| f.path == unicode_new)
+        .expect("rename must be reported under its exact post-image path");
+    assert_eq!(renamed.status_code, "R");
+    let plain = files
+        .iter()
+        .find(|f| f.path == "plain.txt")
+        .expect("edited file must be listed");
+    assert_eq!(plain.status_code, "M");
+    assert!(plain.additions > 0 && plain.deletions > 0);
+    let binary = files
+        .iter()
+        .find(|f| f.path == "blob.bin")
+        .expect("binary file must be listed");
+    assert_eq!(binary.status_code, "B");
+    assert_eq!((binary.additions, binary.deletions), (0, 0));
+}
+
+#[test]
+fn get_commit_file_diff_returns_only_the_requested_path() {
+    let repo = TestRepo::init();
+    repo.write("keep.txt", "keep-old\n");
+    repo.write("other.txt", "other-old\n");
+    repo.commit_all("chore: seed");
+    repo.write("keep.txt", "keep-new\n");
+    repo.write("other.txt", "other-new\n");
+    repo.commit_all("feat: edit both");
+
+    let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    let one = GitReader::get_commit_file_diff(&repo.path_str(), &head, "keep.txt")
+        .expect("path-scoped commit diff");
+    assert!(one.contains("keep-new") || one.contains("+keep-new"));
+    assert!(
+        !one.contains("other-new") && !one.contains("other-old"),
+        "scoped diff must not carry the sibling file: {one}"
+    );
+}
+
+#[test]
+fn empty_selective_patch_is_rejected_before_git_apply() {
+    let file_patch = FilePatch {
+        old_path: "app.txt".into(),
+        new_path: "app.txt".into(),
+        hunks: vec![UnifiedDiffHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            header: String::new(),
+            lines: vec![UnifiedDiffLine {
+                line_type: DiffLineType::Addition,
+                old_line_no: None,
+                new_line_no: Some(1),
+                content: "nope".into(),
+                is_selected: false,
+            }],
+        }],
+    };
+    let err = PatchBuilder::validate_file_patch(&file_patch).expect_err("empty selection");
+    assert!(err.to_lowercase().contains("no lines selected"));
+}
+
+#[test]
+fn github_ssh_url_with_explicit_port_strips_the_port() {
+    let parsed = parse_github_remote_url("ssh://git@github.com:22/acme/gitpulse.git").unwrap();
+    assert_eq!(parsed.host, "github.com");
+    assert_eq!(parsed.owner, "acme");
+    assert_eq!(parsed.name, "gitpulse");
+    assert_eq!(parsed.slug(), "acme/gitpulse");
+}
+
+#[test]
+fn rebase_rejects_squash_as_the_first_step() {
+    let repo = TestRepo::init();
+    repo.write("a.txt", "root\n");
+    repo.commit_all("chore: root");
+    repo.write("b.txt", "feature\n");
+    repo.commit_all("feat: feature");
+    let path = repo.path_str();
+    let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    let onto = git_out(repo.dir.path(), &["rev-parse", "HEAD~1"]);
+    let err = GitWriter::execute_rebase_sequence(
+        &path,
+        &onto,
+        &[RebaseStep {
+            commit_id: head,
+            action: RebaseActionKind::Squash,
+        }],
+    )
+    .expect_err("squash with no previous commit must be refused");
+    assert!(
+        err.to_lowercase().contains("squash"),
+        "error must name the illegal first action, got: {err}"
+    );
+}
+
+#[test]
+fn selective_staging_new_file_via_dev_null() {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "seed\n");
+    repo.commit_all("chore: seed");
+    let file_patch = FilePatch {
+        old_path: "/dev/null".into(),
+        new_path: "fresh.txt".into(),
+        hunks: vec![UnifiedDiffHunk {
+            old_start: 0,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+            header: String::new(),
+            lines: vec![UnifiedDiffLine {
+                line_type: DiffLineType::Addition,
+                old_line_no: None,
+                new_line_no: Some(1),
+                content: "hello from patch".into(),
+                is_selected: true,
+            }],
+        }],
+    };
+    PatchBuilder::validate_file_patch(&file_patch).expect("new-file /dev/null must validate");
+    let patch = PatchBuilder::build_selective_patch(&file_patch, true);
+    GitWriter::apply_patch_to_index(&repo.path_str(), &patch).expect("apply new-file patch");
+    let status = git_out(repo.dir.path(), &["status", "--porcelain"]);
+    assert!(
+        status.contains("fresh.txt"),
+        "new file must be staged, status was: {status}"
+    );
+}
+
+#[test]
+fn linked_worktree_mutations_serialize_without_lock_failures() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("chore: first");
+    let work_parent = TempDir::new().expect("worktree parent");
+    let work_path = work_parent.path().join("linked");
+    run_git(
+        repo.dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt-main",
+            work_path.to_str().unwrap(),
+        ],
+    );
+
+    let main_path = repo.path_str();
+    let wt_path = work_path.to_string_lossy().into_owned();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b_main = barrier.clone();
+    let b_wt = barrier.clone();
+    let h_main = std::thread::spawn(move || {
+        b_main.wait();
+        GitWriter::create_branch(&main_path, "from-main", None)
+    });
+    let h_wt = std::thread::spawn(move || {
+        b_wt.wait();
+        GitWriter::create_branch(&wt_path, "from-wt", None)
+    });
+    h_main
+        .join()
+        .expect("main thread")
+        .expect("create branch from main checkout");
+    h_wt.join()
+        .expect("worktree thread")
+        .expect("create branch from linked worktree");
+    let branches = git_out(repo.dir.path(), &["branch", "--list"]);
+    assert!(branches.contains("from-main"), "got: {branches}");
+    assert!(branches.contains("from-wt"), "got: {branches}");
 }

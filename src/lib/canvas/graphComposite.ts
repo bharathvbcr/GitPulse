@@ -65,8 +65,6 @@ export function paintGraphFrame(
     viewportHeightCss: req.heightCss,
   });
 
-  const viewportOffsetY = ((req.scrollTop % rowHeight) + rowHeight) % rowHeight;
-
   // Dangling-parent stubs live outside the strip cache on purpose: translucent
   // geometry crossing a strip edge would clip mid-fade and show alpha seams at
   // each tile boundary. Visible stubs are few (bounded by lookback), so
@@ -76,7 +74,7 @@ export function paintGraphFrame(
     req.rows,
     req.startIndex,
     req.endIndex,
-    viewportOffsetY,
+    req.scrollTop,
     req.heightCss,
   );
 
@@ -85,7 +83,7 @@ export function paintGraphFrame(
     req.rows,
     req.startIndex,
     req.endIndex,
-    viewportOffsetY,
+    req.scrollTop,
     req.selectedCommitId ?? undefined,
     {
       theme: req.theme,

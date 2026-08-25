@@ -238,6 +238,8 @@ fn validate_target_path(target: &str) -> Result<(), String> {
     Ok(())
 }
 
+use crate::engine::git_writer::repo_mutation_lock;
+
 /// Creates a linked worktree. Exactly one of `new_branch` / `detach` shapes the
 /// checkout; `start_point` may name any commit-ish.
 pub fn add_worktree(
@@ -248,6 +250,11 @@ pub fn add_worktree(
     detach: bool,
 ) -> Result<String, String> {
     let repo = validate_repo(repo_path)?;
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     validate_target_path(target_path)?;
     if let Some(branch) = new_branch {
         validate_ref_name(branch)?;
@@ -274,6 +281,11 @@ pub fn add_worktree(
 /// Removes a linked worktree. Git refuses the main worktree itself.
 pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Result<(), String> {
     let repo = validate_repo(repo_path)?;
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     validate_target_path(target_path)?;
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
@@ -281,6 +293,56 @@ pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Resul
     }
     args.push(target_path);
     git_text(&repo, &args)?;
+    Ok(())
+}
+
+/// Locks a linked worktree to prevent it from being automatically pruned or removed.
+pub fn lock_worktree(
+    repo_path: &str,
+    target_path: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    validate_target_path(target_path)?;
+    let mut args: Vec<&str> = vec!["worktree", "lock"];
+    if let Some(r) = reason {
+        if !r.trim().is_empty() {
+            args.push("--reason");
+            args.push(r);
+        }
+    }
+    args.push(target_path);
+    git_text(&repo, &args)?;
+    Ok(())
+}
+
+/// Unlocks a locked linked worktree.
+pub fn unlock_worktree(repo_path: &str, target_path: &str) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    validate_target_path(target_path)?;
+    git_text(&repo, &["worktree", "unlock", target_path])?;
+    Ok(())
+}
+
+/// Prunes stale worktree administrative data where worktree directory no longer exists.
+pub fn prune_worktree(repo_path: &str) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    git_text(&repo, &["worktree", "prune", "--expire", "now"])?;
     Ok(())
 }
 
@@ -306,9 +368,50 @@ pub fn add_worktree_argv(
     argv
 }
 
+pub fn remove_worktree_argv(target_path: &str, force: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["git".into(), "worktree".into(), "remove".into()];
+    if force {
+        argv.push("--force".into());
+    }
+    argv.push(target_path.into());
+    argv
+}
+
+pub fn lock_worktree_argv(target_path: &str, reason: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["git".into(), "worktree".into(), "lock".into()];
+    if let Some(r) = reason {
+        if !r.trim().is_empty() {
+            argv.push("--reason".into());
+            argv.push(r.into());
+        }
+    }
+    argv.push(target_path.into());
+    argv
+}
+
+pub fn unlock_worktree_argv(target_path: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "worktree".into(),
+        "unlock".into(),
+        target_path.into(),
+    ]
+}
+
+pub fn prune_worktree_argv() -> Vec<String> {
+    vec![
+        "git".into(),
+        "worktree".into(),
+        "prune".into(),
+        "--expire".into(),
+        "now".into(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_porcelain_full_blocks() {
@@ -484,6 +587,82 @@ some-future-field whatever
             .expect("remove worktree");
         let listed = list_worktrees(main.path().to_str().unwrap()).expect("list back to one");
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn test_lock_unlock_and_prune_roundtrip() {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
+        git_in(main.path(), &["add", "."]);
+        git_in(main.path(), &["commit", "-m", "init"]);
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let wt_path = parent.path().join("locked-task");
+        let created = add_worktree(
+            main.path().to_str().unwrap(),
+            wt_path.to_str().unwrap(),
+            Some("agent/locked"),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+
+        lock_worktree(
+            main.path().to_str().unwrap(),
+            created.as_str(),
+            Some("agent hold"),
+        )
+        .expect("lock");
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list locked");
+        let created_canon = Path::new(&created)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&created));
+        assert!(
+            listed.iter().any(|w| {
+                let listed_canon = Path::new(&w.path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&w.path));
+                listed_canon == created_canon && w.is_locked
+            }),
+            "locked worktree missing: created={created}, listed={listed:?}"
+        );
+
+        unlock_worktree(main.path().to_str().unwrap(), created.as_str()).expect("unlock");
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list unlocked");
+        assert!(
+            listed.iter().any(|w| {
+                let listed_canon = Path::new(&w.path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&w.path));
+                listed_canon == created_canon && !w.is_locked
+            }),
+            "unlocked worktree missing: created={created}, listed={listed:?}"
+        );
+
+        // Delete the worktree directory out of band; prune must drop the stale
+        // administrative entry.
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        prune_worktree(main.path().to_str().unwrap()).expect("prune");
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list after prune");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_main);
+    }
+
+    #[test]
+    fn test_lock_unlock_prune_argv_matches_writer_shape() {
+        assert_eq!(
+            lock_worktree_argv("/tmp/wt", Some("hold")),
+            vec!["git", "worktree", "lock", "--reason", "hold", "/tmp/wt"]
+        );
+        assert_eq!(
+            unlock_worktree_argv("/tmp/wt"),
+            vec!["git", "worktree", "unlock", "/tmp/wt"]
+        );
+        assert_eq!(
+            prune_worktree_argv(),
+            vec!["git", "worktree", "prune", "--expire", "now"]
+        );
     }
 
     #[test]

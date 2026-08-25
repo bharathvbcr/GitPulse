@@ -160,7 +160,9 @@
               <button
                 type="button"
                 class="w-16 px-2 text-[10px] text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0"
-                onclick={() => repoStore.selectCommitDiff(line.commit_id)}
+                onclick={() => {
+                  repoStore.inspectCommitInHistory(line.commit_id);
+                }}
               >{shortHash(line.commit_id)}</button>
               <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
               <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>

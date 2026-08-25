@@ -73,6 +73,7 @@ export interface DepsHealthReport {
   pip_audit_present?: boolean;
   govulncheck_present?: boolean;
   composer_present?: boolean;
+  bundler_audit_present?: boolean;
   manifests: NpmManifest[];
   ecosystems: EcosystemHint[];
   issues: HealthIssue[];

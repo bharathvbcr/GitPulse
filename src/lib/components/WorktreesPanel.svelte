@@ -3,12 +3,15 @@
   import { invoke } from "@tauri-apps/api/core";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     FolderGit2,
     Plus,
     Trash2,
     ExternalLink,
     Lock,
+    Unlock,
+    Sparkles,
     AlertTriangle,
   } from "lucide-svelte";
 
@@ -34,21 +37,64 @@
   let newPath = $state("");
   let newBranch = $state("");
   let startPoint = $state("");
+  let inflight: AsyncGuard | null = null;
+  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    $repoStore.currentPath;
+    $repoStore.generation;
+    void load();
+    return () => {
+      // A load that outlives its repo/generation must not apply: the next
+      // effect run (or unmount) cancels it here, and load() re-checks below.
+      inflight?.cancel();
+      if (confirmTimer !== null) clearTimeout(confirmTimer);
+    };
+  });
 
   async function load() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    inflight?.cancel();
+    const guard = createAsyncGuard();
+    inflight = guard;
     isLoading = true;
     error = null;
     try {
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
-      if ($repoStore.currentPath !== repo) return;
+      if (!guard.isLive()) return;
       worktrees = next;
     } catch (err: unknown) {
-      if ($repoStore.currentPath !== repo) return;
+      if (!guard.isLive()) return;
       error = String(err);
     } finally {
-      isLoading = false;
+      if (guard.isLive()) isLoading = false;
+    }
+  }
+
+  async function toggleLock(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      if (wt.is_locked) {
+        await invoke("cmd_unlock_worktree", { repoPath: repo, targetPath: wt.path });
+      } else {
+        await invoke("cmd_lock_worktree", { repoPath: repo, targetPath: wt.path, reason: null });
+      }
+      await load();
+    } catch (err: unknown) {
+      error = String(err);
+    }
+  }
+
+  async function prune() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await invoke("cmd_prune_worktree", { repoPath: repo });
+      await load();
+    } catch (err: unknown) {
+      error = String(err);
     }
   }
 
@@ -89,10 +135,13 @@
     const repo = $repoStore.currentPath;
     if (!repo) return;
     // Two-step confirm: the first click arms, the second removes. No native
-    // dialog, so the flow stays keyboard-reachable and testable.
+    // dialog, so the flow stays keyboard-reachable and testable. The arming
+    // timer is tracked so destroy (effect cleanup above) can clear it.
     if (removingPath !== wt.path) {
       removingPath = wt.path;
-      setTimeout(() => {
+      if (confirmTimer !== null) clearTimeout(confirmTimer);
+      confirmTimer = setTimeout(() => {
+        confirmTimer = null;
         if (removingPath === wt.path) removingPath = null;
       }, 4000);
       return;
@@ -126,13 +175,22 @@
       <FolderGit2 size={11} />
       <span>Worktrees ({worktrees.length})</span>
     </span>
-    <button
-      onclick={() => (showAddForm = !showAddForm)}
-      title="Create a linked worktree for a parallel task"
-      class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
-    >
-      <Plus size={12} />
-    </button>
+    <div class="flex items-center gap-1">
+      <button
+        onclick={prune}
+        title="Prune stale worktree metadata"
+        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
+      >
+        <Sparkles size={11} />
+      </button>
+      <button
+        onclick={() => (showAddForm = !showAddForm)}
+        title="Create a linked worktree for a parallel task"
+        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
+      >
+        <Plus size={12} />
+      </button>
+    </div>
   </div>
 
   {#if showAddForm}
@@ -210,6 +268,17 @@
               <ExternalLink size={11} />
             </button>
             {#if !wt.is_main}
+              <button
+                onclick={() => void toggleLock(wt)}
+                title={wt.is_locked ? "Unlock this worktree" : "Lock this worktree"}
+                class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
+              >
+                {#if wt.is_locked}
+                  <Unlock size={11} />
+                {:else}
+                  <Lock size={11} />
+                {/if}
+              </button>
               <button
                 onclick={() => void remove(wt)}
                 title={removingPath === wt.path ? "Click again to remove" : "Remove this worktree"}

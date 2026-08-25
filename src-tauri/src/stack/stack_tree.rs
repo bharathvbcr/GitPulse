@@ -19,6 +19,10 @@ pub struct BranchAncestryChain {
 
 pub struct StackTreeEngine;
 
+/// First-parent walk ceiling: far beyond any real stacked-branch depth, and
+/// turns a pathological history into bounded work instead of an unbounded one.
+const MAX_FIRST_PARENT_WALK: usize = 100_000;
+
 impl StackTreeEngine {
     /// Computes stacked branch hierarchies based on merge base and branch heads.
     pub fn build_stack_hierarchy(
@@ -26,9 +30,32 @@ impl StackTreeEngine {
         commit_parents: &HashMap<String, Vec<String>>, // commit_id -> parents
         default_branch: &str,
     ) -> Vec<StackedBranchNode> {
-        let mut nodes = Vec::new();
+        // One pass builds tip -> owning branch, so the per-branch walk is a
+        // hash lookup instead of a scan over every tip at every step. Ties
+        // (two branches on one commit) resolve deterministically: the default
+        // branch wins, otherwise the lexicographically smallest name.
+        let mut tip_owner: HashMap<&str, &str> = HashMap::with_capacity(branch_tips.len());
+        for (name, tip) in branch_tips {
+            match tip_owner.get(tip.as_str()) {
+                None => {
+                    tip_owner.insert(tip.as_str(), name.as_str());
+                }
+                Some(&existing) => {
+                    let better = name == default_branch
+                        || (existing != default_branch && name.as_str() < existing);
+                    if better {
+                        tip_owner.insert(tip.as_str(), name.as_str());
+                    }
+                }
+            }
+        }
 
-        for (branch_name, tip_id) in branch_tips {
+        let mut names: Vec<&String> = branch_tips.keys().collect();
+        names.sort();
+
+        let mut nodes = Vec::with_capacity(names.len());
+        for branch_name in names {
+            let tip_id = &branch_tips[branch_name.as_str()];
             if branch_name == default_branch {
                 nodes.push(StackedBranchNode {
                     branch_name: branch_name.clone(),
@@ -40,43 +67,43 @@ impl StackTreeEngine {
                 continue;
             }
 
-            // Walk back from tip_id until hitting another branch tip or root
-            let mut current = tip_id.clone();
-            let mut count = 0;
-            let mut parent_branch = None;
-
+            // Walk first-parent history until landing on another branch's
+            // literal tip. Exhausting the chain means no discoverable base:
+            // reporting none is honest; grafting onto the default branch with
+            // the whole depth as "ahead" invented hierarchy that does not
+            // exist in git.
+            let mut current: &str = tip_id;
+            let mut count = 0usize;
+            let mut parent_branch: Option<String> = None;
             let mut visited = std::collections::HashSet::new();
+            visited.insert(current.to_string());
 
-            while let Some(parents) = commit_parents.get(&current) {
-                if visited.contains(&current) {
+            for _ in 0..MAX_FIRST_PARENT_WALK {
+                let Some(parents) = commit_parents.get(current) else {
+                    break;
+                };
+                let Some(first_parent) = parents.first() else {
+                    break;
+                };
+                if !visited.insert(first_parent.clone()) {
                     break;
                 }
-                visited.insert(current.clone());
-
-                if let Some(first_parent) = parents.first() {
-                    count += 1;
-                    // Check if first_parent is the tip of another branch
-                    for (other_bname, other_tip) in branch_tips {
-                        if other_bname != branch_name && other_tip == first_parent {
-                            parent_branch = Some(other_bname.clone());
-                            break;
-                        }
-                    }
-                    if parent_branch.is_some() {
+                count += 1;
+                if let Some(owner) = tip_owner.get(first_parent.as_str()) {
+                    if *owner != branch_name.as_str() {
+                        parent_branch = Some((*owner).to_string());
                         break;
                     }
-                    current = first_parent.clone();
-                } else {
-                    break;
                 }
+                current = first_parent.as_str();
             }
 
             nodes.push(StackedBranchNode {
                 branch_name: branch_name.clone(),
                 tip_commit_id: tip_id.clone(),
-                parent_branch_name: parent_branch.or_else(|| Some(default_branch.to_string())),
+                parent_branch_name: parent_branch.clone(),
                 child_branch_names: Vec::new(),
-                commit_count_ahead_of_parent: count,
+                commit_count_ahead_of_parent: if parent_branch.is_some() { count } else { 0 },
             });
         }
 
@@ -190,5 +217,77 @@ mod tests {
         let chain = StackTreeEngine::get_ancestry_breadcrumbs(&cyclic, "feat-a");
         assert!(chain.breadcrumb_chain.len() <= 3);
         assert!(chain.breadcrumb_chain.contains(&"feat-a".to_string()));
+    }
+
+    /// Regression (audit H1-stack): a branch whose first-parent chain never
+    /// lands on another branch's literal tip must NOT be grafted onto the
+    /// default branch with its full depth as an invented ahead-count.
+    #[test]
+    fn fork_off_mid_history_is_not_fabricated_onto_default_branch() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "m9".to_string());
+        tips.insert("feat-x".to_string(), "f5".to_string());
+
+        let mut parents = HashMap::new();
+        // feat-x descends f5 -> f4 -> ... -> r0; no tip sits on that chain.
+        parents.insert("f5".to_string(), vec!["f4".to_string()]);
+        parents.insert("f4".to_string(), vec!["f3".to_string()]);
+        parents.insert("f3".to_string(), vec!["r0".to_string()]);
+        // main lives on a separate line entirely.
+        parents.insert("m9".to_string(), vec!["m8".to_string()]);
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let x = nodes.iter().find(|n| n.branch_name == "feat-x").unwrap();
+        assert_eq!(
+            x.parent_branch_name, None,
+            "no real base means no claimed base"
+        );
+        assert_eq!(x.commit_count_ahead_of_parent, 0);
+        // And the default branch must not silently grow this orphan as a child.
+        let m = nodes.iter().find(|n| n.branch_name == "main").unwrap();
+        assert!(
+            !m.child_branch_names.contains(&"feat-x".to_string()),
+            "fabricated hierarchy leaked into child list"
+        );
+    }
+
+    /// The walk must stay linear per branch even when another tip never
+    /// appears: a long unbranched history cannot degrade into repeated
+    /// whole-map scans.
+    #[test]
+    fn deep_unbranched_history_walks_bounded_and_reports_no_base() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "n50000".to_string());
+        tips.insert("orphan".to_string(), "o1".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert("o1".to_string(), vec!["o0".to_string()]);
+        for i in 1..=50_000usize {
+            parents.insert(format!("n{i}"), vec![format!("n{}", i - 1)]);
+        }
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let o = nodes.iter().find(|n| n.branch_name == "orphan").unwrap();
+        assert_eq!(o.parent_branch_name, None);
+        assert_eq!(o.commit_count_ahead_of_parent, 0);
+    }
+
+    /// Branch iteration order comes from a HashMap, so identical inputs used
+    /// to produce differently-ordered output (and child lists) run to run.
+    #[test]
+    fn output_is_deterministic_across_runs() {
+        let build = || {
+            let mut tips = HashMap::new();
+            for name in ["zeta", "alpha", "main", "mid"] {
+                tips.insert(name.to_string(), format!("tip-{name}"));
+            }
+            let mut parents = HashMap::new();
+            parents.insert("tip-mid".to_string(), vec!["tip-main".to_string()]);
+            parents.insert("tip-alpha".to_string(), vec!["tip-main".to_string()]);
+            StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main")
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a, b, "same input must give byte-identical output");
     }
 }

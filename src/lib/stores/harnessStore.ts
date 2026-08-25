@@ -121,6 +121,22 @@ export interface HarnessState {
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
 
+/**
+ * An AI status probe nests a HarnessStatus that is often empty even when the
+ * preceding sidecar handshake recorded a connection error. Keep that error
+ * rather than letting a "clean" nested payload wipe it on refresh.
+ */
+function retainHarnessError(
+  current: HarnessStatus | null,
+  incoming: HarnessStatus,
+): HarnessStatus {
+  if (incoming.error) return incoming;
+  if (current?.error) {
+    return { ...incoming, error: current.error, error_code: current.error_code };
+  }
+  return incoming;
+}
+
 function loadPreferred(): AiSelection | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_MODEL);
@@ -176,18 +192,23 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
 
   async function probeAi(token: number): Promise<AiStatus | null> {
     const preferred = currentPreferred();
-    update((s) => ({ ...s, isProbing: true, error: null }));
+    update((s) => ({ ...s, isProbing: true }));
     try {
       const ai = await invokeFn<AiStatus>("cmd_ai_status", {
         baseUrl: preferred?.base_url ?? null,
         model: preferred?.model ?? null,
       });
       if (token !== probeToken) return null;
-      update((s) => ({ ...s, ai, harness: ai.harness, isProbing: false }));
+      update((s) => ({
+        ...s,
+        ai,
+        harness: retainHarnessError(s.harness, ai.harness),
+        isProbing: false,
+      }));
       return ai;
     } catch (err: any) {
       if (token !== probeToken) return null;
-      update((s) => ({ ...s, isProbing: false, error: String(err) }));
+      update((s) => ({ ...s, isProbing: false, error: s.error ?? String(err) }));
       return null;
     }
   }

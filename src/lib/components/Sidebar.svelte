@@ -51,6 +51,15 @@
     <div>
       <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
         <span>Staged Changes ({stagedFiles.length})</span>
+        {#if stagedFiles.length > 0}
+          <button
+            onclick={() => repoStore.unstageAll()}
+            title="Unstage all files"
+            class="text-[9px] lowercase font-normal text-textMuted hover:text-red-400 transition-colors"
+          >
+            unstage all
+          </button>
+        {/if}
       </div>
       {#if stagedFiles.length === 0}
         <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">No staged changes</div>
@@ -93,6 +102,15 @@
     <div>
       <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
         <span>Changes ({unstagedFiles.length})</span>
+        {#if unstagedFiles.length > 0}
+          <button
+            onclick={() => repoStore.stageAll()}
+            title="Stage all files"
+            class="text-[9px] lowercase font-normal text-textMuted hover:text-green-400 transition-colors"
+          >
+            stage all
+          </button>
+        {/if}
       </div>
       {#if unstagedFiles.length === 0}
         <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">Working tree clean</div>

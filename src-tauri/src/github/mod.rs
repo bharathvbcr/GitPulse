@@ -59,6 +59,18 @@ pub struct IssueInfo {
     pub author: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub tag_name: String,
+    pub name: String,
+    pub is_draft: bool,
+    pub is_prerelease: bool,
+    pub is_latest: bool,
+    pub published_at: String,
+    pub created_at: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubContext {
     pub available: bool,
@@ -76,7 +88,21 @@ pub struct GitHubContext {
     /// while the rest of the context is still usable.
     #[serde(default)]
     pub runs_error: Option<String>,
+    #[serde(default)]
+    pub releases: Vec<ReleaseInfo>,
+    #[serde(default)]
+    pub releases_truncated: bool,
+    #[serde(default)]
+    pub releases_error: Option<String>,
     pub error: Option<String>,
+    /// Degradations that did not fail the whole context: a section that could
+    /// not be fetched or parsed keeps going with an empty list plus a reason
+    /// here, so "no pull requests" never silently doubles as "could not
+    /// check". Mirrors the coverage scanner's skip-reason pattern. Absent
+    /// from the JSON entirely while empty, so existing TS consumers see no
+    /// shape change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// One open Dependabot alert, shaped for the Health view.
@@ -147,6 +173,7 @@ pub fn parse_github_remote_url(url: &str) -> Option<GitHubRepoRef> {
 }
 
 fn split_owner_repo(host: &str, path: &str) -> Option<GitHubRepoRef> {
+    let host = host.split(':').next().unwrap_or(host).trim();
     if host.is_empty() {
         return None;
     }
@@ -433,6 +460,80 @@ fn parse_workflow_runs(stdout: &[u8]) -> Result<Vec<WorkflowRunInfo>, String> {
         .collect())
 }
 
+#[derive(Debug, Deserialize)]
+struct GhRelease {
+    #[serde(rename = "tagName", default)]
+    tag_name: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "isDraft", default)]
+    is_draft: bool,
+    #[serde(rename = "isPrerelease", default)]
+    is_prerelease: bool,
+    #[serde(rename = "isLatest", default)]
+    is_latest: bool,
+    #[serde(rename = "publishedAt", default)]
+    published_at: Option<String>,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+const RELEASE_DISPLAY_LIMIT: usize = 50;
+
+fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), String> {
+    let fetch_limit = (RELEASE_DISPLAY_LIMIT + 1).to_string();
+    let stdout = run_gh(
+        remote,
+        &[
+            "release",
+            "list",
+            "--limit",
+            &fetch_limit,
+            "--json",
+            "tagName,name,isDraft,isLatest,isPrerelease,publishedAt,createdAt,url",
+        ],
+        Duration::from_secs(45),
+        None,
+    )?;
+    parse_release_list(&stdout, &remote.html_url(), RELEASE_DISPLAY_LIMIT)
+}
+
+fn parse_release_list(
+    stdout: &[u8],
+    base_html_url: &str,
+    display_limit: usize,
+) -> Result<(Vec<ReleaseInfo>, bool), String> {
+    let mut releases: Vec<GhRelease> = serde_json::from_slice(stdout)
+        .map_err(|error| format!("GitHub returned invalid release data: {error}"))?;
+    let truncated = releases.len() > display_limit;
+    releases.truncate(display_limit);
+    let releases = releases
+        .into_iter()
+        .map(|rel| {
+            let url = if let Some(u) = rel.url.filter(|s| !s.trim().is_empty()) {
+                u
+            } else if !rel.tag_name.trim().is_empty() {
+                format!("{}/releases/tag/{}", base_html_url, rel.tag_name.trim())
+            } else {
+                format!("{}/releases", base_html_url)
+            };
+            ReleaseInfo {
+                tag_name: rel.tag_name,
+                name: rel.name,
+                is_draft: rel.is_draft,
+                is_prerelease: rel.is_prerelease,
+                is_latest: rel.is_latest,
+                published_at: rel.published_at.unwrap_or_default(),
+                created_at: rel.created_at.unwrap_or_default(),
+                url,
+            }
+        })
+        .collect();
+    Ok((releases, truncated))
+}
+
 /// Upper bound on open Dependabot alerts shown in the Health view. One extra
 /// row is fetched so a capped result is reported instead of silently looking
 /// complete.
@@ -649,6 +750,14 @@ pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Res
         if label.is_empty() {
             continue;
         }
+        // A leading '-' makes the label option-shaped: interpolated as
+        // `gh issue create … --label <label>`, some CLI parsers read
+        // "-inbox" (or worse, "-oProxyCommand=…") as flags rather than as
+        // the label's value. Labels are names on GitHub anyway — none begin
+        // with '-' — so refuse instead of hoping every parser quotes well.
+        if label.starts_with('-') {
+            return Err(format!("Issue label '{label}' must not start with '-'"));
+        }
         if label.chars().count() > 128 || label.contains(['\n', '\r', '\0']) {
             return Err("Issue label is invalid or exceeds 128 characters".into());
         }
@@ -709,7 +818,11 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 runs_error: None,
                 issues_error: None,
                 workflow_runs: Vec::new(),
+                releases: Vec::new(),
+                releases_truncated: false,
+                releases_error: None,
                 error: Some("No GitHub remote configured".into()),
+                warnings: Vec::new(),
             };
         }
         Err(e) => {
@@ -726,7 +839,11 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 runs_error: None,
                 issues_error: None,
                 workflow_runs: Vec::new(),
+                releases: Vec::new(),
+                releases_truncated: false,
+                releases_error: None,
                 error: Some(e),
+                warnings: Vec::new(),
             };
         }
     };
@@ -745,7 +862,11 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             runs_error: None,
             issues_error: None,
             workflow_runs: Vec::new(),
+            releases: Vec::new(),
+            releases_truncated: false,
+            releases_error: None,
             error: Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
+            warnings: Vec::new(),
         };
     }
 
@@ -754,6 +875,17 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         Ok((issues, truncated)) => (issues, truncated, None),
         Err(error) => (Vec::new(), false, Some(error)),
     };
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(ref issue_error) = issues_error {
+        warnings.push(format!("Issue listing failed: {issue_error}"));
+    }
+    let (releases, releases_truncated, releases_error) = match list_releases(&remote) {
+        Ok((releases, truncated)) => (releases, truncated, None),
+        Err(error) => (Vec::new(), false, Some(error)),
+    };
+    if let Some(ref release_error) = releases_error {
+        warnings.push(format!("Release listing failed: {release_error}"));
+    }
     match run_gh(
         &remote,
         &[
@@ -770,30 +902,25 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         None,
     ) {
         Ok(stdout) => {
+            // A parse failure no longer poisons the whole context: the
+            // repository facts are still real, so degrade the PR section and
+            // carry the reason in `warnings` where the UI can show it.
             let pull_requests = match parse_pr_list(&stdout) {
                 Ok(prs) => prs,
                 Err(e) => {
-                    return GitHubContext {
-                        available: false,
-                        cli_present: true,
-                        host: remote.host,
-                        owner: remote.owner,
-                        repo: remote.name,
-                        html_url,
-                        pull_requests: Vec::new(),
-                        issues,
-                        issues_truncated,
-                        issues_error,
-                        workflow_runs: Vec::new(),
-                        runs_error: None,
-                        error: Some(e),
-                    };
+                    warnings.push(format!(
+                        "Pull request listing failed: {e}. The list may be incomplete."
+                    ));
+                    Vec::new()
                 }
             };
             let (workflow_runs, runs_error) = match list_workflow_runs(&remote) {
                 Ok(runs) => (runs, None),
                 Err(e) => (Vec::new(), Some(e)),
             };
+            if let Some(ref run_error) = runs_error {
+                warnings.push(format!("Workflow run listing failed: {run_error}"));
+            }
             GitHubContext {
                 available: true,
                 cli_present: true,
@@ -807,7 +934,11 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 issues_error,
                 workflow_runs,
                 runs_error,
+                releases,
+                releases_truncated,
+                releases_error,
                 error: None,
+                warnings,
             }
         }
         Err(e) => GitHubContext {
@@ -823,7 +954,11 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             issues_error,
             workflow_runs: Vec::new(),
             runs_error: None,
+            releases,
+            releases_truncated,
+            releases_error,
             error: Some(e),
+            warnings,
         },
     }
 }
@@ -900,6 +1035,14 @@ mod tests {
         let parsed = parse_github_remote_url("ssh://git@github.com/acme/gitpulse.git").unwrap();
         assert_eq!(parsed.owner, "acme");
         assert_eq!(parsed.name, "gitpulse");
+    }
+
+    #[test]
+    fn test_parse_ssh_scheme_url_with_port() {
+        let parsed = parse_github_remote_url("ssh://git@github.com:22/acme/gitpulse.git").unwrap();
+        assert_eq!(parsed.owner, "acme");
+        assert_eq!(parsed.name, "gitpulse");
+        assert_eq!(parsed.host, "github.com");
     }
 
     #[test]
@@ -1009,6 +1152,25 @@ mod tests {
         assert!(create_issue("/tmp", " ", "body", &[]).is_err());
         assert!(create_issue("/tmp", &"x".repeat(257), "body", &[]).is_err());
         assert!(create_issue("/tmp", "title", &"x".repeat(65 * 1024), &[]).is_err());
+    }
+
+    /// A label beginning with '-' is option-shaped and could be parsed as a
+    /// gh flag instead of a value; validation refuses it up front.
+    #[test]
+    fn dash_prefixed_labels_are_rejected() {
+        assert!(validate_issue_payload("title", "body", &["-inbox".to_string()]).is_err());
+        // Whitespace does not launder the prefix: trimming happens first.
+        assert!(validate_issue_payload("title", "body", &["  --repo=evil".to_string()]).is_err());
+        let err = validate_issue_payload("title", "body", &["-bug".to_string()]).unwrap_err();
+        assert!(
+            err.contains("must not start with '-'"),
+            "refusal should name the rule, got: {err}"
+        );
+        // Ordinary labels, including ones containing dashes mid-name, pass.
+        assert!(validate_issue_payload("title", "body", &["good-label".to_string()]).is_ok());
+        assert!(
+            validate_issue_payload("title", "body", &["bug".to_string(), String::new()]).is_ok()
+        );
     }
 
     #[test]
@@ -1123,5 +1285,108 @@ mod tests {
         let (alerts, truncated) = parse_dependabot_alerts(&text, 2).unwrap();
         assert_eq!(alerts.len(), 2);
         assert!(truncated);
+    }
+
+    #[test]
+    fn release_list_parses_tags_drafts_and_generates_urls() {
+        let json = br#"[
+            {
+                "tagName": "v1.2.0",
+                "name": "Version 1.2.0",
+                "isDraft": false,
+                "isPrerelease": false,
+                "isLatest": true,
+                "publishedAt": "2026-08-25T01:00:00Z",
+                "createdAt": "2026-08-25T00:30:00Z",
+                "url": "https://github.com/acme/gitpulse/releases/tag/v1.2.0"
+            },
+            {
+                "tagName": "v1.3.0-rc.1",
+                "name": "Release Candidate 1",
+                "isDraft": false,
+                "isPrerelease": true,
+                "isLatest": false,
+                "publishedAt": "2026-08-25T02:00:00Z",
+                "createdAt": "2026-08-25T01:30:00Z",
+                "url": ""
+            },
+            {
+                "tagName": "",
+                "name": "Draft Next",
+                "isDraft": true,
+                "isPrerelease": false,
+                "isLatest": false,
+                "publishedAt": null,
+                "createdAt": "2026-08-25T03:00:00Z"
+            }
+        ]"#;
+        let (releases, truncated) =
+            parse_release_list(json, "https://github.com/acme/gitpulse", 50).unwrap();
+        assert!(!truncated);
+        assert_eq!(releases.len(), 3);
+
+        let r0 = &releases[0];
+        assert_eq!(r0.tag_name, "v1.2.0");
+        assert_eq!(r0.name, "Version 1.2.0");
+        assert!(!r0.is_draft);
+        assert!(!r0.is_prerelease);
+        assert!(r0.is_latest);
+        assert_eq!(r0.published_at, "2026-08-25T01:00:00Z");
+        assert_eq!(
+            r0.url,
+            "https://github.com/acme/gitpulse/releases/tag/v1.2.0"
+        );
+
+        let r1 = &releases[1];
+        assert_eq!(r1.tag_name, "v1.3.0-rc.1");
+        assert!(r1.is_prerelease);
+        assert!(!r1.is_latest);
+        assert_eq!(
+            r1.url,
+            "https://github.com/acme/gitpulse/releases/tag/v1.3.0-rc.1"
+        );
+
+        let r2 = &releases[2];
+        assert!(r2.is_draft);
+        assert_eq!(r2.published_at, "");
+        assert_eq!(r2.url, "https://github.com/acme/gitpulse/releases");
+    }
+
+    #[test]
+    fn release_fetch_capping_is_reported_not_hidden() {
+        let rows: Vec<serde_json::Value> = (1..=5)
+            .map(|n| {
+                serde_json::json!({
+                    "tagName": format!("v1.0.{n}"),
+                    "name": format!("Release {n}"),
+                    "isDraft": false,
+                    "isPrerelease": false,
+                    "isLatest": n == 5,
+                    "publishedAt": "2026-08-25T00:00:00Z",
+                    "createdAt": "2026-08-25T00:00:00Z"
+                })
+            })
+            .collect();
+        let json = serde_json::to_vec(&rows).unwrap();
+        let (releases, truncated) =
+            parse_release_list(&json, "https://github.com/acme/gitpulse", 3).unwrap();
+        assert_eq!(releases.len(), 3);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn garbage_release_output_is_a_parse_error_not_an_empty_success() {
+        for garbage in [
+            &b""[..],
+            b"gh: error\n[]",
+            b"\xef\xbb\xbf[]",
+            b"{\"unexpected\":true}",
+        ] {
+            assert!(
+                parse_release_list(garbage, "https://github.com/acme/gitpulse", 50).is_err(),
+                "release parse must fail loudly on {:?}",
+                String::from_utf8_lossy(garbage)
+            );
+        }
     }
 }

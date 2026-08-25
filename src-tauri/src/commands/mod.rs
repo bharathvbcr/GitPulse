@@ -6,17 +6,18 @@ use crate::analyzer::{
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
-use crate::engine::git_cli::{resolve_repo, sandbox_write, ResolvedRepo};
+use crate::engine::git_cli::{git_text, resolve_repo, sandbox_write, validate_repo, ResolvedRepo};
 use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, FileBlob, ReflogEntry, RepoLanguageStat,
 };
-use crate::engine::git_writer::RebaseStep;
+use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, TagInfo, WorktreeInfo,
 };
 use crate::github::{
-    checkout_pull_request, create_issue, load_dependabot_alerts, load_github_context,
-    validate_issue_payload, DependabotReport, GitHubContext,
+    checkout_pull_request, create_issue, discover_github_remote, gh_repo_flags,
+    load_dependabot_alerts, load_github_context, validate_issue_payload, DependabotReport,
+    GitHubContext,
 };
 use crate::graph::{
     BezierGeometryCalculator, BranchFoldingEngine, CubicBezierCurve, FoldedBranchRun, LaneSolver,
@@ -196,6 +197,15 @@ pub async fn cmd_get_commit_diff(repo_path: String, commit_id: String) -> Result
 }
 
 #[tauri::command(async)]
+pub async fn cmd_get_commit_file_diff(
+    repo_path: String,
+    commit_id: String,
+    file_path: String,
+) -> Result<String, String> {
+    off_thread(move || GitReader::get_commit_file_diff(&repo_path, &commit_id, &file_path)).await
+}
+
+#[tauri::command(async)]
 pub async fn cmd_get_range_diff(
     repo_path: String,
     from: String,
@@ -249,10 +259,7 @@ pub async fn cmd_write_file_content(
     content: String,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = crate::harness::check_file(&repo_path, &file_path, "modify");
-        if policy.blocks() {
-            return Err(policy.refusal());
-        }
+        let policy = crate::harness::guard_file(&repo_path, &file_path, "modify")?;
         sandbox_write(&repo_path, &file_path, &content)?;
         Ok(Guarded { policy, output: () })
     })
@@ -284,6 +291,48 @@ pub async fn cmd_stage_selective_patch(
         // text; validate before anything reaches `git apply`.
         PatchBuilder::validate_file_patch(&file_patch)?;
         let patch = PatchBuilder::build_selective_patch(&file_patch, true);
+        // This is a mutating git action (index rewrite via `git apply
+        // --cached`), so it goes through the same command gate as every
+        // other mutation. The argv is exactly what
+        // GitWriter::apply_patch_to_index runs. The verdict is not returned:
+        // this command's IPC shape predates Guarded<()>, and changing it
+        // would break the frontend contract — an allow proceeds silently, a
+        // refusal surfaces as Err either way.
+        guard(
+            &repo_path,
+            &[
+                "git",
+                "apply",
+                "--cached",
+                "--unidiff-zero",
+                "--recount",
+                "-",
+            ],
+        )?;
+        GitWriter::apply_patch_to_index(&repo_path, &patch)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_unstage_selective_patch(
+    repo_path: String,
+    file_patch: FilePatch,
+) -> Result<(), String> {
+    off_thread(move || {
+        PatchBuilder::validate_file_patch(&file_patch)?;
+        let patch = PatchBuilder::build_selective_patch(&file_patch, false);
+        guard(
+            &repo_path,
+            &[
+                "git",
+                "apply",
+                "--cached",
+                "--unidiff-zero",
+                "--recount",
+                "-",
+            ],
+        )?;
         GitWriter::apply_patch_to_index(&repo_path, &patch)
     })
     .await
@@ -298,10 +347,18 @@ pub async fn cmd_commit(
     amend: bool,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let mut argv = vec!["git", "commit", "-m", message.as_str()];
-        if amend {
-            argv.push("--amend");
-        }
+        // Mirror GitWriter::commit_inner's branching exactly so the judged
+        // line is the line that would run: an amend with an empty message is
+        // `commit --amend --no-edit`, never a fictional `-m ''`.
+        let argv: Vec<&str> = if amend && message.is_empty() {
+            vec!["git", "commit", "--amend", "--no-edit"]
+        } else {
+            let mut argv = vec!["git", "commit", "-m", message.as_str()];
+            if amend {
+                argv.push("--amend");
+            }
+            argv
+        };
         let policy = guard(&repo_path, &argv)?;
         let output = GitWriter::commit(&repo_path, &message, amend)?;
         Ok(Guarded { policy, output })
@@ -310,8 +367,41 @@ pub async fn cmd_commit(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_checkout_branch(repo_path: String, branch_name: String) -> Result<(), String> {
-    off_thread(move || GitWriter::checkout_branch(&repo_path, &branch_name)).await
+pub async fn cmd_checkout_branch(
+    repo_path: String,
+    branch_name: String,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        // checkout_branch tries `switch --guess`, then plain `checkout`,
+        // falling through on failure. Both can execute, so both are judged;
+        // a refusal of either refuses the action (a policy denying
+        // `git checkout X` must not be routed around by running
+        // `git switch X` instead).
+        let attempts: [Vec<String>; 2] = [
+            vec![
+                "git".into(),
+                "switch".into(),
+                "--guess".into(),
+                branch_name.clone(),
+            ],
+            vec!["git".into(), "checkout".into(), branch_name.clone()],
+        ];
+        let mut representative: Option<crate::harness::PolicyVerdict> = None;
+        for argv in &attempts {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let verdict = guard(&repo_path, &refs)?;
+            representative = Some(match representative {
+                Some(prev) => strictest_verdict(prev, verdict),
+                None => verdict,
+            });
+        }
+        GitWriter::checkout_branch(&repo_path, &branch_name)?;
+        Ok(Guarded {
+            policy: representative.expect("at least one attempt is always gated"),
+            output: (),
+        })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -319,9 +409,17 @@ pub async fn cmd_create_branch(
     repo_path: String,
     branch_name: String,
     start_point: Option<String>,
-) -> Result<(), String> {
-    off_thread(move || GitWriter::create_branch(&repo_path, &branch_name, start_point.as_deref()))
-        .await
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let mut argv = vec!["git", "branch", branch_name.as_str()];
+        if let Some(ref sp) = start_point {
+            argv.push(sp.as_str());
+        }
+        let policy = guard(&repo_path, &argv)?;
+        GitWriter::create_branch(&repo_path, &branch_name, start_point.as_deref())?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -372,6 +470,11 @@ pub fn cmd_resolve_conflict(document: ConflictDocument) -> Result<String, String
 }
 
 #[tauri::command(async)]
+pub fn cmd_preview_conflict(document: ConflictDocument) -> String {
+    ConflictResolver::render_preview(&document)
+}
+
+#[tauri::command(async)]
 pub fn cmd_detect_language(file_path: String) -> LanguageInfo {
     LanguageDetector::detect_from_path(&file_path)
 }
@@ -401,12 +504,35 @@ pub async fn cmd_rebase_interactive(
     steps: Vec<RebaseStep>,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = guard(
-            &repo_path,
-            &["git", "rebase", "--onto", onto_commit.as_str()],
-        )?;
+        // The gate must judge the commands that actually run, and
+        // execute_rebase_sequence never runs `git rebase`: it replays the
+        // steps with checkout --detach / cherry-pick / commit --amend /
+        // branch -f (see GitWriter::execute_rebase_sequence). A rendered
+        // `git rebase …` line is a command that does not exist; worse, `-i`
+        // names an interactive session this client never opens. Derive the
+        // exact planned sequence here and put every line through the gate;
+        // a refusal on ANY of them refuses the whole rebase before the
+        // first mutation.
+        let planned = rebase_planned_commands(&repo_path, &onto_commit, &steps)?;
+        let mut representative: Option<crate::harness::PolicyVerdict> = None;
+        for argv in &planned {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let verdict = guard(&repo_path, &refs)?;
+            representative = Some(match representative {
+                Some(prev) => strictest_verdict(prev, verdict),
+                None => verdict,
+            });
+        }
         GitWriter::execute_rebase_sequence(&repo_path, &onto_commit, &steps)?;
-        Ok(Guarded { policy, output: () })
+        Ok(Guarded {
+            // Representative-verdict policy for multi-command actions: the
+            // strictest pass travels with the result (Blocked can never be
+            // attached — it errors out above). A single "last" verdict would
+            // surface the trailing `git checkout`, hiding an earlier warning
+            // or demotion on the mutating cherry-picks.
+            policy: representative.expect("at least one planned command is always gated"),
+            output: (),
+        })
     })
     .await
 }
@@ -535,6 +661,14 @@ pub async fn cmd_pull(
 
 /// Pushes, after the command gate has judged it. A force push is refused by
 /// the harness's hard rules, which is the whole reason this call is gated.
+///
+/// Judged argv is the executed argv: GitWriter::push runs
+/// `--force-with-lease`, so that exact flag is what gets judged. The
+/// harness's `command.force_push` hard rule catches it — verified against a
+/// live `manvi serve`: both `git push --force origin main` and
+/// `git push --force-with-lease origin main` come back deny/hard. (The old
+/// code judged a fictional `--force`; truthful rendering keeps denies intact
+/// without belt-and-braces double-gating.)
 #[tauri::command(async)]
 pub async fn cmd_push(
     repo_path: String,
@@ -546,7 +680,7 @@ pub async fn cmd_push(
         let force = force.unwrap_or(false);
         let mut argv = vec!["git", "push"];
         if force {
-            argv.push("--force");
+            argv.push("--force-with-lease");
         }
         if let Some(ref r) = remote {
             argv.push(r.as_str());
@@ -569,10 +703,13 @@ pub async fn cmd_merge_branch(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let ff_only = ff_only.unwrap_or(false);
+        // Same flag order as GitWriter::merge_branch, which always passes
+        // --no-edit (it never opens an interactive editor).
         let mut argv = vec!["git", "merge"];
         if ff_only {
             argv.push("--ff-only");
         }
+        argv.push("--no-edit");
         argv.push(branch_name.as_str());
         let policy = guard(&repo_path, &argv)?;
         let output = GitWriter::merge_branch(&repo_path, &branch_name, ff_only)?;
@@ -586,8 +723,21 @@ pub async fn cmd_restack(
     repo_path: String,
     branch: String,
     onto: String,
-) -> Result<String, String> {
-    off_thread(move || GitWriter::restack(&repo_path, &branch, &onto)).await
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        // GitWriter::restack executes `rebase --onto <onto> <upstream>
+        // <branch>` after resolving upstream from the reflog; the gate sees
+        // that full line, not a truncated prefix. The resolution mirrors
+        // restack's exactly (fork-point, then plain merge-base, then onto);
+        // residual TOCTOU: HEAD could move between this read and the
+        // writer's own re-resolution under the mutation lock.
+        let planned = restack_planned_argv(&repo_path, &branch, &onto)?;
+        let refs: Vec<&str> = planned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = GitWriter::restack(&repo_path, &branch, &onto)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -609,10 +759,7 @@ pub async fn cmd_discard_changes(
     file_path: String,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = crate::harness::check_file(&repo_path, &file_path, "modify");
-        if policy.blocks() {
-            return Err(policy.refusal());
-        }
+        let policy = crate::harness::guard_file(&repo_path, &file_path, "modify")?;
         GitWriter::discard_changes(&repo_path, &file_path)?;
         Ok(Guarded { policy, output: () })
     })
@@ -640,6 +787,10 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
             issues: Vec::new(),
             issues_error: None,
             issues_truncated: false,
+            releases: Vec::new(),
+            releases_error: None,
+            releases_truncated: false,
+            warnings: Vec::new(),
         })
 }
 
@@ -670,6 +821,12 @@ pub async fn cmd_github_create_issue(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         validate_issue_payload(&title, &body, &labels)?;
+        // Judge the exact argv create_issue runs. github::run_gh appends the
+        // remote pinning flags (--repo, and --hostname off github.com) after
+        // the user-shaped arguments, so they are part of the executed line
+        // and belong in the judged one too.
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
         let mut argv = vec![
             "gh".to_string(),
             "issue".to_string(),
@@ -687,6 +844,7 @@ pub async fn cmd_github_create_issue(
             argv.push("--label".to_string());
             argv.push(label.to_string());
         }
+        argv.extend(gh_repo_flags(&remote));
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
         let output = create_issue(&repo_path, &title, &body, &labels)?;
@@ -702,7 +860,17 @@ pub async fn cmd_github_checkout_pr(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let n = number.to_string();
-        let policy = guard(&repo_path, &["gh", "pr", "checkout", n.as_str()])?;
+        // checkout_pull_request runs `gh pr checkout <n> --repo <slug>
+        // [--hostname <host>]`; the pinning flags are judged with it. A
+        // missing GitHub remote fails here exactly as it would inside
+        // checkout_pull_request, just before the gate instead of after.
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let mut argv_owned: Vec<String> =
+            vec!["gh".into(), "pr".into(), "checkout".into(), n.clone()];
+        argv_owned.extend(gh_repo_flags(&remote));
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
         let output = checkout_pull_request(&repo_path, number)?;
         Ok(Guarded { policy, output })
     })
@@ -767,14 +935,54 @@ pub async fn cmd_remove_worktree(
     force: bool,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let flag = if force { "--force" } else { "remove" };
-        let mut argv = vec!["git", "worktree", "remove"];
-        if force {
-            argv.push(flag);
-        }
-        argv.push(target_path.as_str());
-        let policy = guard(&repo_path, &argv)?;
+        let argv_owned = crate::engine::worktree::remove_worktree_argv(&target_path, force);
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
         crate::engine::worktree::remove_worktree(&repo_path, &target_path, force)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_lock_worktree(
+    repo_path: String,
+    target_path: String,
+    reason: Option<String>,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let argv_owned =
+            crate::engine::worktree::lock_worktree_argv(&target_path, reason.as_deref());
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        crate::engine::worktree::lock_worktree(&repo_path, &target_path, reason.as_deref())?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_unlock_worktree(
+    repo_path: String,
+    target_path: String,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let argv_owned = crate::engine::worktree::unlock_worktree_argv(&target_path);
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        crate::engine::worktree::unlock_worktree(&repo_path, &target_path)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_prune_worktree(repo_path: String) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let argv_owned = crate::engine::worktree::prune_worktree_argv();
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        crate::engine::worktree::prune_worktree(&repo_path)?;
         Ok(Guarded { policy, output: () })
     })
     .await
@@ -803,21 +1011,40 @@ pub async fn cmd_create_tag(
     tag_name: String,
     commit_id: Option<String>,
     message: Option<String>,
-) -> Result<(), String> {
+) -> Result<Guarded<()>, String> {
     off_thread(move || {
+        let mut argv = vec!["git", "tag"];
+        if message.is_some() {
+            argv.push("-a");
+            argv.push(tag_name.as_str());
+            argv.push("-m");
+            argv.push(message.as_deref().unwrap_or_default());
+        } else {
+            argv.push(tag_name.as_str());
+        }
+        if let Some(cid) = commit_id.as_deref() {
+            argv.push(cid);
+        }
+        let policy = guard(&repo_path, &argv)?;
         GitWriter::create_tag(
             &repo_path,
             &tag_name,
             commit_id.as_deref(),
             message.as_deref(),
-        )
+        )?;
+        Ok(Guarded { policy, output: () })
     })
     .await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<(), String> {
-    off_thread(move || GitWriter::delete_tag(&repo_path, &tag_name)).await
+pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let policy = guard(&repo_path, &["git", "tag", "-d", tag_name.as_str()])?;
+        GitWriter::delete_tag(&repo_path, &tag_name)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 /// Creates (or resumes) an annotated release tag and pushes exactly that tag.
@@ -892,13 +1119,226 @@ pub struct Guarded<T> {
 }
 
 /// Evaluates one command line, refusing the action when a rule fires.
+///
+/// Thin delegate to the harness's canonical owner (`crate::harness::
+/// guard_command`), so this file keeps no second copy of render→check→refuse.
 fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict, String> {
-    let command = crate::harness::render_command(argv);
-    let verdict = crate::harness::check_command(repo_path, &command);
-    if verdict.blocks() {
-        return Err(verdict.refusal());
+    crate::harness::guard_command(repo_path, argv)
+}
+
+/// Picks the verdict a multi-command action should report.
+///
+/// Ranking, strictest first: Blocked > Warned > Demoted > Unchecked > Allowed.
+/// Blocked never actually reaches here as a survivor — `guard` refuses on it —
+/// but the ranking still documents intent. A warning is an explicit rule
+/// firing, a demotion is posture noise, an unchecked gate is an absence of a
+/// check, and a clean allow carries nothing worth surfacing over its peers.
+fn strictest_verdict(
+    a: crate::harness::PolicyVerdict,
+    b: crate::harness::PolicyVerdict,
+) -> crate::harness::PolicyVerdict {
+    use crate::harness::PolicyStatus::*;
+    let rank = |v: &crate::harness::PolicyVerdict| match v.status {
+        Blocked => 5,
+        Warned => 4,
+        Demoted => 3,
+        Unchecked => 2,
+        Allowed => 1,
+    };
+    if rank(&a) >= rank(&b) {
+        a
+    } else {
+        b
     }
-    Ok(verdict)
+}
+
+/// The amend argv [`crate::engine::git_writer::GitWriter::commit_inner`] runs
+/// for `(message, amend)`. Kept in lockstep with that private fn by test
+/// (`commit_amend_argv_mirrors_commit_inner`); if the writer ever changes flag
+/// shape or order, both must move together.
+fn commit_amend_argv(message: &str, amend: bool) -> Vec<String> {
+    let mut args = vec!["git".to_string(), "commit".to_string()];
+    if amend && message.is_empty() {
+        args.push("--amend".into());
+        args.push("--no-edit".into());
+    } else {
+        args.push("-m".into());
+        args.push(message.to_string());
+        if amend {
+            args.push("--amend".into());
+        }
+    }
+    args
+}
+
+/// Mirrors git_writer's private `reworded_message`: rewrites only the subject
+/// line, keeping the body intact.
+fn reworded_message(original: &str, new_subject: &str) -> String {
+    match original.split_once('\n') {
+        Some((_, rest)) => format!("{new_subject}\n{rest}"),
+        None => new_subject.to_string(),
+    }
+}
+
+/// The exact mutating commands [`GitWriter::execute_rebase_sequence`] will run
+/// for this rebase, in execution order — derived here because engine/ cannot
+/// own a shared argv builder without this file growing a second gate seam.
+///
+/// Mirrored decision points (keep in lockstep with the writer):
+/// - validations first (onto, steps non-empty, every step oid);
+/// - `checkout --detach <onto>`;
+/// - per step: `cherry-pick [cid|-n cid]`, plus the amend each action makes
+///   (Squash amends preserving the message via `--amend --no-edit`, Fixup the
+///   same, Reword amends `-m <composed> --amend`);
+/// - rollback pair that runs whenever a step fails: `cherry-pick --abort`,
+///   then `checkout -f <branch|head>` — gated proactively because they are
+///   part of what this invocation may execute;
+/// - on a branch, the success tail: `branch -f <branch> HEAD`, then
+///   `checkout <branch>` (the retry reruns the same argv).
+///
+/// Read-only probes (status, merge-base ancestry, symbolic-ref, log) are not
+/// gated, matching the existing fetch/status precedent. A failing reword
+/// composition refuses up front — strictly safer than the writer's
+/// mid-sequence failure.
+fn rebase_planned_commands(
+    repo_path: &str,
+    onto_commit: &str,
+    steps: &[RebaseStep],
+) -> Result<Vec<Vec<String>>, String> {
+    let repo = validate_repo(repo_path)?;
+    validate_oid_or_revision(onto_commit)?;
+    if steps.is_empty() {
+        return Err("Rebase sequence is empty".into());
+    }
+    // Mirror of the writer's own input validations, so a sequence it would
+    // refuse never reaches the gate or the subprocess layer.
+    if let Some(first) = steps.first() {
+        if matches!(
+            first.action,
+            crate::engine::git_writer::RebaseActionKind::Squash
+                | crate::engine::git_writer::RebaseActionKind::Fixup
+        ) {
+            return Err(format!(
+                "Cannot '{}' commit {} without a previous commit to combine into",
+                match first.action {
+                    crate::engine::git_writer::RebaseActionKind::Squash => "squash",
+                    _ => "fixup",
+                },
+                first.commit_id
+            ));
+        }
+    }
+    for step in steps {
+        validate_oid_or_revision(&step.commit_id)?;
+    }
+
+    let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
+    let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut planned: Vec<Vec<String>> = vec![vec![
+        "git".into(),
+        "checkout".into(),
+        "--detach".into(),
+        onto_commit.into(),
+    ]];
+
+    for step in steps {
+        match &step.action {
+            crate::engine::git_writer::RebaseActionKind::Pick
+            | crate::engine::git_writer::RebaseActionKind::Reword(_) => {
+                planned.push(vec![
+                    "git".into(),
+                    "cherry-pick".into(),
+                    step.commit_id.clone(),
+                ]);
+            }
+            crate::engine::git_writer::RebaseActionKind::Squash
+            | crate::engine::git_writer::RebaseActionKind::Fixup => {
+                planned.push(vec![
+                    "git".into(),
+                    "cherry-pick".into(),
+                    "-n".into(),
+                    step.commit_id.clone(),
+                ]);
+            }
+            crate::engine::git_writer::RebaseActionKind::Drop => {}
+        }
+        match &step.action {
+            // Squash folds into the picked commit keeping its message;
+            // Fixup keeps it too, discarding the folded commit's own.
+            crate::engine::git_writer::RebaseActionKind::Squash
+            | crate::engine::git_writer::RebaseActionKind::Fixup => {
+                planned.push(commit_amend_argv("", true));
+            }
+            crate::engine::git_writer::RebaseActionKind::Reword(new_msg) => {
+                let original = git_text(&repo, &["log", "-1", "--format=%B", &step.commit_id])?;
+                let message = reworded_message(&original, new_msg);
+                planned.push(commit_amend_argv(&message, true));
+            }
+            _ => {}
+        }
+    }
+
+    // Rollback commands: executed iff some step fails. Judged regardless so a
+    // posture that denies them refuses the whole rebase before HEAD moves.
+    planned.push(vec!["git".into(), "cherry-pick".into(), "--abort".into()]);
+    let restore_target = original_branch
+        .clone()
+        .unwrap_or_else(|| original_head.clone());
+    planned.push(vec![
+        "git".into(),
+        "checkout".into(),
+        "-f".into(),
+        restore_target,
+    ]);
+
+    // Success tail, only when the session started on a branch.
+    if let Some(branch) = original_branch {
+        planned.push(vec![
+            "git".into(),
+            "branch".into(),
+            "-f".into(),
+            branch.clone(),
+            "HEAD".into(),
+        ]);
+        planned.push(vec!["git".into(), "checkout".into(), branch]);
+    }
+
+    Ok(planned)
+}
+
+/// The full argv [`GitWriter::restack`] executes, including the upstream it
+/// resolves from the reflog (fork-point, plain merge-base, then onto).
+/// Mirrors that private resolution; residual TOCTOU between this read and the
+/// writer's re-resolution under the mutation lock is accepted and documented
+/// at the call site.
+fn restack_planned_argv(repo_path: &str, branch: &str, onto: &str) -> Result<Vec<String>, String> {
+    let repo = validate_repo(repo_path)?;
+    validate_ref_name(branch)?;
+    validate_ref_name(onto)?;
+    let upstream = [
+        vec!["merge-base", "--fork-point", onto, branch],
+        vec!["merge-base", onto, branch],
+    ]
+    .into_iter()
+    .find_map(|argv| {
+        git_text(&repo, &argv)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .unwrap_or_else(|| onto.to_string());
+    Ok(vec![
+        "git".into(),
+        "rebase".into(),
+        "--onto".into(),
+        onto.into(),
+        upstream,
+        branch.into(),
+    ])
 }
 
 /// Degraded status used when the probe task itself failed to run (pool join
@@ -1002,15 +1442,6 @@ pub async fn cmd_ai_explain_commit(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_ai_suggest_branch_name(
-    repo_path: String,
-    base_url: Option<String>,
-    model: Option<String>,
-) -> Result<crate::ai::AiGeneration, String> {
-    off_thread(move || crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))).await
-}
-
-#[tauri::command(async)]
 pub async fn cmd_ai_fix_health(
     repo_path: String,
     report: String,
@@ -1018,4 +1449,279 @@ pub async fn cmd_ai_fix_health(
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, String> {
     off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verdict(status: crate::harness::PolicyStatus) -> crate::harness::PolicyVerdict {
+        crate::harness::PolicyVerdict {
+            status,
+            checked: true,
+            target: "git x".into(),
+            rule: String::new(),
+            severity: String::new(),
+            reason: String::new(),
+            demoted: String::new(),
+            detail: String::new(),
+            detail_code: String::new(),
+        }
+    }
+
+    #[test]
+    fn strictest_verdict_ranks_blocked_over_clean_passes() {
+        use crate::harness::PolicyStatus::*;
+        let allowed = strictest_verdict(verdict(Allowed), verdict(Allowed));
+        assert_eq!(allowed.status, Allowed);
+        let warned = strictest_verdict(verdict(Allowed), verdict(Warned));
+        assert_eq!(warned.status, Warned);
+        let demoted = strictest_verdict(verdict(Demoted), verdict(Unchecked));
+        assert_eq!(demoted.status, Demoted);
+        let blocked = strictest_verdict(verdict(Allowed), verdict(Blocked));
+        assert_eq!(blocked.status, Blocked);
+    }
+
+    /// Lockstep test for commit_amend_argv against GitWriter::commit_inner's
+    /// branching: empty-message amend is --amend --no-edit, everything else
+    /// is -m <msg> with an optional trailing --amend.
+    #[test]
+    fn commit_amend_argv_mirrors_commit_inner() {
+        assert_eq!(
+            commit_amend_argv("feat: thing", false),
+            vec!["git", "commit", "-m", "feat: thing"]
+        );
+        assert_eq!(
+            commit_amend_argv("feat: thing", true),
+            vec!["git", "commit", "-m", "feat: thing", "--amend"]
+        );
+        // The Squash/Fixup path amends with no message at all.
+        assert_eq!(
+            commit_amend_argv("", true),
+            vec!["git", "commit", "--amend", "--no-edit"]
+        );
+    }
+
+    #[test]
+    fn reworded_message_keeps_body_rewrites_subject() {
+        assert_eq!(reworded_message("old\n\nbody", "new"), "new\n\nbody");
+        assert_eq!(reworded_message("subject only", "new"), "new");
+    }
+
+    fn init_repo_with_branch_commits() -> (tempfile::TempDir, String, String, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "--", "base.txt"]);
+        git(&["commit", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git(&["add", "--", "a.txt"]);
+        git(&["commit", "-m", "A"]);
+        let c_a = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        git(&["add", "--", "b.txt"]);
+        git(&["commit", "-m", "B"]);
+        let c_b = git(&["rev-parse", "HEAD"]);
+        (dir, base, c_a, c_b)
+    }
+
+    /// The planned sequence for pick+squash on a branch mirrors
+    /// execute_rebase_sequence exactly: detach onto the base, replay the
+    /// steps (squash picks -n and amends --no-edit), then move the branch
+    /// and check it back out. The rollback pair is gated proactively.
+    #[test]
+    fn rebase_planned_commands_mirror_the_writer_sequence_on_a_branch() {
+        let (dir, base, c_a, c_b) = init_repo_with_branch_commits();
+        let path = dir.path().to_str().unwrap();
+        let steps = vec![
+            RebaseStep {
+                commit_id: c_a.clone(),
+                action: crate::engine::git_writer::RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b.clone(),
+                action: crate::engine::git_writer::RebaseActionKind::Squash,
+            },
+        ];
+        let planned = rebase_planned_commands(path, &base, &steps).unwrap();
+        assert_eq!(
+            planned,
+            vec![
+                vec!["git", "checkout", "--detach", &base],
+                vec!["git", "cherry-pick", &c_a],
+                vec!["git", "cherry-pick", "-n", &c_b],
+                vec!["git", "commit", "--amend", "--no-edit"],
+                vec!["git", "cherry-pick", "--abort"],
+                vec!["git", "checkout", "-f", "main"],
+                vec!["git", "branch", "-f", "main", "HEAD"],
+                vec!["git", "checkout", "main"],
+            ]
+        );
+    }
+
+    /// Detached sessions have no branch to fast-forward: the restore target
+    /// is the detached HEAD oid and there is no branch -f / checkout tail.
+    #[test]
+    fn rebase_planned_commands_detached_session_restores_to_head_oid() {
+        let (dir, base, c_a, c_b) = init_repo_with_branch_commits();
+        let path = dir.path().to_str().unwrap();
+        let head = {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let detached = std::process::Command::new("git")
+            .args(["checkout", "-q", "--detach"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            detached.status.success(),
+            "detaching failed: {}",
+            String::from_utf8_lossy(&detached.stderr)
+        );
+        let planned = rebase_planned_commands(
+            path,
+            &base,
+            &[
+                RebaseStep {
+                    commit_id: c_a.clone(),
+                    action: crate::engine::git_writer::RebaseActionKind::Pick,
+                },
+                RebaseStep {
+                    commit_id: c_b.clone(),
+                    action: crate::engine::git_writer::RebaseActionKind::Fixup,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            planned,
+            vec![
+                vec!["git", "checkout", "--detach", &base],
+                vec!["git", "cherry-pick", &c_a],
+                vec!["git", "cherry-pick", "-n", &c_b],
+                vec!["git", "commit", "--amend", "--no-edit"],
+                vec!["git", "cherry-pick", "--abort"],
+                vec!["git", "checkout", "-f", &head],
+            ]
+        );
+    }
+
+    /// A reword step composes its amend message from the original body plus
+    /// the new subject, so the gate judges the real `-m` payload.
+    #[test]
+    fn rebase_planned_commands_reword_composes_the_real_message() {
+        let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+        // Rewrite HEAD's message so it has a body worth preserving.
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "--amend", "-m", "A\n\nbody of A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let c_a = {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let planned = rebase_planned_commands(
+            dir.path().to_str().unwrap(),
+            &base,
+            &[RebaseStep {
+                commit_id: c_a.clone(),
+                action: crate::engine::git_writer::RebaseActionKind::Reword(
+                    "renamed subject".into(),
+                ),
+            }],
+        )
+        .unwrap();
+        assert_eq!(planned[2][0], "git");
+        assert_eq!(planned[2][1], "commit");
+        assert_eq!(planned[2][2], "-m");
+        assert!(
+            planned[2][3].starts_with("renamed subject\n\nbody of A"),
+            "reword must keep the original body, got {:?}",
+            planned[2][3]
+        );
+        assert_eq!(planned[2][4], "--amend");
+    }
+
+    #[test]
+    fn rebase_planned_commands_refuses_empty_steps_and_invalid_oids() {
+        let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+        let path = dir.path().to_str().unwrap();
+        let err = rebase_planned_commands(path, &base, &[]).unwrap_err();
+        assert!(err.contains("empty"));
+        let err = rebase_planned_commands(
+            path,
+            &base,
+            &[RebaseStep {
+                commit_id: "; rm -rf /".into(),
+                action: crate::engine::git_writer::RebaseActionKind::Pick,
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("Invalid revision"), "{err}");
+    }
+
+    /// The restack planner resolves the same upstream restack does (here:
+    /// the fork base of feature from main) and renders the full four-arg
+    /// rebase line, not a prefix.
+    #[test]
+    fn restack_planned_argv_includes_resolved_upstream() {
+        let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["branch", "feature", &base]);
+        let argv = restack_planned_argv(dir.path().to_str().unwrap(), "feature", "main").unwrap();
+        assert_eq!(
+            argv.iter().take(4).map(String::as_str).collect::<Vec<_>>(),
+            vec!["git", "rebase", "--onto", "main"]
+        );
+        assert_eq!(argv.len(), 6);
+        assert_eq!(argv[5], "feature");
+        // Upstream resolves to the fork point (the common ancestor), a full oid.
+        assert_eq!(argv[4], base, "upstream must resolve to the fork base");
+        // Invalid refs are refused before anything is rendered or judged.
+        assert!(restack_planned_argv(dir.path().to_str().unwrap(), "-evil", "main").is_err());
+    }
+}
+
+#[tauri::command(async)]
+pub async fn cmd_ai_suggest_branch_name(
+    repo_path: String,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<crate::ai::AiGeneration, String> {
+    off_thread(move || crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))).await
 }

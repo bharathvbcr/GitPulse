@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { fadeParams, scaleParams } from "../motion/easing";
   import {
@@ -26,12 +27,14 @@
     value = current.options.mode === "text" ? current.options.initialValue ?? "" : "";
     // Focus lands after the DOM update; the prior holder is restored on close.
     previousFocus = document.activeElement;
-    if (current.options.mode === "text") {
-      inputEl?.focus();
-      inputEl?.select();
-    } else {
-      confirmEl?.focus();
-    }
+    void tick().then(() => {
+      if (current.options.mode === "text") {
+        inputEl?.focus();
+        inputEl?.select();
+      } else {
+        confirmEl?.focus();
+      }
+    });
   });
 
   function submit(event?: SubmitEvent) {

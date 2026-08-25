@@ -145,8 +145,23 @@ impl ConflictResolver {
         }
     }
 
-    /// Reassembles the resolved file based on selected chunk resolution choices.
+    /// Reassembles the resolved file. Unresolved chunks are an error — saving
+    /// a half-resolved file is how conflict markers leak into commits.
     pub fn render_resolved(doc: &ConflictDocument) -> Result<String, &'static str> {
+        Self::render_document(doc, false)
+    }
+
+    /// Preview: resolved chunks become their chosen content; unresolved chunks
+    /// keep standard conflict markers so the editor can show a live file
+    /// without failing the render.
+    pub fn render_preview(doc: &ConflictDocument) -> String {
+        Self::render_document(doc, true).unwrap_or_default()
+    }
+
+    fn render_document(
+        doc: &ConflictDocument,
+        allow_unresolved: bool,
+    ) -> Result<String, &'static str> {
         let mut output = Vec::new();
 
         for seg in &doc.segments {
@@ -154,7 +169,10 @@ impl ConflictResolver {
                 FileSegment::Normal(text) => output.push(text.clone()),
                 FileSegment::Conflict(chunk) => match &chunk.resolution {
                     ConflictResolutionChoice::Unresolved => {
-                        return Err("Cannot render document with unresolved conflict chunks");
+                        if !allow_unresolved {
+                            return Err("Cannot render document with unresolved conflict chunks");
+                        }
+                        output.push(unresolved_marker_block(chunk));
                     }
                     ConflictResolutionChoice::AcceptOurs => {
                         if !chunk.ours_content.is_empty() {
@@ -167,20 +185,10 @@ impl ConflictResolver {
                         }
                     }
                     ConflictResolutionChoice::AcceptBothOursFirst => {
-                        let mut combined = chunk.ours_content.clone();
-                        if !combined.is_empty() && !chunk.theirs_content.is_empty() {
-                            combined.push('\n');
-                        }
-                        combined.push_str(&chunk.theirs_content);
-                        output.push(combined);
+                        output.push(join_both(&chunk.ours_content, &chunk.theirs_content));
                     }
                     ConflictResolutionChoice::AcceptBothTheirsFirst => {
-                        let mut combined = chunk.theirs_content.clone();
-                        if !combined.is_empty() && !chunk.ours_content.is_empty() {
-                            combined.push('\n');
-                        }
-                        combined.push_str(&chunk.ours_content);
-                        output.push(combined);
+                        output.push(join_both(&chunk.theirs_content, &chunk.ours_content));
                     }
                     ConflictResolutionChoice::Custom(custom_text) => {
                         output.push(custom_text.clone());
@@ -200,6 +208,37 @@ impl ConflictResolver {
         }
         Ok(joined)
     }
+}
+
+fn join_both(first: &str, second: &str) -> String {
+    let mut combined = first.to_string();
+    if !combined.is_empty() && !second.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(second);
+    combined
+}
+
+fn unresolved_marker_block(chunk: &ConflictChunk) -> String {
+    let mut block = format!("<<<<<<< {}\n", chunk.ours_label);
+    if let Some(base) = &chunk.base_content {
+        block.push_str("||||||| base\n");
+        block.push_str(base);
+        if !base.ends_with('\n') {
+            block.push('\n');
+        }
+    }
+    block.push_str(&chunk.ours_content);
+    if !chunk.ours_content.ends_with('\n') && !chunk.ours_content.is_empty() {
+        block.push('\n');
+    }
+    block.push_str("=======\n");
+    block.push_str(&chunk.theirs_content);
+    if !chunk.theirs_content.ends_with('\n') && !chunk.theirs_content.is_empty() {
+        block.push('\n');
+    }
+    block.push_str(&format!(">>>>>>> {}", chunk.theirs_label));
+    block
 }
 
 #[cfg(test)]
@@ -282,5 +321,24 @@ mod tests {
         }
         let out = ConflictResolver::render_resolved(&doc).unwrap();
         assert_eq!(out, "a\ntheirs\nc");
+    }
+
+    #[test]
+    fn render_preview_keeps_unresolved_markers_and_resolved_chunks() {
+        let content = "head\n<<<<<<< HEAD\nours-a\n=======\ntheirs-a\n>>>>>>> branch\nmid\n<<<<<<< HEAD\nours-b\n=======\ntheirs-b\n>>>>>>> branch\ntail\n";
+        let mut doc = ConflictResolver::parse("f.txt", content);
+        assert_eq!(doc.total_conflicts, 2);
+        if let Some(FileSegment::Conflict(ref mut chunk)) = doc.segments.get_mut(1) {
+            chunk.resolution = ConflictResolutionChoice::AcceptOurs;
+        }
+        assert!(ConflictResolver::render_resolved(&doc).is_err());
+        let preview = ConflictResolver::render_preview(&doc);
+        assert!(preview.contains("ours-a"));
+        assert!(!preview.contains("theirs-a"));
+        assert!(preview.contains("<<<<<<<"));
+        assert!(preview.contains("theirs-b"));
+        assert!(preview.contains(">>>>>>>"));
+        assert!(preview.contains("head"));
+        assert!(preview.contains("tail"));
     }
 }

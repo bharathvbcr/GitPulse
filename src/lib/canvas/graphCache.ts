@@ -284,6 +284,10 @@ export function createGraphStaticCache(
       const sy = (srcTopCss - stripTopCss) * dpr;
       const sh = Math.min((srcBottomCss - srcTopCss) * dpr, surface.canvas.height - sy);
       if (sh <= 0) continue;
+      // Destination is viewport space: the visible canvas is not translated
+      // by scrollTop, so a content-space dest Y would paint the graph 180px
+      // (or however far the user scrolled) below the overlay rings and hits.
+      const destY = srcTopCss - viewTop;
       target.drawImage(
         surface.canvas,
         0,
@@ -291,7 +295,7 @@ export function createGraphStaticCache(
         surface.canvas.width,
         sh,
         0,
-        srcTopCss,
+        destY,
         surface.canvas.width / dpr,
         sh / dpr,
       );

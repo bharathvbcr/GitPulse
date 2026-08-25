@@ -65,8 +65,12 @@ pub fn budget_diff(diff: &str, max_bytes: usize) -> BudgetedDiff {
     // A single file larger than the whole budget leaves nothing: keep a head
     // of it rather than sending an empty diff.
     if kept.is_empty() {
-        let head: String = diff.chars().take(max_bytes.saturating_sub(1)).collect();
-        kept.push_str(&head);
+        let budget = max_bytes.saturating_sub(1);
+        let mut cut = budget.min(diff.len());
+        while cut > 0 && !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        kept.push_str(&diff[..cut]);
         files_kept = files_seen.min(1);
     }
 
@@ -130,7 +134,11 @@ pub fn budget_text(text: &str, max_bytes: usize) -> BudgetedDiff {
     // A single line longer than the whole budget still yields a head rather
     // than an empty context.
     if kept.is_empty() {
-        kept.push_str(&text.chars().take(max_bytes).collect::<String>());
+        let mut cut = max_bytes.min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        kept.push_str(&text[..cut]);
     }
     let used_bytes = kept.len();
     kept.push_str(&format!(
@@ -444,6 +452,27 @@ mod tests {
         assert!(diff_budget_bytes(32_768, 2_000) > diff_budget_bytes(8_192, 2_000));
     }
 
+    /// Regression (audit L1): the single-file fallback truncated by CHARS,
+    /// so a multibyte diff could exceed `max_bytes` up to 4x while reporting
+    /// those inflated numbers as bytes to the model and UI.
+    #[test]
+    fn oversized_multibyte_diff_respects_the_byte_budget() {
+        let line = "héllo wörld\n";
+        let diff = format!(
+            "diff --git a/ünïcode b/ünïcode\nindex 1..2\n--- a/ünïcode\n+++ b/ünïcode\n@@ -1 +1 @@\n{}",
+            line.repeat(50)
+        );
+        let budgeted = budget_diff(&diff, 64);
+        assert!(budgeted.truncated);
+        assert!(
+            budgeted.used_bytes <= 64,
+            "used {} bytes against a 64-byte budget",
+            budgeted.used_bytes
+        );
+        // used_bytes reports the diff payload; the truncation notice rides
+        // on top, so the invariant is on the payload, not the whole text.
+    }
+
     #[test]
     fn think_tags_are_removed_open_or_closed() {
         assert_eq!(strip_think_tags("<think>plan</think>feat: x"), "feat: x");
@@ -514,6 +543,20 @@ mod tests {
         assert!(out.truncated);
         assert!(!out.text.is_empty());
         assert!(out.used_bytes <= 100 + "[context truncated…".len());
+    }
+
+    #[test]
+    fn oversized_multibyte_text_respects_the_byte_budget() {
+        let line = "héllo wörld 你好\n";
+        let report = line.repeat(40);
+        let out = budget_text(&report, 64);
+        assert!(out.truncated);
+        assert!(
+            out.used_bytes <= 64,
+            "used {} bytes against a 64-byte budget",
+            out.used_bytes
+        );
+        assert!(out.text.contains("[context truncated:"));
     }
 
     #[test]

@@ -58,21 +58,48 @@ impl HarnessStatus {
     }
 }
 
-/// Runs `action` only if the command gate does not refuse it.
+/// The single gate seam for guarded Git actions.
 ///
-/// The verdict travels with the result either way, so a caller can report an
-/// action that ran without being checked as exactly that.
-pub fn guard_command<T>(
-    root: &str,
-    argv: &[&str],
-    action: impl FnOnce() -> Result<T, String>,
-) -> (PolicyVerdict, Result<T, String>) {
+/// Every mutating command goes through here and nowhere else: `argv` is
+/// rendered the way a shell would show it ([`render_command`]) so the
+/// command gate judges the command the client actually runs, a blocking
+/// verdict becomes the rendered refusal (`Err`), and otherwise the
+/// [`PolicyVerdict`] is handed back so the caller can report an action that
+/// ran unchecked when no harness is installed — which is never rendered as
+/// an approval.
+///
+/// This used to exist twice (a generic closure-taking variant here, and a
+/// private reimplementation in `commands`); this signature is the canonical
+/// one both now share.
+pub(crate) fn guard_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
-    let verdict = check_command(root, &command);
+    gated(check_command(repo_path, &command))
+}
+
+/// Evaluates one file write, on the same terms as [`guard_command`].
+pub(crate) fn guard_file(
+    repo_path: &str,
+    file_path: &str,
+    op: &str,
+) -> Result<PolicyVerdict, String> {
+    gated(check_file(repo_path, file_path, op))
+}
+
+/// The single place a verdict becomes permission to act.
+///
+/// Two things refuse here, and the second is the one that is easy to miss. A
+/// rule firing is obvious. A gate that *could not run* is not: an unchecked
+/// verdict does not block, so before this seam refused it, a busy or wedged
+/// sidecar let `git push --force` straight through while the UI recorded it as
+/// merely "unguarded" — the check that could not run reporting exactly what a
+/// check that ran and passed reports. See [`PolicyVerdict::gate_failed`] for
+/// why a missing harness is the only unchecked verdict that may proceed.
+fn gated(verdict: PolicyVerdict) -> Result<PolicyVerdict, String> {
     if verdict.blocks() {
-        let refusal = verdict.refusal();
-        return (verdict, Err(refusal));
+        return Err(verdict.refusal());
     }
-    let outcome = action();
-    (verdict, outcome)
+    if verdict.gate_failed() {
+        return Err(verdict.gate_failure());
+    }
+    Ok(verdict)
 }

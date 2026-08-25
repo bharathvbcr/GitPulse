@@ -83,6 +83,14 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
                 }
             }
         }
+        // The sidecar lives in a static that never drops, so it must be
+        // reaped explicitly on quit or a live `manvi serve` is orphaned.
+        // Both exit events are handled defensively (idempotent): which of
+        // them fires depends on how the app is told to quit, and
+        // `sidecar::shutdown` gives up after ~1.2s rather than stalling
+        // exit behind an in-flight request.
+        RunEvent::ExitRequested { .. } => crate::harness::sidecar::shutdown(),
+        RunEvent::Exit => crate::harness::sidecar::shutdown(),
         _ => {}
     }
 }

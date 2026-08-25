@@ -13,12 +13,14 @@ impl RepoFileWatcher {
     /// linked-worktree git dir, or bare repo). See [`Self::watch_repo`] for
     /// the full-repo form.
     pub fn watch(git_dir: &Path) -> Result<Self, String> {
-        Self::watch_repo(git_dir, None)
+        Self::watch_repo(git_dir, None, None)
     }
 
     /// Watches a repository for the change detector: the resolved git dir
-    /// recursively, and — when the repository has a separate worktree root —
-    /// that root too.
+    /// recursively, the shared common dir when it differs (linked worktrees
+    /// keep refs in the main repo's git dir, so branch/ref writes made
+    /// anywhere must fire), and — when the repository has a separate
+    /// worktree root — that root too.
     ///
     /// The worktree watch is deliberately NON-recursive (top-level entries
     /// only). Recursive watching of a whole checkout is far too hot for the
@@ -28,7 +30,11 @@ impl RepoFileWatcher {
     /// deeper edits still reach us through the index/HEAD writes they cause
     /// inside `.git`. Both `notify` backends in use here support the mode:
     /// inotify natively, FSEvents via its own filtering.
-    pub fn watch_repo(git_dir: &Path, worktree_root: Option<&Path>) -> Result<Self, String> {
+    pub fn watch_repo(
+        git_dir: &Path,
+        worktree_root: Option<&Path>,
+        common_dir: Option<&Path>,
+    ) -> Result<Self, String> {
         if !git_dir.exists() {
             return Err(format!(
                 "Git directory does not exist: {}",
@@ -49,6 +55,14 @@ impl RepoFileWatcher {
         watcher
             .watch(git_dir, RecursiveMode::Recursive)
             .map_err(|e| format!("Failed to watch git directory: {}", e))?;
+
+        if let Some(common) = common_dir {
+            if common != git_dir && common.exists() {
+                watcher
+                    .watch(common, RecursiveMode::Recursive)
+                    .map_err(|e| format!("Failed to watch common git directory: {}", e))?;
+            }
+        }
 
         if let Some(root) = worktree_root {
             if !root.exists() {

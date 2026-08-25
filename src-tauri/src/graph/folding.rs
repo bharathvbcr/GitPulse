@@ -23,6 +23,35 @@ impl Default for BranchFoldingEngine {
     }
 }
 
+fn is_in_ancestry(
+    target_id: &str,
+    start_id: &str,
+    commit_map: &HashMap<String, &RawCommitNode>,
+    max_depth: usize,
+) -> bool {
+    if target_id == start_id {
+        return true;
+    }
+    let mut queue = vec![start_id.to_string()];
+    let mut visited = HashSet::new();
+    let mut depth = 0;
+    while let Some(curr) = queue.pop() {
+        if curr == target_id {
+            return true;
+        }
+        if depth >= max_depth || !visited.insert(curr.clone()) {
+            continue;
+        }
+        depth += 1;
+        if let Some(node) = commit_map.get(&curr) {
+            for p in &node.parent_ids {
+                queue.push(p.clone());
+            }
+        }
+    }
+    false
+}
+
 impl BranchFoldingEngine {
     pub fn new() -> Self {
         Self {
@@ -57,7 +86,9 @@ impl BranchFoldingEngine {
 
                     if node.parent_ids.len() == 1 {
                         let next_parent = &node.parent_ids[0];
-                        if next_parent == mainline_parent {
+                        if next_parent == mainline_parent
+                            || is_in_ancestry(next_parent, mainline_parent, &commit_map, 64)
+                        {
                             if !chain.is_empty() {
                                 self.folded_runs.insert(
                                     commit.id.clone(),
@@ -128,5 +159,29 @@ mod tests {
         let run = runs.get("m").unwrap();
         assert_eq!(run.commit_count, 3);
         assert_eq!(run.folded_commit_ids, vec!["feat3", "feat2", "feat1"]);
+    }
+
+    /// The feature branch forked from an ancestor of the merge's first parent,
+    /// not from that parent itself. Folding must walk mainline ancestry rather
+    /// than requiring `next_parent == mainline_parent`.
+    #[test]
+    fn test_fold_when_feature_forked_from_mainline_ancestor() {
+        let mut engine = BranchFoldingEngine::new();
+        let commits = vec![
+            make_node("m", vec!["main2", "feat2"]),
+            make_node("feat2", vec!["feat1"]),
+            make_node("feat1", vec!["main0"]),
+            make_node("main2", vec!["main1"]),
+            make_node("main1", vec!["main0"]),
+            make_node("main0", vec![]),
+        ];
+
+        engine.identify_foldable_runs(&commits);
+        let run = engine
+            .get_foldable_runs()
+            .get("m")
+            .expect("feature run must fold onto the mainline ancestor");
+        assert_eq!(run.folded_commit_ids, vec!["feat2", "feat1"]);
+        assert_eq!(run.branch_root_id, "main0");
     }
 }

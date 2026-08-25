@@ -21,7 +21,7 @@ pub mod discovery;
 pub mod http;
 pub mod prompt;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -132,15 +132,58 @@ impl Feature {
     }
 }
 
+/// Upper bound on tracked calibration sessions. Session ids pair a feature
+/// with a repo path, so a long-lived instance opened over hundreds of
+/// repositories would otherwise grow the map without limit; oldest-inserted
+/// eviction keeps it bounded and deterministic (same pattern as the churn
+/// cache in engine/git_reader.rs).
+const OBSERVED_TOKENS_CAPACITY: usize = 512;
+
 /// Prompt tokens the server reported for the previous request in a session.
 ///
 /// This is what makes the harness's estimator self-correcting: it runs high
 /// against a real tokenizer, and feeding back the server's own count is how it
 /// converges. Keyed by session id, so each feature calibrates on its own shape
-/// of request.
-fn observed_tokens() -> &'static Mutex<HashMap<String, i64>> {
-    static OBSERVED: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-    OBSERVED.get_or_init(|| Mutex::new(HashMap::new()))
+/// of request. Bounded at [`OBSERVED_TOKENS_CAPACITY`] entries; eviction is
+/// oldest-inserted, and re-observing a session refreshes its recency.
+struct ObservedTokens {
+    map: HashMap<String, i64>,
+    order: VecDeque<String>,
+}
+
+impl ObservedTokens {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<i64> {
+        self.map.get(key).copied()
+    }
+
+    fn insert(&mut self, key: String, value: i64) {
+        if self.map.insert(key.clone(), value).is_some() {
+            self.order.retain(|existing| existing != &key);
+        }
+        self.order.push_back(key);
+        while self.order.len() > OBSERVED_TOKENS_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+fn observed_tokens() -> &'static Mutex<ObservedTokens> {
+    static OBSERVED: OnceLock<Mutex<ObservedTokens>> = OnceLock::new();
+    OBSERVED.get_or_init(|| Mutex::new(ObservedTokens::new()))
 }
 
 fn session_id(feature: Feature, repo_path: &str) -> String {
@@ -297,8 +340,8 @@ fn run(
     let session = session_id(feature, repo_path);
     let observed = observed_tokens()
         .lock()
-        .ok()
-        .and_then(|m| m.get(&session).copied())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&session)
         .unwrap_or(0);
 
     let mut budget = BudgetReport::default();
@@ -344,9 +387,10 @@ fn run(
     let completion = complete(&selection, &turn, max_output)?;
 
     if completion.prompt_tokens > 0 {
-        if let Ok(mut map) = observed_tokens().lock() {
-            map.insert(session.clone(), completion.prompt_tokens);
-        }
+        observed_tokens()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session.clone(), completion.prompt_tokens);
     }
 
     // 5. Read the reply. The harness separates thinking from answer and
@@ -688,4 +732,49 @@ pub fn fix_health(
         return Err("The model returned an empty remediation plan.".into());
     }
     Ok(generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The calibration ledger must stay bounded: inserting past the capacity
+    /// evicts oldest-inserted sessions deterministically, re-observing a
+    /// session refreshes its recency, and the map never grows past the cap.
+    #[test]
+    fn observed_tokens_cap_evicts_oldest_inserted() {
+        let mut store = ObservedTokens::new();
+        let key = |i: usize| format!("session-{i}");
+
+        for i in 0..OBSERVED_TOKENS_CAPACITY {
+            store.insert(key(i), i as i64);
+        }
+        assert_eq!(store.len(), OBSERVED_TOKENS_CAPACITY);
+        assert_eq!(store.get(&key(0)), Some(0), "cap boundary not yet crossed");
+
+        // One past the cap: session 0 is evicted, everything else survives.
+        store.insert(key(OBSERVED_TOKENS_CAPACITY), 999);
+        assert_eq!(store.len(), OBSERVED_TOKENS_CAPACITY, "cap is hard");
+        assert_eq!(store.get(&key(0)), None, "oldest-inserted must be evicted");
+        assert_eq!(
+            store.get(&key(OBSERVED_TOKENS_CAPACITY)),
+            Some(999),
+            "newest insert must survive"
+        );
+
+        // Re-observing refreshes recency: bumping session 1 keeps it alive
+        // through the next eviction, which takes session 2 instead.
+        store.insert(key(1), 1111);
+        store.insert("session-extra".to_string(), 42);
+        assert_eq!(
+            store.get(&key(1)),
+            Some(1111),
+            "refreshed entry must survive"
+        );
+        assert_eq!(
+            store.get(&key(2)),
+            None,
+            "un-refreshed oldest must be evicted"
+        );
+    }
 }

@@ -15,6 +15,14 @@ pub struct ConventionalCommit {
 
 pub struct ConventionalCommitParser;
 
+/// Uppercase keys that look like tracker references but are standards or
+/// algorithm names; a `KEY-123` match starting with one of these is prose.
+const NON_ISSUE_KEYS: &[&str] = &[
+    "SHA", "MD", "UTF", "ISO", "CRC", "AES", "RSA", "TLS", "SSL", "IEEE", "RFC", "HTTP", "HTTPS",
+    "ECMA", "ASCII", "UUID", "MIME", "SQL", "LLVM", "GCC", "BASE", "HMAC", "JWT", "CVE", "X509",
+    "PKCS", "SNI", "W3C",
+];
+
 impl Default for ConventionalCommitParser {
     fn default() -> Self {
         Self::new()
@@ -63,7 +71,17 @@ impl ConventionalCommitParser {
 
         let mut issue_references = Vec::new();
         for mat in Self::issue_regex().find_iter(raw_message) {
-            issue_references.push(mat.as_str().to_string());
+            let token = mat.as_str();
+            // A `KEY-123` match whose key is a technical acronym (SHA, UTF,
+            // RFC…) is prose about standards, not a tracker reference.
+            if let Some((key, _)) = token.split_once('-') {
+                if NON_ISSUE_KEYS.contains(&key) {
+                    continue;
+                }
+            }
+            if !issue_references.iter().any(|r| r == token) {
+                issue_references.push(token.to_string());
+            }
         }
 
         let color_badge = match commit_type.as_str() {
@@ -113,5 +131,32 @@ mod tests {
         let parser = ConventionalCommitParser::new();
         let msg = "update readme with new installation instructions";
         assert!(parser.parse(msg).is_none());
+    }
+
+    /// Regression (audit L2): technical tokens in a body (`SHA-256`, `UTF-8`)
+    /// matched the key-number pattern and surfaced as phantom issue
+    /// references; only real tracker keys (#42, JIRA-123) belong there.
+    #[test]
+    fn technical_tokens_are_not_issue_references() {
+        let parser = ConventionalCommitParser::new();
+        let msg = "fix: verify hashes\n\nSHA-256 digests, UTF-8 text, ISO-9001 docs;\ntracks JIRA-123 and #42 (see RFC-9110).";
+        let parsed = parser.parse(msg).unwrap();
+        assert!(parsed.issue_references.contains(&"#42".to_string()));
+        assert!(parsed.issue_references.contains(&"JIRA-123".to_string()));
+        for noise in ["SHA-256", "UTF-8", "ISO-9001", "RFC-9110"] {
+            assert!(
+                !parsed.issue_references.iter().any(|r| r == noise),
+                "{noise} must not be reported as an issue reference"
+            );
+        }
+    }
+
+    /// Repeated references appear once, in first-seen order.
+    #[test]
+    fn duplicate_references_are_deduped_in_order() {
+        let parser = ConventionalCommitParser::new();
+        let msg = "fix: thing\n\nSee #7, then #7 again, then PROJ-2, then #7.";
+        let parsed = parser.parse(msg).unwrap();
+        assert_eq!(parsed.issue_references, vec!["#7", "PROJ-2"]);
     }
 }

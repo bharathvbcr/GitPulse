@@ -41,6 +41,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
 /// Without it, a machine with no `manvi` installed would fork a process per
 /// status poll.
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(30);
+/// How often [`acquire_slot`] re-tests a slot another call is holding.
+/// `std::sync::Mutex` has no timed acquire, so waiting is a bounded spin;
+/// this is the granularity of that spin, not a budget.
+const SLOT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Lines of the child's stderr kept for diagnostics.
 const STDERR_TAIL_LINES: usize = 40;
 /// Grace period between closing the child's stdin (its documented clean
@@ -51,6 +55,16 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// Ours is lower on purpose: a request this large is a defect in our prompt
 /// budgeting, and finding it here is cheaper than finding it as an E_TOO_LARGE.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on a single NDJSON frame read from the sidecar. Mirrors the
+/// request budget: a legitimate reply never approaches this, so a longer
+/// stream means the child is wedged or hostile and its frame is dropped.
+const MAX_SIDECAR_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on *everything* the sidecar may stream back during one
+/// request cycle — answers, noise and foreign ids alike. A healthy reply is
+/// one bounded frame; more than a handful of frames means the child is
+/// flooding, and the cycle faults instead of reading forever within its
+/// timeout window.
+const MAX_RESPONSE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// Why the harness is not answering, in terms a user can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +117,10 @@ impl std::fmt::Display for HarnessError {
 
 /// A running sidecar and the handshake it answered with.
 struct Sidecar {
-    child: Child,
+    /// Shared with the two pipe-reader threads so an oversized or failed read
+    /// can kill the child *immediately* instead of waiting for the next call
+    /// to notice the disconnected channel.
+    child: std::sync::Arc<Mutex<Child>>,
     /// `None` once stdin has been closed for shutdown. An `Option` is what
     /// lets [`Drop`] hand the pipe back to the OS without moving out of
     /// `&mut self`.
@@ -117,8 +134,25 @@ struct Sidecar {
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        shutdown_child(&mut self.child, self.stdin.take(), SHUTDOWN_GRACE);
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shutdown_child(&mut child, self.stdin.take(), SHUTDOWN_GRACE);
     }
+}
+
+/// Kills the child from a pipe-reader thread. A wedged or hostile child must
+/// not stay alive merely because nobody happens to be mid-call when its
+/// overflow is detected; the faulting reader reaps it here, and the
+/// disconnected channel turns the next (or in-flight) call into a transport
+/// fault that sets the respawn backoff.
+fn force_kill(child: &Mutex<Child>) {
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Clean-shutdown escalation ladder, factored out of [`Drop for Sidecar`]
@@ -183,6 +217,7 @@ impl Sidecar {
             .map_err(|e| HarnessError::Unavailable(format!("sidecar stdin closed: {}", e)))?;
 
         let deadline = Instant::now() + timeout;
+        let mut response_bytes = 0usize;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -194,32 +229,50 @@ impl Sidecar {
                 )));
             }
             match self.lines.recv_timeout(remaining) {
-                Ok(raw) => match classify_line(&raw, &id) {
-                    LineOutcome::Ignore => {
-                        // Noise, a log line, or another call's answer: none of
-                        // these fault a healthy sidecar, so keep waiting
-                        // within the same deadline.
-                        continue;
+                Ok(raw) => {
+                    // Every line the child emits during this cycle counts,
+                    // including ignored noise: a flood of unattributable
+                    // lines is just as much a wedged child as one oversized
+                    // frame. Protocol faults drop the sidecar and set the
+                    // respawn backoff, same as the other transport faults.
+                    response_bytes += raw.len() + 1;
+                    if response_bytes > MAX_RESPONSE_TOTAL_BYTES {
+                        return Err(HarnessError::Protocol(format!(
+                            "{} streamed {} bytes past this client's {} byte \
+                             response budget{}",
+                            op,
+                            response_bytes,
+                            MAX_RESPONSE_TOTAL_BYTES,
+                            self.stderr_hint()
+                        )));
                     }
-                    LineOutcome::Answer(response) => {
-                        if !response.ok {
-                            return Err(HarnessError::Refused(response.error.unwrap_or(
-                                WireError {
-                                    code: "E_INTERNAL".into(),
-                                    message: format!("{} failed without an error body", op),
-                                    retryable: false,
-                                },
-                            )));
+                    match classify_line(&raw, &id) {
+                        LineOutcome::Ignore => {
+                            // Noise, a log line, or another call's answer: none of
+                            // these fault a healthy sidecar, so keep waiting
+                            // within the same deadline.
+                            continue;
                         }
-                        return Ok(response.result.unwrap_or(Value::Null));
+                        LineOutcome::Answer(response) => {
+                            if !response.ok {
+                                return Err(HarnessError::Refused(response.error.unwrap_or(
+                                    WireError {
+                                        code: "E_INTERNAL".into(),
+                                        message: format!("{} failed without an error body", op),
+                                        retryable: false,
+                                    },
+                                )));
+                            }
+                            return Ok(response.result.unwrap_or(Value::Null));
+                        }
+                        LineOutcome::Fault(message) => {
+                            // Addressed to this very call yet undecodable: the
+                            // protocol itself is broken and retrying the read
+                            // cannot help.
+                            return Err(HarnessError::Protocol(message));
+                        }
                     }
-                    LineOutcome::Fault(message) => {
-                        // Addressed to this very call yet undecodable: the
-                        // protocol itself is broken and retrying the read
-                        // cannot help.
-                        return Err(HarnessError::Protocol(message));
-                    }
-                },
+                }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(HarnessError::Unavailable(format!(
@@ -303,12 +356,66 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect::<String>() + "…"
 }
 
-/// Where the sidecar is allowed to keep its state: never inside the user's
-/// repository.
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("gitpulse-harness");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+
+/// Prepares an isolated, transient state directory for `manvi serve`.
+///
+/// MANVI creates SQLite and runtime state on disk. A user's home directory
+/// is not ours to touch and is visible to any other process running as the
+/// local user; this per-boot directory is process-unique, private
+/// (`0o700` on Unix), and refuses to traverse a symlink at its own path.
+/// Old directories are deliberately not cleaned up: best-effort deletion of
+/// unknown-provenance paths is riskier than the few kilobytes they hold.
+fn scratch_dir() -> Result<PathBuf, HarnessError> {
+    let unique = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut hasher);
+        format!("{}-{:016x}", std::process::id(), hasher.finish())
+    };
+    create_scratch_under(&std::env::temp_dir(), &unique)
+        .map_err(|e| HarnessError::Unavailable(format!("could not prepare harness state dir: {e}")))
+}
+
+/// Creates `<root>/gitpulse-harness-<unique>` fail-closed: refuses an
+/// existing symlink at the target path, creates the directory privately on
+/// Unix, and never follows someone else's pre-planted entry. Factored with
+/// the root as a parameter so the refusal and privacy behavior are testable
+/// without touching the real temp directory.
+fn create_scratch_under(root: &std::path::Path, unique: &str) -> Result<PathBuf, String> {
+    let dir = root.join(format!("gitpulse-harness-{unique}"));
+
+    // symlink_metadata never follows the final component, so a symlink
+    // planted at `dir` is detected even though it may point somewhere
+    // innocuous. Any other pre-existing entry also fails closed below via
+    // create_dir's AlreadyExists error.
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing {}: a symlink is planted at the harness state path",
+                dir.display()
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(&dir)
+            .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
+    }
+    Ok(dir)
 }
 
 /// Resolves the `manvi` binary: explicit override, then `PATH`, then the
@@ -321,21 +428,85 @@ pub fn resolve_binary() -> Option<String> {
         }
         return None;
     }
+    let bin_name = if cfg!(windows) { "manvi.exe" } else { "manvi" };
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("manvi");
+            let candidate = dir.join(bin_name);
             if candidate.is_file() {
                 return Some(candidate.to_string_lossy().into_owned());
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".local/bin/manvi");
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let candidate = PathBuf::from(home).join(".local/bin").join(bin_name);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// Reads one newline-terminated frame without ever buffering more than
+/// `max` bytes: the buffer is fed chunk-by-chunk from `fill_buf`, so a
+/// sidecar streaming gigabytes without a newline cannot balloon memory.
+/// Semantics:
+/// - `Ok(Some(line))` — a complete in-budget line (trailing newline stripped)
+/// - `Ok(None)` — end of stream
+/// - `Err` — a frame beyond `max` was seen, or the stream errored. An
+///   oversized frame is a protocol fault, not a quiet EOF: the caller kills
+///   the child and sets the respawn backoff rather than treating a hostile
+///   stream as a clean exit. The remainder is drained only up to its newline.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    let mut overflowed = false;
+    let mut saw_data = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        saw_data = true;
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let chunk = &available[..=pos];
+                if !overflowed && out.len() + chunk.len() <= max {
+                    out.extend_from_slice(chunk);
+                } else {
+                    overflowed = true;
+                }
+                reader.consume(pos + 1);
+                break;
+            }
+            None => {
+                if !overflowed && out.len() + available.len() > max {
+                    overflowed = true;
+                    out.clear();
+                } else if !overflowed {
+                    out.extend_from_slice(available);
+                }
+                let len = available.len();
+                reader.consume(len);
+            }
+        }
+    }
+    if !saw_data && out.is_empty() {
+        return Ok(None);
+    }
+    if overflowed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sidecar frame exceeds the {max} byte cap"),
+        ));
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    while out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    String::from_utf8(out)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "sidecar sent non-UTF8"))
 }
 
 fn spawn() -> Result<Sidecar, HarnessError> {
@@ -345,7 +516,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         )
     })?;
 
-    let dir = scratch_dir();
+    let dir = scratch_dir()?;
     let mut child = Command::new(&binary)
         .args(["serve", "--posture", "host"])
         .current_dir(&dir)
@@ -376,27 +547,55 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         .take()
         .ok_or_else(|| HarnessError::Unavailable("sidecar has no stderr".into()))?;
 
+    let child = std::sync::Arc::new(Mutex::new(child));
+    let child_for_stdout = child.clone();
+
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if tx.send(line).is_err() {
-                return;
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    force_kill(&child_for_stdout);
+                    return;
+                }
             }
         }
     });
 
     let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let tail_writer = tail.clone();
+    let child_for_stderr = child.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if let Ok(mut buf) = tail_writer.lock() {
-                if buf.len() == STDERR_TAIL_LINES {
-                    buf.pop_front();
+        // Bounded exactly like stdout: stderr is untrusted bytes from the
+        // same child, and `.lines()` would buffer an unlimited newline-less
+        // flood just to keep a diagnostic tail. A frame past the cap faults
+        // the child instead of feeding it.
+        let mut reader = BufReader::new(stderr);
+        loop {
+            match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
+                Ok(Some(line)) => {
+                    if let Ok(mut buf) = tail_writer.lock() {
+                        if buf.len() == STDERR_TAIL_LINES {
+                            buf.pop_front();
+                        }
+                        buf.push_back(line);
+                    }
                 }
-                buf.push_back(line);
+                Ok(None) => return,
+                Err(_) => {
+                    force_kill(&child_for_stderr);
+                    return;
+                }
             }
         }
     });
@@ -475,32 +674,52 @@ impl Slot {
     }
 }
 
+/// Waits for the process-wide slot until `deadline`, or gives up.
+///
+/// `std::sync::Mutex` offers no timed acquire, so this is a bounded spin
+/// rather than a park. A poisoned slot is *recovered* rather than propagated —
+/// the guard protects only this process's bookkeeping, and the data it guards
+/// stays valid enough to retry from (a wedged child is dropped on its next
+/// fault).
+///
+/// `None` means the slot was held for the entire budget. That is a real fault
+/// worth reporting; merely being second in line is not.
+fn acquire_slot(deadline: Instant) -> Option<std::sync::MutexGuard<'static, Slot>> {
+    use std::sync::TryLockError;
+    loop {
+        match slot().try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                thread::sleep(remaining.min(SLOT_POLL_INTERVAL));
+            }
+        }
+    }
+}
+
 /// Issues one operation, starting the sidecar if it is not running.
 ///
 /// A transport fault drops the child so the next call starts a fresh one; a
 /// refusal by the harness leaves it running, because the harness is fine and
 /// the request was not.
 ///
-/// The slot lock is deliberately held across the whole round trip (serial
-/// dispatch is what makes a stray line attributable), so acquisition uses
-/// `try_lock`: a second caller while one gated action is in flight fails fast
-/// with [`HarnessError::Busy`] instead of silently queueing behind up to 15s
-/// per in-flight request. A poisoned slot is *recovered* rather than
-/// propagated — the guard protects only this process's bookkeeping, and the
-/// data it guards stays valid enough to retry from (a wedged child is dropped
-/// on its next fault).
+/// The slot lock is held across the whole round trip (serial dispatch is
+/// what makes a stray line attributable). Acquisition retries until `timeout`
+/// then fails with [`HarnessError::Busy`] so overlapping agent actions wait
+/// out a short in-flight call instead of failing on the first `try_lock`,
+/// without queueing behind a wedged request when the caller used a shorter
+/// budget.
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
-    use std::sync::TryLockError;
-    let mut guard = match slot().try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock) => {
-            return Err(HarnessError::Busy(format!(
-                "another gated action is already in progress; '{op}' was not sent. \
-                 Retry once the current commit/push/pull settles."
-            )));
-        }
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-    };
+    let mut guard = acquire_slot(Instant::now() + timeout).ok_or_else(|| {
+        HarnessError::Busy(format!(
+            "another gated action held the harness for the whole {timeout:?} budget; \
+             '{op}' was not sent. Retry once the current commit/push/pull settles."
+        ))
+    })?;
     let sidecar = guard.ensure()?;
     match sidecar.call(op, params, timeout) {
         Ok(v) => Ok(v),
@@ -534,9 +753,13 @@ pub fn call_typed<T: serde::de::DeserializeOwned>(
 /// What the sidecar answered at handshake, without provoking a spawn beyond
 /// the first.
 pub fn handshake() -> Result<(String, HelloResult), HarnessError> {
-    let mut guard = slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Same reasoning as `call`: a single `try_lock` turned a harness that is
+    // merely busy into `HarnessStatus { available: false }`, which reads as
+    // "no harness installed" everywhere it is consumed — including the guard
+    // that decides whether the gate tests run at all.
+    let mut guard = acquire_slot(Instant::now() + Duration::from_millis(500)).ok_or_else(|| {
+        HarnessError::Busy("harness is busy with an in-flight operation".to_string())
+    })?;
     let sidecar = guard.ensure()?;
     Ok((sidecar.binary.clone(), sidecar.hello.clone()))
 }
@@ -560,6 +783,44 @@ pub fn reset() {
 /// serves it.
 pub fn serves(hello: &HelloResult, op: &str) -> bool {
     hello.ops.iter().any(|o| o == op)
+}
+
+/// Kills any live sidecar child, for application exit.
+///
+/// The slot lives in a static, and statics never drop — without this, a live
+/// `manvi serve` would be orphaned when the UI process quits. Dropping the
+/// slot's sidecar runs the full clean-shutdown escalation ladder (stdin EOF,
+/// grace wait, kill). Idempotent by construction (second call sees `None`)
+/// and safe to fire on both `RunEvent::ExitRequested` and `RunEvent::Exit`,
+/// whichever the platform delivers: a later harness call simply respawns.
+///
+/// Lock safety: the slot lock is held across a whole round trip by an
+/// in-flight call, so this retries `try_lock` for ~1.2s and then gives up
+/// rather than stalling quit behind a 15s wedged request. Giving up is
+/// best-effort by design: once the process exits, the child's stdin closes
+/// and its documented EOF shutdown applies.
+pub(crate) fn shutdown() {
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    loop {
+        match slot().try_lock() {
+            Ok(mut guard) => {
+                guard.sidecar = None;
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().sidecar = None;
+                return;
+            }
+            // Another caller is mid-round-trip; wait briefly, then let exit
+            // proceed. A bounded give-up is deliberate here.
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -627,25 +888,71 @@ mod tests {
         );
     }
 
-    /// Regression (slot-lock hardening): while one gated action holds the
-    /// slot, a second caller must fail fast with a distinct Busy error naming
-    /// the situation — not queue behind the in-flight 15s round trip. The old
-    /// body used a blocking `lock()`, so this call only ever returned after
-    /// the holder released.
+    /// Regression (slot-lock hardening, corrected): while one gated action
+    /// holds the slot, a second caller must neither queue forever nor give up
+    /// instantly. It waits out its own timeout, then reports `Busy`.
+    ///
+    /// This test previously asserted a *single* `try_lock` — fail fast,
+    /// always. That expectation was wrong, and wrong in the dangerous
+    /// direction. The slot is held across a whole round trip, so two
+    /// overlapping gated actions — the ordinary case, since the UI polls
+    /// harness status while a commit or push is being judged — produced a
+    /// `Busy`, and `check_command` renders any error as an *unchecked*
+    /// verdict, which does not block. `git push --force` went through the gate
+    /// that exists to refuse it, recorded only as "unguarded". Fast-fail
+    /// bought UI latency that no caller wanted: every one of them already runs
+    /// off the UI thread.
+    ///
+    /// Both halves live in one test because they share the process-wide slot;
+    /// as separate `#[test]`s cargo's threads would race them against
+    /// each other.
     #[test]
-    fn second_caller_while_slot_is_held_fails_fast_with_busy() {
+    fn a_waiter_sits_out_the_holder_but_still_gives_up_bounded() {
+        // Held for the caller's whole budget: `Busy` is honest, but only
+        // after the wait. Going through `super::call` keeps the real seam —
+        // the one that renders an unchecked verdict — under test.
         let holder = slot().lock().expect("acquire slot to simulate a call");
         let started = Instant::now();
-        let err =
-            super::call("policy.check", None, Duration::from_millis(50)).expect_err("slot is held");
+        let err = super::call("policy.check", None, Duration::from_millis(200))
+            .expect_err("slot is held for the whole budget");
+        let waited = started.elapsed();
         drop(holder);
-        assert!(matches!(err, HarnessError::Busy(ref m) if m.contains("in progress")));
         assert_eq!(err.code(), "busy");
+        assert!(matches!(err, HarnessError::Busy(ref m) if m.contains("was not sent")));
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "fast-fail took {:?}; the caller queued instead",
-            started.elapsed()
+            waited >= Duration::from_millis(150),
+            "gave up after {waited:?} without waiting out its 200ms budget"
         );
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?}; the caller queued instead of giving up"
+        );
+
+        // Released within the budget: the waiter gets the slot. This is the
+        // case that used to fault instantly and un-gate the action.
+        let held_for = Duration::from_millis(300);
+        let (tx, rx) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let _guard = slot()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tx.send(()).expect("signal that the slot is held");
+            thread::sleep(held_for);
+        });
+        rx.recv().expect("holder took the slot");
+
+        let started = Instant::now();
+        let acquired = acquire_slot(Instant::now() + Duration::from_secs(5));
+        assert!(
+            acquired.is_some(),
+            "a waiter within its budget must get the slot, not a Busy fault"
+        );
+        drop(acquired);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the waiter should wake as soon as the holder releases"
+        );
+        holder.join().expect("holder thread");
     }
 
     /// A child that honors stdin EOF exits on its own inside the grace
@@ -697,5 +1004,178 @@ mod tests {
             "shutdown exceeded grace materially: {elapsed:?}"
         );
         assert!(!status.success(), "a SIGKILLed sleep cannot report success");
+    }
+}
+
+#[cfg(test)]
+mod bounded_reader_tests {
+    use super::read_bounded_line;
+    use std::io::{Cursor, Read, Result};
+
+    /// Wraps a cursor to yield one byte per fill_buf so chunk-boundary
+    /// handling is exercised on every possible split point.
+    struct OneByteAtATime<'a>(&'a [u8]);
+    impl<'a> Read for OneByteAtATime<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if self.0.is_empty() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.0[0];
+            self.0 = &self.0[1..];
+            Ok(1)
+        }
+    }
+    impl<'a> std::io::BufRead for OneByteAtATime<'a> {
+        fn fill_buf(&mut self) -> Result<&[u8]> {
+            if self.0.is_empty() {
+                Ok(&[])
+            } else {
+                Ok(&self.0[..1])
+            }
+        }
+        fn consume(&mut self, n: usize) {
+            self.0 = &self.0[n.min(self.0.len())..];
+        }
+    }
+
+    fn lines_of(data: &[u8], max: usize) -> Vec<String> {
+        let mut cur = Cursor::new(data.to_vec());
+        let mut out = Vec::new();
+        while let Ok(Some(l)) = read_bounded_line(&mut cur, max) {
+            out.push(l);
+        }
+        out
+    }
+
+    #[test]
+    fn reads_simple_framed_lines() {
+        assert_eq!(lines_of(b"a\nbb\nccc\n", 64), vec!["a", "bb", "ccc"]);
+    }
+
+    #[test]
+    fn handles_missing_final_newline_and_blank_lines() {
+        assert_eq!(lines_of(b"x\n\ny", 64), vec!["x", "", "y"]);
+        assert_eq!(lines_of(b"", 64), Vec::<String>::new());
+    }
+
+    fn first_error(data: &[u8], max: usize) -> std::io::Error {
+        let mut cur = Cursor::new(data.to_vec());
+        loop {
+            match read_bounded_line(&mut cur, max) {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected a fault before end of stream"),
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// Regression (audit F6): an oversized frame used to be swallowed as a
+    /// quiet EOF, indistinguishable from a clean child exit. It must be an
+    /// explicit fault naming the cap — and the 10 MiB flood must never be
+    /// buffered whole against a 1 KiB cap.
+    #[test]
+    fn oversized_frame_is_a_fault_that_names_the_cap() {
+        let mut flood = vec![b'x'; 10 * 1024 * 1024];
+        flood.push(b'\n');
+        let err = first_error(&flood, 1024);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("cap") && msg.contains("1024"), "got: {msg}");
+    }
+
+    #[test]
+    fn frames_at_exact_cap_pass_one_over_fails() {
+        let exact = format!("{}\n", "e".repeat(16));
+        assert_eq!(lines_of(exact.as_bytes(), 17), vec!["e".repeat(16)]);
+        let over = format!("{}\n", "o".repeat(17));
+        let err = first_error(over.as_bytes(), 17);
+        assert!(err.to_string().contains("cap"), "got: {err}");
+    }
+
+    #[test]
+    fn byte_split_boundaries_match_cursor_results() {
+        let data: Vec<u8> = b"alpha\nbe\ta\nlonger line here\ntail".to_vec();
+        let fast = lines_of(&data, 1024);
+        let slow = {
+            let mut r = OneByteAtATime(&data);
+            let mut out = Vec::new();
+            while let Ok(Some(l)) = read_bounded_line(&mut r, 1024) {
+                out.push(l);
+            }
+            out
+        };
+        assert_eq!(fast, slow);
+    }
+}
+
+#[cfg(test)]
+mod scratch_dir_tests {
+    use super::create_scratch_under;
+    use std::path::PathBuf;
+
+    /// An isolated root so tests never race the real temp dir or each other.
+    fn root(tag: &str) -> PathBuf {
+        let r = std::env::temp_dir().join(format!(
+            "gitpulse-scratch-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(&r).expect("test root");
+        r
+    }
+
+    #[test]
+    fn creates_distinct_dirs_with_private_mode() {
+        let root = root("unique");
+        let a = create_scratch_under(&root, "alpha").expect("first");
+        let b = create_scratch_under(&root, "beta").expect("second");
+        assert_ne!(a, b, "per-boot names must not collide");
+        assert!(a.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a)
+                .expect("scratch dir exists")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "scratch dir must be 0700, got {mode:o}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_pre_planted_symlink_at_the_target_path() {
+        let root = root("symlink");
+        let planted = root.join("gitpulse-harness-planted");
+        std::os::unix::fs::symlink("/etc", &planted).expect("plant symlink");
+        let err = create_scratch_under(&root, "planted").expect_err("symlink must be refused");
+        assert!(
+            err.contains("refusing") && err.contains("symlink"),
+            "refusal must be explicit, got: {err}"
+        );
+        // Fail closed also means fail clean: the planted entry is untouched.
+        assert!(std::fs::symlink_metadata(&planted)
+            .expect("entry survives")
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_file(&planted);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fails_closed_when_target_already_exists() {
+        let root = root("exists");
+        create_scratch_under(&root, "dup").expect("first creation");
+        assert!(
+            create_scratch_under(&root, "dup").is_err(),
+            "an existing entry must never be adopted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

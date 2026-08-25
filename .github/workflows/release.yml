@@ -5,10 +5,53 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  preflight:
+    name: Pre-flight Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Frontend Dependencies
+        run: npm ci
+
+      - name: Frontend Svelte Check
+        run: npm run check
+
+      - name: Rust Cargo Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
   release:
     permissions:
       contents: write
+    needs: [preflight]
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +64,7 @@ jobs:
             args: ''
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

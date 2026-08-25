@@ -80,20 +80,22 @@ fn stress_list_and_stats_over_120_divergent_branches() {
         assert!(!b.last_summary.is_empty(), "summary feat-{i:03}");
     }
 
-    // Stats pass 1: cap engaged, every eligible branch accounted for. Branches
-    // sharing a tip oid may be computed concurrently on the cold pass, so the
-    // computed/cached split is not deterministic — the total is.
+    // Unique tips here are well under the 96 compute budget (every 3rd branch
+    // diverges; the rest share main's tip), so one call covers every eligible
+    // branch. Duplicate tips are one compute fanned out to every name.
     let first = GitReader::branch_stats(path).expect("branch_stats");
-    assert!(first.capped, ">96 eligible branches must trip the cap");
+    assert!(!first.capped, "41 unique tips must fit the compute budget");
     assert_eq!(first.compared_to, "main");
-    assert_eq!(first.updates.len(), 96);
+    assert_eq!(first.updates.len(), 120);
     assert_eq!(
         first.computed + first.cached,
-        96,
+        120,
         "computed {} + cached {} must cover every update",
         first.computed,
         first.cached
     );
+    assert_eq!(first.computed, 120);
+    assert_eq!(first.cached, 0);
 
     // Divergent branches carry real churn; pointer-only ones stay zero.
     let divergent = first
@@ -121,11 +123,143 @@ fn stress_list_and_stats_over_120_divergent_branches() {
     // Stats pass 2: fully served from the oid-keyed cache, identical payload.
     let second = GitReader::branch_stats(path).expect("branch_stats 2");
     assert_eq!(second.computed, 0);
-    assert_eq!(second.cached, 96);
+    assert_eq!(second.cached, 120);
     assert_eq!(
         serde_json::to_string(&first.updates).unwrap(),
         serde_json::to_string(&second.updates).unwrap()
     );
+}
+
+fn rev_parse(dir: &Path, rev: &str) -> String {
+    let out = StdCommand::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(dir)
+        .output()
+        .expect("rev-parse");
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn create_refs(dir: &Path, specs: impl IntoIterator<Item = (String, String)>) {
+    use std::io::Write;
+    let mut child = StdCommand::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn update-ref");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        for (name, oid) in specs {
+            writeln!(stdin, "create refs/heads/{name} {oid}").unwrap();
+        }
+    }
+    let out = child.wait_with_output().expect("wait update-ref");
+    assert!(
+        out.status.success(),
+        "update-ref failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// 500 branches sharing 8 unique tips: one stats call, exact cache-hit ratio
+/// on the repeat, no extra git walks for duplicates.
+#[test]
+fn stress_500_branches_duplicate_tips_exact_cache_ratio() {
+    let repo = init_repo();
+    let path = repo.path().to_str().unwrap();
+    commit_file(repo.path(), "base.txt", "base\n", "base");
+
+    let mut oids = Vec::new();
+    for i in 0..8 {
+        let name = format!("seed-{i}");
+        run_git(repo.path(), &["checkout", "-q", "-b", &name]);
+        let body = format!("{}\n", "x\n".repeat(i + 1));
+        commit_file(
+            repo.path(),
+            &format!("f-{i}.txt"),
+            &body,
+            &format!("seed {i}"),
+        );
+        oids.push(rev_parse(repo.path(), "HEAD"));
+        run_git(repo.path(), &["checkout", "-q", "main"]);
+    }
+
+    create_refs(
+        repo.path(),
+        (0..492).map(|i| (format!("dup-{i:03}"), oids[i % 8].clone())),
+    );
+
+    let listed = GitReader::list_branches(path).expect("list");
+    assert_eq!(listed.len(), 1 + 8 + 492);
+
+    let first = GitReader::branch_stats(path).expect("stats 1");
+    assert!(!first.capped, "8 unique tips must not trip the compute cap");
+    assert_eq!(first.updates.len(), 500);
+    assert_eq!(first.computed, 500);
+    assert_eq!(first.cached, 0);
+    let seed0 = first
+        .updates
+        .iter()
+        .find(|u| u.name == "seed-0")
+        .expect("seed-0");
+    assert!(seed0.additions > 0);
+    let matching: Vec<_> = first
+        .updates
+        .iter()
+        .filter(|u| u.tip_commit_id == seed0.tip_commit_id)
+        .collect();
+    assert!(matching.len() > 50);
+    assert!(matching.iter().all(|u| u.additions == seed0.additions));
+
+    let second = GitReader::branch_stats(path).expect("stats 2");
+    assert_eq!(second.computed, 0);
+    assert_eq!(second.cached, 500);
+    assert!(!second.capped);
+    assert_eq!(
+        serde_json::to_string(&first.updates).unwrap(),
+        serde_json::to_string(&second.updates).unwrap()
+    );
+}
+
+/// More unique tips than the compute budget: first call caps, second drains
+/// the remainder while returning already-cached tips alongside.
+#[test]
+fn unique_tips_above_budget_cap_then_drain() {
+    let repo = init_repo();
+    let path = repo.path().to_str().unwrap();
+    commit_file(repo.path(), "base.txt", "base\n", "base");
+    let base_oid = rev_parse(repo.path(), "HEAD");
+
+    let mut specs = Vec::new();
+    for i in 0..110 {
+        run_git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", &format!("c-{i}")],
+        );
+        specs.push((format!("uniq-{i:03}"), rev_parse(repo.path(), "HEAD")));
+    }
+    run_git(repo.path(), &["reset", "-q", "--hard", &base_oid]);
+    create_refs(repo.path(), specs);
+
+    let first = GitReader::branch_stats(path).expect("stats 1");
+    assert!(first.capped);
+    assert_eq!(first.updates.len(), 96);
+    assert_eq!(first.computed, 96);
+    assert_eq!(first.cached, 0);
+
+    let second = GitReader::branch_stats(path).expect("stats 2");
+    assert!(!second.capped);
+    assert_eq!(second.updates.len(), 110);
+    assert_eq!(second.cached, 96);
+    assert_eq!(second.computed, 14);
+
+    let third = GitReader::branch_stats(path).expect("stats 3");
+    assert_eq!(third.computed, 0);
+    assert_eq!(third.cached, 110);
+    assert!(!third.capped);
 }
 
 /// Unicode and slash-heavy ref names survive both commands intact.

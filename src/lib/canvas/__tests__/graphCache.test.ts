@@ -224,10 +224,10 @@ describe("strip tiling and slicing", () => {
     });
 
     expect(target.blits).toEqual([
-      // strip 0 clipped to its lower part: source y 12..20 -> dest y 12
-      { src: [0, 12, 220, 8], dst: [0, 12, 220, 8] },
-      // strip 1 clipped to its upper part: source y 0..7 -> dest y 20
-      { src: [0, 0, 220, 7], dst: [0, 20, 220, 7] },
+      // strip 0 clipped to its lower part: source y 12..20 -> dest y 0 (viewport)
+      { src: [0, 12, 220, 8], dst: [0, 0, 220, 8] },
+      // strip 1 clipped to its upper part: source y 0..7 -> dest y 8
+      { src: [0, 0, 220, 7], dst: [0, 8, 220, 7] },
     ]);
   });
 
@@ -239,8 +239,8 @@ describe("strip tiling and slicing", () => {
     cache.paint(target.ctx, paintReq(12, 15));
 
     expect(target.blits).toEqual([
-      { src: [0, 24, 440, 16], dst: [0, 12, 220, 8] },
-      { src: [0, 0, 440, 14], dst: [0, 20, 220, 7] },
+      { src: [0, 24, 440, 16], dst: [0, 0, 220, 8] },
+      { src: [0, 0, 440, 14], dst: [0, 8, 220, 7] },
     ]);
     expect(surfaces[0].canvas.height).toBe(40); // round(20 * 2)
   });
@@ -267,8 +267,8 @@ describe("strip tiling and slicing", () => {
     cache.paint(target.ctx, paintReq(40, 30)); // view extends past content end
 
     expect(target.blits).toEqual([
-      // only rows 4 live here: content 40..50, not the requested 70
-      { src: [0, 0, 440, 20], dst: [0, 40, 220, 10] },
+      // only rows 4 live here: content 40..50 placed at viewport y 0
+      { src: [0, 0, 440, 20], dst: [0, 0, 220, 10] },
     ]);
   });
 
@@ -286,6 +286,23 @@ describe("strip tiling and slicing", () => {
       stripTopCss: 40,
       viewportCssHeight: 10,
     });
+  });
+
+  it("places destination Y in viewport space so a scrolled graph does not vanish", () => {
+    const { cache } = makeCache();
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 30 });
+    const target = recordingTarget();
+
+    // 180px of scroll: the first visible pixel of content must land at dest y 0,
+    // not at dest y 180 (which would paint the tiles below the canvas).
+    cache.paint(target.ctx, paintReq(180, 40));
+
+    expect(target.blits.length).toBeGreaterThan(0);
+    expect(target.blits[0].dst[1]).toBe(0);
+    for (const blit of target.blits) {
+      expect(blit.dst[1]).toBeGreaterThanOrEqual(0);
+      expect(blit.dst[1] + blit.dst[3]).toBeLessThanOrEqual(40);
+    }
   });
 });
 

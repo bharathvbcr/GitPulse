@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitFilter {
     pub author: Option<String>,
+    /// `path:` query token. Deliberately NOT consulted by
+    /// [`CommitFilter::matches_commit`]: its only caller
+    /// (`cmd_get_commit_graph`) narrows rows server-side via
+    /// `GitReader::commits_touching_path` before running the filter, so the
+    /// rows reaching here are already path-filtered and a per-commit path
+    /// check would be redundant.
     pub path: Option<String>,
     pub sha: Option<String>,
     pub commit_type: Option<String>,
@@ -88,6 +94,8 @@ impl CommitFilter {
             let header = commit.summary.to_lowercase();
             if !header.starts_with(&format!("{}:", kind))
                 && !header.starts_with(&format!("{}(", kind))
+                && !header.starts_with(&format!("{}!:", kind))
+                && !header.starts_with(&format!("{}!(", kind))
             {
                 return false;
             }
@@ -100,8 +108,10 @@ impl CommitFilter {
                 commit.author_email.to_lowercase(),
                 commit.id.to_lowercase()
             );
-            if !hay.contains(&self.text) {
-                return false;
+            for word in self.text.split_whitespace() {
+                if !hay.contains(word) {
+                    return false;
+                }
             }
         }
         true
@@ -136,7 +146,16 @@ mod tests {
     fn test_matches_author_and_type() {
         let filter = CommitFilter::parse("author:alice feat:");
         assert!(filter.matches_commit(&commit("feat: add login", "Alice", "aaa111")));
+        assert!(filter.matches_commit(&commit("feat!: breaking api change", "Alice", "aaa112")));
+        assert!(filter.matches_commit(&commit("feat(auth)!: breaking login", "Alice", "aaa113")));
         assert!(!filter.matches_commit(&commit("fix: typo", "Alice", "aaa111")));
         assert!(!filter.matches_commit(&commit("feat: add login", "Bob", "aaa111")));
+    }
+
+    #[test]
+    fn test_matches_multiword_free_text() {
+        let filter = CommitFilter::parse("alice oauth");
+        assert!(filter.matches_commit(&commit("feat: oauth flow", "Alice", "aaa111")));
+        assert!(!filter.matches_commit(&commit("feat: oauth flow", "Bob", "aaa111")));
     }
 }

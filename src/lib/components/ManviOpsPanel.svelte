@@ -14,30 +14,23 @@
     Rocket,
     ScanSearch,
     ShieldCheck,
+    Tag,
     Trash2,
   } from "lucide-svelte";
   import { repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
   import {
+    formatReleaseDate,
     releaseTagSuggestion,
     summarizeCommitReview,
     type BranchCleanupPlan,
     type CommitReviewReport,
     type IssueInfo,
+    type ReleaseInfo,
   } from "../ops/model";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
-
-  interface WorkflowRunInfo {
-    id: number;
-    name: string;
-    title: string;
-    status: string;
-    conclusion: string;
-    head_branch: string;
-    url: string;
-    created_at: string;
-  }
+  import type { WorkflowRunInfo } from "../github/types";
 
   interface OpsGitHubContext {
     available: boolean;
@@ -46,6 +39,9 @@
     issues: IssueInfo[];
     issues_truncated: boolean;
     issues_error?: string | null;
+    releases: ReleaseInfo[];
+    releases_truncated: boolean;
+    releases_error?: string | null;
     workflow_runs: WorkflowRunInfo[];
     error?: string | null;
   }
@@ -184,11 +180,14 @@
   async function sync(kind: "pull" | "push") {
     busy = kind;
     notice = null;
-    const outcome = kind === "pull" ? await repoStore.pull() : await repoStore.push();
-    busy = null;
-    notice = outcome.ok
-      ? `${kind === "pull" ? "Pull" : "Push"} completed${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`
-      : outcome.error ?? `${kind} failed`;
+    try {
+      const outcome = kind === "pull" ? await repoStore.pull() : await repoStore.push();
+      notice = outcome.ok
+        ? `${kind === "pull" ? "Pull" : "Push"} completed${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`
+        : outcome.error ?? `${kind} failed`;
+    } finally {
+      busy = null;
+    }
   }
 
   async function reportIssue() {
@@ -196,36 +195,42 @@
     if (!title) return;
     busy = "report";
     notice = null;
-    const labels = issueLabels.split(",").map((label) => label.trim()).filter(Boolean);
-    const outcome = await repoStore.reportIssue(title, issueBody, labels);
-    busy = null;
-    if (!outcome.ok) {
-      notice = outcome.error ?? "Issue report failed.";
-      return;
+    try {
+      const labels = issueLabels.split(",").map((label) => label.trim()).filter(Boolean);
+      const outcome = await repoStore.reportIssue(title, issueBody, labels);
+      if (!outcome.ok) {
+        notice = outcome.error ?? "Issue report failed.";
+        return;
+      }
+      notice = `Issue reported${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`;
+      issueTitle = "";
+      issueBody = "";
+      if (outcome.output) await openExternal(outcome.output);
+      await loadIssues();
+    } finally {
+      busy = null;
     }
-    notice = `Issue reported${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`;
-    issueTitle = "";
-    issueBody = "";
-    if (outcome.output) await openExternal(outcome.output);
-    await loadIssues();
   }
 
   async function publishRelease() {
     if (!releaseConfirmed || !releaseTag.trim()) return;
     busy = "release";
     notice = null;
-    const outcome = await repoStore.publishRelease(
-      releaseTag.trim(),
-      releaseMessage.trim() || `Release ${releaseTag.trim()}`,
-    );
-    busy = null;
-    if (!outcome.ok) {
-      notice = outcome.error ?? "Release publish failed.";
-      return;
+    try {
+      const outcome = await repoStore.publishRelease(
+        releaseTag.trim(),
+        releaseMessage.trim() || `Release ${releaseTag.trim()}`,
+      );
+      if (!outcome.ok) {
+        notice = outcome.error ?? "Release publish failed.";
+        return;
+      }
+      notice = `Pushed ${outcome.output?.tag ?? releaseTag} to ${outcome.output?.remote ?? "the remote"}; the release workflow can now build the app.`;
+      releaseConfirmed = false;
+      await loadIssues();
+    } finally {
+      busy = null;
     }
-    notice = `Pushed ${outcome.output?.tag ?? releaseTag} to ${outcome.output?.remote ?? "the remote"}; the release workflow can now build the app.`;
-    releaseConfirmed = false;
-    await loadIssues();
   }
 
   function runState(run: WorkflowRunInfo): string {
@@ -396,8 +401,62 @@
       </section>
 
       <section class="gp-card p-4">
-        <div class="mb-3"><h3 class="font-semibold">Publish app release</h3><p class="text-textMuted">Pushes an annotated SemVer tag; the existing release workflow builds the app as a draft.</p></div>
-        <div class="space-y-2">
+        <div class="mb-3 flex items-center justify-between">
+          <div>
+            <h3 class="font-semibold">Release monitor & publication</h3>
+            <p class="text-textMuted">Monitors published releases and pushes annotated SemVer tags.</p>
+          </div>
+          {#if (github?.releases?.length ?? 0) > 0}
+            <span class="gp-pill">{github?.releases?.length ?? 0} releases</span>
+          {/if}
+        </div>
+
+        {#if github?.error}
+          <div class="mb-3 text-amber-400">{github.error}</div>
+        {:else if github?.releases_error}
+          <div class="mb-3 flex items-center gap-2 text-amber-400">
+            <AlertTriangle size={14} /> Release monitor unavailable: {github.releases_error}
+          </div>
+        {:else if (github?.releases?.length ?? 0) > 0}
+          <div class="mb-3 max-h-44 space-y-1 overflow-auto">
+            {#each github?.releases ?? [] as release (release.tag_name || release.name)}
+              <button
+                class="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left hover:bg-surfaceHover"
+                onclick={() => release.url && openExternal(release.url)}
+              >
+                <div class="flex items-center gap-2 min-w-0">
+                  <Tag size={13} class="text-accent shrink-0" />
+                  <span class="font-mono text-textPrimary font-medium truncate">{release.tag_name}</span>
+                  {#if release.name && release.name !== release.tag_name}
+                    <span class="text-textMuted truncate max-w-xs">{release.name}</span>
+                  {/if}
+                  {#if release.is_latest}
+                    <span class="gp-pill !bg-emerald-500/10 !text-emerald-400 !border-emerald-500/30">latest</span>
+                  {/if}
+                  {#if release.is_prerelease}
+                    <span class="gp-pill !bg-amber-500/10 !text-amber-400 !border-amber-500/30">pre-release</span>
+                  {/if}
+                  {#if release.is_draft}
+                    <span class="gp-pill">draft</span>
+                  {/if}
+                </div>
+                {#if release.published_at || release.created_at}
+                  <span class="text-textMuted text-[11px] shrink-0 font-mono">
+                    {formatReleaseDate(release.published_at || release.created_at)}
+                  </span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+          {#if github?.releases_truncated}
+            <div class="mb-3 text-amber-400 text-[11px]">Showing 50 releases; more releases exist. This is not complete coverage.</div>
+          {/if}
+        {:else if github}
+          <div class="mb-3 py-2 text-textMuted">No releases found on GitHub.</div>
+        {/if}
+
+        <div class="space-y-2 border-t border-border pt-3">
+          <div class="text-xs font-semibold text-textPrimary">Publish new release tag</div>
           <input class="gp-input w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
           <input class="gp-input w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
           <label class="flex items-start gap-2 rounded-lg bg-surfaceHover p-2 text-textSecondary"><input class="mt-0.5" type="checkbox" bind:checked={releaseConfirmed} /><span>I confirm the working tree is ready. GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags.</span></label>

@@ -28,7 +28,15 @@ export function computeWindow(
     return { start: 0, end: 0 };
   }
   const safeScrollTop = Math.max(0, scrollTop);
-  const scan = Math.max(0, Math.floor(overscan));
+  // A non-finite overscan must clamp to 0 like every other degenerate input:
+  // Math.max(0, Math.floor(NaN)) is NaN and would poison start/end below.
+  // Positive infinity overscan renders the whole list.
+  const scan =
+    overscan === Number.POSITIVE_INFINITY
+      ? totalRows
+      : Number.isFinite(overscan)
+        ? Math.max(0, Math.floor(overscan))
+        : 0;
   const firstVisible = Math.floor(safeScrollTop / rowHeight);
   // A scroll position past the final row (elastic overscroll, stale spacer
   // height) must not produce a start beyond the list.

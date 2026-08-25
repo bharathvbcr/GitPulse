@@ -45,13 +45,6 @@ export type CollapsedLookup = (id: string, kind: BranchSection["kind"]) => boole
  */
 export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLookup): FlatRow[] {
   const rows: FlatRow[] = [];
-  const seen = new Set<string>();
-  const uniqueKey = (base: string): string => {
-    let key = base;
-    for (let n = 2; seen.has(key); n += 1) key = `${base}#${n}`;
-    seen.add(key);
-    return key;
-  };
 
   const pushFolders = (folders: BranchFolder[], depth: number, sectionId: string): void => {
     for (const folder of folders) {
@@ -61,7 +54,7 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
         sectionId,
         folderId: folder.id,
         folder,
-        key: uniqueKey(folder.id),
+        key: `f:${folder.id}`,
       });
       if (isCollapsed(folder.id, "local")) continue;
       pushFolders(folder.folders, depth + 1, sectionId);
@@ -70,7 +63,7 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
           kind: "branch",
           depth: depth + 1,
           branch,
-          key: uniqueKey(`${folder.id}/${branch.name}`),
+          key: `b:${sectionId}:${branch.name}`,
         });
       }
     }
@@ -82,18 +75,18 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
       depth: 0,
       section,
       sectionId: section.id,
-      key: uniqueKey(section.id),
+      key: `s:${section.id}`,
     });
     if (isCollapsed(section.id, section.kind)) continue;
     if (section.kind === "tags") {
       for (const tag of section.tags) {
-        rows.push({ kind: "tag", depth: 0, tag, key: uniqueKey(`${section.id}/${tag.name}`) });
+        rows.push({ kind: "tag", depth: 0, tag, key: `t:${tag.name}` });
       }
       continue;
     }
     pushFolders(section.folders, 0, section.id);
     for (const branch of section.branches) {
-      rows.push({ kind: "branch", depth: 0, branch, key: uniqueKey(`${section.id}/${branch.name}`) });
+      rows.push({ kind: "branch", depth: 0, branch, key: `b:${section.id}:${branch.name}` });
     }
   }
   return rows;

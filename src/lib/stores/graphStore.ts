@@ -120,10 +120,19 @@ function emptyVisible(
 export function createGraphStore(deps: { invoke?: InvokeFn } = {}) {
   const invokeFn = deps.invoke ?? (invoke as InvokeFn);
   const cache = new Map<string, CachedGraph>();
+  /**
+   * Ordering epochs come from store-wide monotonic counters, so a value is
+   * never handed out twice. That is what makes pruning safe: evict() deletes
+   * both maps' entries for the path (absent entry ⇒ every outstanding token
+   * for it is dead), and a fresh load can never collide with an orphaned
+   * fetch the way a per-path counter reset to 1 would.
+   */
   const generations = new Map<string, number>();
-  /** Monotonic per-repo counter so a slow details fetch from an older
+  /** Monotonic per-repo ordering so a slow details fetch from an older
    * selection can never overwrite a newer one's pane. */
   const selections = new Map<string, number>();
+  let epochSource = 0;
+  let selectionSource = 0;
   let visiblePath: string | null = null;
 
   const { subscribe, update, set } = writable<GraphState>(
@@ -131,7 +140,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn } = {}) {
   );
 
   function bump(path: string): number {
-    const next = (generations.get(path) ?? 0) + 1;
+    const next = ++epochSource;
     generations.set(path, next);
     return next;
   }
@@ -141,7 +150,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn } = {}) {
   }
 
   function selectionSeq(path: string): number {
-    const next = (selections.get(path) ?? 0) + 1;
+    const next = ++selectionSource;
     selections.set(path, next);
     return next;
   }
@@ -208,11 +217,17 @@ export function createGraphStore(deps: { invoke?: InvokeFn } = {}) {
         }));
         return;
       }
-      update((s) => emptyVisible(path, s.maxCommits, true));
+      update(() => emptyVisible(path, limitFor(path), true));
     },
     evict: (path: string) => {
       cache.delete(path);
-      generations.set(path, (generations.get(path) ?? 0) + 1);
+      // Prune the ordering maps too: entries for closed repos would otherwise
+      // grow without bound. A missing entry orphans every outstanding token
+      // for this path (undefined === token is false), which is exactly what
+      // the old bump achieved; uniqueness of fresh tokens comes from the
+      // store-wide sources above.
+      generations.delete(path);
+      selections.delete(path);
       if (visiblePath === path) {
         visiblePath = null;
         set(emptyVisible(null, DEFAULT_MAX_COMMITS, false));

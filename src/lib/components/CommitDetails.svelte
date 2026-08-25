@@ -1,7 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
-  import { invoke } from "@tauri-apps/api/core";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
@@ -125,26 +124,16 @@
 
   $effect(() => {
     const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
-    const repo = $repoStore.currentPath;
-    if (!repo || !id) {
+    if (!id) {
       details = null;
       return;
     }
-    let cancelled = false;
-    details = null;
-    invoke<CommitDetailsPayload>("cmd_get_commit_details", {
-      repoPath: repo,
-      commitId: id,
-    })
-      .then((d) => {
-        if (!cancelled) details = d;
-      })
-      .catch(() => {
-        if (!cancelled) details = null;
-      });
-    return () => {
-      cancelled = true;
-    };
+    // The graph store owns detail fetching (selectCommit and the auto-select
+    // on load both populate it). Fetching here as well doubled every backend
+    // traversal per click; this pane just mirrors the store, showing blank
+    // until the one in-flight fetch lands.
+    const cached = $graphStore.selectedCommitDetails;
+    details = cached?.id === id ? cached : null;
   });
 
   function gpgLabel(status: string): { text: string; ok: boolean } {
@@ -237,7 +226,9 @@
         {#each fileList as f (f.path)}
           <button
             class="w-full px-2 py-1.5 rounded-full hover:bg-surfaceHover flex items-center justify-between text-xs text-left transition-colors"
-            onclick={() => repoStore.selectFileDiff(f.path, false)}
+            onclick={() => {
+              if (currentCommitId) repoStore.selectCommitFileDiff(currentCommitId, f.path);
+            }}
           >
             <div class="flex items-center gap-2 truncate">
               <FileCode size={13} class="text-textMuted" />
