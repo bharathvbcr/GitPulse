@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.DS_Store
+*.log
+coverage/
+lcov.info
+.env
+.env.*
+!.env.example
+.vite/
+*.local

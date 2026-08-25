@@ -1,0 +1,22 @@
+import {
+  defaultRepoRoot,
+  formatResolveMessage,
+  isTauriDevArgs,
+  resolveDevPort,
+  spawnLocalBin,
+  withTauriDevUrl,
+} from "./dev-port.mjs";
+
+const repoRoot = defaultRepoRoot();
+const args = process.argv.slice(2);
+const env = { ...process.env };
+
+if (isTauriDevArgs(args)) {
+  const result = await resolveDevPort({ repoRoot, env, allowAutoport: true });
+  env.GITPULSE_DEV_PORT = String(result.port);
+  const notice = formatResolveMessage(result);
+  if (notice) console.info(notice);
+  args.splice(0, args.length, ...withTauriDevUrl(args, result.port));
+}
+
+spawnLocalBin(repoRoot, "tauri", args, env);

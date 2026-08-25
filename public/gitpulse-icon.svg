@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="1024" height="1024" fill="none" role="img" aria-label="GitPulse">
+  <title>GitPulse</title>
+  <defs>
+    <linearGradient id="gp-stroke" x1="3" y1="27" x2="29" y2="6" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="52%" stop-color="#58a6ff"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <linearGradient id="gp-branch" x1="19" y1="22" x2="30" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6ea8ff"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <linearGradient id="gp-badge" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#151d2b"/>
+      <stop offset="100%" stop-color="#0a0d14"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="10" fill="url(#gp-badge)"/>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="9.7" fill="none" stroke="#ffffff" stroke-opacity="0.1"/>
+  <g transform="translate(4.6 4.3) scale(0.71)">
+    <path d="M20.8 20.4C24.6 20.4 24.8 12.8 27.4 10.4" stroke="url(#gp-branch)" stroke-width="3.2" stroke-linecap="round"/>
+    <path d="M3.6 20.4H9.2L12.6 9.6L16.4 26.4L19.2 20.4H20.8" stroke="url(#gp-stroke)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="28" cy="9.4" r="3.6" fill="url(#gp-branch)"/>
+  </g>
+</svg>

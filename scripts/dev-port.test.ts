@@ -1,0 +1,437 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  DevPortError,
+  PREFERRED_DEV_PORT,
+  attachChildLifetime,
+  defaultRepoRoot,
+  findFreePort,
+  formatResolveMessage,
+  isDevServerCommand,
+  isInsideRepo,
+  isPortFree,
+  isTauriDevArgs,
+  parseLsofPids,
+  parseNetstatPids,
+  parseOptionalPort,
+  portFromEnv,
+  resolveDevPort,
+  shouldReclaimListener,
+  tauriConfigForPort,
+  withTauriDevUrl,
+} from "./dev-port.mjs";
+
+const repoRoot = defaultRepoRoot();
+const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
+const liveChildren: ChildProcess[] = [];
+
+afterEach(() => {
+  while (liveChildren.length > 0) {
+    const child = liveChildren.pop();
+    if (child?.pid && child.exitCode == null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
+});
+
+function mockIo(overrides: Record<string, unknown> = {}) {
+  return {
+    listListeners: async () => [],
+    processCommand: async () => "",
+    processCwd: async () => "",
+    selfPids: () => new Set([process.pid]),
+    kill: async () => {},
+    isFree: async () => true,
+    waitUntilFree: async () => true,
+    findFreePort: async (from: number) => from,
+    ...overrides,
+  };
+}
+
+describe("portFromEnv", () => {
+  it("falls back when unset", () => {
+    expect(portFromEnv({}, 5173)).toBe(5173);
+    expect(parseOptionalPort(undefined)).toBeNull();
+    expect(parseOptionalPort("")).toBeNull();
+  });
+
+  it("reads a valid GITPULSE_DEV_PORT", () => {
+    expect(portFromEnv({ GITPULSE_DEV_PORT: "5180" })).toBe(5180);
+  });
+
+  it("rejects non-integer and out-of-range values", () => {
+    expect(() => portFromEnv({ GITPULSE_DEV_PORT: "nope" })).toThrow(/1-65535/);
+    expect(() => parseOptionalPort("0")).toThrow(/1-65535/);
+    expect(() => parseOptionalPort("65536")).toThrow(/1-65535/);
+    expect(() => parseOptionalPort("5173.5")).toThrow(/1-65535/);
+  });
+});
+
+describe("isDevServerCommand", () => {
+  it("matches Vite listeners", () => {
+    expect(
+      isDevServerCommand(
+        "node /Users/acme/gitpulse/node_modules/vite/bin/vite.js --port 5173",
+      ),
+    ).toBe(true);
+    expect(isDevServerCommand("node ./node_modules/.bin/vite")).toBe(true);
+    expect(isDevServerCommand("vite --host 127.0.0.1")).toBe(true);
+  });
+
+  it("does not match unrelated processes", () => {
+    expect(isDevServerCommand("node server.js")).toBe(false);
+    expect(isDevServerCommand("postgres -D /usr/local/var/postgres")).toBe(false);
+    expect(isDevServerCommand("Google Chrome")).toBe(false);
+    expect(isDevServerCommand("")).toBe(false);
+  });
+});
+
+describe("shouldReclaimListener", () => {
+  const selfPids = new Set([100]);
+
+  it("reclaims this repo's leftover Vite, not our own pid", () => {
+    expect(
+      shouldReclaimListener({
+        pid: 42,
+        command: "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+        cwd: "/tmp/gitpulse",
+        repoRoot: "/tmp/gitpulse",
+        selfPids,
+      }),
+    ).toBe(true);
+    expect(
+      shouldReclaimListener({
+        pid: 100,
+        command: "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+        cwd: "/tmp/gitpulse",
+        repoRoot: "/tmp/gitpulse",
+        selfPids,
+      }),
+    ).toBe(false);
+  });
+
+  it("leaves foreign Vite and non-Vite listeners alone", () => {
+    expect(
+      shouldReclaimListener({
+        pid: 42,
+        command: "node /other/project/node_modules/vite/bin/vite.js",
+        cwd: "/other/project",
+        repoRoot: "/tmp/gitpulse",
+        selfPids,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReclaimListener({
+        pid: 42,
+        command: "node scripts/fixtures/hold-port.mjs",
+        cwd: "/tmp/gitpulse",
+        repoRoot: "/tmp/gitpulse",
+        selfPids,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isInsideRepo", () => {
+  it("accepts the repo and nested paths, not siblings", () => {
+    expect(isInsideRepo("/tmp/gitpulse", "/tmp/gitpulse")).toBe(true);
+    expect(isInsideRepo("/tmp/gitpulse/scripts", "/tmp/gitpulse")).toBe(true);
+    expect(isInsideRepo("/tmp/gitpulse-foo", "/tmp/gitpulse")).toBe(false);
+    expect(isInsideRepo(undefined, "/tmp/gitpulse")).toBe(false);
+  });
+});
+
+describe("listener parsers", () => {
+  it("parses lsof -t pid lists", () => {
+    expect(parseLsofPids("12345\n67890\n")).toEqual([12345, 67890]);
+    expect(parseLsofPids("")).toEqual([]);
+    expect(parseLsofPids("1\n")).toEqual([]);
+  });
+
+  it("parses Windows netstat LISTENING rows for a port", () => {
+    const stdout = [
+      "  TCP    0.0.0.0:5173           0.0.0.0:0              LISTENING       4412",
+      "  TCP    127.0.0.1:5174         0.0.0.0:0              LISTENING       88",
+      "  TCP    127.0.0.1:5173         0.0.0.0:0              ESTABLISHED     4412",
+    ].join("\n");
+    expect(parseNetstatPids(stdout, 5173)).toEqual([4412]);
+    expect(parseNetstatPids(stdout, 5174)).toEqual([88]);
+  });
+});
+
+describe("tauri config helpers", () => {
+  it("only injects --config when the port moved", () => {
+    expect(withTauriDevUrl(["dev"], 5173)).toEqual(["dev"]);
+    expect(withTauriDevUrl(["dev", "--verbose"], 5181)).toEqual([
+      "dev",
+      "--verbose",
+      "--config",
+      JSON.stringify(tauriConfigForPort(5181)),
+    ]);
+    expect(tauriConfigForPort(5181)).toEqual({
+      build: { devUrl: "http://localhost:5181" },
+    });
+  });
+
+  it("detects tauri dev vs help", () => {
+    expect(isTauriDevArgs(["dev"])).toBe(true);
+    expect(isTauriDevArgs(["dev", "--help"])).toBe(false);
+    expect(isTauriDevArgs(["build"])).toBe(false);
+  });
+});
+
+describe("attachChildLifetime", () => {
+  it("forwards SIGTERM to the child and exits when the child exits", () => {
+    const killed: string[] = [];
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const childListeners = new Map<string, (...args: unknown[]) => void>();
+    const child = {
+      exitCode: null as number | null,
+      signalCode: null as string | null,
+      kill: (signal: string) => {
+        killed.push(signal);
+      },
+      on: (event: string, cb: (...args: unknown[]) => void) => {
+        childListeners.set(event, cb);
+      },
+    };
+    const exits: number[] = [];
+    const hooks = {
+      on: (event: string, cb: (...args: unknown[]) => void) => {
+        listeners.set(event, cb);
+      },
+      removeListener: (event: string) => {
+        listeners.delete(event);
+      },
+      exit: (code: number) => {
+        exits.push(code);
+      },
+    };
+    attachChildLifetime(child as never, hooks as never);
+    listeners.get("SIGTERM")?.();
+    expect(killed).toEqual(["SIGTERM"]);
+    childListeners.get("exit")?.(0, null);
+    expect(exits).toEqual([0]);
+  });
+});
+
+describe("resolveDevPort", () => {
+  it("uses the preferred port when it is free", async () => {
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: {},
+      repoRoot: "/tmp/gitpulse",
+      io: mockIo(),
+    });
+    expect(result).toEqual({ port: 5173, source: "preferred" });
+  });
+
+  it("reclaims this app's leftover Vite instead of hopping ports", async () => {
+    const killed: number[] = [];
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: {},
+      repoRoot: "/tmp/gitpulse",
+      io: mockIo({
+        listListeners: async () => [{ pid: 4242 }],
+        processCommand: async () =>
+          "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+        processCwd: async () => "/tmp/gitpulse",
+        isFree: async () => false,
+        kill: async (pid: number) => {
+          killed.push(pid);
+        },
+        waitUntilFree: async () => true,
+      }),
+    });
+    expect(killed).toEqual([4242]);
+    expect(result.source).toBe("cleaned");
+    expect(result.port).toBe(5173);
+    expect(formatResolveMessage(result)).toMatch(/Reclaimed port 5173/);
+  });
+
+  it("auto-selects the next free port when a foreign process owns the preferred one", async () => {
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: {},
+      repoRoot: "/tmp/gitpulse",
+      allowAutoport: true,
+      io: mockIo({
+        listListeners: async () => [{ pid: 88 }],
+        processCommand: async () => "ControlCenter",
+        processCwd: async () => "/System",
+        isFree: async () => false,
+        findFreePort: async () => 5174,
+      }),
+    });
+    expect(result).toMatchObject({ port: 5174, source: "autoport" });
+    expect(formatResolveMessage(result)).toMatch(/using 5174/);
+  });
+
+  it("does not autoport when the port is locked by env or a Tauri hook", async () => {
+    await expect(
+      resolveDevPort({
+        preferred: 5173,
+        env: { GITPULSE_DEV_PORT: "5173" },
+        repoRoot: "/tmp/gitpulse",
+        io: mockIo({
+          listListeners: async () => [{ pid: 88 }],
+          processCommand: async () => "ControlCenter",
+          isFree: async () => false,
+        }),
+      }),
+    ).rejects.toBeInstanceOf(DevPortError);
+
+    await expect(
+      resolveDevPort({
+        preferred: 5173,
+        env: { TAURI_ENV_PLATFORM: "darwin" },
+        repoRoot: "/tmp/gitpulse",
+        io: mockIo({
+          listListeners: async () => [{ pid: 88 }],
+          processCommand: async () => "ControlCenter",
+          isFree: async () => false,
+        }),
+      }),
+    ).rejects.toThrow(/Port 5173 is already in use/);
+  });
+
+  it("honors GITPULSE_DEV_PORT when that port is free", async () => {
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: { GITPULSE_DEV_PORT: "5190" },
+      repoRoot: "/tmp/gitpulse",
+      io: mockIo(),
+    });
+    expect(result).toEqual({ port: 5190, source: "env" });
+  });
+});
+
+describe("live ports", () => {
+  it("findFreePort skips an occupied bind", async () => {
+    const base = await findFreePort(19000, 19900);
+    const occupied = await listenOn(base);
+    try {
+      const next = await findFreePort(base, base + 5);
+      expect(next).toBeGreaterThan(base);
+      expect(await isPortFree(next)).toBe(true);
+    } finally {
+      await closeServer(occupied);
+    }
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "kills a leftover Vite-named listener in this repo and keeps the preferred port",
+    async () => {
+      const port = await findFreePort(19000, 19900);
+      const child = await spawnHolder(
+        path.join(scriptsDir, "fixtures/vite/hold-port.mjs"),
+        port,
+      );
+      expect(await isPortFree(port)).toBe(false);
+
+      const result = await resolveDevPort({
+        preferred: port,
+        env: {},
+        repoRoot,
+        allowAutoport: true,
+      });
+
+      expect(result.port).toBe(port);
+      expect(result.source).toBe("cleaned");
+      expect(await isPortFree(port)).toBe(true);
+      await waitForExit(child);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "does not kill a non-Vite holder; picks another port instead",
+    async () => {
+      const port = await findFreePort(19000, 19900);
+      await spawnHolder(path.join(scriptsDir, "fixtures/hold-port.mjs"), port);
+      expect(await isPortFree(port)).toBe(false);
+
+      const result = await resolveDevPort({
+        preferred: port,
+        env: {},
+        repoRoot,
+        allowAutoport: true,
+        range: 20,
+      });
+
+      expect(result.source).toBe("autoport");
+      expect(result.port).not.toBe(port);
+      expect(await isPortFree(port)).toBe(false);
+      expect(await isPortFree(result.port)).toBe(true);
+    },
+  );
+});
+
+describe("PREFERRED_DEV_PORT", () => {
+  it("stays aligned with the Tauri template default", () => {
+    expect(PREFERRED_DEV_PORT).toBe(5173);
+  });
+});
+
+function listenOn(port: number): Promise<http.Server> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve(server));
+  });
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+async function spawnHolder(script: string, port: number): Promise<ChildProcess> {
+  const child = spawn(process.execPath, [script, String(port)], {
+    cwd: repoRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  liveChildren.push(child);
+  await waitForReady(child);
+  return child;
+}
+
+function waitForReady(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("holder did not become ready"));
+    }, 3000);
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`holder exited before ready (${code})`));
+    });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (chunk.toString().includes("ready")) {
+        clearTimeout(timer);
+        child.stdout?.removeAllListeners("data");
+        child.removeAllListeners("exit");
+        resolve();
+      }
+    });
+  });
+}
+
+function waitForExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode != null) return Promise.resolve();
+  return new Promise((resolve) => {
+    child.once("exit", () => resolve());
+    setTimeout(resolve, 2000);
+  });
+}

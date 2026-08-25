@@ -1,0 +1,410 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * GitPulse design tokens — "soft bubble" language.
+ *
+ * Two parallel sets live here on purpose:
+ *  - `--c-*` RGB triplets feed Tailwind, whose opacity modifiers
+ *    (`bg-accent/15`, `border-border/60`, …) need numeric channels.
+ *  - `--bg-main` & co. are plain colors read at runtime by the canvas graph
+ *    renderer (`themeFromCss`). They are derived from the triplets so there is
+ *    exactly one source of truth per channel.
+ */
+
+:root,
+html.dark {
+  --c-bg: 11 14 23;
+  --c-surface: 20 26 41;
+  --c-surface-hover: 31 39 58;
+  --c-border: 44 54 78;
+  --c-accent: 128 158 255;
+  --c-text: 233 237 248;
+  --c-text-muted: 148 161 190;
+
+  /* Elevation. Soft, layered, low-contrast — bubbles, not boxes. */
+  --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3),
+    0 10px 28px -18px rgb(0 0 0 / 0.65);
+  --shadow-pop: 0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
+  --shadow-float: 0 8px 24px -12px rgb(0 0 0 / 0.55), 0 32px 90px -28px rgb(0 0 0 / 0.7);
+  --shadow-glow: 0 6px 22px -8px rgb(128 158 255 / 0.55);
+  --ring-focus: 0 0 0 3px rgb(128 158 255 / 0.28);
+  --brand-gradient: linear-gradient(135deg, #22d3ee 0%, #7da2ff 52%, #ab8bff 100%);
+}
+
+html.light {
+  --c-bg: 243 244 250;
+  --c-surface: 255 255 255;
+  --c-surface-hover: 236 238 248;
+  --c-border: 148 156 184;
+  --c-accent: 82 104 235;
+  --c-text: 34 40 62;
+  --c-text-muted: 99 108 134;
+
+  --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
+    0 12px 32px -20px rgb(38 46 76 / 0.25);
+  --shadow-pop: 0 2px 8px -2px rgb(38 46 76 / 0.08), 0 18px 44px -16px rgb(38 46 76 / 0.22);
+  --shadow-float: 0 8px 24px -12px rgb(38 46 76 / 0.12), 0 32px 90px -28px rgb(38 46 76 / 0.28);
+  --shadow-glow: 0 6px 22px -8px rgb(82 104 235 / 0.45);
+  --ring-focus: 0 0 0 3px rgb(82 104 235 / 0.22);
+  --brand-gradient: linear-gradient(135deg, #06b6d4 0%, #4f74e8 52%, #8b5cf6 100%);
+
+  color-scheme: light;
+}
+
+:root {
+  /* Derived plain colors — the canvas graph reads these. */
+  --bg-main: rgb(var(--c-bg));
+  --bg-surface: rgb(var(--c-surface));
+  --bg-surface-hover: rgb(var(--c-surface-hover));
+  --border-color: rgb(var(--c-border));
+  --accent-color: rgb(var(--c-accent));
+  --text-primary: rgb(var(--c-text));
+  --text-muted: rgb(var(--c-text-muted));
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+@layer base {
+  body {
+    background-color: rgb(var(--c-bg));
+    color: rgb(var(--c-text));
+  }
+
+  ::selection {
+    background-color: rgb(var(--c-accent) / 0.32);
+  }
+
+  button:focus-visible,
+  [role="button"]:focus-visible,
+  [role="tab"]:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
+  }
+}
+
+/* Bubble primitives shared across views. One owner per shape keeps the
+   geometry consistent; components compose these instead of re-deriving them. */
+@layer components {
+  /* Pill button (secondary). */
+  .gp-btn {
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border border-border/70 bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-sm transition-all duration-150;
+  }
+  .gp-btn:hover {
+    @apply border-accent/50 bg-surfaceHover;
+  }
+  .gp-btn:active {
+    transform: scale(0.97);
+  }
+  .gp-btn:disabled {
+    @apply cursor-not-allowed opacity-40;
+  }
+
+  /* Pill button (primary): brand gradient with a soft halo. */
+  .gp-btn-primary {
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-all duration-150;
+    background-image: var(--brand-gradient);
+    box-shadow: var(--shadow-glow);
+  }
+  .gp-btn-primary:hover {
+    filter: brightness(1.08);
+  }
+  .gp-btn-primary:active {
+    transform: scale(0.97);
+  }
+  .gp-btn-primary:disabled {
+    @apply cursor-not-allowed opacity-40;
+    filter: none;
+    box-shadow: none;
+  }
+
+  /* Pill button (success): same geometry as primary, green ramp. */
+  .gp-btn-success {
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-all duration-150;
+    background-image: linear-gradient(135deg, #34d399, #059669);
+    box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
+  }
+  .gp-btn-success:hover {
+    filter: brightness(1.08);
+  }
+  .gp-btn-success:active {
+    transform: scale(0.97);
+  }
+  .gp-btn-success:disabled {
+    @apply cursor-not-allowed opacity-40;
+    filter: none;
+    box-shadow: none;
+  }
+
+  /* Round icon button (ghost). */
+  .gp-icon-btn {
+    @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-all duration-150;
+  }
+  .gp-icon-btn:hover {
+    @apply bg-surfaceHover text-textPrimary;
+  }
+  .gp-icon-btn:active {
+    transform: scale(0.94);
+  }
+
+  /* Elevated card. */
+  .gp-card {
+    @apply rounded-2xl border border-border/70 bg-surface;
+    box-shadow: var(--shadow-card);
+  }
+
+  /* Floating menu / popover. */
+  .gp-menu {
+    @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
+    box-shadow: var(--shadow-pop);
+  }
+  .gp-menu-item {
+    @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-textPrimary transition-colors duration-100;
+  }
+  .gp-menu-item:hover {
+    @apply bg-surfaceHover;
+  }
+
+  /* Segmented control: a pill track with a raised active bubble. */
+  .gp-segmented {
+    @apply inline-flex select-none items-center gap-0.5 rounded-full border border-border/70 bg-background/70 p-0.5;
+  }
+  .gp-seg-btn {
+    @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-all duration-150;
+  }
+  .gp-seg-btn:hover {
+    @apply text-textPrimary;
+  }
+  .gp-seg-btn[data-active="true"] {
+    @apply bg-surface font-semibold text-accent;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.05);
+  }
+  html.light .gp-seg-btn[data-active="true"] {
+    box-shadow: 0 1px 3px rgb(38 46 76 / 0.16), inset 0 1px 0 rgb(255 255 255 / 0.8);
+  }
+
+  /* Rounded input field. */
+  .gp-field {
+    @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
+  }
+  .gp-field:focus {
+    @apply outline-none border-accent/60;
+    box-shadow: var(--ring-focus);
+  }
+  .gp-field-multi {
+    @apply rounded-xl;
+  }
+
+  /* Small pill chip. */
+  .gp-chip {
+    @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border border-border/70 px-2 py-0.5 text-[11px] leading-none;
+  }
+
+  /* Keycap hint. */
+  .gp-keycap {
+    @apply inline-flex items-center rounded-md border border-border/80 bg-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-textMuted;
+    box-shadow: 0 1.5px 0 rgb(var(--c-border));
+  }
+}
+
+/* Pill range sliders (image-diff swipe/onion controls and future ones). */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgb(var(--c-border));
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 9999px;
+  border: 2px solid rgb(var(--c-surface));
+  background-image: var(--brand-gradient);
+  box-shadow: var(--shadow-glow);
+  cursor: pointer;
+  transition: transform 120ms ease;
+}
+input[type="range"]:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgb(var(--c-border));
+}
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  border: 2px solid rgb(var(--c-surface));
+  background-image: var(--brand-gradient);
+  box-shadow: var(--shadow-glow);
+  cursor: pointer;
+}
+
+/* Custom smooth scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-border));
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--c-text-muted) / 0.55);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+html.macos,
+html.macos body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+}
+
+html.macos ::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+
+.overflow-auto,
+.overflow-y-auto,
+.overflow-x-auto,
+.gp-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* Title-bar clusters must scroll without a 8px track eating the 40px header. */
+.gp-header-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+.gp-header-scroll::-webkit-scrollbar {
+  display: none;
+  height: 0;
+}
+
+.gp-gpu {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+.gp-pane {
+  contain: layout paint;
+}
+
+/* Title-block drag affordance: children ignore the pointer so the block
+   itself receives the drag gesture. */
+.gp-drag-children :is(svg, span) {
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .gp-view {
+    animation: gp-view-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .gp-overlay {
+    animation: gp-overlay-in 140ms ease-out both;
+  }
+
+  .gp-pop {
+    animation: gp-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Spinners keep their glyph (static, visible) so activity indication
+     survives; only the rotation/pulse motion is removed. */
+  .gp-view,
+  .gp-overlay,
+  .gp-pop,
+  .animate-pulse,
+  .animate-spin {
+    animation: none !important;
+  }
+
+  .transition-colors,
+  .transition-all,
+  .transition {
+    transition: none !important;
+  }
+}
+
+@keyframes gp-view-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes gp-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes gp-pop-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/* Theme-switch crossfade (View Transitions API). Runtimes without support
+   flip instantly; that is the graceful path, not a degraded one. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 220ms;
+  animation-timing-function: ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+}
+
+/* Indeterminate progress strip for long graph loads. */
+@keyframes gp-slide {
+  from {
+    transform: translate3d(-100%, 0, 0);
+  }
+  to {
+    transform: translate3d(300%, 0, 0);
+  }
+}

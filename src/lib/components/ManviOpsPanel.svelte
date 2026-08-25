@@ -1,0 +1,412 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import {
+    AlertTriangle,
+    ArrowDownToLine,
+    ArrowUpFromLine,
+    Bug,
+    CheckCircle2,
+    GitBranch,
+    LoaderCircle,
+    RefreshCw,
+    Rocket,
+    ScanSearch,
+    ShieldCheck,
+    Trash2,
+  } from "lucide-svelte";
+  import { repoStore } from "../stores/repoStore";
+  import { askConfirm } from "../stores/modalStore";
+  import { harnessStore, verdictLabel } from "../stores/harnessStore";
+  import {
+    releaseTagSuggestion,
+    summarizeCommitReview,
+    type BranchCleanupPlan,
+    type CommitReviewReport,
+    type IssueInfo,
+  } from "../ops/model";
+  import ManviHarnessPane from "./ManviHarnessPane.svelte";
+
+  interface WorkflowRunInfo {
+    id: number;
+    name: string;
+    title: string;
+    status: string;
+    conclusion: string;
+    head_branch: string;
+    url: string;
+    created_at: string;
+  }
+
+  interface OpsGitHubContext {
+    available: boolean;
+    owner: string;
+    repo: string;
+    issues: IssueInfo[];
+    issues_truncated: boolean;
+    issues_error?: string | null;
+    workflow_runs: WorkflowRunInfo[];
+    error?: string | null;
+  }
+
+  const ISSUE_REFRESH_MS = 60_000;
+
+  /** One MANVI surface, two panes: guarded operations, and harness/AI controls. */
+  type Pane = "ops" | "harness";
+  let pane = $state<Pane>("ops");
+
+  let subtitle = $derived(
+    pane === "ops"
+      ? "Guarded repository operations, release readiness, and issue monitoring in one place."
+      : "Harness connection, local model servers, branch naming, and the agent activity journal.",
+  );
+
+  let cleanup = $state<BranchCleanupPlan | null>(null);
+  let selectedBranches = $state<string[]>([]);
+  let review = $state<CommitReviewReport | null>(null);
+  let github = $state<OpsGitHubContext | null>(null);
+  let busy = $state<string | null>(null);
+  let notice = $state<string | null>(null);
+  let issueTitle = $state("");
+  let issueBody = $state("");
+  let issueLabels = $state("bug");
+  let releaseTag = $state("");
+  let releaseMessage = $state("");
+  let releaseConfirmed = $state(false);
+  let lastRepo: string | null = null;
+
+  let cleanupInvariant = $derived(
+    cleanup
+      ? cleanup.protected_branches + cleanup.unmerged_branches + cleanup.candidates.length ===
+          cleanup.total_local_branches
+      : true,
+  );
+
+  function isSelected(name: string): boolean {
+    return selectedBranches.includes(name);
+  }
+
+  function toggleSelected(name: string) {
+    selectedBranches = isSelected(name)
+      ? selectedBranches.filter((item) => item !== name)
+      : [...selectedBranches, name];
+  }
+
+  async function openExternal(url: string) {
+    try {
+      await openUrl(url);
+    } catch {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  }
+
+  async function loadIssues(repo: string = $repoStore.currentPath ?? "") {
+    if (!repo || busy !== null) return;
+    busy = "issues";
+    try {
+      const next = await invoke<OpsGitHubContext>("cmd_github_context", { repoPath: repo });
+      if ($repoStore.currentPath === repo) github = next;
+    } catch (error) {
+      if ($repoStore.currentPath === repo) notice = String(error);
+    } finally {
+      if ($repoStore.currentPath === repo) busy = null;
+    }
+  }
+
+  async function scanBranches() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    busy = "branches";
+    notice = null;
+    try {
+      const next = await invoke<BranchCleanupPlan>("cmd_branch_cleanup_plan", { repoPath: repo });
+      if ($repoStore.currentPath !== repo) return;
+      cleanup = next;
+      selectedBranches = next.candidates.map((candidate) => candidate.name);
+    } catch (error) {
+      if ($repoStore.currentPath === repo) notice = String(error);
+    } finally {
+      if ($repoStore.currentPath === repo) busy = null;
+    }
+  }
+
+  async function cleanBranches() {
+    if (selectedBranches.length === 0) return;
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    const names = [...selectedBranches];
+    const confirmed = await askConfirm({
+      title: "Delete merged branches",
+      message: `Delete ${names.length} merged local branch${names.length === 1 ? "" : "es"}?\n\n${names.join("\n")}`,
+      confirmLabel: "Delete",
+    });
+    if (!confirmed) {
+      return;
+    }
+    busy = "clean";
+    notice = null;
+    let deleted = 0;
+    const failures: string[] = [];
+    for (const name of names) {
+      if ($repoStore.currentPath !== repo) break;
+      const outcome = await repoStore.deleteBranch(name, false);
+      if (outcome.ok) deleted += 1;
+      else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+    }
+    if ($repoStore.currentPath === repo) {
+      notice = failures.length
+        ? `Deleted ${deleted} of ${names.length}. ${failures.join(" ")}`
+        : `Deleted ${deleted} merged branch${deleted === 1 ? "" : "es"}.`;
+      busy = null;
+      await scanBranches();
+    }
+  }
+
+  async function reviewCommits() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    busy = "review";
+    notice = null;
+    try {
+      const next = await invoke<CommitReviewReport>("cmd_review_outgoing_commits", { repoPath: repo });
+      if ($repoStore.currentPath === repo) review = next;
+    } catch (error) {
+      if ($repoStore.currentPath === repo) notice = String(error);
+    } finally {
+      if ($repoStore.currentPath === repo) busy = null;
+    }
+  }
+
+  async function sync(kind: "pull" | "push") {
+    busy = kind;
+    notice = null;
+    const outcome = kind === "pull" ? await repoStore.pull() : await repoStore.push();
+    busy = null;
+    notice = outcome.ok
+      ? `${kind === "pull" ? "Pull" : "Push"} completed${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`
+      : outcome.error ?? `${kind} failed`;
+  }
+
+  async function reportIssue() {
+    const title = issueTitle.trim();
+    if (!title) return;
+    busy = "report";
+    notice = null;
+    const labels = issueLabels.split(",").map((label) => label.trim()).filter(Boolean);
+    const outcome = await repoStore.reportIssue(title, issueBody, labels);
+    busy = null;
+    if (!outcome.ok) {
+      notice = outcome.error ?? "Issue report failed.";
+      return;
+    }
+    notice = `Issue reported${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`;
+    issueTitle = "";
+    issueBody = "";
+    if (outcome.output) await openExternal(outcome.output);
+    await loadIssues();
+  }
+
+  async function publishRelease() {
+    if (!releaseConfirmed || !releaseTag.trim()) return;
+    busy = "release";
+    notice = null;
+    const outcome = await repoStore.publishRelease(
+      releaseTag.trim(),
+      releaseMessage.trim() || `Release ${releaseTag.trim()}`,
+    );
+    busy = null;
+    if (!outcome.ok) {
+      notice = outcome.error ?? "Release publish failed.";
+      return;
+    }
+    notice = `Pushed ${outcome.output?.tag ?? releaseTag} to ${outcome.output?.remote ?? "the remote"}; the release workflow can now build the app.`;
+    releaseConfirmed = false;
+    await loadIssues();
+  }
+
+  function runState(run: WorkflowRunInfo): string {
+    return run.conclusion || run.status || "unknown";
+  }
+
+  onMount(() => {
+    const timer = window.setInterval(() => {
+      if (!document.hidden && $repoStore.currentPath) void loadIssues();
+    }, ISSUE_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  });
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    if (repo === lastRepo) return;
+    lastRepo = repo;
+    cleanup = null;
+    selectedBranches = [];
+    review = null;
+    github = null;
+    notice = null;
+    releaseTag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
+    releaseMessage = `Release ${releaseTag}`;
+    releaseConfirmed = false;
+    if (repo) void loadIssues(repo);
+  });
+</script>
+
+<div class="flex-1 overflow-auto bg-background p-4 text-xs text-textPrimary">
+  <div class="mx-auto flex w-full max-w-6xl flex-col gap-4">
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-2">
+          <ShieldCheck size={19} class="text-accent" />
+          <h2 class="text-base font-semibold">MANVI</h2>
+          <span class="gp-pill">{$harnessStore.harness?.available ? "policy connected" : "unchecked mode"}</span>
+        </div>
+        <p class="mt-1 text-textMuted">{subtitle}</p>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        {#if pane === "ops"}
+          <button class="gp-btn" onclick={() => { void scanBranches(); void reviewCommits(); void loadIssues(); }} disabled={busy !== null}>
+            <RefreshCw size={13} class={busy ? "animate-spin" : ""} /> Refresh all
+          </button>
+        {/if}
+        <div class="gp-segmented">
+          <button type="button" data-active={pane === "ops" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "ops")}>Ops</button>
+          <button type="button" data-active={pane === "harness" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "harness")}>Harness &amp; AI</button>
+        </div>
+      </div>
+    </div>
+
+    {#if notice}
+      <div class="rounded-xl border border-border bg-surface px-3 py-2 text-textSecondary">{notice}</div>
+    {/if}
+
+    {#if pane === "harness"}
+      <ManviHarnessPane />
+    {:else}
+    <section class="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={() => sync("pull")} disabled={busy !== null}>
+        <ArrowDownToLine size={20} class="text-accent" />
+        <span><strong class="block">Quick pull</strong><span class="text-textMuted">Update the working branch through MANVI.</span></span>
+      </button>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={() => sync("push")} disabled={busy !== null}>
+        <ArrowUpFromLine size={20} class="text-accent" />
+        <span><strong class="block">Quick push</strong><span class="text-textMuted">Publish the current branch safely.</span></span>
+      </button>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={scanBranches} disabled={busy !== null}>
+        <GitBranch size={20} class="text-accent" />
+        <span><strong class="block">Scan branches</strong><span class="text-textMuted">Find merged local branches only.</span></span>
+      </button>
+      <button class="gp-card flex items-center gap-3 p-4 text-left hover:border-accent/50" onclick={reviewCommits} disabled={busy !== null}>
+        <ScanSearch size={20} class="text-accent" />
+        <span><strong class="block">Review messages</strong><span class="text-textMuted">Audit commits that are about to ship.</span></span>
+      </button>
+    </section>
+
+    <div class="grid gap-4 xl:grid-cols-2">
+      <section class="gp-card p-4">
+        <div class="mb-3 flex items-center justify-between">
+          <div>
+            <h3 class="font-semibold">Branch cleanup</h3>
+            <p class="text-textMuted">Dry-run first; current, default, worktree, and unmerged branches stay protected.</p>
+          </div>
+          {#if cleanup}<span class="gp-pill">{cleanup.candidates.length} eligible / {cleanup.total_local_branches} local</span>{/if}
+        </div>
+        {#if busy === "branches" || busy === "clean"}
+          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Inspecting Git refs…</div>
+        {:else if cleanup}
+          {#if !cleanupInvariant}
+            <div class="mb-2 flex items-center gap-2 text-rose-400"><AlertTriangle size={14} /> Cleanup coverage is inconsistent; deletion is disabled.</div>
+          {/if}
+          <div class="max-h-52 space-y-1 overflow-auto">
+            {#each cleanup.candidates as branch (branch.name)}
+              <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
+                <input type="checkbox" checked={isSelected(branch.name)} onchange={() => toggleSelected(branch.name)} />
+                <span class="min-w-0 flex-1"><span class="font-mono">{branch.name}</span><span class="ml-2 truncate text-textMuted">{branch.last_summary}</span></span>
+                {#if branch.upstream_gone}<span class="gp-pill">upstream gone</span>{/if}
+              </label>
+            {:else}
+              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No merged local branches need cleanup.</div>
+            {/each}
+          </div>
+          <div class="mt-3 flex items-center justify-between border-t border-border pt-3 text-textMuted">
+            <span>{cleanup.protected_branches} protected · {cleanup.unmerged_branches} unmerged</span>
+            <button class="gp-btn" onclick={cleanBranches} disabled={!cleanupInvariant || selectedBranches.length === 0 || busy !== null}>
+              <Trash2 size={13} /> Delete {selectedBranches.length} selected
+            </button>
+          </div>
+        {:else}
+          <button class="gp-btn" onclick={scanBranches}><GitBranch size={13} /> Build cleanup plan</button>
+        {/if}
+      </section>
+
+      <section class="gp-card p-4">
+        <div class="mb-3 flex items-center justify-between">
+          <div><h3 class="font-semibold">Outgoing commit review</h3><p class="text-textMuted">Conventional format, duplicate subjects, issue links, and length.</p></div>
+          {#if review}<span class="gp-pill">{review.findings.length} findings</span>{/if}
+        </div>
+        {#if busy === "review"}
+          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Reviewing commit headers…</div>
+        {:else if review}
+          <p class="mb-2 text-textSecondary">{summarizeCommitReview(review)} <span class="font-mono text-textMuted">{review.range}</span></p>
+          <div class="max-h-56 space-y-1 overflow-auto">
+            {#each review.findings as finding (`${finding.commit_id}:${finding.code}`)}
+              <div class="rounded-lg border border-border px-2.5 py-2">
+                <div class="flex items-center gap-2"><span class="font-mono text-accent">{finding.short_id}</span><span class={finding.severity === "error" ? "text-rose-400" : finding.severity === "warning" ? "text-amber-400" : "text-textMuted"}>{finding.code}</span></div>
+                <div class="mt-0.5 truncate">{finding.subject}</div><div class="text-textMuted">{finding.detail}</div>
+              </div>
+            {:else}
+              <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No commit-message findings.</div>
+            {/each}
+          </div>
+        {:else}
+          <button class="gp-btn" onclick={reviewCommits}><ScanSearch size={13} /> Review outgoing commits</button>
+        {/if}
+      </section>
+
+      <section class="gp-card p-4">
+        <div class="mb-3 flex items-center justify-between">
+          <div><h3 class="font-semibold">Issue monitor</h3><p class="text-textMuted">Refreshes open GitHub issues every minute while this view is visible.</p></div>
+          <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
+        </div>
+        {#if github?.error}
+          <div class="text-amber-400">{github.error}</div>
+        {:else if github?.issues_error}
+          <div class="flex items-center gap-2 text-amber-400"><AlertTriangle size={14} /> Issue monitor unavailable: {github.issues_error}</div>
+        {:else}
+          <div class="max-h-44 space-y-1 overflow-auto">
+            {#each github?.issues ?? [] as issue (issue.number)}
+              <button class="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-surfaceHover" onclick={() => openExternal(issue.url)}>
+                <Bug size={13} class="text-accent" /><span class="font-mono text-textMuted">#{issue.number}</span><span class="min-w-0 flex-1 truncate">{issue.title}</span>
+                {#if issue.labels[0]}<span class="gp-pill">{issue.labels[0]}</span>{/if}
+              </button>
+            {:else}
+              <div class="py-3 text-textMuted">No open issues found.</div>
+            {/each}
+          </div>
+          {#if github?.issues_truncated}<div class="mt-1 text-amber-400">Showing 50 issues; more open issues exist. This is not complete coverage.</div>{/if}
+        {/if}
+        <div class="mt-3 space-y-2 border-t border-border pt-3">
+          <input class="gp-input w-full" maxlength="256" placeholder="Issue title" bind:value={issueTitle} />
+          <textarea class="gp-input min-h-20 w-full resize-y" maxlength="65536" placeholder="What happened, what you expected, and how to reproduce it" bind:value={issueBody}></textarea>
+          <div class="flex gap-2"><input class="gp-input min-w-0 flex-1" placeholder="labels, comma-separated" bind:value={issueLabels} /><button class="gp-btn" onclick={reportIssue} disabled={!issueTitle.trim() || busy !== null}><Bug size={13} /> Report issue</button></div>
+        </div>
+      </section>
+
+      <section class="gp-card p-4">
+        <div class="mb-3"><h3 class="font-semibold">Publish app release</h3><p class="text-textMuted">Pushes an annotated SemVer tag; the existing release workflow builds the app as a draft.</p></div>
+        <div class="space-y-2">
+          <input class="gp-input w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
+          <input class="gp-input w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
+          <label class="flex items-start gap-2 rounded-lg bg-surfaceHover p-2 text-textSecondary"><input class="mt-0.5" type="checkbox" bind:checked={releaseConfirmed} /><span>I confirm the working tree is ready. GitPulse will still require a clean, fully synchronized default branch and will refuse duplicate remote tags.</span></label>
+          <button class="gp-btn-primary w-full justify-center" onclick={publishRelease} disabled={!releaseConfirmed || !releaseTag.trim() || busy !== null}>
+            {#if busy === "release"}<LoaderCircle size={14} class="animate-spin" />{:else}<Rocket size={14} />{/if} Push release tag
+          </button>
+        </div>
+        {#if (github?.workflow_runs?.length ?? 0) > 0}
+          <div class="mt-3 border-t border-border pt-3"><div class="mb-1 text-textMuted">Recent release/workflow activity</div>{#each github?.workflow_runs.slice(0, 3) ?? [] as run (run.id)}<button class="flex w-full items-center justify-between rounded px-1 py-1 text-left hover:bg-surfaceHover" onclick={() => openExternal(run.url)}><span class="truncate">{run.title || run.name}</span><span class="gp-pill">{runState(run)}</span></button>{/each}</div>
+        {/if}
+      </section>
+    </div>
+    {/if}
+  </div>
+</div>
