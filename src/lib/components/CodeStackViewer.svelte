@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { Layers, GitBranch, RefreshCw } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { formatError } from "../ui/formatError";
   import EmptyState from "./EmptyState.svelte";
 
   interface StackNode {
@@ -48,7 +49,7 @@
       // An IPC failure must not pose as "no stacked branches": keep any last
       // good nodes and surface why the fetch failed, with a retry.
       if (!guard.isLive()) return;
-      loadError = String(err);
+      loadError = formatError(err);
     } finally {
       if (guard.isLive()) isLoading = false;
     }
@@ -72,7 +73,7 @@
       await loadStack(repoPath);
     } catch (err) {
       if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
-      restackError = String(err);
+      restackError = formatError(err);
     }
   }
 

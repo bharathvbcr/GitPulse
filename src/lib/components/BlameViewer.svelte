@@ -6,6 +6,7 @@
   import { coverageHitClass } from "../coverage/format";
   import type { FileCoverage } from "../coverage/types";
   import { shortHash } from "../format";
+  import { formatError } from "../ui/formatError";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
 
@@ -56,7 +57,7 @@
       }
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      errorMsg = String(err);
+      errorMsg = formatError(err);
       blameLines = [];
       coverageHits = new Map();
     } finally {

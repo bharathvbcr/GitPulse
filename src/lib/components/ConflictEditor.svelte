@@ -6,6 +6,7 @@
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { planConflictSave } from "../diff/conflictSave";
+  import { formatError } from "../ui/formatError";
 
   /**
    * Mirrors the Rust `ConflictResolutionChoice` enum's serde form: unit
@@ -107,7 +108,7 @@
         if (!guard.isLive()) return;
         parsedDoc = null;
         resolvedPreview = "";
-        loadError = String(err);
+        loadError = formatError(err);
         console.error("Failed to load conflict:", err);
       }
     })();
@@ -168,7 +169,7 @@
       // A failed render means the preview no longer matches the chosen
       // resolutions: clear it (which also disables Save) and say why.
       resolvedPreview = "";
-      previewError = String(err);
+      previewError = formatError(err);
     }
   }
 
@@ -203,7 +204,7 @@
     } catch (err) {
       if (!guard.isLive() || $repoStore.currentPath !== repo || selectedFile !== file) return;
       harnessStore.recordAction({ kind: "edit", label: file, ok: false });
-      saveError = String(err);
+      saveError = formatError(err);
     } finally {
       if (guard.isLive()) isSaving = false;
     }

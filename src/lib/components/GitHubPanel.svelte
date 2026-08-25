@@ -7,6 +7,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import type { GitHubContextBase, WorkflowRunInfo } from "../github/types";
   import { formatReleaseDate } from "../ops/model";
+  import { formatError } from "../ui/formatError";
   import EmptyState from "./EmptyState.svelte";
 
   interface PullRequestInfo {
@@ -29,7 +30,8 @@
 
   let ctx = $state<GitHubContext | null>(null);
   let loading = $state(false);
-  let checkingOut = $state<number | null>(null);
+  /** PR numbers with a checkout in flight; any in-flight checkout disables all. */
+  let checkingOut = $state<Set<number>>(new Set());
   let inflight: AsyncGuard | null = null;
 
   function emptyContext(error: string): GitHubContext {
@@ -60,7 +62,7 @@
       ctx = next;
     } catch (err) {
       if (!guard.isLive()) return;
-      ctx = emptyContext(String(err));
+      ctx = emptyContext(formatError(err));
     } finally {
       if (guard.isLive()) loading = false;
     }
@@ -79,7 +81,7 @@
   $effect(() => {
     const repo = $repoStore.currentPath;
     ctx = null;
-    checkingOut = null;
+    checkingOut = new Set();
     if (!repo) {
       inflight?.cancel();
       loading = false;
@@ -121,7 +123,9 @@
   async function checkoutPr(number: number) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    checkingOut = number;
+    // Track per-id so concurrent checkouts cannot clobber each other's
+    // spinner state; while any is running every button is disabled.
+    checkingOut.add(number);
     try {
       await invoke("cmd_github_checkout_pr", {
         repoPath: repo,
@@ -133,14 +137,14 @@
       await graphStore.loadGraph(repo);
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) {
-        repoStore.setError(String(err));
+        repoStore.setError(formatError(err));
       }
     } finally {
-      // Reset unconditionally: this component remounts per repo ({#key} on
-      // currentPath), so a stale settle after a switch cannot clobber a newer
-      // instance — but a path-gated reset here would strand the spinner when
-      // the user switches repos mid-checkout.
-      checkingOut = null;
+      // Clear only this id unconditionally: this component remounts per repo
+      // ({#key} on currentPath), so a stale settle after a switch cannot
+      // clobber a newer instance — but a path-gated reset here would strand
+      // the spinner when the user switches repos mid-checkout.
+      checkingOut.delete(number);
     }
   }
 </script>
@@ -202,9 +206,9 @@
                   <button
                     type="button"
                     onclick={() => void checkoutPr(pr.number)}
-                    disabled={checkingOut === pr.number}
-                    class="gp-icon-btn hover:text-accent disabled:opacity-40"
-                    title="Checkout pull request"
+                    disabled={checkingOut.size > 0}
+                    class="gp-icon-btn hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={checkingOut.has(pr.number) ? "Checking out…" : "Checkout pull request"}
                   >
                     <GitBranch size={14} />
                   </button>

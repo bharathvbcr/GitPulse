@@ -1,3 +1,5 @@
+import type { PolicyVerdict } from "../stores/harnessStore";
+
 export interface BranchCleanupCandidate {
   name: string;
   last_summary: string;
@@ -61,6 +63,8 @@ export interface ReleasePublishResult {
   tag: string;
   remote: string;
   created_tag: boolean;
+  /** Mirrors Rust `ReleasePublishResult::tag_policy: Option<PolicyVerdict>` (no serde rename). */
+  tag_policy?: PolicyVerdict | null;
   output: string;
 }
 

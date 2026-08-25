@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { Percent, RefreshCw, FileCode } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { formatError } from "../ui/formatError";
   import {
     coverageBarColor,
     coverageHitClass,
@@ -41,7 +42,7 @@
       }
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      scanError = String(err);
+      scanError = formatError(err);
     } finally {
       if (guard.isLive()) isScanning = false;
     }
@@ -122,7 +123,7 @@
         }
       } catch (err: unknown) {
         if (!cancelled) {
-          fileError = String(err);
+          fileError = formatError(err);
           sourceLines = [];
           hitMap = new Map();
         }

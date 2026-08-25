@@ -5,6 +5,7 @@
   import { askConfirm, askText } from "../stores/modalStore";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
+  import { formatError } from "../ui/formatError";
   import {
     branchLeafName,
     countFolder,
@@ -21,6 +22,7 @@
     type TagRow,
   } from "../branches/flattenRows";
   import type { BranchFilterTab, BranchSection } from "../branches/types";
+  import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { computeWindow } from "../dom/virtualWindow";
   import { portal } from "../dom/portal";
   import ChurnBar from "./ChurnBar.svelte";
@@ -71,6 +73,7 @@
   let workAdd = $derived($repoStore.statuses.reduce((n, s) => n + (s.additions || 0), 0));
   let workDel = $derived($repoStore.statuses.reduce((n, s) => n + (s.deletions || 0), 0));
   let statsPending = $derived($repoStore.statsPending ?? false);
+  let statsFailed = $derived($repoStore.statsFailed ?? false);
 
   // Grouping, filtering, and flattening pipeline
   let groupedSections = $derived(groupBranches($repoStore.branches, $repoStore.tags, pinnedNames));
@@ -281,22 +284,28 @@
   async function submitCreate() {
     const name = createName.trim();
     if (!name) return;
-    await repoStore.createBranch(name);
+    const outcome = await repoStore.createBranch(name);
+    // F14: a failed create keeps the form open and the typed name intact.
+    if (!outcome.ok) return;
     createName = "";
     creating = false;
   }
 
   async function suggestName() {
-    if (!$repoStore.currentPath) return;
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
     suggesting = true;
     try {
       const gen = await invoke<{ text: string }>("cmd_ai_suggest_branch_name", {
-        repoPath: $repoStore.currentPath,
+        repoPath: repo,
       });
+      // The suggestion raced a tab switch: it belongs to another repo now.
+      if ($repoStore.currentPath !== repo) return;
       const raw = (gen?.text || "").trim().split(/\s+/)[0] || "";
       if (raw) createName = raw.replace(/^[#`]+/, "").replace(/[`]+$/, "");
     } catch (err) {
-      repoStore.setError(String(err));
+      if ($repoStore.currentPath !== repo) return;
+      repoStore.setError(formatError(err));
     } finally {
       suggesting = false;
     }
@@ -312,6 +321,13 @@
     e.preventDefault();
     e.stopPropagation();
     menu = { x: e.clientX, y: e.clientY, tag };
+  }
+
+  // A background refresh can land while the menu is open; actions must run
+  // against the branch as it exists NOW (is_current/is_remote gating), not
+  // the snapshot captured at right-click time.
+  function liveBranch(stale: BranchInfo): BranchInfo {
+    return $repoStore.branches.find((b) => b.name === stale.name && b.is_remote === stale.is_remote) ?? stale;
   }
 
   async function copyText(value: string) {
@@ -343,12 +359,27 @@
 
   async function runDelete(branch: BranchInfo) {
     menu = null;
+    // Two-step escalation (WorktreesPanel's armed remove is the house style):
+    // the first confirm runs the SAFE delete. Only an explicit second confirm
+    // — shown when git refused because the branch is unmerged — retries with
+    // force. The backend still refuses force-deletes of the default branch or
+    // any worktree-checked-out branch regardless of what this dialog offers.
     const ok = await askConfirm({
       title: "Delete branch",
       message: `Delete branch ${branch.name}?`,
       confirmLabel: "Delete",
     });
     if (!ok) return;
+    const outcome = await repoStore.deleteBranch(branch.name, false);
+    if (outcome.ok) return;
+    const decision = escalateDeleteDecision(outcome.error ?? "", branch);
+    if (!decision.canRetryForce || !decision.message) return;
+    const forceOk = await askConfirm({
+      title: "Force-delete branch",
+      message: decision.message,
+      confirmLabel: "Force delete",
+    });
+    if (!forceOk) return;
     await repoStore.deleteBranch(branch.name, true);
   }
 
@@ -417,7 +448,8 @@
       type="button"
       onclick={(e) => togglePin(branch.name, e)}
       title={isPinned ? "Unpin branch" : "Pin branch to top"}
-      class="p-0.5 rounded-full text-textMuted hover:text-amber-400 transition-opacity shrink-0 {isPinned ? 'text-amber-400 opacity-100' : 'opacity-0 group-hover:opacity-60'}"
+      aria-label={isPinned ? "Unpin branch" : "Pin branch to top"}
+      class="p-0.5 rounded-full text-textMuted hover:text-amber-400 transition-opacity shrink-0 {isPinned ? 'text-amber-400 opacity-100' : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60'}"
     >
       <Star size={11} class={isPinned ? "fill-amber-400" : ""} />
     </button>
@@ -444,6 +476,9 @@
     <div class="flex items-center gap-1 shrink-0 opacity-90">
       {#if statsPending && statsMissing}
         <span class="inline-block w-6 h-1 rounded-full bg-border/70 animate-pulse" aria-hidden="true"></span>
+      {:else if statsFailed && statsMissing}
+        <!-- Stats fetch failed outright: a dimmed static marker instead of zeros pretending "no churn". -->
+        <span class="inline-block w-6 h-1 rounded-full bg-rose-500/20 opacity-60" title="Churn unavailable (stats failed)" aria-hidden="true"></span>
       {/if}
       {#if branch.additions > 0 || branch.deletions > 0}
         <ChurnBar additions={branch.additions} deletions={branch.deletions} />
@@ -466,12 +501,13 @@
       {/if}
       <button
         type="button"
-        class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
+        class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
         onclick={(e) => {
           e.stopPropagation();
           openBranchMenu(e, branch);
         }}
         title="Branch actions"
+        aria-label="Branch actions"
       >
         <MoreHorizontal size={12} />
       </button>
@@ -500,6 +536,7 @@
   <button
     type="button"
     onclick={() => toggle(row.folderId, "local")}
+    aria-expanded={!closed}
     class="gp-cv-row w-full h-[26px] flex items-center gap-1.5 text-[11px] font-semibold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
     style="padding-left: {8 + row.depth * 12}px"
   >
@@ -518,6 +555,7 @@
   <button
     type="button"
     onclick={() => toggle(row.sectionId, row.section.kind)}
+    aria-expanded={!closed}
     class="sticky top-0 z-10 h-[26px] bg-surface w-full flex items-center gap-1 px-2 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
   >
     {#if closed}
@@ -540,11 +578,16 @@
 {/snippet}
 
 <!-- Container with full keyboard navigation support -->
+<!--
+  Deliberately NOT a strict ARIA tree: correct semantics need treeitem/group
+  children with roving tabindex; faking it announces broken structure to
+  screen readers. Rows stay real buttons so native semantics carry instead.
+-->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
 <div
   class="flex flex-col h-full focus:outline-none"
-  tabindex="0"
   role="tree"
+  tabindex="0"
   onkeydown={handleKeydown}
 >
   <!-- Header Bar -->
@@ -734,7 +777,7 @@
     onkeydown={(e) => e.key === "Escape" && (menu = null)}
   >
     {#if menu.branch}
-      {@const b = menu.branch}
+      {@const b = liveBranch(menu.branch)}
       <button class="gp-menu-item" onclick={() => { const name = b.name; menu = null; togglePin(name); }}>
         <Star size={12} class={pinnedNames.has(b.name) ? "fill-amber-400 text-amber-400" : ""} />
         {pinnedNames.has(b.name) ? "Unpin branch" : "Pin branch"}

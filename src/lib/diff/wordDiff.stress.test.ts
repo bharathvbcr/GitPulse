@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   annotateRange,
+  classifyMetaLine,
   computeWordDiff,
+  filterFilePatch,
   parseUnifiedDiff,
   type DiffSegment,
   type IntraLineDiff,
@@ -249,5 +251,282 @@ describe("parseUnifiedDiff + annotateRange stress: 200-line document", () => {
     for (const add of adds) {
       expect(add.segments?.length).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave-2 adversarial additions: parseUnifiedDiff / filterFilePatch attacks.
+// Every expectation below was pinned against the current wordDiff.ts
+// implementation; anything the code gets wrong is marked it.fails with a BUG.
+// ---------------------------------------------------------------------------
+
+describe("parseUnifiedDiff stress: header degeneracy", () => {
+  it("reduces an empty payload to a single phantom meta row (characterization)", () => {
+    // "".split("\n") is [""], and the empty string falls into the
+    // outside-hunk else branch → one {type:"meta", content:""} row. The UI
+    // filters meta rows, so this is invisible today — pinned so a renderer
+    // that starts trusting row counts knows.
+    expect(parseUnifiedDiff("")).toEqual([{ type: "meta", content: "" }]);
+    // `raw || ""` also guards nullish callers.
+    expect(parseUnifiedDiff(undefined as unknown as string)).toEqual([
+      { type: "meta", content: "" },
+    ]);
+  });
+
+  it("classifies a lone '@' outside a hunk as meta, not content", () => {
+    const rows = parseUnifiedDiff("@");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].type).toBe("meta");
+  });
+
+  it("keeps a lone '@' inside a hunk as context that advances both counters", () => {
+    // Pinned characterization: "@" satisfies PATCH_BODY_PREFIX_RE (^[-+ \\@]),
+    // so once inHunk is true it is treated as real file content and bumps
+    // oldNo/newNo like any other context line. Harmless for git-produced
+    // patches (a body line can never be bare "@"), pinned so hostile input
+    // cannot crash or stall numbering here.
+    const rows = parseUnifiedDiff("@@ -10,2 +10,2 @@\n@\n ctx");
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "ctx"]);
+    expect(rows[1].oldNo).toBe(10);
+    expect(rows[1].newNo).toBe(10);
+    expect(rows[2].oldNo).toBe(11);
+    expect(rows[2].newNo).toBe(11);
+  });
+
+  it("treats any '@@'-prefixed line as a header even when HUNK_RE cannot parse numbers", () => {
+    // "@@" alone or "@@ garbage" becomes a hdr row with inHunk set, but the
+    // counters are NEVER reset — subsequent body lines are numbered against
+    // the STALE previous header. Characterized, not endorsed.
+    const rows = parseUnifiedDiff("@@ -5,1 +5,1 @@\n-a\n@@\n+b");
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "del", "hdr", "add"]);
+    expect(rows[1].oldNo).toBe(5);
+    expect(rows[3].newNo).toBe(5); // stale "+5" header kept counting from 5
+  });
+
+  it("never throws on '@@' with NUL bytes or lone surrogates embedded", () => {
+    expect(() => parseUnifiedDiff("@@ -\u0000 +\u0000 @@\n+\u0000x")).not.toThrow();
+    expect(() => parseUnifiedDiff("+\uD800 next")).not.toThrow();
+    const rows = parseUnifiedDiff("+\uD800 tail");
+    expect(rows[0].type).toBe("add");
+    // The unpaired surrogate must survive byte-for-byte into the row content.
+    expect(rows[0].content).toBe("+\uD800 tail");
+  });
+});
+
+describe("computeWordDiff stress: lone-surrogate inputs", () => {
+  it("reconstructs lines built from unpaired surrogates losslessly", () => {
+    const diff = computeWordDiff("\uD800abc", "\uD800abd");
+    expect(diff.original_segments.map((s) => s.text).join("")).toBe("\uD800abc");
+    expect(diff.modified_segments.map((s) => s.text).join("")).toBe("\uD800abd");
+  });
+});
+
+describe("parseUnifiedDiff stress: malformed hunk counts", () => {
+  it("emits exactly the body lines when counts over-declare", () => {
+    // Header claims 3 new lines but only one follows. The parser never reads
+    // the counts beyond the start offsets, so no phantom rows appear.
+    const rows = parseUnifiedDiff("@@ -1,1 +1,3 @@\n+only");
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "add"]);
+    expect(rows[1].newNo).toBe(1);
+  });
+
+  it("keeps classifying extra body lines that overrun the declared count", () => {
+    // Two deletions where the header declares one: both must stay del rows
+    // and advance oldNo monotonically — count under-run must not silently
+    // re-type trailing body lines as context or metadata.
+    const rows = parseUnifiedDiff("@@ -7,1 +7,0 @@\n-first\n-second\n");
+    expect(rows.filter((r) => r.type === "del").map((r) => r.oldNo)).toEqual([7, 8]);
+  });
+});
+
+describe("parseUnifiedDiff stress: CR handling", () => {
+  it("treats a CR-only payload as ONE line, not many", () => {
+    // split("\n") never splits on \r: classic-Mac line endings yield a single
+    // giant row whose type comes from its first character. Content keeps the
+    // type prefix (annotateRange strips it via slice(1)). No hang, no throw.
+    const rows = parseUnifiedDiff("-a\rb\rc");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].type).toBe("del");
+    expect(rows[0].content).toBe("-a\rb\rc");
+  });
+
+  it("parses CRLF hunk headers because HUNK_RE is end-unanchored", () => {
+    const rows = parseUnifiedDiff("@@ -3,1 +3,1 @@\r\n ctx\r\n-old\r\n+new\r\n");
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "del", "add", "ctx"]);
+    expect(rows[0].content.endsWith("\r")).toBe(true);
+    expect(rows[1].oldNo).toBe(3);
+    expect(rows[3].content).toBe("+new\r");
+    // The leading ctx already consumed one number from each side.
+    expect(rows[3].newNo).toBe(4);
+    // The final "" from the trailing \n lands inside the hunk → one phantom
+    // ctx row that bumps both counters. Characterized; renderers show it as
+    // an empty line exactly like git's own blank context lines.
+    expect(rows[4]).toEqual({ type: "ctx", content: "", oldNo: 5, newNo: 5 });
+  });
+
+  it("handles mixed LF and CRLF endings in one payload without throwing", () => {
+    const raw = "@@ -1,2 +1,2 @@\n keep\r\n-del\r\n+add";
+    const rows = parseUnifiedDiff(raw);
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "del", "add"]);
+    expect(rows[1]).toMatchObject({ oldNo: 1, newNo: 1 });
+    expect(rows[2].oldNo).toBe(2);
+    expect(rows[3].newNo).toBe(2);
+  });
+});
+
+describe("parseUnifiedDiff stress: performance bounds", () => {
+  it("parses a 1MB single-line addition in under 2000ms", () => {
+    const huge = "+" + "x".repeat(1_000_000);
+    console.time("parseUnifiedDiff:1MB-line");
+    const startedAt = performance.now();
+    const rows = parseUnifiedDiff(huge);
+    const elapsedMs = performance.now() - startedAt;
+    console.timeEnd("parseUnifiedDiff:1MB-line");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].type).toBe("add");
+    expect(elapsedMs).toBeLessThan(2_000);
+  });
+
+  it("parses a 50k-line payload in under 3000ms", () => {
+    const lines: string[] = ["@@ -1,25000 +1,25000 @@"];
+    for (let i = 0; i < 25_000; i += 1) {
+      lines.push(`-${"lorem ipsum dolor ".repeat(4)}${i}`, `+${"lorem ipsum dolor ".repeat(4)}EDITED`);
+    }
+    const raw = lines.join("\n");
+    const startedAt = performance.now();
+    const rows = parseUnifiedDiff(raw);
+    const elapsedMs = performance.now() - startedAt;
+    expect(rows).toHaveLength(50_001);
+    expect(rows.filter((r) => r.type === "add")).toHaveLength(25_000);
+    expect(elapsedMs).toBeLessThan(3_000);
+  });
+});
+
+describe("parseUnifiedDiff stress: --- / +++ inside hunk bodies", () => {
+  it("types a deleted line whose content starts with '--' as del, not hdr", () => {
+    // Removing a Markdown horizontal rule / front-matter fence renders as a
+    // body line starting with "---". Git disambiguates via the hunk counts;
+    // header classification is gated on being outside any hunk body, so the
+    // deletion stays a del row and annotateRange can pair it.
+    const rows = parseUnifiedDiff(
+      ["@@ -1,3 +1,2 @@", " title", "---", " body", "+kept"].join("\n")
+    );
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "del", "ctx", "add"]);
+  });
+
+  it("types an added line whose content starts with '++' as add, not hdr", () => {
+    // Adding a line whose CONTENT begins with "++" (e.g. a diff sample or
+    // C++ pre/post-increment sample) renders the patch line "+++ ...",
+    // which stays an add row inside the hunk body.
+    const rows = parseUnifiedDiff(
+      ["@@ -1,2 +1,3 @@", " title", "+++ bold intro", " body"].join("\n")
+    );
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "add", "ctx"]);
+  });
+
+  it("still routes real per-file headers outside hunks to hdr", () => {
+    // Guarding the two BUG pins above: outside any hunk the classic header
+    // pair must keep working.
+    const rows = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b");
+    expect(rows.slice(0, 2).map((r) => r.type)).toEqual(["hdr", "hdr"]);
+    expect(rows.slice(3).map((r) => r.type)).toEqual(["del", "add"]);
+  });
+});
+
+describe("parseUnifiedDiff stress: \\ No newline markers", () => {
+  it("keeps consecutive no-newline markers as hdr rows between del/add pairs", () => {
+    const rows = parseUnifiedDiff(
+      [
+        "@@ -1,2 +1,2 @@",
+        " fn a() {}",
+        "-fn b()",
+        "\\ No newline at end of file",
+        "+fn b() {}",
+        "\\ No newline at end of file",
+      ].join("\n")
+    );
+    expect(rows.map((r) => r.type)).toEqual([
+      "hdr", "ctx", "del", "hdr", "add", "hdr",
+    ]);
+    // The markers must not disturb the counters feeding neighboring rows.
+    expect(rows[2].oldNo).toBe(2);
+    expect(rows[4].newNo).toBe(2);
+  });
+});
+
+describe("parseUnifiedDiff stress: commit meta interleaved mid-hunk", () => {
+  it("emits meta rows mid-hunk but keeps numbering alive across them", () => {
+    // `git show` noise landing inside a body must become a meta row while the
+    // surrounding +/-/space lines continue counting from the same header.
+    // Deletions only advance oldNo and additions only newNo, so after "-a"
+    // (oldNo 20→21) the following "+b" still carries the untouched newNo 20.
+    const rows = parseUnifiedDiff(
+      ["@@ -20,3 +20,3 @@", "-a", "index 111..222 100644", "+b"].join("\n")
+    );
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "del", "meta", "add"]);
+    expect(rows[1].oldNo).toBe(20);
+    expect(rows[3].newNo).toBe(20);
+  });
+
+  it("closes the hunk on 'diff --git' so prose after files stays meta", () => {
+    const rows = parseUnifiedDiff(
+      ["diff --git a/x b/x", "@@ -1 +1 @@", "-a", "+b", "diff --git a/y b/y", "trailing prose"]
+        .join("\n")
+    );
+    expect(rows.at(-1)!.type).toBe("meta");
+  });
+});
+
+describe("classifyMetaLine vs filterFilePatch agreement", () => {
+  const twoFilePayload = [
+    "diff --git a/src/a.rs b/src/a.rs",
+    "index 111..222 100644",
+    "--- a/src/a.rs",
+    "+++ b/src/a.rs",
+    "@@ -1 +1 @@",
+    "-a",
+    "+b",
+    "diff --git a/sp ace/uniﬁé😀.txt b/sp ace/uniﬁé😀.txt",
+    "index 333..444 100644",
+    "--- a/sp ace/uniﬁé😀.txt",
+    "+++ b/sp ace/uniﬁé😀.txt",
+    "@@ -1 +1 @@",
+    "-old 😀",
+    "+new 😀",
+  ].join("\n");
+
+  it("extracts exactly the matching section and nothing else", () => {
+    const patch = filterFilePatch(twoFilePayload, "sp ace/uniﬁé😀.txt");
+    expect(patch).toContain("diff --git a/sp ace/uniﬁé😀.txt");
+    expect(patch).toContain("+new 😀");
+    expect(patch).not.toContain("src/a.rs");
+    // Re-parsing the kept section standalone: its own header block rides
+    // along (diff --git + index classify as meta, ---/+++ as hdr), and the
+    // hunk body stays exactly del/add — nothing from the OTHER file leaks in.
+    const types = parseUnifiedDiff(patch).map((r) => r.type);
+    expect(types).toEqual(["meta", "meta", "hdr", "hdr", "hdr", "del", "add"]);
+  });
+
+  it("returns empty string — not a throw — when no section matches", () => {
+    expect(filterFilePatch(twoFilePayload, "nope/missing.txt")).toBe("");
+    expect(filterFilePatch(twoFilePayload, "")).toBe("");
+    expect(filterFilePatch("", "any.txt")).toBe("");
+    // Empty input reduces to the single phantom meta row (see header
+    // degeneracy suite) — never a throw.
+    expect(parseUnifiedDiff("")).toEqual([{ type: "meta", content: "" }]);
+  });
+
+  it("agrees with classifyMetaLine: meta-classified lines never leak into a kept patch body", () => {
+    // For every line of every kept section, anything classifyMetaLine calls
+    // meta/binary sits only in the header block before the first hunk.
+    const patch = filterFilePatch(twoFilePayload, "src/a.rs");
+    let seenHunk = false;
+    for (const line of patch.split("\n")) {
+      if (line.startsWith("@@")) seenHunk = true;
+      if (seenHunk && classifyMetaLine(line)) {
+        throw new Error(`meta leaked into hunk body: ${JSON.stringify(line)}`);
+      }
+    }
+    expect(seenHunk).toBe(true);
   });
 });

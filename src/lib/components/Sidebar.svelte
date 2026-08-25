@@ -1,5 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { displayName } from "../repos/paths";
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
   import WorktreesPanel from "./WorktreesPanel.svelte";
@@ -29,7 +30,7 @@
     <div class="flex items-center gap-2 truncate">
       <FolderGit2 size={15} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No Repo"}>
-        {$repoStore.currentPath ? $repoStore.currentPath.split("/").pop() : "No Repository"}
+        {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No Repository"}
       </span>
     </div>
     <button
@@ -71,7 +72,13 @@
               tabindex="0"
               class="px-2 py-1 rounded-full flex items-center justify-between hover:bg-surfaceHover text-textPrimary group transition-colors cursor-pointer"
               onclick={() => repoStore.selectFileDiff(f.path, true)}
-              onkeydown={(e) => (e.key === "Enter" || e.key === " ") && repoStore.selectFileDiff(f.path, true)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  // Space would otherwise scroll the ancestor scroller.
+                  e.preventDefault();
+                  repoStore.selectFileDiff(f.path, true);
+                }
+              }}
             >
               <span class="truncate text-green-400 font-mono text-[11px]">{f.path}</span>
               <button
@@ -122,7 +129,13 @@
               tabindex="0"
               class="px-2 py-1 rounded-full flex items-center justify-between hover:bg-surfaceHover text-textPrimary group transition-colors cursor-pointer"
               onclick={() => repoStore.selectFileDiff(f.path, false)}
-              onkeydown={(e) => (e.key === "Enter" || e.key === " ") && repoStore.selectFileDiff(f.path, false)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  // Space would otherwise scroll the ancestor scroller.
+                  e.preventDefault();
+                  repoStore.selectFileDiff(f.path, false);
+                }
+              }}
             >
               <span class="truncate font-mono text-[11px] {f.is_conflicted ? 'text-amber-400 font-bold' : 'text-textPrimary'}">{f.path}</span>
               <button

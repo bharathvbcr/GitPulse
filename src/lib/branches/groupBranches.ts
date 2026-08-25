@@ -81,10 +81,14 @@ export function isStaleBranch(timestamp: number, nowSec: number = Date.now() / 1
   return nowSec - timestamp > STALE_SECONDS;
 }
 
+// One collator shared by every sort site: constructing Intl.Collator per
+// comparison is the expensive part, and grouping sorts thousands of names.
+const nameCollator = new Intl.Collator();
+
 function compareBranches(a: BranchInfo, b: BranchInfo): number {
   if (a.is_current !== b.is_current) return a.is_current ? -1 : 1;
   if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
-  return a.name.localeCompare(b.name);
+  return nameCollator.compare(a.name, b.name);
 }
 
 function splitPath(name: string): { folders: string[]; leaf: string } {
@@ -137,7 +141,7 @@ function insertBranch(
 }
 
 function sortFolder(folder: BranchFolder) {
-  folder.folders.sort((a, b) => a.label.localeCompare(b.label));
+  folder.folders.sort((a, b) => nameCollator.compare(a.label, b.label));
   folder.branches.sort(compareBranches);
   folder.folders.forEach(sortFolder);
 }
@@ -147,7 +151,7 @@ export function countFolder(folder: BranchFolder): number {
 }
 
 function sortSection(section: BranchSection) {
-  section.folders.sort((a, b) => a.label.localeCompare(b.label));
+  section.folders.sort((a, b) => nameCollator.compare(a.label, b.label));
   section.branches.sort(compareBranches);
   section.folders.forEach(sortFolder);
   section.branchCount =
@@ -216,7 +220,7 @@ export function groupBranches(
   }
 
   sortSection(local);
-  const remoteSections = [...remotes.values()].sort((a, b) => a.label.localeCompare(b.label));
+  const remoteSections = [...remotes.values()].sort((a, b) => nameCollator.compare(a.label, b.label));
   remoteSections.forEach(sortSection);
 
   const sections: BranchSection[] = [];
@@ -238,7 +242,7 @@ export function groupBranches(
   sections.push(...remoteSections);
 
   if (tags.length > 0) {
-    const sorted = [...tags].sort((a, b) => b.name.localeCompare(a.name));
+    const sorted = [...tags].sort((a, b) => nameCollator.compare(b.name, a.name));
     sections.push({
       id: "tags",
       label: "Tags",

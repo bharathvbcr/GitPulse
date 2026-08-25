@@ -956,6 +956,80 @@ describe("repoStore branch stats", () => {
     expect(local).toMatchObject({ additions: 3 });
     expect(remote).toMatchObject({ additions: 9 });
   });
+
+  it("flags statsFailed on a failed drain and clears it after the next success", async () => {
+    const path = "/r/stats-failed";
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("Command not found: cmd_branch_stats");
+        return statsFor(path) as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo(path);
+    await flushMicro();
+
+    // Failure: pending is over AND the failure marker is lit, together —
+    // rows must not read as "still computing" or as real zeros.
+    expect(get(store)).toMatchObject({ statsPending: false, statsFailed: true });
+
+    await store.refresh();
+    await flushMicro();
+    expect(calls).toBe(2);
+    expect(get(store)).toMatchObject({ statsPending: false, statsFailed: false });
+    expect(get(store).branches[0].additions).toBe(10);
+  });
+
+  it("keeps statsFailed clear when a capped drain recovers mid-flight", async () => {
+    const path = "/r/drain-recover";
+    const branches = [branchFor(`${path}-main`, "abc", { is_current: true }), branchFor("feat", "tip-f")];
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_list_branches: async () => branches as never,
+      cmd_branch_stats: async () => {
+        calls += 1;
+        if (calls < 3) {
+          return {
+            compared_to: `${path}-main`,
+            updates: [],
+            computed: 0,
+            cached: 96,
+            capped: true,
+          } as never;
+        }
+        return { compared_to: `${path}-main`, updates: [churnFor("feat", "tip-f", 5)], computed: 1, cached: 0, capped: false } as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo(path);
+    await flushMicro();
+
+    expect(calls).toBe(3);
+    expect(get(store)).toMatchObject({ statsPending: false, statsFailed: false });
+    expect(get(store).branches.find((b) => b.name === "feat")?.additions).toBe(5);
+  });
+
+  it("does not mark the active session statsFailed when an orphaned fetch aborts on generation", async () => {
+    const stats = deferred<unknown>();
+    const invoke = makeInvoke({ cmd_branch_stats: async () => stats.promise as never });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/race-fail");
+    expect(get(store).statsPending).toBe(true);
+
+    await store.openRepo("/r/race-other");
+    await store.activateTab(get(store).openTabs[0].id);
+    stats.reject(new Error("aborted"));
+    await flushMicro();
+
+    const state = get(store);
+    expect(state.currentPath).toBe("/r/race-fail");
+    expect(state.statsPending).toBe(false);
+    // The abort is not a failure of THIS session's data; nothing was lost.
+    expect(state.statsFailed).toBe(false);
+    expect(state.error).toBeNull();
+  });
 });
 
 describe("repoStore status poll lifecycle", () => {

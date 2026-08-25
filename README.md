@@ -19,6 +19,14 @@ It runs entirely on your machine; GitHub features go through your locally instal
 - **Conflict resolution** — parse and resolve merge conflicts in a dedicated editor.
 - **Blame** — per-line authorship viewer.
 - **Coverage** — discovers coverage artifacts in the repository and shows per-file line coverage.
+- **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
+  objects, reflogs, LFS, submodule stores), build-output and cache directories across
+  ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
+  still holding committed files), oversized working-tree files, linked-worktree sizes, and
+  merged-stale branch weight that links into MANVI's cleanup plan. Every completed scan records
+  a per-repository snapshot locally, so growth is visible over time ("+180 MB this week") via a
+  trend sparkline and deltas. Walks are budgeted and never follow symlinks; a hostile or huge
+  repository degrades into an honest "partial scan" instead of a hang.
 - **Dependency health** — npm manifest analysis with audit/vulnerability and outdated-package reports,
   plus open GitHub Dependabot alerts (via `gh`) unified in the Health view. Copy the whole report
   as text, or send it through the MANVI harness's local model for a remediation plan (advisory
@@ -97,8 +105,9 @@ lib/stores/      workspace state       graph/      lane solving, folding
 lib/repos/       tab model, persist    diff/       diffs + conflicts
 lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
                                                  deps health
-        ▲ │                            stack/      stacked branches
-        └─┴── invoke() ──► cmd_* ──►   github/ watcher/ harness/ ai/ desktop/
+         ▲ │                            stack/      stacked branches
+         └─┴── invoke() ──► cmd_* ──►   storage/    disk usage + history
+                                        github/ watcher/ harness/ ai/ desktop/
 ```
 
 - **No router.** Screens are members of the `ViewTab` union (`src/lib/repos/persist.ts`);

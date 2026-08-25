@@ -18,6 +18,7 @@
   } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
   import { formatDate, shortHash } from "../format";
+  import { formatError } from "../ui/formatError";
 
   interface CommitFileChange {
     path: string;
@@ -102,7 +103,7 @@
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       if (currentCommitId !== id || $repoStore.currentPath !== path) return;
-      explainError = String(err);
+      explainError = formatError(err);
     } finally {
       if (guard.isLive()) isExplaining = false;
     }

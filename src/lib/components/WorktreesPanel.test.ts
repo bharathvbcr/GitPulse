@@ -21,3 +21,30 @@ describe("WorktreesPanel agent worktree affordances", () => {
     expect(source).toContain("cmd_list_worktrees");
   });
 });
+
+describe("WorktreesPanel removal safety", () => {
+  it("passes --force only when the worktree scan found no changes", () => {
+    expect(source).toContain("const force = (wt.dirty_files ?? 0) === 0;");
+    // The invoke must carry the computed flag, never a literal true.
+    expect(source).not.toMatch(/cmd_remove_worktree[\s\S]{0,120}?force:\s*true/);
+    expect(source).toMatch(/cmd_remove_worktree[\s\S]{0,120}?force\s*\}/);
+  });
+
+  it("names the discard cost in the armed confirm when files would be lost", () => {
+    expect(source).toContain("`Discard ${dirty} changed files? Click again to remove`");
+    expect(source).toContain("`Discard ${wt.dirty_files} changed files?`");
+  });
+
+  it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
+    const guardIdx = source.indexOf("$repoStore.currentPath === wt.path");
+    expect(guardIdx).toBeGreaterThan(-1);
+    const closeIdx = source.indexOf("repoStore.closeTab(stranded.id)");
+    expect(closeIdx).toBeGreaterThan(guardIdx);
+  });
+
+  it("preserves the concurrent-session currentPath guards after the await", () => {
+    const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(2);
+    expect(fn).toContain("await load()");
+  });
+});

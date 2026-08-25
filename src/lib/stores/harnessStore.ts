@@ -1,5 +1,6 @@
 import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../ui/formatError";
 import {
   appendAction,
   makeAgentAction,
@@ -208,7 +209,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       return ai;
     } catch (err: any) {
       if (token !== probeToken) return null;
-      update((s) => ({ ...s, isProbing: false, error: s.error ?? String(err) }));
+      update((s) => ({ ...s, isProbing: false, error: s.error ?? formatError(err) }));
       return null;
     }
   }
@@ -225,7 +226,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         update((s) => ({ ...s, harness }));
       } catch (err: any) {
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, error: String(err) }));
+        update((s) => ({ ...s, error: formatError(err) }));
       }
       return probeAi(token);
     },
@@ -242,7 +243,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         update((s) => ({ ...s, harness }));
       } catch (err: any) {
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, error: String(err) }));
+        update((s) => ({ ...s, error: formatError(err) }));
       }
       return probeAi(token);
     },

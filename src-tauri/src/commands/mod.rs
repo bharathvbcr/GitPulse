@@ -615,6 +615,14 @@ pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport,
     off_thread(move || DepsScanner::scan(&repo_path)).await
 }
 
+/// Full disk-usage scan of the repository (git internals, build/cache
+/// artifacts, large files, worktrees, stale-branch weight). The walk is
+/// budgeted and never follows symlinks; see `crate::storage`.
+#[tauri::command(async)]
+pub async fn cmd_storage_scan(repo_path: String) -> Result<crate::storage::StorageReport, String> {
+    off_thread(move || crate::storage::scan_storage(&repo_path)).await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_branch_cleanup_plan(
     repo_path: String,

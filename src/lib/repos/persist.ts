@@ -18,6 +18,7 @@ export type ViewTab =
   | "blame"
   | "coverage"
   | "health"
+  | "storage"
   | "stack"
   | "github"
   | "manvi"
@@ -30,6 +31,7 @@ export const VIEW_TABS: readonly ViewTab[] = [
   "blame",
   "coverage",
   "health",
+  "storage",
   "stack",
   "github",
   "manvi",

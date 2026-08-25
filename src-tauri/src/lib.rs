@@ -9,6 +9,7 @@ pub mod graph;
 pub mod harness;
 pub mod ops;
 pub mod stack;
+pub mod storage;
 pub mod watcher;
 
 use commands::*;
@@ -72,6 +73,7 @@ pub fn run() {
             cmd_scan_coverage,
             cmd_get_file_coverage,
             cmd_scan_deps_health,
+            cmd_storage_scan,
             cmd_branch_cleanup_plan,
             cmd_review_outgoing_commits,
             cmd_fetch,

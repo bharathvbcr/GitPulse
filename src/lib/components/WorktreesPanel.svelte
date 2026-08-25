@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { formatError } from "../ui/formatError";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -66,7 +67,7 @@
       worktrees = next;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      error = String(err);
+      error = formatError(err);
     } finally {
       if (guard.isLive()) isLoading = false;
     }
@@ -83,7 +84,7 @@
       }
       await load();
     } catch (err: unknown) {
-      error = String(err);
+      error = formatError(err);
     }
   }
 
@@ -94,7 +95,7 @@
       await invoke("cmd_prune_worktree", { repoPath: repo });
       await load();
     } catch (err: unknown) {
-      error = String(err);
+      error = formatError(err);
     }
   }
 
@@ -125,10 +126,19 @@
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree", label: newPath.trim(), ok: false });
-      error = String(err);
+      error = formatError(err);
     } finally {
       isCreating = false;
     }
+  }
+
+  /** Armed-confirm label; names the discard cost when changes would be lost. */
+  function removeArmTitle(wt: WorktreeInfo): string {
+    if (removingPath !== wt.path) return "Remove this worktree";
+    const dirty = wt.dirty_files ?? 0;
+    return dirty > 0
+      ? `Discard ${dirty} changed files? Click again to remove`
+      : "Click again to remove";
   }
 
   async function remove(wt: WorktreeInfo) {
@@ -147,16 +157,27 @@
       return;
     }
     removingPath = null;
+    // A dirty worktree must not be silently discarded: --force only when the
+    // status scan found nothing to lose (dirty_files === null means "not
+    // scanned", treated as clean so removal stays one confirm).
+    const force = (wt.dirty_files ?? 0) === 0;
     try {
-      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force: true });
+      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force });
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: true });
-      if ($repoStore.currentPath === wt.path) return;
+      if ($repoStore.currentPath === wt.path) {
+        // T-F09: the active tab points INTO the removed directory. Close it —
+        // which activates a surviving neighbor — instead of stranding the
+        // workspace on a deleted path.
+        const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+        if (stranded) await repoStore.closeTab(stranded.id);
+        return;
+      }
       await load();
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: false });
-      error = String(err);
+      error = formatError(err);
     }
   }
 
@@ -279,9 +300,15 @@
                   <Lock size={11} />
                 {/if}
               </button>
+              {#if removingPath === wt.path}
+                <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
+                  {(wt.dirty_files ?? 0) > 0 ? `Discard ${wt.dirty_files} changed files?` : "Remove?"}
+                </span>
+              {/if}
               <button
                 onclick={() => void remove(wt)}
-                title={removingPath === wt.path ? "Click again to remove" : "Remove this worktree"}
+                title={removeArmTitle(wt)}
+                aria-label={removeArmTitle(wt)}
                 class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
               >
                 <Trash2 size={11} />

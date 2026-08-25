@@ -13,6 +13,7 @@
     type ViewNavItem,
   } from "../views/viewNav";
   import { portal } from "../dom/portal";
+  import { LAYERS } from "../ui/layers";
 
   let { conflictedCount = 0 }: { conflictedCount?: number } = $props();
 
@@ -142,8 +143,8 @@
     use:portal
     data-view-nav
     role="menu"
-    class="fixed z-50 min-w-40 gp-menu gp-pop text-xs text-textPrimary"
-    style="left: {menuPos.x}px; top: {menuPos.y}px"
+    class="fixed min-w-40 gp-menu gp-pop text-xs text-textPrimary"
+    style="left: {menuPos.x}px; top: {menuPos.y}px; z-index: {LAYERS.MENU}"
   >
     {#each openMenu.items as item (item.id)}
       {@const active = activeTab === item.id}

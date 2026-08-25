@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../ui/formatError";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 import {
   DEFAULT_MAX_COMMITS,
@@ -317,7 +318,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn } = {}) {
             ...s,
             isLoading: false,
             hasMore: false,
-            error: String(err),
+            error: formatError(err),
             visiblePath: repoPath,
           }));
         }

@@ -3,6 +3,9 @@
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { trapFocus } from "../ui/focusTrap";
+  import { LAYERS } from "../ui/layers";
+  import { formatError } from "../ui/formatError";
   import { Download, FolderOpen, Check } from "lucide-svelte";
 
   let {
@@ -23,7 +26,7 @@
       const folder = await invoke<string | null>("cmd_pick_folder");
       if (folder) targetDir = folder;
     } catch (err) {
-      errorMsg = String(err);
+      errorMsg = formatError(err);
     }
   }
 
@@ -38,11 +41,17 @@
       });
       await repoStore.openRepo(clonedPath);
       onClose?.();
-    } catch (err: any) {
-      errorMsg = String(err);
+    } catch (err: unknown) {
+      errorMsg = formatError(err);
     } finally {
       isCloning = false;
     }
+  }
+
+  /** Mid-clone dismissal hides progress and completes invisibly later. */
+  function requestClose() {
+    if (isCloning) return;
+    onClose?.();
   }
 </script>
 
@@ -51,14 +60,16 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={onClose}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onclick={requestClose}
+    onkeydown={(e) => e.key === "Escape" && requestClose()}
     transition:fade={fadeParams()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 select-none gp-gpu"
+    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
+    style="z-index: {LAYERS.MODAL}"
   >
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
+      use:trapFocus
       onclick={(e) => e.stopPropagation()}
       in:scale={scaleParams()}
       out:scale={scaleParams()}
@@ -111,7 +122,7 @@
       </div>
 
       <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
-        <button onclick={onClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
+        <button onclick={requestClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
         <button
           onclick={handleClone}
           disabled={!url.trim() || !targetDir.trim() || isCloning}

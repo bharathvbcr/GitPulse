@@ -5,6 +5,9 @@
   import { fade, scale } from "svelte/transition";
   import { fadeParams, scaleParams } from "../motion/easing";
   import { seedRebasePlan, shouldReseed } from "../rebase/planner";
+  import { trapFocus } from "../ui/focusTrap";
+  import { LAYERS } from "../ui/layers";
+  import { formatError } from "../ui/formatError";
   import { GitMerge, Check, AlertCircle } from "lucide-svelte";
 
   let {
@@ -87,10 +90,16 @@
       await graphStore.loadGraph(repoPath);
       onClose?.();
     } catch (err: unknown) {
-      errorMsg = String(err);
+      errorMsg = formatError(err);
     } finally {
       isExecuting = false;
     }
+  }
+
+  /** Mid-run dismissal hides progress and completes invisibly later. */
+  function requestClose() {
+    if (isExecuting) return;
+    onClose?.();
   }
 </script>
 
@@ -99,15 +108,17 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={onClose}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onclick={requestClose}
+    onkeydown={(e) => e.key === "Escape" && requestClose()}
     transition:fade={fadeParams()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 select-none gp-gpu"
+    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
+    style="z-index: {LAYERS.MODAL}"
   >
     <!-- Modal Card -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
+      use:trapFocus
       onclick={(e) => e.stopPropagation()}
       in:scale={scaleParams()}
       out:scale={scaleParams()}
@@ -161,7 +172,7 @@
       </div>
 
       <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
-        <button onclick={onClose} disabled={isExecuting} class="gp-btn">Cancel</button>
+        <button onclick={requestClose} disabled={isExecuting} class="gp-btn">Cancel</button>
         <button
           onclick={executeRebase}
           disabled={isExecuting || items.length === 0}

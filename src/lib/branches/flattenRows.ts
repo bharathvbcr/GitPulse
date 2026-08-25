@@ -40,8 +40,8 @@ export type CollapsedLookup = (id: string, kind: BranchSection["kind"]) => boole
 /**
  * Flattens grouped sections into render-order rows for the sidebar's single
  * shared scroller. Collapsed sections/folders contribute only their header
- * row. Keys are path-derived and unique across sections and folders; a
- * suffix guard keeps duplicate ref names from breaking the keyed each.
+ * row. Keys are deterministic section/folder/name prefixes; uniqueness within
+ * a section is guaranteed upstream by git ref naming, not re-enforced here.
  */
 export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLookup): FlatRow[] {
   const rows: FlatRow[] = [];

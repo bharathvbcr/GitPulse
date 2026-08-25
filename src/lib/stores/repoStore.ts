@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../ui/formatError";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import type { BranchInfo, TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
@@ -92,6 +93,8 @@ interface BranchStatsReport {
   computed: number;
   cached: number;
   capped: boolean;
+  /** Branches whose churn walk errored this call — missing, not pending. */
+  compute_failures: number;
 }
 
 export interface OpenRepoTab {
@@ -135,6 +138,11 @@ export interface RepoSession {
   generation: number;
   /** True while this session's progressive branch-stats fetch is in flight. */
   statsPending: boolean;
+  /**
+   * True when this path's last branch-stats attempt failed outright, so rows
+   * would otherwise show fake zeros; cleared by the next successful drain.
+   */
+  statsFailed: boolean;
 }
 
 export interface RepoState {
@@ -162,6 +170,8 @@ export interface RepoState {
   generation: number;
   /** True while the active session's progressive branch-stats fetch is in flight. */
   statsPending: boolean;
+  /** True when the active session's last branch-stats attempt failed. */
+  statsFailed: boolean;
 }
 
 interface InternalState {
@@ -238,6 +248,7 @@ function emptyProjected(): RepoState {
     isBare: false,
     generation: 0,
     statsPending: false,
+    statsFailed: false,
   };
 }
 
@@ -266,6 +277,7 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     error: extras.error ?? null,
     generation: extras.generation ?? nextSessionGeneration(),
     statsPending: extras.statsPending ?? false,
+    statsFailed: extras.statsFailed ?? false,
   };
 }
 
@@ -317,6 +329,7 @@ function project(internal: InternalState): RepoState {
     isBare: active?.isBare ?? false,
     generation: active?.generation ?? 0,
     statsPending: active?.statsPending ?? false,
+    statsFailed: active?.statsFailed ?? false,
   };
 }
 
@@ -506,9 +519,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /**
    * Presents the session's repository in the graph pane (cached rows render
    * instantly). It deliberately does NOT call loadGraph: the App-level effect
-   * keyed on path/generation/revision/query is the single owner of graph
-   * fetching, and activation paths here also re-ran that effect — every tab
-   * switch fetched the same page twice.
+   * owns fetches keyed on path/revision/query — activation re-renders cached
+   * rows without a refetch. Freshness comes from refresh(), which loadGraphs
+   * directly for the active session on watcher events and after mutations.
    */
   function revealGraph(session: RepoSession | undefined) {
     if (!session) {
@@ -590,7 +603,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
-      applyToSession(id, generation, { isLoading: false, error: String(err) });
+      applyToSession(id, generation, { isLoading: false, error: formatError(err) });
     }
   }
 
@@ -616,19 +629,29 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
     let branches = start.branches;
     let dirty = false;
-    const flush = (statsPending: boolean) => {
-      if (!dirty) {
-        applyToSession(id, generation, { statsPending });
+    // `pending` keeps the in-flight marker lit across intermediate publishes;
+    // `failed` lands only on the final settle so a mid-drain hiccup that a
+    // later batch recovers from never flashes the failure marker.
+    const flush = (pending: boolean, failed: boolean) => {
+      if (dirty) {
+        applyToSession(id, generation, { branches, statsPending: pending, statsFailed: failed });
+        dirty = false;
         return;
       }
-      applyToSession(id, generation, { branches, statsPending });
-      dirty = false;
+      applyToSession(id, generation, { statsPending: pending, statsFailed: failed });
     };
     try {
+      // Only the LAST batch's failure count matters: uncached failures are
+      // retried every round, so an early hiccup a later batch recovered from
+      // must not taint the settle.
+      let lastBatchHadFailures = false;
+      let drainedCleanly = false;
       for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
         const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
         const session = internal.sessions[id];
         if (!session || session.generation !== generation) return;
+
+        lastBatchHadFailures = report.compute_failures > 0;
 
         const updates = new Map(
           report.updates.map((update) => [
@@ -654,13 +677,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (batchTouched) dirty = true;
         const drained = !report.capped;
         if (dirty && (drained || (batch + 1) % STATS_PUBLISH_EVERY === 0)) {
-          flush(report.capped);
+          flush(report.capped, false);
         }
-        if (drained) break;
+        if (drained) {
+          drainedCleanly = true;
+          break;
+        }
       }
-      flush(false);
+      // Clean drain retires any earlier failure marker; exhausting the batch
+      // bound or losing walks to errors must NOT read as success — BranchList
+      // renders its "churn unavailable" marker off statsFailed.
+      flush(false, !drainedCleanly || lastBatchHadFailures);
     } catch {
-      flush(false);
+      // Final failure: stop posing zeros as data — BranchList renders its
+      // "churn unavailable" marker off statsFailed instead.
+      flush(false, true);
     } finally {
       statsInflight.delete(id);
     }
@@ -707,7 +738,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
         if (!extras.allowBroken) {
-          internal = { ...internal, workspaceError: String(err) };
+          internal = { ...internal, workspaceError: formatError(err) };
           publish();
           return false;
         }
@@ -831,7 +862,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await store.openRepo(folder);
         }
       } catch (err: unknown) {
-        internal = { ...internal, workspaceError: String(err) };
+        internal = { ...internal, workspaceError: formatError(err) };
         publish();
       }
     },
@@ -1074,7 +1105,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     selectCommitDiff: async (commitId: string) => {
@@ -1096,7 +1127,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     /**
@@ -1123,7 +1154,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     selectRangeDiff: async (from: string, to: string) => {
@@ -1147,7 +1178,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     stageFile: async (filePath: string) =>
@@ -1302,9 +1333,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // a caller that must react to a refusal — the commit box keeping the
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
-      applyToSession(session.id, generation, { error: String(err) });
+      applyToSession(session.id, generation, { error: formatError(err) });
       harnessStore.recordAction({ kind, label, ok: false });
-      return { ok: false, error: String(err) };
+      return { ok: false, error: formatError(err) };
     }
   }
 

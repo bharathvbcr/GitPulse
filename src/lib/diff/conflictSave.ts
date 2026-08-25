@@ -6,6 +6,8 @@
  * journal recorded an edit that did happen, and the user was told nothing
  * was saved when the working tree already held the resolution.
  */
+import { formatError } from "../ui/formatError";
+
 export interface ConflictSavePlan {
   /** The resolved content reached the working tree. */
   written: boolean;
@@ -33,7 +35,7 @@ export function planConflictSave(
       staged,
       journalOk: false,
       complete: false,
-      message: `Save failed: ${String(error ?? "unknown error")}`,
+      message: `Save failed: ${formatError(error)}`,
     };
   }
   if (!staged) {
@@ -42,7 +44,7 @@ export function planConflictSave(
       staged,
       journalOk: true,
       complete: false,
-      message: `Resolution saved to the file, but staging failed: ${String(error ?? "unknown error")}`,
+      message: `Resolution saved to the file, but staging failed: ${formatError(error)}`,
     };
   }
   return { written, staged, journalOk: true, complete: true, message: null };

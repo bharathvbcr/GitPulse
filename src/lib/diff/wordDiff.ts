@@ -189,7 +189,10 @@ export function parseUnifiedDiff(raw: string): AnnotatedDiffLine[] {
       out.push({ type: metaKind, content: line });
       continue;
     }
-    if (line.startsWith("+++") || line.startsWith("---")) {
+    // File headers only ever appear between `diff --git` and the first `@@`.
+    // Inside a hunk body these prefixes are deletions/additions whose content
+    // itself begins with dashes/plus signs (markdown rules, YAML fences).
+    if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) {
       out.push({ type: "hdr", content: line });
       continue;
     }

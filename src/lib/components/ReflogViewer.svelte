@@ -5,6 +5,7 @@
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatDate, shortHash } from "../format";
+  import { formatError } from "../ui/formatError";
 
   interface ReflogEntry {
     index: number;
@@ -37,7 +38,7 @@
       entries = next;
     } catch (err) {
       if (!guard.isLive()) return;
-      errorMsg = String(err);
+      errorMsg = formatError(err);
       entries = [];
     } finally {
       if (guard.isLive()) loading = false;

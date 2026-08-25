@@ -2,6 +2,7 @@
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
+  import { formatError } from "../ui/formatError";
   import {
     RefreshCw,
     ShieldCheck,
@@ -89,7 +90,7 @@
       branchSuggestion = result.text;
       branchWarnings = result.warnings;
     } catch (err: any) {
-      branchError = String(err);
+      branchError = formatError(err);
     } finally {
       isSuggesting = false;
     }
@@ -101,7 +102,7 @@
       await repoStore.createBranch(branchSuggestion);
       branchSuggestion = "";
     } catch (err: any) {
-      branchError = String(err);
+      branchError = formatError(err);
     }
   }
 </script>

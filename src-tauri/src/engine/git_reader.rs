@@ -78,9 +78,15 @@ pub struct BranchStatsReport {
     /// Served from the oid-keyed churn cache.
     pub cached: usize,
     /// True when more unique uncached tips existed than MAX_BRANCH_STAT_TARGETS;
-    /// callers re-invoke to drain the rest. Already-cached tips ride along so
-    /// a warm refresh hydrates every eligible branch in one payload.
+    /// callers re-invoke to drain the rest (the oid-keyed churn cache is the
+    /// implicit cursor: already-computed tips hit the cache, so each re-call
+    /// advances to the next tranche). Already-cached tips ride along so a
+    /// warm refresh hydrates every eligible branch in one payload.
     pub capped: bool,
+    /// Eligible branches whose churn walk FAILED this call (not capped —
+    /// attempted, errored). A failed branch silently missing from `updates`
+    /// must stay countable: "checked and failed" is not "not yet reached".
+    pub compute_failures: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +399,7 @@ impl GitReader {
                 computed: 0,
                 cached: 0,
                 capped: false,
+                compute_failures: 0,
             });
         };
 
@@ -417,7 +424,7 @@ impl GitReader {
             eligible.push(target);
         }
 
-        let (updates, computed, cached, capped) =
+        let (updates, computed, cached, capped, compute_failures) =
             compute_eligible_churn(&repo, &repo_key, &base_oid, eligible);
 
         Ok(BranchStatsReport {
@@ -426,6 +433,7 @@ impl GitReader {
             computed,
             cached,
             capped,
+            compute_failures,
         })
     }
 
@@ -1273,12 +1281,15 @@ fn churn_cache() -> MutexGuard<'static, ChurnCache> {
 
 /// Looks up cache in bulk, computes unique uncached tips (capped), stores
 /// results, and returns an update per eligible branch we have a value for.
+/// The fifth tuple element counts attempted walks that FAILED — branches
+/// which will be missing from `updates` through error, not through capping.
+#[allow(clippy::type_complexity)]
 fn compute_eligible_churn(
     repo: &Path,
     repo_key: &str,
     base_oid: &str,
     eligible: Vec<BranchStatTarget>,
-) -> (Vec<BranchStatsUpdate>, usize, usize, bool) {
+) -> (Vec<BranchStatsUpdate>, usize, usize, bool, usize) {
     let mut cached_hits: HashMap<String, ComputedBranchChurn> = HashMap::new();
     let mut unique_uncached: Vec<String> = Vec::new();
     let mut seen_miss: HashSet<String> = HashSet::new();
@@ -1308,11 +1319,13 @@ fn compute_eligible_churn(
         .saturating_sub(MAX_BRANCH_STAT_TARGETS);
     let capped = remaining_after > 0;
     unique_uncached.truncate(MAX_BRANCH_STAT_TARGETS);
+    let attempted = unique_uncached.len();
 
     let computed_map: HashMap<String, ComputedBranchChurn> = unique_uncached
         .into_par_iter()
         .filter_map(|tip| compute_branch_churn(repo, base_oid, &tip).map(|churn| (tip, churn)))
         .collect();
+    let compute_failures = attempted.saturating_sub(computed_map.len());
 
     {
         let mut cache = churn_cache();
@@ -1350,7 +1363,7 @@ fn compute_eligible_churn(
         });
     }
 
-    (updates, computed, cached, capped)
+    (updates, computed, cached, capped, compute_failures)
 }
 
 /// Computes diff churn between two validated ref names or full oids via
@@ -1740,6 +1753,7 @@ fn mime_from_path(path: &str) -> String {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
         _ => "application/octet-stream",
     }
     .to_string()
@@ -1783,6 +1797,48 @@ mod tests {
             parse_co_authors(body),
             vec!["Bob <bob@example.com>".to_string()]
         );
+    }
+
+    /// Audit C2: every extension the frontend's image path list accepts must
+    /// map to a proper image/* MIME type, including .bmp.
+    #[test]
+    fn mime_from_path_maps_known_image_extensions() {
+        let cases = [
+            ("a.png", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.gif", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("a.svg", "image/svg+xml"),
+            ("a.bmp", "image/bmp"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(mime_from_path(path), want, "{path}");
+        }
+    }
+
+    /// Audit C2: extension case must not change the mapping (uppercase and
+    /// mixed-case names are common from cameras and Windows exports).
+    #[test]
+    fn mime_from_path_is_case_insensitive() {
+        let cases = [
+            ("photo.PNG", "image/png"),
+            ("IMG.JPG", "image/jpeg"),
+            ("scan.BMP", "image/bmp"),
+            ("icon.WebP", "image/webp"),
+            ("art.SVG", "image/svg+xml"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(mime_from_path(path), want, "{path}");
+        }
+    }
+
+    /// Unknown or missing extensions stay generic binary.
+    #[test]
+    fn mime_from_path_unknown_falls_back_to_octet_stream() {
+        for path in ["a.exe", "notes.txt", "noext", "archive.tar.gz2"] {
+            assert_eq!(mime_from_path(path), "application/octet-stream", "{path}");
+        }
     }
 
     #[test]
@@ -2418,5 +2474,55 @@ mod tests {
         assert_eq!(literal_pathspec("weird*.txt"), ":(literal)weird*.txt");
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
+    }
+    #[test]
+    fn branch_stats_counts_failed_walks_instead_of_hiding_them() {
+        // A repo with one healthy branch off the default and one "ghost" branch
+        // whose tip object does not exist: the ghost's churn walk errors, which
+        // previously vanished silently — now it must surface as compute_failures
+        // while the healthy branch still gets its update.
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("git spawn");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let dir = init_repo_with_remotes(&[], "main");
+        run_git(dir.path(), &["branch", "healthy"]);
+        // Ghost branch: a real tip whose object file is then deleted from the
+        // store — ref resolves to valid-format hex, but every churn walk fails.
+        run_git(dir.path(), &["commit", "--allow-empty", "-m", "doomed"]);
+        let ghost_oid = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(ghost_oid.len(), 40);
+        run_git(dir.path(), &["branch", "ghost"]);
+        run_git(dir.path(), &["reset", "--hard", "HEAD~1"]);
+        let obj_path = dir
+            .path()
+            .join(".git/objects")
+            .join(&ghost_oid[..2])
+            .join(&ghost_oid[2..]);
+        std::fs::remove_file(&obj_path).expect("delete ghost object");
+
+        let report = GitReader::branch_stats(dir.path().to_str().unwrap()).unwrap();
+        let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
+        assert!(names.contains(&"healthy"), "healthy branch got churn");
+        assert_eq!(report.compute_failures, 1, "ghost walk counted as failure");
     }
 }

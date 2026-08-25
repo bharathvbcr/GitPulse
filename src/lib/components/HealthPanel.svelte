@@ -28,6 +28,7 @@
     updateKind,
     updateKindClass,
   } from "../health/format";
+  import { formatError } from "../ui/formatError";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
@@ -88,7 +89,7 @@
       plan = null;
       planError = null;
     } else {
-      errorMsg = String(deps.reason);
+      errorMsg = formatError(deps.reason);
       report = null;
       // A failed scan must not mark the repo as scanned, or the effect above
       // would refuse to rescan it after something changes.
@@ -107,7 +108,7 @@
             slug: "",
             alerts: [],
             truncated: false,
-            error: String(alerts.reason),
+            error: formatError(alerts.reason),
           };
     if (guard.isLive()) loading = false;
   }
@@ -152,7 +153,7 @@
       plan = next;
     } catch (err) {
       if (!guard.isLive()) return;
-      planError = String(err);
+      planError = formatError(err);
     } finally {
       if (guard.isLive()) fixing = false;
     }
@@ -343,7 +344,13 @@
           {/if}
         </button>
       {/if}
-      <button type="button" onclick={() => scan()} class="gp-btn" title="Rescan vulnerabilities and updates">
+      <button
+        type="button"
+        onclick={() => scan()}
+        disabled={loading}
+        class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
+        title="Rescan vulnerabilities and updates"
+      >
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Scan
       </button>

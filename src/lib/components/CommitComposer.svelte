@@ -8,6 +8,7 @@
     type PolicyVerdict,
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "lucide-svelte";
+  import { formatError } from "../ui/formatError";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
@@ -33,7 +34,7 @@
       generation = result;
       repoStore.setCommitDraft(result.text);
     } catch (err: unknown) {
-      aiError = String(err);
+      aiError = formatError(err);
     } finally {
       isGenerating = false;
     }

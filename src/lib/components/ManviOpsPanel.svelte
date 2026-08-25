@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { formatError } from "../ui/formatError";
   import {
     AlertTriangle,
     ArrowDownToLine,
@@ -104,7 +105,7 @@
       const next = await invoke<OpsGitHubContext>("cmd_github_context", { repoPath: repo });
       if ($repoStore.currentPath === repo) github = next;
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = String(error);
+      if ($repoStore.currentPath === repo) notice = formatError(error);
     } finally {
       busy = null;
     }
@@ -121,7 +122,7 @@
       cleanup = next;
       selectedBranches = next.candidates.map((candidate) => candidate.name);
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = String(error);
+      if ($repoStore.currentPath === repo) notice = formatError(error);
     } finally {
       busy = null;
     }
@@ -171,7 +172,7 @@
       const next = await invoke<CommitReviewReport>("cmd_review_outgoing_commits", { repoPath: repo });
       if ($repoStore.currentPath === repo) review = next;
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = String(error);
+      if ($repoStore.currentPath === repo) notice = formatError(error);
     } finally {
       busy = null;
     }

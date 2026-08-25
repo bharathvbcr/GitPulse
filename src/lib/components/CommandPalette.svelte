@@ -1,14 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
-  import { isCaseInsensitiveFs, isPathAmong } from "../repos/paths";
+  import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
   import type { ViewTab } from "../repos/persist";
   import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
   import { themeStore } from "../stores/themeStore";
-  import { askText } from "../stores/modalStore";
+  import { askText, promptState } from "../stores/modalStore";
   import { fadeParams, scaleParams } from "../motion/easing";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { trapFocus } from "../ui/focusTrap";
+  import { LAYERS } from "../ui/layers";
   import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X } from "lucide-svelte";
 
   let isOpen = $state(false);
@@ -103,7 +106,7 @@
       .filter((path) => !isPathAmong(path, $repoStore.openTabs.map((tab) => tab.path), { caseInsensitive: isCaseInsensitiveFs() }))
       .map((path) => ({
         id: `recent:${path}`,
-        label: `Open recent ${path.split(/[\\/]/).pop() ?? path}`,
+        label: `Open recent ${displayName(path)}`,
         icon: FolderGit2,
         action: () => void repoStore.openRepo(path),
       })),
@@ -133,9 +136,18 @@
     isOpen = false;
   }
 
+  /**
+   * A prompt modal owns the surface while pending; Cmd+K or the menu event
+   * must not stack the palette on top of (or beneath) it.
+   */
+  function modalOccupied(): boolean {
+    return get(promptState) !== null;
+  }
+
   function handleKeyDown(e: KeyboardEvent) {
     if (isImeComposition(e)) return;
     if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if (modalOccupied()) return;
       e.preventDefault();
       isOpen = !isOpen;
       query = "";
@@ -157,6 +169,7 @@
   onMount(() => {
     window.addEventListener("keydown", handleKeyDown);
     const openPalette = () => {
+      if (modalOccupied()) return;
       isOpen = true;
       query = "";
       highlighted = 0;
@@ -177,12 +190,14 @@
     onclick={() => (isOpen = false)}
     onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
     transition:fade={fadeParams()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-start justify-center pt-24 select-none gp-gpu"
+    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-start justify-center pt-24 select-none gp-gpu"
+    style="z-index: {LAYERS.MODAL}"
   >
     <!-- Modal Card -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
+      use:trapFocus={{ initial: () => inputEl ?? null }}
       onclick={(e) => e.stopPropagation()}
       in:scale={scaleParams()}
       out:scale={scaleParams()}
@@ -196,15 +211,30 @@
           bind:value={query}
           placeholder="Type a command or search..."
           class="w-full bg-transparent text-textPrimary placeholder:text-textMuted text-sm focus:outline-none"
+          role="combobox"
+          aria-expanded="true"
+          aria-autocomplete="list"
+          aria-controls="command-palette-listbox"
+          aria-activedescendant={filteredCommands.length > 0
+            ? `palette-option-${highlighted}`
+            : undefined}
         />
       </div>
 
-      <div bind:this={listEl} class="max-h-72 overflow-y-auto p-1.5" role="listbox" aria-label="Commands">
-        {#each filteredCommands as cmd, i}
+      <div
+        bind:this={listEl}
+        id="command-palette-listbox"
+        class="max-h-72 overflow-y-auto p-1.5"
+        role="listbox"
+        aria-label="Commands"
+      >
+        {#each filteredCommands as cmd, i (cmd.id)}
           <button
+            id={`palette-option-${i}`}
             onclick={() => run(i)}
             role="option"
             aria-selected={i === highlighted}
+            aria-label={cmd.label}
             data-highlighted={i === highlighted ? "true" : "false"}
             class="w-full px-3 py-2 text-left rounded-xl text-xs flex items-center gap-3 transition-colors {i === highlighted ? 'bg-surfaceHover ring-1 ring-accent/25' : 'hover:bg-surfaceHover'}"
           >
@@ -214,6 +244,11 @@
             <span class="flex-1">{cmd.label}</span>
           </button>
         {/each}
+        {#if filteredCommands.length === 0}
+          <div class="px-3 py-2.5 text-xs text-textMuted text-center" role="status">
+            No matching commands
+          </div>
+        {/if}
       </div>
     </div>
   </div>
