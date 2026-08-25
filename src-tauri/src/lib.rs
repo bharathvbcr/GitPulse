@@ -60,6 +60,7 @@ pub fn run() {
             cmd_count_loc,
             cmd_parse_conventional_commit,
             cmd_get_file_blame,
+            cmd_blame_range,
             cmd_rebase_interactive,
             cmd_get_stack_hierarchy,
             cmd_get_bezier_connector,

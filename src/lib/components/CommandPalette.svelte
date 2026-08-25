@@ -6,7 +6,7 @@
   import type { ViewTab } from "../repos/persist";
   import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
   import { themeStore } from "../stores/themeStore";
-  import { askText } from "../stores/modalStore";
+  import { askConfirm, askText } from "../stores/modalStore";
   import { fadeParams, scaleParams } from "../motion/easing";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X } from "lucide-svelte";
@@ -84,7 +84,22 @@
     { id: "push", label: "Push Current Branch", icon: Upload, action: () => repoStore.push() },
     ...viewCommands,
     { id: "stash", label: "Stash Working Tree", icon: Layers, action: () => repoStore.stashSave() },
-    { id: "stash_pop", label: "Pop Stash", icon: Layers, action: () => repoStore.stashPop() },
+    {
+      id: "stash_pop",
+      label: "Pop Stash",
+      icon: Layers,
+      // Popping drops the stash entry even when applying conflicts; same
+      // confirm-before-destructive pattern as BranchList's delete.
+      action: async () => {
+        const ok = await askConfirm({
+          title: "Pop Stash",
+          message:
+            "Apply the most recent stash and remove it from the stash list? Conflicted files keep their local state, but the stash entry is dropped.",
+          confirmLabel: "Pop",
+        });
+        if (ok) repoStore.stashPop();
+      },
+    },
   ];
 
   let repoCommands = $derived([
@@ -216,5 +231,14 @@
         {/each}
       </div>
     </div>
+  </div>
+{/if}
+
+{#if $repoStore.pendingMutation}
+  <!-- Menu-driven mutations have no busy indicator of their own; this thin
+       strip (same treatment as CommitTable's load bar) shows the work. -->
+  <div class="fixed top-0 inset-x-0 h-0.5 z-[60] overflow-hidden pointer-events-none" role="status">
+    <span class="sr-only">{$repoStore.pendingMutation}…</span>
+    <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
   </div>
 {/if}

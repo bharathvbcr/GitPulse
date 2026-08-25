@@ -1,6 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
-  import { graphStore } from "../stores/graphStore";
+  import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { invoke } from "@tauri-apps/api/core";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -39,6 +39,9 @@
     changed_files: CommitFileChange[];
     total_additions: number;
     total_deletions: number;
+    /** Optional during the backend transition; absent means "not truncated". */
+    files_total_count?: number;
+    files_list_truncated?: boolean;
   }
 
   let selectedCommit = $derived(
@@ -58,20 +61,26 @@
     void currentCommitId;
     fileListLimit = FILE_LIST_STEP;
   });
+  // When the backend capped the list, the header reports the true file count
+  // instead of the size of the capped slice.
+  let filesListTruncated = $derived(details?.files_list_truncated === true);
+  let changedFileCount = $derived(
+    filesListTruncated && typeof details?.files_total_count === "number"
+      ? details.files_total_count
+      : details?.changed_files.length ?? 0
+  );
 
   // Same story for the inline preview: a capped slice keeps the pane
-  // responsive, and the full diff opens in the virtualized Diff view.
+  // responsive, and the full diff opens in the virtualized Diff view. The
+  // normalizer keeps a legacy string payload and a new payload object alike
+  // from reaching `.split` unvalidated.
   const PREVIEW_LINE_CAP = 2_000;
+  let selectedDiffText = $derived(normalizeDiffPayload($repoStore.selectedDiff).content);
   let previewLines = $derived.by(() => {
-    const raw = $repoStore.selectedDiff;
-    if (!raw) return [];
-    return raw.split("\n").slice(0, PREVIEW_LINE_CAP);
+    if (!selectedDiffText) return [];
+    return selectedDiffText.split("\n").slice(0, PREVIEW_LINE_CAP);
   });
-  let previewTruncated = $derived.by(() => {
-    const raw = $repoStore.selectedDiff;
-    if (!raw) return false;
-    return raw.split("\n").length > PREVIEW_LINE_CAP;
-  });
+  let previewTruncated = $derived(selectedDiffText.split("\n").length > PREVIEW_LINE_CAP);
 
   // Explain-this-commit, answered by a model on this machine.
   let explanation = $state<AiGeneration | null>(null);
@@ -180,7 +189,7 @@
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">
         <div class="text-[10px] font-semibold uppercase text-textMuted px-2 py-1">
-          Changed Files ({details?.changed_files.length ?? 0})
+          Changed Files ({changedFileCount})
           {#if details}
             <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}</span>
             <span class="normal-case font-mono text-red-400">-{details.total_deletions}</span>
@@ -234,6 +243,11 @@
             </div>
           {/if}
         </div>
+        {#if filesListTruncated}
+          <div class="px-2 pb-1 text-[10px] text-textMuted">
+            +only first {(details?.changed_files.length ?? 0).toLocaleString()} listed
+          </div>
+        {/if}
         {#each fileList as f (f.path)}
           <button
             class="w-full px-2 py-1.5 rounded-full hover:bg-surfaceHover flex items-center justify-between text-xs text-left transition-colors"

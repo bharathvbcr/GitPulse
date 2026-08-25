@@ -1,4 +1,7 @@
-use crate::engine::git_cli::{git_global, git_text, git_with_stdin, sandbox_join, validate_repo};
+use crate::engine::git_cli::{
+    git_global_with_timeout, git_text, git_text_network, git_with_stdin, sandbox_join,
+    validate_repo, NETWORK_TIMEOUT,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +31,286 @@ pub enum RebaseActionKind {
 pub struct RebaseStep {
     pub commit_id: String,
     pub action: RebaseActionKind,
+}
+
+/// One command in a planned [`GitWriter::execute_rebase_sequence`] run.
+///
+/// The gate must judge every command line before the first mutation happens,
+/// so the whole sequence is composed up front as these commands and both the
+/// policy layer and the executor consume the same list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebasePlanCommand {
+    /// Full argv including the program name; element 0 is always "git".
+    pub argv: Vec<String>,
+    /// When set, an execution failure is reported as
+    /// `Rebase step failed ({label}): {error}` — the historical wording for
+    /// cherry-pick steps. `None` propagates the git error unchanged.
+    pub failure_label: Option<String>,
+}
+
+/// Runs a builder-produced argv in `repo`: element 0 is the program name
+/// ("git"), elements 1.. are the subcommand and its arguments. Every executor
+/// that gates through an argv builder runs its git call through here, so the
+/// gated line and the executed line cannot drift apart.
+fn run_argv(repo: &Path, argv: &[String]) -> Result<String, String> {
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    git_text(repo, &args)
+}
+
+/// Like [`run_argv`], but under [`crate::engine::git_cli::NETWORK_TIMEOUT`]:
+/// clone/fetch/pull/push transfer real data over the network where the 90s
+/// default cap kills healthy multi-gigabyte transfers mid-flight.
+fn run_network_argv(repo: &Path, argv: &[String]) -> Result<String, String> {
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    git_text_network(repo, &args)
+}
+
+/// Builds one full argv from a program name plus argument literals.
+fn argv0(program: &str, args: &[&str]) -> Vec<String> {
+    std::iter::once(program.to_string())
+        .chain(args.iter().map(|s| s.to_string()))
+        .collect()
+}
+
+/// The exact argv [`GitWriter::push`] executes. Authoritative for the command
+/// gate: force pushes run `--force-with-lease` (never bare `--force`), so
+/// this — not the caller's assumption — is what gets judged.
+pub fn push_argv(remote: Option<&str>, branch: Option<&str>, force: bool) -> Vec<String> {
+    let mut argv = vec!["git".to_string(), "push".to_string()];
+    if force {
+        argv.push("--force-with-lease".to_string());
+    }
+    if let Some(r) = remote {
+        argv.push(r.to_string());
+    }
+    if let Some(b) = branch {
+        argv.push(b.to_string());
+    }
+    argv
+}
+
+/// The exact argv [`GitWriter::pull`] executes.
+pub fn pull_argv(remote: Option<&str>, branch: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["git".to_string(), "pull".to_string()];
+    if let Some(r) = remote {
+        argv.push(r.to_string());
+    }
+    if let Some(b) = branch {
+        argv.push(b.to_string());
+    }
+    argv
+}
+
+/// The exact argv [`GitWriter::merge_branch`] executes, including the
+/// `--no-edit` flag the writer always adds to keep merges non-interactive.
+pub fn merge_argv(branch_name: &str, ff_only: bool) -> Vec<String> {
+    let mut argv = vec!["git".to_string(), "merge".to_string()];
+    if ff_only {
+        argv.push("--ff-only".to_string());
+    }
+    argv.push("--no-edit".to_string());
+    argv.push(branch_name.to_string());
+    argv
+}
+
+/// The exact argv [`commit_inner`] executes for [`GitWriter::commit`],
+/// including the empty-message amend form (`--amend --no-edit`) used by
+/// internal squash flows.
+pub fn commit_argv(message: &str, amend: bool) -> Vec<String> {
+    let mut argv = vec!["git".to_string(), "commit".to_string()];
+    if amend && message.is_empty() {
+        argv.push("--amend".to_string());
+        argv.push("--no-edit".to_string());
+    } else {
+        argv.push("-m".to_string());
+        argv.push(message.to_string());
+        if amend {
+            argv.push("--amend".to_string());
+        }
+    }
+    argv
+}
+
+/// The exact argv [`GitWriter::restack`] executes: rebase the branch onto the
+/// upstream tip (`rebase --onto <upstream> <upstream> <branch>`).
+pub fn restack_argv(branch: &str, onto: &str) -> Vec<String> {
+    vec![
+        "git".to_string(),
+        "rebase".to_string(),
+        "--onto".to_string(),
+        onto.to_string(),
+        onto.to_string(),
+        branch.to_string(),
+    ]
+}
+
+/// The exact argv [`GitWriter::create_branch`] executes. Fallible because ref
+/// validation must reject a malformed name before the policy layer is asked
+/// to judge it.
+pub fn create_branch_argv(
+    branch_name: &str,
+    start_point: Option<&str>,
+) -> Result<Vec<String>, String> {
+    validate_ref_name(branch_name)?;
+    let mut argv = vec![
+        "git".to_string(),
+        "branch".to_string(),
+        branch_name.to_string(),
+    ];
+    if let Some(sp) = start_point {
+        validate_ref_name(sp)?;
+        argv.push(sp.to_string());
+    }
+    Ok(argv)
+}
+
+/// The exact argvs [`GitWriter::checkout_branch`] may execute, in attempt
+/// order. All of them are gated up front because any one could be the one
+/// that runs.
+pub fn checkout_branch_attempts(branch_name: &str) -> Vec<Vec<String>> {
+    [
+        vec!["switch", "--guess", branch_name],
+        vec!["checkout", "--guess", branch_name],
+        vec!["checkout", branch_name],
+    ]
+    .iter()
+    .map(|args| argv0("git", args))
+    .collect()
+}
+
+/// The exact argv [`GitWriter::stash_save`] executes.
+pub fn stash_save_argv(message: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "git".to_string(),
+        "stash".to_string(),
+        "push".to_string(),
+        "-u".to_string(),
+    ];
+    if let Some(msg) = message {
+        argv.push("-m".to_string());
+        argv.push(msg.to_string());
+    }
+    argv
+}
+
+/// The exact argv [`GitWriter::stash_pop`] executes.
+pub fn stash_pop_argv() -> Vec<String> {
+    argv0("git", &["stash", "pop"])
+}
+
+/// The exact argv [`GitWriter::create_tag`] executes: annotated when a
+/// message is given, lightweight otherwise, with the optional commit id last.
+pub fn create_tag_argv(
+    tag_name: &str,
+    commit_id: Option<&str>,
+    message: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec!["git".to_string(), "tag".to_string()];
+    match message {
+        Some(msg) => {
+            argv.push("-a".to_string());
+            argv.push(tag_name.to_string());
+            argv.push("-m".to_string());
+            argv.push(msg.to_string());
+        }
+        None => argv.push(tag_name.to_string()),
+    }
+    if let Some(cid) = commit_id {
+        argv.push(cid.to_string());
+    }
+    argv
+}
+
+/// The exact argv [`GitWriter::delete_tag`] executes.
+pub fn delete_tag_argv(tag_name: &str) -> Vec<String> {
+    argv0("git", &["tag", "-d", tag_name])
+}
+
+/// The exact argv [`GitWriter::push_tag`] executes: a fully-qualified tag
+/// refspec so an ambiguous name can never publish the wrong object.
+pub fn push_tag_argv(remote: &str, tag: &str) -> Vec<String> {
+    argv0("git", &["push", remote, &format!("refs/tags/{tag}")])
+}
+
+/// Composes every mutating command [`GitWriter::execute_rebase_sequence`]
+/// will run for `(onto_commit, steps, original_branch)`, in execution order:
+/// detach onto the target, then the per-step cherry-pick/expand section, then
+/// (when the session started on a branch) the finalize moves. Read-only
+/// probes (status, rev-parse, symbolic-ref) are not mutations and stay out.
+///
+/// This is the single source of truth shared by the command gate (which
+/// judges each argv before anything runs) and the executor (which runs this
+/// list verbatim), so gating a plan and executing it can never disagree.
+pub fn rebase_sequence_plan(
+    onto_commit: &str,
+    steps: &[RebaseStep],
+    original_branch: Option<&str>,
+) -> Result<Vec<RebasePlanCommand>, String> {
+    validate_oid_or_revision(onto_commit)?;
+    if steps.is_empty() {
+        return Err("Rebase sequence is empty".into());
+    }
+
+    let mut plan = Vec::new();
+    plan.push(RebasePlanCommand {
+        argv: argv0("git", &["checkout", "--detach", onto_commit]),
+        failure_label: None,
+    });
+
+    for step in steps {
+        validate_oid_or_revision(&step.commit_id)?;
+        match &step.action {
+            RebaseActionKind::Pick => plan.push(RebasePlanCommand {
+                argv: argv0("git", &["cherry-pick", &step.commit_id]),
+                failure_label: Some(format!("pick {}", step.commit_id)),
+            }),
+            RebaseActionKind::Squash => {
+                plan.push(RebasePlanCommand {
+                    argv: argv0("git", &["cherry-pick", "-n", &step.commit_id]),
+                    failure_label: Some(format!("squash {}", step.commit_id)),
+                });
+                plan.push(RebasePlanCommand {
+                    // commit_inner("", true): fold into HEAD keeping its message.
+                    argv: argv0("git", &["commit", "--amend", "--no-edit"]),
+                    failure_label: None,
+                });
+            }
+            RebaseActionKind::Fixup => {
+                plan.push(RebasePlanCommand {
+                    argv: argv0("git", &["cherry-pick", "-n", &step.commit_id]),
+                    failure_label: Some(format!("fixup {}", step.commit_id)),
+                });
+                plan.push(RebasePlanCommand {
+                    argv: argv0("git", &["commit", "--amend", "--no-edit"]),
+                    failure_label: None,
+                });
+            }
+            RebaseActionKind::Drop => {}
+            RebaseActionKind::Reword(new_msg) => {
+                plan.push(RebasePlanCommand {
+                    argv: argv0("git", &["cherry-pick", &step.commit_id]),
+                    failure_label: Some(format!("reword {}", step.commit_id)),
+                });
+                plan.push(RebasePlanCommand {
+                    argv: argv0("git", &["commit", "-m", new_msg, "--amend"]),
+                    failure_label: None,
+                });
+            }
+        }
+    }
+
+    if let Some(branch) = original_branch {
+        validate_ref_name(branch)?;
+        plan.push(RebasePlanCommand {
+            argv: argv0("git", &["branch", "-f", branch, "HEAD"]),
+            failure_label: None,
+        });
+        plan.push(RebasePlanCommand {
+            argv: argv0("git", &["checkout", branch]),
+            failure_label: None,
+        });
+    }
+    Ok(plan)
 }
 
 pub struct GitWriter;
@@ -68,18 +351,8 @@ impl GitWriter {
     }
 
     fn commit_inner(repo: &Path, message: &str, amend: bool) -> Result<String, String> {
-        let mut args = vec!["commit"];
-        if amend && message.is_empty() {
-            args.push("--amend");
-            args.push("--no-edit");
-        } else {
-            args.push("-m");
-            args.push(message);
-            if amend {
-                args.push("--amend");
-            }
-        }
-        git_text(repo, &args)
+        let argv = commit_argv(message, amend);
+        run_argv(repo, &argv)
     }
 
     /// Stage exactly `files` and commit them under a single mutation-lock
@@ -129,21 +402,18 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch_name)?;
-        let attempts: [&[&str]; 3] = [
-            &["switch", "--guess", branch_name],
-            &["checkout", "--guess", branch_name],
-            &["checkout", branch_name],
-        ];
         let mut first_err = None;
-        for attempt in attempts {
-            match git_text(&repo, attempt) {
+        for attempt in checkout_branch_attempts(branch_name) {
+            match run_argv(&repo, &attempt) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     first_err.get_or_insert(e);
                 }
             }
         }
-        Err(first_err.expect("at least one attempt recorded"))
+        // Unreachable while the builder produces at least one attempt; a
+        // fallback string keeps this total without inventing success.
+        Err(first_err.unwrap_or_else(|| "checkout failed".into()))
     }
 
     pub fn create_branch(
@@ -156,13 +426,8 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_ref_name(branch_name)?;
-        let mut args = vec!["branch", branch_name];
-        if let Some(sp) = start_point {
-            validate_ref_name(sp)?;
-            args.push(sp);
-        }
-        git_text(&repo, args.as_slice())?;
+        let argv = create_branch_argv(branch_name, start_point)?;
+        run_argv(&repo, &argv)?;
         Ok(())
     }
 
@@ -204,23 +469,63 @@ impl GitWriter {
         Ok(())
     }
 
+    /// Read-only probe used by callers that need to plan a rebase sequence
+    /// (and gate it) before executing: the branch HEAD is on, if any. The
+    /// result feeds both [`rebase_sequence_plan`] and
+    /// [`GitWriter::execute_rebase_sequence`] so the gated plan and the
+    /// executed plan are built from the same inputs.
+    pub fn rebase_original_branch(repo_path: &str) -> Result<Option<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        Ok(
+            git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        )
+    }
+
+    /// Executes a rebase sequence, discovering the checked-out branch itself.
+    /// Convenience form for callers that have not gated a pre-built plan;
+    /// policy-gated flows should discover the branch once via
+    /// [`GitWriter::rebase_original_branch`], gate
+    /// [`rebase_sequence_plan`]'s output, then call
+    /// [`GitWriter::execute_rebase_sequence_for_branch`] with the same value.
     pub fn execute_rebase_sequence(
         repo_path: &str,
         onto_commit: &str,
         steps: &[RebaseStep],
+    ) -> Result<(), String> {
+        let original_branch = Self::rebase_original_branch(repo_path)?;
+        Self::execute_rebase_sequence_for_branch(
+            repo_path,
+            onto_commit,
+            steps,
+            original_branch.as_deref(),
+        )
+    }
+
+    /// Executes a validated rebase sequence: detach onto `onto_commit`,
+    /// replay `steps` via cherry-picks, then move `original_branch` to the
+    /// result and check it back out.
+    ///
+    /// `original_branch` must be the value [`rebase_original_branch`]
+    /// returned when the caller planned (and gated) the run; the executor
+    /// replays exactly that plan rather than rediscovering state mid-flight,
+    /// so what was judged is what runs. Every argv comes from
+    /// [`rebase_sequence_plan`] — this body only sequences them and handles
+    /// failure rollback (`cherry-pick --abort`, forced restore).
+    pub fn execute_rebase_sequence_for_branch(
+        repo_path: &str,
+        onto_commit: &str,
+        steps: &[RebaseStep],
+        original_branch: Option<&str>,
     ) -> Result<(), String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_oid_or_revision(onto_commit)?;
-        if steps.is_empty() {
-            return Err("Rebase sequence is empty".into());
-        }
-        for step in steps {
-            validate_oid_or_revision(&step.commit_id)?;
-        }
+        let plan = rebase_sequence_plan(onto_commit, steps, original_branch)?;
 
         let dirty = git_text(&repo, &["status", "--porcelain"])?;
         if !dirty.trim().is_empty() {
@@ -230,48 +535,32 @@ impl GitWriter {
         }
 
         let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-        let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
 
         let restore = |repo: &std::path::Path| {
-            if let Some(ref branch) = original_branch {
+            if let Some(branch) = original_branch {
                 let _ = git_text(repo, &["checkout", "-f", branch]);
             } else {
                 let _ = git_text(repo, &["checkout", "-f", &original_head]);
             }
         };
 
-        git_text(&repo, &["checkout", "--detach", onto_commit])?;
+        // Phase 1: detach onto the target. Nothing has mutated yet, so a
+        // failure here propagates without an abort/restore pass.
+        let (detach, rest) = plan.split_first().ok_or("Rebase plan is empty")?;
+        run_argv(&repo, &detach.argv)?;
 
+        // Phase 2: the cherry-pick section. Any failure aborts the pick and
+        // restores the starting point; labeled steps report their historical
+        // "Rebase step failed (...)" wording.
+        let finalize_len = usize::from(original_branch.is_some());
+        let (body, finalize) = rest.split_at(rest.len() - finalize_len);
         let result = (|| -> Result<(), String> {
-            for step in steps {
-                match &step.action {
-                    RebaseActionKind::Pick => {
-                        git_text(&repo, &["cherry-pick", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (pick {}): {}", step.commit_id, e)
-                        })?;
-                    }
-                    RebaseActionKind::Squash => {
-                        git_text(&repo, &["cherry-pick", "-n", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (squash {}): {}", step.commit_id, e)
-                        })?;
-                        Self::commit_inner(&repo, "", true)?;
-                    }
-                    RebaseActionKind::Fixup => {
-                        git_text(&repo, &["cherry-pick", "-n", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (fixup {}): {}", step.commit_id, e)
-                        })?;
-                        git_text(&repo, &["commit", "--amend", "--no-edit"])?;
-                    }
-                    RebaseActionKind::Drop => {}
-                    RebaseActionKind::Reword(new_msg) => {
-                        git_text(&repo, &["cherry-pick", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (reword {}): {}", step.commit_id, e)
-                        })?;
-                        Self::commit_inner(&repo, new_msg, true)?;
-                    }
+            for cmd in body {
+                if let Err(e) = run_argv(&repo, &cmd.argv) {
+                    return match &cmd.failure_label {
+                        Some(label) => Err(format!("Rebase step failed ({label}): {e}")),
+                        None => Err(e),
+                    };
                 }
             }
             Ok(())
@@ -283,12 +572,9 @@ impl GitWriter {
             return Err(e);
         }
 
-        if let Some(ref branch) = original_branch {
-            if let Err(e) = git_text(&repo, &["branch", "-f", branch, "HEAD"]) {
-                restore(&repo);
-                return Err(e);
-            }
-            if let Err(e) = git_text(&repo, &["checkout", branch]) {
+        // Phase 3: finalize — repoint the branch and check it back out.
+        for cmd in finalize {
+            if let Err(e) = run_argv(&repo, &cmd.argv) {
                 restore(&repo);
                 return Err(e);
             }
@@ -302,11 +588,14 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fetch only moves remote-tracking refs, but a fetch of a large
+        // remote is still a long transfer: the 90s default cap would kill
+        // healthy traffic mid-flight, so network work gets NETWORK_TIMEOUT.
         if let Some(r) = remote {
             validate_ref_name(r)?;
-            git_text(&repo, &["fetch", r])
+            git_text_network(&repo, &["fetch", r])
         } else {
-            git_text(&repo, &["fetch", "--all", "--prune"])
+            git_text_network(&repo, &["fetch", "--all", "--prune"])
         }
     }
 
@@ -320,18 +609,15 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (remote, branch) {
-            (Some(r), Some(b)) => {
-                validate_ref_name(r)?;
-                validate_ref_name(b)?;
-                git_text(&repo, &["pull", r, b])
-            }
-            (Some(r), None) => {
-                validate_ref_name(r)?;
-                git_text(&repo, &["pull", r])
-            }
-            _ => git_text(&repo, &["pull"]),
+        if let Some(r) = remote {
+            validate_ref_name(r)?;
         }
+        if let Some(b) = branch {
+            validate_ref_name(b)?;
+        }
+        // Pull fetches before it merges; the fetch leg is the long pole and
+        // inherits DEFAULT_TIMEOUT's mid-transfer kill otherwise.
+        run_network_argv(&repo, &pull_argv(remote, branch))
     }
 
     pub fn push(
@@ -345,19 +631,15 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut args = vec!["push"];
-        if force {
-            args.push("--force-with-lease");
-        }
         if let Some(r) = remote {
             validate_ref_name(r)?;
-            args.push(r);
         }
         if let Some(b) = branch {
             validate_ref_name(b)?;
-            args.push(b);
         }
-        git_text(&repo, &args)
+        // The argv comes from the shared builder so the command gate judges
+        // exactly this line (--force-with-lease semantics included).
+        run_network_argv(&repo, &push_argv(remote, branch, force))
     }
 
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
@@ -370,8 +652,9 @@ impl GitWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(remote)?;
         validate_ref_name(tag)?;
-        let refspec = format!("refs/tags/{tag}");
-        git_text(&repo, &["push", remote, &refspec])
+        // Same network class as `push`: the gate judges this exact line via
+        // [`push_tag_argv`] in cmd_publish_release.
+        run_network_argv(&repo, &push_tag_argv(remote, tag))
     }
 
     pub fn merge_branch(
@@ -385,11 +668,9 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch_name)?;
-        if ff_only {
-            git_text(&repo, &["merge", "--ff-only", "--no-edit", branch_name])
-        } else {
-            git_text(&repo, &["merge", "--no-edit", branch_name])
-        }
+        // The builder owns the flags (--no-edit keeps merges non-interactive)
+        // so the gate sees exactly this command line.
+        run_argv(&repo, &merge_argv(branch_name, ff_only))
     }
 
     pub fn restack(repo_path: &str, branch: &str, onto: &str) -> Result<String, String> {
@@ -400,7 +681,7 @@ impl GitWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
-        git_text(&repo, &["rebase", "--onto", onto, onto, branch])
+        run_argv(&repo, &restack_argv(branch, onto))
     }
 
     pub fn create_tag(
@@ -415,20 +696,10 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(tag_name)?;
-        let mut args = vec!["tag"];
-        if let Some(msg) = message {
-            args.push("-a");
-            args.push(tag_name);
-            args.push("-m");
-            args.push(msg);
-        } else {
-            args.push(tag_name);
-        }
         if let Some(cid) = commit_id {
             validate_oid(cid)?;
-            args.push(cid);
         }
-        git_text(&repo, &args)?;
+        run_argv(&repo, &create_tag_argv(tag_name, commit_id, message))?;
         Ok(())
     }
 
@@ -439,7 +710,7 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(tag_name)?;
-        git_text(&repo, &["tag", "-d", tag_name])?;
+        run_argv(&repo, &delete_tag_argv(tag_name))?;
         Ok(())
     }
 
@@ -484,11 +755,7 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(msg) = message {
-            git_text(&repo, &["stash", "push", "-u", "-m", msg])
-        } else {
-            git_text(&repo, &["stash", "push", "-u"])
-        }
+        run_argv(&repo, &stash_save_argv(message))
     }
 
     pub fn stash_pop(repo_path: &str) -> Result<String, String> {
@@ -497,7 +764,7 @@ impl GitWriter {
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git_text(&repo, &["stash", "pop"])
+        run_argv(&repo, &stash_pop_argv())
     }
 
     pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {
@@ -520,7 +787,11 @@ impl GitWriter {
             return Err(format!("Already cloned at {}", clone_path.display()));
         }
         let clone_str = clone_path.to_string_lossy().into_owned();
-        git_global(&["clone", "--", url, &clone_str])?;
+        // Clone is the longest network operation in the app (whole history +
+        // working tree over possibly slow links). DEFAULT_TIMEOUT's 90s cap
+        // kills healthy multi-gigabyte transfers mid-flight and leaves a
+        // partial clone behind, so this runs under NETWORK_TIMEOUT.
+        git_global_with_timeout(&["clone", "--", url, &clone_str], NETWORK_TIMEOUT)?;
         Ok(clone_str)
     }
 }
@@ -790,8 +1061,13 @@ mod tests {
                 action: RebaseActionKind::Squash,
             },
         ];
-        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
-            .expect("pick+squash sequence should succeed");
+        GitWriter::execute_rebase_sequence_for_branch(
+            dir.path().to_str().unwrap(),
+            &base,
+            &steps,
+            Some("main"),
+        )
+        .expect("pick+squash sequence should succeed");
 
         let msg = head_message(&dir);
         assert_eq!(
@@ -814,13 +1090,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = GitWriter::execute_rebase_sequence(
+        let result = GitWriter::execute_rebase_sequence_for_branch(
             dir.path().to_str().unwrap(),
             &base,
             &[RebaseStep {
                 commit_id: c_a,
                 action: RebaseActionKind::Pick,
             }],
+            Some("main"),
         );
         assert!(result.is_err(), "dirty tree must refuse to rebase");
         assert_eq!(
@@ -986,7 +1263,7 @@ mod tests {
                         GitWriter::commit_files(
                             &path,
                             &format!("commit t{t}.{i}"),
-                            &[file.clone()],
+                            std::slice::from_ref(&file),
                         )
                         .unwrap_or_else(|e| panic!("commit_files {t}.{i}: {e}"));
                     }
@@ -1030,5 +1307,206 @@ mod tests {
         assert!(GitWriter::commit_files(&path, "   ", &["a.txt".into()]).is_err());
         assert!(GitWriter::commit_files(&path, "msg", &["../escape.txt".into()]).is_err());
         assert_eq!(head_message(&dir), "init", "no commit may be created");
+    }
+
+    /// Compile-time proof that the network writers reference the shared
+    /// network deadline: clone/fetch/pull/push must never run under the 90s
+    /// DEFAULT_TIMEOUT (it kills healthy multi-gigabyte transfers mid-flight),
+    /// so the constant they use has to be strictly larger.
+    #[test]
+    fn network_timeout_exceeds_default_timeout() {
+        assert!(
+            NETWORK_TIMEOUT > crate::engine::git_cli::DEFAULT_TIMEOUT,
+            "network operations must not inherit the short default cap"
+        );
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Gate/execution parity: push_argv is what the executor runs, so a force
+    /// push must surface `--force-with-lease` — the flag actually executed —
+    /// to the gate, never the bare `--force` the old hand-rolled gate line
+    /// claimed.
+    #[test]
+    fn push_argv_is_the_executed_line_including_lease_semantics() {
+        assert_eq!(
+            push_argv(Some("origin"), Some("main"), false),
+            owned(&["git", "push", "origin", "main"])
+        );
+        assert_eq!(
+            push_argv(None, None, true),
+            owned(&["git", "push", "--force-with-lease"]),
+            "force pushes must be judged as --force-with-lease"
+        );
+        assert_eq!(
+            push_argv(Some("up"), Some("feat/x"), true),
+            owned(&["git", "push", "--force-with-lease", "up", "feat/x"])
+        );
+    }
+
+    #[test]
+    fn pull_and_merge_and_commit_argvs_match_execution() {
+        assert_eq!(
+            pull_argv(Some("origin"), Some("main")),
+            owned(&["git", "pull", "origin", "main"])
+        );
+        assert_eq!(pull_argv(None, None), owned(&["git", "pull"]));
+
+        // The writer always adds --no-edit; the gate must see it.
+        assert_eq!(
+            merge_argv("feature", false),
+            owned(&["git", "merge", "--no-edit", "feature"])
+        );
+        assert_eq!(
+            merge_argv("feature", true),
+            owned(&["git", "merge", "--ff-only", "--no-edit", "feature"])
+        );
+
+        assert_eq!(
+            commit_argv("msg here", false),
+            owned(&["git", "commit", "-m", "msg here"])
+        );
+        assert_eq!(
+            commit_argv("msg", true),
+            owned(&["git", "commit", "-m", "msg", "--amend"])
+        );
+        // Empty-message amend is what internal squash flows execute; the gate
+        // has to judge those flags, not a "-m ''" line that never runs.
+        assert_eq!(
+            commit_argv("", true),
+            owned(&["git", "commit", "--amend", "--no-edit"])
+        );
+    }
+
+    #[test]
+    fn restack_stash_and_tag_argvs_match_execution() {
+        assert_eq!(
+            restack_argv("topic", "origin/main"),
+            owned(&[
+                "git",
+                "rebase",
+                "--onto",
+                "origin/main",
+                "origin/main",
+                "topic"
+            ])
+        );
+        assert_eq!(
+            stash_save_argv(None),
+            owned(&["git", "stash", "push", "-u"])
+        );
+        assert_eq!(
+            stash_save_argv(Some("wip")),
+            owned(&["git", "stash", "push", "-u", "-m", "wip"])
+        );
+        assert_eq!(stash_pop_argv(), owned(&["git", "stash", "pop"]));
+        assert_eq!(
+            create_tag_argv("v1.0", None, None),
+            owned(&["git", "tag", "v1.0"])
+        );
+        assert_eq!(
+            create_tag_argv("v1.0", Some("abc123"), Some("release")),
+            owned(&["git", "tag", "-a", "v1.0", "-m", "release", "abc123"])
+        );
+        assert_eq!(
+            delete_tag_argv("v1.0"),
+            owned(&["git", "tag", "-d", "v1.0"])
+        );
+        assert_eq!(
+            push_tag_argv("origin", "v1.0"),
+            owned(&["git", "push", "origin", "refs/tags/v1.0"])
+        );
+    }
+
+    /// Every strategy checkout_branch may attempt is listed up front so all
+    /// of them can be gated before the first one runs.
+    #[test]
+    fn checkout_attempts_cover_every_fallback_strategy() {
+        let attempts = checkout_branch_attempts("feature");
+        assert_eq!(
+            attempts,
+            vec![
+                owned(&["git", "switch", "--guess", "feature"]),
+                owned(&["git", "checkout", "--guess", "feature"]),
+                owned(&["git", "checkout", "feature"]),
+            ]
+        );
+    }
+
+    /// The plan is the single source of truth for both gate and executor: it
+    /// must contain detach, one cherry-pick per non-drop step (plus its amend
+    /// for squash/fixup/reword), and the finalize pair only when starting on
+    /// a branch.
+    #[test]
+    fn rebase_plan_composes_the_full_mutation_sequence() {
+        let steps = vec![
+            RebaseStep {
+                commit_id: "a1".into(),
+                action: RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: "b2".into(),
+                action: RebaseActionKind::Squash,
+            },
+            RebaseStep {
+                commit_id: "c3".into(),
+                action: RebaseActionKind::Drop,
+            },
+            RebaseStep {
+                commit_id: "d4".into(),
+                action: RebaseActionKind::Fixup,
+            },
+            RebaseStep {
+                commit_id: "e5".into(),
+                action: RebaseActionKind::Reword("new msg".into()),
+            },
+        ];
+        let plan =
+            rebase_sequence_plan("base0", &steps, Some("topic")).expect("plan should compose");
+        let argvs: Vec<Vec<String>> = plan.iter().map(|c| c.argv.clone()).collect();
+        assert_eq!(
+            argvs,
+            vec![
+                owned(&["git", "checkout", "--detach", "base0"]),
+                owned(&["git", "cherry-pick", "a1"]),
+                owned(&["git", "cherry-pick", "-n", "b2"]),
+                owned(&["git", "commit", "--amend", "--no-edit"]),
+                owned(&["git", "cherry-pick", "-n", "d4"]),
+                owned(&["git", "commit", "--amend", "--no-edit"]),
+                owned(&["git", "cherry-pick", "e5"]),
+                owned(&["git", "commit", "-m", "new msg", "--amend"]),
+                owned(&["git", "branch", "-f", "topic", "HEAD"]),
+                owned(&["git", "checkout", "topic"]),
+            ],
+            "gate and executor must share this exact sequence"
+        );
+        // Cherry-picks carry the historical failure labels; amends propagate
+        // bare, matching the pre-planner error wording exactly.
+        assert_eq!(plan[1].failure_label.as_deref(), Some("pick a1"));
+        assert_eq!(plan[2].failure_label.as_deref(), Some("squash b2"));
+        assert_eq!(plan[4].failure_label.as_deref(), Some("fixup d4"));
+        assert_eq!(plan[6].failure_label.as_deref(), Some("reword e5"));
+        assert!(plan[3].failure_label.is_none());
+
+        // Detached sessions have no finalize pair.
+        let detached = rebase_sequence_plan("base0", &steps, None).expect("plan");
+        assert_eq!(detached.len(), plan.len() - 2);
+        assert!(detached
+            .iter()
+            .all(|c| !c.argv.contains(&"branch".to_string())));
+    }
+
+    #[test]
+    fn rebase_plan_rejects_invalid_input_before_any_command_exists() {
+        let steps = vec![RebaseStep {
+            commit_id: "; rm -rf".into(),
+            action: RebaseActionKind::Pick,
+        }];
+        assert!(rebase_sequence_plan("ok-rev", &steps, None).is_err());
+        assert!(rebase_sequence_plan("-evil", &steps, None).is_err());
+        assert!(rebase_sequence_plan("ok-rev", &[], None).is_err());
+        assert!(rebase_sequence_plan("ok-rev", &steps, Some("bad..ref")).is_err());
     }
 }

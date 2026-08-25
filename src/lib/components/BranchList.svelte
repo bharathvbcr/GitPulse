@@ -95,7 +95,9 @@
   }
 
   async function suggestName() {
-    if (!$repoStore.currentPath) return;
+    // In-flight flag guards same-tick double clicks: the disabled attribute
+    // only updates after Svelte flushes, so two rapid clicks could both pass.
+    if (suggesting || !$repoStore.currentPath) return;
     suggesting = true;
     try {
       const gen = await invoke<{ text: string }>("cmd_ai_suggest_branch_name", {
@@ -345,6 +347,7 @@
       type="button"
       onclick={() => (creating = !creating)}
       title="Create branch"
+      aria-label="Create branch"
       class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
     >
       <Plus size={12} />
@@ -383,6 +386,7 @@
         type="button"
         onclick={() => void suggestName()}
         title="Suggest name"
+        aria-label="Suggest branch name"
         class="p-1 rounded-full hover:bg-surfaceHover text-textMuted transition-colors"
         disabled={suggesting}
       >

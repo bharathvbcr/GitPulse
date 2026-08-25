@@ -1,6 +1,6 @@
 <script lang="ts" generics="T">
   import type { Snippet } from "svelte";
-  import { computeWindow } from "../dom/virtualWindow";
+  import { clampScrollTop, computeWindow } from "../dom/virtualWindow";
 
   interface Props {
     /** Rows to window over. Omit and pass `itemCount` to render blanks. */
@@ -50,11 +50,12 @@
   });
 
   // Honor an externally written scroll position (split-pane sync). The guard
-  // breaks the feedback loop with our own scroll events.
+  // breaks the feedback loop with our own scroll events, and the clamp keeps
+  // elastic-overscroll values from parking the pane out of range.
   $effect(() => {
     const el = scroller;
     if (el && Math.abs(el.scrollTop - scrollTop) > 0.5) {
-      el.scrollTop = scrollTop;
+      el.scrollTop = clampScrollTop(scrollTop, el.scrollHeight, el.clientHeight);
     }
   });
 </script>

@@ -707,3 +707,292 @@ describe("repoStore branch stats", () => {
     expect(state.branches[0].compared_to).toBeUndefined();
   });
 });
+
+describe("repoStore diff selection races", () => {
+  const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  it("applies the LAST REQUEST when two file-diff responses resolve out of order", async () => {
+    const slow = deferred<string>();
+    const invoke = makeInvoke({
+      cmd_get_file_diff: async (_cmd, args) => {
+        if (args?.filePath === "slow.txt") return slow.promise as never;
+        return `diff ${String(args?.filePath)}` as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/race-file");
+
+    // Request A (slow) first, request B (fast) second. B is the last
+    // REQUEST, so A's late resolution must be discarded.
+    const firstRequest = store.selectFileDiff("slow.txt");
+    const secondRequest = store.selectFileDiff("fast.txt");
+    await secondRequest;
+    expect(get(store).selectedFilePath).toBe("fast.txt");
+    expect(get(store).selectedDiff).toBe("diff fast.txt");
+
+    slow.resolve("diff slow");
+    await firstRequest;
+
+    const state = get(store);
+    expect(state.selectedFilePath).toBe("fast.txt");
+    expect(state.selectedDiff).toBe("diff fast.txt");
+    expect(state.error).toBeNull();
+  });
+
+  it("applies the last-requested kind: a later commit selection wins over an in-flight file diff", async () => {
+    const fileDiff = deferred<string>();
+    const invoke = makeInvoke({
+      cmd_get_file_diff: async () => fileDiff.promise as never,
+      cmd_get_commit_diff: async (_cmd, args) =>
+        `commit ${String(args?.commitId)}` as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/race-kind");
+
+    const fileRequest = store.selectFileDiff("slow.txt");
+    const commitRequest = store.selectCommitDiff("deadbeef");
+    await commitRequest;
+
+    expect(get(store).selectedCommitId).toBe("deadbeef");
+    expect(get(store).selectedFilePath).toBeNull();
+    expect(get(store).selectedDiff).toBe("commit deadbeef");
+
+    fileDiff.resolve("diff slow");
+    await fileRequest;
+
+    const state = get(store);
+    expect(state.selectedCommitId).toBe("deadbeef");
+    expect(state.selectedDiff).toBe("commit deadbeef");
+  });
+
+  it("does not let a stale FAILED diff clobber a newer successful selection", async () => {
+    const doomed = deferred<never>();
+    let doomedArmed = true;
+    const invoke = makeInvoke({
+      cmd_get_file_diff: async (_cmd, args) => {
+        if (doomedArmed && args?.filePath === "boom.txt") return doomed.promise as never;
+        return `diff ${String(args?.filePath)}` as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/race-error");
+
+    const staleRequest = store.selectFileDiff("boom.txt");
+    doomedArmed = false;
+    await store.selectFileDiff("safe.txt");
+
+    expect(get(store).error).toBeNull();
+    doomed.reject(new Error("git blew up"));
+    await staleRequest;
+
+    const state = get(store);
+    expect(state.selectedFilePath).toBe("safe.txt");
+    expect(state.error).toBeNull();
+  });
+
+  it("still surfaces the error when the CURRENT request fails", async () => {
+    const invoke = makeInvoke({
+      cmd_get_commit_diff: async () => {
+        throw new Error("no such commit");
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/race-current-error");
+
+    await store.selectCommitDiff("missing");
+
+    expect(get(store).error).toMatch(/no such commit/);
+    await flushMicro();
+  });
+
+  it("keeps selections from different sessions independent", async () => {
+    const alphaDiff = deferred<string>();
+    const invoke = makeInvoke({
+      cmd_get_file_diff: async (_cmd, args) => {
+        if (args?.repoPath === "/r/sel-a" && args?.filePath === "a-slow.txt") {
+          return alphaDiff.promise as never;
+        }
+        return `diff ${String(args?.filePath)} on ${String(args?.repoPath)}` as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/sel-a");
+    const alphaId = get(store).activeTabId!;
+    const staleAlpha = store.selectFileDiff("a-slow.txt");
+    await store.openRepo("/r/sel-b");
+    await store.selectFileDiff("b.txt");
+    await store.activateTab(alphaId);
+
+    // The stale /r/sel-a response lands after reactivation; the fresh
+    // generation guard plus seq must not let it paint over the reactivated
+    // session's own (empty) pane.
+    alphaDiff.resolve("diff a-stale");
+    await staleAlpha;
+    expect(get(store).selectedFilePath).toBeNull();
+    expect(get(store).selectedDiff).toBeNull();
+  });
+});
+
+describe("repoStore mutation progress", () => {
+  const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  it("exposes a human pendingMutation label while a mutation runs and clears it after", async () => {
+    const op = deferred<unknown>();
+    const invoke = makeInvoke({ cmd_pull: async () => op.promise as never });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/mutate-run");
+    expect(get(store).pendingMutation).toBeNull();
+
+    const running = store.pull();
+    await flushMicro();
+    expect(get(store).pendingMutation).toBe("Pulling");
+
+    op.resolve(undefined);
+    const outcome = await running;
+    expect(outcome.ok).toBe(true);
+    expect(get(store).pendingMutation).toBeNull();
+  });
+
+  it("clears pendingMutation through finally even when the mutation fails", async () => {
+    const op = deferred<never>();
+    const invoke = makeInvoke({ cmd_push: async () => op.promise as never });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/mutate-fail");
+
+    const running = store.push();
+    await flushMicro();
+    expect(get(store).pendingMutation).toBe("Pushing");
+
+    op.reject(new Error("rejected by remote"));
+    const outcome = await running;
+    expect(outcome.ok).toBe(false);
+    expect(get(store).pendingMutation).toBeNull();
+  });
+
+  it("clears pendingMutation when no repository is open (early return path)", async () => {
+    const { store } = makeStore();
+    const outcome = await store.pull();
+    expect(outcome.ok).toBe(false);
+    expect(get(store).pendingMutation).toBeNull();
+  });
+});
+
+describe("repoStore workspace restore concurrency", () => {
+  function makeTrackedInvoke() {
+    const events: string[] = [];
+    let inflight = 0;
+    let maxInflight = 0;
+    const invoke = makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => {
+        const path = String(args?.repoPath);
+        inflight += 1;
+        maxInflight = Math.max(maxInflight, inflight);
+        events.push(`start:${path}`);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inflight -= 1;
+        events.push(`end:${path}`);
+        return { path, name: path.split("/").pop(), is_bare: false } as never;
+      },
+    });
+    return { invoke, events, maxInflight: () => maxInflight };
+  }
+
+  it("restores the active repo FIRST and drains the rest with bounded parallelism of 3", async () => {
+    const tracked = makeTrackedInvoke();
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        tabs: [
+          { path: "/r/tab-1", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-2", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-3", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-4", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-5", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-6", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+          { path: "/r/tab-7", pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null },
+        ],
+        activePath: "/r/tab-4",
+        recents: [],
+        lastClosed: [],
+      }),
+    });
+    const graph = makeGraph();
+    const store = createRepoStore({
+      invoke: tracked.invoke,
+      storage,
+      caseInsensitive: true,
+      graph: graph.api,
+      filter: makeFilter(),
+    });
+
+    await store.restoreWorkspace();
+
+    // The previously-active repo starts hydrating before anything else.
+    expect(tracked.events[0]).toBe("start:/r/tab-4");
+    // Seven tabs: head alone, then batches of 3+3 — never more than 3
+    // resolves in flight.
+    expect(tracked.maxInflight()).toBe(3);
+    expect(tracked.events.filter((event) => event.startsWith("start:"))).toHaveLength(7);
+
+    // The user's saved tab arrangement survives the active-first open.
+    const state = get(store);
+    expect(state.openTabs.map((tab) => tab.path)).toEqual([
+      "/r/tab-1",
+      "/r/tab-2",
+      "/r/tab-3",
+      "/r/tab-4",
+      "/r/tab-5",
+      "/r/tab-6",
+      "/r/tab-7",
+    ]);
+    expect(state.currentPath).toBe("/r/tab-4");
+  });
+});
+
+describe("commit diff payload plumbing", () => {
+  it("stores the structured truncated payload from cmd_get_commit_diff as-is", async () => {
+    const payload = {
+      content: "diff --git a/a.txt b/a.txt\n+++ a.txt\n",
+      truncated: true,
+      included_files: 2,
+      skipped_files: [{ path: "big.min.js", additions: 9001, deletions: 0 }],
+      total_files: 3,
+      total_additions: 9100,
+      total_deletions: 12,
+    };
+    const invoke: InvokeFn = (cmd, args) => {
+      if (cmd === "cmd_open_repo") {
+        return Promise.resolve({
+          path: args?.repoPath ?? "/r/payload",
+          name: "payload",
+          is_bare: false,
+        } as never);
+      }
+      if (cmd === "cmd_get_commit_diff") {
+        return Promise.resolve(payload as never);
+      }
+      return makeInvoke()(cmd, args);
+    };
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/payload");
+    await store.selectCommitDiff("abc1234");
+    const state = get(store);
+    expect(state.selectedCommitId).toBe("abc1234");
+    expect(state.selectedDiff).not.toBeNull();
+    expect(typeof state.selectedDiff).toBe("object");
+    const diff = state.selectedDiff as { truncated?: boolean; total_files?: number };
+    expect(diff.truncated).toBe(true);
+    expect(diff.total_files).toBe(3);
+
+    // A legacy bare-string response still lands unchanged for downstream
+    // normalization.
+    const legacyInvoke: InvokeFn = (cmd, args) => {
+      if (cmd === "cmd_get_commit_diff") return Promise.resolve("legacy raw patch" as never);
+      return invoke(cmd, args);
+    };
+    const legacy = makeStore(legacyInvoke);
+    await legacy.store.openRepo("/r/payload");
+    await legacy.store.selectCommitDiff("def5678");
+    expect(get(legacy.store).selectedDiff).toBe("legacy raw patch");
+  });
+});

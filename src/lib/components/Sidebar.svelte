@@ -23,7 +23,15 @@
 
 </script>
 
-<aside class="w-80 bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane">
+<aside class="relative w-80 bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane">
+  {#if $repoStore.pendingMutation}
+    <!-- Stage/unstage and menu-driven mutations report through the store;
+         this strip is their progress indicator. -->
+    <div class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden" role="status">
+      <span class="sr-only">{$repoStore.pendingMutation}…</span>
+      <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
+    </div>
+  {/if}
   <!-- Repo Header & Open Button -->
   <div class="p-3 flex items-center justify-between bg-surfaceHover/30">
     <div class="flex items-center gap-2 truncate">
@@ -35,6 +43,7 @@
     <button
       onclick={() => repoStore.pickAndOpenRepo()}
       title="Open Repository"
+      aria-label="Open Repository"
       class="gp-icon-btn !p-1 hover:text-accent"
     >
       <FolderOpen size={14} />

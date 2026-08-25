@@ -24,6 +24,33 @@ const CHURN_CACHE_CAPACITY: usize = 8192;
 /// `git`'s output cap; this guards the direct `fs::read` path.
 const MAX_WORKING_TREE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// One file's patch is excluded from a commit's rendered diff when its changed
+/// line count (`additions + deletions` from numstat) exceeds this.
+pub const PER_FILE_DIFF_LINE_LIMIT: usize = 5_000;
+
+/// Total changed lines a single rendered commit diff may carry before the
+/// remaining normal files are skipped and `truncated` is reported.
+pub const DIFF_TOTAL_LINE_BUDGET: usize = 60_000;
+
+/// Hard ceiling on how many per-file patches one commit-diff payload may
+/// include regardless of budget headroom.
+pub const MAX_INCLUDED_FILES: usize = 2_000;
+
+/// Pathspecs are passed to `git show` in batches no larger than this so argv
+/// stays far below OS limits even for enormous commits.
+const DIFF_PATHSPEC_BATCH_SIZE: usize = 200;
+
+/// Cap on how many entries [`GitReader::get_commit_files`] returns; the full
+/// count rides along on [`CommitDetails`] as `files_total_count`.
+pub const COMMIT_FILES_LIST_CAP: usize = 500;
+
+/// Most recent tags returned by the tag listing; older tags beyond this cap
+/// are dropped so a repository with thousands of tags cannot flood the UI.
+pub const REFS_TAG_CAP: usize = 200;
+
+/// Hard cap on lines fetched by one ranged blame request.
+pub const BLAME_MAX_RANGE_LINES: usize = 50_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     pub name: String,
@@ -85,6 +112,19 @@ pub struct TagInfo {
     pub message: Option<String>,
 }
 
+/// Wire shape for [`GitReader::list_tags_summary`]: the newest
+/// [`REFS_TAG_CAP`] tags (creatordate descending) plus the totals needed to
+/// tell the user that older tags were dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagListSummary {
+    pub tags: Vec<TagInfo>,
+    /// Total number of tags present in the repository.
+    pub total_tags: usize,
+    /// True when `total_tags` exceeded [`REFS_TAG_CAP`] and only the newest
+    /// cap worth of tags are listed.
+    pub tags_truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatus {
     pub path: String,
@@ -96,6 +136,35 @@ pub struct FileStatus {
     pub deletions: usize,
 }
 
+/// Wire shape for [`GitReader::get_status_payload`]: the working-tree status
+/// plus a health flag for the auxiliary numstat lookups.
+///
+/// `stats_degraded` is true only when BOTH numstat attempts (worktree and
+/// staged diff) failed; per-file addition/deletion counts are then zero but
+/// the paths themselves are still trustworthy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusPayload {
+    pub files: Vec<FileStatus>,
+    pub stats_degraded: bool,
+}
+
+/// Wire shape for [`GitReader::get_commit_diff_payload`].
+///
+/// Large commits no longer fail wholesale: normal-sized files are included
+/// until the line budget or file cap is hit, and everything else (oversized
+/// text, binary, budget-exhausted) lands in `skipped_files` with its numstat
+/// counts so callers can explain what was left out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitDiffPayload {
+    pub content: String,
+    pub truncated: bool,
+    pub included_files: u32,
+    pub skipped_files: Vec<CommitFileChange>,
+    pub total_files: u32,
+    pub total_additions: usize,
+    pub total_deletions: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlameLine {
     pub line_no: usize,
@@ -104,6 +173,15 @@ pub struct BlameLine {
     pub author_email: String,
     pub timestamp: i64,
     pub content: String,
+}
+
+/// Wire shape for [`GitReader::get_blame_range`]: the blame rows for the
+/// requested range plus a flag set when the range exceeded
+/// [`BLAME_MAX_RANGE_LINES`] and `end_line` was clamped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlameResult {
+    pub lines: Vec<BlameLine>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +209,12 @@ pub struct CommitDetails {
     pub changed_files: Vec<CommitFileChange>,
     pub total_additions: usize,
     pub total_deletions: usize,
+    /// Total number of files changed by the commit, BEFORE the
+    /// [`COMMIT_FILES_LIST_CAP`] truncation applied to `changed_files`.
+    pub files_total_count: usize,
+    /// True when more files changed than [`COMMIT_FILES_LIST_CAP`] and
+    /// `changed_files` was truncated.
+    pub files_list_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,10 +562,47 @@ impl GitReader {
         revision: Option<&str>,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_count.clamp(1, Self::MAX_HISTORY_COMMITS).to_string();
-        let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
+        let count = max_count.clamp(1, Self::MAX_HISTORY_COMMITS);
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
+        Self::history_rows(&repo, skipped, count, revision)
+    }
+
+    /// Reads one page of history AND answers "are there more rows?" in a
+    /// single walk, so paginators do not have to fetch `limit + 1` themselves.
+    ///
+    /// The probe fetch runs BEFORE any clamping: it asks git for
+    /// `min(limit, MAX_HISTORY_COMMITS) + 1` rows, reports
+    /// `has_more = fetched > effective_limit`, and only then truncates the
+    /// returned rows to the effective limit. Unlike
+    /// [`GitReader::read_commit_history_paged`], this stays correct when the
+    /// caller's limit equals [`MAX_HISTORY_COMMITS`] exactly — the extra probe
+    /// row is fetched as CAP + 1, never clamped away.
+    pub fn read_commit_history_probe(
+        repo_path: &str,
+        skip: usize,
+        max_count: usize,
+        revision: Option<&str>,
+    ) -> Result<(Vec<RawCommitNode>, bool), String> {
+        let repo = validate_repo(repo_path)?;
+        let effective_limit = max_count.clamp(1, Self::MAX_HISTORY_COMMITS);
+        let fetch = (effective_limit + 1).min(Self::MAX_HISTORY_COMMITS.saturating_add(1));
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
+        let mut rows = Self::history_rows(&repo, skipped, fetch, revision)?;
+        let has_more = rows.len() > effective_limit;
+        rows.truncate(effective_limit);
+        Ok((rows, has_more))
+    }
+
+    /// Shared log walker: exactly `count` rows after `skip` skips. No clamping
+    /// here — both public wrappers own their own limits.
+    fn history_rows(
+        repo: &Path,
+        skip: usize,
+        count: usize,
+        revision: Option<&str>,
+    ) -> Result<Vec<RawCommitNode>, String> {
         let count_arg = format!("-n{}", count);
-        let skip_arg = format!("--skip={}", skipped);
+        let skip_arg = format!("--skip={}", skip);
         let mut args = vec![
             "log",
             count_arg.as_str(),
@@ -495,7 +616,7 @@ impl GitReader {
         } else {
             args.push("--all");
         }
-        let stdout = git_text(&repo, &args)?;
+        let stdout = git_text(repo, &args)?;
 
         let mut commits = Vec::new();
         for record in stdout.split('\x01') {
@@ -550,20 +671,42 @@ impl GitReader {
     }
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {
+        Ok(Self::get_status_payload(repo_path)?.files)
+    }
+
+    /// Full status payload: files plus the `stats_degraded` health flag.
+    ///
+    /// The two auxiliary numstat walks (`diff --numstat` for unstaged,
+    /// `diff --cached --numstat` for staged) are retried once on failure; if
+    /// both attempts fail, `stats_degraded` is true and those counts are zero
+    /// while paths/status codes remain authoritative.
+    pub fn get_status_payload(repo_path: &str) -> Result<StatusPayload, String> {
         let repo = validate_repo(repo_path)?;
         let stdout = git_text(&repo, &["status", "--porcelain=v1", "-z"])?;
-        let numstat_work =
-            parse_numstat(&git_text(&repo, &["diff", "--numstat"]).unwrap_or_default());
-        let numstat_index =
-            parse_numstat(&git_text(&repo, &["diff", "--cached", "--numstat"]).unwrap_or_default());
+        Self::status_from_porcelain(&repo, &stdout, numstat_with_retry)
+    }
+
+    /// Assembles [`StatusPayload`] from porcelain output with an injectable
+    /// numstat fetcher so tests can simulate repeated failures.
+    fn status_from_porcelain(
+        repo: &Path,
+        stdout: &str,
+        fetch_numstat: impl Fn(&Path, bool) -> (HashMap<String, (usize, usize)>, bool),
+    ) -> Result<StatusPayload, String> {
+        let (numstat_work, degraded_work) = fetch_numstat(repo, false);
+        let (numstat_index, degraded_index) = fetch_numstat(repo, true);
+        let stats_degraded = degraded_work || degraded_index;
 
         let mut statuses = Vec::new();
-        let bytes = stdout.into_bytes();
+        let bytes = stdout.as_bytes();
         let mut i = 0;
         while i + 3 < bytes.len() {
             let index_status = bytes[i] as char;
             let work_status = bytes[i + 1] as char;
             i += 3;
+            // In -z mode a rename record is `XY NEW\0OLD\0` (git swaps the
+            // arrow order versus non-z output), every other entry is
+            // `XY PATH\0`.
             let rest = match bytes[i..].iter().position(|&b| b == 0) {
                 Some(n) => {
                     let s = String::from_utf8_lossy(&bytes[i..i + n]).into_owned();
@@ -579,19 +722,21 @@ impl GitReader {
                 let new = split.next().unwrap_or(&rest).to_string();
                 (new, old)
             } else if index_status == 'R' || work_status == 'R' {
-                let old = rest.clone();
-                let new = match bytes.get(i..) {
-                    Some(slice) => match slice.iter().position(|&b| b == 0) {
-                        Some(n) => {
-                            let s = String::from_utf8_lossy(&slice[..n]).into_owned();
-                            i += n + 1;
-                            s
-                        }
-                        None => rest.clone(),
-                    },
-                    None => rest.clone(),
-                };
-                (new, Some(old))
+                match bytes.get(i..).and_then(|slice| {
+                    slice
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map(|n| String::from_utf8_lossy(&slice[..n]).into_owned())
+                }) {
+                    // git lists the NEW path first, then the ORIGINAL path;
+                    // assigning them swapped made stage/unstage/discard target
+                    // the wrong file and broke numstat lookups.
+                    Some(old) => {
+                        i += old.len() + 1;
+                        (rest.clone(), Some(old))
+                    }
+                    None => (rest, None),
+                }
             } else {
                 (rest, None)
             };
@@ -617,20 +762,75 @@ impl GitReader {
                 deletions,
             });
         }
-        Ok(statuses)
+        Ok(StatusPayload {
+            files: statuses,
+            stats_degraded,
+        })
     }
 
     pub fn get_file_blame(repo_path: &str, file_path: &str) -> Result<Vec<BlameLine>, String> {
         let repo = validate_repo(repo_path)?;
-        let _ = sandbox_join(&repo, file_path)?;
-        let stdout = git_text(&repo, &["blame", "--line-porcelain", "--", file_path])?;
+        Ok(Self::blame_porcelain(&repo, file_path, None)?.lines)
+    }
+
+    /// Blame for a 1-based, inclusive `[start_line, end_line]` window.
+    ///
+    /// Ranges larger than [`BLAME_MAX_RANGE_LINES`] are clamped and reported
+    /// via [`BlameResult::truncated`] instead of letting one request pull
+    /// hundreds of thousands of porcelain records through the pipe.
+    pub fn get_blame_range(
+        repo_path: &str,
+        file_path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<BlameResult, String> {
+        let repo = validate_repo(repo_path)?;
+        if start_line == 0 {
+            return Err("blame lines are 1-based; start line must be at least 1".into());
+        }
+        if end_line < start_line {
+            return Err("blame end line precedes start line".into());
+        }
+        let clamped_end = end_line.min(start_line.saturating_add(BLAME_MAX_RANGE_LINES - 1));
+        let truncated = clamped_end != end_line;
+        let mut result = Self::blame_porcelain(&repo, file_path, Some((start_line, clamped_end)))?;
+        result.truncated = truncated;
+        Ok(result)
+    }
+
+    /// Shared blame runner. `range` is an inclusive 1-based window; when it is
+    /// `None` the whole file is blamed exactly as before (no `-L`, so git's
+    /// own line-count validation never rejects short files).
+    fn blame_porcelain(
+        repo: &Path,
+        file_path: &str,
+        range: Option<(usize, usize)>,
+    ) -> Result<BlameResult, String> {
+        let _ = sandbox_join(repo, file_path)?;
+        let stdout = match range {
+            None => git_text(repo, &["blame", "--line-porcelain", "--", file_path])?,
+            Some((start, end)) => {
+                let range_arg = format!("-L{},{}", start, end);
+                git_text(
+                    repo,
+                    &[
+                        "blame",
+                        "--line-porcelain",
+                        range_arg.as_str(),
+                        "--",
+                        file_path,
+                    ],
+                )?
+            }
+        };
+        let base_line = range.map(|(start, _)| start).unwrap_or(1);
 
         let mut blame_lines = Vec::new();
         let mut current_sha = String::new();
         let mut current_author = String::new();
         let mut current_email = String::new();
         let mut current_time: i64 = 0;
-        let mut line_count = 1;
+        let mut line_count = base_line;
 
         for line in stdout.lines() {
             if let Some(content) = line.strip_prefix('\t') {
@@ -659,7 +859,10 @@ impl GitReader {
                 }
             }
         }
-        Ok(blame_lines)
+        Ok(BlameResult {
+            lines: blame_lines,
+            truncated: false,
+        })
     }
 
     pub fn get_file_diff(
@@ -682,10 +885,119 @@ impl GitReader {
         git_text(&repo, &args)
     }
 
+    /// Legacy string view of a commit's diff, kept for existing callers.
+    ///
+    /// Delegates to [`GitReader::get_commit_diff_payload`]; unlike the
+    /// historical implementation it no longer fails outright when the raw
+    /// patch would exceed the 64 MB pipe cap — oversized/binary files are
+    /// skipped and the returned content is simply truncated. New callers
+    /// should use [`GitReader::get_commit_diff_payload`] to also receive the
+    /// truncation metadata.
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<String, String> {
+        Ok(Self::get_commit_diff_payload(repo_path, commit_id)?.content)
+    }
+
+    /// Renders one commit's diff with hard bounds on time, memory, and IPC
+    /// size.
+    ///
+    /// A cheap numstat preflight (`--numstat -z`, no patch text) classifies
+    /// every changed file as binary, oversized (more than
+    /// [`PER_FILE_DIFF_LINE_LIMIT`] changed lines), or normal. When everything
+    /// is normal and within [`DIFF_TOTAL_LINE_BUDGET`], the fast path runs the
+    /// exact command the legacy implementation used and returns its full
+    /// output unmodified. Otherwise normal files are included until the budget
+    /// or [`MAX_INCLUDED_FILES`] is reached — fetched via explicit pathspec
+    /// batches of at most [`DIFF_PATHSPEC_BATCH_SIZE`] paths — and every other
+    /// file lands in `skipped_files` with its numstat counts.
+    pub fn get_commit_diff_payload(
+        repo_path: &str,
+        commit_id: &str,
+    ) -> Result<CommitDiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        git_text(&repo, &["show", "--unified=3", "--format=", commit_id])
+        let stdout = git_text(
+            &repo,
+            &["show", "--pretty=format:", "--numstat", "-z", commit_id],
+        )?;
+        let entries = parse_numstat_z(&stdout);
+
+        let total_files = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        let total_additions = entries.iter().map(|e| e.additions).sum();
+        let total_deletions = entries.iter().map(|e| e.deletions).sum();
+
+        let all_normal = entries
+            .iter()
+            .all(|e| !e.is_binary && e.additions + e.deletions <= PER_FILE_DIFF_LINE_LIMIT);
+        let total_changed_lines: usize = entries
+            .iter()
+            .filter(|e| !e.is_binary)
+            .map(|e| e.additions + e.deletions)
+            .sum();
+        if all_normal && total_changed_lines <= DIFF_TOTAL_LINE_BUDGET {
+            // Fast path: identical bytes to the historical implementation.
+            let content = git_text(&repo, &["show", "--unified=3", "--format=", commit_id])?;
+            return Ok(CommitDiffPayload {
+                content,
+                truncated: false,
+                included_files: total_files,
+                skipped_files: Vec::new(),
+                total_files,
+                total_additions,
+                total_deletions,
+            });
+        }
+
+        // Slow path: greedy inclusion in numstat order; smaller later files may
+        // still fit when an earlier one missed the remaining budget.
+        let mut included: Vec<&NumstatZEntry> = Vec::new();
+        let mut skipped_files: Vec<CommitFileChange> = Vec::new();
+        let mut budget = DIFF_TOTAL_LINE_BUDGET;
+        for entry in &entries {
+            let change = CommitFileChange {
+                path: entry.path.clone(),
+                status_code: if entry.is_binary {
+                    "B".to_string()
+                } else {
+                    "M".to_string()
+                },
+                additions: entry.additions,
+                deletions: entry.deletions,
+            };
+            let fits_budget =
+                !entry.is_binary && entry.additions + entry.deletions <= PER_FILE_DIFF_LINE_LIMIT;
+            if fits_budget
+                && included.len() < MAX_INCLUDED_FILES
+                && entry.additions + entry.deletions <= budget
+            {
+                budget -= entry.additions + entry.deletions;
+                included.push(entry);
+            } else {
+                skipped_files.push(change);
+            }
+        }
+
+        let mut content = String::new();
+        for batch in included.chunks(DIFF_PATHSPEC_BATCH_SIZE) {
+            let mut args: Vec<&str> = vec!["show", "--pretty=format:", "--unified=3", "--"];
+            for entry in batch {
+                args.push(&entry.pathspec);
+            }
+            let piece = git_text(&repo, &args)?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&piece);
+        }
+
+        Ok(CommitDiffPayload {
+            content,
+            truncated: true,
+            included_files: u32::try_from(included.len()).unwrap_or(u32::MAX),
+            skipped_files,
+            total_files,
+            total_additions,
+            total_deletions,
+        })
     }
 
     pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<String, String> {
@@ -702,7 +1014,18 @@ impl GitReader {
     ) -> Result<Vec<CommitFileChange>, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(&repo, &["show", "--pretty=format:", "--numstat", commit_id])?;
+        let mut files = Self::commit_files_uncapped(&repo, commit_id)?;
+        files.truncate(COMMIT_FILES_LIST_CAP);
+        Ok(files)
+    }
+
+    /// Uncapped numstat listing; [`GitReader::get_commit_details`] needs the
+    /// full list to compute accurate totals before truncation.
+    fn commit_files_uncapped(
+        repo: &Path,
+        commit_id: &str,
+    ) -> Result<Vec<CommitFileChange>, String> {
+        let stdout = git_text(repo, &["show", "--pretty=format:", "--numstat", commit_id])?;
         Ok(parse_numstat_files(&stdout))
     }
 
@@ -784,9 +1107,15 @@ impl GitReader {
             return Err("Failed to parse commit metadata format".into());
         }
         let body = fields[10].trim().to_string();
-        let changed_files = Self::get_commit_files(repo_path, commit_id).unwrap_or_default();
+        let all_files = Self::commit_files_uncapped(&repo, commit_id).unwrap_or_default();
+        let files_total_count = all_files.len();
+        let mut changed_files = all_files;
+        // Totals describe the WHOLE commit even when the shipped list is
+        // truncated for the UI.
         let total_additions = changed_files.iter().map(|f| f.additions).sum();
         let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
+        let files_list_truncated = changed_files.len() > COMMIT_FILES_LIST_CAP;
+        changed_files.truncate(COMMIT_FILES_LIST_CAP);
         Ok(CommitDetails {
             id: fields[0].to_string(),
             parent_ids: if fields[1].is_empty() {
@@ -807,16 +1136,32 @@ impl GitReader {
             changed_files,
             total_additions,
             total_deletions,
+            files_total_count,
+            files_list_truncated,
         })
     }
 
     pub fn list_tags(repo_path: &str) -> Result<Vec<TagInfo>, String> {
+        let mut summary = Self::list_tags_summary(repo_path)?;
+        // Legacy callers expect the historical alphabetical (refname) order;
+        // the cap selection itself is newest-first.
+        summary.tags.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(summary.tags)
+    }
+
+    /// Tag listing with the decoration cap made explicit: only the
+    /// [`REFS_TAG_CAP`] most recent tags (by creatordate, refname descending as
+    /// a deterministic tie-break) are returned, with `total_tags` and
+    /// `tags_truncated` telling the caller what was dropped.
+    pub fn list_tags_summary(repo_path: &str) -> Result<TagListSummary, String> {
         let repo = validate_repo(repo_path)?;
         let stdout = git_text(
             &repo,
             &[
                 "tag",
                 "-l",
+                "--sort=-creatordate",
+                "--sort=-refname",
                 "--format=%(refname:short)%00%(objectname)%00%(contents:subject)",
             ],
         )?;
@@ -834,7 +1179,14 @@ impl GitReader {
                 });
             }
         }
-        Ok(tags)
+        let total_tags = tags.len();
+        let tags_truncated = total_tags > REFS_TAG_CAP;
+        tags.truncate(REFS_TAG_CAP);
+        Ok(TagListSummary {
+            tags,
+            total_tags,
+            tags_truncated,
+        })
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
@@ -1163,6 +1515,66 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// One numstat record from the `-z` preflight of
+/// [`GitReader::get_commit_diff_payload`].
+struct NumstatZEntry {
+    path: String,
+    /// `:(literal)`-prefixed pathspec so metacharacters in real filenames are
+    /// never interpreted as globs when fetching per-file patches.
+    pathspec: String,
+    additions: usize,
+    deletions: usize,
+    is_binary: bool,
+}
+
+/// Parses `git show --pretty=format: --numstat -z <commit>`.
+///
+/// With `-z`, records are NUL-separated and never quoted: normal and binary
+/// files are `add\tdel\tpath\0` (binary uses `-` for both counts), while
+/// renames/copies emit an empty third field followed by the ORIGINAL path and
+/// then the NEW path (`add\tdel\t\0from\0to\0`).
+fn parse_numstat_z(stdout: &str) -> Vec<NumstatZEntry> {
+    let mut entries = Vec::new();
+    let mut records = stdout.split('\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(3, '\t');
+        let add_raw = fields.next().unwrap_or("");
+        let del_raw = fields.next().unwrap_or("");
+        let Some(third) = fields.next() else {
+            continue;
+        };
+        let is_binary = add_raw == "-" && del_raw == "-";
+        let entry = |path: String| NumstatZEntry {
+            pathspec: format!(":(literal){}", path),
+            path,
+            additions: add_raw.parse().unwrap_or(0),
+            deletions: del_raw.parse().unwrap_or(0),
+            is_binary,
+        };
+        if third.is_empty() {
+            // Rename/copy: the ORIGINAL path and then the NEW path follow as
+            // their own NUL-terminated records (`add\tdel\t\0from\0to\0`).
+            // The original record is consumed to advance the stream; patches
+            // for renames are fetched under the new path alone.
+            match records.next() {
+                Some(from) if !from.is_empty() => {}
+                _ => break,
+            }
+            let to = match records.next() {
+                Some(t) if !t.is_empty() => t,
+                _ => break,
+            };
+            entries.push(entry(to.to_string()));
+        } else {
+            entries.push(entry(third.to_string()));
+        }
+    }
+    entries
+}
+
 fn parse_numstat(stdout: &str) -> HashMap<String, (usize, usize)> {
     let mut map = HashMap::new();
     for line in stdout.lines() {
@@ -1170,11 +1582,7 @@ fn parse_numstat(stdout: &str) -> HashMap<String, (usize, usize)> {
         if parts.len() >= 3 {
             let add = parts[0].parse().unwrap_or(0);
             let del = parts[1].parse().unwrap_or(0);
-            let path = parts[2]
-                .rsplit(" => ")
-                .next()
-                .unwrap_or(parts[2])
-                .to_string();
+            let path = c_unquote_path(parts[2].rsplit(" => ").next().unwrap_or(parts[2]));
             map.insert(path, (add, del));
         }
     }
@@ -1188,11 +1596,7 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
         if parts.len() < 3 {
             continue;
         }
-        let path = parts[2]
-            .rsplit(" => ")
-            .next()
-            .unwrap_or(parts[2])
-            .to_string();
+        let path = c_unquote_path(parts[2].rsplit(" => ").next().unwrap_or(parts[2]));
         let status_code = if parts[0] == "-" && parts[1] == "-" {
             "B".to_string()
         } else if parts[2].contains(" => ") {
@@ -1208,6 +1612,77 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
         });
     }
     files
+}
+
+/// Fetches one status numstat map with a single retry; reports `true` (the
+/// degraded flag) only when BOTH attempts fail. Success-path behavior is
+/// unchanged from the historical `unwrap_or_default()` — a healthy repo gets
+/// exactly the same numbers.
+fn numstat_with_retry(repo: &Path, cached: bool) -> (HashMap<String, (usize, usize)>, bool) {
+    let mut args: Vec<&str> = vec!["diff"];
+    if cached {
+        args.push("--cached");
+    }
+    args.push("--numstat");
+    match git_text(repo, &args) {
+        Ok(stdout) => (parse_numstat(&stdout), false),
+        Err(_) => match git_text(repo, &args) {
+            Ok(stdout) => (parse_numstat(&stdout), false),
+            Err(_) => (HashMap::new(), true),
+        },
+    }
+}
+
+/// Decodes a C-style git-quoted path (`"\346\226\207.txt"`) back to raw bytes.
+///
+/// With `core.quotepath=false` non-ASCII names arrive unquoted, but paths
+/// containing double quotes or control characters are still always quoted by
+/// git regardless of config, so numstat parsing stays defensive.
+fn c_unquote_path(raw: &str) -> String {
+    if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
+        return raw.to_string();
+    }
+    let inner = &raw[1..raw.len() - 1];
+    // Quoted output escapes every byte outside printable ASCII, so iterating
+    // bytes is safe and keeps octal sequences exact before UTF-8 reassembly.
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match bytes[i] {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0C),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0B),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'0'..=b'7' => {
+                let mut value: u32 = (bytes[i] - b'0') as u32;
+                let mut digits = 1;
+                while digits < 3 && i + 1 < bytes.len() && (b'0'..=b'7').contains(&bytes[i + 1]) {
+                    i += 1;
+                    digits += 1;
+                    value = value * 8 + (bytes[i] - b'0') as u32;
+                }
+                out.push((value & 0xFF) as u8);
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_co_authors(body: &str) -> Vec<String> {
@@ -1408,5 +1883,481 @@ mod tests {
         let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "big.bin", None)
             .expect_err("oversized working-tree file");
         assert!(err.contains("working-tree size limit"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Hardening regression suite: helpers first.
+    // ------------------------------------------------------------------
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        run_git_at(dir, 1_700_000_000, args)
+    }
+
+    /// Runs git with fixed author/committer identity; `unix_date` pins the
+    /// commit (and therefore lightweight-tag creatordate) so ordering tests
+    /// are deterministic even when many refs share one wall-clock second.
+    fn run_git_at(dir: &Path, unix_date: i64, args: &[&str]) -> String {
+        let date = format!("@{unix_date} +0000");
+        let output = std::process::Command::new("git")
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "GitPulse")
+            .env("GIT_AUTHOR_EMAIL", "gitpulse@test.local")
+            .env("GIT_COMMITTER_NAME", "GitPulse")
+            .env("GIT_COMMITTER_EMAIL", "gitpulse@test.local")
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_git(dir.path(), &["init", "-b", "main"]);
+        dir
+    }
+
+    fn write_file(dir: &Path, rel: &str, content: &str) {
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(dest, content).unwrap();
+    }
+
+    fn commit_file(dir: &Path, rel: &str, content: &str, msg: &str) -> String {
+        write_file(dir, rel, content);
+        run_git(dir, &["add", rel]);
+        run_git(dir, &["commit", "-m", msg]);
+        run_git(dir, &["rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    fn repo_str(dir: &Path) -> String {
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn numstat_ok(cached: bool) -> impl Fn(&Path, bool) -> (HashMap<String, (usize, usize)>, bool) {
+        move |_repo, want_cached| {
+            if want_cached == cached {
+                (
+                    HashMap::from([
+                        ("new.txt".to_string(), (3usize, 4usize)),
+                        ("tracked.txt".to_string(), (3usize, 4usize)),
+                    ]),
+                    false,
+                )
+            } else {
+                (HashMap::new(), false)
+            }
+        }
+    }
+
+    // Item 1: porcelain -z rename paths must be (NEW, Some(OLD)).
+
+    #[test]
+    fn status_z_rename_record_assigns_new_then_old() {
+        let stdout = "R  new.txt\0old.txt\0M  edited.txt\0";
+        let payload =
+            GitReader::status_from_porcelain(Path::new("/unused"), stdout, numstat_ok(true))
+                .expect("parse synthetic status");
+        assert!(!payload.stats_degraded);
+        let rename = &payload.files[0];
+        assert_eq!(rename.path, "new.txt");
+        assert_eq!(rename.old_path.as_deref(), Some("old.txt"));
+        assert_eq!(rename.status_code, "R ");
+        assert!(rename.is_staged);
+        // Numstat lookup must hit under the NEW path (this is what stage and
+        // discard act on).
+        assert_eq!((rename.additions, rename.deletions), (3, 4));
+        let plain = &payload.files[1];
+        assert_eq!(plain.path, "edited.txt");
+        assert!(plain.old_path.is_none());
+    }
+
+    #[test]
+    fn get_status_reports_staged_rename_new_path_with_old_path() {
+        let dir = init_repo();
+        commit_file(dir.path(), "a.txt", "one\n", "base");
+        run_git(dir.path(), &["mv", "a.txt", "b.txt"]);
+        let payload = GitReader::get_status_payload(&repo_str(dir.path())).expect("status");
+        assert!(!payload.stats_degraded);
+        let renames: Vec<&FileStatus> = payload
+            .files
+            .iter()
+            .filter(|f| f.status_code.starts_with('R'))
+            .collect();
+        assert_eq!(
+            renames.len(),
+            1,
+            "expected the staged rename, got {renames:?}"
+        );
+        assert_eq!(renames[0].path, "b.txt");
+        assert_eq!(renames[0].old_path.as_deref(), Some("a.txt"));
+        assert!(renames[0].is_staged);
+    }
+
+    // Item 2: unicode paths must line up between status -z bytes and numstat.
+
+    #[test]
+    fn unicode_paths_match_between_status_and_numstat() {
+        let dir = init_repo();
+        let unicode = "docs/日本語メモ.txt";
+        commit_file(dir.path(), unicode, "line1\n", "add unicode");
+        write_file(dir.path(), unicode, "line1\nline2\n");
+
+        let payload = GitReader::get_status_payload(&repo_str(dir.path())).expect("status");
+        let entry = payload
+            .files
+            .iter()
+            .find(|f| f.path == unicode)
+            .expect("unicode path listed verbatim");
+        assert_eq!((entry.additions, entry.deletions), (1, 0));
+
+        let oid = run_git(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let files = GitReader::get_commit_files(&repo_str(dir.path()), &oid).expect("commit files");
+        let changed = files
+            .iter()
+            .find(|f| f.path == unicode)
+            .expect("numstat for committed unicode file decoded");
+        assert_eq!((changed.additions, changed.deletions), (1, 0));
+    }
+
+    #[test]
+    fn parse_numstat_decodes_c_quoted_paths_defensively() {
+        let map = parse_numstat("12\t34\t\"\\346\\227\\245.txt\"\n5\t6\tplain.txt\n");
+        assert_eq!(map.get("日.txt"), Some(&(12, 34)));
+        assert_eq!(map.get("plain.txt"), Some(&(5, 6)));
+
+        // Quotes/control characters stay quoted even with quotepath off.
+        let tab_map = parse_numstat("7\t8\t\"we\\trd.txt\"\n");
+        assert_eq!(tab_map.get("we\trd.txt"), Some(&(7, 8)));
+
+        // Passthrough of unquoted names is untouched.
+        assert!(parse_numstat("").is_empty());
+    }
+
+    // Item 3: massive-commit diff pipeline.
+
+    #[test]
+    fn oversized_and_binary_files_are_skipped_in_commit_diff_payload() {
+        let dir = init_repo();
+        for name in ["small_a.txt", "small_b.txt", "small_c.txt"] {
+            commit_file(dir.path(), name, "original\n", &format!("base {name}"));
+        }
+        write_file(dir.path(), "small_a.txt", "original\nsmall_a edit\n");
+        write_file(dir.path(), "small_b.txt", "original\nsmall_b edit\n");
+        write_file(dir.path(), "small_c.txt", "original\nsmall_c edit\n");
+        let big_body: String = std::iter::repeat_n("filler line\n", 6001).collect();
+        write_file(dir.path(), "big.txt", &big_body);
+        write_file(dir.path(), "blob.bin", "\u{0}\u{1}\u{2}binary\u{0}");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "-m", "massive"]);
+        let oid = run_git(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        let payload =
+            GitReader::get_commit_diff_payload(&repo_str(dir.path()), &oid).expect("payload");
+        assert!(payload.truncated);
+        assert_eq!(payload.total_files, 5);
+        assert_eq!(payload.included_files, 3);
+        assert_eq!(payload.skipped_files.len(), 2);
+
+        let big = payload
+            .skipped_files
+            .iter()
+            .find(|f| f.path == "big.txt")
+            .expect("oversized text file skipped");
+        assert_eq!((big.additions, big.deletions), (6001, 0));
+        let bin = payload
+            .skipped_files
+            .iter()
+            .find(|f| f.path == "blob.bin")
+            .expect("binary file skipped");
+        assert_eq!(bin.status_code, "B");
+
+        // Totals describe the whole commit, including skipped files.
+        assert_eq!(payload.total_additions, 6001 + 3);
+        assert_eq!(payload.total_deletions, 0);
+
+        for small in ["small_a.txt", "small_b.txt", "small_c.txt"] {
+            assert!(
+                payload.content.contains(small),
+                "content must include the {small} hunk"
+            );
+        }
+        assert!(
+            !payload.content.contains("big.txt"),
+            "the 6001-line blob must not leak into the rendered diff"
+        );
+        assert!(!payload.content.contains("blob.bin"));
+    }
+
+    #[test]
+    fn fitting_commit_diff_matches_raw_git_show_byte_for_byte() {
+        let dir = init_repo();
+        commit_file(dir.path(), "one.txt", "alpha\nbeta\n", "first");
+        let oid = commit_file(dir.path(), "two.txt", "gamma\n", "second");
+
+        let payload =
+            GitReader::get_commit_diff_payload(&repo_str(dir.path()), &oid).expect("payload");
+        assert!(!payload.truncated);
+        assert!(payload.skipped_files.is_empty());
+        assert_eq!(payload.total_files, 1);
+        assert_eq!(payload.total_additions, 1);
+        assert_eq!(payload.total_deletions, 0);
+
+        // Byte-identical to what plain `git show` prints (ASCII paths only, so
+        // core.quotepath cannot influence either side).
+        let raw = std::process::Command::new("git")
+            .args(["show", "--unified=3", "--format=", &oid])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn raw git show");
+        assert!(raw.status.success());
+        assert_eq!(
+            payload.content,
+            String::from_utf8_lossy(&raw.stdout).into_owned()
+        );
+
+        // The legacy string wrapper rides the same pipeline.
+        assert_eq!(
+            GitReader::get_commit_diff(&repo_str(dir.path()), &oid).expect("legacy wrapper"),
+            payload.content
+        );
+    }
+
+    #[test]
+    fn parse_numstat_z_handles_plain_binary_and_rename_records() {
+        let records = [
+            "3\t1\tmod.txt",
+            "-\t-\tbin.dat",
+            "4\t2\t",
+            "old.txt",
+            "new.txt",
+        ];
+        let entries = parse_numstat_z(&records.join("\0"));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "mod.txt");
+        assert!(!entries[0].is_binary);
+        assert_eq!((entries[0].additions, entries[0].deletions), (3, 1));
+        assert_eq!(entries[1].path, "bin.dat");
+        assert!(entries[1].is_binary);
+        assert_eq!(entries[2].path, "new.txt");
+        assert_eq!(entries[2].pathspec, ":(literal)new.txt");
+    }
+
+    // Item 3e: changed-file list cap on commit details.
+
+    #[test]
+    fn get_commit_details_reports_file_list_truncation() {
+        let dir = init_repo();
+        commit_file(dir.path(), "base.txt", "base\n", "root");
+        commit_file(dir.path(), "small.txt", "small\n", "one file");
+        // One commit changing more than COMMIT_FILES_LIST_CAP files at once.
+        for i in 0..(COMMIT_FILES_LIST_CAP + 10) {
+            write_file(dir.path(), &format!("f{i:04}.txt"), "x\n");
+        }
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "-m", "bulk"]);
+        let oid = run_git(dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let details = GitReader::get_commit_details(&repo_str(dir.path()), &oid).expect("details");
+        assert!(details.files_list_truncated);
+        assert_eq!(details.files_total_count, COMMIT_FILES_LIST_CAP + 10);
+        assert_eq!(details.changed_files.len(), COMMIT_FILES_LIST_CAP);
+        // Totals still cover every file, not just the shipped slice.
+        assert_eq!(details.total_additions, COMMIT_FILES_LIST_CAP + 10);
+        // A small commit keeps the flags quiet.
+        let base = run_git(dir.path(), &["rev-parse", "HEAD~1"])
+            .trim()
+            .to_string();
+        let small =
+            GitReader::get_commit_details(&repo_str(dir.path()), &base).expect("small details");
+        assert!(!small.files_list_truncated);
+        assert_eq!(small.files_total_count, 1);
+        assert_eq!(small.changed_files.len(), 1);
+    }
+
+    // Item 4 lives in git_cli.rs; NETWORK_TIMEOUT wiring is exported there.
+
+    // Item 5: history pagination probe.
+
+    #[test]
+    fn history_probe_detects_more_pages_across_the_boundary() {
+        let dir = init_repo();
+        let mut last = String::new();
+        for i in 0..5 {
+            last = commit_file(dir.path(), &format!("p{i}.txt"), "x\n", &format!("c{i}"));
+        }
+        let (rows, has_more) =
+            GitReader::read_commit_history_probe(&repo_str(dir.path()), 0, 5, None).expect("probe");
+        assert!(!has_more);
+        assert_eq!(rows.len(), 5);
+
+        commit_file(dir.path(), "extra.txt", "x\n", "sixth");
+        let (rows, has_more) =
+            GitReader::read_commit_history_probe(&repo_str(dir.path()), 0, 5, None)
+                .expect("probe 2");
+        assert!(has_more);
+        assert_eq!(rows.len(), 5);
+        assert_ne!(rows[0].id, last, "newest row is the sixth commit");
+        let _ = last;
+
+        // At exactly MAX_HISTORY_COMMITS the probe still fetches cap+1 rows,
+        // so has_more stays truthful — the old paged clamp swallowed it.
+        let (rows, has_more) = GitReader::read_commit_history_probe(
+            &repo_str(dir.path()),
+            0,
+            GitReader::MAX_HISTORY_COMMITS,
+            None,
+        )
+        .expect("probe at cap");
+        assert!(!has_more);
+        assert_eq!(rows.len(), 6);
+    }
+
+    // Item 6: tag decoration cap.
+
+    #[test]
+    fn tag_listing_caps_at_newest_two_hundred_tags() {
+        let dir = init_repo();
+        let total = REFS_TAG_CAP + 50;
+        for i in 0..total {
+            let date = 1_700_000_000 + i as i64;
+            let name = format!("f{i:04}.txt");
+            write_file(dir.path(), &name, "x\n");
+            run_git(dir.path(), &["add", &name]);
+            run_git_at(dir.path(), date, &["commit", "-m", &format!("c{i}")]);
+            run_git_at(dir.path(), date, &["tag", &format!("tag-{i:03}")]);
+        }
+
+        let summary = GitReader::list_tags_summary(&repo_str(dir.path())).expect("tag summary");
+        assert!(summary.tags_truncated);
+        assert_eq!(summary.total_tags, total);
+        assert_eq!(summary.tags.len(), REFS_TAG_CAP);
+        // Newest by creatordate: tag-249 .. tag-050.
+        assert_eq!(summary.tags[0].name, format!("tag-{:03}", total - 1));
+        assert_eq!(
+            summary.tags.last().unwrap().name,
+            format!("tag-{:03}", total - REFS_TAG_CAP)
+        );
+
+        // Legacy listing: same capped membership, historical alphabetical order.
+        let legacy = GitReader::list_tags(&repo_str(dir.path())).expect("legacy tags");
+        assert_eq!(legacy.len(), REFS_TAG_CAP);
+        let names: Vec<&str> = legacy.iter().map(|t| t.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "legacy order remains alphabetical");
+        let expected_last = format!("tag-{:03}", total - REFS_TAG_CAP);
+        assert!(legacy
+            .iter()
+            .all(|t| t.name.as_str() >= expected_last.as_str()));
+        assert!(legacy
+            .iter()
+            .any(|t| t.name == format!("tag-{:03}", total - 1)));
+    }
+
+    // Item 7: ranged blame.
+
+    #[test]
+    fn blame_range_returns_requested_window_with_numbers() {
+        let dir = init_repo();
+        let body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        let _oid = commit_file(dir.path(), "code.rs", &body, "ten lines");
+
+        let result = GitReader::get_blame_range(&repo_str(dir.path()), "code.rs", 4, 6)
+            .expect("range blame");
+        assert!(!result.truncated);
+        assert_eq!(result.lines.len(), 3);
+        assert_eq!(result.lines[0].line_no, 4);
+        assert_eq!(result.lines[1].line_no, 5);
+        assert_eq!(result.lines[2].line_no, 6);
+        assert_eq!(result.lines[0].content, "line 4");
+        assert_eq!(result.lines[2].content, "line 6");
+
+        // Requests beyond BLAME_MAX_RANGE_LINES clamp and flag truncation.
+        let result = GitReader::get_blame_range(
+            &repo_str(dir.path()),
+            "code.rs",
+            1,
+            BLAME_MAX_RANGE_LINES + 10,
+        )
+        .expect("clamped range");
+        assert!(result.truncated);
+        assert_eq!(result.lines.len(), 10, "file only has ten lines");
+        assert_eq!(result.lines[0].line_no, 1);
+
+        assert!(GitReader::get_blame_range(&repo_str(dir.path()), "code.rs", 0, 5).is_err());
+        assert!(GitReader::get_blame_range(&repo_str(dir.path()), "code.rs", 5, 4).is_err());
+
+        // Legacy whole-file blame is untouched and 1-based.
+        let full = GitReader::get_file_blame(&repo_str(dir.path()), "code.rs").expect("full blame");
+        assert_eq!(full.len(), 10);
+        assert_eq!(full[0].line_no, 1);
+        assert_eq!(full[9].content, "line 10");
+    }
+
+    // Item 8: degraded numstat reporting.
+
+    #[test]
+    fn double_numstat_failure_marks_status_degraded_but_keeps_paths() {
+        let stdout = "M  tracked.txt\0?? untracked.txt\0";
+        let always_fails = |_repo: &Path, _cached: bool| (HashMap::new(), true);
+        let payload = GitReader::status_from_porcelain(Path::new("/unused"), stdout, always_fails)
+            .expect("degraded status");
+        assert!(payload.stats_degraded);
+        assert_eq!(payload.files.len(), 2);
+        assert_eq!(payload.files[0].path, "tracked.txt");
+        assert_eq!(
+            (payload.files[0].additions, payload.files[0].deletions),
+            (0, 0)
+        );
+        assert_eq!(payload.files[1].status_code, "??");
+        assert!(!payload.files[1].is_staged);
+
+        // A healthy fetcher leaves the flag off and numbers intact.
+        let payload =
+            GitReader::status_from_porcelain(Path::new("/unused"), stdout, numstat_ok(true))
+                .expect("healthy status");
+        assert!(!payload.stats_degraded);
+        assert_eq!(
+            (payload.files[0].additions, payload.files[0].deletions),
+            (3, 4)
+        );
+    }
+
+    #[test]
+    fn get_status_payload_is_not_degraded_on_a_healthy_repo() {
+        let dir = init_repo();
+        commit_file(dir.path(), "ok.txt", "fine\n", "clean");
+        let payload = GitReader::get_status_payload(&repo_str(dir.path())).expect("status");
+        assert!(!payload.stats_degraded);
+        assert!(payload.files.is_empty());
+    }
+
+    // Item 2 (cli side): every invocation must carry the quoting config.
+
+    #[test]
+    fn show_output_for_unicode_paths_is_unquoted_end_to_end() {
+        let dir = init_repo();
+        let unicode = "レポート.md";
+        let oid = commit_file(dir.path(), unicode, "hello\n", "unicode commit");
+        let files = GitReader::get_commit_files(&repo_str(dir.path()), &oid).expect("files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, unicode, "no C-style quoting may survive");
+        let diff =
+            GitReader::get_commit_diff_payload(&repo_str(dir.path()), &oid).expect("diff payload");
+        assert!(diff.content.contains(unicode));
     }
 }

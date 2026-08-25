@@ -4,7 +4,7 @@ import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import type { BranchInfo, TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
 import { graphStore } from "./graphStore";
-import type { InvokeFn } from "./graphStore";
+import type { DiffPayload, InvokeFn } from "./graphStore";
 import {
   disambiguateLabels,
   displayName,
@@ -33,6 +33,7 @@ import {
   loadPersistedWorkspace,
   savePersistedWorkspace,
   workspaceToPersisted,
+  type PersistedTab,
   type PersistedWorkspace,
   type StorageLike,
   type ViewTab,
@@ -119,7 +120,7 @@ export interface RepoSession {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
-  selectedDiff: string | null;
+  selectedDiff: string | DiffPayload | null;
   activeTab: ViewTab;
   searchQuery: string;
   selectedBranch: string | null;
@@ -145,7 +146,7 @@ export interface RepoState {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
-  selectedDiff: string | null;
+  selectedDiff: string | DiffPayload | null;
   activeTab: ViewTab;
   isLoading: boolean;
   error: string | null;
@@ -156,12 +157,18 @@ export interface RepoState {
   generation: number;
   /** True while the active session's progressive branch-stats fetch is in flight. */
   statsPending: boolean;
+  /**
+   * Human label ("Pulling", "Pushing") of the mutating action currently
+   * running, or null. Workspace-global, not per-session.
+   */
+  pendingMutation: string | null;
 }
 
 interface InternalState {
   workspace: WorkspaceTabs;
   sessions: Record<string, RepoSession>;
   workspaceError: string | null;
+  pendingMutation: string | null;
 }
 
 export interface RepoStoreDeps {
@@ -184,6 +191,37 @@ export interface RepoStoreDeps {
 const MENU_RECENT_CAP = 12;
 /** Trailing debounce for localStorage writes and the native-menu rebuild. */
 const PERSIST_DEBOUNCE_MS = 300;
+/** Concurrent repo loads while restoring the saved workspace. */
+const RESTORE_PARALLELISM = 3;
+
+/**
+ * Human progress labels for mutating actions, keyed by `runMutating` kind.
+ * Surfaced as `pendingMutation` so chrome without its own busy indicator can
+ * still show that a pull/push/commit is running.
+ */
+const MUTATION_LABELS: Record<string, string> = {
+  stage: "Staging",
+  unstage: "Unstaging",
+  discard: "Discarding",
+  commit: "Committing",
+  checkout: "Checking out",
+  branch: "Creating branch",
+  "branch-rename": "Renaming branch",
+  "branch-delete": "Deleting branch",
+  merge: "Merging",
+  fetch: "Fetching",
+  pull: "Pulling",
+  push: "Pushing",
+  "push-force": "Force pushing",
+  "issue-report": "Filing issue",
+  "release-publish": "Publishing release",
+  stash: "Stashing",
+  unstash: "Popping stash",
+};
+
+function mutationLabel(kind: string): string {
+  return MUTATION_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
+}
 
 function emptyProjected(): RepoState {
   return {
@@ -208,6 +246,7 @@ function emptyProjected(): RepoState {
     isBare: false,
     generation: 0,
     statsPending: false,
+    pendingMutation: null,
   };
 }
 
@@ -285,6 +324,7 @@ function project(internal: InternalState): RepoState {
     isBare: active?.isBare ?? false,
     generation: active?.generation ?? 0,
     statsPending: active?.statsPending ?? false,
+    pendingMutation: internal.pendingMutation,
   };
 }
 
@@ -301,6 +341,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     workspace: emptyWorkspace(),
     sessions: {},
     workspaceError: null,
+    pendingMutation: null,
   };
 
   const { subscribe, set } = writable<RepoState>(emptyProjected());
@@ -565,6 +606,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
   }
   // ------------------------------------------------------------------------
+
+  /**
+   * Monotonic per-session counter for diff selections — same shape as
+   * graphStore's selectionSeq. Two rapid selections race on resolution order;
+   * without this token the last-RESOLVED response would win instead of the
+   * last-REQUESTED one, leaving the pane showing a file/commit the user moved
+   * past. The session generation guard alone cannot help here because both
+   * requests share one generation.
+   */
+  const diffSelections = new Map<string, number>();
+
+  function beginDiffSelection(sessionId: string): number {
+    const next = (diffSelections.get(sessionId) ?? 0) + 1;
+    diffSelections.set(sessionId, next);
+    return next;
+  }
+
+  function diffSelectionCurrent(sessionId: string, seq: number): boolean {
+    return diffSelections.get(sessionId) === seq;
+  }
 
   const store = {
     subscribe,
@@ -882,8 +943,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         lastClosed: persisted.lastClosed,
       });
       internal = { ...internal, sessions: {} };
-      for (const tab of persisted.tabs) {
-        await store.openRepo(tab.path, {
+      const openRestored = (tab: PersistedTab) =>
+        store.openRepo(tab.path, {
           allowBroken: true,
           activate: false,
           pinned: tab.pinned,
@@ -893,7 +954,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             selectedBranch: tab.selectedBranch,
           },
         });
+      // The previously-active repo hydrates first so its snapshot starts
+      // loading before anything else; the rest drain in small batches —
+      // startup latency drops without stampeding the backend with one
+      // simultaneous load per saved tab.
+      const activeEntry = persisted.activePath
+        ? persisted.tabs.find((tab) => sameRepo(tab.path, persisted.activePath ?? "", options))
+        : undefined;
+      const ordered = activeEntry
+        ? [activeEntry, ...persisted.tabs.filter((tab) => tab !== activeEntry)]
+        : [...persisted.tabs];
+      for (let index = 0; index < ordered.length; index += RESTORE_PARALLELISM) {
+        await Promise.all(
+          ordered.slice(index, index + RESTORE_PARALLELISM).map(openRestored),
+        );
       }
+      // Active-first opening scrambles the saved arrangement (tabs append in
+      // open order); put the bar back exactly how the user left it.
+      const restoredIds: string[] = [];
+      for (const tab of persisted.tabs) {
+        const match = internal.workspace.tabs.find(
+          (candidate) => sameRepo(candidate.path, tab.path, options),
+        );
+        if (match && !restoredIds.includes(match.id)) restoredIds.push(match.id);
+      }
+      for (let target = 0; target < restoredIds.length; target += 1) {
+        const current = internal.workspace.tabs.findIndex((tab) => tab.id === restoredIds[target]);
+        if (current !== target) replaceWorkspace(reorderTab(internal.workspace, current, target));
+      }
+      publish();
       const desired = persisted.activePath
         ? internal.workspace.tabs.find((tab) => sameRepo(tab.path, persisted.activePath ?? "", options))
         : internal.workspace.tabs[0];
@@ -909,6 +998,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const seq = beginDiffSelection(session.id);
       try {
         const diff = await invokeFn<string>("cmd_get_file_diff", {
           repoPath: session.path,
@@ -916,6 +1006,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           isStaged,
           ignoreWhitespace,
         });
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, {
           selectedFilePath: filePath,
           selectedCommitId: null,
@@ -923,6 +1014,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           activeTab: "diff",
         });
       } catch (err: unknown) {
+        // A stale failure must not paint its error over a newer selection.
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -930,17 +1023,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const seq = beginDiffSelection(session.id);
       try {
-        const diff = await invokeFn<string>("cmd_get_commit_diff", {
+        const diff = await invokeFn<DiffPayload>("cmd_get_commit_diff", {
           repoPath: session.path,
           commitId,
         });
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, {
           selectedCommitId: commitId,
           selectedFilePath: null,
           selectedDiff: diff,
         });
       } catch (err: unknown) {
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -948,12 +1044,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const seq = beginDiffSelection(session.id);
       try {
         const diff = await invokeFn<string>("cmd_get_range_diff", {
           repoPath: session.path,
           from,
           to,
         });
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, {
           selectedFilePath: `${from}...${to}`,
           selectedCommitId: null,
@@ -961,6 +1059,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           activeTab: "diff",
         });
       } catch (err: unknown) {
+        if (!diffSelectionCurrent(session.id, seq)) return;
         applyToSession(session.id, generation, { error: String(err) });
       }
     },
@@ -1060,6 +1159,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (!session) return { ok: false, error: "No repository is open." };
     const path = session.path;
     const generation = session.generation;
+    internal = { ...internal, pendingMutation: mutationLabel(kind) };
+    publish();
     try {
       const result = await action(path);
       const policy = recordPolicyVerdict(result);
@@ -1078,6 +1179,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, generation, { error: String(err) });
       harnessStore.recordAction({ kind, label, ok: false });
       return { ok: false, error: String(err) };
+    } finally {
+      if (internal.pendingMutation !== null) {
+        internal = { ...internal, pendingMutation: null };
+        publish();
+      }
     }
   }
 

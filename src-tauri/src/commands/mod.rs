@@ -8,9 +8,14 @@ use crate::diff::{
 };
 use crate::engine::git_cli::{resolve_repo, sandbox_write, ResolvedRepo};
 use crate::engine::git_reader::{
-    BlameLine, CommitDetails, CommitFileChange, FileBlob, ReflogEntry, RepoLanguageStat,
+    BlameLine, BlameResult, CommitDetails, CommitDiffPayload, CommitFileChange, FileBlob,
+    ReflogEntry, RepoLanguageStat,
 };
-use crate::engine::git_writer::RebaseStep;
+use crate::engine::git_writer::{
+    checkout_branch_attempts, commit_argv, create_branch_argv, create_tag_argv, delete_tag_argv,
+    merge_argv, pull_argv, push_argv, push_tag_argv, rebase_sequence_plan, restack_argv,
+    stash_pop_argv, stash_save_argv, RebaseStep,
+};
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, TagInfo, WorktreeInfo,
 };
@@ -91,7 +96,10 @@ where
 
 #[tauri::command(async)]
 pub async fn cmd_get_status(repo_path: String) -> Result<Vec<FileStatus>, String> {
-    off_thread(move || GitReader::get_status(&repo_path)).await
+    // The payload also carries `stats_degraded` (numstat lookups failed);
+    // the frontend does not know that flag yet, so only the files array is
+    // surfaced for now — identical to the old shape.
+    off_thread(move || GitReader::get_status_payload(&repo_path).map(|p| p.files)).await
 }
 
 #[tauri::command(async)]
@@ -103,73 +111,83 @@ pub async fn cmd_get_commit_graph(
     skip: Option<usize>,
 ) -> Result<CommitGraphPayload, String> {
     off_thread(move || {
-        // One row over the cap: the extra row is the has_more probe and is
-        // dropped before lanes are solved.
-        let fetch_limit = max_commits.clamp(1, GitReader::MAX_HISTORY_COMMITS) + 1;
-        let repo = repo_path.clone();
-        let rev = revision.clone();
-        // History is the long pole; HEAD and ref decorations are independent of
-        // it, so they run concurrently instead of serializing three walks behind
-        // one another on a large repository.
-        let (history, head_id, refs) = std::thread::scope(|scope| {
-            let history = scope.spawn(move || {
-                GitReader::read_commit_history_paged(
-                    &repo,
-                    skip.unwrap_or(0),
-                    fetch_limit,
-                    rev.as_deref(),
-                )
-            });
-            let repo2 = repo_path.clone();
-            let head = scope.spawn(move || GitReader::head_id(&repo2).ok());
-            let repo3 = repo_path.clone();
-            let refs =
-                scope.spawn(move || crate::graph::list_ref_decorations(&repo3).unwrap_or_default());
-            (
-                history
-                    .join()
-                    .unwrap_or_else(|_| Err("history walker panicked".into())),
-                head.join().unwrap_or(None),
-                refs.join().unwrap_or_default(),
-            )
-        });
-
-        let mut raw_commits = history?;
-        let has_more = raw_commits.len() > max_commits;
-        if has_more {
-            raw_commits.truncate(max_commits);
-        }
-
-        let filter = query
-            .as_deref()
-            .map(CommitFilter::parse)
-            .unwrap_or_default();
-        if let Some(ref path) = filter.path {
-            let touching: HashSet<String> =
-                GitReader::commits_touching_path(&repo_path, path, fetch_limit)?
-                    .into_iter()
-                    .collect();
-            raw_commits.retain(|c| touching.contains(&c.id));
-        }
-        if !filter.is_empty() {
-            raw_commits.retain(|c| filter.matches_commit(c));
-        }
-
-        let mut folding = BranchFoldingEngine::new();
-        folding.identify_foldable_runs(&raw_commits);
-        let folds = folding.get_foldable_runs().values().cloned().collect();
-
-        let mut solver = LaneSolver::new(12);
-        let rows = solver.solve(&raw_commits);
-        Ok(CommitGraphPayload {
-            rows,
-            folds,
-            head_id,
-            refs,
-            has_more,
-        })
+        build_commit_graph_payload(
+            &repo_path,
+            max_commits,
+            query.as_deref(),
+            revision.as_deref(),
+            skip.unwrap_or(0),
+        )
     })
     .await
+}
+
+/// Walks one page of history and assembles the graph payload around it.
+///
+/// Pagination goes through [`GitReader::read_commit_history_probe`] so
+/// `has_more` stays truthful when `max_commits` equals
+/// [`GitReader::MAX_HISTORY_COMMITS`] exactly: the old limit+1 dance had its
+/// probe row clamped back down at the cap, so a full page reported "no more
+/// history" while older commits existed. The probe fetches CAP+1 before any
+/// clamping and truncates internally; lane solving still sees exactly
+/// `min(max_commits, cap)` rows either way.
+fn build_commit_graph_payload(
+    repo_path: &str,
+    max_commits: usize,
+    query: Option<&str>,
+    revision: Option<&str>,
+    skip: usize,
+) -> Result<CommitGraphPayload, String> {
+    let limit = max_commits.clamp(1, GitReader::MAX_HISTORY_COMMITS);
+    let repo = repo_path.to_string();
+    let rev = revision.map(str::to_string);
+    // History is the long pole; HEAD and ref decorations are independent of
+    // it, so they run concurrently instead of serializing three walks behind
+    // one another on a large repository.
+    let (history, head_id, refs) = std::thread::scope(|scope| {
+        let history = scope.spawn(move || {
+            GitReader::read_commit_history_probe(&repo, skip, limit, rev.as_deref())
+        });
+        let repo2 = repo_path.to_string();
+        let head = scope.spawn(move || GitReader::head_id(&repo2).ok());
+        let repo3 = repo_path.to_string();
+        let refs =
+            scope.spawn(move || crate::graph::list_ref_decorations(&repo3).unwrap_or_default());
+        (
+            history
+                .join()
+                .unwrap_or_else(|_| Err("history walker panicked".into())),
+            head.join().unwrap_or(None),
+            refs.join().unwrap_or_default(),
+        )
+    });
+
+    let (mut raw_commits, has_more) = history?;
+
+    let filter = query.map(CommitFilter::parse).unwrap_or_default();
+    if let Some(ref path) = filter.path {
+        let touching: HashSet<String> = GitReader::commits_touching_path(repo_path, path, limit)?
+            .into_iter()
+            .collect();
+        raw_commits.retain(|c| touching.contains(&c.id));
+    }
+    if !filter.is_empty() {
+        raw_commits.retain(|c| filter.matches_commit(c));
+    }
+
+    let mut folding = BranchFoldingEngine::new();
+    folding.identify_foldable_runs(&raw_commits);
+    let folds = folding.get_foldable_runs().values().cloned().collect();
+
+    let mut solver = LaneSolver::new(12);
+    let rows = solver.solve(&raw_commits);
+    Ok(CommitGraphPayload {
+        rows,
+        folds,
+        head_id,
+        refs,
+        has_more,
+    })
 }
 
 #[tauri::command(async)]
@@ -190,9 +208,16 @@ pub async fn cmd_get_file_diff(
     .await
 }
 
+/// Commit diff as a structured payload: normal-sized files inline in
+/// `content`, anything left out (oversized, binary, budget-exhausted)
+/// reported in `skipped_files` with its numstat counts. Wire-contract change
+/// from the old raw diff string; the frontend consumes the new shape.
 #[tauri::command(async)]
-pub async fn cmd_get_commit_diff(repo_path: String, commit_id: String) -> Result<String, String> {
-    off_thread(move || GitReader::get_commit_diff(&repo_path, &commit_id)).await
+pub async fn cmd_get_commit_diff(
+    repo_path: String,
+    commit_id: String,
+) -> Result<CommitDiffPayload, String> {
+    off_thread(move || GitReader::get_commit_diff_payload(&repo_path, &commit_id)).await
 }
 
 #[tauri::command(async)]
@@ -290,7 +315,8 @@ pub async fn cmd_stage_selective_patch(
 }
 
 /// Commits the index, after the harness's command gate has judged the exact
-/// command line this would run.
+/// command line this would run — including the empty-message amend form
+/// (`--amend --no-edit`) the writer uses for internal squash flows.
 #[tauri::command(async)]
 pub async fn cmd_commit(
     repo_path: String,
@@ -298,20 +324,35 @@ pub async fn cmd_commit(
     amend: bool,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let mut argv = vec!["git", "commit", "-m", message.as_str()];
-        if amend {
-            argv.push("--amend");
-        }
-        let policy = guard(&repo_path, &argv)?;
+        let argv = commit_argv(&message, amend);
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
         let output = GitWriter::commit(&repo_path, &message, amend)?;
         Ok(Guarded { policy, output })
     })
     .await
 }
 
+/// Checks out a branch, after the gate has judged every strategy the writer
+/// may attempt (`switch --guess`, then two `checkout` fallbacks). All of
+/// them are gated before the first runs because any one could be the one
+/// that executes.
 #[tauri::command(async)]
-pub async fn cmd_checkout_branch(repo_path: String, branch_name: String) -> Result<(), String> {
-    off_thread(move || GitWriter::checkout_branch(&repo_path, &branch_name)).await
+pub async fn cmd_checkout_branch(
+    repo_path: String,
+    branch_name: String,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let attempts = checkout_branch_attempts(&branch_name);
+        let mut verdicts = attempts.iter();
+        let first = verdicts.next().ok_or("no checkout strategy available")?;
+        let policy = guard(&repo_path, &argv_refs(first))?;
+        for attempt in verdicts {
+            guard(&repo_path, &argv_refs(attempt))?;
+        }
+        GitWriter::checkout_branch(&repo_path, &branch_name)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -319,9 +360,14 @@ pub async fn cmd_create_branch(
     repo_path: String,
     branch_name: String,
     start_point: Option<String>,
-) -> Result<(), String> {
-    off_thread(move || GitWriter::create_branch(&repo_path, &branch_name, start_point.as_deref()))
-        .await
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let argv = create_branch_argv(&branch_name, start_point.as_deref())?;
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
+        GitWriter::create_branch(&repo_path, &branch_name, start_point.as_deref())?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -394,6 +440,32 @@ pub async fn cmd_get_file_blame(
     off_thread(move || GitReader::get_file_blame(&repo_path, &file_path)).await
 }
 
+/// Blame for a 1-based inclusive line window, so the UI can blame a visible
+/// region of a huge file without pulling the whole porcelain stream. Ranges
+/// beyond the reader's cap come back clamped with `truncated: true` instead
+/// of silently succeeding or failing.
+///
+/// NOTE for the lib.rs owner: register this one-liner in
+/// `tauri::generate_handler!` (next to `cmd_get_file_blame`):
+///     cmd_blame_range,
+#[tauri::command(async)]
+pub async fn cmd_blame_range(
+    repo_path: String,
+    file_path: String,
+    start_line: usize,
+    end_line: usize,
+) -> Result<BlameResult, String> {
+    off_thread(move || GitReader::get_blame_range(&repo_path, &file_path, start_line, end_line))
+        .await
+}
+
+/// Rebases the current branch onto `onto_commit` by replaying `steps`.
+///
+/// The old gate judged only `git rebase --onto <X>` while execution ran a
+/// detach, N cherry-picks, amends, a branch reset and a checkout. Now the
+/// writer's planner composes every mutating argv up front, each one is
+/// passed through the guard, and execution starts only if no verdict is a
+/// denial — a refusal aborts before any mutation, not mid-sequence.
 #[tauri::command(async)]
 pub async fn cmd_rebase_interactive(
     repo_path: String,
@@ -401,11 +473,25 @@ pub async fn cmd_rebase_interactive(
     steps: Vec<RebaseStep>,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = guard(
+        // Discovered once (read-only) so the gated plan and the executed
+        // plan are built from identical inputs.
+        let original_branch = GitWriter::rebase_original_branch(&repo_path)?;
+        let plan = rebase_sequence_plan(&onto_commit, &steps, original_branch.as_deref())?;
+        let mut verdicts = plan.iter();
+        let first = verdicts.next().ok_or("rebase plan is empty")?;
+        // Surfaced verdict: the first command's. Every other verdict was
+        // also an approval by the time execution started — a single Guarded
+        // can only carry one, and a denial anywhere fails closed below.
+        let policy = guard(&repo_path, &argv_refs(&first.argv))?;
+        for cmd in verdicts {
+            guard(&repo_path, &argv_refs(&cmd.argv))?;
+        }
+        GitWriter::execute_rebase_sequence_for_branch(
             &repo_path,
-            &["git", "rebase", "--onto", onto_commit.as_str()],
+            &onto_commit,
+            &steps,
+            original_branch.as_deref(),
         )?;
-        GitWriter::execute_rebase_sequence(&repo_path, &onto_commit, &steps)?;
         Ok(Guarded { policy, output: () })
     })
     .await
@@ -519,14 +605,8 @@ pub async fn cmd_pull(
         // the working tree is what the write gate exists to protect. A fetch only
         // moves remote-tracking refs, and gating every one would put a sidecar
         // round trip in front of a background refresh for no decision.
-        let mut argv = vec!["git", "pull"];
-        if let Some(ref r) = remote {
-            argv.push(r.as_str());
-        }
-        if let Some(ref b) = branch {
-            argv.push(b.as_str());
-        }
-        let policy = guard(&repo_path, &argv)?;
+        let argv = pull_argv(remote.as_deref(), branch.as_deref());
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
         let output = GitWriter::pull(&repo_path, remote.as_deref(), branch.as_deref())?;
         Ok(Guarded { policy, output })
     })
@@ -535,6 +615,9 @@ pub async fn cmd_pull(
 
 /// Pushes, after the command gate has judged it. A force push is refused by
 /// the harness's hard rules, which is the whole reason this call is gated.
+/// The gate line comes from [`push_argv`], so what is judged is exactly what
+/// executes — including `--force-with-lease` on force pushes, not a bare
+/// `--force` the writer never runs.
 #[tauri::command(async)]
 pub async fn cmd_push(
     repo_path: String,
@@ -544,17 +627,8 @@ pub async fn cmd_push(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let force = force.unwrap_or(false);
-        let mut argv = vec!["git", "push"];
-        if force {
-            argv.push("--force");
-        }
-        if let Some(ref r) = remote {
-            argv.push(r.as_str());
-        }
-        if let Some(ref b) = branch {
-            argv.push(b.as_str());
-        }
-        let policy = guard(&repo_path, &argv)?;
+        let argv = push_argv(remote.as_deref(), branch.as_deref(), force);
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
         let output = GitWriter::push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
         Ok(Guarded { policy, output })
     })
@@ -569,35 +643,58 @@ pub async fn cmd_merge_branch(
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         let ff_only = ff_only.unwrap_or(false);
-        let mut argv = vec!["git", "merge"];
-        if ff_only {
-            argv.push("--ff-only");
-        }
-        argv.push(branch_name.as_str());
-        let policy = guard(&repo_path, &argv)?;
+        // merge_argv includes the --no-edit flag the writer always adds; the
+        // gate judges the real command line, not an idealized one.
+        let argv = merge_argv(&branch_name, ff_only);
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
         let output = GitWriter::merge_branch(&repo_path, &branch_name, ff_only)?;
         Ok(Guarded { policy, output })
     })
     .await
 }
 
+/// Restacks `branch` onto the tip of `onto`, after the gate has judged the
+/// exact `rebase --onto` line the writer executes.
 #[tauri::command(async)]
 pub async fn cmd_restack(
     repo_path: String,
     branch: String,
     onto: String,
-) -> Result<String, String> {
-    off_thread(move || GitWriter::restack(&repo_path, &branch, &onto)).await
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let argv = restack_argv(&branch, &onto);
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
+        let output = GitWriter::restack(&repo_path, &branch, &onto)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stash_save(repo_path: String, message: Option<String>) -> Result<String, String> {
-    off_thread(move || GitWriter::stash_save(&repo_path, message.as_deref())).await
+pub async fn cmd_stash_save(
+    repo_path: String,
+    message: Option<String>,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        // Stashing rewrites the index and working tree, so it is a mutation
+        // the gate judges like any other.
+        let argv = stash_save_argv(message.as_deref());
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
+        let output = GitWriter::stash_save(&repo_path, message.as_deref())?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stash_pop(repo_path: String) -> Result<String, String> {
-    off_thread(move || GitWriter::stash_pop(&repo_path)).await
+pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let argv = stash_pop_argv();
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
+        let output = GitWriter::stash_pop(&repo_path)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 /// Throws away a file's working-tree changes, after the write gate has judged
@@ -797,27 +894,39 @@ pub async fn cmd_unwatch_repo(
     unwatch(&state, repo_path)
 }
 
+/// Creates a tag (annotated when a message is given), after the gate has
+/// judged the exact `git tag` line.
 #[tauri::command(async)]
 pub async fn cmd_create_tag(
     repo_path: String,
     tag_name: String,
     commit_id: Option<String>,
     message: Option<String>,
-) -> Result<(), String> {
+) -> Result<Guarded<()>, String> {
     off_thread(move || {
+        let argv = create_tag_argv(&tag_name, commit_id.as_deref(), message.as_deref());
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
         GitWriter::create_tag(
             &repo_path,
             &tag_name,
             commit_id.as_deref(),
             message.as_deref(),
-        )
+        )?;
+        Ok(Guarded { policy, output: () })
     })
     .await
 }
 
+/// Deletes a tag — a destructive ref write, gated like one.
 #[tauri::command(async)]
-pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<(), String> {
-    off_thread(move || GitWriter::delete_tag(&repo_path, &tag_name)).await
+pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let argv = delete_tag_argv(&tag_name);
+        let policy = guard(&repo_path, &argv_refs(&argv))?;
+        GitWriter::delete_tag(&repo_path, &tag_name)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 /// Creates (or resumes) an annotated release tag and pushes exactly that tag.
@@ -834,22 +943,16 @@ pub async fn cmd_publish_release(
         let tag_policy = if plan.create_tag {
             Some(guard(
                 &repo_path,
-                &[
-                    "git",
-                    "tag",
-                    "-a",
-                    plan.tag.as_str(),
-                    "-m",
-                    plan.message.as_str(),
-                ],
+                &argv_refs(&create_tag_argv(&plan.tag, None, Some(&plan.message))),
             )?)
         } else {
             None
         };
-        let tag_ref = format!("refs/tags/{}", plan.tag);
+        // Judged via push_tag_argv, the same builder the writer executes, so
+        // the fully-qualified refs/tags/<tag> refspec cannot drift.
         let push_policy = guard(
             &repo_path,
-            &["git", "push", plan.remote.as_str(), tag_ref.as_str()],
+            &argv_refs(&push_tag_argv(&plan.remote, &plan.tag)),
         )?;
 
         if plan.create_tag {
@@ -899,6 +1002,11 @@ fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict
         return Err(verdict.refusal());
     }
     Ok(verdict)
+}
+
+/// Borrows a builder-produced argv for [`guard`].
+fn argv_refs(argv: &[String]) -> Vec<&str> {
+    argv.iter().map(String::as_str).collect()
 }
 
 /// Degraded status used when the probe task itself failed to run (pool join
@@ -1018,4 +1126,177 @@ pub async fn cmd_ai_fix_health(
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, String> {
     off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["add", "--", "tracked.txt"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git add");
+        assert!(output.status.success());
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("git commit");
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir
+    }
+
+    /// Creates `count` chained commits in one `git fast-import` stream — the
+    /// only fast way to exercise history pagination at MAX_HISTORY_COMMITS
+    /// scale (100k+ `git commit` spawns would take minutes). Starts from an
+    /// empty repository so the imported chain owns `main`.
+    fn init_repo_with_imported_history(count: usize) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let mut stream = String::with_capacity(count * 48 + 64);
+        for i in 0..count {
+            let msg = format!("imported commit {i}");
+            stream.push_str("commit refs/heads/main\n");
+            stream.push_str(&format!("mark :{}\n", i + 1));
+            stream.push_str("committer t <t@t> 1700000000 +0000\n");
+            stream.push_str(&format!("data {}\n{msg}\n", msg.len()));
+            if i > 0 {
+                stream.push_str(&format!("from :{}\n", i));
+            }
+            stream.push('\n');
+        }
+        let mut child = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git fast-import");
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("fast-import stdin")
+            .write_all(stream.as_bytes())
+            .expect("feed fast-import stream");
+        let out = child.wait_with_output().expect("wait fast-import");
+        assert!(
+            out.status.success(),
+            "fast-import failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    /// Regression for the truthful-pagination fix: when a page's limit equals
+    /// MAX_HISTORY_COMMITS exactly, the old fetch_limit+1 dance had its probe
+    /// row clamped back to the cap, so a full page reported has_more=false and
+    /// silently hid the rest of history. The probe keeps the extra row.
+    #[test]
+    fn commit_graph_reports_more_history_when_page_equals_the_cap() {
+        let dir = init_repo_with_imported_history(GitReader::MAX_HISTORY_COMMITS + 3);
+        let path = dir.path().to_str().unwrap();
+        let payload =
+            build_commit_graph_payload(path, GitReader::MAX_HISTORY_COMMITS, None, None, 0)
+                .expect("graph at cap");
+        assert!(
+            payload.has_more,
+            "older commits exist beyond the cap; has_more must say so"
+        );
+        assert_eq!(payload.rows.len(), GitReader::MAX_HISTORY_COMMITS);
+
+        // A small page on the same repository reports both directions right.
+        let small = build_commit_graph_payload(path, 10, None, None, 0).expect("small page");
+        assert!(small.has_more);
+        assert_eq!(small.rows.len(), 10);
+        // Deepest reachable page: the reader clamps skips at the cap as well,
+        // so skipping "past" it still lands on its final three commits.
+        let tail = build_commit_graph_payload(path, 10, None, None, GitReader::MAX_HISTORY_COMMITS)
+            .expect("tail page");
+        assert!(!tail.has_more);
+        assert_eq!(tail.rows.len(), 3);
+    }
+
+    /// Wire-contract pin for cmd_get_commit_diff: the command now returns the
+    /// structured payload, so its serialized keys are part of the frontend
+    /// contract and must not drift silently.
+    #[test]
+    fn commit_diff_payload_serializes_the_documented_wire_keys() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["commit", "-am", "second"])
+            .current_dir(dir.path())
+            .output()
+            .expect("second commit");
+        assert!(output.status.success());
+        let oid = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .unwrap();
+
+        let payload = GitReader::get_commit_diff_payload(dir.path().to_str().unwrap(), oid.trim())
+            .expect("payload");
+        assert!(!payload.truncated && payload.skipped_files.is_empty());
+        assert_eq!(payload.total_files, 1);
+        assert_eq!(payload.total_additions, 1);
+        assert_eq!(payload.total_deletions, 1);
+        assert!(payload.content.contains("changed"));
+
+        let json = serde_json::to_value(&payload).unwrap();
+        let mut keys: Vec<String> = json
+            .as_object()
+            .expect("payload serializes to an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "content",
+                "included_files",
+                "skipped_files",
+                "total_additions",
+                "total_deletions",
+                "total_files",
+                "truncated"
+            ]
+        );
+    }
 }

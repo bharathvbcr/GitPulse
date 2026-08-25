@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_reader::REFS_TAG_CAP;
 
 /// What a ref is, so the UI can style and order them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,12 +41,15 @@ pub fn list_ref_decorations(repo_path: &str) -> Result<Vec<RefDecoration>, Strin
 
     // A branch name can contain anything but the ASCII control characters and a
     // few specials, so the fields are NUL-separated and the records
-    // \x01-separated rather than parsed out of whitespace.
+    // \x01-separated rather than parsed out of whitespace. Tags carry their
+    // creatordate so a CI-tagged monorepo with tens of thousands of them can
+    // be capped to the newest REFS_TAG_CAP instead of shipping every chip on
+    // every graph load.
     let raw = git_text(
         &repo,
         &[
             "for-each-ref",
-            "--format=%(objectname)%00%(refname)%00%(objecttype)%00%(*objectname)%01",
+            "--format=%(objectname)%00%(refname)%00%(objecttype)%00%(*objectname)%00%(creatordate:unix)%01",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
@@ -57,6 +61,9 @@ pub fn list_ref_decorations(repo_path: &str) -> Result<Vec<RefDecoration>, Strin
         .unwrap_or_default();
 
     let mut decorations = Vec::new();
+    // Tags are held aside so the cap can keep the NEWEST ones; branches and
+    // remotes go straight through uncapped.
+    let mut tags: Vec<(RefDecoration, i64)> = Vec::new();
     for record in raw.split('\x01') {
         let record = record.trim_matches(['\n', '\r']);
         if record.trim().is_empty() {
@@ -72,6 +79,10 @@ pub fn list_ref_decorations(repo_path: &str) -> Result<Vec<RefDecoration>, Strin
         // An annotated tag's own object is not on the graph; the commit it
         // peels to is.
         let commit_id = if peeled.is_empty() { object_id } else { peeled };
+        let creatordate = fields
+            .get(4)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
 
         let (kind, name) = if let Some(short) = refname.strip_prefix("refs/heads/") {
             (RefKind::Local, short)
@@ -91,13 +102,26 @@ pub fn list_ref_decorations(repo_path: &str) -> Result<Vec<RefDecoration>, Strin
         if commit_id.is_empty() || name.is_empty() {
             continue;
         }
-        decorations.push(RefDecoration {
+        let decoration = RefDecoration {
             name: name.to_string(),
             kind,
             commit_id: commit_id.to_string(),
             is_head: kind == RefKind::Local && !current_branch.is_empty() && name == current_branch,
-        });
+        };
+        if decoration.kind == RefKind::Tag {
+            tags.push((decoration, creatordate));
+        } else {
+            decorations.push(decoration);
+        }
     }
+
+    if tags.len() > REFS_TAG_CAP {
+        // Newest first (creatordate desc, name desc as deterministic
+        // tie-break), keep the newest REFS_TAG_CAP, then hand back only those.
+        tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.name.cmp(&a.0.name)));
+        tags.truncate(REFS_TAG_CAP);
+    }
+    decorations.extend(tags.into_iter().map(|(d, _)| d));
 
     // A detached HEAD points at a commit no branch names; without this the
     // graph shows no "you are here" at all.
@@ -130,4 +154,108 @@ pub fn list_ref_decorations(repo_path: &str) -> Result<Vec<RefDecoration>, Strin
         )
     });
     Ok(decorations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str], env: &[(&str, &str)]| {
+            let mut cmd = Command::new("git");
+            cmd.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path());
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("git helper");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"], &[]);
+        std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        run(&["add", "--", "f.txt"], &[]);
+        run(&["commit", "-m", "init"], &[]);
+        dir
+    }
+
+    fn tag_names(decorations: &[RefDecoration]) -> Vec<String> {
+        decorations
+            .iter()
+            .filter(|d| d.kind == RefKind::Tag)
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn all_tags_are_kept_when_under_the_cap() {
+        let dir = init_repo();
+        for i in 0..5 {
+            Command::new("git")
+                .args(["tag", "-a", "-m", "t", &format!("v0.0.{i}")])
+                .env(
+                    "GIT_COMMITTER_DATE",
+                    format!("2026-01-{:02}T00:00:00Z", i + 1),
+                )
+                .current_dir(dir.path())
+                .output()
+                .expect("git tag");
+        }
+        let decorations = list_ref_decorations(dir.path().to_str().unwrap()).unwrap();
+        let names = tag_names(&decorations);
+        assert_eq!(names.len(), 5);
+    }
+
+    /// A CI-tagged monorepo can carry tens of thousands of tags; shipping
+    /// every chip on every graph load bloats the IPC payload. The decoration
+    /// listing caps tags at REFS_TAG_CAP and keeps the NEWEST ones.
+    #[test]
+    fn tag_decorations_cap_to_the_newest_two_hundred() {
+        let dir = init_repo();
+        for i in 0..250u32 {
+            // Spread dates so recency ordering is unambiguous: v0.0.249 is
+            // the newest, v0.0.0 the oldest.
+            let day = 1 + (i % 28);
+            let month = 1 + i / 28;
+            Command::new("git")
+                .args(["tag", "-a", "-m", "t", &format!("v0.0.{i}")])
+                .env(
+                    "GIT_COMMITTER_DATE",
+                    format!("2026-{month:02}-{day:02}T00:00:00Z"),
+                )
+                .current_dir(dir.path())
+                .output()
+                .expect("git tag");
+        }
+        let decorations = list_ref_decorations(dir.path().to_str().unwrap()).unwrap();
+        let mut names = tag_names(&decorations);
+        assert_eq!(names.len(), REFS_TAG_CAP, "cap must hold");
+        names.sort();
+        // The 50 oldest tags must be gone; every kept name is in the newest 200.
+        for i in 0..50u32 {
+            assert!(
+                !names.contains(&format!("v0.0.{i}")),
+                "oldest tag {i} survived"
+            );
+        }
+        for i in 50..250u32 {
+            assert!(
+                names.contains(&format!("v0.0.{i}")),
+                "newest tag {i} dropped"
+            );
+        }
+        // Branches are never subject to the cap.
+        assert!(
+            decorations
+                .iter()
+                .any(|d| d.kind == RefKind::Local && d.name == "main"),
+            "branch decoration missing"
+        );
+    }
 }

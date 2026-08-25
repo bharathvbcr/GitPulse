@@ -40,3 +40,16 @@ export function computeWindow(
   const end = Math.max(start, Math.min(totalRows, firstVisible + visibleCount + scan));
   return { start, end };
 }
+
+/**
+ * Clamps a programmatic scrollTop write to `[0, scrollHeight - clientHeight]`.
+ * Elastic overscroll and stale spacer heights can hand back out-of-range
+ * positions; writing those back verbatim makes the pane snap or park past the
+ * last row. Non-finite input fails closed to 0, matching computeWindow.
+ */
+export function clampScrollTop(scrollTop: number, scrollHeight: number, clientHeight: number): number {
+  if (!Number.isFinite(scrollTop)) return 0;
+  const max = scrollHeight - clientHeight;
+  if (!Number.isFinite(max) || max <= 0) return 0;
+  return Math.min(Math.max(scrollTop, 0), max);
+}

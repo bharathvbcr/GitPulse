@@ -3,6 +3,7 @@
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { guardedDismiss } from "./modalGuard";
   import { Download, FolderOpen, Check } from "lucide-svelte";
 
   let {
@@ -44,6 +45,12 @@
       isCloning = false;
     }
   }
+
+  // Backdrop, Escape, and Cancel share one gate: while a clone runs, none of
+  // them may close the dialog the Cancel button is already guarding.
+  function requestClose() {
+    guardedDismiss(isCloning, onClose);
+  }
 </script>
 
 {#if isOpen}
@@ -51,8 +58,8 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={onClose}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onclick={requestClose}
+    onkeydown={(e) => e.key === "Escape" && requestClose()}
     transition:fade={fadeParams()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 select-none gp-gpu"
   >
@@ -111,7 +118,7 @@
       </div>
 
       <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
-        <button onclick={onClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
+        <button onclick={requestClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
         <button
           onclick={handleClone}
           disabled={!url.trim() || !targetDir.trim() || isCloning}

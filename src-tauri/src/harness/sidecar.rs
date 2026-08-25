@@ -37,6 +37,13 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Handshake budget. A cold `manvi serve` has to resolve its configuration
 /// before it answers, so this is deliberately looser than a warm call.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long one write to the child's stdin may take before the child is
+/// considered wedged mid-line. Only the child can drain its request pipe, so a
+/// child that stops reading would block `write_all` forever — and with the
+/// global slot held, every policy check and AI call behind it. The write
+/// therefore runs on a worker thread under this deadline; a stall is reported
+/// as [`HarnessError::Unavailable`] and drops the connection.
+pub const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a failed start is remembered before another spawn is attempted.
 /// Without it, a machine with no `manvi` installed would fork a process per
 /// status poll.
@@ -113,6 +120,10 @@ struct Sidecar {
     hello: HelloResult,
     binary: String,
     next_id: u64,
+    /// Deadline for one stdin write. Production always runs
+    /// [`WRITE_DEADLINE`]; it is a field only so tests can shrink the deadline
+    /// and exercise the stall path inside a unit-test budget.
+    write_deadline: Duration,
 }
 
 impl Drop for Sidecar {
@@ -172,15 +183,7 @@ impl Sidecar {
             )));
         }
 
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| HarnessError::Unavailable("sidecar stdin closed".into()))?;
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|e| HarnessError::Unavailable(format!("sidecar stdin closed: {}", e)))?;
+        self.write_request_line(&line, op)?;
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -229,6 +232,60 @@ impl Sidecar {
                     )))
                 }
             }
+        }
+    }
+
+    /// Sends one encoded request line to the child under a deadline.
+    ///
+    /// `write_all` on the child's stdin blocks once the kernel pipe buffer is
+    /// full, and nothing in this process can drain it — only the child can.
+    /// Running the write on a worker thread and bounding the wait with
+    /// `recv_timeout` (the same shape the read loop uses below) keeps a wedged
+    /// child from holding this thread, and with it the global slot lock, past
+    /// [`WRITE_DEADLINE`].
+    ///
+    /// On a stall the pipe handle stays with the stuck worker; it unblocks
+    /// with EPIPE when [`Drop for Sidecar`] kills the child. The handle is
+    /// *not* restored here, so every later call fails fast with
+    /// "stdin closed" and the [`HarnessError::Unavailable`] returned drops the
+    /// sidecar so a fresh one respawns.
+    fn write_request_line(&mut self, line: &str, op: &str) -> Result<(), HarnessError> {
+        let hint = self.stderr_hint();
+        let mut stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Unavailable("sidecar stdin closed".into()))?;
+        let mut payload = line.as_bytes().to_vec();
+        payload.push(b'\n');
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = stdin
+                .write_all(&payload)
+                .and_then(|()| stdin.flush())
+                .map_err(|e| e.to_string());
+            // After a timeout nobody is left receiving; sending anyway is what
+            // lets the worker drop the pipe handle and finish once the child's
+            // death unblocks the write.
+            let _ = tx.send((stdin, outcome));
+        });
+        match rx.recv_timeout(self.write_deadline) {
+            Ok((returned, Ok(()))) => {
+                self.stdin = Some(returned);
+                Ok(())
+            }
+            Ok((_, Err(e))) => Err(HarnessError::Unavailable(format!(
+                "sidecar stdin closed during {}: {}{}",
+                op, e, hint
+            ))),
+            Err(RecvTimeoutError::Timeout) => Err(HarnessError::Unavailable(format!(
+                "sidecar did not accept {} within {:?}; its stdin write stalled \
+                 and the connection is dropped{}",
+                op, self.write_deadline, hint
+            ))),
+            Err(RecvTimeoutError::Disconnected) => Err(HarnessError::Unavailable(format!(
+                "sidecar stdin writer stopped during {}{}",
+                op, hint
+            ))),
         }
     }
 
@@ -314,6 +371,10 @@ fn scratch_dir() -> PathBuf {
 /// Resolves the `manvi` binary: explicit override, then `PATH`, then the
 /// conventional user-local install directory.
 pub fn resolve_binary() -> Option<String> {
+    #[cfg(test)]
+    if let Some(explicit) = test_binary_override() {
+        return Some(explicit);
+    }
     if let Ok(explicit) = std::env::var("GITPULSE_MANVI_BIN") {
         let path = PathBuf::from(&explicit);
         if path.is_file() {
@@ -336,6 +397,23 @@ pub fn resolve_binary() -> Option<String> {
         }
     }
     None
+}
+
+/// Test seam: a binary path [`resolve_binary`] returns ahead of every real
+/// lookup. A process-global env var would race with tests running in
+/// parallel; this stays inside `cfg(test)` builds only.
+#[cfg(test)]
+static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_test_binary(path: Option<String>) {
+    let mut current = TEST_BINARY.lock().expect("test binary registry");
+    *current = path;
+}
+
+#[cfg(test)]
+fn test_binary_override() -> Option<String> {
+    TEST_BINARY.lock().ok().and_then(|current| current.clone())
 }
 
 fn spawn() -> Result<Sidecar, HarnessError> {
@@ -409,6 +487,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         hello: HelloResult::default(),
         binary: binary.clone(),
         next_id: 0,
+        write_deadline: WRITE_DEADLINE,
     };
 
     let raw = sidecar.call(
@@ -446,6 +525,31 @@ fn slot() -> &'static Mutex<Slot> {
             backoff_until: None,
         })
     })
+}
+
+/// Recovers the slot guard from a poisoned lock, discarding what the panicking
+/// holder left behind.
+///
+/// The panic can strike anywhere between [`Slot::ensure`] and the end of a
+/// round trip, so a recovered session is trustworthy for nothing: the wire may
+/// carry half a request line and the bookkeeping may disagree with reality.
+/// The guarded child is dropped right here — its [`Drop`] shuts it down —
+/// together with any stale error and backoff state, so the next caller starts
+/// from a fresh spawn instead of silently inheriting wreckage it cannot see.
+fn recover_slot(
+    poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, Slot>>,
+) -> std::sync::MutexGuard<'_, Slot> {
+    let mut guard = poisoned.into_inner();
+    guard.sidecar = None;
+    guard.last_error = None;
+    guard.backoff_until = None;
+    // `into_inner` recovers the data but leaves the poison flag raised: every
+    // later plain `.lock()` would return Err forever, and the next caller that
+    // forgets to recover would hang or fail on wreckage that no longer exists.
+    // The guarded state above has just been made consistent, so the flag can
+    // honestly go back down.
+    slot().clear_poison();
+    guard
 }
 
 impl Slot {
@@ -486,9 +590,9 @@ impl Slot {
 /// `try_lock`: a second caller while one gated action is in flight fails fast
 /// with [`HarnessError::Busy`] instead of silently queueing behind up to 15s
 /// per in-flight request. A poisoned slot is *recovered* rather than
-/// propagated — the guard protects only this process's bookkeeping, and the
-/// data it guards stays valid enough to retry from (a wedged child is dropped
-/// on its next fault).
+/// propagated — the guard protects only this process's bookkeeping, and
+/// [`recover_slot`] drops the possibly-corrupt session so no caller ever talks
+/// to a child whose stream a panicking holder left mid-line.
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
     use std::sync::TryLockError;
     let mut guard = match slot().try_lock() {
@@ -499,7 +603,7 @@ pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value,
                  Retry once the current commit/push/pull settles."
             )));
         }
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::Poisoned(poisoned)) => recover_slot(poisoned),
     };
     let sidecar = guard.ensure()?;
     match sidecar.call(op, params, timeout) {
@@ -531,12 +635,56 @@ pub fn call_typed<T: serde::de::DeserializeOwned>(
         .map_err(|e| HarnessError::Protocol(format!("could not decode {} result: {}", op, e)))
 }
 
+/// True for the faults that mean *this connection* broke, as opposed to a
+/// definitive answer or a structural condition: exactly the set worth
+/// retrying once on a freshly spawned child.
+fn retriable_transport_fault(e: &HarnessError) -> bool {
+    matches!(
+        e,
+        HarnessError::Timeout(_) | HarnessError::Unavailable(_) | HarnessError::Protocol(_)
+    )
+}
+
+/// Issues one short policy-verdict operation, retrying once on a fresh
+/// connection when the first attempt faults the transport.
+///
+/// A verdict is milliseconds of harness work; when it times out the likely
+/// cause is a wedged connection, not a downed gate. Without the retry, one
+/// slow verdict faults the sidecar and arms the respawn backoff — thirty
+/// seconds in which every mutating action proceeds unchecked. This turns that
+/// single unlucky round trip into a fresh spawn plus one more chance before
+/// anything runs unchecked.
+///
+/// Long AI generations deliberately go through [`call_typed`] instead: they
+/// legitimately run for many seconds, and re-issuing one against a fresh
+/// child would double their worst-case cost for no safety gain.
+pub fn call_policy<T: serde::de::DeserializeOwned>(
+    op: &str,
+    params: impl Serialize,
+    timeout: Duration,
+) -> Result<T, HarnessError> {
+    let params = serde_json::to_value(params)
+        .map_err(|e| HarnessError::Protocol(format!("could not encode {} params: {}", op, e)))?;
+    match call_typed::<T>(op, Some(params.clone()), timeout) {
+        Ok(v) => Ok(v),
+        Err(e) if retriable_transport_fault(&e) => {
+            // The first fault already dropped the child and armed the respawn
+            // backoff inside [`call`]; clear it so the retry is allowed to
+            // spawn at all, then let the second attempt decide the outcome.
+            reset();
+            call_typed::<T>(op, Some(params), timeout)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// What the sidecar answered at handshake, without provoking a spawn beyond
 /// the first.
+///
+/// A poisoned slot is recovered through [`recover_slot`], which drops the
+/// possibly-corrupt session the panicking holder left behind.
 pub fn handshake() -> Result<(String, HelloResult), HarnessError> {
-    let mut guard = slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = slot().lock().unwrap_or_else(recover_slot);
     let sidecar = guard.ensure()?;
     Ok((sidecar.binary.clone(), sidecar.hello.clone()))
 }
@@ -544,13 +692,12 @@ pub fn handshake() -> Result<(String, HelloResult), HarnessError> {
 /// Forgets the backoff so the next call retries immediately. The UI's
 /// "reconnect" affordance.
 ///
-/// A poisoned slot is recovered deterministically: the fields being cleared
-/// are plain bookkeeping, and leaving them stale behind a poisoned lock would
-/// keep the 30s respawn backoff alive with no way to reset it.
+/// A poisoned slot is recovered through [`recover_slot`] rather than left
+/// locked: the fields being cleared are plain bookkeeping, and leaving them
+/// stale behind a poisoned lock would keep the 30s respawn backoff alive with
+/// no way to reset it.
 pub fn reset() {
-    let mut guard = slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = slot().lock().unwrap_or_else(recover_slot);
     guard.sidecar = None;
     guard.last_error = None;
     guard.backoff_until = None;
@@ -634,6 +781,12 @@ mod tests {
     /// the holder released.
     #[test]
     fn second_caller_while_slot_is_held_fails_fast_with_busy() {
+        // Share the slot tests' serialization: the poisoned-slot fixture
+        // holds a transiently poisoned mutex, and this test's plain `lock`
+        // must never observe that window.
+        let _serial = SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let holder = slot().lock().expect("acquire slot to simulate a call");
         let started = Instant::now();
         let err =
@@ -697,5 +850,314 @@ mod tests {
             "shutdown exceeded grace materially: {elapsed:?}"
         );
         assert!(!status.success(), "a SIGKILLed sleep cannot report success");
+    }
+
+    /// Serializes the tests below that drive the process-wide slot, so they
+    /// cannot interleave their seeding/poisoning with each other.
+    static SLOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Builds a live [`Sidecar`] around an arbitrary shell script, mirroring
+    /// `spawn`'s reader plumbing but skipping its handshake — each test wants
+    /// a different script and a different deadline.
+    fn scripted_sidecar(script: &str, write_deadline: Duration) -> Sidecar {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn scripted sidecar");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let tail_writer = tail.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Ok(mut buf) = tail_writer.lock() {
+                    if buf.len() == STDERR_TAIL_LINES {
+                        buf.pop_front();
+                    }
+                    buf.push_back(line);
+                }
+            }
+        });
+
+        Sidecar {
+            child,
+            stdin: Some(stdin),
+            lines: rx,
+            stderr: tail,
+            hello: HelloResult::default(),
+            binary: "scripted".into(),
+            next_id: 0,
+            write_deadline,
+        }
+    }
+
+    /// Regression (stdin write stall): `write_all` on a child that never
+    /// drains its request pipe used to block forever while the global slot was
+    /// held — every policy check and AI call behind it hung permanently. The
+    /// write now runs on a worker thread under the (injected, shortened)
+    /// write deadline; a stall must surface as Unavailable within a bounded
+    /// time and leave the connection unusable so a fresh one respawns.
+    #[test]
+    fn stdin_write_stall_returns_unavailable_within_a_bounded_time() {
+        // `sleep` never reads stdin: once the kernel pipe buffer fills, our
+        // write can only block. Half a mebibyte of payload guarantees the
+        // fill on any OS's default pipe capacity.
+        let mut sidecar = scripted_sidecar("exec sleep 30", Duration::from_millis(400));
+
+        let blob = "x".repeat(512 * 1024);
+        let started = Instant::now();
+        let err = sidecar
+            .call(
+                "policy.check.command",
+                Some(serde_json::json!({ "command": blob, "root": "/tmp" })),
+                Duration::from_secs(5),
+            )
+            .expect_err("a stalled stdin cannot deliver an answer");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, HarnessError::Unavailable(ref m) if m.contains("stalled")),
+            "expected a write-stall Unavailable, got {err:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "gave up before the injected deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the stall was not bounded: {elapsed:?}"
+        );
+
+        // stdin was forfeited to the stuck writer: a follow-up call must fail
+        // fast instead of blocking a second time.
+        let started = Instant::now();
+        let err = sidecar
+            .call("policy.check.command", None, Duration::from_secs(5))
+            .expect_err("no stdin remains");
+        assert!(matches!(err, HarnessError::Unavailable(_)));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "follow-up call blocked again: {:?}",
+            started.elapsed()
+        );
+
+        // Dropping the wedged connection still reaps the child promptly.
+        let started = Instant::now();
+        drop(sidecar);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown escalation overran: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Regression (poisoned slot): recovering the guard data used to keep the
+    /// panicking holder's session — possibly left mid-line on the wire — plus
+    /// any backoff it had armed. Recovery must drop the possibly-corrupt child
+    /// and clear the bookkeeping, and a request through the recovered lock
+    /// must complete promptly rather than hang or re-raise the poison.
+    #[test]
+    fn poisoned_slot_recovery_drops_the_corrupt_session() {
+        let _serial = SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        {
+            let mut guard = slot().lock().expect("seed the slot");
+            guard.sidecar = Some(scripted_sidecar("exec sleep 30", WRITE_DEADLINE));
+            guard.last_error = Some(HarnessError::Unavailable("stale fault".into()));
+            guard.backoff_until = Some(Instant::now() + RESPAWN_BACKOFF);
+        }
+
+        let mutex = slot();
+        {
+            let guard = mutex.lock().expect("acquire before poisoning");
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _held = guard;
+                panic!("simulated panic while holding the slot");
+            }));
+            assert!(panicked.is_err(), "fixture panic must unwind");
+        }
+        assert!(mutex.is_poisoned(), "fixture must leave the lock poisoned");
+
+        // Recovery through the reset path: neither the corrupt session nor its
+        // bookkeeping may survive behind the recovered guard.
+        reset();
+        {
+            let guard = slot().lock().expect("slot usable after recovery");
+            assert!(!mutex.is_poisoned());
+            assert!(guard.sidecar.is_none(), "corrupt session survived recovery");
+            assert!(
+                guard.backoff_until.is_none(),
+                "stale backoff survived recovery"
+            );
+            assert!(guard.last_error.is_none());
+        }
+
+        // A full request through the recovered lock answers or fails
+        // structured within a bounded time — never hangs on wreckage left by
+        // the panicking holder. Which outcome depends on whether this machine
+        // has manvi installed; both are acceptable here.
+        let started = Instant::now();
+        let _outcome = super::call(
+            OP_POLICY_CHECK_COMMAND,
+            Some(serde_json::json!({ "command": "true", "root": "/tmp" })),
+            Duration::from_millis(250),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "request after recovery hung for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Fake `manvi serve`: the first connection answers the handshake and then
+    /// wedges silently (never answering what follows); later connections speak
+    /// enough NDJSON to satisfy the handshake and one policy verdict. Each
+    /// spawn appends itself to a count file, so a test can prove which
+    /// connection actually served a request.
+    const FAKE_MANVI_SH: &str = r#"#!/bin/sh
+count_file="@COUNT_FILE@"
+n=0
+[ -f "$count_file" ] && n=$(cat "$count_file")
+n=$((n + 1))
+printf '%s\n' "$n" > "$count_file"
+
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+
+if [ "$n" = "1" ]; then
+  IFS= read -r line || exit 1
+  reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+  sleep 60
+  exit 0
+fi
+
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  reply "$line" '{"action":"allow","rule":"stub","severity":"info","reason":"stub allow","target":"","task_id":"","demoted":""}'
+done
+"#;
+
+    /// Regression (one policy timeout kills the gate): a single timed-out
+    /// verdict used to drop the sidecar and arm the 30s respawn backoff, so
+    /// every mutation in that window proceeded unchecked. `call_policy` must
+    /// retry once on a FRESH connection and surface that attempt's verdict
+    /// with no backoff left armed.
+    #[test]
+    fn policy_verdict_retries_once_on_a_fresh_connection() {
+        let _serial = SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = tempfile::tempdir().expect("tempdir for fake-manvi");
+        let count_file = dir.path().join("connections");
+        let script_path = dir.path().join("fake-manvi");
+        std::fs::write(
+            &script_path,
+            FAKE_MANVI_SH.replace("@COUNT_FILE@", &count_file.display().to_string()),
+        )
+        .expect("write fake-manvi script");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake-manvi executable");
+
+        set_test_binary(Some(script_path.to_string_lossy().into_owned()));
+        struct ClearBinary;
+        impl Drop for ClearBinary {
+            fn drop(&mut self) {
+                set_test_binary(None);
+            }
+        }
+        let _clear_on_unwind = ClearBinary;
+
+        // Tests share the process-wide slot: an earlier test may have left a
+        // live sidecar (spawned from the real manvi) sitting in it, which
+        // would let this test's first attempt skip spawning entirely and
+        // answer from that inherited child. Reset so both attempts provably
+        // go through the overridden binary.
+        super::reset();
+
+        let started = Instant::now();
+        let verdict = super::call_policy::<RawDecision>(
+            OP_POLICY_CHECK_COMMAND,
+            serde_json::json!({ "command": "true", "root": dir.path() }),
+            Duration::from_millis(400),
+        );
+        let elapsed = started.elapsed();
+
+        let decision = verdict.expect("the fresh second connection must answer the verdict");
+        // The stub signs its verdicts; anything else means the request never
+        // reached the fake harness and the count below proves nothing.
+        assert_eq!(decision.action, "allow");
+        assert_eq!(
+            decision.rule, "stub",
+            "verdict must come from the stub, not another binary"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "retry exceeded any sane bound: {elapsed:?}"
+        );
+
+        let count = std::fs::read_to_string(&count_file).expect("read connection count");
+        assert_eq!(
+            count.trim(),
+            "2",
+            "the verdict must land on the SECOND connection, not the stalled first"
+        );
+
+        // Success must leave no respawn backoff armed: the next mutation gets
+        // a checked verdict, not an unchecked one.
+        let guard = slot().lock().expect("inspect slot after retry");
+        assert!(
+            guard.backoff_until.is_none(),
+            "a successful retry must not leave respawn backoff armed"
+        );
+    }
+
+    /// Only transport faults are worth a fresh connection; refusals are real
+    /// answers, and Busy / NotInstalled cannot improve by respawning.
+    #[test]
+    fn only_transport_faults_are_retried_for_policy_verdicts() {
+        assert!(retriable_transport_fault(&HarnessError::Timeout(
+            "t".into()
+        )));
+        assert!(retriable_transport_fault(&HarnessError::Unavailable(
+            "u".into()
+        )));
+        assert!(retriable_transport_fault(&HarnessError::Protocol(
+            "p".into()
+        )));
+        assert!(!retriable_transport_fault(&HarnessError::Refused(
+            WireError {
+                code: "E_BLOCKED".into(),
+                message: "no".into(),
+                retryable: false,
+            }
+        )));
+        assert!(!retriable_transport_fault(&HarnessError::Busy(
+            "held".into()
+        )));
+        assert!(!retriable_transport_fault(&HarnessError::NotInstalled(
+            "gone".into()
+        )));
     }
 }

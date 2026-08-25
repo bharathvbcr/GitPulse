@@ -31,6 +31,90 @@ export interface CommitDetails {
   changed_files: CommitFileChange[];
   total_additions: number;
   total_deletions: number;
+  /**
+   * Present only when the backend capped the changed-file list for a massive
+   * commit; absent otherwise, so every consumer must default gracefully.
+   */
+  files_total_count?: number;
+  files_list_truncated?: boolean;
+}
+
+/** A file left out of a truncated commit diff, stats only. */
+export interface SkippedFileStat {
+  path: string;
+  additions: number;
+  deletions: number;
+}
+
+/** Wire shape of `cmd_get_commit_diff` (snake_case over IPC). */
+export interface DiffPayload {
+  content: string;
+  truncated: boolean;
+  included_files: number;
+  skipped_files: SkippedFileStat[];
+  total_files: number;
+  total_additions: number;
+  total_deletions: number;
+}
+
+function coerceCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : 0;
+}
+
+function coerceSkippedFiles(value: unknown): SkippedFileStat[] {
+  if (!Array.isArray(value)) return [];
+  const files: SkippedFileStat[] = [];
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.path !== "string") continue;
+    files.push({
+      path: record.path,
+      additions: coerceCount(record.additions),
+      deletions: coerceCount(record.deletions),
+    });
+  }
+  return files;
+}
+
+function emptyDiffPayload(): DiffPayload {
+  return {
+    content: "",
+    truncated: false,
+    included_files: 0,
+    skipped_files: [],
+    total_files: 0,
+    total_additions: 0,
+    total_deletions: 0,
+  };
+}
+
+/**
+ * Defensively turns whatever crossed `invoke()` into a `DiffPayload`. The
+ * backend is transitioning from a bare diff string to this object, and other
+ * stores still hold `string | null`-typed diff state, so every wrong shape
+ * degrades to a safe default instead of throwing downstream: a legacy string
+ * becomes an untruncated payload; null, arrays and other junk become empty.
+ */
+export function normalizeDiffPayload(raw: unknown): DiffPayload {
+  if (typeof raw === "string") {
+    return { ...emptyDiffPayload(), content: raw };
+  }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return emptyDiffPayload();
+  }
+  const record = raw as Record<string, unknown>;
+  return {
+    content: typeof record.content === "string" ? record.content : "",
+    truncated: record.truncated === true,
+    included_files: coerceCount(record.included_files),
+    skipped_files: coerceSkippedFiles(record.skipped_files),
+    total_files: coerceCount(record.total_files),
+    total_additions: coerceCount(record.total_additions),
+    total_deletions: coerceCount(record.total_deletions),
+  };
 }
 
 export interface FoldedBranchRun {

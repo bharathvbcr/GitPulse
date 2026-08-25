@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeWindow } from "./virtualWindow";
+import { clampScrollTop, computeWindow } from "./virtualWindow";
 
 describe("computeWindow", () => {
   it("returns an empty window for an empty list", () => {
@@ -83,6 +83,47 @@ describe("computeWindow", () => {
         expect(win.end).toBeGreaterThanOrEqual(win.start);
         expect(win.end).toBeLessThanOrEqual(totalRows);
       }
+    }
+  });
+});
+
+describe("clampScrollTop", () => {
+  it("keeps in-range positions untouched", () => {
+    // 2000px of content in a 600px viewport → max scrollTop is 1400.
+    expect(clampScrollTop(0, 2000, 600)).toBe(0);
+    expect(clampScrollTop(700, 2000, 600)).toBe(700);
+    expect(clampScrollTop(1400, 2000, 600)).toBe(1400);
+  });
+
+  it("clamps elastic-overscroll positions back into range", () => {
+    expect(clampScrollTop(5000, 2000, 600)).toBe(1400);
+    expect(clampScrollTop(-37, 2000, 600)).toBe(0);
+  });
+
+  it("returns 0 when the content cannot scroll at all", () => {
+    // No overflow: any write is out of range by definition.
+    expect(clampScrollTop(10, 600, 600)).toBe(0);
+    // Degenerate layout (scrollHeight below clientHeight) must not go
+    // negative and then "allow" scrolling upward.
+    expect(clampScrollTop(50, 100, 600)).toBe(0);
+  });
+
+  it("fails closed on non-finite inputs like computeWindow does", () => {
+    // A non-finite scroll anchor anchors nowhere: paint from the top.
+    expect(clampScrollTop(Number.NaN, 2000, 600)).toBe(0);
+    expect(clampScrollTop(Number.POSITIVE_INFINITY, 2000, 600)).toBe(0);
+    // Broken layout metrics (NaN/Infinity content height) cannot bound a
+    // write, so refuse it rather than trust them.
+    expect(clampScrollTop(100, Number.NaN, 600)).toBe(0);
+    expect(clampScrollTop(100, Number.POSITIVE_INFINITY, 600)).toBe(0);
+  });
+
+  it("stays inside [0, max] across a hostile sweep", () => {
+    for (const value of [-9999, -0.5, 0, 0.5, 1399.5, 1400, 1400.5, 9999]) {
+      const clamped = clampScrollTop(value, 2000, 600);
+      expect(clamped).toBeGreaterThanOrEqual(0);
+      expect(clamped).toBeLessThanOrEqual(1400);
+      expect(Number.isFinite(clamped)).toBe(true);
     }
   });
 });

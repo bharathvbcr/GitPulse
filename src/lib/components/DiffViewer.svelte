@@ -1,7 +1,8 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { normalizeDiffPayload } from "../stores/graphStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { FileCode, Check } from "lucide-svelte";
+  import { FileCode, Check, X } from "lucide-svelte";
   import ImageDiffViewer from "./ImageDiffViewer.svelte";
   import EmptyState from "./EmptyState.svelte";
   import VirtualList from "./VirtualList.svelte";
@@ -35,7 +36,31 @@
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
 
-  let allLines = $derived(parseUnifiedDiff($repoStore.selectedDiff || ""));
+  /**
+   * The diff may arrive as a legacy bare string or as the new payload object
+   * (the backend is mid-transition); the normalizer makes either renderable
+   * and carries the truncation metadata a massive commit needs.
+   */
+  let diffPayload = $derived(normalizeDiffPayload($repoStore.selectedDiff));
+  let bannerDismissed = $state(false);
+  let commitTruncated = $derived(diffPayload.truncated);
+  const MAX_SKIPPED_SHOWN = 5;
+  let visibleSkippedFiles = $derived(
+    commitTruncated ? diffPayload.skipped_files.slice(0, MAX_SKIPPED_SHOWN) : []
+  );
+  let moreSkippedCount = $derived(
+    Math.max(0, diffPayload.skipped_files.length - visibleSkippedFiles.length)
+  );
+  let skippedAdditions = $derived(
+    diffPayload.skipped_files.reduce((sum, f) => sum + f.additions, 0)
+  );
+  let skippedDeletions = $derived(
+    diffPayload.skipped_files.reduce((sum, f) => sum + f.deletions, 0)
+  );
+  let shownAdditions = $derived(Math.max(0, diffPayload.total_additions - skippedAdditions));
+  let shownDeletions = $derived(Math.max(0, diffPayload.total_deletions - skippedDeletions));
+
+  let allLines = $derived(parseUnifiedDiff(diffPayload.content));
   let truncatedSource = $derived(allLines.length > MAX_RENDER_LINES);
   let lines = $derived(truncatedSource ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
 
@@ -130,6 +155,7 @@
     void $repoStore.selectedCommitId;
     unifiedScroll = 0;
     splitScroll = 0;
+    bannerDismissed = false;
   });
 
   let prevIgnore = $state(false);
@@ -244,6 +270,34 @@
       {/if}
     </div>
   </div>
+
+  {#if commitTruncated && !bannerDismissed}
+    <div class="mx-3 mt-2 px-3 py-2 rounded-xl bg-surfaceHover border border-border/60 text-[11px] font-sans text-textMuted space-y-1">
+      <div class="flex items-center justify-between gap-2">
+        <span>
+          Large commit: showing {diffPayload.included_files.toLocaleString()} of {diffPayload.total_files.toLocaleString()} changed files
+          (+{shownAdditions.toLocaleString()}/-{shownDeletions.toLocaleString()} lines shown of +{diffPayload.total_additions.toLocaleString()}/-{diffPayload.total_deletions.toLocaleString()} total)
+        </span>
+        <button
+          onclick={() => (bannerDismissed = true)}
+          aria-label="Dismiss truncation notice"
+          title="Dismiss truncation notice"
+          class="shrink-0 rounded-full p-0.5 text-textMuted hover:text-textPrimary hover:bg-background/70 transition-colors cursor-pointer"
+        >
+          <X size={13} />
+        </button>
+      </div>
+      {#each visibleSkippedFiles as f (f.path)}
+        <div class="flex items-center justify-between gap-3 pl-3 min-w-0">
+          <span class="truncate font-mono">{f.path}</span>
+          <span class="font-mono shrink-0"><span class="text-green-400">+{f.additions}</span> <span class="text-red-400">-{f.deletions}</span></span>
+        </div>
+      {/each}
+      {#if moreSkippedCount > 0}
+        <div class="pl-3">+{moreSkippedCount.toLocaleString()} more files not shown</div>
+      {/if}
+    </div>
+  {/if}
 
   {#if truncatedSource}
     <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 font-sans flex items-center gap-2">

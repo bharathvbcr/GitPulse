@@ -4,6 +4,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { guardedDismiss } from "./modalGuard";
   import { GitMerge, Check, AlertCircle } from "lucide-svelte";
 
   let {
@@ -86,6 +87,12 @@
       isExecuting = false;
     }
   }
+
+  // Backdrop, Escape, and Cancel share one gate: while a rebase runs, none
+  // of them may close the dialog the Cancel button is already guarding.
+  function requestClose() {
+    guardedDismiss(isExecuting, onClose);
+  }
 </script>
 
 {#if isOpen}
@@ -93,8 +100,8 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={onClose}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onclick={requestClose}
+    onkeydown={(e) => e.key === "Escape" && requestClose()}
     transition:fade={fadeParams()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 select-none gp-gpu"
   >
@@ -153,7 +160,7 @@
       </div>
 
       <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
-        <button onclick={onClose} disabled={isExecuting} class="gp-btn">Cancel</button>
+        <button onclick={requestClose} disabled={isExecuting} class="gp-btn">Cancel</button>
         <button
           onclick={executeRebase}
           disabled={isExecuting || items.length === 0}

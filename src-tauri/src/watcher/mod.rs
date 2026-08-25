@@ -12,7 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-pub const MAX_WATCHES: usize = 24;
+/// Cap on concurrently watched repositories. Sized for agent workflows that
+/// fan out across many clones and linked worktrees at once; each watch is one
+/// OS stream plus a 2s fingerprint poll, so dozens stay cheap.
+pub const MAX_WATCHES: usize = 64;
 
 pub struct WatchSession {
     stop: Arc<AtomicBool>,
@@ -441,7 +444,7 @@ mod tests {
             .begin_watch_slot("/cap-repo-overflow")
             .expect_err("25th unique path must fail");
         assert!(
-            err.contains("24") || err.to_lowercase().contains("too many"),
+            err.contains("64") || err.to_lowercase().contains("too many"),
             "cap error should mention the limit, got: {err}"
         );
         assert_eq!(state.watch_count().unwrap(), MAX_WATCHES);
@@ -499,7 +502,7 @@ mod tests {
         let err = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {})
             .expect_err("25th live watch must fail closed");
         assert!(
-            err.contains("24") || err.to_lowercase().contains("too many"),
+            err.contains("64") || err.to_lowercase().contains("too many"),
             "cap error should mention the limit, got: {err}"
         );
         assert_eq!(state.watch_count().unwrap(), MAX_WATCHES);

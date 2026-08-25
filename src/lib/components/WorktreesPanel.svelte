@@ -28,6 +28,9 @@
   let worktrees = $state<WorktreeInfo[]>([]);
   let isLoading = $state(false);
   let error = $state<string | null>(null);
+  // Bumped on every load trigger; a response from an older epoch is dropped
+  // so rapid create/remove cannot land an out-of-order list last.
+  let loadEpoch = 0;
   let isCreating = $state(false);
   let removingPath = $state<string | null>(null);
   let showAddForm = $state(false);
@@ -38,17 +41,19 @@
   async function load() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = ++loadEpoch;
     isLoading = true;
     error = null;
     try {
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
-      if ($repoStore.currentPath !== repo) return;
+      if (epoch !== loadEpoch || $repoStore.currentPath !== repo) return;
       worktrees = next;
     } catch (err: unknown) {
-      if ($repoStore.currentPath !== repo) return;
+      if (epoch !== loadEpoch || $repoStore.currentPath !== repo) return;
       error = String(err);
     } finally {
-      isLoading = false;
+      // A superseded load must not clear a newer load's spinner.
+      if (epoch === loadEpoch) isLoading = false;
     }
   }
 
@@ -129,6 +134,7 @@
     <button
       onclick={() => (showAddForm = !showAddForm)}
       title="Create a linked worktree for a parallel task"
+      aria-label="Create worktree"
       class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
     >
       <Plus size={12} />
@@ -210,11 +216,12 @@
               <ExternalLink size={11} />
             </button>
             {#if !wt.is_main}
-              <button
-                onclick={() => void remove(wt)}
-                title={removingPath === wt.path ? "Click again to remove" : "Remove this worktree"}
-                class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
-              >
+            <button
+              onclick={() => void remove(wt)}
+              title={removingPath === wt.path ? "Click again to remove" : "Remove this worktree"}
+              aria-label={removingPath === wt.path ? `Click again to remove ${wt.name}` : `Remove worktree ${wt.name}`}
+              class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
+            >
                 <Trash2 size={11} />
               </button>
             {/if}
