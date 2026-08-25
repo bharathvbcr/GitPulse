@@ -1,11 +1,50 @@
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
 pub struct RepoFileWatcher {
     _watcher: RecommendedWatcher,
-    pub receiver: Receiver<Result<Event, notify::Error>>,
+    pub receiver: Receiver<Result<notify::Event, notify::Error>>,
+}
+
+/// Cheap change fingerprint over the small set of paths whose modification
+/// implies repository activity: the git dir itself plus HEAD/index/packed-refs,
+/// and — when watching a checkout — the worktree root directory and its
+/// immediate entries (creating or deleting a top-level file bumps the
+/// directory mtime). Used by the consumer-side watchdog in `run_watch_loop`.
+///
+/// Returns `(path, len, mtime_nanos)` triples so additions, removals, size
+/// changes, and in-place rewrites all register.
+pub fn watch_fingerprint(git_dir: &Path, worktree_root: Option<&Path>) -> Vec<(PathBuf, u64, i64)> {
+    fn stat_entry(path: &Path) -> Option<(PathBuf, u64, i64)> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(i64::MIN);
+        Some((path.to_path_buf(), meta.len(), mtime))
+    }
+
+    let mut paths = vec![
+        git_dir.to_path_buf(),
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("packed-refs"),
+    ];
+    if let Some(root) = worktree_root {
+        paths.push(root.to_path_buf());
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten().take(256) {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths.iter().filter_map(|p| stat_entry(p)).collect()
 }
 
 impl RepoFileWatcher {
@@ -28,6 +67,11 @@ impl RepoFileWatcher {
     /// deeper edits still reach us through the index/HEAD writes they cause
     /// inside `.git`. Both `notify` backends in use here support the mode:
     /// inotify natively, FSEvents via its own filtering.
+    ///
+    /// Delivery latency and reliability of those OS backends vary with system
+    /// load; [`crate::watcher::run_watch_loop`] therefore cross-checks a
+    /// [`watch_fingerprint`] on a short interval and reports changes even when
+    /// the OS stream goes quiet.
     pub fn watch_repo(git_dir: &Path, worktree_root: Option<&Path>) -> Result<Self, String> {
         if !git_dir.exists() {
             return Err(format!(

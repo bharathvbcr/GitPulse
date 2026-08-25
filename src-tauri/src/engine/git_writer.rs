@@ -82,6 +82,46 @@ impl GitWriter {
         git_text(repo, &args)
     }
 
+    /// Stage exactly `files` and commit them under a single mutation-lock
+    /// acquisition.
+    ///
+    /// `stage_file()` followed by `commit()` spans two lock acquisitions, so
+    /// a concurrent writer can commit the shared index in between and absorb
+    /// the staged bytes into its own commit. Programmatic callers
+    /// (automation, agents, batch tooling) need stage+commit to be one
+    /// indivisible mutation; this is that primitive. Interactive flows that
+    /// intentionally commit whatever the user staged keep using
+    /// `stage_file()` + `commit()`.
+    pub fn commit_files(
+        repo_path: &str,
+        message: &str,
+        files: &[String],
+    ) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        if message.trim().is_empty() {
+            return Err("Commit message must not be empty".into());
+        }
+        if files.is_empty() {
+            return Err("commit_files requires at least one path".into());
+        }
+        for file in files {
+            if file.is_empty() {
+                return Err("commit_files requires non-empty paths".into());
+            }
+            sandbox_join(&repo, file)?;
+        }
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut add_args: Vec<&str> = Vec::with_capacity(files.len() + 2);
+        add_args.push("add");
+        add_args.push("--");
+        add_args.extend(files.iter().map(String::as_str));
+        git_text(&repo, &add_args)?;
+        Self::commit_inner(&repo, message, false)
+    }
+
     pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -917,5 +957,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Stress: `commit_files` is the atomic stage+commit primitive. Under
+    /// concurrency every round must produce its OWN commit — no sibling can
+    /// absorb its staged bytes because stage and commit share one lock
+    /// acquisition.
+    #[test]
+    fn concurrent_commit_files_produce_one_commit_per_round() {
+        let dir = init_repo_with_commit();
+        let path = dir.path().to_str().unwrap().to_string();
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let file = format!("t{t}_f{i}.txt");
+                        std::fs::write(
+                            std::path::Path::new(&path).join(&file),
+                            format!("thread {t} round {i}\n"),
+                        )
+                        .unwrap();
+                        GitWriter::commit_files(
+                            &path,
+                            &format!("commit t{t}.{i}"),
+                            &[file.clone()],
+                        )
+                        .unwrap_or_else(|e| panic!("commit_files {t}.{i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread must not panic");
+        }
+        let log = StdCommand::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(log.stdout).unwrap();
+        assert_eq!(
+            stdout.lines().count(),
+            1 + THREADS * PER_THREAD,
+            "atomic commit_files must yield exactly one commit per round"
+        );
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let msg = format!("commit t{t}.{i}");
+                assert_eq!(
+                    stdout.lines().filter(|l| *l == msg).count(),
+                    1,
+                    "{msg} must appear exactly once"
+                );
+            }
+        }
+    }
+
+    /// `commit_files` must refuse empty inputs instead of silently creating
+    /// an empty commit or running `git add` with no pathspec.
+    #[test]
+    fn commit_files_rejects_empty_inputs() {
+        let dir = init_repo_with_commit();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(GitWriter::commit_files(&path, "msg", &[]).is_err());
+        assert!(GitWriter::commit_files(&path, "msg", &[String::new()]).is_err());
+        assert!(GitWriter::commit_files(&path, "   ", &["a.txt".into()]).is_err());
+        assert!(GitWriter::commit_files(&path, "msg", &["../escape.txt".into()]).is_err());
+        assert_eq!(head_message(&dir), "init", "no commit may be created");
     }
 }

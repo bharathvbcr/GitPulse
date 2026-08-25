@@ -96,15 +96,60 @@ fn watch_lookup_keys(repo_path: &str) -> Vec<String> {
     keys
 }
 
-fn run_watch_loop<F>(watcher: RepoFileWatcher, stop: Arc<AtomicBool>, path: String, on_change: F)
-where
+/// Quiet period after the last event before a debounced `repo-changed` fires.
+const SETTLE_QUIET: Duration = Duration::from_millis(400);
+/// Upper bound on how long pending events may go unreported when writes never
+/// stop long enough to settle. Without this, a continuous writer (build tool,
+/// agent automation) resets the settle timer forever and the UI goes stale
+/// indefinitely; with it, updates flow at least once per interval under load.
+const MAX_REPORT_LATENCY: Duration = Duration::from_secs(2);
+/// How often the loop cross-checks a [`watch_fingerprint`] against the last
+/// observed state. The OS stream (FSEvents/inotify) provides low-latency
+/// delivery; this consumer-side poll exists because those backends can stall
+/// or drop deliveries under heavy system load, and a silently dead stream
+/// would otherwise mean status updates never fire again. The check is a dozen
+/// stats per interval per watched repo — negligible next to the git calls a
+/// report itself triggers.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
+
+fn run_watch_loop<F>(
+    watcher: RepoFileWatcher,
+    stop: Arc<AtomicBool>,
+    path: String,
+    fingerprint_paths: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
+    on_change: F,
+) where
     F: Fn(String),
 {
     let mut pending = false;
+    let mut pending_since: Option<Instant> = None;
     let mut last_event = Instant::now();
+    // Watchdog state: the fingerprint as of the last cross-check, when that
+    // check ran, and whether consumed OS events have made the cached
+    // fingerprint stale. Seeding from the current state means only changes
+    // after the loop started are reported — never a spurious first report.
+    let (mut watchdog_fp, mut last_watchdog) = match &fingerprint_paths {
+        Some((git_dir, worktree_root)) => (
+            Some(crate::watcher::debouncer::watch_fingerprint(
+                git_dir,
+                worktree_root.as_deref(),
+            )),
+            Instant::now(),
+        ),
+        None => (None, Instant::now()),
+    };
+    let mut fingerprint_stale = false;
     while !stop.load(Ordering::Relaxed) {
         match watcher.receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(_) => {
+                // A real OS delivery proves the stream is alive and that
+                // everything it has emitted is accounted for: resynchronize
+                // the fingerprint on the next tick so the watchdog never
+                // re-reports changes the stream already announced.
+                fingerprint_stale = true;
+                if !pending {
+                    pending_since = Some(Instant::now());
+                }
                 pending = true;
                 last_event = Instant::now();
                 // Drain everything already queued behind that first event:
@@ -114,9 +159,39 @@ where
                 for _ in watcher.receiver.try_iter() {}
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if pending && last_event.elapsed() >= Duration::from_millis(400) {
-                    on_change(path.clone());
-                    pending = false;
+                // Watchdog tick: if the OS stream has gone quiet while the
+                // repository actually changed, treat the divergence as an
+                // event. This is the single consumer, and the fingerprint is
+                // resynchronized on every stream delivery, so the watchdog
+                // only ever reports changes the stream did NOT.
+                if let (Some(fp), Some((git_dir, worktree_root))) =
+                    (&mut watchdog_fp, &fingerprint_paths)
+                {
+                    if fingerprint_stale || last_watchdog.elapsed() >= WATCHDOG_INTERVAL {
+                        fingerprint_stale = false;
+                        last_watchdog = Instant::now();
+                        let next = crate::watcher::debouncer::watch_fingerprint(
+                            git_dir,
+                            worktree_root.as_deref(),
+                        );
+                        if *fp != next {
+                            *fp = next;
+                            if !pending {
+                                pending_since = Some(Instant::now());
+                            }
+                            pending = true;
+                        }
+                    }
+                }
+                if pending {
+                    let settled = last_event.elapsed() >= SETTLE_QUIET;
+                    let starved =
+                        pending_since.is_some_and(|since| since.elapsed() >= MAX_REPORT_LATENCY);
+                    if settled || starved {
+                        on_change(path.clone());
+                        pending = false;
+                        pending_since = None;
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -182,10 +257,17 @@ where
     // deadlock if the watch thread (or `on_change`) needs the same lock.
     let emit_path = key.clone();
     let thread_stop = stop.clone();
+    let fingerprint_paths = Some((git_dir, worktree_root));
     if let Err(e) = thread::Builder::new()
         .name("gitpulse-fs-watch".into())
         .spawn(move || {
-            run_watch_loop(watcher, thread_stop, emit_path, on_change);
+            run_watch_loop(
+                watcher,
+                thread_stop,
+                emit_path,
+                fingerprint_paths,
+                on_change,
+            );
         })
     {
         let _ = state.abandon_watch_slot(&key, &stop);
@@ -553,17 +635,36 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let emit_path = canonical.to_string_lossy().into_owned();
+        let fingerprint_paths = Some((git_dir.clone(), Some(canonical.clone())));
         let (tx, rx) = std::sync::mpsc::channel();
         thread::Builder::new()
             .name("watch-loop-test".into())
             .spawn(move || {
-                run_watch_loop(watcher, thread_stop, emit_path.clone(), move |p| {
-                    let _ = tx.send(p);
-                });
+                run_watch_loop(
+                    watcher,
+                    thread_stop,
+                    emit_path.clone(),
+                    fingerprint_paths,
+                    move |p| {
+                        let _ = tx.send(p);
+                    },
+                );
             })
             .expect("spawn loop");
         // Give the OS backend time to install its watches before the storm.
         thread::sleep(Duration::from_millis(300));
+        // Warmup handshake: prove the backend's event stream is actually live
+        // before any timing assertion runs. macOS FSEvents streams can start
+        // late under system load; without this handshake that startup race
+        // reads as a product bug. If the very first event never arrives the
+        // watcher setup is broken and failing here is correct.
+        std::fs::write(canonical.join(".gitpulse-warmup"), "warm").unwrap();
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("watcher backend must deliver a warmup event once live");
+        // The callback already implies the 400ms settle window passed, so a
+        // short drain clears any coalesced stragglers cleanly.
+        thread::sleep(Duration::from_millis(200));
+        while rx.try_recv().is_ok() {}
         (rx, stop, canonical)
     }
 
@@ -581,17 +682,44 @@ mod tests {
         }
 
         let first = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("at least one settled callback");
         assert!(!first.is_empty());
 
         // Quiet window well past the 400ms settle: no further callbacks may
-        // arrive, because no further events exist to debounce.
-        match rx.recv_timeout(Duration::from_millis(900)) {
+        // arrive, because no further events exist to debounce. The window is
+        // generous because late-delivered duplicates are a backend artifact,
+        // not coalescing behavior.
+        match rx.recv_timeout(Duration::from_millis(1500)) {
             Ok(extra) => panic!("unexpected extra callback for {extra}: not coalesced"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(e) => panic!("channel failed during quiet window: {e}"),
         }
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Anti-starvation bound: a writer that never pauses long enough for the
+    /// 400ms quiet window must still produce callbacks — at least one per
+    /// [`MAX_REPORT_LATENCY`] — so a busy build or agent session can never
+    /// leave the UI stale indefinitely.
+    #[test]
+    fn watch_loop_reports_under_sustained_writes_without_quiet() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+
+        // Each write lands ~150ms after the previous one, inside the 400ms
+        // settle window, so only the max-latency bound can produce a callback
+        // while the churn is running (a scheduling hiccup that stretches one
+        // gap past 400ms would legitimately fire early via the quiet path).
+        let churn_start = Instant::now();
+        let mut i = 0u32;
+        while churn_start.elapsed() < Duration::from_millis(2400) {
+            std::fs::write(root.join(format!("churn_{i}.txt")), "x").unwrap();
+            i += 1;
+            thread::sleep(Duration::from_millis(150));
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("sustained writes must still produce at least one callback");
         stop.store(true, Ordering::SeqCst);
     }
 
@@ -605,12 +733,12 @@ mod tests {
 
         // 1. Worktree-only write: no index/HEAD traffic involved.
         std::fs::write(root.join("unstaged-edit.txt"), "dirty\n").unwrap();
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(Duration::from_secs(30))
             .expect("unstaged worktree edit must trigger repo-changed");
 
         // 2. A .git-only write still triggers through the recursive watch.
         std::fs::write(root.join(".git").join("gitpulse-probe"), "x").unwrap();
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(Duration::from_secs(30))
             .expect("git-dir write must still trigger repo-changed");
 
         stop.store(true, Ordering::SeqCst);
