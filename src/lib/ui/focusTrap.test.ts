@@ -155,3 +155,128 @@ describe("cycleFocus", () => {
     expect(reachable.focusCalls).toBe(1);
   });
 });
+
+describe("trapFocus action", () => {
+  function currentTarget(): unknown {
+    const doc = (globalThis as Record<string, unknown>).document as {
+      activeElement: unknown;
+    };
+    return doc.activeElement;
+  }
+
+  class FakeNodeWithEvents extends FakeFocusable {
+    isConnected = true;
+    listeners = new Map<string, Array<(event: unknown) => void>>();
+    children: FakeFocusable[] = [];
+
+    querySelectorAll(_selector: string): FakeFocusable[] {
+      return this.children;
+    }
+
+    addEventListener(event: string, fn: (event: unknown) => void): void {
+      const list = this.listeners.get(event) ?? [];
+      list.push(fn);
+      this.listeners.set(event, list);
+    }
+
+    removeEventListener(event: string, fn: (event: unknown) => void): void {
+      const list = this.listeners.get(event) ?? [];
+      const index = list.indexOf(fn);
+      if (index >= 0) list.splice(index, 1);
+    }
+
+    dispatchEvent(event: unknown & { type: string }): void {
+      for (const fn of this.listeners.get(event.type) ?? []) {
+        fn(event);
+      }
+    }
+  }
+
+  it("autofocuses first focusable by default when options are omitted", () => {
+    installFakeDocument();
+    (globalThis as Record<string, unknown>).HTMLElement = FakeNodeWithEvents;
+
+    const dialog = new FakeNodeWithEvents();
+    const btn1 = new FakeNodeWithEvents();
+    const btn2 = new FakeNodeWithEvents();
+    dialog.children = [btn1, btn2];
+
+    const action = import("./focusTrap").then(({ trapFocus }) => {
+      const res = trapFocus(dialog as unknown as HTMLElement);
+      expect(currentTarget()).toBe(btn1);
+      expect(btn1.focusCalls).toBe(1);
+      res.destroy();
+    });
+    return action;
+  });
+
+  it("respects autofocus: false", async () => {
+    installFakeDocument();
+    (globalThis as Record<string, unknown>).HTMLElement = FakeNodeWithEvents;
+
+    const dialog = new FakeNodeWithEvents();
+    const btn1 = new FakeNodeWithEvents();
+    dialog.children = [btn1];
+
+    const { trapFocus } = await import("./focusTrap");
+    const res = trapFocus(dialog as unknown as HTMLElement, { autofocus: false });
+    expect(currentTarget()).toBeNull();
+    expect(btn1.focusCalls).toBe(0);
+    res.destroy();
+  });
+
+  it("prioritizes initial() when provided", async () => {
+    installFakeDocument();
+    (globalThis as Record<string, unknown>).HTMLElement = FakeNodeWithEvents;
+
+    const dialog = new FakeNodeWithEvents();
+    const btn1 = new FakeNodeWithEvents();
+    const input = new FakeNodeWithEvents();
+    dialog.children = [btn1, input];
+
+    const { trapFocus } = await import("./focusTrap");
+    const res = trapFocus(dialog as unknown as HTMLElement, {
+      initial: () => input as unknown as HTMLElement,
+    });
+    expect(currentTarget()).toBe(input);
+    expect(input.focusCalls).toBe(1);
+    expect(btn1.focusCalls).toBe(0);
+    res.destroy();
+  });
+
+  it("cycles focus on Tab key and restores previous element on destroy", async () => {
+    installFakeDocument();
+    (globalThis as Record<string, unknown>).HTMLElement = FakeNodeWithEvents;
+
+    const outside = new FakeNodeWithEvents();
+    (globalThis as Record<string, unknown>).document = { activeElement: outside };
+
+    const dialog = new FakeNodeWithEvents();
+    const btn1 = new FakeNodeWithEvents();
+    const btn2 = new FakeNodeWithEvents();
+    dialog.children = [btn1, btn2];
+
+    const { trapFocus } = await import("./focusTrap");
+    const action = trapFocus(dialog as unknown as HTMLElement);
+    expect(currentTarget()).toBe(btn1);
+
+    let defaultPrevented = false;
+    const tabEvent = {
+      type: "keydown",
+      key: "Tab",
+      shiftKey: false,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      preventDefault: () => {
+        defaultPrevented = true;
+      },
+    };
+    dialog.dispatchEvent(tabEvent);
+    expect(defaultPrevented).toBe(true);
+    expect(currentTarget()).toBe(btn2);
+
+    action.destroy();
+    expect(currentTarget()).toBe(outside);
+  });
+});

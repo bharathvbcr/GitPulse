@@ -2,6 +2,7 @@ use crate::analyzer::deps::severity_rank;
 use crate::engine::git_cli::{
     capture_command, git_text, run_command_in, validate_repo, CapturedOutput,
 };
+pub mod actions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -172,15 +173,34 @@ pub fn parse_github_remote_url(url: &str) -> Option<GitHubRepoRef> {
     split_owner_repo(host, path)
 }
 
+/// Hard upper bound for each parsed remote component (host, owner, name).
+///
+/// Real hosts and GitHub names are far shorter; this only stops a crafted
+/// megabyte-scale URL from flowing whole into endpoints, flags, and the UI.
+const MAX_REMOTE_COMPONENT_LEN: usize = 100;
+
+/// A remote component is argv-safe and endpoint-safe: no leading `-` (it
+/// would be re-parsed as a flag by `gh`'s CLI — e.g. `--repo -inbox/x`),
+/// no whitespace or control characters (they would corrupt argv, endpoint
+/// paths, built URLs, and error messages alike), and bounded length.
+fn is_valid_remote_component(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= MAX_REMOTE_COMPONENT_LEN
+        && !component.starts_with('-')
+        && !component
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn split_owner_repo(host: &str, path: &str) -> Option<GitHubRepoRef> {
     let host = host.split(':').next().unwrap_or(host).trim();
-    if host.is_empty() {
-        return None;
-    }
     let mut parts = path.split('/').filter(|p| !p.is_empty());
     let owner = parts.next()?;
     let name = parts.next()?;
-    if owner.is_empty() || name.is_empty() {
+    if !(is_valid_remote_component(host)
+        && is_valid_remote_component(owner)
+        && is_valid_remote_component(name))
+    {
         return None;
     }
     Some(GitHubRepoRef {
@@ -217,6 +237,11 @@ pub fn is_github_host(host: &str) -> bool {
 }
 
 /// `gh` flags that pin a call to this remote (`--repo`, and `--hostname` on GHES).
+///
+/// Only valid for the repo-context subcommands (`pr`, `issue`, `run`,
+/// `release`), which inherit `-R`. `gh api` has no `--repo` flag and fails
+/// outright when given one; use [`api_host_flags`] there instead — the REST
+/// endpoint path already scopes the request to the repository.
 pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
     let mut flags = vec!["--repo".to_string(), remote.slug()];
     if !remote.host.eq_ignore_ascii_case("github.com") {
@@ -482,21 +507,31 @@ struct GhRelease {
 
 const RELEASE_DISPLAY_LIMIT: usize = 50;
 
+/// Leading argv for `gh release list`, before the repo-pinning flags.
+///
+/// `url` must not be requested: it is not one of `gh release list`'s JSON
+/// fields, so asking for it fails the whole listing ("Unknown JSON field"),
+/// which used to degrade every release panel into an error. Release URLs are
+/// rebuilt from tag names by [`parse_release_list`] instead.
+fn release_list_leading_args(fetch_limit: &str) -> Vec<String> {
+    [
+        "release",
+        "list",
+        "--limit",
+        fetch_limit,
+        "--json",
+        "tagName,name,isDraft,isLatest,isPrerelease,publishedAt,createdAt",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect()
+}
+
 fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), String> {
     let fetch_limit = (RELEASE_DISPLAY_LIMIT + 1).to_string();
-    let stdout = run_gh(
-        remote,
-        &[
-            "release",
-            "list",
-            "--limit",
-            &fetch_limit,
-            "--json",
-            "tagName,name,isDraft,isLatest,isPrerelease,publishedAt,createdAt,url",
-        ],
-        Duration::from_secs(45),
-        None,
-    )?;
+    let leading = release_list_leading_args(&fetch_limit);
+    let refs: Vec<&str> = leading.iter().map(String::as_str).collect();
+    let stdout = run_gh(remote, &refs, Duration::from_secs(45), None)?;
     parse_release_list(&stdout, &remote.html_url(), RELEASE_DISPLAY_LIMIT)
 }
 
@@ -607,10 +642,24 @@ fn list_dependabot_alerts(
     parse_dependabot_alerts(&out.stdout_text(), ALERT_DISPLAY_LIMIT)
 }
 
-/// Runs one read-only `gh api` call pinned to this remote.
+/// Extra flags that pin a read-only `gh api` call to this remote's host.
+///
+/// Deliberately not [`gh_repo_flags`]: `gh api` rejects `--repo`
+/// ("unknown flag"), which used to fail every Dependabot fetch. No repo flag
+/// is needed because the REST endpoint path already names the repository;
+/// hostname pinning still matters for GitHub Enterprise remotes.
+fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
+    if remote.host.eq_ignore_ascii_case("github.com") {
+        Vec::new()
+    } else {
+        vec!["--hostname".to_string(), remote.host.clone()]
+    }
+}
+
+/// Runs one read-only `gh api` call pinned to this remote's host.
 fn capture_gh_api(remote: &GitHubRepoRef, endpoint: &str) -> Result<CapturedOutput, String> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
-    args.extend(gh_repo_flags(remote));
+    args.extend(api_host_flags(remote));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     capture_command("gh", &refs, None, Duration::from_secs(45), &[])
 }
@@ -645,17 +694,17 @@ fn parse_dependabot_alerts(
         .as_array()
         .ok_or("dependabot payload must be an array")?;
     let truncated = rows.len() > display_limit;
-    let mut alerts: Vec<DependabotAlertInfo> = rows
-        .iter()
-        .take(display_limit)
-        .map(alert_from_json)
-        .collect();
-    // Worst first; ties read in ascending alert order like the web UI does.
+    // Sort the full fetched window worst-first BEFORE capping, so the cap
+    // drops the least severe alerts instead of an arbitrary slice that can
+    // hide a critical advisory behind a run of lows. The fetched window is
+    // already bounded server-side by the per_page limit.
+    let mut alerts: Vec<DependabotAlertInfo> = rows.iter().map(alert_from_json).collect();
     alerts.sort_by(|a, b| {
         severity_rank(&a.severity)
             .cmp(&severity_rank(&b.severity))
             .then_with(|| a.number.cmp(&b.number))
     });
+    alerts.truncate(display_limit);
     Ok((alerts, truncated))
 }
 
@@ -871,36 +920,68 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
     }
 
     let html_url = remote.html_url();
-    let (issues, issues_truncated, issues_error) = match list_issues(&remote) {
-        Ok((issues, truncated)) => (issues, truncated, None),
-        Err(error) => (Vec::new(), false, Some(error)),
-    };
+    let (
+        (issues, issues_truncated, issues_error),
+        (releases, releases_truncated, releases_error),
+        pr_outcome,
+        (workflow_runs, runs_error),
+    ) = std::thread::scope(|s| {
+        let issues_handle = s.spawn(|| match list_issues(&remote) {
+            Ok((issues, truncated)) => (issues, truncated, None),
+            Err(error) => (Vec::new(), false, Some(error)),
+        });
+        let releases_handle = s.spawn(|| match list_releases(&remote) {
+            Ok((releases, truncated)) => (releases, truncated, None),
+            Err(error) => (Vec::new(), false, Some(error)),
+        });
+        let pr_handle = s.spawn(|| {
+            run_gh(
+                &remote,
+                &[
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--limit",
+                    "50",
+                    "--json",
+                    "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup",
+                ],
+                Duration::from_secs(45),
+                None,
+            )
+        });
+        let runs_handle = s.spawn(|| match list_workflow_runs(&remote) {
+            Ok(runs) => (runs, None),
+            Err(e) => (Vec::new(), Some(e)),
+        });
+
+        (
+            issues_handle
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), false, Some("thread panic".into()))),
+            releases_handle
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), false, Some("thread panic".into()))),
+            pr_handle.join().unwrap_or_else(|_| Err("thread panic".into())),
+            runs_handle
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), Some("thread panic".into()))),
+        )
+    });
+
     let mut warnings: Vec<String> = Vec::new();
     if let Some(ref issue_error) = issues_error {
         warnings.push(format!("Issue listing failed: {issue_error}"));
     }
-    let (releases, releases_truncated, releases_error) = match list_releases(&remote) {
-        Ok((releases, truncated)) => (releases, truncated, None),
-        Err(error) => (Vec::new(), false, Some(error)),
-    };
     if let Some(ref release_error) = releases_error {
         warnings.push(format!("Release listing failed: {release_error}"));
     }
-    match run_gh(
-        &remote,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "50",
-            "--json",
-            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup",
-        ],
-        Duration::from_secs(45),
-        None,
-    ) {
+    if let Some(ref run_error) = runs_error {
+        warnings.push(format!("Workflow run listing failed: {run_error}"));
+    }
+
+    match pr_outcome {
         Ok(stdout) => {
             // A parse failure no longer poisons the whole context: the
             // repository facts are still real, so degrade the PR section and
@@ -914,13 +995,6 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                     Vec::new()
                 }
             };
-            let (workflow_runs, runs_error) = match list_workflow_runs(&remote) {
-                Ok(runs) => (runs, None),
-                Err(e) => (Vec::new(), Some(e)),
-            };
-            if let Some(ref run_error) = runs_error {
-                warnings.push(format!("Workflow run listing failed: {run_error}"));
-            }
             GitHubContext {
                 available: true,
                 cli_present: true,
@@ -1049,6 +1123,54 @@ mod tests {
     fn test_parse_rejects_non_githubish() {
         assert!(parse_github_remote_url("https://example.com/not-a-repo").is_none());
         assert!(parse_github_remote_url("").is_none());
+    }
+
+    /// Regression (hardening pass): parsed components flow verbatim into
+    /// argv values (`--repo`, `--hostname`), REST endpoint paths, and built
+    /// URLs. A component shaped like a flag (`-inbox`) would be re-parsed by
+    /// gh's CLI as flags rather than values; whitespace/control characters
+    /// corrupt argv, endpoints, and error messages; unbounded components let
+    /// a crafted megabyte URL flow whole into the UI. All are refused at the
+    /// single parsing choke point.
+    #[test]
+    fn hostile_remote_components_are_refused_at_parse_time() {
+        // Flag-shaped owners/hosts must not survive into `--repo`/`--hostname`.
+        assert!(parse_github_remote_url("https://github.com/-acme/repo.git").is_none());
+        assert!(parse_github_remote_url("git@github.com:-acme/repo.git").is_none());
+        assert!(parse_github_remote_url("https://github.com/acme/-repo.git").is_none());
+        assert!(parse_github_remote_url("ssh://git@-evil.dev:22/acme/repo.git").is_none());
+        // Whitespace cannot reach argv or endpoint paths.
+        assert!(parse_github_remote_url("https://github.com/a b/c.git").is_none());
+        // Control characters (here \u{7} BEL) are refused everywhere.
+        assert!(parse_github_remote_url("https://github.com/a\u{7}b/c.git").is_none());
+        assert!(parse_github_remote_url("https://github.com/acme/re\u{1F}po.git").is_none());
+        // Unbounded components are capped.
+        let long_owner = "a".repeat(101);
+        assert!(
+            parse_github_remote_url(&format!("https://github.com/{long_owner}/repo.git")).is_none()
+        );
+        let long_host = format!("{}.ghe.com", "b".repeat(101));
+        assert!(parse_github_remote_url(&format!("https://{long_host}/acme/repo.git")).is_none());
+        // Ordinary names that merely contain dashes, dots, or underscores stay valid.
+        for url in [
+            "https://github.com/my-org/my.repo_name.git",
+            "git@github.com:acme-corp/Repo-Name_1.git",
+            "https://acme.ghe.com/o/r",
+        ] {
+            assert!(
+                parse_github_remote_url(url).is_some(),
+                "benign remote {url} must still parse"
+            );
+        }
+    }
+
+    /// The empty host that used to be special-cased is covered by the
+    /// component rule, and so is an owner-less or name-less path.
+    #[test]
+    fn degenerate_remote_shapes_stay_refused() {
+        assert!(split_owner_repo("", "a/b").is_none());
+        assert!(split_owner_repo("github.com", "").is_none());
+        assert!(split_owner_repo("github.com", "only-owner").is_none());
     }
 
     #[test]
@@ -1287,6 +1409,27 @@ mod tests {
         assert!(truncated);
     }
 
+    /// Regression (hardening pass): capping used to happen before sorting,
+    /// so a critical advisory arriving after the first `display_limit` rows
+    /// was dropped while less severe ones survived. The full fetched window
+    /// (already bounded by per_page) must be ranked, then capped.
+    #[test]
+    fn dependabot_cap_drops_least_severe_not_arbitrary_rows() {
+        let rows = vec![
+            dependabot_row(1, "low-a", "low"),
+            dependabot_row(2, "low-b", "low"),
+            dependabot_row(3, "critical-c", "critical"),
+        ];
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, truncated) = parse_dependabot_alerts(&text, 2).unwrap();
+        assert!(truncated);
+        assert_eq!(alerts.len(), 2);
+        // The critical alert beyond the cap survives; a low one is dropped.
+        assert_eq!(alerts[0].number, 3);
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[1].number, 1);
+    }
+
     #[test]
     fn release_list_parses_tags_drafts_and_generates_urls() {
         let json = br#"[
@@ -1386,6 +1529,63 @@ mod tests {
                 parse_release_list(garbage, "https://github.com/acme/gitpulse", 50).is_err(),
                 "release parse must fail loudly on {:?}",
                 String::from_utf8_lossy(garbage)
+            );
+        }
+    }
+
+    /// Regression (live-verified against gh 2.95): `gh api` has no `--repo`
+    /// flag, so appending [`gh_repo_flags`] to the Dependabot fetch failed
+    /// every call with "unknown flag". Hostname pinning stays, and only for
+    /// non-github.com hosts.
+    #[test]
+    fn gh_api_calls_are_hostname_pinned_and_never_carry_repo_flag() {
+        let dot_com = GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "gitpulse".into(),
+        };
+        assert!(api_host_flags(&dot_com).is_empty());
+
+        let ghes = GitHubRepoRef {
+            host: "acme.ghe.com".into(),
+            owner: "acme".into(),
+            name: "gitpulse".into(),
+        };
+        assert_eq!(
+            api_host_flags(&ghes),
+            vec!["--hostname".to_string(), "acme.ghe.com".to_string()]
+        );
+        assert!(!api_host_flags(&ghes).contains(&"--repo".to_string()));
+    }
+
+    /// Regression (live-verified against gh 2.95): `url` is not a
+    /// `gh release list` JSON field; requesting it failed the whole listing
+    /// with "Unknown JSON field", degrading every release panel into an
+    /// error. The field set must stay within gh's documented fields; URLs
+    /// are rebuilt by `parse_release_list` from tags instead.
+    #[test]
+    fn release_listing_requests_only_supported_json_fields() {
+        const SUPPORTED: &[&str] = &[
+            "createdAt",
+            "isDraft",
+            "isImmutable",
+            "isLatest",
+            "isPrerelease",
+            "name",
+            "publishedAt",
+            "tagName",
+        ];
+        let args = release_list_leading_args("51");
+        let json_pos = args
+            .iter()
+            .position(|arg| arg == "--json")
+            .expect("--json flag present");
+        let fields: Vec<&str> = args[json_pos + 1].split(',').collect();
+        assert!(!fields.is_empty(), "at least one JSON field is requested");
+        for field in fields {
+            assert!(
+                SUPPORTED.contains(&field),
+                "field '{field}' is not a gh release list JSON field; fetching would fail"
             );
         }
     }

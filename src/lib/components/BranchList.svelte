@@ -768,7 +768,7 @@
 {#if menu}
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div
-    use:portal
+    use:portal={"body"}
     class="fixed z-50 min-w-44 gp-menu gp-pop text-xs text-textPrimary"
     style="left: {Math.min(menu.x, window.innerWidth - 200)}px; top: {Math.min(menu.y, window.innerHeight - 280)}px"
     role="menu"

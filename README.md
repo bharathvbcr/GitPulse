@@ -13,12 +13,15 @@ It runs entirely on your machine; GitHub features go through your locally instal
 - **Commit history graph** — canvas-rendered graph; lanes, branch folding, and ref decoration
   are solved on the Rust side.
 - **Diff viewer** — file, commit, and range diffs with word-level intra-line highlighting
-  and image diffs. Selective patch staging is backend-complete (`cmd_stage_selective_patch`);
-  UI wiring is pending.
+  and image diffs. Patches can be staged or unstaged selectively straight from the diff view
+  (`cmd_stage_selective_patch`).
 - **Staging & commits** — stage/unstage files, commit with amend, AI-assisted commit messages.
 - **Conflict resolution** — parse and resolve merge conflicts in a dedicated editor.
 - **Blame** — per-line authorship viewer.
-- **Coverage** — discovers coverage artifacts in the repository and shows per-file line coverage.
+- **Coverage** — discovers coverage artifacts in the repository and shows per-file line coverage,
+  split per language (e.g. Rust vs TypeScript) with per-language totals
+  (LCOV, Cobertura, Go cover, Istanbul JSON, JaCoCo, and Clover reports are matched per language tree,
+  including artifacts under nested cargo workspaces like `src-tauri/target/llvm-cov/`).
 - **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
   objects, reflogs, LFS, submodule stores), build-output and cache directories across
   ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
@@ -27,11 +30,14 @@ It runs entirely on your machine; GitHub features go through your locally instal
   a per-repository snapshot locally, so growth is visible over time ("+180 MB this week") via a
   trend sparkline and deltas. Walks are budgeted and never follow symlinks; a hostile or huge
   repository degrades into an honest "partial scan" instead of a hang.
-- **Dependency health** — npm manifest analysis with audit/vulnerability and outdated-package reports,
-  plus open GitHub Dependabot alerts (via `gh`) unified in the Health view. Copy the whole report
-  as text, or send it through the MANVI harness's local model for a remediation plan (advisory
-  only — nothing is applied automatically).
+- **Dependency health** — multi-ecosystem vulnerability and staleness scanning: `npm audit`/`outdated`,
+  `cargo-audit`, `pip-audit` (pinned requirements files), `govulncheck`, `composer audit`, and
+  `bundler-audit`, each used when its CLI is present, plus open GitHub Dependabot alerts (via `gh`)
+  unified in the Health view. Copy the whole report as text, or send it through the configured
+  local model for a remediation plan (advisory only — nothing is applied automatically).
 - **Stacked branches** — visualize and manage stacked branches (`stack` view).
+- **Worktrees** — linked-worktree panel in the sidebar: list with HEAD, branch, dirty-file
+  counts, and prunable state; add (with branch and start point), remove, and lock/unlock.
 - **Reflog** — browse the reference log.
 - **Policy-gated mutations & local AI** — an optional [MANVI](#the-manvi-harness) harness sidecar
   vets mutating git actions and answers AI prompts against a local model. Everything degrades
@@ -43,8 +49,20 @@ It runs entirely on your machine; GitHub features go through your locally instal
   the agent activity journal (copyable as a log). The header badge is a status indicator that
   leads here. The OS View menu's numbered tab shortcuts stop at Reflog; reach MANVI through the
   header tab bar's More menu or the command palette ("Open MANVI View").
-- **GitHub integration** — PR context for the current branch, one-click PR checkout, workflow run status,
-  and live GitHub release monitoring via the `gh` CLI; GitHub Enterprise hosts are supported via remote-URL detection.
+- **GitHub integration** — repo-wide open-PR list with one-click PR checkout, workflow run status,
+  Dependabot alerts, issue creation, and live release monitoring, all through the locally installed
+  `gh` CLI. Remote-URL detection recognizes github.com, `*.github.com`, and `*.ghe.com`;
+  self-hosted GHES on arbitrary domains is intentionally not matched.
+- **GitHub CI/CD actions** — the GitHub view lists the repository's Actions workflows
+  (`gh workflow list`), dispatches any active one against a chosen branch or tag
+  (`workflow_dispatch`), and re-runs or cancels recent runs in place — every action policy-gated
+  like the rest of GitPulse's mutations. The repository's own release workflow is dispatchable:
+  `.github/workflows/release.yml` accepts a manual `tag` input as well as tag pushes.
+- **CI:local** — one button runs this repository's CI pipeline on the current machine before you
+  push: the frontend checks and Rust checks of `.github/workflows/ci.yml`, planned from the
+  manifests actually present (`package.json`, `Cargo.toml`), executed sequentially with hard
+  per-step timeouts, capped output tails, stop-on-first-failure, and honest passed/failed/skipped
+  accounting.
 
 ## Requirements
 
@@ -63,7 +81,9 @@ npm run tauri dev    # builds the Rust backend and opens the app window
 ```
 
 The dev scripts resolve a free Vite port automatically (preferred: 5173, falling back through
-nearby ports). Set `GITPULSE_DEV_PORT=<port>` to pin it — Tauri's `devUrl` is rewritten to match.
+5174–5193). Set `GITPULSE_DEV_PORT=<port>` to pin it — Tauri's `devUrl` is rewritten to match.
+Nuance: under `tauri dev`, a busy pinned port that can't be reclaimed autoports past the pin;
+the bare Vite wrapper (`npm run dev`) fails loudly instead.
 
 ### Production build
 
@@ -92,7 +112,7 @@ and Windows. Clippy treats warnings as errors; `svelte-check` reports warnings w
 ## Architecture
 
 Two codebases meet at a single IPC seam — every `cmd_*` handler in the Rust registry
-(`src-tauri/src/lib.rs:33`) is checked against every frontend `invoke()` call site by
+(`src-tauri/src/lib.rs:34`) is checked against every frontend `invoke()` call site by
 `npm run check:ipc`, which fails on either direction of drift: a UI command the backend never
 registered (guaranteed runtime crash) or a registered handler no view ever calls. Handlers that
 are intentionally Rust-only carry a justification in the checker's allowlist:
@@ -105,14 +125,17 @@ lib/stores/      workspace state       graph/      lane solving, folding
 lib/repos/       tab model, persist    diff/       diffs + conflicts
 lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
                                                  deps health
-         ▲ │                            stack/      stacked branches
-         └─┴── invoke() ──► cmd_* ──►   storage/    disk usage + history
-                                        github/ watcher/ harness/ ai/ desktop/
+         ▲ │                           stack/      stacked branches
+         └─┴── invoke() ──► cmd_* ──►  storage/    disk usage + history
+                                       ops.rs      MANVI cleanup/review planning
+                                       github/ watcher/ harness/ ai/ desktop/
 ```
 
 - **No router.** Screens are members of the `ViewTab` union (`src/lib/repos/persist.ts`);
-  `src/App.svelte` maps each to one component. Adding a screen touches three places: the union,
-  the header button, and the `{#if}` branch.
+  `src/App.svelte` maps each to one component. Adding a screen touches three places: the union +
+  `VIEW_TABS` in `persist.ts`, one entry in the view registry (`src/lib/views/viewRegistry.ts`)
+  — from which the header tabs, native menu, and command palette all derive — and the render
+  branch in `App.svelte`. TypeScript's `Record<ViewTab, …>` on the registry rejects anything less.
 - **State** lives in classic Svelte stores built by factory functions with injectable
   dependencies (`createRepoStore(deps)`, …), which keeps them unit-testable without Tauri.
   Components use Svelte 5 runes (`$state`, `$derived`, `$effect`) for local UI state.
@@ -129,15 +152,19 @@ lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
 `src-tauri/src/harness/` embeds the MANVI coding-agent harness as a `manvi serve` sidecar
 speaking NDJSON over stdio. It provides two things:
 
-1. **Policy verdicts** — every mutating git command passes through a command gate; verdicts
-   (allow/deny/warn) are recorded centrally by `runMutating()` in the repo store and surfaced in
-   the UI badge.
+1. **Policy verdicts** — mutating git commands pass through a command gate (low-risk index,
+   stash, and clone operations excepted). Verdicts land on a five-step ladder — allowed, demoted,
+   warned, blocked, unchecked; unknown actions fail closed to blocked. They are recorded centrally
+   by `runMutating()` in the repo store and surfaced in the header badge.
 2. **Local AI** — commit messages, commit explanations, and branch-name suggestions answered by a
    locally configured model, with token budgets planned by the harness.
 
-With no `manvi` binary installed, all features still work: mutating commands proceed, but their
-verdicts are recorded as `unchecked` — explicitly distinct from an allow — and AI features report
-themselves unavailable. Set `GITPULSE_MANVI_BIN` to point at a specific binary.
+Degradation is asymmetric by design. With no `manvi` binary installed, mutating commands proceed
+but their verdicts are recorded as `unchecked` — explicitly distinct from an allow. With the
+harness installed but wedged or unreachable, mutations are refused rather than proceeding
+unchecked. Local AI does not require the harness: it answers against whatever local model server
+is configured; the harness only plans token budgets when available. Set `GITPULSE_MANVI_BIN` to
+point at a specific binary.
 
 The **MANVI view** groups the highest-frequency repository operations without bypassing their
 canonical owners, and hosts the harness and local-AI controls in a second pane. Branch cleanup is
@@ -156,18 +183,28 @@ src/
   app.css                 Design tokens, scrollbars, animation helpers
   lib/
     components/           One component per view plus chrome (Sidebar, CommandPalette, …)
-    stores/               repoStore (workspace + mutations), graph/filter/theme/density/harness
+    stores/               repoStore (workspace + mutations), graph/filter/theme/density/
+                          harness/interface/modal stores
+    views/                Single view catalog (VIEW_REGISTRY): nav, menus, palette derive from it
     repos/                Tab model, persistence schema, path identity
     canvas/  motion/      Commit-graph rendering and paint scheduling
-    diff/ filter/         Word-level diffing; commit query language
-    async/guard.ts        Cancellation guards for stale IPC responses
-    desktop/              Native menu/event wiring, window title sync
+    diff/                 Word-level diffing, patch building, conflict save
+    filter/               Commit query language (parse + memoized filtering)
+    branches/ rebase/     Branch grouping/flattening; interactive-rebase planning
+    ops/  agents/         Types for the Rust ops planner; agent activity journal model
     coverage/ health/     Formatting and types for the analyzers' output
-scripts/                  Dev-port resolution wrappers around vite/tauri CLIs
+    storage/ github/      Storage-scan formatting/history; shared GitHub types
+    async/                Cancellation guards and debouncing for stale IPC responses
+    desktop/              Native menu/event wiring, clipboard, window title sync
+    ui/                   Focus trap, z-index layers, error formatting, webview shortcuts
+    keyboard/ dom/        IME-safe shortcuts; portals, tooltips, virtual windows
+    language/             Language-bar statistics
+scripts/                  Dev-port wrappers around vite/tauri CLIs; IPC contract checker
 src-tauri/
   src/lib.rs              Command registry, watcher, native menu
   src/commands/mod.rs     Definitions of the cmd_* IPC handlers
   src/engine/…            Subsystems (see Architecture)
+  src/ops.rs              Read-only MANVI ops planning: cleanup plans, commit review, releases
   tests/                  Rust integration suites
 .github/workflows/        CI, coverage, release
 ```

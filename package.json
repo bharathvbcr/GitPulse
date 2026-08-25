@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.node.json --noEmit",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
+    "check:types": "node scripts/check-coverage-types.mjs",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "tauri": "node scripts/tauri.mjs"

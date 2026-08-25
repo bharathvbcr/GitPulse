@@ -133,7 +133,8 @@ export function trapFocus(node: HTMLElement, options: TrapFocusOptions = {}) {
   let config = options;
 
   const placeInitialFocus = () => {
-    if (!config.autofocus) return;
+    const shouldAutofocus = config.autofocus ?? true;
+    if (!shouldAutofocus) return;
     const preferred = config.initial?.() ?? null;
     if (isHtmlElement(preferred)) {
       preferred.focus();

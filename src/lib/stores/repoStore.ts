@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
+import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import type { BranchInfo, TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
@@ -715,6 +716,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const store = {
     subscribe,
     setError: (error: string | null) => {
+      // Every user-facing error funnels through here; mirror it into the
+      // diagnostics log so the banner's dismissal never loses it.
+      if (error) diagnostics.error("repo", error);
       const session = activeSession();
       if (session) {
         putSession({ ...session, error });

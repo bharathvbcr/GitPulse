@@ -352,3 +352,59 @@ fn concurrent_scans_agree() {
     }
     assert_eq!(baseline, Some((2, 1)));
 }
+
+#[test]
+fn xml_parsers_handle_newline_formatted_tags_and_spaced_attributes() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    // Cobertura with newlines inside tag definitions and spaces around '='
+    let cobertura_xml = r#"<?xml version="1.0"?>
+    <coverage>
+      <packages>
+        <package name="my_pkg">
+          <classes>
+            <class
+              name="lib"
+              filename = "src/lib.rs">
+              <lines>
+                <line
+                  number = "1"
+                  hits = "5" />
+              </lines>
+            </class>
+          </classes>
+        </package>
+      </packages>
+    </coverage>"#;
+    write(repo.path(), "cobertura.xml", cobertura_xml);
+
+    let report = scan(repo.path());
+    assert_eq!(report.overall.lines_found, 1);
+    assert_eq!(report.overall.lines_hit, 1);
+    assert_eq!(report.overall.percentage, 100.0);
+}
+
+#[test]
+fn istanbul_parser_handles_float_hit_counts_in_line_map() {
+    let repo = git_repo();
+    write(repo.path(), "src/index.ts", "export const x = 1;\n");
+    let istanbul_json = r#"{
+      "src/index.ts": {
+        "path": "src/index.ts",
+        "statementMap": {},
+        "s": {},
+        "b": {},
+        "f": {},
+        "l": {
+          "1": 1.0,
+          "2": 0.0
+        }
+      }
+    }"#;
+    write(repo.path(), "coverage/coverage-final.json", istanbul_json);
+
+    let report = scan(repo.path());
+    assert_eq!(report.overall.lines_found, 2);
+    assert_eq!(report.overall.lines_hit, 1);
+    assert_eq!(report.overall.percentage, 50.0);
+}

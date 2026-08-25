@@ -14,6 +14,7 @@
   } from "../views/viewNav";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
+  import { shouldDismissOverlay } from "../ui/dismiss";
 
   let { conflictedCount = 0 }: { conflictedCount?: number } = $props();
 
@@ -59,15 +60,19 @@
     return "text-textMuted hover:text-textPrimary";
   }
 
-  function handlePointerDown(event: MouseEvent) {
+  function handlePointerDown(event: PointerEvent) {
     if (!openGroup) return;
-    const el =
-      event.target instanceof Element
-        ? event.target
-        : event.target instanceof Node
-          ? event.target.parentElement
-          : null;
-    if (el?.closest("[data-view-nav]")) return;
+    // The panel and any header menu trigger count as "inside".
+    // Marking the whole tablist would swallow Graph/Diff/Resolve clicks
+    // and header padding, leaving the menu stuck open.
+    if (
+      !shouldDismissOverlay(
+        event.target,
+        "[data-view-nav-menu], [data-view-nav-trigger]",
+      )
+    ) {
+      return;
+    }
     closeMenu();
   }
 
@@ -79,14 +84,15 @@
   }
 
   onMount(() => {
-    window.addEventListener("mousedown", handlePointerDown);
+    // Capture so a stopPropagation on a pane cannot trap the menu open.
+    // Do not close on arbitrary nested scroll: focusing the trigger inside
+    // `.gp-header-scroll` can fire a scroll event and dismiss on open.
+    window.addEventListener("pointerdown", handlePointerDown, true);
     window.addEventListener("keydown", handleKey);
-    window.addEventListener("scroll", closeMenu, true);
     window.addEventListener("resize", closeMenu);
     return () => {
-      window.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("pointerdown", handlePointerDown, true);
       window.removeEventListener("keydown", handleKey);
-      window.removeEventListener("scroll", closeMenu, true);
       window.removeEventListener("resize", closeMenu);
     };
   });
@@ -100,7 +106,7 @@
   });
 </script>
 
-<div bind:this={scroller} class="flex items-center gap-1.5 shrink-0" data-view-nav role="tablist" aria-label="Views">
+<div bind:this={scroller} class="flex items-center gap-1.5 shrink-0" role="tablist" aria-label="Views">
   {#each VIEW_NAV as group (group.id)}
     {#if group.kind === "tabs"}
       <div class="gp-segmented">
@@ -126,6 +132,7 @@
           type="button"
           aria-haspopup="menu"
           aria-expanded={openGroup === group.id}
+          data-view-nav-trigger={group.id}
           data-active-view={active ? "true" : "false"}
           onclick={(event) => toggleMenu(group, event)}
           class="gp-btn !py-1 flex items-center gap-1 {menuClass(active)}"
@@ -140,8 +147,8 @@
 
 {#if openMenu && menuPos}
   <div
-    use:portal
-    data-view-nav
+    use:portal={"body"}
+    data-view-nav-menu
     role="menu"
     class="fixed min-w-40 gp-menu gp-pop text-xs text-textPrimary"
     style="left: {menuPos.x}px; top: {menuPos.y}px; z-index: {LAYERS.MENU}"

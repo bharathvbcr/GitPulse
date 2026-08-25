@@ -30,6 +30,26 @@ impl RepoFileWatcher {
     /// deeper edits still reach us through the index/HEAD writes they cause
     /// inside `.git`. Both `notify` backends in use here support the mode:
     /// inotify natively, FSEvents via its own filtering.
+    ///
+    /// # Known hazard (macOS): sequential registrations are not atomic
+    ///
+    /// The sequential `watcher.watch(..)` calls below are lossy on FSEvents.
+    /// notify's fsevent backend implements every `watch()` call as
+    /// `stop()` + append-path + `run()` (`fsevent.rs`, `watch_inner`), and
+    /// `run()` recreates the whole `FSEventStream` with a fresh
+    /// `kFSEventStreamEventIdSinceNow` epoch. Changes landing between two
+    /// successive `watch()` calls therefore fall into no epoch and are
+    /// permanently missed, and changes racing the first stream installation
+    /// are equally unreliable. Until this is fixed, treat the startup of a
+    /// watch as lossy on macOS (the app-level periodic refresh papers over
+    /// missed changes).
+    ///
+    /// Recommended future fix: register all paths atomically instead of
+    /// sequentially — notify 8 exposes multi-path registration via
+    /// `Watcher::paths_mut()` plus a single `PathsMut::commit()`, which lets
+    /// the complete git-dir / common-dir / worktree-root set be accumulated
+    /// before the FSEvents stream is created once, eliminating the
+    /// per-call stop/recreate window entirely.
     pub fn watch_repo(
         git_dir: &Path,
         worktree_root: Option<&Path>,

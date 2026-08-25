@@ -2,9 +2,9 @@ name: Code Coverage
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, develop]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -69,11 +69,19 @@ jobs:
           cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --summary-only > rust-coverage-summary.txt
           cat rust-coverage-summary.txt
 
+      - name: Verify Rust LCOV Was Produced
+        run: |
+          test -f lcov.info || {
+            echo "lcov.info missing — cargo llvm-cov did not emit lcov";
+            exit 1;
+          }
+
       - name: Upload Rust Coverage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-lcov
           path: lcov.info
+          if-no-files-found: error
 
       - name: Report Coverage Summary
         run: |

@@ -7,6 +7,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
   import { LAYERS } from "../ui/layers";
+  import { shouldDismissOverlay } from "../ui/dismiss";
   import {
     ChevronDown,
     Pin,
@@ -93,21 +94,21 @@
     }
   }
 
-  function handlePointerDown(e: MouseEvent) {
-    if (menu && !(e.target instanceof Node && (e.target as HTMLElement).closest?.("[data-repo-menu]"))) {
+  function handlePointerDown(e: PointerEvent) {
+    if (menu && shouldDismissOverlay(e.target, "[data-repo-menu]")) {
       closeMenu();
     }
-    if (recentsOpen && !(e.target instanceof Node && (e.target as HTMLElement).closest?.("[data-recents-menu]"))) {
+    if (recentsOpen && shouldDismissOverlay(e.target, "[data-recents-menu]")) {
       recentsOpen = false;
     }
   }
 
   onMount(() => {
     window.addEventListener("keydown", handleKey);
-    window.addEventListener("mousedown", handlePointerDown);
+    window.addEventListener("pointerdown", handlePointerDown, true);
     return () => {
       window.removeEventListener("keydown", handleKey);
-      window.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("pointerdown", handlePointerDown, true);
     };
   });
 
@@ -309,7 +310,7 @@
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}
   {#if tab}
     <div
-      use:portal
+      use:portal={"body"}
       data-repo-menu
       class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
       style="left: {Math.min(menu.x, window.innerWidth - 200)}px; top: {Math.min(menu.y, window.innerHeight - 260)}px; z-index: {LAYERS.MENU}"

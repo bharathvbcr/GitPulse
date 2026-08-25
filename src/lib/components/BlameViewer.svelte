@@ -4,7 +4,7 @@
   import { FileCode, Search } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
-  import type { FileCoverage } from "../coverage/types";
+  import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
   import { shortHash } from "../format";
   import { formatError } from "../ui/formatError";
   import VirtualList from "./VirtualList.svelte";
@@ -34,27 +34,18 @@
     isLoading = true;
     errorMsg = null;
     try {
-      const next = await invoke<BlameLine[]>("cmd_get_file_blame", {
-        repoPath: repo,
-        filePath: path,
-      });
-      if (!guard.isLive()) return;
-      blameLines = next;
-      try {
-        const coverage = await invoke<FileCoverage>("cmd_get_file_coverage", {
+      const [next, hits] = await Promise.all([
+        invoke<BlameLine[]>("cmd_get_file_blame", {
           repoPath: repo,
           filePath: path,
-        });
-        if (!guard.isLive()) return;
-        const hits = new Map<number, number>();
-        for (const line of coverage.lines) {
-          hits.set(line.line_no, line.hits);
-        }
-        coverageHits = hits;
-      } catch {
-        if (!guard.isLive()) return;
-        coverageHits = new Map();
-      }
+        }),
+        fetchFileCoverage(repo, path)
+          .then((coverage) => buildHitMap(coverage.lines))
+          .catch(() => new Map<number, number>()),
+      ]);
+      if (!guard.isLive()) return;
+      blameLines = next;
+      coverageHits = hits;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       errorMsg = formatError(err);
@@ -167,7 +158,7 @@
               >{shortHash(line.commit_id)}</button>
               <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
               <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
-              <span class="w-8 px-1 text-right text-[10px] tabular-nums shrink-0 {coverageHits.get(line.line_no) === undefined ? 'text-transparent' : (coverageHits.get(line.line_no) ?? 0) > 0 ? 'text-emerald-400/80' : 'text-red-400/80'}">{coverageHits.get(line.line_no) ?? "·"}</span>
+              <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
               <span class="px-3 whitespace-pre overflow-hidden text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
             </div>
           {/if}

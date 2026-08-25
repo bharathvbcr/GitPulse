@@ -62,7 +62,10 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   cmd_policy_check_command: "policy gate reached via store mutations; direct endpoint reserved",
 });
 
-const SKIP_DIRS = new Set(["node_modules", "dist", "coverage", ".git", ".svelte-kit", "target"]);
+// "coverage" is deliberately absent: src/lib/coverage holds production invoke
+// sites, while vitest's coverage/ output lives at the repo root, which is
+// never a scan root.
+const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".svelte-kit", "target"]);
 // Tests mock invoke rather than exercise the real seam; production reachability
 // is the invariant this checker enforces, so test files are not callers.
 const NON_PRODUCTION_FILE = /(^|[\\/])__tests__([\\/])|\.(test|spec)\.[cm]?[jt]s$|\.d\.ts$/i;

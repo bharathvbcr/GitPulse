@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod analyzer;
+pub mod ci_local;
 pub mod commands;
 pub mod desktop;
 pub mod diff;
@@ -88,6 +89,11 @@ pub fn run() {
             cmd_github_dependabot_alerts,
             cmd_github_create_issue,
             cmd_github_checkout_pr,
+            cmd_github_workflows,
+            cmd_github_trigger_workflow,
+            cmd_github_rerun_run,
+            cmd_github_cancel_run,
+            cmd_ci_local,
             cmd_watch_repo,
             cmd_unwatch_repo,
             cmd_resolve_repo,

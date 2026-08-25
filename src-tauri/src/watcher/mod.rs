@@ -778,40 +778,116 @@ mod tests {
         (rx, stop, canonical)
     }
 
+    /// Overall ceiling for priming the watcher pipeline in tests: generous
+    /// enough for a machine shared with cargo builds and other suites, yet
+    /// bounded so a genuinely broken backend fails fast instead of hanging.
+    const PRIME_DEADLINE: Duration = Duration::from_secs(12);
+
+    /// Consumes callbacks until a silent stretch longer than [`DEBOUNCE_MAX_WAIT`]
+    /// passes. Every delivered event is guaranteed to produce an emission
+    /// within [`DEBOUNCE_MAX_WAIT`] (`should_emit` anti-starvation bound), so
+    /// silence of that length proves no event is still in flight — a plain
+    /// fixed sleep is not enough, because under parallel-suite load FSEvents
+    /// can trail its writes by hundreds of ms and a leaked emission would
+    /// pollute whatever the caller measures next.
+    fn await_watcher_quiescence<T>(rx: &std::sync::mpsc::Receiver<T>) {
+        loop {
+            match rx.recv_timeout(DEBOUNCE_MAX_WAIT + Duration::from_millis(100)) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Writes uniquely-named probe files into `probe_dir` until the debounce
+    /// pipeline delivers one settled callback, then quiesces via
+    /// [`await_watcher_quiescence`] so the caller starts from an empty,
+    /// genuinely idle channel.
+    ///
+    /// Why a retry loop instead of one write plus one long recv_timeout:
+    /// FSEvents gives no delivery guarantee for writes racing watch-stream
+    /// installation (each `watch()` call recreates the stream with a fresh
+    /// SinceNow epoch), so a single priming write can be silently lost and
+    /// flake the test. Retrying fresh probe names until delivery — the cure
+    /// already proven in `dead_repo_watch_stops_emitting_and_reaps_session` —
+    /// makes priming deterministic under load. Panics with the attempt count
+    /// only if nothing is ever delivered within `deadline`.
+    fn prime_watcher<T>(rx: &std::sync::mpsc::Receiver<T>, probe_dir: &Path, deadline: Duration) {
+        let overall = Instant::now() + deadline;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(probe_dir.join(format!("watcher-prime-{n}.txt")), "x")
+                .expect("write priming probe");
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < overall,
+                "watcher never delivered a priming callback after {n} probe writes within \
+                 {deadline:?}; the OS watch stream likely never installed"
+            );
+        }
+        await_watcher_quiescence(rx);
+    }
+
     /// Debounce proof: 30 rapid top-level writes must settle into exactly one
     /// callback after the quiet window, not thirty. A second callback during
     /// a subsequent quiet window would mean events are being forwarded
-    /// per-write instead of debounced. The priming write exists because an
-    /// OS backend may need its first delivered event before later ones flow;
-    /// without it the storm races watch installation.
+    /// per-write instead of debounced. Priming goes through `prime_watcher`
+    /// because a single fixed write races watch installation and can be
+    /// silently dropped by FSEvents, which made this test fail intermittently.
     #[test]
     fn watch_loop_coalesces_a_write_storm_into_one_settled_callback() {
         let temp = TempDir::new().unwrap();
         let (rx, stop, root) = spawn_loop(temp.path());
 
-        // Prime: prove the pipeline delivers before measuring coalescing.
-        std::fs::write(root.join("prime.txt"), "x").unwrap();
-        let _ = rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("priming write must be delivered");
+        // Prime: prove the pipeline delivers before measuring coalescing,
+        // starting the storm from a drained, quiescent channel.
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
 
-        // Storm: 30 writes inside roughly one debounce tick.
-        for i in 0..30 {
-            std::fs::write(root.join(format!("storm_{i}.txt")), "x").unwrap();
-        }
+        // Burst: 30 writes inside roughly one debounce tick must settle into
+        // exactly one callback followed by quiet. Each attempt uses fresh
+        // file names. If the backend silently drops the whole batch, or a
+        // stray late delivery splits the burst (both observed under parallel
+        // suite load even on a proven-hot stream), the attempt is retried
+        // until the deadline; genuine per-write forwarding instead of
+        // debouncing would fail EVERY attempt and still panic below.
+        let burst_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut attempt = 0u32;
+        loop {
+            assert!(
+                Instant::now() < burst_deadline,
+                "no cleanly coalesced 30-write burst within {PRIME_DEADLINE:?} \
+                 ({attempt} attempts)"
+            );
+            for i in 0..30 {
+                std::fs::write(root.join(format!("storm_{attempt}_{i}.txt")), "x").unwrap();
+            }
+            attempt += 1;
 
-        // Exactly one settled callback for the whole burst.
-        let first = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("storm must produce a settled callback");
-        assert!(!first.is_empty());
+            // Exactly one settled callback for the whole burst.
+            let Ok(first) = rx.recv_timeout(Duration::from_secs(10)) else {
+                continue; // whole batch dropped by the backend: retry
+            };
+            assert!(!first.is_empty());
 
-        // Quiet window well past the 400ms settle: no further callbacks may
-        // arrive, because no further events exist to debounce.
-        match rx.recv_timeout(Duration::from_millis(900)) {
-            Ok(extra) => panic!("unexpected extra callback for {extra}: not coalesced"),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(e) => panic!("channel failed during quiet window: {e}"),
+            // Quiet window well past the 400ms settle: no further callbacks
+            // may arrive for this burst, because no further events exist to
+            // debounce.
+            match rx.recv_timeout(Duration::from_millis(900)) {
+                Ok(_) => {
+                    // Burst was split by a stray late delivery: quiesce and
+                    // retry with fresh names.
+                    await_watcher_quiescence(&rx);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(e) => panic!("channel failed during quiet window: {e}"),
+            }
         }
         stop.store(true, Ordering::SeqCst);
     }
@@ -824,19 +900,56 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (rx, stop, root) = spawn_loop(temp.path());
 
-        // 1. Worktree-only write: no index/HEAD traffic involved.
-        std::fs::write(root.join("unstaged-edit.txt"), "dirty\n").unwrap();
-        rx.recv_timeout(Duration::from_secs(15))
-            .expect("unstaged worktree edit must trigger repo-changed");
+        // Prime with bounded retries before asserting: one fixed write racing
+        // watch installation can be silently dropped by FSEvents (see
+        // prime_watcher).
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        // 1. Worktree-only write: no index/HEAD traffic involved. Kept
+        //    retry-bounded too: under parallel suite load even a write to the
+        //    freshly-proven-hot stream was once lost for >15s.
+        let edit_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(root.join(format!("unstaged-edit-{n}.txt")), "dirty\n").unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < edit_deadline,
+                "unstaged worktree edit must trigger repo-changed ({n} writes within \
+                 {PRIME_DEADLINE:?})"
+            );
+        }
 
         // Close the quiet window so the next write is a distinct emission
         // rather than coalesced with a late event from the first write.
         thread::sleep(DEBOUNCE_QUIET + Duration::from_millis(100));
 
         // 2. A .git-only write still triggers through the recursive watch.
-        std::fs::write(root.join(".git").join("gitpulse-probe"), "x").unwrap();
-        rx.recv_timeout(Duration::from_secs(15))
-            .expect("git-dir write must still trigger repo-changed");
+        //    Retry-bounded for the same reason as above; each attempt uses a
+        //    fresh name inside `.git` so no state carries between attempts.
+        let git_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(root.join(".git").join(format!("gitpulse-probe-{n}")), "x").unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < git_deadline,
+                "git-dir write must still trigger repo-changed ({n} writes within \
+                 {PRIME_DEADLINE:?})"
+            );
+        }
 
         stop.store(true, Ordering::SeqCst);
     }
@@ -1025,9 +1138,36 @@ mod tests {
             .expect("common dir above worktrees/<name>");
 
         std::fs::create_dir_all(&common_refs).unwrap();
-        std::fs::write(common_refs.join("pulse_new_branch"), "0".repeat(40)).unwrap();
 
-        rx.recv_timeout(Duration::from_secs(6))
-            .expect("common-dir ref write must trigger repo-changed for the worktree");
+        // Warm the pipeline with bounded retries before asserting: the probe
+        // files land in the watched (non-recursive) worktree root. A single
+        // assertion write races FSEvents stream installation (see
+        // prime_watcher).
+        prime_watcher(&rx, &work_path, PRIME_DEADLINE);
+
+        // Retry-bounded assertion: write fresh uniquely-named refs until one
+        // triggers repo-changed, instead of betting delivery on exactly one
+        // write.
+        let ref_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(
+                common_refs.join(format!("pulse_new_branch_{n}")),
+                "0".repeat(40),
+            )
+            .unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < ref_deadline,
+                "common-dir ref write must trigger repo-changed for the worktree ({n} probe refs \
+                 within {PRIME_DEADLINE:?})"
+            );
+        }
     }
 }

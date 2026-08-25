@@ -27,5 +27,30 @@ describe("platform", () => {
       });
     }
   });
+
+  it("applies platform class to document element", async () => {
+    const { applyPlatformClass } = await import("./platform");
+    // No document environment
+    expect(() => applyPlatformClass()).not.toThrow();
+
+    // With document
+    const classes = new Set<string>();
+    (globalThis as Record<string, unknown>).document = {
+      documentElement: {
+        classList: {
+          toggle: (cls: string, force: boolean) => {
+            if (force) classes.add(cls);
+            else classes.delete(cls);
+          },
+        },
+      },
+    };
+    try {
+      applyPlatformClass();
+      expect(classes.has("macos")).toBe(isMacOS());
+    } finally {
+      delete (globalThis as Record<string, unknown>).document;
+    }
+  });
 });
 

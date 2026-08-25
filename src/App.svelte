@@ -10,6 +10,7 @@
   import { displayName } from "./lib/repos/paths";
   import { formatError } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
+  import { diagnostics } from "./lib/diagnostics/diagnostics";
   import {
     subscribeNativeShell,
     syncRecentMenu,
@@ -38,6 +39,7 @@
   import GitHubPanel from "./lib/components/GitHubPanel.svelte";
   import ManviOpsPanel from "./lib/components/ManviOpsPanel.svelte";
   import ReflogViewer from "./lib/components/ReflogViewer.svelte";
+  import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -46,18 +48,30 @@
     FolderOpen,
     Download,
     Clock,
+    Bug,
   } from "lucide-svelte";
   import { interfaceStore } from "./lib/stores/interfaceStore";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
   let isSettingsModalOpen = $state(false);
+  let isDiagnosticsOpen = $state(false);
   let dropActive = $state(false);
   const macos = isMacOS();
   /** Last repo/revision(/path-query) the graph actually fetched for. */
   let lastGraphKey: string | null = null;
 
   let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
+
+  /** Total occurrences across recorded errors, for the header badge. */
+  let diagnosticErrorCount = $derived(
+    $diagnostics.reduce((total, entry) => (entry.severity === "error" ? total + entry.count : total), 0),
+  );
+
+  function reportPaneCrash(error: unknown) {
+    // Deferred out of the render pass: boundary failures happen mid-render.
+    setTimeout(() => diagnostics.error("pane-crash", error), 0);
+  }
 
   async function openFromExternal(path: string) {
     await repoStore.openRepo(path);
@@ -74,6 +88,12 @@
       if (disposed) unsub();
       else unsubs.push(unsub);
     };
+    // The command palette opens Diagnostics through this window event.
+    const openDiagnostics = () => {
+      isDiagnosticsOpen = true;
+    };
+    window.addEventListener("gitpulse:diagnostics", openDiagnostics);
+    track(() => window.removeEventListener("gitpulse:diagnostics", openDiagnostics));
     void (async () => {
       // A failed native-shell subscription must not abort startup: it unwinds
       // its own listeners before rethrowing, and skipping the restore below
@@ -181,13 +201,14 @@
   });
 </script>
 
-{#snippet paneFailed(error: unknown, reset: () => void)}
-  <!-- Minimal crash isolation: a broken pane never takes down the window. -->
-  <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatError(error)}>
-    <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
-    <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
-  </div>
-{/snippet}
+  {#snippet paneFailed(error: unknown, reset: () => void)}
+    <!-- Minimal crash isolation: a broken pane never takes down the window. -->
+    {reportPaneCrash(error)}
+    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatError(error)}>
+      <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
+      <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
+    </div>
+  {/snippet}
 
 <div class="h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative">
   <!-- Top App Navigation Bar -->
@@ -230,6 +251,22 @@
 
     <!-- Right Actions -->
     <div class="flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+      <button
+        onclick={() => (isDiagnosticsOpen = true)}
+        title="Diagnostics — errors, warnings and crash logs"
+        aria-label="Open Diagnostics"
+        class="gp-icon-btn relative"
+      >
+        <Bug size={14} />
+        {#if diagnosticErrorCount > 0}
+          <span
+            class="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-rose-500 text-white text-[9px] leading-[15px] font-semibold text-center"
+            title="{diagnosticErrorCount} error{diagnosticErrorCount === 1 ? '' : 's'} recorded"
+          >
+            {diagnosticErrorCount > 99 ? "99+" : diagnosticErrorCount}
+          </span>
+        {/if}
+      </button>
       {#if $repoStore.currentPath}
         <button
           onclick={() => repoStore.refresh()}
@@ -374,6 +411,7 @@
   <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
   <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
   <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
+  <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
   <PromptModal />
   <CommandPalette />
   <Tooltip />

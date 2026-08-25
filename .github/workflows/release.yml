@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual dispatch (GitHub UI or GitPulse's workflow trigger) requires an
+  # explicit tag, since a branch ref has no tag name to release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.1.2)'
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -99,7 +107,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: 'GitPulse v__VERSION__'
           releaseBody: 'High-performance native Git desktop client release built with Rust & Svelte 5.'
           releaseDraft: true

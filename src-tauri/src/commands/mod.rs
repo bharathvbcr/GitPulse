@@ -885,6 +885,84 @@ pub async fn cmd_github_checkout_pr(
     .await
 }
 
+/// The repository's Actions workflows (`gh workflow list`). A separate,
+/// lazily-loaded command rather than another section of
+/// [`cmd_github_context`]: that call already serializes four gh round trips,
+/// and the workflows list is only needed on its own panel.
+#[tauri::command(async)]
+pub async fn cmd_github_workflows(repo_path: String) -> crate::github::actions::WorkflowsReport {
+    off_thread(move || Ok::<_, String>(crate::github::actions::load_workflows_report(&repo_path)))
+        .await
+        .unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
+}
+
+/// Dispatches a workflow (`gh workflow run <selector> --ref <ref>`), after
+/// the command gate has judged the exact line. The selector is the workflow's
+/// file path from the listing; only dispatchable workflows succeed upstream.
+#[tauri::command(async)]
+pub async fn cmd_github_trigger_workflow(
+    repo_path: String,
+    workflow: String,
+    git_ref: String,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let argv_owned =
+            crate::github::actions::trigger_workflow_argv(&remote, &workflow, &git_ref)?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output =
+            crate::github::actions::trigger_workflow(&repo_path, &remote, &workflow, &git_ref)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Re-runs a workflow run (`gh run rerun <id>`), gated like every action.
+#[tauri::command(async)]
+pub async fn cmd_github_rerun_run(
+    repo_path: String,
+    run_id: u64,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let argv_owned = crate::github::actions::rerun_run_argv(&remote, run_id)?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::github::actions::rerun_workflow_run(&repo_path, &remote, run_id)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Cancels an in-flight workflow run (`gh run cancel <id>`), gated.
+#[tauri::command(async)]
+pub async fn cmd_github_cancel_run(
+    repo_path: String,
+    run_id: u64,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let argv_owned = crate::github::actions::cancel_run_argv(&remote, run_id)?;
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::github::actions::cancel_workflow_run(&repo_path, &remote, run_id)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// CI:local — runs the repository's CI pipeline on this machine. Build/test
+/// commands are not git mutations, so they follow the deps-scanner precedent
+/// and skip the harness command gate; see `ci_local` for the reasoning.
+#[tauri::command(async)]
+pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, String> {
+    off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, String> {
     off_thread(move || resolve_repo(&repo_path)).await

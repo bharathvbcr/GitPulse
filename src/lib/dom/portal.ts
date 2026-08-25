@@ -14,16 +14,22 @@ export function resolvePortalTarget(target: PortalTarget): HTMLElement | null {
 
 /**
  * Svelte action: relocate a node to a high-level container (document.body by
- * default) on mount and restore its original position on destroy.
+ * default) on mount, and unmount it on destroy.
  *
  * Viewport-fixed popovers must live outside paint-contained subtrees such as
  * `.gp-pane`: `contain: paint` turns those elements into containing blocks for
  * `position: fixed` descendants (clipping the popover to the pane) and into
  * stacking contexts (trapping the popover below sibling panes regardless of
  * its own z-index). Rendering through the body sidesteps both.
+ *
+ * Destroy must *remove* the node, not put it back at the original parent.
+ * Svelte 5's `destroy_effect()` walks `nodes.start..end` at the original
+ * location *before* action teardown; a portaled node is no longer in that
+ * range, so the walk misses it. Re-parenting to home would resurrect a
+ * leftover overlay after the component has already closed it — a dropdown
+ * that cannot dismiss, because closed state no longer owns the node.
  */
 export function portal(node: HTMLElement, target: PortalTarget = "body") {
-  const home = node.parentNode;
   const attach = (next: PortalTarget) => {
     const destination = resolvePortalTarget(next);
     if (destination && destination !== node.parentElement) {
@@ -37,10 +43,7 @@ export function portal(node: HTMLElement, target: PortalTarget = "body") {
       attach(target);
     },
     destroy() {
-      // Put the node back before Svelte tears it down so removal bookkeeping
-      // operates on the tree shape it recorded at mount time.
-      if (home && home.contains(node)) return;
-      home?.appendChild(node);
+      node.remove();
     },
   };
 }

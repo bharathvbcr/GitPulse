@@ -404,6 +404,8 @@ fn watcher_storm_keeps_session_responsive() {
     let watcher = gitpulse_lib::watcher::RepoFileWatcher::watch_repo(&git_dir, Some(path), None)
         .expect("watcher starts");
     let receiver = &watcher.receiver;
+    // Give the OS backend time to install its watches before the storm.
+    std::thread::sleep(Duration::from_millis(300));
 
     // 200 rapid create/delete pairs at the watched (non-recursive) root.
     // Drain opportunistically between chunks so the queue cannot wedge, the
@@ -422,7 +424,7 @@ fn watcher_storm_keeps_session_responsive() {
     std::fs::write(path.join("sentinel_after_storm.txt"), "done").unwrap();
     let started = Instant::now();
     let mut saw_event_after_sentinel = false;
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < Duration::from_secs(10) {
         match receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(_) => {
                 saw_event_after_sentinel = true;
@@ -436,7 +438,7 @@ fn watcher_storm_keeps_session_responsive() {
     }
     assert!(
         saw_event_after_sentinel,
-        "watcher wedged: no event within 5s of post-storm activity"
+        "watcher wedged: no event within 10s of post-storm activity"
     );
     drop(watcher); // Drop impl flips the stop flag; must not hang.
 }

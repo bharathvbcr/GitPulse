@@ -12,7 +12,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X } from "lucide-svelte";
+  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug } from "lucide-svelte";
 
   let isOpen = $state(false);
   let query = $state("");
@@ -88,6 +88,12 @@
     ...viewCommands,
     { id: "stash", label: "Stash Working Tree", icon: Layers, action: () => repoStore.stashSave() },
     { id: "stash_pop", label: "Pop Stash", icon: Layers, action: () => repoStore.stashPop() },
+    {
+      id: "diagnostics",
+      label: "Open Diagnostics",
+      icon: Bug,
+      action: () => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics")),
+    },
   ];
 
   let repoCommands = $derived([

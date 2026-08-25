@@ -186,6 +186,11 @@
       notice = outcome.ok
         ? `${kind === "pull" ? "Pull" : "Push"} completed${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`
         : outcome.error ?? `${kind} failed`;
+    } catch (error) {
+      // runMutating resolves invoke failures itself; this keeps an unexpected
+      // throw (verdict rendering, store internals) visible in the panel
+      // instead of console-only, matching scanBranches/reportIssue.
+      notice = formatError(error);
     } finally {
       busy = null;
     }
@@ -206,8 +211,14 @@
       notice = `Issue reported${outcome.policy ? ` — ${verdictLabel(outcome.policy)}` : ""}.`;
       issueTitle = "";
       issueBody = "";
-      if (outcome.output) await openExternal(outcome.output);
+      try {
+        if (outcome.output) await openExternal(outcome.output);
+      } catch {
+        // The issue exists even if opening it fails; the URL is in the journal.
+      }
       await loadIssues();
+    } catch (error) {
+      notice = formatError(error);
     } finally {
       busy = null;
     }
@@ -229,6 +240,8 @@
       notice = `Pushed ${outcome.output?.tag ?? releaseTag} to ${outcome.output?.remote ?? "the remote"}; the release workflow can now build the app.`;
       releaseConfirmed = false;
       await loadIssues();
+    } catch (error) {
+      notice = formatError(error);
     } finally {
       busy = null;
     }
