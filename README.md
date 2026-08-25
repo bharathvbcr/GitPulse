@@ -12,12 +12,21 @@ It runs entirely on your machine; GitHub features go through your locally instal
   and native OS menu integration. Workspace state persists across launches.
 - **Commit history graph** — canvas-rendered graph; lanes, branch folding, and ref decoration
   are solved on the Rust side.
-- **Diff viewer** — file, commit, and range diffs with word-level intra-line highlighting,
-  image diffs, and selective patch staging.
+- **Diff viewer** — file, commit, and range diffs with word-level intra-line highlighting
+  and image diffs. Selective patch staging is backend-complete (`cmd_stage_selective_patch`);
+  UI wiring is pending.
 - **Staging & commits** — stage/unstage files, commit with amend, AI-assisted commit messages.
 - **Conflict resolution** — parse and resolve merge conflicts in a dedicated editor.
 - **Blame** — per-line authorship viewer.
 - **Coverage** — discovers coverage artifacts in the repository and shows per-file line coverage.
+- **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
+  objects, reflogs, LFS, submodule stores), build-output and cache directories across
+  ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
+  still holding committed files), oversized working-tree files, linked-worktree sizes, and
+  merged-stale branch weight that links into MANVI's cleanup plan. Every completed scan records
+  a per-repository snapshot locally, so growth is visible over time ("+180 MB this week") via a
+  trend sparkline and deltas. Walks are budgeted and never follow symlinks; a hostile or huge
+  repository degrades into an honest "partial scan" instead of a hang.
 - **Dependency health** — npm manifest analysis with audit/vulnerability and outdated-package reports,
   plus open GitHub Dependabot alerts (via `gh`) unified in the Health view. Copy the whole report
   as text, or send it through the MANVI harness's local model for a remediation plan (advisory
@@ -29,12 +38,13 @@ It runs entirely on your machine; GitHub features go through your locally instal
   gracefully when it is not installed.
 - **MANVI view** — one surface for everything MANVI: guarded pull/push shortcuts, conservative
   merged-branch cleanup plans, outgoing commit-message review with explicit coverage counts,
-  bounded GitHub issue monitoring and reporting, release-tag publication with clean/synchronized/
+  bounded GitHub issue & release monitoring and reporting, release-tag publication with clean/synchronized/
   default-branch preflights, plus the harness connection, local model servers, branch naming, and
   the agent activity journal (copyable as a log). The header badge is a status indicator that
-  leads here.
-- **GitHub integration** — PR context for the current branch and one-click PR checkout via the
-  `gh` CLI; GitHub Enterprise hosts are supported via remote-URL detection.
+  leads here. The OS View menu's numbered tab shortcuts stop at Reflog; reach MANVI through the
+  header tab bar's More menu or the command palette ("Open MANVI View").
+- **GitHub integration** — PR context for the current branch, one-click PR checkout, workflow run status,
+  and live GitHub release monitoring via the `gh` CLI; GitHub Enterprise hosts are supported via remote-URL detection.
 
 ## Requirements
 
@@ -69,6 +79,7 @@ npm run tauri build  # bundles installers for the current platform
 | `npm run tauri dev` | Full desktop app with hot reload |
 | `npm run build` | Frontend production bundle (`vite build`) |
 | `npm run check` | Type-check the frontend (`svelte-check`) and node-side config/scripts (`tsc`) |
+| `npm run check:ipc` | Verify the Rust `cmd_*` registry and every frontend `invoke()` call site stay in lockstep |
 | `npm test` | Frontend unit tests (Vitest) |
 | `npm run coverage` | Vitest with v8 coverage |
 | `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | Rust format check |
@@ -80,8 +91,11 @@ and Windows. Clippy treats warnings as errors; `svelte-check` reports warnings w
 
 ## Architecture
 
-Two codebases meet at a single IPC seam — 72 registered `cmd_*` command handlers
-(`src-tauri/src/lib.rs:33`):
+Two codebases meet at a single IPC seam — every `cmd_*` handler in the Rust registry
+(`src-tauri/src/lib.rs:33`) is checked against every frontend `invoke()` call site by
+`npm run check:ipc`, which fails on either direction of drift: a UI command the backend never
+registered (guaranteed runtime crash) or a registered handler no view ever calls. Handlers that
+are intentionally Rust-only carry a justification in the checker's allowlist:
 
 ```
 Svelte 5 + TS frontend                 Rust backend
@@ -91,8 +105,9 @@ lib/stores/      workspace state       graph/      lane solving, folding
 lib/repos/       tab model, persist    diff/       diffs + conflicts
 lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
                                                  deps health
-        ▲ │                            stack/      stacked branches
-        └─┴── invoke() ──► cmd_* ──►   github/ watcher/ harness/ ai/ desktop/
+         ▲ │                            stack/      stacked branches
+         └─┴── invoke() ──► cmd_* ──►   storage/    disk usage + history
+                                        github/ watcher/ harness/ ai/ desktop/
 ```
 
 - **No router.** Screens are members of the `ViewTab` union (`src/lib/repos/persist.ts`);

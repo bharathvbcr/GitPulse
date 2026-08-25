@@ -5,6 +5,7 @@
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatDate, shortHash } from "../format";
+  import { formatError } from "../ui/formatError";
 
   interface ReflogEntry {
     index: number;
@@ -37,7 +38,7 @@
       entries = next;
     } catch (err) {
       if (!guard.isLive()) return;
-      errorMsg = String(err);
+      errorMsg = formatError(err);
       entries = [];
     } finally {
       if (guard.isLive()) loading = false;
@@ -102,7 +103,9 @@
           {#each entries as entry}
             <tr
               class="border-t border-border/30 hover:bg-surfaceHover/60 cursor-pointer transition-colors"
-              onclick={() => repoStore.selectCommitDiff(entry.commit_id)}
+              onclick={() => {
+                repoStore.inspectCommitInHistory(entry.commit_id);
+              }}
             >
               <td class="px-3 py-1.5 font-mono text-accent rounded-l-lg">{entry.selector}</td>
               <td class="px-3 py-1.5 font-mono">{shortHash(entry.commit_id, 8)}</td>

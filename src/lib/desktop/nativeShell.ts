@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { formatError } from "../ui/formatError";
 import { isTauri } from "../platform";
 import {
   dispatchNativeMenu,
@@ -72,7 +73,7 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
           const root = await resolveGitRoot(dropped);
           handlers.openRepo(root);
         } catch (err) {
-          handlers.openError(String(err));
+          handlers.openError(formatError(err));
         }
       }),
     );

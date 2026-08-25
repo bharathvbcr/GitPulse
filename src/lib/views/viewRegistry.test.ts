@@ -43,6 +43,7 @@ describe("viewRegistry", () => {
       "blame",
       "coverage",
       "health",
+      "storage",
       "stack",
       "manvi",
       "github",

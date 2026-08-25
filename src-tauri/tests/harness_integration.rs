@@ -2,8 +2,9 @@
 //!
 //! The policy tests need the MANVI binary. When it is absent they report a skip
 //! on stderr rather than passing quietly — a check that could not run must not
-//! look like one that ran and passed. Set `GITPULSE_REQUIRE_MANVI=1` (as CI
-//! should) to turn its absence into a failure.
+//! look like one that ran and passed. These suites are opt-in locally and are
+//! NOT wired into any workflow; set `GITPULSE_REQUIRE_MANVI=1` yourself to turn
+//! the binary's absence into a hard failure.
 
 use std::process::Command;
 
@@ -129,7 +130,13 @@ fn harness_refuses_the_commands_it_exists_to_refuse() {
     let root = repo_path(&dir);
 
     let force_push = check_command(&root, "git push --force origin main");
-    assert!(force_push.checked);
+    // `PolicyVerdict::unchecked` swallows the cause into a string; surface it,
+    // or a failure here says only "false is not true".
+    assert!(
+        force_push.checked,
+        "the gate did not run [{}]: {}",
+        force_push.detail_code, force_push.detail
+    );
     assert_eq!(force_push.status, PolicyStatus::Blocked);
     assert_eq!(force_push.rule, "command.force_push");
     assert_eq!(force_push.severity, "hard");
@@ -193,4 +200,57 @@ fn the_sidecar_never_writes_into_the_users_repository() {
             .replace(".gitignore", "?? .gitignore"),
         "the working tree changed in some way other than the .gitignore this test wrote"
     );
+}
+
+/// Regression: the gate must survive concurrency, because it is used
+/// concurrently.
+///
+/// The process-wide sidecar slot is held across a whole round trip, and `call`
+/// used to `try_lock` it exactly once. A second gated action overlapping the
+/// first therefore got `HarnessError::Busy`, which `check_command` renders as
+/// an *unchecked* verdict — and an unchecked verdict does not block. A
+/// force-push issued while any other gated action was in flight went through
+/// the gate that exists to refuse it, recorded merely as "unguarded".
+///
+/// This is not a hypothetical: it is why this suite was red. Two integration
+/// tests share one test binary and one slot, and cargo runs them in parallel.
+#[test]
+fn overlapping_gated_actions_are_all_actually_checked() {
+    if !manvi_available("overlapping_gated_actions_are_all_actually_checked") {
+        return;
+    }
+    let dir = fixture();
+    let root = repo_path(&dir);
+
+    const THREADS: usize = 6;
+    const ROUNDS: usize = 4;
+
+    let verdicts: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = root.as_str();
+                scope.spawn(move || {
+                    (0..ROUNDS)
+                        .map(|_| check_command(root, "git push --force origin main"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("gate thread"))
+            .collect()
+    });
+
+    assert_eq!(verdicts.len(), THREADS * ROUNDS);
+    for verdict in &verdicts {
+        assert!(
+            verdict.checked,
+            "a concurrent force-push went unchecked [{}]: {}",
+            verdict.detail_code, verdict.detail
+        );
+        // The whole point: contention must not soften the refusal.
+        assert_eq!(verdict.status, PolicyStatus::Blocked);
+        assert_eq!(verdict.rule, "command.force_push");
+    }
 }

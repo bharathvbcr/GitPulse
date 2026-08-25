@@ -120,4 +120,37 @@ describe("graphStore generation", () => {
 
     expect(get(store).selectedCommitDetails?.summary).toBe("B");
   });
+
+  it("keeps an evicted repo's in-flight load dead after pruning its ordering state", async () => {
+    // evict() deletes the generation/selection entries for the path. That is
+    // only safe because tokens come from store-wide monotonic counters: a
+    // per-path counter reset to 1 would hand the fresh load the same token
+    // the orphaned fetch holds, and the stale payload would win.
+    const gates = [deferred<ReturnType<typeof payload>>(), deferred<ReturnType<typeof payload>>()];
+    let graphCall = 0;
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") {
+        graphCall += 1;
+        if (graphCall === 1) return gates[0].promise as never;
+        return payload("fresh") as never;
+      }
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, summary: "d", changed_files: [], total_additions: 0, total_deletions: 0 } as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/prune");
+    const staleLoad = store.loadGraph("/r/prune");
+
+    store.evict("/r/prune");
+    store.showRepo("/r/prune");
+    await store.loadGraph("/r/prune");
+    expect(get(store).rows[0]?.id).toBe("fresh");
+
+    // The pre-evict fetch resolves last; it must stay dead.
+    gates[0].resolve(payload("stale"));
+    await staleLoad;
+    expect(get(store).rows[0]?.id).toBe("fresh");
+  });
 });

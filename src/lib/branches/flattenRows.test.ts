@@ -119,8 +119,33 @@ describe("flattenRows", () => {
     const rows = flattenRows(sections, () => false);
     const keys = rows.map((r) => r.key);
     expect(new Set(keys).size).toBe(keys.length);
-    const branchKeys = keys.filter((k) => k.includes("/dup"));
-    expect(new Set(branchKeys).size).toBe(branchKeys.length);
+    expect(keys.filter((k) => k.startsWith("b:local:")).sort()).toEqual([
+      "b:local:bugfix/dup",
+      "b:local:dup",
+      "b:local:feat/dup",
+    ]);
+    expect(keys.filter((k) => k.startsWith("b:remote:"))).toEqual(["b:remote:origin:origin/feat/dup"]);
+    expect(keys.filter((k) => k.startsWith("f:"))).toEqual(["f:local/bugfix", "f:local/feat", "f:remote:origin/feat"]);
+    expect(keys.filter((k) => k.startsWith("s:"))).toEqual(["s:local", "s:remote:origin"]);
+  });
+
+  it("prefixes pinned and tag keys without a uniqueness scan", () => {
+    const sections = groupBranches(
+      [branch({ name: "feat/auth" }), branch({ name: "main" })],
+      [{ name: "v1.0.0", commit_id: "aaa" }],
+      new Set(["feat/auth"])
+    );
+    const rows = flattenRows(sections, () => false);
+    expect(rows.map((r) => r.key)).toEqual([
+      "s:pinned",
+      "b:pinned:feat/auth",
+      "s:local",
+      "f:local/feat",
+      "b:local:feat/auth",
+      "b:local:main",
+      "s:tags",
+      "t:v1.0.0",
+    ]);
   });
 
   it("handles filtered sections with empty branch lists", () => {

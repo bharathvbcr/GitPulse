@@ -28,10 +28,26 @@ pub struct BezierGeometryCalculator {
 impl BezierGeometryCalculator {
     pub fn new(lane_width: f64, row_height: f64, x_offset: f64, y_offset: f64) -> Self {
         Self {
-            lane_width: if lane_width > 0.0 { lane_width } else { 16.0 },
-            row_height: if row_height > 0.0 { row_height } else { 24.0 },
-            x_offset: if x_offset >= 0.0 { x_offset } else { 12.0 },
-            y_offset: if y_offset >= 0.0 { y_offset } else { 12.0 },
+            lane_width: if lane_width.is_finite() && lane_width > 0.0 {
+                lane_width
+            } else {
+                16.0
+            },
+            row_height: if row_height.is_finite() && row_height > 0.0 {
+                row_height
+            } else {
+                24.0
+            },
+            x_offset: if x_offset.is_finite() && x_offset >= 0.0 {
+                x_offset
+            } else {
+                12.0
+            },
+            y_offset: if y_offset.is_finite() && y_offset >= 0.0 {
+                y_offset
+            } else {
+                12.0
+            },
         }
     }
 
@@ -98,5 +114,19 @@ mod tests {
         assert_eq!(curve.cp2.x, curve.end.x);
         assert_eq!(curve.cp1.y, 30.0); // 15 + 15
         assert_eq!(curve.cp2.y, 30.0); // 45 - 15
+    }
+
+    #[test]
+    fn non_finite_geometry_falls_back_to_finite_defaults() {
+        let calc = BezierGeometryCalculator::new(f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0);
+        assert!(calc.lane_width.is_finite() && calc.lane_width > 0.0);
+        assert!(calc.row_height.is_finite() && calc.row_height > 0.0);
+        assert!(calc.x_offset.is_finite() && calc.x_offset >= 0.0);
+        assert!(calc.y_offset.is_finite() && calc.y_offset >= 0.0);
+        let curve = calc.calculate_connector(0, 0, 1, 1, 0, false);
+        assert!(curve.start.x.is_finite() && curve.start.y.is_finite());
+        assert!(curve.cp1.x.is_finite() && curve.cp1.y.is_finite());
+        assert!(curve.cp2.x.is_finite() && curve.cp2.y.is_finite());
+        assert!(curve.end.x.is_finite() && curve.end.y.is_finite());
     }
 }

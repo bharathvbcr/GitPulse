@@ -46,6 +46,15 @@ pub struct FilePatch {
 pub struct PatchBuilder;
 
 impl PatchBuilder {
+    pub fn has_selected_lines(file_patch: &FilePatch) -> bool {
+        file_patch.hunks.iter().any(|h| {
+            h.lines.iter().any(|l| {
+                l.is_selected
+                    && matches!(l.line_type, DiffLineType::Addition | DiffLineType::Deletion)
+            })
+        })
+    }
+
     /// Validates a [`FilePatch`] before its contents are interpolated into
     /// unified-diff headers and hunks.
     ///
@@ -55,9 +64,12 @@ impl PatchBuilder {
     /// traversal segments, backslashes, NUL bytes and embedded newlines are
     /// therefore rejected here — once, at the single owner of the rules.
     pub fn validate_file_patch(file_patch: &FilePatch) -> Result<(), String> {
+        if !Self::has_selected_lines(file_patch) {
+            return Err("No lines selected in patch".to_string());
+        }
         for (role, path) in [
-            ("&old_path", &file_patch.old_path),
-            ("&new_path", &file_patch.new_path),
+            ("old_path", &file_patch.old_path),
+            ("new_path", &file_patch.new_path),
         ] {
             Self::validate_patch_path(role, path)?;
         }
@@ -81,6 +93,9 @@ impl PatchBuilder {
     fn validate_patch_path(role: &str, path: &str) -> Result<(), String> {
         if path.is_empty() {
             return Err(format!("diff {} path is empty", role));
+        }
+        if path == "/dev/null" {
+            return Ok(());
         }
         if path.contains('\0') {
             return Err(format!("diff {} path contains a NUL byte", role));
@@ -119,8 +134,8 @@ impl PatchBuilder {
     pub fn build_selective_patch(file_patch: &FilePatch, is_staging: bool) -> String {
         let mut patch_buffer = String::new();
 
-        patch_buffer.push_str(&format!("--- a/{}\n", file_patch.old_path));
-        patch_buffer.push_str(&format!("+++ b/{}\n", file_patch.new_path));
+        patch_buffer.push_str(&unified_path_header("---", "a", &file_patch.old_path));
+        patch_buffer.push_str(&unified_path_header("+++", "b", &file_patch.new_path));
 
         for hunk in &file_patch.hunks {
             let mut hunk_lines_out = Vec::new();
@@ -190,6 +205,15 @@ impl PatchBuilder {
         }
 
         patch_buffer
+    }
+}
+
+/// `--- a/path` / `+++ b/path`, except `/dev/null` which git expects unprefixed.
+fn unified_path_header(marker: &str, prefix: &str, path: &str) -> String {
+    if path == "/dev/null" {
+        format!("{marker} /dev/null\n")
+    } else {
+        format!("{marker} {prefix}/{path}\n")
     }
 }
 
@@ -316,7 +340,14 @@ mod tests {
                     } else {
                         "ok.rs".to_string()
                     },
-                    hunks: Vec::new(),
+                    hunks: vec![UnifiedDiffHunk {
+                        old_start: 1,
+                        old_lines: 0,
+                        new_start: 1,
+                        new_lines: 1,
+                        header: String::new(),
+                        lines: vec![line(DiffLineType::Addition, "ok", true)],
+                    }],
                 };
                 let err = PatchBuilder::validate_file_patch(&fp)
                     .expect_err(&format!("path {path:?} (role {role}) must be rejected"));
@@ -387,5 +418,73 @@ mod tests {
         assert!(patch.contains("+fn b() {}"));
         assert!(patch.contains("-fn gone() {}"));
         assert!(patch.contains(" fn stays() {}"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_selection_before_emitting_headers() {
+        let fp = FilePatch {
+            old_path: "a.txt".to_string(),
+            new_path: "a.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![line(DiffLineType::Addition, "x", false)],
+            }],
+        };
+        let err = PatchBuilder::validate_file_patch(&fp).expect_err("empty selection");
+        assert!(
+            err.to_lowercase().contains("no lines selected"),
+            "got: {err}"
+        );
+        let built = PatchBuilder::build_selective_patch(&fp, true);
+        assert!(
+            !built.contains("@@"),
+            "empty selection must not emit a hunk that git apply would reject"
+        );
+    }
+
+    #[test]
+    fn validate_allows_dev_null_for_new_and_deleted_files() {
+        let created = FilePatch {
+            old_path: "/dev/null".to_string(),
+            new_path: "fresh.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![line(DiffLineType::Addition, "hello", true)],
+            }],
+        };
+        PatchBuilder::validate_file_patch(&created).expect("new-file /dev/null must be allowed");
+        let patch = PatchBuilder::build_selective_patch(&created, true);
+        assert!(patch.contains("--- /dev/null\n"), "got:\n{patch}");
+        assert!(patch.contains("+++ b/fresh.txt\n"), "got:\n{patch}");
+        assert!(
+            !patch.contains("--- a//dev/null"),
+            "must not prefix /dev/null"
+        );
+
+        let deleted = FilePatch {
+            old_path: "gone.txt".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 0,
+                new_lines: 0,
+                header: String::new(),
+                lines: vec![line(DiffLineType::Deletion, "bye", true)],
+            }],
+        };
+        PatchBuilder::validate_file_patch(&deleted)
+            .expect("deleted-file /dev/null must be allowed");
+        let patch = PatchBuilder::build_selective_patch(&deleted, true);
+        assert!(patch.contains("--- a/gone.txt\n"), "got:\n{patch}");
+        assert!(patch.contains("+++ /dev/null\n"), "got:\n{patch}");
     }
 }

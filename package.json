@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc -p tsconfig.node.json --noEmit",
+    "check:ipc": "node scripts/check-ipc-contract.mjs",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "tauri": "node scripts/tauri.mjs"

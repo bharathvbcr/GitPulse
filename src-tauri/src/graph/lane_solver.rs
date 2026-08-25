@@ -102,6 +102,9 @@ impl LaneSolver {
 
     /// Solves the visual DAG layout for a topologically sorted list of commits.
     pub fn solve(&mut self, commits: &[RawCommitNode]) -> Vec<VisualCommitRow> {
+        self.active_columns.clear();
+        self.column_colors.clear();
+        self.next_color_index = 0;
         let mut visual_rows = Vec::with_capacity(commits.len());
         let commit_to_row_idx: HashMap<String, usize> = commits
             .iter()

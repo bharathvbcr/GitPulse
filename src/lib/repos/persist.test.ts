@@ -113,6 +113,24 @@ describe("persist workspace", () => {
     // stays consistent rather than half-updated.
     expect(loadPersistedWorkspace(storage, opts).tabs).toEqual([]);
   });
+
+  /// Regression (audit M12): the save outcome must be observable, so the
+  /// store's dedup marker only advances past payloads that actually landed.
+  it("reports success so a failed write can be retried", () => {
+    const first = openTab(emptyWorkspace(), "/r/retry", opts);
+    if (!first.ok) throw new Error("open");
+    const persisted = workspaceToPersisted(first.workspace, {});
+
+    const failing = memoryStorage();
+    const baseSetItem = failing.setItem;
+    failing.setItem = (key, value) => {
+      if (key === STORAGE_KEY_WORKSPACE) throw new Error("quota");
+      baseSetItem(key, value);
+    };
+    expect(savePersistedWorkspace(failing, persisted)).toBe(false);
+
+    expect(savePersistedWorkspace(memoryStorage(), persisted)).toBe(true);
+  });
 });
 
 describe("persist workspace migrations", () => {

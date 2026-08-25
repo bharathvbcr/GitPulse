@@ -4,6 +4,8 @@
   import { densityStore } from "../stores/densityStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { trapFocus } from "../ui/focusTrap";
+  import { LAYERS } from "../ui/layers";
   import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck } from "lucide-svelte";
 
   let {
@@ -41,11 +43,13 @@
     onclick={onClose}
     onkeydown={(e) => e.key === "Escape" && onClose?.()}
     transition:fade={fadeParams()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 select-none gp-gpu"
+    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
+    style="z-index: {LAYERS.MODAL}"
   >
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
+      use:trapFocus
       onclick={(e) => e.stopPropagation()}
       in:scale={scaleParams()}
       out:scale={scaleParams()}

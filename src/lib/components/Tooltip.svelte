@@ -1,14 +1,18 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { tipTextOf } from "../dom/tipText";
+  import { LAYERS } from "../ui/layers";
 
   /**
    * Global styled tooltip — mounted once, upgrades every `title=` in the app.
    *
    * Rather than migrating dozens of call sites to a custom attribute, this
    * intercepts hovers/focuses on anything carrying a `title`, moves the text
-   * into a `data-tip-text` attribute (which suppresses the OS-native bubble),
-   * and renders it as a themed pill instead. Svelte re-applying `title` on a
-   * re-render is harmless: the next hover migrates it again.
+   * into a `data-tip-text` attribute (which suppresses the OS-native bubble)
+   * and renders it as a themed pill instead. Migration mirrors the title
+   * into `aria-label` for icon-only controls, so stripping `title` never
+   * erases an accessible name (see dom/tipText.ts). Svelte re-applying
+   * `title` on a re-render is harmless: the next hover migrates it again.
    *
    * Shows after a short delay, follows neither mouse nor scroll (scroll hides),
    * flips above the anchor near the viewport bottom, and clamps horizontally.
@@ -30,16 +34,6 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   /** The tooltip text for an element, migrating a native `title` if present. */
-  function tipTextOf(el: HTMLElement): string {
-    const migrated = el.getAttribute("data-tip-text");
-    if (migrated !== null) return migrated;
-    const native = el.getAttribute("title");
-    if (native === null) return "";
-    el.setAttribute("data-tip-text", native);
-    el.removeAttribute("title");
-    return native;
-  }
-
   function anchorOf(target: EventTarget | null): HTMLElement | null {
     if (!(target instanceof Element)) return null;
     const el = target.closest<HTMLElement>("[title], [data-tip-text]");
@@ -151,10 +145,10 @@
   <div
     bind:this={bubble}
     role="tooltip"
-    class="gp-pop pointer-events-none fixed z-[60] max-w-xs whitespace-pre-line rounded-lg border border-border/80 bg-surface px-2.5 py-1.5 text-[11px] leading-snug text-textPrimary shadow-pop {placed
+    class="gp-pop pointer-events-none fixed max-w-xs whitespace-pre-line rounded-lg border border-border/80 bg-surface px-2.5 py-1.5 text-[11px] leading-snug text-textPrimary shadow-pop {placed
       ? 'opacity-100'
       : 'opacity-0'}"
-    style="left: {left}px; top: {top}px"
+    style="left: {left}px; top: {top}px; z-index: {LAYERS.TOOLTIP}"
   >
     {text}
   </div>

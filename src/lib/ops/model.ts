@@ -1,3 +1,5 @@
+import type { PolicyVerdict } from "../stores/harnessStore";
+
 export interface BranchCleanupCandidate {
   name: string;
   last_summary: string;
@@ -46,11 +48,46 @@ export interface IssueInfo {
   author: string;
 }
 
+export interface ReleaseInfo {
+  tag_name: string;
+  name: string;
+  is_draft: boolean;
+  is_prerelease: boolean;
+  is_latest: boolean;
+  published_at: string;
+  created_at: string;
+  url: string;
+}
+
 export interface ReleasePublishResult {
   tag: string;
   remote: string;
   created_tag: boolean;
+  /** Mirrors Rust `ReleasePublishResult::tag_policy: Option<PolicyVerdict>` (no serde rename). */
+  tag_policy?: PolicyVerdict | null;
   output: string;
+}
+
+export function formatReleaseDate(isoString: string): string {
+  if (!isoString) return "";
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return isoString;
+    return d.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return isoString;
+  }
+}
+
+export function summarizeReleases(releases: ReleaseInfo[], truncated = false): string {
+  const count = releases.length;
+  if (count === 0) return "No releases";
+  const suffix = truncated ? " (capped)" : "";
+  return `${count} release${count === 1 ? "" : "s"}${suffix}`;
 }
 
 const STABLE_RELEASE = /^v(\d+)\.(\d+)\.(\d+)$/;

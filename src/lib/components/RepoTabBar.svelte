@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
-  import { isCaseInsensitiveFs, isPathAmong } from "../repos/paths";
+  import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
+  import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
+  import { LAYERS } from "../ui/layers";
   import {
     ChevronDown,
     Pin,
@@ -55,33 +57,40 @@
 
   function handleKey(e: KeyboardEvent) {
     if (isImeComposition(e)) return;
-    const meta = e.metaKey || e.ctrlKey;
-    // The native menu owns Cmd/Ctrl+Shift+W under Tauri (CLOSE_REPO_TAB_ACCEL)
-    // and closes the active tab through the gitpulse-menu event; a JS handler
-    // here would close two tabs per press. Browser dev keeps the shortcut.
-    if (meta && e.shiftKey && e.key.toLowerCase() === "w" && !isTypingTarget(e.target)) {
-      if (isTauri()) return;
+    // Escape closes any open tab menu, regardless of where focus sits —
+    // same window-listener pattern as ViewTabBar.
+    if (e.key === "Escape" && (menu || recentsOpen)) {
       e.preventDefault();
-      void repoStore.closeActiveTab();
+      closeMenu();
       return;
     }
-    if (e.ctrlKey && e.altKey && !e.metaKey) {
-      const digit = e.code.match(/^Digit([1-9])$/);
-      if (digit) {
+    if (shouldSkipWebviewShortcut(e, isTauri())) return;
+    switch (classifyShortcut(e)) {
+      case "closeActiveTab":
+        if (isTypingTarget(e.target)) return;
+        e.preventDefault();
+        void repoStore.closeActiveTab();
+        return;
+      case "jumpToTab": {
+        const digit = e.code.match(/^Digit([1-9])$/);
+        if (!digit) return;
         e.preventDefault();
         void repoStore.activateTabAt(Number(digit[1]) - 1);
         return;
       }
-    }
-    if (e.key === "Tab" && e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      if (e.shiftKey) void repoStore.prevTab();
-      else void repoStore.nextTab();
-      return;
-    }
-    if (meta && e.key.toLowerCase() === "t" && !e.shiftKey && !isTypingTarget(e.target)) {
-      e.preventDefault();
-      onOpen?.();
+      case "cycleTabs": {
+        e.preventDefault();
+        if (e.shiftKey) void repoStore.prevTab();
+        else void repoStore.nextTab();
+        return;
+      }
+      case "openRepo":
+        if (isTypingTarget(e.target)) return;
+        e.preventDefault();
+        onOpen?.();
+        return;
+      default:
+        return;
     }
   }
 
@@ -278,7 +287,10 @@
         <ChevronDown size={13} />
       </button>
       {#if recentsOpen}
-        <div class="absolute right-0 top-full z-30 mt-1.5 w-80 gp-menu gp-pop">
+        <div
+          class="absolute right-0 top-full mt-1.5 w-80 gp-menu gp-pop"
+          style="z-index: {LAYERS.MENU}"
+        >
           <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted">
             Recent repositories
           </div>
@@ -295,7 +307,7 @@
                   }}
                   class="flex-1 min-w-0 px-2 py-1.5 text-left hover:bg-surfaceHover rounded-lg transition-colors"
                 >
-                  <div class="truncate text-textPrimary">{path.split(/[\\/]/).pop()}</div>
+                  <div class="truncate text-textPrimary">{displayName(path)}</div>
                   <div class="truncate text-[10px] text-textMuted font-mono">{path}</div>
                 </button>
                 <button
@@ -324,8 +336,8 @@
     <div
       use:portal
       data-repo-menu
-      class="fixed z-50 min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
-      style="left: {Math.min(menu.x, window.innerWidth - 200)}px; top: {Math.min(menu.y, window.innerHeight - 260)}px"
+      class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
+      style="left: {Math.min(menu.x, window.innerWidth - 200)}px; top: {Math.min(menu.y, window.innerHeight - 260)}px; z-index: {LAYERS.MENU}"
     >
       <button class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab

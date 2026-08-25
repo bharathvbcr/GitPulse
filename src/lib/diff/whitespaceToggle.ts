@@ -17,16 +17,24 @@ interface SelectionInput {
   /** A commit/range selection has no worktree diff; toggling must not swap it. */
   commitId: string | null | undefined;
   statuses: ReadonlyArray<{ path: string; is_staged: boolean }>;
+  isStaged?: boolean;
 }
 
 export function decideWhitespaceRefetch(input: SelectionInput): WhitespaceToggleDecision {
-  const { filePath, commitId, statuses } = input;
+  const { filePath, commitId, statuses, isStaged } = input;
   if (!filePath || commitId) {
     return { refetch: false, isStaged: false };
   }
-  // A path can appear twice (staged + unstaged entries); prefer the staged
-  // entry so the toggle keeps whichever side the sidebar offered first.
-  const match = statuses.find((status) => status.path === filePath);
+  if (typeof isStaged === "boolean") {
+    return { refetch: true, isStaged };
+  }
+  // A path can appear twice (staged + unstaged entries). The staged entry is
+  // picked explicitly rather than relying on list order: Sidebar.svelte may
+  // offer either side first, and the toggle must keep whichever side carries
+  // the staged diff.
+  const match =
+    statuses.find((status) => status.path === filePath && status.is_staged) ??
+    statuses.find((status) => status.path === filePath);
   if (!match) {
     return { refetch: false, isStaged: false };
   }

@@ -126,6 +126,35 @@ describe("GraphRenderer and Palette", () => {
     expect(miss).toBeNull();
   });
 
+  it("hit-tests in viewport space when the graph is scrolled", () => {
+    const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
+    const rows: VisualCommitRow[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `c${i}`,
+      parent_ids: [],
+      summary: `Commit ${i}`,
+      author_name: "Dev",
+      author_email: "dev@example.com",
+      timestamp: 1000 - i,
+      lane: 0,
+      color_index: 0,
+      active_lanes: [0],
+      active_lane_colors: [0],
+      connections: [],
+      is_merge: false,
+      is_root: i === 9,
+    }));
+
+    // Row 5 centre in content space is 5*36+18 = 198. After 180px of scroll
+    // that node sits at viewport y 18 — the same place row 0 occupies at rest.
+    expect(renderer.getRowY(5, 0, 180, true)).toBe(18);
+    const hit = renderer.getCommitAtPoint(20, 18, rows, 0, 10, 180);
+    expect(hit?.id).toBe("c5");
+
+    // Clicking the content-space Y must miss: that is the 180px offset bug.
+    const miss = renderer.getCommitAtPoint(20, 198, rows, 0, 10, 180);
+    expect(miss).toBeNull();
+  });
+
 
   it("renders linear commit history with straight vertical lines and nodes", () => {
     const renderer = new GraphRenderer();

@@ -175,6 +175,27 @@ pub struct CoverageReport {
     pub truncated: bool,
 }
 
+// Test instrumentation: how many artifact parses this thread's scan pipeline
+// ran. Thread-local because the suite runs coverage tests in parallel — a
+// process-global counter gets incremented by every concurrent test's parses
+// and makes cache-hit assertions nondeterministically fail.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SCAN_PARSE_COUNT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone)]
+struct CoverageCacheEntry {
+    fingerprint: Vec<(String, u64, u64)>,
+    report: CoverageReport,
+    hit_maps: FileHitMaps,
+}
+
+static COVERAGE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CoverageCacheEntry>>,
+> = std::sync::OnceLock::new();
+
 pub struct CoverageScanner;
 
 impl CoverageScanner {
@@ -230,8 +251,39 @@ impl CoverageScanner {
             ));
         }
 
-        let mut candidates = collect_candidates(&families);
-        extend_directory_candidates(&repo, &families, &mut candidates);
+        let candidates = {
+            let mut c = collect_candidates(&families);
+            extend_directory_candidates(&repo, &families, &mut c);
+            c
+        };
+
+        let mut fingerprint = Vec::new();
+        for cand in &candidates {
+            if let Ok(meta) = repo.join(&cand.rel).metadata() {
+                // Nanosecond precision: millisecond buckets collide when an
+                // artifact is rewritten between two scans of the same tick,
+                // which would serve stale parses as fresh.
+                let mtime = meta
+                    .modified()
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64
+                    })
+                    .unwrap_or(0);
+                fingerprint.push((cand.rel.clone(), meta.len(), mtime));
+            }
+        }
+
+        let cache =
+            COVERAGE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(guard) = cache.lock() {
+            if let Some(entry) = guard.get(&repo) {
+                if entry.fingerprint == fingerprint && !fingerprint.is_empty() {
+                    return Ok((entry.report.clone(), entry.hit_maps.clone()));
+                }
+            }
+        }
 
         let mut artifacts = Vec::new();
         let mut merged: FileHitMaps = HashMap::new();
@@ -272,6 +324,8 @@ impl CoverageScanner {
                         });
                         continue;
                     }
+                    #[cfg(test)]
+                    SCAN_PARSE_COUNT.with(|c| c.set(c.get() + 1));
                     match parse_artifact(cand.format, &text, &repo, &mut budget) {
                         Ok(map) => {
                             let totals = totals_of(&map);
@@ -344,16 +398,26 @@ impl CoverageScanner {
         let mut family_list: Vec<CoverageFamilyStatus> = families.into_values().collect();
         family_list.sort_by(|a, b| a.family.cmp(&b.family));
 
-        Ok((
-            CoverageReport {
-                families: family_list,
-                artifacts,
-                files,
-                overall,
-                truncated,
-            },
-            merged,
-        ))
+        let report = CoverageReport {
+            families: family_list,
+            artifacts,
+            files,
+            overall,
+            truncated,
+        };
+
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(
+                repo.clone(),
+                CoverageCacheEntry {
+                    fingerprint,
+                    report: report.clone(),
+                    hit_maps: merged.clone(),
+                },
+            );
+        }
+
+        Ok((report, merged))
     }
 }
 
@@ -675,7 +739,7 @@ fn parse_lcov(
     for raw in text.lines() {
         if let Some(sf) = raw.strip_prefix("SF:") {
             flush_record(&mut out, &mut current, &mut lines, budget);
-            current = relativize(repo, sf.trim());
+            current = relativize_or_suffix(repo, sf.trim());
         } else if raw.trim() == "end_of_record" {
             flush_record(&mut out, &mut current, &mut lines, budget);
         } else if let Some(da) = raw.strip_prefix("DA:") {
@@ -711,7 +775,7 @@ fn parse_cobertura(
             let reported = xml_attr(trimmed, "filename")
                 .or_else(|| xml_attr(trimmed, "name"))
                 .unwrap_or("");
-            current = relativize(repo, reported);
+            current = relativize_or_suffix(repo, reported);
         } else if current.is_some() {
             if let Some(rest) = trimmed.strip_prefix("line ") {
                 let ln = xml_attr(rest, "number").or_else(|| xml_attr(rest, "nr"));
@@ -743,6 +807,9 @@ fn parse_go_cover(
     const MAX_EXPANDED_LINES_PER_FILE: usize = 200_000;
     let mut out = HashMap::new();
     let mut expansion: HashMap<String, usize> = HashMap::new();
+    // One artifact can repeat a path across thousands of block lines; each
+    // resolution stats the filesystem, so resolve every distinct path once.
+    let mut resolved_paths: HashMap<String, Option<String>> = HashMap::new();
     for raw in text.lines() {
         if raw.starts_with("mode:") || raw.trim().is_empty() {
             continue;
@@ -750,7 +817,12 @@ fn parse_go_cover(
         let Some((path_part, rest)) = raw.rsplit_once(':') else {
             continue;
         };
-        let Some(path) = relativize_or_suffix(repo, path_part.trim()) else {
+        let trimmed_path = path_part.trim().to_string();
+        let Some(path) = resolved_paths
+            .entry(trimmed_path.clone())
+            .or_insert_with(|| relativize_or_suffix(repo, &trimmed_path))
+            .clone()
+        else {
             continue;
         };
         let Some((range, counts)) = rest.split_once(' ') else {
@@ -821,7 +893,7 @@ fn parse_istanbul(
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or(key.as_str());
-        let Some(path) = relativize(repo, reported) else {
+        let Some(path) = relativize_or_suffix(repo, reported) else {
             continue;
         };
         let dest = out.entry(path).or_default();
@@ -887,7 +959,7 @@ fn parse_jacoco(
             let mi = xml_attr(trimmed, "mi")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            if ci + mi == 0 {
+            if ci.saturating_add(mi) == 0 {
                 continue;
             }
             if let Some(ln) = ln.and_then(|v| v.parse::<usize>().ok()) {
@@ -916,7 +988,7 @@ fn parse_clover(
                 merge_file(&mut out, path, std::mem::take(&mut lines), budget);
             }
             let reported = xml_attr(trimmed, "path").or_else(|| xml_attr(trimmed, "name"));
-            current = reported.and_then(|r| relativize(repo, r));
+            current = reported.and_then(|r| relativize_or_suffix(repo, r));
         } else if current.is_some() && trimmed.starts_with("line ") {
             let ln = xml_attr(trimmed, "num");
             let hits = xml_attr(trimmed, "count");
@@ -1104,6 +1176,51 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Regression (audit M4): every per-file detail request re-parsed every
+    /// artifact on disk. A second identical scan must be served from the
+    /// mtime-keyed cache without a single new parse, and an artifact change
+    /// must invalidate it.
+    #[test]
+    fn repeated_scans_are_cached_until_artifacts_change() {
+        let repo = git_repo();
+        write(repo.path(), "src/main.go", "package main\n");
+        write(
+            repo.path(),
+            "coverage.out",
+            "mode: set\nsrc/main.go:1.1,2.10 2 1\n",
+        );
+        let path = repo.path().to_str().unwrap();
+
+        SCAN_PARSE_COUNT.with(|c| c.set(0));
+        let first = CoverageScanner::scan(path).expect("first scan");
+        let after_first = SCAN_PARSE_COUNT.with(|c| c.get());
+        assert!(after_first >= 1, "first scan must parse");
+
+        let second = CoverageScanner::scan(path).expect("second scan");
+        assert_eq!(SCAN_PARSE_COUNT.with(|c| c.get()), after_first);
+        assert_eq!(first.overall, second.overall);
+
+        // Detail requests ride the same cache instead of rescanning.
+        let detail =
+            CoverageScanner::file_coverage(path, "src/main.go").expect("detail from cache");
+        assert_eq!(detail.totals.lines_hit, first.files[0].lines_hit);
+        assert_eq!(SCAN_PARSE_COUNT.with(|c| c.get()), after_first);
+
+        // Changing the artifact invalidates the entry.
+        write(
+            repo.path(),
+            "coverage.out",
+            "mode: set\nsrc/main.go:1.1,2.10 0 0\n",
+        );
+        let third = CoverageScanner::scan(path).expect("scan after change");
+        assert_eq!(
+            SCAN_PARSE_COUNT.with(|c| c.get()),
+            after_first + 1,
+            "changed artifact must force one fresh parse"
+        );
+        assert_ne!(third.overall.lines_hit, second.overall.lines_hit);
+    }
 
     fn git_repo() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
@@ -1444,6 +1561,27 @@ src/main.go:4.1,4.8 1 0
         let cmap = parse_clover(clover, repo.path(), &mut EntryBudget::new(usize::MAX));
         assert_eq!(cmap["src/Foo.php"].get(&3), Some(&2));
         assert_eq!(cmap["src/Foo.php"].get(&4), Some(&0));
+    }
+
+    #[test]
+    fn parse_jacoco_extreme_counters_saturate_instead_of_panicking() {
+        let repo = git_repo();
+        write(repo.path(), "com/foo/Big.java", "class Big {}\n");
+        let jacoco = r#"
+<report>
+  <package name="com/foo">
+    <sourcefile name="Big.java">
+      <line nr="1" mi="1" ci="18446744073709551615"/>
+      <line nr="2" mi="18446744073709551615" ci="18446744073709551615"/>
+    </sourcefile>
+  </package>
+</report>
+"#;
+        let map = parse_jacoco(jacoco, repo.path(), &mut EntryBudget::new(usize::MAX));
+        // ci + mi overflows u64 on both lines; saturating math must treat
+        // them as covered instead of panicking in debug builds.
+        assert_eq!(map["com/foo/Big.java"].get(&1), Some(&u64::MAX));
+        assert_eq!(map["com/foo/Big.java"].get(&2), Some(&u64::MAX));
     }
 
     #[test]

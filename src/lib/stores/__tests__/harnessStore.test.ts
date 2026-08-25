@@ -139,6 +139,31 @@ describe("probe token staleness", () => {
   });
 });
 
+describe("harness error retention", () => {
+  it("keeps a sidecar connection error when a later AI probe reports a clean nested harness", async () => {
+    const store = createHarnessStore({
+      invoke: (async (cmd: string) => {
+        if (cmd === "cmd_harness_status") {
+          return {
+            ...harnessOk,
+            available: false,
+            error: "sidecar not running",
+            error_code: "not_installed",
+          };
+        }
+        if (cmd === "cmd_ai_status") {
+          return aiWith("m", { ...harnessOk, error: "", error_code: "" });
+        }
+        throw new Error(`unexpected ${cmd}`);
+      }) as never,
+    });
+    await store.refresh();
+    expect(get(store).harness?.error).toBe("sidecar not running");
+    expect(get(store).harness?.error_code).toBe("not_installed");
+    expect(get(store).ai?.selected?.model).toBe("m");
+  });
+});
+
 describe("policy verdict rendering", () => {
   it("never labels an unchecked action the same as an allowed one", () => {
     const allowed = verdict({ status: "allowed" });

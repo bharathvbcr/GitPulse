@@ -23,7 +23,7 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
-  import { matchesCommit, parseFilterQuery } from "../filter/parseQuery";
+  import { filterRowsWithLanes, parseFilterQueryCached } from "../filter/queryMemo";
   import { nextLoadLimit } from "../stores/graphLimits";
   import {
     forwardGraphWheel,
@@ -90,21 +90,12 @@
   let rowsVersion = 0;
   let versionedRows: VisualCommitRow[] | null = null;
 
-  let filteredRows = $derived.by(() => {
-    const parsed = parseFilterQuery($filterStore.searchQuery);
-    return $graphStore.rows.filter((row) => matchesCommit(row, parsed));
-  });
+  let filtered = $derived.by(() =>
+    filterRowsWithLanes($graphStore.rows, parseFilterQueryCached($filterStore.searchQuery))
+  );
+  let filteredRows = $derived(filtered.rows);
 
-  let maxActiveLane = $derived.by(() => {
-    let max = 0;
-    for (const r of filteredRows) {
-      if (r.lane > max) max = r.lane;
-      for (const al of r.active_lanes) {
-        if (al > max) max = al;
-      }
-    }
-    return max;
-  });
+  let maxActiveLane = $derived(filtered.maxActiveLane);
 
   let graphColumnWidth = $derived(Math.max(220, (maxActiveLane + 2) * laneWidth + originX));
 
@@ -276,14 +267,13 @@
   function hitAt(clientX: number, clientY: number) {
     const rect = canvasRect();
     if (!rect) return null;
-    const viewportOffsetY = scrollTop % rowHeight;
     return renderer.getCommitAtPoint(
       clientX - rect.left,
       clientY - rect.top,
       filteredRows,
       startIndex,
       endIndex,
-      viewportOffsetY,
+      scrollTop,
     );
   }
 

@@ -25,3 +25,12 @@ describe("Sidebar", () => {
     expect(source).toContain('title="Stage file"');
   });
 });
+
+describe("Sidebar batch staging", () => {
+  it("offers stage all and unstage all in the change-list headers", () => {
+    expect(source).toContain("stageAll");
+    expect(source).toContain("unstageAll");
+    expect(source).toContain("stage all");
+    expect(source).toContain("unstage all");
+  });
+});

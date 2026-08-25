@@ -28,6 +28,7 @@
     updateKind,
     updateKindClass,
   } from "../health/format";
+  import { formatError } from "../ui/formatError";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
@@ -88,7 +89,7 @@
       plan = null;
       planError = null;
     } else {
-      errorMsg = String(deps.reason);
+      errorMsg = formatError(deps.reason);
       report = null;
       // A failed scan must not mark the repo as scanned, or the effect above
       // would refuse to rescan it after something changes.
@@ -107,7 +108,7 @@
             slug: "",
             alerts: [],
             truncated: false,
-            error: String(alerts.reason),
+            error: formatError(alerts.reason),
           };
     if (guard.isLive()) loading = false;
   }
@@ -120,12 +121,16 @@
     return formatHealthReport(current, repoPath);
   }
 
+  let copyTimer: number | null = null;
+  let planCopyTimer: number | null = null;
+
   async function copyReport() {
     const text = renderedReport();
     if (!text) return;
     if (await copyText(text)) {
       copied = true;
-      window.setTimeout(() => (copied = false), 1500);
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      copyTimer = window.setTimeout(() => (copied = false), 1500);
     }
   }
 
@@ -148,7 +153,7 @@
       plan = next;
     } catch (err) {
       if (!guard.isLive()) return;
-      planError = String(err);
+      planError = formatError(err);
     } finally {
       if (guard.isLive()) fixing = false;
     }
@@ -158,7 +163,8 @@
     if (!plan?.text) return;
     if (await copyText(plan.text)) {
       planCopied = true;
-      window.setTimeout(() => (planCopied = false), 1500);
+      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
+      planCopyTimer = window.setTimeout(() => (planCopied = false), 1500);
     }
   }
 
@@ -168,6 +174,8 @@
     return () => {
       inflight?.cancel();
       fixInflight?.cancel();
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
     };
   });
 
@@ -191,10 +199,14 @@
   });
 
   async function openExternal(url: string) {
+    // No window.open fallback: inside a Tauri webview it can navigate the
+    // app shell itself, and these URLs come from advisory/GitHub payloads.
+    // If the opener plugin fails, surfacing the failure beats handing the
+    // webview to an arbitrary URL.
     try {
       await openUrl(url);
-    } catch {
-      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      console.error("openUrl failed for", url, err);
     }
   }
 </script>
@@ -332,7 +344,13 @@
           {/if}
         </button>
       {/if}
-      <button type="button" onclick={() => scan()} class="gp-btn" title="Rescan vulnerabilities and updates">
+      <button
+        type="button"
+        onclick={() => scan()}
+        disabled={loading}
+        class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
+        title="Rescan vulnerabilities and updates"
+      >
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
         Scan
       </button>

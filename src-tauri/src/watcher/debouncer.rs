@@ -16,7 +16,11 @@ pub struct RepoFileWatcher {
 ///
 /// Returns `(path, len, mtime_nanos)` triples so additions, removals, size
 /// changes, and in-place rewrites all register.
-pub fn watch_fingerprint(git_dir: &Path, worktree_root: Option<&Path>) -> Vec<(PathBuf, u64, i64)> {
+pub fn watch_fingerprint(
+    git_dir: &Path,
+    worktree_root: Option<&Path>,
+    common_dir: Option<&Path>,
+) -> Vec<(PathBuf, u64, i64)> {
     fn stat_entry(path: &Path) -> Option<(PathBuf, u64, i64)> {
         let meta = std::fs::symlink_metadata(path).ok()?;
         let mtime = meta
@@ -42,6 +46,18 @@ pub fn watch_fingerprint(git_dir: &Path, worktree_root: Option<&Path>) -> Vec<(P
             }
         }
     }
+    // Linked worktrees keep shared refs in the common dir; branch writes
+    // landing there must register even when the OS stream is stalled.
+    if let Some(common) = common_dir {
+        paths.push(common.to_path_buf());
+        paths.push(common.join("refs"));
+        paths.push(common.join("refs").join("heads"));
+        if let Ok(entries) = std::fs::read_dir(common.join("refs").join("heads")) {
+            for entry in entries.flatten().take(256) {
+                paths.push(entry.path());
+            }
+        }
+    }
     paths.sort();
     paths.dedup();
     paths.iter().filter_map(|p| stat_entry(p)).collect()
@@ -52,12 +68,14 @@ impl RepoFileWatcher {
     /// linked-worktree git dir, or bare repo). See [`Self::watch_repo`] for
     /// the full-repo form.
     pub fn watch(git_dir: &Path) -> Result<Self, String> {
-        Self::watch_repo(git_dir, None)
+        Self::watch_repo(git_dir, None, None)
     }
 
     /// Watches a repository for the change detector: the resolved git dir
-    /// recursively, and — when the repository has a separate worktree root —
-    /// that root too.
+    /// recursively, the shared common dir when it differs (linked worktrees
+    /// keep refs in the main repo's git dir, so branch/ref writes made
+    /// anywhere must fire), and — when the repository has a separate
+    /// worktree root — that root too.
     ///
     /// The worktree watch is deliberately NON-recursive (top-level entries
     /// only). Recursive watching of a whole checkout is far too hot for the
@@ -72,7 +90,11 @@ impl RepoFileWatcher {
     /// load; [`crate::watcher::run_watch_loop`] therefore cross-checks a
     /// [`watch_fingerprint`] on a short interval and reports changes even when
     /// the OS stream goes quiet.
-    pub fn watch_repo(git_dir: &Path, worktree_root: Option<&Path>) -> Result<Self, String> {
+    pub fn watch_repo(
+        git_dir: &Path,
+        worktree_root: Option<&Path>,
+        common_dir: Option<&Path>,
+    ) -> Result<Self, String> {
         if !git_dir.exists() {
             return Err(format!(
                 "Git directory does not exist: {}",
@@ -93,6 +115,14 @@ impl RepoFileWatcher {
         watcher
             .watch(git_dir, RecursiveMode::Recursive)
             .map_err(|e| format!("Failed to watch git directory: {}", e))?;
+
+        if let Some(common) = common_dir {
+            if common != git_dir && common.exists() {
+                watcher
+                    .watch(common, RecursiveMode::Recursive)
+                    .map_err(|e| format!("Failed to watch common git directory: {}", e))?;
+            }
+        }
 
         if let Some(root) = worktree_root {
             if !root.exists() {

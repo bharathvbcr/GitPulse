@@ -55,4 +55,31 @@ describe("decideWhitespaceRefetch", () => {
       }).isStaged
     ).toBe(true);
   });
+
+  it("prefers the staged entry even when it is listed after the unstaged one", () => {
+    expect(
+      decideWhitespaceRefetch({
+        filePath: "dupe.ts",
+        commitId: null,
+        statuses: [
+          { path: "dupe.ts", is_staged: false },
+          { path: "dupe.ts", is_staged: true },
+        ],
+      })
+    ).toEqual({ refetch: true, isStaged: true });
+  });
+
+  it("honors an explicit isStaged even when the path appears on both sides", () => {
+    expect(
+      decideWhitespaceRefetch({
+        filePath: "dupe.ts",
+        commitId: null,
+        isStaged: false,
+        statuses: [
+          { path: "dupe.ts", is_staged: true },
+          { path: "dupe.ts", is_staged: false },
+        ],
+      })
+    ).toEqual({ refetch: true, isStaged: false });
+  });
 });

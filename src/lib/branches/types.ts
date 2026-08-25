@@ -36,10 +36,12 @@ export interface BranchFolder {
 export interface BranchSection {
   id: string;
   label: string;
-  kind: "local" | "remote" | "tags";
+  kind: "pinned" | "recent" | "local" | "remote" | "tags";
   remoteName?: string;
   folders: BranchFolder[];
   branches: BranchInfo[];
   tags: TagInfo[];
   branchCount: number;
 }
+
+export type BranchFilterTab = "all" | "local" | "remote" | "active" | "stale" | "tags" | "pinned";

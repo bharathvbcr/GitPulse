@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { fadeParams, scaleParams } from "../motion/easing";
+  import { trapFocus } from "../ui/focusTrap";
+  import { LAYERS } from "../ui/layers";
   import {
     cancelPrompt,
     completePrompt,
@@ -26,12 +29,14 @@
     value = current.options.mode === "text" ? current.options.initialValue ?? "" : "";
     // Focus lands after the DOM update; the prior holder is restored on close.
     previousFocus = document.activeElement;
-    if (current.options.mode === "text") {
-      inputEl?.focus();
-      inputEl?.select();
-    } else {
-      confirmEl?.focus();
-    }
+    void tick().then(() => {
+      if (current.options.mode === "text") {
+        inputEl?.focus();
+        inputEl?.select();
+      } else {
+        confirmEl?.focus();
+      }
+    });
   });
 
   function submit(event?: SubmitEvent) {
@@ -57,11 +62,16 @@
     onclick={cancelPrompt}
     onkeydown={handleKeydown}
     transition:fade={fadeParams()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4 select-none gp-gpu"
+    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
+    style="z-index: {LAYERS.PROMPT}"
   >
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- autofocus:false — the $effect below focuses the input or confirm
+         button by prompt mode; the trap still cycles Tab and restores focus
+         on close. -->
     <div
+      use:trapFocus={{ autofocus: false }}
       onclick={(e) => e.stopPropagation()}
       in:scale={scaleParams()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"

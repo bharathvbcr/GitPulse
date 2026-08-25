@@ -94,7 +94,7 @@ html.dark {
 @layer components {
   /* Pill button (secondary). */
   .gp-btn {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border border-border/70 bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-sm transition-all duration-150;
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border border-border/70 bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-sm transition-[color,background-color,border-color,box-shadow] duration-150;
   }
   .gp-btn:hover {
     @apply border-accent/50 bg-surfaceHover;
@@ -108,7 +108,7 @@ html.dark {
 
   /* Pill button (primary): brand gradient with a soft halo. */
   .gp-btn-primary {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-all duration-150;
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
     background-image: var(--brand-gradient);
     box-shadow: var(--shadow-glow);
   }
@@ -126,7 +126,7 @@ html.dark {
 
   /* Pill button (success): same geometry as primary, green ramp. */
   .gp-btn-success {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-all duration-150;
+    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
     background-image: linear-gradient(135deg, #34d399, #059669);
     box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
   }
@@ -144,7 +144,7 @@ html.dark {
 
   /* Round icon button (ghost). */
   .gp-icon-btn {
-    @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-all duration-150;
+    @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
   }
   .gp-icon-btn:hover {
     @apply bg-surfaceHover text-textPrimary;
@@ -176,7 +176,7 @@ html.dark {
     @apply inline-flex select-none items-center gap-0.5 rounded-full border border-border/70 bg-background/70 p-0.5;
   }
   .gp-seg-btn {
-    @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-all duration-150;
+    @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
   }
   .gp-seg-btn:hover {
     @apply text-textPrimary;
@@ -359,7 +359,8 @@ html.macos ::-webkit-scrollbar {
 
   .transition-colors,
   .transition-all,
-  .transition {
+  .transition,
+  [class*="transition-["] {
     transition: none !important;
   }
 }

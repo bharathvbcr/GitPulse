@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 /// keeps [`DEFAULT_TIMEOUT`].
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Grace window [`run_bounded`] grants pipe EOF after a timeout kill before
+/// it deliberately detaches any still-blocked drain threads.
+const DRAIN_JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Canonical work tree or bare repository resolved from a user-supplied path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +86,32 @@ pub fn resolve_git_dir(repo: &Path) -> Result<PathBuf, String> {
     absolute.canonicalize().map_err(|e| {
         format!(
             "Cannot resolve git directory '{}': {}",
+            absolute.display(),
+            e
+        )
+    })
+}
+
+/// Resolves `git rev-parse --git-common-dir` to the shared canonical git directory,
+/// ensuring all linked worktrees in the same repository map to the same root git directory.
+pub fn resolve_git_common_dir(repo: &Path) -> Result<PathBuf, String> {
+    let raw = match git_text(repo, &["rev-parse", "--git-common-dir"]) {
+        Ok(text) => text,
+        Err(_) => git_text(repo, &["rev-parse", "--git-dir"])?,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("git rev-parse --git-common-dir returned an empty path".into());
+    }
+    let git_dir = Path::new(trimmed);
+    let absolute = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        repo.join(git_dir)
+    };
+    absolute.canonicalize().map_err(|e| {
+        format!(
+            "Cannot resolve common git directory '{}': {}",
             absolute.display(),
             e
         )
@@ -209,11 +240,35 @@ pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create parent directories: {}", e))?;
     }
-    std::fs::write(&dest, content).map_err(|e| format!("Failed to write file: {}", e))
+    std::fs::write(&dest, content).map_err(|e| format!("Failed to write file: {}", e))?;
+    // TOCTOU hardening (post-hoc containment re-check): sandbox_join_canonical
+    // verified every existing component before the write, but a symlink
+    // swapped in between that check and fs::write would redirect the write
+    // outside the repository. Full prevention needs O_NOFOLLOW via libc,
+    // which this crate deliberately does not depend on, so we instead
+    // re-canonicalize the written file — resolving any final-component or
+    // parent-directory swap — and fail loudly if it left the repo. Residual
+    // race, documented honestly: a swap AFTER this check goes undetected, and
+    // the escaped bytes are already on disk; the window is narrowed, not closed.
+    let written = std::fs::canonicalize(&dest)
+        .map_err(|e| format!("Cannot verify written file '{}': {}", dest.display(), e))?;
+    if !written.starts_with(&repo) {
+        return Err(format!(
+            "Written file '{}' escaped the repository (containment re-check failed)",
+            written.display()
+        ));
+    }
+    Ok(())
 }
 
 /// True for inherited environment names that can redirect git's config,
 /// transport, or credential resolution away from what the user picked.
+///
+/// `GIT_CONFIG_PARAMETERS` is the shell-quoted config channel (`'alias.st=!sh
+/// -c …'` outranks even repo-local config), so it is injected by definition;
+/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are listed here too so the
+/// classification stays in lockstep with the explicit strip list in
+/// [`git_command`] — anything stripped must classify as injected.
 fn is_injected_git_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.starts_with("GIT_CONFIG_KEY_")
@@ -221,7 +276,16 @@ fn is_injected_git_env(name: &str) -> bool {
         || upper.starts_with("GIT_CREDHELPER")
         || matches!(
             upper.as_str(),
-            "GIT_CONFIG_COUNT" | "GIT_SSH_COMMAND" | "GIT_SSH_VARIANT" | "GIT_ASKPASS"
+            "GIT_CONFIG_COUNT"
+                | "GIT_CONFIG_PARAMETERS"
+                | "GIT_CONFIG_GLOBAL"
+                | "GIT_CONFIG_SYSTEM"
+                | "GIT_SSH_COMMAND"
+                | "GIT_SSH_VARIANT"
+                | "GIT_ASKPASS"
+                | "GIT_EXTERNAL_DIFF"
+                | "GIT_SEQUENCE_EDITOR"
+                | "GIT_EXEC_PATH"
         )
 }
 
@@ -253,8 +317,15 @@ fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
         .env_remove("GIT_CONFIG_GLOBAL")
         .env_remove("GIT_CONFIG_SYSTEM")
         // The numbered-config channel (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n /
-        // VALUE_n) injects arbitrary config without any of the names above.
-        .env_remove("GIT_CONFIG_COUNT");
+        // VALUE_n) and the shell-quoted GIT_CONFIG_PARAMETERS channel inject
+        // arbitrary config without any of the names above — the latter
+        // outranks even repo-local config, so an `alias.*=!sh -c …` planted
+        // there would execute on the next GUI status call.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_SEQUENCE_EDITOR")
+        .env_remove("GIT_EXEC_PATH");
     for (name, _) in std::env::vars_os() {
         if is_injected_git_env(&name.to_string_lossy()) {
             cmd.env_remove(&name);
@@ -404,6 +475,7 @@ pub fn capture_command(
 }
 
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
+#[derive(Debug)]
 struct BoundedRun {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -440,9 +512,21 @@ fn run_bounded(
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let stdout_handle = thread::spawn(move || drain_capped(stdout_pipe, MAX_OUTPUT_BYTES));
-    let stderr_handle =
-        thread::spawn(move || drain_capped(stderr_pipe, MAX_OUTPUT_BYTES.min(4 * 1024 * 1024)));
+    // Drain results travel over channels rather than `JoinHandle::join()`:
+    // join has no timeout, so a drain thread stuck behind an orphaned
+    // grandchild holding a pipe write end would block this function forever.
+    // [`collect_drained`] bounds that wait instead.
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = stdout_tx.send(drain_capped(stdout_pipe, MAX_OUTPUT_BYTES));
+    });
+    thread::spawn(move || {
+        let _ = stderr_tx.send(drain_capped(
+            stderr_pipe,
+            MAX_OUTPUT_BYTES.min(4 * 1024 * 1024),
+        ));
+    });
 
     // Feed stdin from its own thread: a child that exits early (rejecting our
     // input) makes the write fail with EPIPE, which is not an error of ours —
@@ -467,7 +551,7 @@ fn run_bounded(
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    let _ = child.kill();
+                    kill_process_tree(&mut child);
                     let _ = child.wait();
                     break Err(format!("{} timed out after {}s", label, timeout.as_secs()));
                 }
@@ -481,16 +565,92 @@ fn run_bounded(
         // exit the thread has already finished.
         let _ = handle.join();
     }
-    let status = outcome?;
-    let (stdout, truncated) = stdout_handle.join().unwrap_or_default();
-    let (stderr, _) = stderr_handle.join().unwrap_or_default();
-    Ok(BoundedRun {
-        stdout,
-        stderr,
-        success: status.success(),
-        status_code: status.code().unwrap_or(-1),
-        truncated,
-    })
+    match outcome {
+        Ok(status) => {
+            // Normal exit: EOF is imminent unless the child daemonized a
+            // grandchild that inherited the pipes; then we take whatever was
+            // buffered after the grace window instead of hanging forever.
+            let (stdout, truncated) = collect_drained(&stdout_rx);
+            let (stderr, _) = collect_drained(&stderr_rx);
+            Ok(BoundedRun {
+                stdout,
+                stderr,
+                success: status.success(),
+                status_code: status.code().unwrap_or(-1),
+                truncated,
+            })
+        }
+        Err(e) => {
+            // Timeout/wait failure: the pipes are dead weight now. Grant one
+            // shared grace window for EOF (a tree-kill on Windows usually delivers
+            // it), then detach any still-blocked drain threads — see
+            // [`collect_drained`] for the documented residual leak.
+            let deadline = Instant::now() + DRAIN_JOIN_GRACE;
+            let _ = collect_drained_deadline(&stdout_rx, deadline);
+            let _ = collect_drained_deadline(&stderr_rx, deadline);
+            Err(e)
+        }
+    }
+}
+
+/// Collects a pipe-drain result, waiting at most [`DRAIN_JOIN_GRACE`] for EOF.
+///
+/// Residual leak, documented deliberately: when a timed-out command forked a
+/// grandchild that inherited stdout/stderr, killing the direct child does not
+/// close the pipe write ends and the drain thread stays blocked on read. This
+/// crate has no libc dependency, so a portable Unix process-group kill
+/// (`setsid`/`killpg` via `pre_exec`) is unavailable — Windows gets a real
+/// tree kill through `taskkill /T`, but on Unix the orphan cannot be signalled
+/// portably. The honest options were hanging forever or detaching; we detach.
+/// The detached thread unblocks when the orphan exits (pipe EOF) or at app
+/// shutdown, holds at most [`MAX_OUTPUT_BYTES`], and at most two exist per
+/// timed-out command. When the grace expires, bytes read but not yet delivered
+/// (no EOF seen) are discarded — acceptable because git and the other tools
+/// routed through this engine do not fork pipe-holding descendants.
+fn collect_drained(rx: &mpsc::Receiver<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
+    rx.recv_timeout(DRAIN_JOIN_GRACE).unwrap_or_default()
+}
+
+fn collect_drained_deadline(
+    rx: &mpsc::Receiver<(Vec<u8>, bool)>,
+    deadline: Instant,
+) -> (Vec<u8>, bool) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    rx.recv_timeout(remaining).unwrap_or_default()
+}
+
+/// Kills `child`, best-effort taking its whole process tree down on Windows.
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        // `taskkill /T /F` walks the PID tree. Spawned directly by argv,
+        // never through a shell, and best-effort only.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+/// Detects transient git lock contention errors (e.g. background AI agents or terminal processes holding index.lock)
+pub fn is_transient_git_lock_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    (lower.contains(".lock'") && lower.contains("file exists"))
+        || lower.contains("another git process seems to be running")
+        || (lower.contains("unable to create") && lower.contains(".lock"))
+        || lower.contains("cannot lock ref")
+        || (lower.contains("index.lock") && lower.contains("file exists"))
+}
+
+/// Backoff for attempts 1..=3: 50 + 150 + 300 ms = 500 ms, plus a tiny pid jitter
+/// so concurrent waiters do not stampede the lock file together.
+fn lock_retry_backoff_ms(attempt: usize) -> u64 {
+    const STEPS: [u64; 3] = [50, 150, 300];
+    let base = STEPS[(attempt.saturating_sub(1)).min(2)];
+    base + (std::process::id() as u64 % 20)
 }
 
 fn git_timeout(
@@ -501,46 +661,70 @@ fn git_timeout(
 ) -> Result<Vec<u8>, String> {
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
-    let cmd = git_command(repo, args);
-    let out = run_bounded(cmd, &label, timeout, stdin_bytes)?;
-    if out.truncated {
+    let mut attempts = 0;
+    const MAX_LOCK_RETRIES: usize = 3;
+
+    loop {
+        let cmd = git_command(repo, args);
+        let out = run_bounded(cmd, &label, timeout, stdin_bytes)?;
+        if out.truncated {
+            return Err(format!(
+                "git {} output exceeded {} MB",
+                sub,
+                MAX_OUTPUT_BYTES / (1024 * 1024)
+            ));
+        }
+        if out.success {
+            return Ok(out.stdout);
+        }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !err.is_empty() {
+            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(&err) {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(lock_retry_backoff_ms(attempts)));
+                continue;
+            }
+            return Err(err);
+        }
+        // Some git failures report entirely on stdout — notably `commit`'s
+        // "nothing added to commit" (exit 1, empty stderr). A bare status code
+        // hides the one string callers match on to retry; surface the diagnosis.
+        let stdout_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stdout_text.is_empty() {
+            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(&stdout_text) {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(lock_retry_backoff_ms(attempts)));
+                continue;
+            }
+            if stdout_text.len() > MAX_FAILURE_MESSAGE_BYTES {
+                let cut = truncate_utf8_bytes(&stdout_text, MAX_FAILURE_MESSAGE_BYTES);
+                return Err(format!("{cut}… (git {} output truncated)", sub));
+            }
+            return Err(stdout_text);
+        }
         return Err(format!(
-            "git {} output exceeded {} MB",
-            sub,
-            MAX_OUTPUT_BYTES / (1024 * 1024)
+            "git {} failed with status {}",
+            sub, out.status_code
         ));
     }
-    if out.success {
-        return Ok(out.stdout);
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !err.is_empty() {
-        return Err(err);
-    }
-    // Some git failures report entirely on stdout — notably `commit`'s
-    // "nothing added to commit" (exit 1, empty stderr). A bare status code
-    // hides the one string callers match on to retry; surface the diagnosis.
-    let stdout_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !stdout_text.is_empty() {
-        if stdout_text.chars().count() > MAX_FAILURE_MESSAGE_CHARS {
-            let cut: String = stdout_text
-                .chars()
-                .take(MAX_FAILURE_MESSAGE_CHARS)
-                .collect();
-            return Err(format!("{cut}… (git {} output truncated)", sub));
-        }
-        return Err(stdout_text);
-    }
-    Err(format!(
-        "git {} failed with status {}",
-        sub, out.status_code
-    ))
 }
 
 /// Upper bound on stdout text embedded in a failure message when git put its
 /// diagnosis on stdout instead of stderr. Bounded so a chatty failure never
 /// drags megabytes into an error string.
-const MAX_FAILURE_MESSAGE_CHARS: usize = 2_000;
+const MAX_FAILURE_MESSAGE_BYTES: usize = 2_000;
+
+/// Truncates `s` to at most `max_bytes` on a UTF-8 character boundary.
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
 
 fn drain_capped<R: Read>(pipe: Option<R>, max_bytes: usize) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
@@ -584,25 +768,25 @@ pub fn parse_left_right_count(raw: &str) -> (usize, usize) {
 }
 
 pub fn parse_ahead_behind(track: &str) -> (usize, usize) {
-    let mut ahead = 0;
-    let mut behind = 0;
-    if let Some(rest) = track.split("ahead ").nth(1) {
-        ahead = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
+    fn digits_after(haystack: &str, marker: &str) -> usize {
+        let Some(idx) = haystack.find(marker) else {
+            return 0;
+        };
+        let rest = &haystack.as_bytes()[idx + marker.len()..];
+        let mut n = 0usize;
+        for &b in rest {
+            if b.is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
+            } else {
+                break;
+            }
+        }
+        n
     }
-    if let Some(rest) = track.split("behind ").nth(1) {
-        behind = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-    }
-    (ahead, behind)
+    (
+        digits_after(track, "ahead "),
+        digits_after(track, "behind "),
+    )
 }
 
 pub fn repo_name_from_url(url: &str) -> String {
@@ -629,12 +813,35 @@ mod tests {
     }
 
     #[test]
+    fn transient_lock_errors_match_real_git_wording() {
+        assert!(is_transient_git_lock_error(
+            "fatal: Unable to create '/tmp/repo/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository"
+        ));
+        assert!(is_transient_git_lock_error(
+            "fatal: cannot lock ref 'refs/heads/main': Unable to create '/tmp/repo/.git/refs/heads/main.lock': File exists."
+        ));
+        assert!(!is_transient_git_lock_error(
+            "nothing to commit, working tree clean"
+        ));
+        assert!(!is_transient_git_lock_error(
+            "pathspec 'ghost.txt' did not match any files"
+        ));
+        assert!(lock_retry_backoff_ms(1) >= 50);
+        assert!(lock_retry_backoff_ms(2) >= 150);
+        assert!(lock_retry_backoff_ms(3) >= 300);
+    }
+
+    #[test]
     fn test_parse_ahead_behind() {
         assert_eq!(parse_ahead_behind("[ahead 3, behind 1]"), (3, 1));
         assert_eq!(parse_ahead_behind("[ahead 12]"), (12, 0));
         assert_eq!(parse_ahead_behind("[behind 4]"), (0, 4));
         assert_eq!(parse_ahead_behind("[gone]"), (0, 0));
         assert_eq!(parse_ahead_behind(""), (0, 0));
+        assert_eq!(parse_ahead_behind("[ahead 0, behind 0]"), (0, 0));
+        assert_eq!(parse_ahead_behind("[ahead 1234, behind 99]"), (1234, 99));
+        // Digits must be consumed without an intermediate String.
+        assert_eq!(parse_ahead_behind("ahead 7 behind 8 extra"), (7, 8));
     }
 
     #[test]
@@ -971,6 +1178,9 @@ mod tests {
             "GIT_CONFIG",
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_SYSTEM",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_EXEC_PATH",
         ] {
             assert!(removed.contains(key), "git_command must remove {key}");
         }
@@ -1049,10 +1259,16 @@ mod tests {
             "GIT_CONFIG_VALUE_0",
             "GIT_CONFIG_KEY_17",
             "git_config_key_3",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
             "GIT_SSH_COMMAND",
             "GIT_SSH_VARIANT",
             "GIT_ASKPASS",
             "GIT_CREDHELPER",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_EXEC_PATH",
         ] {
             assert!(is_injected_git_env(name), "{name} must be stripped");
         }
@@ -1065,6 +1281,67 @@ mod tests {
         ] {
             assert!(!is_injected_git_env(safe), "{safe} must survive");
         }
+    }
+
+    /// Regression (M4): a planted GIT_CONFIG_PARAMETERS value must not
+    /// survive into the spawned environment. The Command's env map marks a
+    /// stripped variable with a `None` value; this asserts that marker.
+    #[test]
+    fn planted_git_config_parameters_is_removed_from_spawn_env() {
+        let key = "GIT_CONFIG_PARAMETERS";
+        // Process-global mutation is tolerable here: every other test that
+        // spawns git through this module also strips exactly this variable
+        // (that is the behavior under test), so even if the cleanup below is
+        // skipped on a panic the value cannot influence a spawned git.
+        std::env::set_var(key, "'alias.st=!echo PWNED'");
+        let cmd = git_command(Some(Path::new("/tmp")), &["status"]);
+        let removed = cmd
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new(key) && v.is_none());
+        std::env::remove_var(key);
+        assert!(
+            removed,
+            "planted GIT_CONFIG_PARAMETERS must be stripped from the spawned env"
+        );
+    }
+
+    /// Regression (M3): a child that exits successfully while a daemonized
+    /// grandchild keeps the stdout/stderr write ends open used to block the
+    /// unconditional drain joins forever. The run must return promptly with
+    /// the child's exit status.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_success_does_not_hang_on_grandchild_holding_pipes() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        // `sh` backgrounds `sleep 30` (which inherits both pipe write ends)
+        // and then itself exits 0 immediately.
+        cmd.args(["-c", "sleep 30 & exit 0"]);
+        let out = run_bounded(cmd, "sh", Duration::from_secs(5), None).expect("run");
+        assert!(out.success);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "drain collection must be grace-bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Regression (M3): a timed-out child whose backgrounded grandchild keeps
+    /// the pipes open must still yield the timeout error within the grace
+    /// window instead of leaking unbounded blocking work into the caller.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_timeout_returns_despite_grandchild_holding_pipes() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let err = run_bounded(cmd, "sh", Duration::from_secs(1), None).expect_err("timeout");
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout handling must stay bounded (grace is 2s per pipe), took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1167,6 +1444,15 @@ mod tests {
             std::fs::read_to_string(dir.path().join("real").join("sub.txt")).unwrap(),
             "kept inside"
         );
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_cuts_on_a_character_boundary() {
+        let s = "éééé"; // each é is 2 bytes
+        assert_eq!(truncate_utf8_bytes(s, 100), s);
+        assert_eq!(truncate_utf8_bytes(s, 3).len(), 2);
+        assert!(truncate_utf8_bytes(s, 3).is_char_boundary(truncate_utf8_bytes(s, 3).len()));
+        assert!(!truncate_utf8_bytes(s, 3).contains('\u{FFFD}'));
     }
 
     fn init_plain_git_repo(dir: &Path) {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { displayName } from "../repos/paths";
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
   import WorktreesPanel from "./WorktreesPanel.svelte";
@@ -37,7 +38,7 @@
     <div class="flex items-center gap-2 truncate">
       <FolderGit2 size={15} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary truncate" title={$repoStore.currentPath || "No Repo"}>
-        {$repoStore.currentPath ? $repoStore.currentPath.split("/").pop() : "No Repository"}
+        {$repoStore.currentPath ? displayName($repoStore.currentPath) : "No Repository"}
       </span>
     </div>
     <button
@@ -60,6 +61,15 @@
     <div>
       <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
         <span>Staged Changes ({stagedFiles.length})</span>
+        {#if stagedFiles.length > 0}
+          <button
+            onclick={() => repoStore.unstageAll()}
+            title="Unstage all files"
+            class="text-[9px] lowercase font-normal text-textMuted hover:text-red-400 transition-colors"
+          >
+            unstage all
+          </button>
+        {/if}
       </div>
       {#if stagedFiles.length === 0}
         <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">No staged changes</div>
@@ -71,7 +81,13 @@
               tabindex="0"
               class="px-2 py-1 rounded-full flex items-center justify-between hover:bg-surfaceHover text-textPrimary group transition-colors cursor-pointer"
               onclick={() => repoStore.selectFileDiff(f.path, true)}
-              onkeydown={(e) => (e.key === "Enter" || e.key === " ") && repoStore.selectFileDiff(f.path, true)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  // Space would otherwise scroll the ancestor scroller.
+                  e.preventDefault();
+                  repoStore.selectFileDiff(f.path, true);
+                }
+              }}
             >
               <span class="truncate text-green-400 font-mono text-[11px]">{f.path}</span>
               <button
@@ -102,6 +118,15 @@
     <div>
       <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
         <span>Changes ({unstagedFiles.length})</span>
+        {#if unstagedFiles.length > 0}
+          <button
+            onclick={() => repoStore.stageAll()}
+            title="Stage all files"
+            class="text-[9px] lowercase font-normal text-textMuted hover:text-green-400 transition-colors"
+          >
+            stage all
+          </button>
+        {/if}
       </div>
       {#if unstagedFiles.length === 0}
         <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">Working tree clean</div>
@@ -113,7 +138,13 @@
               tabindex="0"
               class="px-2 py-1 rounded-full flex items-center justify-between hover:bg-surfaceHover text-textPrimary group transition-colors cursor-pointer"
               onclick={() => repoStore.selectFileDiff(f.path, false)}
-              onkeydown={(e) => (e.key === "Enter" || e.key === " ") && repoStore.selectFileDiff(f.path, false)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  // Space would otherwise scroll the ancestor scroller.
+                  e.preventDefault();
+                  repoStore.selectFileDiff(f.path, false);
+                }
+              }}
             >
               <span class="truncate font-mono text-[11px] {f.is_conflicted ? 'text-amber-400 font-bold' : 'text-textPrimary'}">{f.path}</span>
               <button

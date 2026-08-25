@@ -2031,25 +2031,33 @@ fn composer_error_message(value: &Value) -> Option<String> {
     }
 }
 
-/// Conservative engines.node check: flag only when the running Node major is
-/// provably below a `>=` / `>` / `^` / `~` / bare minimum, or at/above an
-/// exclusive `<` maximum. Unparseable specs produce no warning.
+/// Conservative engines.node check: flag only when the running Node major
+/// satisfies NONE of the spec's `||` alternatives. Each alternative is an AND
+/// of its comparators; unparsable fragments are skipped rather than allowed
+/// to discard their neighbours, and unparseable specs produce no warning.
 pub(crate) fn engines_mismatch(spec: &str, node_version: &str) -> Option<String> {
     let current = parse_node_major(node_version)?;
-    let (min_major, max_exclusive) = parse_engine_bounds(spec)?;
-    if let Some(min) = min_major {
-        if current < min {
-            return Some(format!(
-                "package.json engines.node is `{spec}` but this machine is Node {node_version}"
-            ));
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "*" {
+        return None;
+    }
+    let mut parsed_any = false;
+    let mut satisfied_any = false;
+    for clause in spec.split("||") {
+        let Some((min_major, max_exclusive)) = parse_engine_bounds(clause) else {
+            continue;
+        };
+        parsed_any = true;
+        let above_min = min_major.is_none_or(|min| current >= min);
+        let below_max = max_exclusive.is_none_or(|max| current < max);
+        if above_min && below_max {
+            satisfied_any = true;
         }
     }
-    if let Some(max) = max_exclusive {
-        if current >= max {
-            return Some(format!(
-                "package.json engines.node is `{spec}` but this machine is Node {node_version}"
-            ));
-        }
+    if parsed_any && !satisfied_any {
+        return Some(format!(
+            "package.json engines.node is `{spec}` but this machine is Node {node_version}"
+        ));
     }
     None
 }
@@ -2060,33 +2068,75 @@ pub(crate) fn parse_node_major(version: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn parse_engine_bounds(spec: &str) -> Option<(Option<u32>, Option<u32>)> {
-    let spec = spec.trim();
-    if spec.is_empty() || spec == "*" {
+/// Parses ONE `||`-free clause into inclusive-major bounds. Comparators AND
+/// together; a hyphen range (`16.4.0 - 18.2.0`, spaced or glued) is the
+/// interval [A, B] with B inclusive; unknown fragments are skipped instead
+/// of discarding the bounds already parsed.
+fn parse_engine_bounds(clause: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let clause = clause.trim();
+    if clause.is_empty() || clause == "*" {
         return None;
     }
-    let mut min = None;
-    let mut max_ex = None;
-    for token in spec.split_whitespace() {
+    let mut min: Option<u32> = None;
+    let mut max_ex: Option<u32> = None;
+
+    // Split glued hyphen ranges first so token iteration stays uniform.
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in clause.split_whitespace() {
+        let mut piece = raw.trim().to_string();
+        if !piece.contains(' ') && !piece.contains('-') {
+            tokens.push(piece);
+            continue;
+        }
+        // Hyphen ranges carry a '-' between two version-looking operands.
+        if let Some(idx) = find_hyphen_range_split(&piece) {
+            let a = piece[..idx].to_string();
+            let b = piece[idx + 1..].to_string();
+            tokens.push(a);
+            tokens.push("-".to_string());
+            piece = b;
+        }
+        tokens.push(piece);
+    }
+
+    let mut expect_upper = false;
+    for token in &tokens {
         let token = token.trim().trim_matches(',');
         if token.is_empty() || token == "||" {
             continue;
         }
+        if token == "-" {
+            expect_upper = true;
+            continue;
+        }
         if let Some(rest) = token.strip_prefix(">=") {
-            min = Some(leading_major(rest)?);
+            min = Some(leading_major(rest).unwrap_or(min.unwrap_or(0)));
         } else if let Some(rest) = token.strip_prefix('>') {
-            let n = leading_major(rest)?;
-            min = Some(n.saturating_add(1));
+            if let Some(n) = leading_major(rest) {
+                min = Some(n.saturating_add(1));
+            }
+        } else if let Some(rest) = token.strip_prefix("<=") {
+            if let Some(n) = leading_major(rest) {
+                max_ex = Some(n.saturating_add(1));
+            }
         } else if let Some(rest) = token.strip_prefix('<') {
-            if let Some(rest) = rest.strip_prefix('=') {
-                max_ex = Some(leading_major(rest)?.saturating_add(1));
-            } else {
-                max_ex = Some(leading_major(rest)?);
+            if let Some(n) = leading_major(rest) {
+                max_ex = Some(n);
             }
         } else if let Some(rest) = token.strip_prefix('^').or_else(|| token.strip_prefix('~')) {
-            min = Some(leading_major(rest)?);
-        } else if token.chars().next()?.is_ascii_digit() {
-            min = Some(leading_major(token)?);
+            let m = leading_major(rest);
+            min = m;
+            if let Some(n) = m {
+                max_ex = Some(n.saturating_add(1));
+            }
+        } else if expect_upper {
+            // Upper bound of a hyphen range: inclusive, hence +1 exclusive.
+            if let Some(n) = leading_major(token) {
+                max_ex = Some(n.saturating_add(1));
+            }
+            expect_upper = false;
+        } else if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            min = leading_major(token);
         }
     }
     if min.is_none() && max_ex.is_none() {
@@ -2094,6 +2144,39 @@ fn parse_engine_bounds(spec: &str) -> Option<(Option<u32>, Option<u32>)> {
     } else {
         Some((min, max_ex))
     }
+}
+
+/// Finds the split index of a hyphen-range operator inside a single token:
+/// a `-` preceded by a digit and followed by a digit or `v`-digit.
+fn find_hyphen_range_split(token: &str) -> Option<usize> {
+    if token.starts_with('>')
+        || token.starts_with('<')
+        || token.starts_with('^')
+        || token.starts_with('~')
+        || token.starts_with('=')
+    {
+        return None;
+    }
+    let bytes = token.as_bytes();
+    for i in 1..bytes.len().saturating_sub(1) {
+        if bytes[i] != b'-' {
+            continue;
+        }
+        let prefix = &token[..i];
+        let suffix = &token[i + 1..];
+        // If prefix has >=2 dots (e.g. 18.0.0), it is a prerelease tag (e.g. 18.0.0-1)
+        // unless the suffix also looks like a full version with dots or 'v' (e.g. 16.4.0-18.2.0)
+        if prefix.matches('.').count() >= 2 && !suffix.contains('.') && !suffix.starts_with('v') {
+            continue;
+        }
+        let prev_is_digit = bytes[i - 1].is_ascii_digit();
+        let next = bytes[i + 1];
+        let next_starts_version = next.is_ascii_digit() || (next == b'v');
+        if prev_is_digit && next_starts_version {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn leading_major(s: &str) -> Option<u32> {
@@ -2282,12 +2365,46 @@ mod tests {
     fn engines_mismatch_flags_too_old_and_too_new() {
         assert!(engines_mismatch(">=20", "v18.20.0").is_some());
         assert!(engines_mismatch(">=18", "v20.11.0").is_none());
+        assert!(engines_mismatch(">=18.0.0-0", "v18.20.0").is_none());
+        assert!(engines_mismatch("18.0.0-1", "v18.20.0").is_none());
         assert!(engines_mismatch(">=18 <20", "v22.0.0").is_some());
         assert!(engines_mismatch(">=18 <20", "v18.5.0").is_none());
         assert!(engines_mismatch("^18.0.0", "v16.0.0").is_some());
         assert!(engines_mismatch("*", "v12.0.0").is_none());
         assert!(engines_mismatch("not-a-spec", "v20.0.0").is_none());
         assert_eq!(parse_node_major("v20.11.1"), Some(20));
+    }
+
+    /// Regression (audit M8): a hyphen range used to overwrite its own
+    /// minimum with the upper bound, flagging Node 17 against `16 - 18`.
+    #[test]
+    fn engines_hyphen_range_is_treated_as_inclusive_interval() {
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v17.9.0").is_none());
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v18.2.99").is_none());
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v15.0.0").is_some());
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v19.0.0").is_some());
+        // Glued form without spaces.
+        assert!(engines_mismatch("16.4.0-18.2.0", "v17.9.0").is_none());
+        assert!(engines_mismatch("16.4.0-18.2.0", "v19.0.0").is_some());
+    }
+
+    /// OR clauses are alternatives: satisfying ANY one of them is enough.
+    #[test]
+    fn engines_or_clauses_satisfy_either_side() {
+        assert!(engines_mismatch(">=18 || <=14", "v19.3.0").is_none());
+        assert!(engines_mismatch(">=18 || <=14", "v13.0.0").is_none());
+        assert!(engines_mismatch(">=18 || <=14", "v16.0.0").is_some());
+        // Major-granularity conservativeness: carets set floors only.
+        assert!(engines_mismatch("^18 || ^16", "v15.0.0").is_some());
+        assert!(engines_mismatch("^18 || ^16", "v16.14.0").is_none());
+    }
+
+    /// One unparsable token must not discard the bounds parsed around it.
+    #[test]
+    fn engines_garbage_token_does_not_discard_valid_bounds() {
+        assert!(engines_mismatch(">=18 banana <20", "v19.0.0").is_none());
+        assert!(engines_mismatch(">=18 banana <20", "v17.0.0").is_some());
+        assert!(engines_mismatch(">=18 banana <20", "v21.0.0").is_some());
     }
 
     #[test]
@@ -3003,6 +3120,8 @@ not-json-at-all
         // the v2 fallback mapped where present.
         assert!(vulns.iter().any(|v| v.via.contains(&"A-0".to_string())));
     }
+
+    // -- scanner failure surfacing ---------------------------------------------
 
     use crate::engine::git_cli::CapturedOutput;
 

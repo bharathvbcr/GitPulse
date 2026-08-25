@@ -11,7 +11,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "lcov", "json-summary"],
       reportsDirectory: "coverage",
-      include: ["src/**/*.{ts,js,svelte}"],
+      include: ["src/lib/**"],
       exclude: [
         "src/**/*.test.ts",
         "src/**/*.spec.ts",
@@ -21,8 +21,6 @@ export default defineConfig({
         "src/lib/stores/harnessStore.ts",
         "src/lib/desktop/nativeShell.ts",
         "**/*.svelte",
-        "src/main.ts",
-        "src/App.svelte",
       ],
     },
   },

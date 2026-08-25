@@ -1,13 +1,14 @@
-import type { BranchFolder, BranchInfo, BranchSection, TagInfo } from "./types";
+import type { BranchFolder, BranchInfo, BranchSection, TagInfo, BranchFilterTab } from "./types";
 
 const STALE_SECONDS = 90 * 24 * 60 * 60;
 
-export function fuzzyMatch(query: string, text: string): boolean {
-  return matchFolded(query.trim().toLowerCase(), text.toLowerCase());
+export interface MatchChunk {
+  text: string;
+  matched: boolean;
 }
 
 /** Case-folds `text` against an already-lowercased query — hot-path helper. */
-function matchFolded(q: string, foldedText: string): boolean {
+export function matchFolded(q: string, foldedText: string): boolean {
   if (!q) return true;
   if (foldedText.includes(q)) return true;
   let qi = 0;
@@ -15,6 +16,50 @@ function matchFolded(q: string, foldedText: string): boolean {
     if (foldedText[i] === q[qi]) qi += 1;
   }
   return qi === q.length;
+}
+
+export function fuzzyMatch(query: string, text: string): boolean {
+  return matchFolded(query.trim().toLowerCase(), text.toLowerCase());
+}
+
+/** Computes slice chunks for UI search highlight with zero regex. */
+export function highlightMatches(text: string, query: string): MatchChunk[] {
+  const q = query.trim().toLowerCase();
+  if (!q || !text) return [{ text, matched: false }];
+  const lower = text.toLowerCase();
+
+  // Substring match takes precedence
+  const subIdx = lower.indexOf(q);
+  if (subIdx !== -1) {
+    const chunks: MatchChunk[] = [];
+    if (subIdx > 0) chunks.push({ text: text.slice(0, subIdx), matched: false });
+    chunks.push({ text: text.slice(subIdx, subIdx + q.length), matched: true });
+    if (subIdx + q.length < text.length) {
+      chunks.push({ text: text.slice(subIdx + q.length), matched: false });
+    }
+    return chunks;
+  }
+
+  // Subsequence match fallback
+  const chunks: MatchChunk[] = [];
+  let qi = 0;
+  let currMatched = false;
+  let currBuf = "";
+
+  for (let i = 0; i < text.length; i++) {
+    const isCharMatch = qi < q.length && lower[i] === q[qi];
+    if (isCharMatch) qi++;
+
+    if (isCharMatch === currMatched) {
+      currBuf += text[i];
+    } else {
+      if (currBuf) chunks.push({ text: currBuf, matched: currMatched });
+      currBuf = text[i];
+      currMatched = isCharMatch;
+    }
+  }
+  if (currBuf) chunks.push({ text: currBuf, matched: currMatched });
+  return qi === q.length ? chunks : [{ text, matched: false }];
 }
 
 export function localNameFor(branch: BranchInfo): string {
@@ -36,10 +81,14 @@ export function isStaleBranch(timestamp: number, nowSec: number = Date.now() / 1
   return nowSec - timestamp > STALE_SECONDS;
 }
 
+// One collator shared by every sort site: constructing Intl.Collator per
+// comparison is the expensive part, and grouping sorts thousands of names.
+const nameCollator = new Intl.Collator();
+
 function compareBranches(a: BranchInfo, b: BranchInfo): number {
   if (a.is_current !== b.is_current) return a.is_current ? -1 : 1;
   if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
-  return a.name.localeCompare(b.name);
+  return nameCollator.compare(a.name, b.name);
 }
 
 function splitPath(name: string): { folders: string[]; leaf: string } {
@@ -92,7 +141,7 @@ function insertBranch(
 }
 
 function sortFolder(folder: BranchFolder) {
-  folder.folders.sort((a, b) => a.label.localeCompare(b.label));
+  folder.folders.sort((a, b) => nameCollator.compare(a.label, b.label));
   folder.branches.sort(compareBranches);
   folder.folders.forEach(sortFolder);
 }
@@ -102,7 +151,7 @@ export function countFolder(folder: BranchFolder): number {
 }
 
 function sortSection(section: BranchSection) {
-  section.folders.sort((a, b) => a.label.localeCompare(b.label));
+  section.folders.sort((a, b) => nameCollator.compare(a.label, b.label));
   section.branches.sort(compareBranches);
   section.folders.forEach(sortFolder);
   section.branchCount =
@@ -111,7 +160,11 @@ function sortSection(section: BranchSection) {
       : section.branches.length + section.folders.reduce((n, folder) => n + countFolder(folder), 0);
 }
 
-export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): BranchSection[] {
+export function groupBranches(
+  branches: BranchInfo[],
+  tags: TagInfo[] = [],
+  pinnedBranchNames: Set<string> = new Set()
+): BranchSection[] {
   const local: BranchSection = {
     id: "local",
     label: "Local",
@@ -122,8 +175,6 @@ export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): Bra
     branchCount: 0,
   };
   const remotes = new Map<string, BranchSection>();
-  // Folder indexes live for the whole call so every branch's path parts are
-  // a Map lookup instead of a sibling scan.
   const indexes = new Map<string, Map<string, BranchFolder>>();
   const indexFor = (sectionId: string): Map<string, BranchFolder> => {
     let index = indexes.get(sectionId);
@@ -134,7 +185,12 @@ export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): Bra
     return index;
   };
 
+  const pinnedBranches: BranchInfo[] = [];
+
   for (const branch of branches) {
+    if (pinnedBranchNames.has(branch.name)) {
+      pinnedBranches.push(branch);
+    }
     if (branch.is_remote) {
       const remote = branch.remote_name || "origin";
       let section = remotes.get(remote);
@@ -151,8 +207,12 @@ export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): Bra
         };
         remotes.set(remote, section);
       }
-      const prefix = `${remote}/`;
-      const display = branch.name.startsWith(prefix) ? branch.name.slice(prefix.length) : branch.name;
+      const display =
+        branch.name.length > remote.length &&
+        branch.name.startsWith(remote) &&
+        branch.name.charCodeAt(remote.length) === 47
+          ? branch.name.slice(remote.length + 1)
+          : branch.name;
       insertBranch(indexFor(section.id), section, display, branch);
     } else {
       insertBranch(indexFor(local.id), local, branch.name, branch);
@@ -160,15 +220,29 @@ export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): Bra
   }
 
   sortSection(local);
-  const remoteSections = [...remotes.values()].sort((a, b) => a.label.localeCompare(b.label));
+  const remoteSections = [...remotes.values()].sort((a, b) => nameCollator.compare(a.label, b.label));
   remoteSections.forEach(sortSection);
 
   const sections: BranchSection[] = [];
+
+  if (pinnedBranches.length > 0) {
+    pinnedBranches.sort(compareBranches);
+    sections.push({
+      id: "pinned",
+      label: "Pinned",
+      kind: "pinned",
+      folders: [],
+      branches: pinnedBranches,
+      tags: [],
+      branchCount: pinnedBranches.length,
+    });
+  }
+
   if (local.branchCount > 0) sections.push(local);
   sections.push(...remoteSections);
 
   if (tags.length > 0) {
-    const sorted = [...tags].sort((a, b) => b.name.localeCompare(a.name));
+    const sorted = [...tags].sort((a, b) => nameCollator.compare(b.name, a.name));
     sections.push({
       id: "tags",
       label: "Tags",
@@ -182,57 +256,90 @@ export function groupBranches(branches: BranchInfo[], tags: TagInfo[] = []): Bra
   return sections;
 }
 
-// BranchInfo objects are replaced wholesale on refresh (never mutated in
-// place), so identity-keyed case folding never serves stale fields.
-const haystackCache = new WeakMap<BranchInfo, { name: string; summary: string; author: string }>();
+// Stable text cache keyed on branch name + tip_commit_id so object mutations do NOT evict string cache
+const textCache = new Map<string, { name: string; summary: string; author: string }>();
 
-function branchMatches(branch: BranchInfo, q: string): boolean {
-  let folded = haystackCache.get(branch);
-  if (!folded) {
-    folded = {
+function getFoldedBranch(branch: BranchInfo) {
+  const key = `${branch.name}@${branch.tip_commit_id}`;
+  let cached = textCache.get(key);
+  if (!cached) {
+    cached = {
       name: branch.name.toLowerCase(),
       summary: (branch.last_summary || "").toLowerCase(),
-      author: branch.last_author.toLowerCase(),
+      author: (branch.last_author || "").toLowerCase(),
     };
-    haystackCache.set(branch, folded);
+    textCache.set(key, cached);
+    if (textCache.size > 25000) textCache.clear();
   }
+  return cached;
+}
+
+function branchMatches(branch: BranchInfo, q: string, tab: BranchFilterTab, nowSec: number): boolean {
+  if (tab === "local" && branch.is_remote) return false;
+  if (tab === "remote" && !branch.is_remote) return false;
+  if (tab === "active" && isStaleBranch(branch.last_commit_timestamp, nowSec)) return false;
+  if (tab === "stale" && !isStaleBranch(branch.last_commit_timestamp, nowSec)) return false;
+
+  if (!q) return true;
+  const folded = getFoldedBranch(branch);
   return (
-    matchFolded(q, folded.name) || matchFolded(q, folded.summary) || matchFolded(q, folded.author)
+    matchFolded(q, folded.name) ||
+    matchFolded(q, folded.summary) ||
+    matchFolded(q, folded.author)
   );
 }
 
-function filterFolder(folder: BranchFolder, q: string): BranchFolder | null {
-  if (folder.label.toLowerCase().includes(q)) {
-    return folder;
+function filterFolder(folder: BranchFolder, q: string, tab: BranchFilterTab, nowSec: number): BranchFolder | null {
+  if (q && folder.label.toLowerCase().includes(q)) {
+    if (tab === "all") return folder;
+    const folders = folder.folders
+      .map((child) => filterFolder(child, "", tab, nowSec))
+      .filter((child): child is BranchFolder => child !== null);
+    const branches = folder.branches.filter((branch) => branchMatches(branch, "", tab, nowSec));
+    if (folders.length === 0 && branches.length === 0) return null;
+    return { ...folder, folders, branches };
   }
   const folders = folder.folders
-    .map((child) => filterFolder(child, q))
+    .map((child) => filterFolder(child, q, tab, nowSec))
     .filter((child): child is BranchFolder => child !== null);
-  const branches = folder.branches.filter((branch) => branchMatches(branch, q));
+  const branches = folder.branches.filter((branch) => branchMatches(branch, q, tab, nowSec));
   if (folders.length === 0 && branches.length === 0) return null;
   return { ...folder, folders, branches };
 }
 
-export function filterBranchSections(sections: BranchSection[], query: string): BranchSection[] {
-  const q = query.trim();
-  if (!q) return sections;
-  const ql = q.toLowerCase();
+export function filterBranchSections(
+  sections: BranchSection[],
+  query: string,
+  tab: BranchFilterTab = "all",
+  nowSec: number = Date.now() / 1000
+): BranchSection[] {
+  const q = query.trim().toLowerCase();
+  if (!q && tab === "all") return sections;
+
   return sections
     .map((section) => {
+      if (tab === "local" && section.kind !== "local" && section.kind !== "pinned") return null;
+      if (tab === "remote" && section.kind !== "remote") return null;
+      if (tab === "tags" && section.kind !== "tags") return null;
+      if (tab === "pinned" && section.kind !== "pinned") return null;
+
       if (section.kind === "tags") {
+        if (tab === "local" || tab === "remote" || tab === "active" || tab === "stale" || tab === "pinned") return null;
         const tags = section.tags.filter(
           (tag) => fuzzyMatch(q, tag.name) || (tag.message ? fuzzyMatch(q, tag.message) : false)
         );
-        if (tags.length === 0 && !fuzzyMatch(q, section.label)) return null;
+        if (tags.length === 0 && (q && !fuzzyMatch(q, section.label))) return null;
         return { ...section, tags, branchCount: tags.length };
       }
-      if (fuzzyMatch(q, section.label) && q.length === section.label.length) {
+
+      if (q && fuzzyMatch(q, section.label) && q.length === section.label.length) {
         return section;
       }
+
       const folders = section.folders
-        .map((folder) => filterFolder(folder, ql))
+        .map((folder) => filterFolder(folder, q, tab, nowSec))
         .filter((folder): folder is BranchFolder => folder !== null);
-      const branches = section.branches.filter((branch) => branchMatches(branch, ql));
+      const branches = section.branches.filter((branch) => branchMatches(branch, q, tab, nowSec));
       if (folders.length === 0 && branches.length === 0) return null;
       const branchCount = branches.length + folders.reduce((n, folder) => n + countFolder(folder), 0);
       return { ...section, folders, branches, branchCount };

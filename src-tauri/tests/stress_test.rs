@@ -3,7 +3,7 @@ use gitpulse_lib::diff::{
     compute_word_diff, ConflictResolver, DiffLineType, FilePatch, PatchBuilder, UnifiedDiffHunk,
     UnifiedDiffLine,
 };
-use gitpulse_lib::engine::GitWriter;
+use gitpulse_lib::engine::{GitReader, GitWriter};
 use gitpulse_lib::graph::{LaneSolver, RawCommitNode, TopologyIndex};
 use std::process::Command as StdCommand;
 use std::time::Instant;
@@ -501,4 +501,227 @@ fn test_stack_tree_cyclic_ancestry_safety() {
 
     let breadcrumbs = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, "feat-a");
     assert!(!breadcrumbs.breadcrumb_chain.is_empty());
+}
+
+#[test]
+fn test_topology_slice_hostile_window_requests() {
+    use gitpulse_lib::graph::VisualCommitRow;
+
+    let rows: Vec<VisualCommitRow> = (0..500)
+        .map(|i| VisualCommitRow {
+            id: format!("c{i}"),
+            parent_ids: vec![],
+            summary: "s".to_string(),
+            author_name: "Dev".to_string(),
+            author_email: "dev@example.com".to_string(),
+            timestamp: 1700000000 + i as i64,
+            lane: 0,
+            color_index: 0,
+            active_lanes: vec![0, 1],
+            active_lane_colors: vec![0, 1],
+            connections: vec![],
+            is_merge: false,
+            is_root: false,
+        })
+        .collect();
+    let index = TopologyIndex::build(&rows);
+    assert_eq!(index.len(), 500);
+
+    // Hostile viewport arguments must clamp, never panic or overflow.
+    assert!(index.slice(usize::MAX, 1).is_empty());
+    assert!(index.slice(50_000, 50).is_empty());
+    assert_eq!(index.slice(0, usize::MAX).len(), 500);
+    assert_eq!(index.slice(499, usize::MAX).len(), 1);
+    assert_eq!(index.slice(250, usize::MAX).len(), 250);
+
+    // Sweep every window boundary, including counts that would overflow
+    // `start + count` if the math were unguarded.
+    for start in 0..500 {
+        for count in [1usize, 499, 500, usize::MAX] {
+            let window = index.slice(start, count);
+            let expected = (500 - start).min(count);
+            assert_eq!(
+                window.len(),
+                expected,
+                "slice({start}, {count:#x}) clamped wrong"
+            );
+        }
+    }
+}
+
+/// Path-scoped commit diffs must stay bounded when one commit touches thousands
+/// of files: transferring the full `git show` over IPC is the bottleneck this
+/// command exists to avoid.
+#[test]
+fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let git = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let _ = StdCommand::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .status()
+        .expect("git init");
+    let files_dir = dir.path().join("bulk");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    const N: usize = 5_000;
+    for i in 0..N {
+        std::fs::write(files_dir.join(format!("f{i}.txt")), format!("v0-{i}\n")).unwrap();
+    }
+    git(&["add", "-A"]);
+    git(&["commit", "-m", "bulk v0"]);
+    std::fs::write(files_dir.join("f0.txt"), "v1-target\n").unwrap();
+    std::fs::write(files_dir.join("f4999.txt"), "v1-other\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-m", "bulk v1"]);
+    let head = String::from_utf8(
+        StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let path = dir.path().to_string_lossy().into_owned();
+    let scoped = GitReader::get_commit_file_diff(&path, &head, "bulk/f0.txt").expect("scoped");
+    assert!(
+        scoped.contains("v1-target"),
+        "must contain the requested file: {scoped}"
+    );
+    assert!(
+        !scoped.contains("v1-other"),
+        "must not carry a sibling file from the 5000-file commit"
+    );
+    assert!(
+        scoped.len() < 64 * 1024,
+        "path-scoped diff must stay small, got {} bytes",
+        scoped.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// discard_changes under a held .git/index.lock
+// ---------------------------------------------------------------------------
+
+/// Deterministic clean-failure trigger for discard_changes: holding
+/// `.git/index.lock` makes BOTH underlying commands fail (restore and clean
+/// each need the index), so the call must surface a proper Err naming the
+/// lock — never a silent Ok — leave the working tree untouched, keep working
+/// once the lock is released, and not leak the stale lock itself.
+#[test]
+fn discard_changes_reports_err_while_index_lock_is_held_and_recovers() {
+    let dir = init_repo_with_base_file();
+    let path = dir.path().to_str().unwrap().to_string();
+
+    // A tracked modification that the discard is supposed to revert.
+    std::fs::write(dir.path().join("lib.rs"), "fn mutated() {}\n").unwrap();
+
+    let lock = dir.path().join(".git").join("index.lock");
+    std::fs::write(&lock, b"held by a concurrent git process").unwrap();
+
+    let result = GitWriter::discard_changes(&path, "lib.rs");
+    let err = match result {
+        Err(err) => err,
+        Ok(()) => panic!(
+            "discard under a held index.lock reported success; \
+             a check that could not run must not read as a pass"
+        ),
+    };
+    assert!(
+        err.contains("index.lock"),
+        "error should name the actual obstruction, got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("lib.rs")).unwrap(),
+        "fn mutated() {}\n",
+        "working tree must be untouched while the lock is held"
+    );
+    assert!(lock.exists(), "the test harness's own lock must survive");
+
+    // Release: the identical call now succeeds and reverts the file.
+    std::fs::remove_file(&lock).unwrap();
+    GitWriter::discard_changes(&path, "lib.rs")
+        .expect("discard must succeed once the lock is gone");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("lib.rs")).unwrap(),
+        "fn a() {}\nfn b() {}\n",
+        "discard after lock release must restore tracked content"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// worktree roundtrip through the command layer's engine seam
+// ---------------------------------------------------------------------------
+
+/// list/add/remove roundtrip over linked worktrees.
+///
+/// NOTE: written as a plain `#[test]`, not `#[tokio::test]`: this crate has
+/// NO direct tokio dependency (it arrives transitively via tauri) and the
+/// hardening budget forbids adding one, so the async command wrappers cannot
+/// be awaited here. The commands themselves are one-line off_thread hops over
+/// exactly these engine functions, so exercising them exercises everything
+/// the command layer adds beyond scheduling.
+#[test]
+fn worktree_list_add_remove_roundtrip_on_a_temp_repo() {
+    use gitpulse_lib::engine::worktree::{add_worktree, list_worktrees, remove_worktree};
+
+    let dir = init_repo_with_base_file();
+    let repo = dir.path().to_str().unwrap().to_string();
+    let parent = tempfile::TempDir::new().unwrap();
+    let target = parent.path().join("wt-feature");
+    let target_str = target.to_str().unwrap();
+
+    // Baseline listing: exactly the main worktree, not bare, on main.
+    let before = list_worktrees(&repo).expect("initial list");
+    assert_eq!(before.len(), 1, "fresh repo has only its main worktree");
+    assert!(before[0].is_main);
+
+    // Add a linked worktree on a new branch.
+    add_worktree(&repo, target_str, Some("feature/wt"), None, false).expect("worktree add");
+    assert!(
+        target.join(".git").is_file(),
+        "linked worktree uses a gitfile"
+    );
+
+    // Listing sees both, main first, with branch names resolved.
+    let listed = list_worktrees(&repo).expect("list after add");
+    assert_eq!(listed.len(), 2);
+    assert!(listed[0].is_main);
+    assert!(!listed[0].branch.as_deref().unwrap_or("").is_empty());
+    let linked = listed
+        .iter()
+        .find(|w| !w.is_main)
+        .expect("linked entry present");
+    assert_eq!(linked.branch.as_deref(), Some("feature/wt"));
+    assert!(!linked.is_locked);
+    assert!(!linked.is_detached);
+
+    // Remove it; listing collapses back to one, and the directory is gone.
+    remove_worktree(&repo, target_str, false).expect("worktree remove");
+    let after = list_worktrees(&repo).expect("list after remove");
+    assert_eq!(after.len(), 1);
+    assert!(
+        !target.exists(),
+        "removed worktree directory must not linger"
+    );
+
+    // Removing an already-removed worktree is refused, not silently Ok.
+    assert!(
+        remove_worktree(&repo, target_str, false).is_err(),
+        "double remove must surface as an error"
+    );
 }

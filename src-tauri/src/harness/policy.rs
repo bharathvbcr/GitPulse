@@ -108,6 +108,40 @@ impl PolicyVerdict {
         self.status.blocks()
     }
 
+    /// True when the gate did not run for a reason that is *not* "this machine
+    /// has no harness installed".
+    ///
+    /// The two are not the same event and must not degrade the same way.
+    /// Running unguarded with no harness installed is GitPulse's documented
+    /// behaviour: it is a standing condition the user chose and the UI shows
+    /// permanently. Running unguarded because our own sidecar was busy, wedged,
+    /// timed out, or spoke a protocol we could not read is none of those — it
+    /// is transient, self-inflicted, and invisible in the moment it matters.
+    /// Treating it as a pass is how a force-push gets through the check that
+    /// exists to stop it, so a mutating action refuses instead.
+    ///
+    /// Note this is deliberately *not* folded into [`PolicyVerdict::blocks`]:
+    /// no rule fired, so nothing was refused *by policy*, and the UI must keep
+    /// telling those apart. This is the action seam's question, not a verdict.
+    pub fn gate_failed(&self) -> bool {
+        self.status == PolicyStatus::Unchecked && self.detail_code != "not_installed"
+    }
+
+    /// The gate failure, rendered for an error dialog.
+    pub fn gate_failure(&self) -> String {
+        format!(
+            "The MANVI harness is installed but could not judge this action, so \
+             GitPulse did not run it [{}]: {}\n  target: {}",
+            if self.detail_code.is_empty() {
+                "unknown"
+            } else {
+                &self.detail_code
+            },
+            self.detail,
+            self.target
+        )
+    }
+
     /// The refusal, rendered for an error dialog.
     pub fn refusal(&self) -> String {
         let rule = if self.rule.is_empty() {
@@ -230,6 +264,59 @@ mod tests {
         assert!(!v.blocks());
         assert_eq!(v.detail_code, "not_installed");
         assert_ne!(v.status, PolicyStatus::Allowed);
+    }
+
+    /// Regression: contention, a timeout, a dead child and a protocol breach
+    /// all produce an *unchecked* verdict, and an unchecked verdict does not
+    /// block. Before `gate_failed`, that meant a momentarily busy sidecar let
+    /// `git push --force` through the gate that exists to refuse it, recorded
+    /// only as "unguarded". Only a machine with no harness installed may
+    /// degrade that way.
+    #[test]
+    fn a_gate_that_failed_while_installed_is_not_permission_to_act() {
+        for err in [
+            HarnessError::Busy("another gated action is in progress".into()),
+            HarnessError::Timeout("no answer in 15s".into()),
+            HarnessError::Unavailable("sidecar exited".into()),
+            HarnessError::Protocol("undecodable response".into()),
+            HarnessError::Refused(crate::harness::protocol::WireError {
+                code: "E_INTERNAL".into(),
+                message: "boom".into(),
+                retryable: false,
+            }),
+        ] {
+            let v = PolicyVerdict::unchecked("git push --force origin main", &err);
+            assert!(!v.checked, "{err:?} must not read as a check that ran");
+            assert!(
+                v.gate_failed(),
+                "{err:?} must not be treated as permission to act"
+            );
+            // The refusal has to name the cause, or the user cannot act on it.
+            assert!(v.gate_failure().contains(&err.message()));
+            // Still not a policy refusal: no rule fired, and the UI must be
+            // able to tell an unavailable gate from a gate that said no.
+            assert!(!v.blocks(), "{err:?} is not a rule firing");
+        }
+    }
+
+    #[test]
+    fn no_harness_installed_is_the_one_unchecked_verdict_that_may_proceed() {
+        let v = PolicyVerdict::unchecked(
+            "git push --force origin main",
+            &HarnessError::NotInstalled("no manvi binary".into()),
+        );
+        assert!(!v.gate_failed());
+        assert!(!v.blocks());
+    }
+
+    #[test]
+    fn a_verdict_that_ran_never_reads_as_a_failed_gate() {
+        for action in ["allow", "warn", "deny", "something-new"] {
+            let v = PolicyVerdict::from_decision("x", decision(action, ""));
+            assert!(v.checked);
+            assert!(!v.gate_failed(), "{action} ran; the gate did not fail");
+        }
+        assert!(!PolicyVerdict::from_decision("x", decision("allow", "host-scope")).gate_failed());
     }
 
     #[test]

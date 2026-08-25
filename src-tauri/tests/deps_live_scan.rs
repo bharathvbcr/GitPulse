@@ -116,6 +116,196 @@ fn live_pip_audit_reports_flask_advisories() {
     );
 }
 
+/// Real `bundler-audit` against a Gemfile.lock pinning nokogiri 1.10.3,
+/// which carries CVE-2019-13118 in the Ruby Advisory Database.
+#[test]
+fn live_bundler_audit_reports_nokogiri_advisory() {
+    let Some(bin) = resolve_tool("GITPULSE_TEST_BUNDLER_AUDIT", "bundler-audit") else {
+        eprintln!("skip: bundler-audit not on PATH and GITPULSE_TEST_BUNDLER_AUDIT unset");
+        return;
+    };
+    prepend_path(bin.parent().expect("bin dir"));
+
+    let repo = git_repo();
+    // bundler-audit resolves Bundler.root, which requires a Gemfile beside
+    // the lockfile; no `BUNDLED WITH` section avoids pinning a runtime.
+    write(
+        repo.path(),
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '~> 1.10.3'\n",
+    );
+    write(
+        repo.path(),
+        "Gemfile.lock",
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.10.3)\n      mini_portile2 (~> 2.4.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  nokogiri\n",
+    );
+    git_add(repo.path(), "Gemfile");
+    git_add(repo.path(), "Gemfile.lock");
+
+    let report =
+        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
+            .expect("scan");
+
+    assert!(
+        report.bundler_audit_present,
+        "scanner probe must find the real bundler-audit"
+    );
+    assert!(
+        !report
+            .issues
+            .iter()
+            .any(|i| i.code == "bundler_audit_failed"),
+        "live audit must not fail: {:?}",
+        report.issues
+    );
+    let hits: Vec<_> = report
+        .vulnerabilities
+        .iter()
+        .filter(|v| v.name == "nokogiri" && v.ecosystem == "ruby")
+        .collect();
+    assert!(
+        !hits.is_empty(),
+        "expected nokogiri advisories among: {:?}",
+        report.vulnerabilities
+    );
+    assert!(
+        hits.iter()
+            .any(|v| v.severity == "high" || v.severity == SEVERITY_UNKNOWN_TAG),
+        "cvss-derived or unranked severity expected: {:?}",
+        hits.iter().map(|v| &v.severity).collect::<Vec<_>>()
+    );
+}
+
+const SEVERITY_UNKNOWN_TAG: &str = "unknown";
+
+/// Real `cargo audit` against a lockfile pinning time 0.1.45
+/// (RUSTSEC-2020-0071). Requires the isolated cargo-audit binary via
+/// GITPULSE_TEST_CARGO_AUDIT (a plain `cargo` on PATH also works).
+#[test]
+fn live_cargo_audit_reports_time_rustsec() {
+    let Some(bin) = resolve_tool("GITPULSE_TEST_CARGO_AUDIT", "cargo-audit") else {
+        eprintln!("skip: cargo-audit not on PATH and GITPULSE_TEST_CARGO_AUDIT unset");
+        return;
+    };
+    // `cargo audit` resolves cargo-* subcommands from PATH.
+    prepend_path(bin.parent().expect("bin dir"));
+
+    let repo = git_repo();
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[package]\nname = \"auditfix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntime = \"=0.1.45\"\n",
+    );
+    // A real lockfile needs real checksums; let cargo resolve it.
+    let resolved = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .env("CARGO_NET_OFFLINE", "false")
+        .current_dir(repo.path())
+        .status();
+    if !matches!(resolved, Ok(s) if s.success()) {
+        eprintln!("skip: could not generate Cargo.lock (offline?)");
+        return;
+    }
+    if !repo.path().join("Cargo.lock").exists() {
+        eprintln!("skip: no Cargo.lock produced");
+        return;
+    }
+    git_add(repo.path(), "Cargo.toml");
+    git_add(repo.path(), "Cargo.lock");
+
+    let report =
+        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
+            .expect("scan");
+
+    assert!(
+        report.cargo_audit_present,
+        "scanner probe must find the real cargo-audit"
+    );
+    assert!(
+        !report.issues.iter().any(|i| i.code == "cargo_audit_failed"),
+        "live audit must not fail: {:?}",
+        report.issues
+    );
+    let time_vulns: Vec<_> = report
+        .vulnerabilities
+        .iter()
+        .filter(|v| v.name == "time" && v.ecosystem == "cargo")
+        .collect();
+    assert!(
+        time_vulns
+            .iter()
+            .any(|v| v.title.contains("RUSTSEC-2020-0071") || v.range.contains("RUSTSEC-2020-0071")),
+        "expected RUSTSEC-2020-0071 among: {:?}",
+        time_vulns
+    );
+}
+
+/// Real `npm audit` + `npm outdated` through the pre-existing enrich path:
+/// lodash 4.17.15 carries multiple high-severity advisories.
+#[test]
+fn live_npm_audit_reports_lodash_advisories() {
+    if resolve_tool("GITPULSE_TEST_NPM", "npm").is_none() {
+        eprintln!("skip: npm not on PATH and GITPULSE_TEST_NPM unset");
+        return;
+    }
+
+    let repo = git_repo();
+    write(
+        repo.path(),
+        "package.json",
+        r#"{
+  "name": "npm-live-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "lodash": "4.17.15" }
+}"#,
+    );
+    let locked = Command::new("npm")
+        .args([
+            "install",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--no-audit",
+        ])
+        .current_dir(repo.path())
+        .status();
+    if !matches!(locked, Ok(s) if s.success()) {
+        eprintln!("skip: could not generate package-lock.json (offline?)");
+        return;
+    }
+    git_add(repo.path(), "package.json");
+    git_add(repo.path(), "package-lock.json");
+
+    let report =
+        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
+            .expect("scan");
+
+    assert!(
+        report.npm_cli_present,
+        "scanner probe must find the real npm"
+    );
+    assert!(
+        !report.issues.iter().any(|i| i.code == "audit_failed"),
+        "live npm audit must not fail: {:?}",
+        report.issues
+    );
+    let lodash: Vec<_> = report
+        .vulnerabilities
+        .iter()
+        .filter(|v| v.name == "lodash" && v.ecosystem == "npm")
+        .collect();
+    assert!(
+        !lodash.is_empty(),
+        "expected lodash advisories among: {:?}",
+        report.vulnerabilities
+    );
+    assert!(
+        report.audit.high > 0 || report.audit.critical > 0,
+        "lodash 4.17.15 carries high/critical advisories; summary was {:?}",
+        report.audit
+    );
+}
+
 /// Real `govulncheck` against a module pinning golang.org/x/text v0.3.5,
 /// which carries GO-2021-0113 / GO-2022-1059 at module level.
 #[test]

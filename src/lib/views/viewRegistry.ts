@@ -43,6 +43,12 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     menuGroup: "inspect",
     paletteCommand: "Scan npm vulnerabilities and updates",
   },
+  storage: {
+    id: "storage",
+    label: "Storage",
+    menuGroup: "inspect",
+    paletteCommand: "Scan repository disk usage",
+  },
   stack: { id: "stack", label: "Stack", menuGroup: "inspect" },
   manvi: { id: "manvi", label: "MANVI", menuGroup: "more", paletteCommand: "Open MANVI View" },
   github: { id: "github", label: "GitHub", menuGroup: "more", paletteCommand: "Open GitHub Panel" },

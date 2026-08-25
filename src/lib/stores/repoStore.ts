@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../ui/formatError";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import type { BranchInfo, TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
@@ -42,6 +43,8 @@ import {
   STATUS_POLL_INTERVAL_MS,
   shouldRunStatusPoll,
 } from "../repos/statusPoll";
+import { debounce, type Debounced } from "../async/debounce";
+import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
 /** What a mutating action reports back: whether it ran, and under what verdict. */
@@ -90,6 +93,8 @@ interface BranchStatsReport {
   computed: number;
   cached: number;
   capped: boolean;
+  /** Branches whose churn walk errored this call — missing, not pending. */
+  compute_failures: number;
 }
 
 export interface OpenRepoTab {
@@ -120,6 +125,8 @@ export interface RepoSession {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
+  /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
+  selectedIsStaged: boolean;
   selectedDiff: string | DiffPayload | null;
   activeTab: ViewTab;
   searchQuery: string;
@@ -131,6 +138,11 @@ export interface RepoSession {
   generation: number;
   /** True while this session's progressive branch-stats fetch is in flight. */
   statsPending: boolean;
+  /**
+   * True when this path's last branch-stats attempt failed outright, so rows
+   * would otherwise show fake zeros; cleared by the next successful drain.
+   */
+  statsFailed: boolean;
 }
 
 export interface RepoState {
@@ -146,6 +158,8 @@ export interface RepoState {
   statuses: FileStatus[];
   selectedCommitId: string | null;
   selectedFilePath: string | null;
+  /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
+  selectedIsStaged: boolean;
   selectedDiff: string | DiffPayload | null;
   activeTab: ViewTab;
   isLoading: boolean;
@@ -162,6 +176,8 @@ export interface RepoState {
    * running, or null. Workspace-global, not per-session.
    */
   pendingMutation: string | null;
+  /** True when the active session's last branch-stats attempt failed. */
+  statsFailed: boolean;
 }
 
 interface InternalState {
@@ -186,6 +202,18 @@ export interface RepoStoreDeps {
     selectBranch(branch: string | null): void;
     clear(): void;
   };
+}
+
+/**
+ * Session generations never restart — not on close+reopen, not on workspace
+ * restore, not on store re-creation. A pre-close in-flight hydrate still
+ * carries its old (session id, generation) pair; if a fresh incarnation drew
+ * generation 1 again, that stale response would pass the guard and overwrite
+ * the new session's data.
+ */
+let sessionGenerationSource = 0;
+function nextSessionGeneration(): number {
+  return ++sessionGenerationSource;
 }
 
 const MENU_RECENT_CAP = 12;
@@ -223,6 +251,18 @@ function mutationLabel(kind: string): string {
   return MUTATION_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 
+/**
+ * Upper bound of cmd_branch_stats batches drained per fetch. The backend
+ * computes at most 96 unique uncached tips per call, so 64 batches cover
+ * ~6100 unique tips; past the bound draining stops silently and churn
+ * resumes on the next refresh.
+ */
+export const STATS_DRAIN_MAX_BATCHES = 64;
+/** Publish coalesced stats every N batches (and always on the final drain). */
+export const STATS_PUBLISH_EVERY = 8;
+/** Trailing window that collapses watcher-event storms into one refresh. */
+const WATCHER_REFRESH_DEBOUNCE_MS = 200;
+
 function emptyProjected(): RepoState {
   return {
     openTabs: [],
@@ -237,6 +277,7 @@ function emptyProjected(): RepoState {
     statuses: [],
     selectedCommitId: null,
     selectedFilePath: null,
+    selectedIsStaged: false,
     selectedDiff: null,
     activeTab: "history",
     isLoading: false,
@@ -247,6 +288,7 @@ function emptyProjected(): RepoState {
     generation: 0,
     statsPending: false,
     pendingMutation: null,
+    statsFailed: false,
   };
 }
 
@@ -264,6 +306,7 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     statuses: extras.statuses ?? [],
     selectedCommitId: extras.selectedCommitId ?? null,
     selectedFilePath: extras.selectedFilePath ?? null,
+    selectedIsStaged: extras.selectedIsStaged ?? false,
     selectedDiff: extras.selectedDiff ?? null,
     activeTab: extras.activeTab ?? "history",
     searchQuery: extras.searchQuery ?? "",
@@ -272,8 +315,9 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     isAmending: extras.isAmending ?? false,
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
-    generation: extras.generation ?? 1,
+    generation: extras.generation ?? nextSessionGeneration(),
     statsPending: extras.statsPending ?? false,
+    statsFailed: extras.statsFailed ?? false,
   };
 }
 
@@ -315,6 +359,7 @@ function project(internal: InternalState): RepoState {
     statuses: active?.statuses ?? [],
     selectedCommitId: active?.selectedCommitId ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
+    selectedIsStaged: active?.selectedIsStaged ?? false,
     selectedDiff: active?.selectedDiff ?? null,
     activeTab: active?.activeTab ?? "history",
     isLoading: active?.isLoading ?? false,
@@ -325,6 +370,7 @@ function project(internal: InternalState): RepoState {
     generation: active?.generation ?? 0,
     statsPending: active?.statsPending ?? false,
     pendingMutation: internal.pendingMutation,
+    statsFailed: active?.statsFailed ?? false,
   };
 }
 
@@ -358,6 +404,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   function ensureStatusPoll() {
     if (pollTimer !== null || typeof setInterval === "undefined") return;
     pollTimer = setInterval(() => void runStatusPoll(), STATUS_POLL_INTERVAL_MS);
+    // Quitting inside the persist debounce window would drop the newest
+    // search query / view tab; `pagehide` fires on close and navigation.
+    if (typeof document !== "undefined") {
+      document.addEventListener("pagehide", flushPersist);
+    }
+  }
+
+  /** Stops the workspace poll; the next activation restarts it lazily. */
+  function stopStatusPoll() {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
 
   async function runStatusPoll() {
@@ -431,7 +489,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const pending = pendingPersist;
     if (!pending) return;
     pendingPersist = null;
-    savePersistedWorkspace(storage, pending.data);
+    if (!savePersistedWorkspace(storage, pending.data)) {
+      // The write did not land (quota, private mode). Restore the payload
+      // and roll the dedup marker back so an identical future state retries
+      // instead of being skipped as "already persisted".
+      pendingPersist = pending;
+      lastPersistedPayload = null;
+      if (typeof setTimeout !== "undefined" && persistTimer === null) {
+        persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+      }
+    }
     const recentsJson = JSON.stringify(pending.recents);
     if (recentsJson !== lastSentRecentsJson) {
       lastSentRecentsJson = recentsJson;
@@ -489,9 +556,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /**
    * Presents the session's repository in the graph pane (cached rows render
    * instantly). It deliberately does NOT call loadGraph: the App-level effect
-   * keyed on path/generation/revision/query is the single owner of graph
-   * fetching, and activation paths here also re-ran that effect — every tab
-   * switch fetched the same page twice.
+   * owns fetches keyed on path/revision/query — activation re-renders cached
+   * rows without a refetch. Freshness comes from refresh(), which loadGraphs
+   * directly for the active session on watcher events and after mutations.
    */
   function revealGraph(session: RepoSession | undefined) {
     if (!session) {
@@ -553,54 +620,115 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return invokeFn<ResolvedRepo>("cmd_resolve_repo", { repoPath: path });
   }
 
+  /**
+   * Ordering token for snapshot fetches. `activateTab` starts a hydrate at
+   * generation N; `refresh()` and watcher events start more at the SAME N
+   * (refresh never bumps). Generation alone cannot order those, so the older
+   * response could resolve last and overwrite fresher data. Only the
+   * latest-started fetch may apply.
+   */
+  const snapshotRuns = new Map<string, number>();
+
   async function hydrate(id: string, path: string, generation: number) {
+    const run = (snapshotRuns.get(id) ?? 0) + 1;
+    snapshotRuns.set(id, run);
     try {
       const snapshot = await loadSnapshot(path);
+      if (snapshotRuns.get(id) !== run) return;
       if (applyToSession(id, generation, { ...snapshot, isLoading: false, error: null })) {
         void fetchBranchStats(id, path, generation);
       }
     } catch (err: unknown) {
-      applyToSession(id, generation, { isLoading: false, error: String(err) });
+      if (snapshotRuns.get(id) !== run) return;
+      applyToSession(id, generation, { isLoading: false, error: formatError(err) });
     }
   }
 
   // --- progressive branch churn ------------------------------------------
-  // Churn arrives via cmd_branch_stats after the snapshot renders. One fetch
-  // per session at a time: a refresh while one is in flight lets it finish —
+  // Churn arrives via cmd_branch_stats after the snapshot renders. One logical
+  // fetch per session at a time: capped reports re-invoke inside the same
+  // in-flight slot until drained, and a refresh racing one lets it finish —
   // the tip guard keeps stale merges out, and the next refresh fetches again.
   const statsInflight = new Set<string>();
+
+  function branchStatsKey(name: string, isRemote: boolean, remoteName?: string | null): string {
+    return `${isRemote ? "remote" : "local"}:${remoteName ?? ""}:${name}`;
+  }
 
   async function fetchBranchStats(id: string, path: string, generation: number) {
     if (statsInflight.has(id)) return;
     statsInflight.add(id);
     applyToSession(id, generation, { statsPending: true });
+    const start = internal.sessions[id];
+    if (!start || start.generation !== generation) {
+      statsInflight.delete(id);
+      return;
+    }
+    let branches = start.branches;
+    let dirty = false;
+    // `pending` keeps the in-flight marker lit across intermediate publishes;
+    // `failed` lands only on the final settle so a mid-drain hiccup that a
+    // later batch recovers from never flashes the failure marker.
+    const flush = (pending: boolean, failed: boolean) => {
+      if (dirty) {
+        applyToSession(id, generation, { branches, statsPending: pending, statsFailed: failed });
+        dirty = false;
+        return;
+      }
+      applyToSession(id, generation, { statsPending: pending, statsFailed: failed });
+    };
     try {
-      const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
-      const session = internal.sessions[id];
-      if (!session || session.generation !== generation) return;
-      const updates = new Map(report.updates.map((update) => [update.name, update]));
-      let touched = false;
-      const branches = session.branches.map((branch) => {
-        const update = updates.get(branch.name);
-        // Tip guard: churn computed for another commit is stale; dropping it
-        // means a moved branch can never wear another commit's numbers.
-        if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
-        touched = true;
-        return {
-          ...branch,
-          additions: update.additions,
-          deletions: update.deletions,
-          files_changed: update.files_changed,
-          commits_ahead_of_base: update.commits_ahead_of_base,
-          commits_behind_base: update.commits_behind_base,
-          compared_to: report.compared_to,
-        };
-      });
-      applyToSession(id, generation, touched ? { branches, statsPending: false } : { statsPending: false });
+      // Only the LAST batch's failure count matters: uncached failures are
+      // retried every round, so an early hiccup a later batch recovered from
+      // must not taint the settle.
+      let lastBatchHadFailures = false;
+      let drainedCleanly = false;
+      for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
+        const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
+        const session = internal.sessions[id];
+        if (!session || session.generation !== generation) return;
+
+        lastBatchHadFailures = report.compute_failures > 0;
+
+        const updates = new Map(
+          report.updates.map((update) => [
+            branchStatsKey(update.name, update.is_remote, update.remote_name),
+            update,
+          ]),
+        );
+        let batchTouched = false;
+        branches = branches.map((branch) => {
+          const update = updates.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
+          if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
+          batchTouched = true;
+          return {
+            ...branch,
+            additions: update.additions,
+            deletions: update.deletions,
+            files_changed: update.files_changed,
+            commits_ahead_of_base: update.commits_ahead_of_base,
+            commits_behind_base: update.commits_behind_base,
+            compared_to: report.compared_to,
+          };
+        });
+        if (batchTouched) dirty = true;
+        const drained = !report.capped;
+        if (dirty && (drained || (batch + 1) % STATS_PUBLISH_EVERY === 0)) {
+          flush(report.capped, false);
+        }
+        if (drained) {
+          drainedCleanly = true;
+          break;
+        }
+      }
+      // Clean drain retires any earlier failure marker; exhausting the batch
+      // bound or losing walks to errors must NOT read as success — BranchList
+      // renders its "churn unavailable" marker off statsFailed.
+      flush(false, !drainedCleanly || lastBatchHadFailures);
     } catch {
-      // Unknown-command rejections from older backends degrade like
-      // cmd_list_tags: churn stays as-is, never an error state.
-      applyToSession(id, generation, { statsPending: false });
+      // Final failure: stop posing zeros as data — BranchList renders its
+      // "churn unavailable" marker off statsFailed instead.
+      flush(false, true);
     } finally {
       statsInflight.delete(id);
     }
@@ -625,6 +753,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   function diffSelectionCurrent(sessionId: string, seq: number): boolean {
     return diffSelections.get(sessionId) === seq;
+  }
+
+  // --- watcher-storm coalescing -------------------------------------------
+  // One trailing debounce per changed repo path; a later event re-arms the
+  // same timer instead of queueing overlapping refreshes.
+  const watcherRefreshTimers = new Map<string, Debounced<[]>>();
+
+  function scheduleWatcherRefresh(key: string, run: () => void) {
+    let timer = watcherRefreshTimers.get(key);
+    if (!timer) {
+      timer = debounce(run, WATCHER_REFRESH_DEBOUNCE_MS);
+      watcherRefreshTimers.set(key, timer);
+    }
+    timer();
   }
 
   const store = {
@@ -653,7 +795,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         resolved = await resolvePath(rawPath);
       } catch (err: unknown) {
         if (!extras.allowBroken) {
-          internal = { ...internal, workspaceError: String(err) };
+          internal = { ...internal, workspaceError: formatError(err) };
           publish();
           return false;
         }
@@ -750,7 +892,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
               error: resolved ? null : "Repository is unavailable",
-              generation: 1,
             },
           );
       putSession(session);
@@ -778,7 +919,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await store.openRepo(folder);
         }
       } catch (err: unknown) {
-        internal = { ...internal, workspaceError: String(err) };
+        internal = { ...internal, workspaceError: formatError(err) };
         publish();
       }
     },
@@ -810,6 +951,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
       internal = { ...internal, sessions: rest };
+      stopStatusPoll();
       if (session) {
         graph.evict(session.path);
         await unwatch(session.path);
@@ -819,6 +961,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         // Activation-by-close: bump the neighbor so the App-owned graph
         // effect refetches exactly once for it.
         putSession(bumped(next));
+        ensureStatusPoll();
       }
       syncFilterFromSession(activeSession());
       publish();
@@ -836,6 +979,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -843,6 +987,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (internal.workspace.activeId === id) {
         putSession(bumped(keep));
       }
+      ensureStatusPoll();
       syncFilterFromSession(activeSession());
       publish();
       revealGraph(activeSession());
@@ -859,6 +1004,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (remaining.has(key)) sessions[key] = session;
       }
       internal = { ...internal, sessions };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -869,10 +1015,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // treats it as a fresh activation.
       if (revealed) {
         putSession(bumped(revealed));
+        ensureStatusPoll();
       }
       syncFilterFromSession(activeSession());
       publish();
       revealGraph(activeSession());
+      flushPersist();
     },
     nextTab: async () => {
       if (!beginShortcut()) return;
@@ -925,17 +1073,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     },
     handleRepoChanged: async (changedPath?: string | null) => {
+      // Watcher events arrive per file; a checkout or rebase fires many at
+      // once. Each changed path collapses onto its own trailing window so a
+      // storm becomes one refresh; explicit refresh() calls stay undelayed.
       if (!changedPath) {
-        await store.refresh();
+        scheduleWatcherRefresh("", () => void store.refresh());
         return;
       }
       const session = Object.values(internal.sessions).find((item) =>
         sameRepo(item.path, changedPath, options),
       );
       if (!session) return;
-      await store.refresh(session.path);
+      scheduleWatcherRefresh(session.path, () => void store.refresh(session.path));
     },
     restoreWorkspace: async () => {
+      stopStatusPoll();
       const persisted = loadPersistedWorkspace(storage, options);
       replaceWorkspace({
         ...emptyWorkspace(),
@@ -1011,12 +1163,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: filePath,
           selectedCommitId: null,
           selectedDiff: diff,
+          selectedIsStaged: isStaged,
           activeTab: "diff",
         });
       } catch (err: unknown) {
         // A stale failure must not paint its error over a newer selection.
         if (!diffSelectionCurrent(session.id, seq)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     selectCommitDiff: async (commitId: string) => {
@@ -1034,10 +1187,38 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedCommitId: commitId,
           selectedFilePath: null,
           selectedDiff: diff,
+          selectedIsStaged: false,
         });
       } catch (err: unknown) {
         if (!diffSelectionCurrent(session.id, seq)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
+      }
+    },
+    /**
+     * Opens one file of a commit while keeping the commit as the selection owner.
+     */
+    selectCommitFileDiff: async (commitId: string, filePath: string) => {
+      const session = activeSession();
+      if (!session) return;
+      const generation = session.generation;
+      const seq = beginDiffSelection(session.id);
+      try {
+        const fileDiff = await invokeFn<string>("cmd_get_commit_file_diff", {
+          repoPath: session.path,
+          commitId,
+          filePath,
+        });
+        if (!diffSelectionCurrent(session.id, seq)) return;
+        applyToSession(session.id, generation, {
+          selectedCommitId: commitId,
+          selectedFilePath: filePath,
+          selectedDiff: fileDiff,
+          selectedIsStaged: false,
+          activeTab: "diff",
+        });
+      } catch (err: unknown) {
+        if (!diffSelectionCurrent(session.id, seq)) return;
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     selectRangeDiff: async (from: string, to: string) => {
@@ -1056,17 +1237,47 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: `${from}...${to}`,
           selectedCommitId: null,
           selectedDiff: diff,
+          selectedIsStaged: false,
           activeTab: "diff",
         });
       } catch (err: unknown) {
         if (!diffSelectionCurrent(session.id, seq)) return;
-        applyToSession(session.id, generation, { error: String(err) });
+        applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
     stageFile: async (filePath: string) =>
       runMutating("stage", filePath, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath })),
     unstageFile: async (filePath: string) =>
       runMutating("unstage", filePath, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath })),
+    stageSelectivePatch: async (filePatch: FilePatch, isStaging: boolean = true) => {
+      if (isStaging) {
+        return runMutating("stage-patch", filePatch.new_path, (path) =>
+          invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch })
+        );
+      } else {
+        return runMutating("unstage-patch", filePatch.new_path, (path) =>
+          invokeFn("cmd_unstage_selective_patch", { repoPath: path, filePatch })
+        );
+      }
+    },
+    stageAll: async () => {
+      const session = activeSession();
+      if (!session) return { ok: false, error: "No active repository" };
+      const unstaged = session.statuses.filter((s) => !s.is_staged);
+      for (const f of unstaged) {
+        await runMutating("stage", f.path, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }));
+      }
+      return { ok: true };
+    },
+    unstageAll: async () => {
+      const session = activeSession();
+      if (!session) return { ok: false, error: "No active repository" };
+      const staged = session.statuses.filter((s) => s.is_staged);
+      for (const f of staged) {
+        await runMutating("unstage", f.path, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath: f.path }));
+      }
+      return { ok: true };
+    },
     discardChanges: async (filePath: string) =>
       runMutating("discard", filePath, (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath })),
     commit: async (message: string, amend: boolean = false) =>
@@ -1086,7 +1297,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName })
       ),
     deleteBranch: async (branchName: string, force: boolean = false) =>
-      runMutating(force ? "branch-delete" : "branch-delete", branchName, (path) =>
+      runMutating(force ? "branch-delete-force" : "branch-delete", branchName, (path) =>
         invokeFn("cmd_delete_branch", { repoPath: path, branchName, force })
       ),
     mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
@@ -1125,6 +1336,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, session.generation, { activeTab: tab });
       // The view tab is persisted state: flush so quitting right after a
       // switch does not restore the previous one.
+      flushPersist();
+    },
+    inspectCommitInHistory: (commitId: string) => {
+      const session = activeSession();
+      if (!session || !commitId) return;
+      applyToSession(session.id, session.generation, {
+        selectedCommitId: commitId,
+        selectedFilePath: null,
+        selectedDiff: null,
+        selectedIsStaged: false,
+        activeTab: "history",
+      });
       flushPersist();
     },
     setCommitDraft: (message: string) => {
@@ -1176,9 +1399,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // a caller that must react to a refusal — the commit box keeping the
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
-      applyToSession(session.id, generation, { error: String(err) });
+      applyToSession(session.id, generation, { error: formatError(err) });
       harnessStore.recordAction({ kind, label, ok: false });
-      return { ok: false, error: String(err) };
+      return { ok: false, error: formatError(err) };
     } finally {
       if (internal.pendingMutation !== null) {
         internal = { ...internal, pendingMutation: null };

@@ -1,7 +1,8 @@
 //! Adversarial and stress coverage for the language-aware coverage scanner.
 //!
-//! Regression sections are marked EXPECTED-FAIL-PRE-FIX: they encode bugs
-//! found in audit and must fail until the scanner is fixed.
+//! Regression tests below are marked REGRESSION GUARD: each encodes a bug
+//! found in audit that has since been fixed and now asserts the fixed
+//! behavior, failing loudly if it reappears.
 
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
@@ -42,8 +43,9 @@ fn entries_for(report: &gitpulse_lib::analyzer::coverage::CoverageReport, path: 
         .unwrap_or(0)
 }
 
-// EXPECTED-FAIL-PRE-FIX: lcov `DA:<line>,<hits>[,<checksum>]` records were
-// silently dropped because the third field made the hits field unparseable.
+// REGRESSION GUARD: lcov `DA:<line>,<hits>[,<checksum>]` records were silently
+// dropped by the pre-fix parser because the optional third field made the hits
+// value unparseable; records must now parse with the checksum ignored.
 #[test]
 fn regression_lcov_checksum_records_are_kept() {
     let repo = git_repo();
@@ -63,8 +65,9 @@ fn regression_lcov_checksum_records_are_kept() {
     assert_eq!(detail.lines[1].hits, 0);
 }
 
-// EXPECTED-FAIL-PRE-FIX: a few KB of go-cover text expanded into millions of
-// BTreeMap entries because block ranges had no entry budget.
+// REGRESSION GUARD: a few KB of go-cover text once expanded into millions of
+// BTreeMap entries because block ranges had no entry budget; expansion must
+// stay bounded.
 #[test]
 fn regression_go_cover_expansion_is_bounded() {
     let repo = git_repo();
@@ -93,8 +96,9 @@ fn regression_go_cover_expansion_is_bounded() {
     );
 }
 
-// EXPECTED-FAIL-PRE-FIX: the same artifact path was read and parsed once per
-// interested family (e.g. javascript + native both claim coverage/lcov.info).
+// REGRESSION GUARD: the same artifact path was once read and parsed once per
+// interested family (e.g. javascript + native both claim coverage/lcov.info);
+// deduplication must report it exactly once.
 #[test]
 fn regression_shared_artifact_is_reported_once() {
     let repo = git_repo();

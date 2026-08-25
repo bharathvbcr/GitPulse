@@ -28,6 +28,44 @@ impl Default for BranchFoldingEngine {
     }
 }
 
+/// How far up the mainline the fork-point probe may search when the chain's
+/// terminating parent does not equal the merge's first parent outright.
+const FOLD_ANCESTRY_DEPTH: usize = 64;
+
+fn is_in_ancestry(
+    target_id: &str,
+    start_id: &str,
+    commits: &[RawCommitNode],
+    index: &HashMap<&str, usize>,
+    max_depth: usize,
+) -> bool {
+    if target_id == start_id {
+        return true;
+    }
+    let Some(start) = index.get(start_id).copied() else {
+        return false;
+    };
+    let mut queue = vec![start];
+    let mut visited: Vec<usize> = Vec::new();
+    let mut depth = 0;
+    while let Some(curr) = queue.pop() {
+        if commits[curr].id == target_id {
+            return true;
+        }
+        if depth >= max_depth || visited.contains(&curr) {
+            continue;
+        }
+        visited.push(curr);
+        depth += 1;
+        for p in &commits[curr].parent_ids {
+            if let Some(&pi) = index.get(p.as_str()) {
+                queue.push(pi);
+            }
+        }
+    }
+    false
+}
+
 impl BranchFoldingEngine {
     pub fn new() -> Self {
         Self {
@@ -35,14 +73,14 @@ impl BranchFoldingEngine {
         }
     }
 
-    /// Identifies all linear feature subgraphs that can be collapsed.
-    ///
     /// For every 2-parent merge the feature parent's ancestry is walked back
-    /// until a node whose single parent equals the merge's mainline parent
-    /// (fold), or until the walk can say no (fork, merge, root, or history
-    /// boundary). The walk is a literal mirror of that specification over
-    /// integer indices — no per-step `String` clones or `HashSet` churn like
-    /// the first implementation — and is hard-bounded by `MAX_FOLD_WALK`
+    /// until a node whose single parent is the merge's mainline parent or an
+    /// ancestor of it within [`FOLD_ANCESTRY_DEPTH`] levels (fold — branches
+    /// commonly fork from an older mainline commit, not the merge's immediate
+    /// first parent), or until the walk can say no (fork, merge, root, or
+    /// history boundary). The walk is a literal mirror of that specification
+    /// over integer indices — no per-step `String` clones or `HashSet` churn
+    /// like the first implementation — and is hard-bounded by `MAX_FOLD_WALK`
     /// steps per merge so an agent-scale window (hundreds of merges over
     /// 100k-commit lineages) degrades by skipping the deepest runs instead of
     /// stalling the graph load.
@@ -69,6 +107,9 @@ impl BranchFoldingEngine {
 
             let mut chain: Vec<usize> = Vec::new();
             let mut folded = false;
+            // Where the run rejoins mainline: the mainline parent itself on
+            // the exact-match path, the fork point on the ancestry path.
+            let mut fold_root = mainline_parent;
             let mut steps = 0usize;
             loop {
                 chain.push(current);
@@ -77,6 +118,20 @@ impl BranchFoldingEngine {
                     let next_parent = parents[0].as_str();
                     if next_parent == mainline_parent {
                         folded = true;
+                        break;
+                    }
+                    // The chain may rejoin below the immediate first parent:
+                    // a branch forked from any ancestor of the mainline
+                    // parent still forms a clean diverge-and-rejoin run.
+                    if is_in_ancestry(
+                        next_parent,
+                        mainline_parent,
+                        commits,
+                        &index,
+                        FOLD_ANCESTRY_DEPTH,
+                    ) {
+                        folded = true;
+                        fold_root = next_parent;
                         break;
                     }
                     match index.get(next_parent) {
@@ -101,7 +156,7 @@ impl BranchFoldingEngine {
                     commit.id.clone(),
                     FoldedBranchRun {
                         merge_commit_id: commit.id.clone(),
-                        branch_root_id: mainline_parent.to_string(),
+                        branch_root_id: fold_root.to_string(),
                         folded_commit_ids: chain.iter().map(|&i| commits[i].id.clone()).collect(),
                         commit_count: chain.len(),
                         is_collapsed: false,
@@ -298,5 +353,29 @@ mod tests {
         let mut engine2 = BranchFoldingEngine::new();
         let commits2 = vec![make_node("s", vec!["s"]), make_node("m2", vec!["s", "s"])];
         engine2.identify_foldable_runs(&commits2);
+    }
+
+    /// The feature branch forked from an ancestor of the merge's first parent,
+    /// not from that parent itself. Folding must walk mainline ancestry rather
+    /// than requiring `next_parent == mainline_parent`.
+    #[test]
+    fn test_fold_when_feature_forked_from_mainline_ancestor() {
+        let mut engine = BranchFoldingEngine::new();
+        let commits = vec![
+            make_node("m", vec!["main2", "feat2"]),
+            make_node("feat2", vec!["feat1"]),
+            make_node("feat1", vec!["main0"]),
+            make_node("main2", vec!["main1"]),
+            make_node("main1", vec!["main0"]),
+            make_node("main0", vec![]),
+        ];
+
+        engine.identify_foldable_runs(&commits);
+        let run = engine
+            .get_foldable_runs()
+            .get("m")
+            .expect("feature run must fold onto the mainline ancestor");
+        assert_eq!(run.folded_commit_ids, vec!["feat2", "feat1"]);
+        assert_eq!(run.branch_root_id, "main0");
     }
 }

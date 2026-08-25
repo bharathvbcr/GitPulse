@@ -7,6 +7,9 @@
   import { filterStore } from "./lib/stores/filterStore";
   import { applyPlatformClass, isMacOS } from "./lib/platform";
   import { queryNeedsServerFetch } from "./lib/filter/parseQuery";
+  import { displayName } from "./lib/repos/paths";
+  import { formatError } from "./lib/ui/formatError";
+  import { LAYERS } from "./lib/ui/layers";
   import {
     subscribeNativeShell,
     syncRecentMenu,
@@ -23,6 +26,7 @@
   import BlameViewer from "./lib/components/BlameViewer.svelte";
   import CoverageViewer from "./lib/components/CoverageViewer.svelte";
   import HealthPanel from "./lib/components/HealthPanel.svelte";
+  import StoragePanel from "./lib/components/StoragePanel.svelte";
   import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
@@ -62,12 +66,20 @@
   onMount(() => {
     applyPlatformClass();
     const unsubs: Array<() => void> = [];
+    // HMR/unmount can tear the component down while the async subscription
+    // chain is still awaiting; listeners pushed after cleanup must be
+    // unwound immediately instead of leaking past the component.
+    let disposed = false;
+    const track = (unsub: () => void) => {
+      if (disposed) unsub();
+      else unsubs.push(unsub);
+    };
     void (async () => {
       // A failed native-shell subscription must not abort startup: it unwinds
       // its own listeners before rethrowing, and skipping the restore below
       // would lose the persisted session. Log and keep booting.
       try {
-        unsubs.push(
+        track(
           await subscribeNativeShell({
             open: () => void repoStore.pickAndOpenRepo(),
             clone: () => {
@@ -115,7 +127,7 @@
       }
       await syncRecentMenu($repoStore.recentRepos);
       try {
-        unsubs.push(
+        track(
           await listen<{ path?: string }>("repo-changed", (event) => {
             void repoStore.handleRepoChanged(event.payload?.path);
           }),
@@ -125,15 +137,17 @@
       }
     })();
     return () => {
+      disposed = true;
       for (const unsub of unsubs) unsub();
     };
   });
 
   $effect(() => {
     const path = $repoStore.currentPath;
-    // The activation epoch: every open/activate/close bumps it, making this
-    // effect the single owner of graph fetches (repoStore only presents).
-    const generation = $repoStore.generation;
+    // Fetch ownership: path/revision/query changes re-walk history here.
+    // Activation does NOT: cached rows render instantly via showRepo, and
+    // freshness comes from refresh()'s own loadGraph (watcher events,
+    // post-mutation refreshes), so switching tabs never re-walks.
     const query = $filterStore.searchQuery;
     const revision = $filterStore.selectedBranch;
     if (!path) {
@@ -144,7 +158,7 @@
     // client-side over the rows already loaded, so keystrokes do not re-walk
     // a large repository per character.
     const needsServer = queryNeedsServerFetch(query);
-    const repoRevisionKey = `${path}\u241f${generation}\u241f${revision ?? ""}`;
+    const repoRevisionKey = `${path}\u241f${revision ?? ""}`;
     const key = needsServer ? `${repoRevisionKey}\u241f${query}` : repoRevisionKey;
     if (key === lastGraphKey) return;
     lastGraphKey = key;
@@ -169,7 +183,7 @@
 
 {#snippet paneFailed(error: unknown, reset: () => void)}
   <!-- Minimal crash isolation: a broken pane never takes down the window. -->
-  <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={String(error)}>
+  <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatError(error)}>
     <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
     <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
   </div>
@@ -284,9 +298,9 @@
               {#each $repoStore.recentRepos as repo}
                 <button
                   onclick={() => repoStore.openRepo(repo)}
-                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-sm hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-all duration-150 text-left"
+                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-sm hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
                 >
-                  <span class="font-medium truncate">{repo.split("/").pop()}</span>
+                  <span class="font-medium truncate">{displayName(repo)}</span>
                   <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{repo}</span>
                 </button>
               {/each}
@@ -324,6 +338,8 @@
                 <CoverageViewer />
               {:else if $repoStore.activeTab === "health"}
                 <HealthPanel />
+              {:else if $repoStore.activeTab === "storage"}
+                <StoragePanel />
               {:else if $repoStore.activeTab === "stack"}
                 <CodeStackViewer />
               {:else if $repoStore.activeTab === "github"}
@@ -343,7 +359,8 @@
 
   {#if dropActive}
     <div
-      class="gp-overlay absolute inset-0 z-40 bg-accent/10 backdrop-blur-sm p-4 flex items-center justify-center pointer-events-none gp-gpu"
+      class="gp-overlay absolute inset-0 bg-accent/10 backdrop-blur-sm p-4 flex items-center justify-center pointer-events-none gp-gpu"
+      style="z-index: {LAYERS.DROP_OVERLAY}"
     >
       <div class="w-full h-full rounded-3xl border-2 border-dashed border-accent/70 bg-accent/5 flex items-center justify-center">
         <div class="gp-pop px-6 py-4 rounded-2xl bg-surface border border-accent/50 text-sm font-semibold text-textPrimary shadow-float">

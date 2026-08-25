@@ -345,7 +345,8 @@ export class GraphRenderer {
     if (!rows || rows.length === 0) return;
 
     ctx.save();
-    ctx.lineWidth = lineWidth;
+    try {
+      ctx.lineWidth = lineWidth;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.imageSmoothingEnabled = true;
@@ -527,10 +528,11 @@ export class GraphRenderer {
 
       ctx.lineWidth = lineWidth;
     }
-
+  } finally {
     ctx.restore();
     releaseLaneScratch();
   }
+}
 
   /**
    * Draws the fading stubs for commits whose parent lies outside the loaded

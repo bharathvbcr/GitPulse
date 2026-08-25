@@ -21,6 +21,7 @@ export type ViewTab =
   | "blame"
   | "coverage"
   | "health"
+  | "storage"
   | "stack"
   | "github"
   | "manvi"
@@ -33,6 +34,7 @@ export const VIEW_TABS: readonly ViewTab[] = [
   "blame",
   "coverage",
   "health",
+  "storage",
   "stack",
   "github",
   "manvi",
@@ -176,8 +178,11 @@ export function loadPersistedWorkspace(
   };
 }
 
-export function savePersistedWorkspace(storage: StorageLike | null, data: PersistedWorkspace): void {
-  if (!storage) return;
+export function savePersistedWorkspace(
+  storage: StorageLike | null,
+  data: PersistedWorkspace
+): boolean {
+  if (!storage) return false;
   try {
     // Legacy keys first, workspace blob LAST: the loader prefers the blob, so
     // a quota failure mid-write can leave stale legacy keys but never a
@@ -189,8 +194,11 @@ export function savePersistedWorkspace(storage: StorageLike | null, data: Persis
       storage.removeItem(STORAGE_KEY_LAST_PATH);
     }
     storage.setItem(STORAGE_KEY_WORKSPACE, JSON.stringify(data));
+    return true;
   } catch {
-    /* quota / private mode — fail closed, keep in-memory state */
+    /* quota / private mode — fail closed, keep in-memory state. The false
+       return lets callers retry instead of believing the write landed. */
+    return false;
   }
 }
 

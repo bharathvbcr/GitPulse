@@ -9,6 +9,7 @@ pub mod graph;
 pub mod harness;
 pub mod ops;
 pub mod stack;
+pub mod storage;
 pub mod watcher;
 
 use commands::*;
@@ -38,6 +39,7 @@ pub fn run() {
             cmd_get_commit_graph,
             cmd_get_file_diff,
             cmd_get_commit_diff,
+            cmd_get_commit_file_diff,
             cmd_get_range_diff,
             cmd_get_commit_files,
             cmd_get_commit_details,
@@ -48,6 +50,7 @@ pub fn run() {
             cmd_stage_file,
             cmd_unstage_file,
             cmd_stage_selective_patch,
+            cmd_unstage_selective_patch,
             cmd_commit,
             cmd_checkout_branch,
             cmd_create_branch,
@@ -56,6 +59,7 @@ pub fn run() {
             cmd_clone_repo,
             cmd_parse_conflict,
             cmd_resolve_conflict,
+            cmd_preview_conflict,
             cmd_detect_language,
             cmd_count_loc,
             cmd_parse_conventional_commit,
@@ -70,6 +74,7 @@ pub fn run() {
             cmd_scan_coverage,
             cmd_get_file_coverage,
             cmd_scan_deps_health,
+            cmd_storage_scan,
             cmd_branch_cleanup_plan,
             cmd_review_outgoing_commits,
             cmd_fetch,
@@ -90,6 +95,9 @@ pub fn run() {
             cmd_list_worktrees,
             cmd_add_worktree,
             cmd_remove_worktree,
+            cmd_lock_worktree,
+            cmd_unlock_worktree,
+            cmd_prune_worktree,
             cmd_create_tag,
             cmd_delete_tag,
             cmd_publish_release,

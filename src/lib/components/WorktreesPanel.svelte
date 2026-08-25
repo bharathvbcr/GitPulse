@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { formatError } from "../ui/formatError";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import {
@@ -9,6 +10,8 @@
     Trash2,
     ExternalLink,
     Lock,
+    Unlock,
+    Sparkles,
     AlertTriangle,
   } from "lucide-svelte";
 
@@ -37,6 +40,18 @@
   let newPath = $state("");
   let newBranch = $state("");
   let startPoint = $state("");
+  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    $repoStore.currentPath;
+    $repoStore.generation;
+    void load();
+    return () => {
+      // The arming timer is tracked so destroy can clear it; a pending
+      // confirm must not survive its panel.
+      if (confirmTimer !== null) clearTimeout(confirmTimer);
+    };
+  });
 
   async function load() {
     const repo = $repoStore.currentPath;
@@ -50,10 +65,36 @@
       worktrees = next;
     } catch (err: unknown) {
       if (epoch !== loadEpoch || $repoStore.currentPath !== repo) return;
-      error = String(err);
+      error = formatError(err);
     } finally {
       // A superseded load must not clear a newer load's spinner.
       if (epoch === loadEpoch) isLoading = false;
+    }
+  }
+
+  async function toggleLock(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      if (wt.is_locked) {
+        await invoke("cmd_unlock_worktree", { repoPath: repo, targetPath: wt.path });
+      } else {
+        await invoke("cmd_lock_worktree", { repoPath: repo, targetPath: wt.path, reason: null });
+      }
+      await load();
+    } catch (err: unknown) {
+      error = formatError(err);
+    }
+  }
+
+  async function prune() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await invoke("cmd_prune_worktree", { repoPath: repo });
+      await load();
+    } catch (err: unknown) {
+      error = formatError(err);
     }
   }
 
@@ -84,35 +125,58 @@
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree", label: newPath.trim(), ok: false });
-      error = String(err);
+      error = formatError(err);
     } finally {
       isCreating = false;
     }
+  }
+
+  /** Armed-confirm label; names the discard cost when changes would be lost. */
+  function removeArmTitle(wt: WorktreeInfo): string {
+    if (removingPath !== wt.path) return "Remove this worktree";
+    const dirty = wt.dirty_files ?? 0;
+    return dirty > 0
+      ? `Discard ${dirty} changed files? Click again to remove`
+      : "Click again to remove";
   }
 
   async function remove(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
     // Two-step confirm: the first click arms, the second removes. No native
-    // dialog, so the flow stays keyboard-reachable and testable.
+    // dialog, so the flow stays keyboard-reachable and testable. The arming
+    // timer is tracked so destroy (effect cleanup above) can clear it.
     if (removingPath !== wt.path) {
       removingPath = wt.path;
-      setTimeout(() => {
+      if (confirmTimer !== null) clearTimeout(confirmTimer);
+      confirmTimer = setTimeout(() => {
+        confirmTimer = null;
         if (removingPath === wt.path) removingPath = null;
       }, 4000);
       return;
     }
     removingPath = null;
+    // A dirty worktree must not be silently discarded: --force only when the
+    // status scan found nothing to lose (dirty_files === null means "not
+    // scanned", treated as clean so removal stays one confirm).
+    const force = (wt.dirty_files ?? 0) === 0;
     try {
-      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force: true });
+      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force });
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: true });
-      if ($repoStore.currentPath === wt.path) return;
+      if ($repoStore.currentPath === wt.path) {
+        // T-F09: the active tab points INTO the removed directory. Close it —
+        // which activates a surviving neighbor — instead of stranding the
+        // workspace on a deleted path.
+        const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+        if (stranded) await repoStore.closeTab(stranded.id);
+        return;
+      }
       await load();
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: false });
-      error = String(err);
+      error = formatError(err);
     }
   }
 
@@ -131,14 +195,24 @@
       <FolderGit2 size={11} />
       <span>Worktrees ({worktrees.length})</span>
     </span>
-    <button
-      onclick={() => (showAddForm = !showAddForm)}
-      title="Create a linked worktree for a parallel task"
-      aria-label="Create worktree"
-      class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
-    >
-      <Plus size={12} />
-    </button>
+    <div class="flex items-center gap-1">
+      <button
+        onclick={prune}
+        title="Prune stale worktree metadata"
+        aria-label="Prune stale worktrees"
+        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
+      >
+        <Sparkles size={11} />
+      </button>
+      <button
+        onclick={() => (showAddForm = !showAddForm)}
+        title="Create a linked worktree for a parallel task"
+        aria-label="Create worktree"
+        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
+      >
+        <Plus size={12} />
+      </button>
+    </div>
   </div>
 
   {#if showAddForm}
@@ -216,12 +290,29 @@
               <ExternalLink size={11} />
             </button>
             {#if !wt.is_main}
-            <button
-              onclick={() => void remove(wt)}
-              title={removingPath === wt.path ? "Click again to remove" : "Remove this worktree"}
-              aria-label={removingPath === wt.path ? `Click again to remove ${wt.name}` : `Remove worktree ${wt.name}`}
-              class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
-            >
+              <button
+                onclick={() => void toggleLock(wt)}
+                title={wt.is_locked ? "Unlock this worktree" : "Lock this worktree"}
+                aria-label={wt.is_locked ? `Unlock worktree ${wt.name}` : `Lock worktree ${wt.name}`}
+                class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
+              >
+                {#if wt.is_locked}
+                  <Unlock size={11} />
+                {:else}
+                  <Lock size={11} />
+                {/if}
+              </button>
+              {#if removingPath === wt.path}
+                <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
+                  {(wt.dirty_files ?? 0) > 0 ? `Discard ${wt.dirty_files} changed files?` : "Remove?"}
+                </span>
+              {/if}
+              <button
+                onclick={() => void remove(wt)}
+                title={removeArmTitle(wt)}
+                aria-label={removingPath === wt.path ? `Click again to remove ${wt.name}` : `Remove worktree ${wt.name}`}
+                class="p-0.5 rounded-full {removingPath === wt.path ? 'text-rose-400' : 'hover:text-rose-400'}"
+              >
                 <Trash2 size={11} />
               </button>
             {/if}

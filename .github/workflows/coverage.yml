@@ -14,6 +14,7 @@ jobs:
   coverage:
     name: Generate Code Coverage Reports
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -48,12 +49,19 @@ jobs:
       - name: Frontend Coverage (Vitest + v8)
         run: npm run coverage
 
+      - name: Verify Frontend LCOV Was Produced
+        run: |
+          test -f coverage/lcov.info || {
+            echo "coverage/lcov.info missing — vitest --coverage did not emit lcov";
+            exit 1;
+          }
+
       - name: Upload Frontend Coverage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: frontend-lcov
           path: coverage/lcov.info
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Generate Rust Coverage (LCOV + summary)
         run: |

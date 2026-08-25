@@ -279,19 +279,30 @@ pub fn review_outgoing_commits(repo_path: &str) -> Result<CommitReviewReport, St
     }
 
     let limit = format!("-n{}", COMMIT_REVIEW_LIMIT);
-    let output = git_text(&repo, &["log", &limit, "--format=%H%x00%s%x01", &range])?;
-    let commits: Vec<(String, String)> = output
-        .split('\x01')
-        .filter_map(|record| {
-            let record = record.trim();
-            if record.is_empty() {
-                return None;
-            }
-            let (id, subject) = record.split_once('\0')?;
-            Some((id.to_string(), subject.trim().to_string()))
-        })
-        .collect();
+    let output = git_text(&repo, &["log", &limit, "--format=%H%x00%s%x00", &range])?;
+    let commits = parse_commit_review_log(&output);
     Ok(analyze_commit_messages(range, total_commits, &commits))
+}
+
+/// Parses `git log --format=%H%x00%s%x00` output into `(commit_id, subject)`
+/// pairs.
+///
+/// NUL is used as both the field and record separator because a commit
+/// subject may contain any byte except NUL (git only forbids NUL in commit
+/// data), whereas the `\x01` record separator this format replaced can
+/// legitimately appear inside a subject. Git appends a newline after each
+/// entry, so the newline ahead of the next hash is trimmed off the id.
+fn parse_commit_review_log(output: &str) -> Vec<(String, String)> {
+    let mut fields = output.split('\0');
+    let mut commits = Vec::new();
+    while let (Some(id), Some(subject)) = (fields.next(), fields.next()) {
+        let id = id.trim();
+        if id.is_empty() {
+            break;
+        }
+        commits.push((id.to_string(), subject.trim().to_string()));
+    }
+    commits
 }
 
 fn release_tag_regex() -> &'static Regex {
@@ -417,6 +428,38 @@ mod tests {
         assert!(validate_release_tag("1.2.3").is_err());
         assert!(validate_release_tag("v01.2.3").is_err());
         assert!(validate_release_tag("v1.2.3^{}").is_err());
+    }
+
+    #[test]
+    fn commit_review_log_parses_nul_records_with_control_chars_in_subject() {
+        // Mirrors `git log --format=%H%x00%s%x00` output: each entry ends
+        // with NUL plus git's trailing newline. The subject carrying a raw
+        // \x01 byte must not split the record stream.
+        let output = "abc12345\x00fix: embed \x01 byte in subject\x00\ndef67890\x00second\x00\n";
+        let commits = parse_commit_review_log(output);
+        assert_eq!(
+            commits,
+            vec![
+                (
+                    "abc12345".to_string(),
+                    "fix: embed \x01 byte in subject".to_string()
+                ),
+                ("def67890".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_review_log_keeps_empty_subjects_aligned() {
+        let output = "aaa11111\x00\x00\nbbb22222\x00real subject\x00\n";
+        let commits = parse_commit_review_log(output);
+        assert_eq!(
+            commits,
+            vec![
+                ("aaa11111".to_string(), String::new()),
+                ("bbb22222".to_string(), "real subject".to_string()),
+            ]
+        );
     }
 
     #[test]

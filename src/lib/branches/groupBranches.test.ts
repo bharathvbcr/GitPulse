@@ -4,6 +4,7 @@ import {
   filterBranchSections,
   fuzzyMatch,
   groupBranches,
+  highlightMatches,
   isStaleBranch,
   localNameFor,
 } from "./groupBranches";
@@ -30,12 +31,30 @@ function branch(partial: Partial<BranchInfo> & Pick<BranchInfo, "name">): Branch
   };
 }
 
-describe("fuzzyMatch", () => {
+describe("fuzzyMatch and highlightMatches", () => {
   it("matches substrings and subsequences", () => {
     expect(fuzzyMatch("", "feat/auth")).toBe(true);
     expect(fuzzyMatch("auth", "feat/auth")).toBe(true);
     expect(fuzzyMatch("fta", "feat/auth")).toBe(true);
     expect(fuzzyMatch("xyz", "feat/auth")).toBe(false);
+  });
+
+  it("chunks text for search highlight accurately", () => {
+    expect(highlightMatches("feature/auth", "auth")).toEqual([
+      { text: "feature/", matched: false },
+      { text: "auth", matched: true },
+    ]);
+    expect(highlightMatches("main", "")).toEqual([{ text: "main", matched: false }]);
+    expect(highlightMatches("feature/login", "ftr")).toEqual([
+      { text: "f", matched: true },
+      { text: "ea", matched: false },
+      { text: "t", matched: true },
+      { text: "u", matched: false },
+      { text: "r", matched: true },
+      { text: "e/login", matched: false },
+    ]);
+    expect(highlightMatches("main", "zzz")).toEqual([{ text: "main", matched: false }]);
+    expect(highlightMatches("", "x")).toEqual([{ text: "", matched: false }]);
   });
 });
 
@@ -166,5 +185,39 @@ describe("groupBranches at scale", () => {
       deepest = next!;
     }
     expect(deepest.branches.map((b) => b.name)).toEqual(["lvl0/lvl1/lvl2/lvl3/br19999"]);
+  });
+
+  it("supports pinned branches and tab filtering", () => {
+    const branches = [
+      branch({ name: "main", is_current: true }),
+      branch({ name: "feat/auth", last_commit_timestamp: 1_800_000_000 }),
+      branch({ name: "legacy/old", last_commit_timestamp: 1_500_000_000 }),
+      branch({ name: "origin/feat/auth", is_remote: true, remote_name: "origin" }),
+    ];
+    const tags = [{ name: "v1.0.0", commit_id: "aaa" }];
+    const pinned = new Set(["feat/auth"]);
+
+    const sections = groupBranches(branches, tags, pinned);
+    expect(sections.map((s) => s.id)).toEqual(["pinned", "local", "remote:origin", "tags"]);
+    expect(sections[0].branches.map((b) => b.name)).toEqual(["feat/auth"]);
+
+    // Test tab filtering
+    const localTab = filterBranchSections(sections, "", "local");
+    expect(localTab.map((s) => s.id)).toEqual(["pinned", "local"]);
+
+    const remoteTab = filterBranchSections(sections, "", "remote");
+    expect(remoteTab.map((s) => s.id)).toEqual(["remote:origin"]);
+
+    const tagsTab = filterBranchSections(sections, "", "tags");
+    expect(tagsTab.map((s) => s.id)).toEqual(["tags"]);
+
+    const pinnedTab = filterBranchSections(sections, "", "pinned");
+    expect(pinnedTab.map((s) => s.id)).toEqual(["pinned"]);
+
+    const now = 1_800_000_000;
+    const activeTab = filterBranchSections(sections, "", "active", now);
+    const staleTab = filterBranchSections(sections, "", "stale", now);
+    expect(activeTab.some((s) => s.branchCount > 0)).toBe(true);
+    expect(staleTab.some((s) => s.folders.some((f) => f.branches.some((b) => b.name === "legacy/old")))).toBe(true);
   });
 });
