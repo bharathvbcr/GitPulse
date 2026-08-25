@@ -24,9 +24,13 @@ export function decideWhitespaceRefetch(input: SelectionInput): WhitespaceToggle
   if (!filePath || commitId) {
     return { refetch: false, isStaged: false };
   }
-  // A path can appear twice (staged + unstaged entries); prefer the staged
-  // entry so the toggle keeps whichever side the sidebar offered first.
-  const match = statuses.find((status) => status.path === filePath);
+  // A path can appear twice (staged + unstaged entries). The staged entry is
+  // picked explicitly rather than relying on list order: Sidebar.svelte may
+  // offer either side first, and the toggle must keep whichever side carries
+  // the staged diff.
+  const match =
+    statuses.find((status) => status.path === filePath && status.is_staged) ??
+    statuses.find((status) => status.path === filePath);
   if (!match) {
     return { refetch: false, isStaged: false };
   }

@@ -40,7 +40,10 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = sandbox_join(&repo, file_path)?;
-        git_text(&repo, &["add", "--", file_path])?;
+        // `:(literal)` disables pathspec globbing so a user path can never
+        // widen its own blast radius ("*" must match a file named "*", never
+        // the whole tree). Same convention as the reader side.
+        git_text(&repo, &["add", "--", &format!(":(literal){file_path}")])?;
         Ok(())
     }
 
@@ -51,7 +54,15 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = sandbox_join(&repo, file_path)?;
-        git_text(&repo, &["restore", "--staged", "--", file_path])?;
+        git_text(
+            &repo,
+            &[
+                "restore",
+                "--staged",
+                "--",
+                &format!(":(literal){file_path}"),
+            ],
+        )?;
         Ok(())
     }
 
@@ -80,6 +91,44 @@ impl GitWriter {
             }
         }
         git_text(repo, &args)
+    }
+
+    /// Stage exactly `files` and commit them under a single mutation-lock
+    /// acquisition.
+    ///
+    /// `stage_file()` followed by `commit()` spans two lock acquisitions, so a
+    /// concurrent writer can commit the shared index in between and absorb the
+    /// staged bytes into its own commit. Programmatic callers (automation,
+    /// agents, batch tooling) need stage+commit to be one indivisible
+    /// mutation; this is that primitive. Interactive flows that intentionally
+    /// commit whatever the user staged keep using `stage_file()` + `commit()`.
+    pub fn commit_files(
+        repo_path: &str,
+        message: &str,
+        files: &[String],
+    ) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        if message.trim().is_empty() {
+            return Err("Commit message must not be empty".into());
+        }
+        if files.is_empty() {
+            return Err("commit_files requires at least one path".into());
+        }        for file in files {
+            if file.is_empty() {
+                return Err("commit_files requires non-empty paths".into());
+            }
+            sandbox_join(&repo, file)?;
+        }
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut add_args: Vec<&str> = Vec::with_capacity(files.len() + 2);
+        add_args.push("add");
+        add_args.push("--");
+        add_args.extend(files.iter().map(String::as_str));
+        git_text(&repo, &add_args)?;
+        Self::commit_inner(&repo, message, false)
     }
 
     pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<(), String> {
@@ -119,7 +168,9 @@ impl GitWriter {
         validate_ref_name(branch_name)?;
         let mut args = vec!["branch", branch_name];
         if let Some(sp) = start_point {
-            validate_ref_name(sp)?;
+            // Start points are revisions, not refs to create: HEAD~1,
+            // main@{u} and raw oids are all legal here.
+            validate_oid_or_revision(sp)?;
             args.push(sp);
         }
         git_text(&repo, args.as_slice())?;
@@ -133,6 +184,20 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch_name)?;
+        if force {
+            // `-d` leaves these to git's own safety nets; `-D` bypasses them,
+            // so the checks must be re-done server side.
+            if is_default_branch(&repo, branch_name) {
+                return Err(format!(
+                    "refusing to force-delete '{branch_name}': it resolves to the repository's default branch"
+                ));
+            }
+            if is_checked_out_in_any_worktree(&repo, branch_name)? {
+                return Err(format!(
+                    "refusing to force-delete '{branch_name}': it is checked out in a linked worktree"
+                ));
+            }
+        }
         let flag = if force { "-D" } else { "-d" };
         git_text(&repo, &["branch", flag, branch_name])?;
         Ok(())
@@ -190,6 +255,26 @@ impl GitWriter {
         }
 
         let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
+        // A step whose commit is not reachable from the HEAD being rebased
+        // would transplant a foreign commit onto the new base; refuse before
+        // any state is touched.
+        for step in steps {
+            let is_ancestor = git_text(
+                &repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &step.commit_id,
+                    &original_head,
+                ],
+            );
+            if is_ancestor.is_err() {
+                return Err(format!(
+                    "Rebase step {} is not an ancestor of HEAD; refusing to transplant foreign commits",
+                    step.commit_id
+                ));
+            }
+        }
         let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
             .ok()
             .map(|s| s.trim().to_string())
@@ -230,7 +315,12 @@ impl GitWriter {
                         git_text(&repo, &["cherry-pick", &step.commit_id]).map_err(|e| {
                             format!("Rebase step failed (reword {}): {}", step.commit_id, e)
                         })?;
-                        Self::commit_inner(&repo, new_msg, true)?;
+                        // Amending with only the new subject would destroy the
+                        // commit body; rewrite the subject line in place.
+                        let original =
+                            git_text(&repo, &["log", "-1", "--format=%B", &step.commit_id])?;
+                        let message = reworded_message(&original, new_msg);
+                        Self::commit_inner(&repo, &message, true)?;
                     }
                 }
             }
@@ -248,9 +338,17 @@ impl GitWriter {
                 restore(&repo);
                 return Err(e);
             }
-            if let Err(e) = git_text(&repo, &["checkout", branch]) {
-                restore(&repo);
-                return Err(e);
+            // The rebase is durably applied once `branch -f` succeeded; only
+            // the working-tree checkout remains. Retry once, and if it still
+            // fails never claim total failure — name the true end-state so
+            // the user knows the branch DID move.
+            if let Err(checkout_err) = git_text(&repo, &["checkout", branch]) {
+                if git_text(&repo, &["checkout", branch]).is_err() {
+                    return Err(format!(
+                        "rebase was applied to '{branch}', but working-tree checkout failed: \
+                         {checkout_err}"
+                    ));
+                }
             }
         }
         Ok(())
@@ -360,7 +458,27 @@ impl GitWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
-        git_text(&repo, &["rebase", "--onto", onto, onto, branch])
+        // The upstream must be where `branch` forked, not the new base itself:
+        // after the parent branch was rewritten, `onto..branch` still contains
+        // the stale pre-image commits and replaying them conflicts. --fork-point
+        // recovers the pre-rewrite fork from the reflog; plain merge-base covers
+        // reflog-less clones; unrelated histories fall back to the old behavior.
+        let upstream = [
+            vec!["merge-base", "--fork-point", onto, branch],
+            vec!["merge-base", onto, branch],
+        ]
+        .into_iter()
+        .find_map(|argv| {
+            git_text(&repo, &argv)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| onto.to_string());
+        git_text(
+            &repo,
+            &["rebase", "--onto", onto, upstream.as_str(), branch],
+        )
     }
 
     pub fn create_tag(
@@ -421,8 +539,12 @@ impl GitWriter {
         // Existence before the fact is what separates "untracked file that
         // clean will remove" from a pathspec that never matched anything.
         let existed_before = std::fs::symlink_metadata(&dest).is_ok();
-        let restore_result = git_text(&repo, &["restore", "--", file_path]);
-        let clean_result = git_text(&repo, &["clean", "-f", "--", file_path]);
+        // Same :(literal) convention as stage/unstage: glob metacharacters in
+        // a user path (notably "*") must match exactly themselves, never
+        // expand across the working tree.
+        let spec = format!(":(literal){file_path}");
+        let restore_result = git_text(&repo, &["restore", "--", &spec]);
+        let clean_result = git_text(&repo, &["clean", "-f", "--", &spec]);
         match (restore_result, clean_result) {
             (Ok(_), Ok(_)) => Ok(()),
             (Ok(_), Err(e)) => Err(format!(
@@ -461,9 +583,7 @@ impl GitWriter {
     }
 
     pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {
-        if url.is_empty() || url.contains('\0') {
-            return Err("Invalid clone URL".into());
-        }
+        validate_clone_url(url)?;
         let dest = Path::new(target_dir);
         if !dest.is_absolute() {
             return Err("Clone destination must be an absolute path".into());
@@ -480,9 +600,61 @@ impl GitWriter {
             return Err(format!("Already cloned at {}", clone_path.display()));
         }
         let clone_str = clone_path.to_string_lossy().into_owned();
-        git_global(&["clone", "--", url, &clone_str])?;
+        if let Err(clone_err) = git_global(&["clone", "--", url, &clone_str]) {
+            // git materializes <dest>/.git before transferring objects, so a
+            // failed or timed-out clone leaves a skeleton behind that blocks
+            // every retry ("already exists"). Its absence was verified just
+            // above, so anything present now came from our own attempt:
+            // remove it best-effort so a retry starts clean.
+            let leftover = clone_path.join(".git");
+            if leftover.is_dir() {
+                let _ = std::fs::remove_dir_all(&leftover);
+                return Err(format!(
+                    "clone failed ({clone_err}); removed the partial '.git' left at {}",
+                    leftover.display()
+                ));
+            }
+            return Err(clone_err);
+        }
         Ok(clone_str)
     }
+}
+
+/// Rejects clone URLs whose transport could execute local commands.
+///
+/// Allowlist: `http(s)://`, `ssh://`, `git://`, `ftp(s)://`, `file://`, plus
+/// bare local paths (absolute or relative) and scp-like `user@host:path`
+/// shorthand. Everything else is refused — notably git's pseudo-transports,
+/// where `<scheme>::<args>` hands the argument string to an arbitrary helper
+/// (`ext::sh -c <cmd>` executes it through /bin/sh). A leading `-` is refused
+/// so a URL can never be parsed as a git option.
+pub fn validate_clone_url(url: &str) -> Result<(), String> {
+    if url.is_empty() || url.contains('\0') || url.chars().any(|c| c.is_control()) {
+        return Err("Invalid clone URL".into());
+    }
+    if url.starts_with('-') {
+        return Err("Clone URL must not start with '-'".into());
+    }
+    const ALLOWED_SCHEMES: [&str; 7] = [
+        "http://", "https://", "ssh://", "git://", "ftps://", "ftp://", "file://",
+    ];
+    let lower = url.to_ascii_lowercase();
+    if ALLOWED_SCHEMES
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+    {
+        return Ok(());
+    }
+    // Any remaining `<scheme>::` pseudo-transport form is rejected wholesale;
+    // plain local paths and scp-like syntax carry no `::` and fall through.
+    if url.contains("::") {
+        let scheme = url.split(':').next().unwrap_or("");
+        return Err(format!(
+            "Clone URL uses unsupported transport '{scheme}': use http(s), ssh, git, ftp(s), \
+             file, or a local path"
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
@@ -492,12 +664,17 @@ pub fn validate_ref_name(name: &str) -> Result<(), String> {
     if name.contains("..") {
         return Err("Invalid ref name: contains traversal '..'".into());
     }
-    if name.starts_with('.')
-        || name.ends_with('.')
-        || name.ends_with('/')
-        || name.ends_with(".lock")
-    {
+    if name.starts_with('.') || name.ends_with('.') || name.ends_with('/') {
         return Err("Invalid ref name: invalid prefix or suffix".into());
+    }
+    // A ".lock" suffix on ANY component collides with git's lock files under
+    // .git/refs/ — not just when the whole ref ends in .lock. The split also
+    // covers the single-component case.
+    if name
+        .split('/')
+        .any(|component| component.ends_with(".lock"))
+    {
+        return Err("Invalid ref name: a component ends in '.lock'".into());
     }
     if name == "@" || name.contains("@{") {
         return Err("Invalid ref name: invalid '@' sequence".into());
@@ -546,12 +723,32 @@ pub fn validate_oid(oid: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates a single revision argument supplied by the UI.
+///
+/// Caller audit (all four call sites pass exactly one commit-ish each, sourced
+/// from the frontend as OIDs or branch names):
+/// - `execute_rebase_sequence`: `onto_commit` → `checkout --detach`, step
+///   `commit_id` → `cherry-pick`;
+/// - `worktree::add_worktree`: `start_point` → `worktree add … <start>`;
+/// - `git_reader::get_file_blob`: builds `<rev>:<path>` and *independently
+///   rejects* any `:` before doing so.
+/// No caller ever passes ranges (`a..b`), reflog syntax (`@{u}`, `HEAD@{1}`),
+/// or peel suffixes (`^{tree}`), so tightening to forbid them is proven safe:
+/// `:` would inject into downstream `rev:path` specs, `{}` enables the
+/// reflog/peel/search grammar, and `..` turns a single revision into a range.
 pub fn validate_oid_or_revision(rev: &str) -> Result<(), String> {
     if rev.is_empty() || rev.starts_with('-') || rev.contains('\0') {
         return Err("Invalid revision".into());
     }
+    if rev.contains("..") {
+        return Err("Invalid revision: ranges ('..') are not accepted".into());
+    }
     if rev.chars().any(|c| {
-        c.is_control() || matches!(c, ' ' | ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>')
+        c.is_control()
+            || matches!(
+                c,
+                ' ' | ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | ':' | '{' | '}'
+            )
     }) {
         return Err("Invalid revision".into());
     }
@@ -581,6 +778,12 @@ mod tests {
         assert!(validate_ref_name("foo bar").is_err());
         assert!(validate_ref_name("refs/../evil").is_err());
         assert!(validate_ref_name("feature.lock").is_err());
+        // A ".lock" suffix on ANY component collides with git's lock files,
+        // not only when it ends the whole ref.
+        assert!(validate_ref_name("feature/foo.lock").is_err());
+        assert!(validate_ref_name("foo.lock/bar").is_err());
+        assert!(validate_ref_name("feature/lockfile").is_ok());
+        assert!(validate_ref_name("foo.lockdown").is_ok());
         assert!(validate_ref_name("branch/").is_err());
         assert!(validate_ref_name(".hidden").is_err());
         assert!(validate_ref_name("foo..bar").is_err());
@@ -606,6 +809,49 @@ mod tests {
         assert!(validate_oid_or_revision("a1b2c3d4").is_ok());
         assert!(validate_oid_or_revision("; rm -rf /").is_err());
         assert!(validate_oid_or_revision("-evil").is_err());
+        // Tightened forms: no caller passes ranges or rev:path / reflog /
+        // peel syntax, so they are refused (see the fn's caller audit).
+        assert!(validate_oid_or_revision("a..b").is_err());
+        assert!(validate_oid_or_revision("@{u}").is_err());
+        assert!(validate_oid_or_revision("HEAD@{1}").is_err());
+        assert!(validate_oid_or_revision("HEAD^{tree}").is_err());
+        assert!(validate_oid_or_revision("rev:path.txt").is_err());
+    }
+
+    /// The clone transport allowlist: network schemes, file://, local paths
+    /// and scp shorthand pass; pseudo-transports and option-shaped URLs fail.
+    #[test]
+    fn test_validate_clone_url() {
+        for good in [
+            "https://github.com/acme/gitpulse.git",
+            "http://example.com/repo.git",
+            "ssh://git@host/team/repo.git",
+            "git://host/repo.git",
+            "ftps://host/repo.git",
+            "ftp://host/repo.git",
+            "file:///tmp/some/repo.git",
+            "/tmp/local/path",
+            "some-relative-name",
+            "git@github.com:acme/gitpulse.git",
+            "HTTPS://HOST/REPO.GIT",
+        ] {
+            assert!(validate_clone_url(good).is_ok(), "{good} must be allowed");
+        }
+        for evil in [
+            "ext::sh -c touch /tmp/gitpulse-pwned",
+            "fd::9",
+            "vsock::1234",
+            "weird-scheme::data",
+            "-oProxyCommand=evil",
+            "",
+            "has\0nul",
+            "line\nbreak",
+        ] {
+            assert!(
+                validate_clone_url(evil).is_err(),
+                "{evil:?} must be rejected"
+            );
+        }
     }
 
     fn init_repo_with_commit() -> tempfile::TempDir {
@@ -869,7 +1115,7 @@ mod tests {
                             match GitWriter::commit(&path, &format!("commit t{t}.{i}"), false) {
                                 Ok(_) => break,
                                 Err(e) if is_empty_commit_refusal(&e) => {
-                                    let landed = StdCommand::new("git")
+                                    let landed = std::process::Command::new("git")
                                         .args(["show", &format!("HEAD:{file}")])
                                         .current_dir(std::path::Path::new(&path))
                                         .output()
@@ -903,7 +1149,7 @@ mod tests {
             for i in 0..PER_THREAD {
                 let file = format!("t{t}_f{i}.txt");
                 let needle = format!("thread {t} round {i}");
-                let log = StdCommand::new("git")
+                let log = std::process::Command::new("git")
                     .args(["log", "--format=%H", "-S", &needle, "--", &file])
                     .current_dir(dir.path())
                     .output()
@@ -917,5 +1163,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Stress: `commit_files` is the atomic stage+commit primitive. Under
+    /// concurrency every round must produce its OWN commit — no sibling can
+    /// absorb its staged bytes because stage and commit share one lock
+    /// acquisition.
+    #[test]
+    fn concurrent_commit_files_produce_one_commit_per_round() {
+        let dir = init_repo_with_commit();
+        let path = dir.path().to_str().unwrap().to_string();
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let file = format!("t{t}_f{i}.txt");
+                        std::fs::write(
+                            std::path::Path::new(&path).join(&file),
+                            format!("thread {t} round {i}\n"),
+                        )
+                        .unwrap();
+                        GitWriter::commit_files(
+                            &path,
+                            &format!("commit t{t}.{i}"),
+                            &[file.clone()],
+                        )
+                        .unwrap_or_else(|e| panic!("commit_files {t}.{i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread must not panic");
+        }
+        let log = StdCommand::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(log.stdout).unwrap();
+        assert_eq!(
+            stdout.lines().count(),
+            1 + THREADS * PER_THREAD,
+            "atomic commit_files must yield exactly one commit per round"
+        );
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let msg = format!("commit t{t}.{i}");
+                assert_eq!(
+                    stdout.lines().filter(|l| *l == msg).count(),
+                    1,
+                    "{msg} must appear exactly once"
+                );
+            }
+        }
+    }
+
+    /// `commit_files` must refuse empty inputs instead of silently creating
+    /// an empty commit or running `git add` with no pathspec.
+    #[test]
+    fn commit_files_rejects_empty_inputs() {
+        let dir = init_repo_with_commit();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(GitWriter::commit_files(&path, "msg", &[]).is_err());
+        assert!(GitWriter::commit_files(&path, "msg", &[String::new()]).is_err());
+        assert!(GitWriter::commit_files(&path, "   ", &["a.txt".into()]).is_err());
+        assert!(GitWriter::commit_files(&path, "msg", &["../escape.txt".into()]).is_err());
+        assert_eq!(head_message(&dir), "init", "no commit may be created");
     }
 }

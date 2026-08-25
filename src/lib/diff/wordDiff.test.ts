@@ -3,6 +3,8 @@ import {
   annotateRange,
   annotateUnifiedDiff,
   computeWordDiff,
+  emptyDiffCopy,
+  filterFilePatch,
   isImagePath,
   parseUnifiedDiff,
 } from "./wordDiff";
@@ -119,6 +121,201 @@ describe("annotateRange", () => {
   it("returns an empty slice for out-of-bounds ranges", () => {
     const parsed = parseUnifiedDiff("+x\n");
     expect(annotateRange(parsed, 99, 120)).toHaveLength(0);
+  });
+});
+
+describe("parseUnifiedDiff meta classification", () => {
+  const gitShowPayload = [
+    "commit 9f8e7d6c5b4a (HEAD -> main, origin/main)",
+    "Author: Ada Lovelace <ada@example.com>",
+    "Date:   Mon Aug 24 10:00:00 2026 +0000",
+    "",
+    "    feat: add parser and drop legacy asset",
+    "",
+    "diff --git a/src/parser.rs b/src/parser.rs",
+    "index e69de29..4b825dc 100644",
+    "--- a/src/parser.rs",
+    "+++ b/src/parser.rs",
+    "@@ -1,2 +1,3 @@",
+    " fn main() {",
+    "+    parser::run();",
+    " }",
+    "diff --git a/src/legacy.rs b/src/legacy.rs",
+    "deleted file mode 100644",
+    "index 4b825dc..e69de29",
+    "--- a/src/legacy.rs",
+    "+++ /dev/null",
+    "@@ -1 +0,0 @@",
+    "-legacy",
+    "diff --git a/logo.png b/logo.png",
+    "similarity index 92%",
+    "rename from assets/logo_old.png",
+    "rename to logo.png",
+    "diff --git a/diagram.png b/diagram.png",
+    "index 1111111..2222222 100644",
+    "Binary files a/diagram.png and b/diagram.png differ",
+  ].join("\n");
+
+  it("classifies commit metadata as meta instead of fake context rows", () => {
+    const lines = parseUnifiedDiff(gitShowPayload);
+    const indexRow = lines.find((l) => l.content.startsWith("index "));
+    expect(indexRow?.type).toBe("meta");
+    const deletedRow = lines.find((l) => l.content.startsWith("deleted file mode "));
+    expect(deletedRow?.type).toBe("meta");
+    const similarityRow = lines.find((l) => l.content.startsWith("similarity index "));
+    expect(similarityRow?.type).toBe("meta");
+    const renameFromRow = lines.find((l) => l.content.startsWith("rename from "));
+    expect(renameFromRow?.type).toBe("meta");
+    // Nothing that is metadata leaks into the context stream.
+    const ctxContents = lines.filter((l) => l.type === "ctx").map((l) => l.content);
+    expect(ctxContents).toEqual([" fn main() {", " }"]);
+  });
+
+  it("never counts meta or binary rows toward content stats", () => {
+    const lines = parseUnifiedDiff(gitShowPayload);
+    const contentRows = lines.filter((l) => l.type === "add" || l.type === "del" || l.type === "ctx");
+    expect(contentRows.map((l) => l.content)).toEqual([
+      " fn main() {",
+      "+    parser::run();",
+      " }",
+      "-legacy",
+    ]);
+  });
+
+  it("surfaces a distinct binary notice row for Binary files lines", () => {
+    const lines = parseUnifiedDiff(gitShowPayload);
+    const binary = lines.filter((l) => l.type === "binary").map((l) => l.content);
+    expect(binary).toEqual(["Binary files a/diagram.png and b/diagram.png differ"]);
+    expect(binary[0]).not.toContain("GIT binary patch");
+  });
+
+  it("classifies GIT binary patch payloads as binary notices too", () => {
+    const lines = parseUnifiedDiff("diff --git a/a.bin b/a.bin\nGIT binary patch\nliteral 10\n");
+    expect(lines[1].type).toBe("binary");
+    expect(lines[2].type).toBe("meta");
+  });
+
+  it("keeps hunk line numbers intact across a meta boundary", () => {
+    const twoFile = [
+      "diff --git a/a.txt b/a.txt",
+      "--- a/a.txt",
+      "+++ b/a.txt",
+      "@@ -1 +1 @@",
+      "-one",
+      "+uno",
+      "diff --git a/b.txt b/b.txt",
+      "--- a/b.txt",
+      "+++ b/b.txt",
+      "@@ -5 +5 @@",
+      "+five",
+    ].join("\n");
+    const lines = parseUnifiedDiff(twoFile);
+    const five = lines.find((l) => l.type === "add" && l.content === "+five");
+    expect(five?.newNo).toBe(5);
+  });
+});
+
+describe("filterFilePatch", () => {
+  const multiFile = [
+    "commit abcdef1234567890",
+    "Author: Ada <ada@example.com>",
+    "",
+    "    subject line",
+    "",
+    "diff --git a/src/a.rs b/src/a.rs",
+    "index aaa..bbb 100644",
+    "--- a/src/a.rs",
+    "+++ b/src/a.rs",
+    "@@ -1 +1 @@",
+    "-alpha",
+    "+ALPHA",
+    "diff --git a/src/b.ts b/src/b.ts",
+    "index ccc..ddd 100644",
+    "--- a/src/b.ts",
+    "+++ b/src/b.ts",
+    "@@ -1 +1 @@",
+    "-beta",
+    "+BETA",
+    "diff --git a/old_name.txt b/new_name.txt",
+    "similarity index 100%",
+    "rename from old_name.txt",
+    "rename to new_name.txt",
+  ].join("\n");
+
+  it("extracts exactly one file's patch with its metadata block", () => {
+    const patch = filterFilePatch(multiFile, "src/b.ts");
+    expect(patch).toContain("diff --git a/src/b.ts b/src/b.ts");
+    expect(patch).toContain("+BETA");
+    expect(patch).not.toContain("ALPHA");
+    expect(patch).not.toContain("rename from");
+    expect(patch.split("\n")[0]).toBe("diff --git a/src/b.ts b/src/b.ts");
+  });
+
+  it("matches pure renames by their new name", () => {
+    expect(filterFilePatch(multiFile, "new_name.txt")).toContain("rename to new_name.txt");
+    expect(filterFilePatch(multiFile, "old_name.txt")).toContain("rename from old_name.txt");
+  });
+
+  it("drops the git-show preamble before the first file header", () => {
+    const patch = filterFilePatch(multiFile, "src/a.rs");
+    expect(patch).not.toContain("Author:");
+    expect(patch).not.toContain("subject line");
+  });
+
+  it("returns empty for paths absent from the diff and for empty input", () => {
+    expect(filterFilePatch(multiFile, "src/missing.rs")).toBe("");
+    expect(filterFilePatch("", "src/a.rs")).toBe("");
+    expect(filterFilePatch(multiFile, "")).toBe("");
+  });
+
+  it("does not let one path shadow a longer sibling path", () => {
+    const tricky = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1 +1 @@",
+      "-x",
+      "diff --git a/src/a.ts.bak b/src/a.ts.bak",
+      "--- a/src/a.ts.bak",
+      "+++ b/src/a.ts.bak",
+      "@@ -1 +1 @@",
+      "-y",
+    ].join("\n");
+    expect(filterFilePatch(tricky, "src/a.ts")).not.toContain(".bak");
+    expect(filterFilePatch(tricky, "src/a.ts.bak")).toContain("-y");
+  });
+
+  it("handles quoted diff headers for paths with special characters", () => {
+    const quoted =
+      'diff --git "a/weird\tname" "b/weird\tname"\nindex aaa..bbb 100644\n--- "a/weird\tname"\n+++ "b/weird\tname"\n@@ -1 +1 @@\n-q\n+Q\n'.replace(
+        /\t/g,
+        " "
+      );
+    expect(filterFilePatch(quoted, "weird name")).toContain("+Q");
+  });
+
+  it("keeps timestamps after the path from breaking +++/--- matching", () => {
+    const stamped = [
+      "diff --git a/x.txt b/x.txt",
+      "--- a/x.txt\t2026-01-01 00:00:00.000000000 +0000",
+      "+++ b/x.txt\t2026-08-24 00:00:00.000000000 +0000",
+      "@@ -1 +1 @@",
+      "-t",
+      "+T",
+    ].join("\n");
+    expect(filterFilePatch(stamped, "x.txt")).toContain("+T");
+  });
+});
+
+describe("emptyDiffCopy", () => {
+  it("explains clean merges instead of claiming nothing is selected", () => {
+    const copy = emptyDiffCopy(true);
+    expect(copy.title).toMatch(/merge/i);
+    expect(copy.hint).toMatch(/cleanly|parent/i);
+  });
+
+  it("keeps the plain selection prompt for non-merges", () => {
+    expect(emptyDiffCopy(false).title).toBe("No diff selected");
   });
 });
 

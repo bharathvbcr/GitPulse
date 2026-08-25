@@ -887,7 +887,7 @@ fn parse_jacoco(
             let mi = xml_attr(trimmed, "mi")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            if ci + mi == 0 {
+            if ci.saturating_add(mi) == 0 {
                 continue;
             }
             if let Some(ln) = ln.and_then(|v| v.parse::<usize>().ok()) {
@@ -1444,6 +1444,27 @@ src/main.go:4.1,4.8 1 0
         let cmap = parse_clover(clover, repo.path(), &mut EntryBudget::new(usize::MAX));
         assert_eq!(cmap["src/Foo.php"].get(&3), Some(&2));
         assert_eq!(cmap["src/Foo.php"].get(&4), Some(&0));
+    }
+
+    #[test]
+    fn parse_jacoco_extreme_counters_saturate_instead_of_panicking() {
+        let repo = git_repo();
+        write(repo.path(), "com/foo/Big.java", "class Big {}\n");
+        let jacoco = r#"
+<report>
+  <package name="com/foo">
+    <sourcefile name="Big.java">
+      <line nr="1" mi="1" ci="18446744073709551615"/>
+      <line nr="2" mi="18446744073709551615" ci="18446744073709551615"/>
+    </sourcefile>
+  </package>
+</report>
+"#;
+        let map = parse_jacoco(jacoco, repo.path(), &mut EntryBudget::new(usize::MAX));
+        // ci + mi overflows u64 on both lines; saturating math must treat
+        // them as covered instead of panicking in debug builds.
+        assert_eq!(map["com/foo/Big.java"].get(&1), Some(&u64::MAX));
+        assert_eq!(map["com/foo/Big.java"].get(&2), Some(&u64::MAX));
     }
 
     #[test]

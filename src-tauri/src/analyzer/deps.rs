@@ -3004,6 +3004,8 @@ not-json-at-all
         assert!(vulns.iter().any(|v| v.via.contains(&"A-0".to_string())));
     }
 
+    // -- scanner failure surfacing ---------------------------------------------
+
     use crate::engine::git_cli::CapturedOutput;
 
     fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {

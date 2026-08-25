@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 
 /// Packed metadata entry for memory-efficient viewport windowing.
 /// Uses a compact fixed header (16 bytes) with extended lane spillover support for 64+ concurrent lanes.
+///
+/// Deliberate packing limit: the 16-byte representation is pinned by
+/// `test_packed_struct_size`, so `lane_index`, `color_index`,
+/// `parent_count` and `active_lane_count` saturate at 255 via `min(255)`
+/// during [`CommitRowMetadata::from_visual_row`] — values beyond that are
+/// lossy by design. Lanes ≥ 64 never widen `active_lanes_mask`; rows
+/// carrying them set `has_extended_lanes` and spill those lanes into
+/// [`TopologyIndex::extended_lanes`], which is the only place full-width
+/// lane data survives.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRowMetadata {
@@ -97,11 +106,13 @@ impl TopologyIndex {
 
     pub fn slice(&self, start: usize, count: usize) -> &[CommitRowMetadata] {
         if start >= self.rows.len() {
-            &[]
-        } else {
-            let end = (start + count).min(self.rows.len());
-            &self.rows[start..end]
+            return &[];
         }
+        // Clamp first: `start + count` can overflow usize for hostile
+        // viewport arguments, so the window length is bounded by what is
+        // left after `start` before any addition happens.
+        let take = count.min(self.rows.len() - start);
+        &self.rows[start..start + take]
     }
 
     pub fn is_lane_active_at(&self, row_idx: usize, lane_index: u32) -> bool {
@@ -159,5 +170,41 @@ mod tests {
         assert!(index.is_lane_active_at(0, 100));
         assert!(!index.is_lane_active_at(0, 1));
         assert!(!index.is_lane_active_at(0, 75));
+    }
+
+    #[test]
+    fn test_slice_clamps_hostile_windows_instead_of_overflowing() {
+        let visual_rows: Vec<VisualCommitRow> = (0..5)
+            .map(|i| VisualCommitRow {
+                id: format!("c{i}"),
+                parent_ids: vec![],
+                summary: "s".to_string(),
+                author_name: "Dev".to_string(),
+                author_email: "dev@example.com".to_string(),
+                timestamp: 1700000000,
+                lane: 0,
+                color_index: 0,
+                active_lanes: vec![0],
+                active_lane_colors: vec![0],
+                connections: vec![],
+                is_merge: false,
+                is_root: false,
+            })
+            .collect();
+        let index = TopologyIndex::build(&visual_rows);
+
+        assert!(index.slice(usize::MAX, 1).is_empty(), "start past end");
+        assert!(index.slice(index.len(), 10).is_empty(), "start == len");
+        assert_eq!(
+            index.slice(0, usize::MAX).len(),
+            index.len(),
+            "count overflow must clamp to the remaining rows"
+        );
+        assert_eq!(
+            index.slice(3, usize::MAX).len(),
+            2,
+            "count overflow mid-index must clamp to rows.len() - start"
+        );
+        assert_eq!(index.slice(1, 2).len(), 2, "in-range window unchanged");
     }
 }

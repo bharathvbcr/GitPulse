@@ -56,8 +56,8 @@ impl PatchBuilder {
     /// therefore rejected here — once, at the single owner of the rules.
     pub fn validate_file_patch(file_patch: &FilePatch) -> Result<(), String> {
         for (role, path) in [
-            ("&old_path", &file_patch.old_path),
-            ("&new_path", &file_patch.new_path),
+            ("old_path", &file_patch.old_path),
+            ("new_path", &file_patch.new_path),
         ] {
             Self::validate_patch_path(role, path)?;
         }

@@ -502,3 +502,49 @@ fn test_stack_tree_cyclic_ancestry_safety() {
     let breadcrumbs = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, "feat-a");
     assert!(!breadcrumbs.breadcrumb_chain.is_empty());
 }
+
+#[test]
+fn test_topology_slice_hostile_window_requests() {
+    use gitpulse_lib::graph::VisualCommitRow;
+
+    let rows: Vec<VisualCommitRow> = (0..500)
+        .map(|i| VisualCommitRow {
+            id: format!("c{i}"),
+            parent_ids: vec![],
+            summary: "s".to_string(),
+            author_name: "Dev".to_string(),
+            author_email: "dev@example.com".to_string(),
+            timestamp: 1700000000 + i as i64,
+            lane: 0,
+            color_index: 0,
+            active_lanes: vec![0, 1],
+            active_lane_colors: vec![0, 1],
+            connections: vec![],
+            is_merge: false,
+            is_root: false,
+        })
+        .collect();
+    let index = TopologyIndex::build(&rows);
+    assert_eq!(index.len(), 500);
+
+    // Hostile viewport arguments must clamp, never panic or overflow.
+    assert!(index.slice(usize::MAX, 1).is_empty());
+    assert!(index.slice(50_000, 50).is_empty());
+    assert_eq!(index.slice(0, usize::MAX).len(), 500);
+    assert_eq!(index.slice(499, usize::MAX).len(), 1);
+    assert_eq!(index.slice(250, usize::MAX).len(), 250);
+
+    // Sweep every window boundary, including counts that would overflow
+    // `start + count` if the math were unguarded.
+    for start in 0..500 {
+        for count in [1usize, 499, 500, usize::MAX] {
+            let window = index.slice(start, count);
+            let expected = (500 - start).min(count);
+            assert_eq!(
+                window.len(),
+                expected,
+                "slice({start}, {count:#x}) clamped wrong"
+            );
+        }
+    }
+}

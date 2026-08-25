@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { get, writable } from "svelte/store";
-import { createRepoStore, type InvokeFn } from "../repoStore";
+import { createRepoStore, STATS_DRAIN_MAX_BATCHES, type BranchInfo, type InvokeFn } from "../repoStore";
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import type { FilterState } from "../filterStore";
 
@@ -95,6 +95,50 @@ function statsFor(path: string, tipCommitId = "abc") {
     computed: 1,
     cached: 0,
     capped: false,
+  };
+}
+
+function branchFor(name: string, tipCommitId: string, extras: Partial<BranchInfo> = {}): BranchInfo {
+  return {
+    name,
+    is_current: false,
+    is_remote: false,
+    remote_name: null,
+    tip_commit_id: tipCommitId,
+    ahead_count: 0,
+    behind_count: 0,
+    upstream: null,
+    is_default: false,
+    is_gone: false,
+    last_commit_timestamp: 0,
+    last_author: "ada",
+    last_summary: "init",
+    commits_ahead_of_base: 0,
+    commits_behind_base: 0,
+    additions: 0,
+    deletions: 0,
+    files_changed: 0,
+    ...extras,
+  };
+}
+
+function churnFor(
+  name: string,
+  tipCommitId: string,
+  additions: number,
+  isRemote = false,
+  remoteName: string | null = null,
+) {
+  return {
+    name,
+    tip_commit_id: tipCommitId,
+    is_remote: isRemote,
+    remote_name: remoteName,
+    additions,
+    deletions: additions,
+    files_changed: additions,
+    commits_ahead_of_base: additions,
+    commits_behind_base: 0,
   };
 }
 
@@ -705,5 +749,212 @@ describe("repoStore branch stats", () => {
     expect(state.branches[0].additions).toBe(0);
     expect(state.branches[0].deletions).toBe(0);
     expect(state.branches[0].compared_to).toBeUndefined();
+  });
+
+  it("drains capped reports until capped is false, keeping every batch", async () => {
+    const path = "/r/drain";
+    const branches = [
+      branchFor(`${path}-main`, "abc", { is_current: true }),
+      branchFor("feature-a", "tip-a"),
+      branchFor("feature-b", "tip-b"),
+      branchFor("feature-c", "tip-c"),
+    ];
+    const batches = [
+      { compared_to: `${path}-main`, updates: [churnFor("feature-a", "tip-a", 11)], computed: 1, cached: 0, capped: true },
+      { compared_to: `${path}-main`, updates: [churnFor("feature-b", "tip-b", 22)], computed: 1, cached: 0, capped: true },
+      { compared_to: `${path}-main`, updates: [churnFor("feature-c", "tip-c", 33)], computed: 1, cached: 0, capped: false },
+    ];
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_list_branches: async () => branches as never,
+      cmd_branch_stats: async () => batches[calls++] as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo(path);
+    await flushMicro();
+
+    expect(calls).toBe(3);
+    const names = get(store).branches;
+    // Earlier batches must survive later ones: each merges into the CURRENT
+    // session branches, not a stale copy.
+    expect(names.find((b) => b.name === "feature-a")?.additions).toBe(11);
+    expect(names.find((b) => b.name === "feature-b")?.additions).toBe(22);
+    expect(names.find((b) => b.name === "feature-c")?.additions).toBe(33);
+    expect(get(store).statsPending).toBe(false);
+  });
+
+  it("stops draining at the named batch bound instead of looping forever", async () => {
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async () => {
+        calls += 1;
+        return { compared_to: "x", updates: [], computed: 0, cached: 96, capped: true } as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/bound");
+    await flushMicro();
+
+    expect(calls).toBe(STATS_DRAIN_MAX_BATCHES);
+    expect(get(store).statsPending).toBe(false);
+  });
+
+  it("keeps earlier drain batches and degrades cleanly when a later batch fails", async () => {
+    const path = "/r/drain-fail";
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            compared_to: `${path}-main`,
+            updates: [churnFor(`${path}-main`, "abc", 7)],
+            computed: 1,
+            cached: 0,
+            capped: true,
+          } as never;
+        }
+        throw new Error("backend hiccup");
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo(path);
+    await flushMicro();
+
+    expect(calls).toBe(2);
+    const state = get(store);
+    expect(state.branches[0].additions).toBe(7);
+    expect(state.statsPending).toBe(false);
+    expect(state.error).toBeNull();
+  });
+
+  it("applies churn independently when a local branch shares its name with a remote-tracking entry", async () => {
+    const path = "/r/clash";
+    const branches = [
+      // A local branch literally named origin/foo...
+      branchFor("origin/foo", "tip-local", { is_current: true }),
+      // ...and remote origin's foo, whose update carries the same display name.
+      branchFor("origin/foo", "tip-remote", { is_remote: true, remote_name: "origin" }),
+    ];
+    const invoke = makeInvoke({
+      cmd_list_branches: async () => branches as never,
+      cmd_branch_stats: async () =>
+        ({
+          compared_to: `${path}-main`,
+          updates: [
+            churnFor("origin/foo", "tip-local", 3),
+            churnFor("origin/foo", "tip-remote", 9, true, "origin"),
+          ],
+          computed: 2,
+          cached: 0,
+          capped: false,
+        }) as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo(path);
+    await flushMicro();
+
+    const state = get(store);
+    const local = state.branches.find((b) => !b.is_remote && b.name === "origin/foo");
+    const remote = state.branches.find((b) => b.is_remote && b.remote_name === "origin");
+    expect(local).toMatchObject({ additions: 3 });
+    expect(remote).toMatchObject({ additions: 9 });
+  });
+});
+
+describe("repoStore status poll lifecycle", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function pollSpies() {
+    const setSpy = vi.spyOn(globalThis, "setInterval");
+    const clearSpy = vi.spyOn(globalThis, "clearInterval");
+    return { setSpy, clearSpy };
+  }
+
+  it("schedules one interval per workspace, clears it on tab close, restarts lazily", async () => {
+    const { setSpy, clearSpy } = pollSpies();
+    const { store } = makeStore();
+    await store.openRepo("/r/poll-a");
+    // Re-opening the same workspace must not stack a second interval.
+    await store.openRepo("/r/poll-b");
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    const handle = setSpy.mock.results[0]?.value;
+
+    await store.closeTab(get(store).openTabs[0].id);
+    expect(clearSpy.mock.calls.some(([timer]) => timer === handle)).toBe(true);
+
+    await store.openRepo("/r/poll-c");
+    expect(setSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the interval when the workspace is restored", async () => {
+    const { setSpy, clearSpy } = pollSpies();
+    const { store } = makeStore();
+    await store.openRepo("/r/poll-reset");
+    expect(setSpy).toHaveBeenCalledTimes(1);
+
+    await store.restoreWorkspace();
+    // Reset stops the old interval; reopening the persisted tab restarts one.
+    expect(clearSpy).toHaveBeenCalled();
+    expect(setSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("repoStore watcher coalescing", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function countingLoads(loaded: Record<string, number>): InvokeFn {
+    return makeInvoke({
+      cmd_list_branches: async (_cmd, args) => {
+        const path = String(args?.repoPath);
+        loaded[path] = (loaded[path] ?? 0) + 1;
+        return [] as never;
+      },
+    });
+  }
+
+  it("collapses a burst of watcher events into one trailing refresh", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/storm");
+    loaded["/r/storm"] = 0;
+
+    await store.handleRepoChanged("/r/storm");
+    await store.handleRepoChanged("/r/storm");
+    await store.handleRepoChanged("/r/storm");
+    expect(loaded["/r/storm"]).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(199);
+    expect(loaded["/r/storm"]).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(loaded["/r/storm"]).toBe(1);
+
+    // One-shot trailing window: no further refreshes without new events.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(loaded["/r/storm"]).toBe(1);
+  });
+
+  it("debounces each changed path separately so parallel repos each refresh once", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/storm-x");
+    await store.openRepo("/r/storm-y");
+    loaded["/r/storm-x"] = 0;
+    loaded["/r/storm-y"] = 0;
+
+    for (const suffix of ["x", "y", "x", "y", "x"]) {
+      await store.handleRepoChanged(`/r/storm-${suffix}`);
+    }
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(loaded["/r/storm-x"]).toBe(1);
+    expect(loaded["/r/storm-y"]).toBe(1);
   });
 });

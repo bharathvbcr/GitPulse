@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitFilter {
     pub author: Option<String>,
+    /// `path:` query token. Deliberately NOT consulted by
+    /// [`CommitFilter::matches_commit`]: its only caller
+    /// (`cmd_get_commit_graph`) narrows rows server-side via
+    /// `GitReader::commits_touching_path` before running the filter, so the
+    /// rows reaching here are already path-filtered and a per-commit path
+    /// check would be redundant.
     pub path: Option<String>,
     pub sha: Option<String>,
     pub commit_type: Option<String>,

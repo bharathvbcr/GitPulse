@@ -16,6 +16,12 @@ pub const MAX_WATCHES: usize = 24;
 
 pub struct WatchSession {
     stop: Arc<AtomicBool>,
+    /// Path spellings that identified this session when it was created:
+    /// the canonical map key plus whatever raw path the caller supplied.
+    /// Kept so `unwatch` can still resolve the slot after the watched
+    /// directory disappears and canonicalization starts failing (which
+    /// would otherwise leak one of MAX_WATCHES slots forever).
+    aliases: Vec<String>,
 }
 
 impl Drop for WatchSession {
@@ -58,6 +64,7 @@ impl WatcherState {
 fn insert_watch_session(
     sessions: &mut HashMap<String, WatchSession>,
     key: &str,
+    caller_paths: &[String],
 ) -> Result<Option<Arc<AtomicBool>>, String> {
     if sessions.contains_key(key) {
         return Ok(None);
@@ -65,8 +72,20 @@ fn insert_watch_session(
     if sessions.len() >= MAX_WATCHES {
         return Err(format!("Too many watched repositories (max {MAX_WATCHES})"));
     }
+    let mut aliases = vec![key.to_string()];
+    for path in caller_paths {
+        if !aliases.contains(path) {
+            aliases.push(path.clone());
+        }
+    }
     let stop = Arc::new(AtomicBool::new(false));
-    sessions.insert(key.to_string(), WatchSession { stop: stop.clone() });
+    sessions.insert(
+        key.to_string(),
+        WatchSession {
+            stop: stop.clone(),
+            aliases,
+        },
+    );
     Ok(Some(stop))
 }
 
@@ -172,7 +191,7 @@ where
 
     let stop = {
         let mut guard = state.lock_sessions()?;
-        match insert_watch_session(&mut guard, &key)? {
+        match insert_watch_session(&mut guard, &key, std::slice::from_ref(&repo_path))? {
             None => return Ok(key),
             Some(stop) => stop,
         }
@@ -194,10 +213,53 @@ where
     Ok(key)
 }
 
+/// Purely lexical normalizations of `repo_path` that stay valid even when
+/// the path no longer exists: trailing slashes and inner `.` components are
+/// stripped without touching the filesystem. Symlinked prefixes (macOS
+/// `/var` → `/private/var`) cannot be resolved lexically — that gap is
+/// covered by the watch-time aliases recorded on each session.
+fn lexical_normalizations(repo_path: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(2);
+    let mut push = |value: String| {
+        if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+            out.push(value);
+        }
+    };
+    push(repo_path.to_string());
+    // `components()` drops trailing slashes and non-leading `.` segments,
+    // so `path/./` collapses to `path` with no filesystem access.
+    let normalized = Path::new(repo_path)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned();
+    push(normalized);
+    out
+}
+
 pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
     let keys = watch_lookup_keys(&repo_path);
     let mut guard = state.lock_sessions()?;
+    // Pass 1: exact matches against map keys. Covers the healthy case where
+    // canonicalization still works.
     for key in keys {
+        guard.remove(&key);
+    }
+    // Pass 2: post-deletion recovery. The directory is gone, so the
+    // canonicalize()/validate_repo() lookups above failed; fall back to
+    // lexical variants matched against both the map keys and every spelling
+    // recorded when each session was created.
+    let lexical = lexical_normalizations(&repo_path);
+    let stale: Vec<String> = guard
+        .iter()
+        .filter(|(key, session)| {
+            lexical.iter().any(|candidate| {
+                key == &candidate || session.aliases.iter().any(|alias| alias == candidate)
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in stale {
         guard.remove(&key);
     }
     Ok(())
@@ -294,7 +356,7 @@ mod tests {
     impl WatcherState {
         fn begin_watch_slot(&self, key: &str) -> Result<bool, String> {
             let mut guard = self.lock_sessions()?;
-            Ok(insert_watch_session(&mut guard, key)?.is_some())
+            Ok(insert_watch_session(&mut guard, key, &[])?.is_some())
         }
 
         fn watch_count(&self) -> Result<usize, String> {
@@ -471,6 +533,44 @@ mod tests {
         }
     }
 
+    /// After the watched directory is deleted, `canonicalize()` and
+    /// `validate_repo()` both fail, so the lookup can only succeed via the
+    /// watch-time aliases or lexical variants. Losing this race leaked a
+    /// MAX_WATCHES slot forever (macOS `/var` → `/private/var` makes the
+    /// stored key differ lexically from every path the caller still holds).
+    #[test]
+    fn unwatch_after_directory_deletion_releases_the_slot() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let state = WatcherState::default();
+        let raw = dir.path().to_string_lossy().into_owned();
+        start_watch_inner(&state, raw.clone(), |_| {}).expect("watch");
+        assert_eq!(state.watch_count().unwrap(), 1);
+
+        drop(dir); // directory gone: canonicalization now fails
+
+        unwatch(&state, raw).unwrap();
+        assert_eq!(
+            state.watch_count().unwrap(),
+            0,
+            "deleted-dir unwatch must not leak a watch slot"
+        );
+        assert!(state.begin_watch_slot("/post-deletion-slot").unwrap());
+    }
+
+    #[test]
+    fn lexical_normalizations_strip_trailing_slash_and_dot_segments() {
+        assert_eq!(
+            lexical_normalizations("/tmp/repo/"),
+            vec!["/tmp/repo/".to_string(), "/tmp/repo".to_string()]
+        );
+        assert_eq!(lexical_normalizations("."), vec![".".to_string()]);
+        assert_eq!(
+            lexical_normalizations("relative/repo"),
+            vec!["relative/repo".to_string()]
+        );
+    }
+
     #[test]
     fn test_unwatch_relative_path_does_not_canonicalize_against_cwd() {
         let dir = TempDir::new().unwrap();
@@ -570,19 +670,29 @@ mod tests {
     /// Debounce proof: 30 rapid top-level writes must settle into exactly one
     /// callback after the quiet window, not thirty. A second callback during
     /// a subsequent quiet window would mean events are being forwarded
-    /// per-write instead of debounced.
+    /// per-write instead of debounced. The priming write exists because an
+    /// OS backend may need its first delivered event before later ones flow;
+    /// without it the storm races watch installation.
     #[test]
     fn watch_loop_coalesces_a_write_storm_into_one_settled_callback() {
         let temp = TempDir::new().unwrap();
         let (rx, stop, root) = spawn_loop(temp.path());
 
+        // Prime: prove the pipeline delivers before measuring coalescing.
+        std::fs::write(root.join("prime.txt"), "x").unwrap();
+        let _ = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("priming write must be delivered");
+
+        // Storm: 30 writes inside roughly one debounce tick.
         for i in 0..30 {
             std::fs::write(root.join(format!("storm_{i}.txt")), "x").unwrap();
         }
 
+        // Exactly one settled callback for the whole burst.
         let first = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("at least one settled callback");
+            .expect("storm must produce a settled callback");
         assert!(!first.is_empty());
 
         // Quiet window well past the 400ms settle: no further callbacks may

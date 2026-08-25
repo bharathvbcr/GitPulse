@@ -184,7 +184,7 @@ impl GitReader {
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
-            format.push_str("%01%(ahead-behind:");
+            format.push_str("%x00%(ahead-behind:");
             format.push_str(base_oid);
             format.push(')');
         }
@@ -224,8 +224,10 @@ impl GitReader {
         let default_short = default_base.map(|(name, _)| name);
 
         let mut branches = Vec::new();
+        // One line per ref; refnames and subjects cannot contain newlines or
+        // NULs, so NUL-separated fields stay aligned.
         for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\u{01}').collect();
+            let parts: Vec<&str> = line.split('\0').collect();
             if parts.len() < 3 {
                 continue;
             }
@@ -320,11 +322,13 @@ impl GitReader {
         .ok();
 
         // Cheap listing only: refnames and tips, no history walks here.
+        // Refnames and object ids cannot contain NULs, so %x00 fields stay
+        // aligned where \x01 could be split by hostile ref-adjacent content.
         let stdout = git_text(
             &repo,
             &[
                 "for-each-ref",
-                "--format=%(refname)%01%(objectname)",
+                "--format=%(refname)%x00%(objectname)",
                 "refs/heads/",
                 "refs/remotes/",
             ],
@@ -333,7 +337,7 @@ impl GitReader {
         let mut local_names: Vec<String> = Vec::new();
         let mut targets: Vec<BranchStatTarget> = Vec::new();
         for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\u{01}').collect();
+            let parts: Vec<&str> = line.split('\0').collect();
             if parts.len() < 2 || parts[1].is_empty() {
                 continue;
             }
@@ -487,7 +491,12 @@ impl GitReader {
             count_arg.as_str(),
             skip_arg.as_str(),
             "--topo-order",
-            "--format=format:%H%x00%P%x00%ct%x00%an%x00%ae%x00%s%x01",
+            // Subjects may legally contain any byte except NUL, so the RECORD
+            // terminator is %x00 — a hostile subject can no longer split the
+            // stream into bogus records. Fields use %x01; a stray \x01 inside
+            // one subject only truncates that summary, never misparses later
+            // commits.
+            "--format=format:%H%x01%P%x01%ct%x01%an%x01%ae%x01%s%x00",
         ];
         if let Some(rev) = revision {
             validate_ref_name(rev)?;
@@ -497,28 +506,29 @@ impl GitReader {
         }
         let stdout = git_text(&repo, &args)?;
 
+        // Each record is exactly six NUL-delimited fields plus its terminator.
+        const FIELDS_PER_COMMIT: usize = 6;
+        let fields: Vec<&str> = stdout.split('\x00').collect();
         let mut commits = Vec::new();
-        for record in stdout.split('\x01') {
-            let record = record.trim();
-            if record.is_empty() {
+        let mut i = 0;
+        while i + FIELDS_PER_COMMIT <= fields.len() {
+            let f = &fields[i..i + FIELDS_PER_COMMIT];
+            i += FIELDS_PER_COMMIT;
+            if f[0].is_empty() {
                 continue;
             }
-            let fields: Vec<&str> = record.split('\x00').collect();
-            if fields.len() < 6 {
-                continue;
-            }
-            let parent_ids = if fields[1].is_empty() {
+            let parent_ids = if f[1].is_empty() {
                 Vec::new()
             } else {
-                fields[1].split_whitespace().map(String::from).collect()
+                f[1].split_whitespace().map(String::from).collect()
             };
             commits.push(RawCommitNode {
-                id: fields[0].to_string(),
+                id: f[0].to_string(),
                 parent_ids,
-                timestamp: fields[2].parse().unwrap_or(0),
-                author_name: fields[3].to_string(),
-                author_email: fields[4].to_string(),
-                summary: fields[5].to_string(),
+                timestamp: f[2].parse().unwrap_or(0),
+                author_name: f[3].to_string(),
+                author_email: f[4].to_string(),
+                summary: f[5].to_string(),
             });
         }
         Ok(commits)
@@ -530,16 +540,22 @@ impl GitReader {
         max_count: usize,
     ) -> Result<Vec<String>, String> {
         let repo = validate_repo(repo_path)?;
-        let _ = sandbox_join(&repo, file_path)?;
+        // Canonical join resolves existing prefixes through symlinks and keeps
+        // not-yet-tracked leaves lexical, so a symlinked directory cannot
+        // redirect the query outside the repository.
+        sandbox_join_canonical(&repo, file_path)?;
         let count = max_count.clamp(1, 100_000).to_string();
+        let spec = literal_pathspec(file_path);
         let stdout = git_text(
             &repo,
             &[
+                "-c",
+                "core.quotepath=off",
                 "log",
                 &format!("-n{}", count),
                 "--format=%H",
                 "--",
-                file_path,
+                spec.as_str(),
             ],
         )?;
         Ok(stdout
@@ -551,51 +567,32 @@ impl GitReader {
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {
         let repo = validate_repo(repo_path)?;
-        let stdout = git_text(&repo, &["status", "--porcelain=v1", "-z"])?;
+        // -z disables path quoting outright; core.quotepath=off is kept as
+        // belt-and-braces so a future non-z invocation still gets raw UTF-8.
+        let stdout = git_text(
+            &repo,
+            &[
+                "-c",
+                "core.quotepath=off",
+                "status",
+                "--porcelain=v1",
+                "-z",
+            ],
+        )?;
+        // numstat failures are surfaced, not laundered into "zero churn": a
+        // broken diff must fail the report rather than fabricate numbers.
         let numstat_work =
-            parse_numstat(&git_text(&repo, &["diff", "--numstat"]).unwrap_or_default());
-        let numstat_index =
-            parse_numstat(&git_text(&repo, &["diff", "--cached", "--numstat"]).unwrap_or_default());
+            parse_numstat(&git_text(&repo, &["diff", "--numstat", "-z"])?);
+        let numstat_index = parse_numstat(&git_text(&repo, &["diff", "--cached", "--numstat", "-z"])?);
 
         let mut statuses = Vec::new();
-        let bytes = stdout.into_bytes();
-        let mut i = 0;
-        while i + 3 < bytes.len() {
-            let index_status = bytes[i] as char;
-            let work_status = bytes[i + 1] as char;
-            i += 3;
-            let rest = match bytes[i..].iter().position(|&b| b == 0) {
-                Some(n) => {
-                    let s = String::from_utf8_lossy(&bytes[i..i + n]).into_owned();
-                    i += n + 1;
-                    s
-                }
-                None => break,
-            };
-
-            let (path, old_path) = if rest.contains(" -> ") {
-                let mut split = rest.splitn(2, " -> ");
-                let old = split.next().map(String::from);
-                let new = split.next().unwrap_or(&rest).to_string();
-                (new, old)
-            } else if index_status == 'R' || work_status == 'R' {
-                let old = rest.clone();
-                let new = match bytes.get(i..) {
-                    Some(slice) => match slice.iter().position(|&b| b == 0) {
-                        Some(n) => {
-                            let s = String::from_utf8_lossy(&slice[..n]).into_owned();
-                            i += n + 1;
-                            s
-                        }
-                        None => rest.clone(),
-                    },
-                    None => rest.clone(),
-                };
-                (new, Some(old))
-            } else {
-                (rest, None)
-            };
-
+        for record in parse_status_records(stdout.as_bytes()) {
+            let RawStatusRecord {
+                index_status,
+                work_status,
+                path,
+                old_path,
+            } = record;
             let is_conflicted = index_status == 'U'
                 || work_status == 'U'
                 || (index_status == 'A' && work_status == 'A')
@@ -622,44 +619,17 @@ impl GitReader {
 
     pub fn get_file_blame(repo_path: &str, file_path: &str) -> Result<Vec<BlameLine>, String> {
         let repo = validate_repo(repo_path)?;
-        let _ = sandbox_join(&repo, file_path)?;
+        // Canonical join resolves existing prefixes through symlinks so a
+        // symlinked directory cannot redirect the read outside the repository;
+        // not-yet-tracked leaves stay lexical.
+        sandbox_join_canonical(&repo, file_path)?;
+        // NOTE: no :(literal) magic here. `git blame` treats its <file>
+        // argument as a literal path, NOT a pathspec (globs do not widen:
+        // "weird?.txt" with no such literal file fails outright), and it
+        // rejects pathspec magic entirely ("fatal: no such path
+        // ':(literal)...' in HEAD"), so prefixing would break every call.
         let stdout = git_text(&repo, &["blame", "--line-porcelain", "--", file_path])?;
-
-        let mut blame_lines = Vec::new();
-        let mut current_sha = String::new();
-        let mut current_author = String::new();
-        let mut current_email = String::new();
-        let mut current_time: i64 = 0;
-        let mut line_count = 1;
-
-        for line in stdout.lines() {
-            if let Some(content) = line.strip_prefix('\t') {
-                blame_lines.push(BlameLine {
-                    line_no: line_count,
-                    commit_id: current_sha.clone(),
-                    author_name: current_author.clone(),
-                    author_email: current_email.clone(),
-                    timestamp: current_time,
-                    content: content.to_string(),
-                });
-                line_count += 1;
-            } else if let Some(author) = line.strip_prefix("author ") {
-                current_author = author.to_string();
-            } else if let Some(mail) = line.strip_prefix("author-mail ") {
-                current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
-            } else if let Some(time) = line.strip_prefix("author-time ") {
-                current_time = time.parse().unwrap_or(0);
-            } else {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if !parts.is_empty()
-                    && parts[0].len() == 40
-                    && parts[0].chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    current_sha = parts[0].to_string();
-                }
-            }
-        }
-        Ok(blame_lines)
+        Ok(parse_blame_porcelain(&stdout))
     }
 
     pub fn get_file_diff(
@@ -702,7 +672,10 @@ impl GitReader {
     ) -> Result<Vec<CommitFileChange>, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let stdout = git_text(&repo, &["show", "--pretty=format:", "--numstat", commit_id])?;
+        let stdout = git_text(
+            &repo,
+            &["show", "--pretty=format:", "--numstat", "-z", commit_id],
+        )?;
         Ok(parse_numstat_files(&stdout))
     }
 
@@ -784,7 +757,9 @@ impl GitReader {
             return Err("Failed to parse commit metadata format".into());
         }
         let body = fields[10].trim().to_string();
-        let changed_files = Self::get_commit_files(repo_path, commit_id).unwrap_or_default();
+        // Surface file-list failures instead of reporting a commit with
+        // silently-empty changes.
+        let changed_files = Self::get_commit_files(repo_path, commit_id)?;
         let total_additions = changed_files.iter().map(|f| f.additions).sum();
         let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
         Ok(CommitDetails {
@@ -916,6 +891,14 @@ impl GitReader {
                     continue;
                 }
             };
+            // Stat before reading: a tracked multi-gigabyte file must not be
+            // pulled into memory just to discover it exceeds the budget. The
+            // post-read length check stays as defense against growth between
+            // stat and read.
+            if check_working_tree_size(&full_path, 1_048_576).is_err() {
+                record_lang(&mut lang_counts, path_info, 0);
+                continue;
+            }
             let bytes = match std::fs::read(&full_path) {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -993,7 +976,11 @@ fn pick_default_branch(local_names: &[String], origin_head: Option<&str>) -> Str
 
 /// for-each-ref format for the branch list: everything except churn. The
 /// ahead-behind atom is appended dynamically only when a default base resolves.
-const BRANCH_LIST_FORMAT: &str = "%(HEAD)%01%(refname)%01%(objectname)%01%(upstream:track)%01%(upstream:short)%01%(committerdate:unix)%01%(authorname)%01%(contents:subject)";
+///
+/// Fields are NUL-separated: author names and commit subjects may legally
+/// contain any byte except NUL, so \x01 separators could be split by hostile
+/// content while %x00 cannot.
+const BRANCH_LIST_FORMAT: &str = "%(HEAD)%x00%(refname)%x00%(objectname)%x00%(upstream:track)%x00%(upstream:short)%x00%(committerdate:unix)%x00%(authorname)%x00%(contents:subject)";
 
 /// Resolves the default branch to (short name, commit oid) without needing the
 /// local ref list, so `list_branches` can use it before listing refs.
@@ -1002,7 +989,7 @@ const BRANCH_LIST_FORMAT: &str = "%(HEAD)%01%(refname)%01%(objectname)%01%(upstr
 /// head preferred over the remote-tracking ref so remote-only repos still
 /// resolve), then conventional main/master/trunk/develop heads. None when no
 /// candidate resolves (empty or detached-only repository).
-fn resolve_default_base(repo: &Path, origin_head: Option<&str>) -> Option<(String, String)> {
+pub(crate) fn resolve_default_base(repo: &Path, origin_head: Option<&str>) -> Option<(String, String)> {
     let mut candidates: Vec<(&str, String)> = Vec::new();
     if let Some(head) = origin_head.map(str::trim) {
         if let Some(short) = head.strip_prefix("refs/remotes/origin/") {
@@ -1140,6 +1127,16 @@ fn compute_branch_churn(repo: &Path, base: &str, branch: &str) -> Option<Compute
     })
 }
 
+/// Wraps a user-supplied pathspec so git cannot reinterpret a leading `:`
+/// as magic-pathspec syntax; the file must match literally.
+fn literal_pathspec(path: &str) -> String {
+    if path.starts_with(':') {
+        format!(":(literal){path}")
+    } else {
+        path.to_string()
+    }
+}
+
 fn validate_oid(oid: &str) -> Result<(), String> {
     if oid.is_empty() || oid.len() > 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid commit id".into());
@@ -1163,49 +1160,79 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Parses `git diff --numstat -z` output. Records are NUL-terminated and
+/// paths are never C-quoted, so names containing tabs, arrows or unicode
+/// survive intact. A rename emits `add\tdel\t\0<old>\0<new>\0`: the empty
+/// path field signals that the pre-image and post-image follow as complete
+/// NUL fields, pre-image first (verified against git's actual output).
+/// Both names are keyed so lookups by either side of the rename succeed.
 fn parse_numstat(stdout: &str) -> HashMap<String, (usize, usize)> {
     let mut map = HashMap::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let add = parts[0].parse().unwrap_or(0);
-            let del = parts[1].parse().unwrap_or(0);
-            let path = parts[2]
-                .rsplit(" => ")
-                .next()
-                .unwrap_or(parts[2])
-                .to_string();
-            map.insert(path, (add, del));
+    let mut tokens = stdout.split('\0');
+    while let Some(head) = tokens.next() {
+        if head.is_empty() {
+            continue;
+        }
+        let mut fields = head.splitn(3, '\t');
+        let add = fields.next().unwrap_or("").parse().unwrap_or(0);
+        let del = match fields.next() {
+            Some(d) => d.parse().unwrap_or(0),
+            None => continue,
+        };
+        let path_field = fields.next().unwrap_or("");
+        if path_field.is_empty() {
+            if let Some(old) = tokens.next() {
+                map.entry(old.to_string()).or_insert((add, del));
+            }
+            if let Some(new) = tokens.next() {
+                map.insert(new.to_string(), (add, del));
+            }
+        } else {
+            map.insert(path_field.to_string(), (add, del));
         }
     }
     map
 }
 
+/// Same wire format as [`parse_numstat`], but every record becomes a
+/// [`CommitFileChange`]; renames are reported once under their post-image
+/// path with status "R", binary files keep status "B".
 fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
     let mut files = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
+    let mut tokens = stdout.split('\0');
+    while let Some(head) = tokens.next() {
+        if head.is_empty() {
             continue;
         }
-        let path = parts[2]
-            .rsplit(" => ")
-            .next()
-            .unwrap_or(parts[2])
-            .to_string();
-        let status_code = if parts[0] == "-" && parts[1] == "-" {
-            "B".to_string()
-        } else if parts[2].contains(" => ") {
-            "R".to_string()
-        } else {
-            "M".to_string()
+        let mut fields = head.splitn(3, '\t');
+        let add_s = fields.next().unwrap_or("");
+        let del_s = match fields.next() {
+            Some(d) => d,
+            None => continue,
         };
-        files.push(CommitFileChange {
-            path,
-            status_code,
-            additions: parts[0].parse().unwrap_or(0),
-            deletions: parts[1].parse().unwrap_or(0),
-        });
+        let additions = add_s.parse().unwrap_or(0);
+        let deletions = del_s.parse().unwrap_or(0);
+        let binary = add_s == "-" && del_s == "-";
+        let path_field = fields.next().unwrap_or("");
+        if path_field.is_empty() {
+            let _old = tokens.next();
+            if let Some(new) = tokens.next() {
+                files.push(CommitFileChange {
+                    path: new.to_string(),
+                    status_code: "R".to_string(),
+                    additions,
+                    deletions,
+                });
+            }
+        } else {
+            let status_code = if binary { "B" } else { "M" };
+            files.push(CommitFileChange {
+                path: path_field.to_string(),
+                status_code: status_code.to_string(),
+                additions,
+                deletions,
+            });
+        }
     }
     files
 }

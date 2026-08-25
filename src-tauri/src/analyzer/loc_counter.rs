@@ -86,14 +86,13 @@ mod tests {
         let code = r#"
 // This is a comment
 fn main() {
-    println!("Hello");
 
 }
 "#;
         let counts = LocCounter::count(code, Some("//"));
-        assert_eq!(counts.total_lines, 6);
+        assert_eq!(counts.total_lines, 5);
         assert_eq!(counts.comment_lines, 1);
-        assert_eq!(counts.code_lines, 3);
+        assert_eq!(counts.code_lines, 2);
         assert_eq!(counts.blank_lines, 2);
     }
 

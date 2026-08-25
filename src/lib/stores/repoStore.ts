@@ -41,6 +41,7 @@ import {
   STATUS_POLL_INTERVAL_MS,
   shouldRunStatusPoll,
 } from "../repos/statusPoll";
+import { debounce, type Debounced } from "../async/debounce";
 import type { ReleasePublishResult } from "../ops/model";
 
 /** What a mutating action reports back: whether it ran, and under what verdict. */
@@ -184,6 +185,14 @@ export interface RepoStoreDeps {
 const MENU_RECENT_CAP = 12;
 /** Trailing debounce for localStorage writes and the native-menu rebuild. */
 const PERSIST_DEBOUNCE_MS = 300;
+/**
+ * Upper bound of cmd_branch_stats batches drained per fetch. The backend caps
+ * each call at 96 targets, so 64 batches covers ~6100 eligible branches; past
+ * the bound draining stops silently and churn resumes on the next refresh.
+ */
+export const STATS_DRAIN_MAX_BATCHES = 64;
+/** Trailing window that collapses watcher-event storms into one refresh. */
+const WATCHER_REFRESH_DEBOUNCE_MS = 200;
 
 function emptyProjected(): RepoState {
   return {
@@ -317,6 +326,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   function ensureStatusPoll() {
     if (pollTimer !== null || typeof setInterval === "undefined") return;
     pollTimer = setInterval(() => void runStatusPoll(), STATUS_POLL_INTERVAL_MS);
+  }
+
+  /** Stops the workspace poll; the next activation restarts it lazily. */
+  function stopStatusPoll() {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
   }
 
   async function runStatusPoll() {
@@ -524,38 +540,53 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   // --- progressive branch churn ------------------------------------------
-  // Churn arrives via cmd_branch_stats after the snapshot renders. One fetch
-  // per session at a time: a refresh while one is in flight lets it finish —
+  // Churn arrives via cmd_branch_stats after the snapshot renders. One logical
+  // fetch per session at a time: capped reports re-invoke inside the same
+  // in-flight slot until drained, and a refresh racing one lets it finish —
   // the tip guard keeps stale merges out, and the next refresh fetches again.
   const statsInflight = new Set<string>();
+
+  function branchStatsKey(name: string, isRemote: boolean, remoteName?: string | null): string {
+    return `${isRemote ? "remote" : "local"}:${remoteName ?? ""}:${name}`;
+  }
 
   async function fetchBranchStats(id: string, path: string, generation: number) {
     if (statsInflight.has(id)) return;
     statsInflight.add(id);
     applyToSession(id, generation, { statsPending: true });
     try {
-      const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
-      const session = internal.sessions[id];
-      if (!session || session.generation !== generation) return;
-      const updates = new Map(report.updates.map((update) => [update.name, update]));
-      let touched = false;
-      const branches = session.branches.map((branch) => {
-        const update = updates.get(branch.name);
-        // Tip guard: churn computed for another commit is stale; dropping it
-        // means a moved branch can never wear another commit's numbers.
-        if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
-        touched = true;
-        return {
-          ...branch,
-          additions: update.additions,
-          deletions: update.deletions,
-          files_changed: update.files_changed,
-          commits_ahead_of_base: update.commits_ahead_of_base,
-          commits_behind_base: update.commits_behind_base,
-          compared_to: report.compared_to,
-        };
-      });
-      applyToSession(id, generation, touched ? { branches, statsPending: false } : { statsPending: false });
+      for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
+        const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
+        const session = internal.sessions[id];
+        if (!session || session.generation !== generation) return;
+        const updates = new Map(
+          report.updates.map((update) => [
+            branchStatsKey(update.name, update.is_remote, update.remote_name),
+            update,
+          ]),
+        );
+        let touched = false;
+        // Re-read per batch: earlier batches must not be lost to a stale copy.
+        const branches = session.branches.map((branch) => {
+          const update = updates.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
+          // Tip guard: churn computed for another commit is stale; dropping it
+          // means a moved branch can never wear another commit's numbers.
+          if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
+          touched = true;
+          return {
+            ...branch,
+            additions: update.additions,
+            deletions: update.deletions,
+            files_changed: update.files_changed,
+            commits_ahead_of_base: update.commits_ahead_of_base,
+            commits_behind_base: update.commits_behind_base,
+            compared_to: report.compared_to,
+          };
+        });
+        if (touched) applyToSession(id, generation, { branches });
+        if (!report.capped) break;
+      }
+      applyToSession(id, generation, { statsPending: false });
     } catch {
       // Unknown-command rejections from older backends degrade like
       // cmd_list_tags: churn stays as-is, never an error state.
@@ -565,6 +596,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
   }
   // ------------------------------------------------------------------------
+
+  // --- watcher-storm coalescing -------------------------------------------
+  // One trailing debounce per changed repo path; a later event re-arms the
+  // same timer instead of queueing overlapping refreshes.
+  const watcherRefreshTimers = new Map<string, Debounced<[]>>();
+
+  function scheduleWatcherRefresh(key: string, run: () => void) {
+    let timer = watcherRefreshTimers.get(key);
+    if (!timer) {
+      timer = debounce(run, WATCHER_REFRESH_DEBOUNCE_MS);
+      watcherRefreshTimers.set(key, timer);
+    }
+    timer();
+  }
 
   const store = {
     subscribe,
@@ -749,6 +794,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
       internal = { ...internal, sessions: rest };
+      stopStatusPoll();
       if (session) {
         graph.evict(session.path);
         await unwatch(session.path);
@@ -775,6 +821,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -798,6 +845,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (remaining.has(key)) sessions[key] = session;
       }
       internal = { ...internal, sessions };
+      stopStatusPoll();
       for (const tab of removed) {
         graph.evict(tab.path);
         await unwatch(tab.path);
@@ -864,17 +912,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     },
     handleRepoChanged: async (changedPath?: string | null) => {
+      // Watcher events arrive per file; a checkout or rebase fires many at
+      // once. Each changed path collapses onto its own trailing window so a
+      // storm becomes one refresh; explicit refresh() calls stay undelayed.
       if (!changedPath) {
-        await store.refresh();
+        scheduleWatcherRefresh("", () => void store.refresh());
         return;
       }
       const session = Object.values(internal.sessions).find((item) =>
         sameRepo(item.path, changedPath, options),
       );
       if (!session) return;
-      await store.refresh(session.path);
+      scheduleWatcherRefresh(session.path, () => void store.refresh(session.path));
     },
     restoreWorkspace: async () => {
+      stopStatusPoll();
       const persisted = loadPersistedWorkspace(storage, options);
       replaceWorkspace({
         ...emptyWorkspace(),
