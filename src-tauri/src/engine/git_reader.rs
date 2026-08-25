@@ -172,8 +172,11 @@ impl GitReader {
 
     pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, String> {
         let repo = validate_repo(repo_path)?;
-        let origin_head =
-            git_text(&repo, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).ok();
+        let origin_head = git_text(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        )
+        .ok();
         // Resolving the default base BEFORE listing lets ahead-behind vs that
         // base ride the same for-each-ref process, so this call never blocks
         // on per-branch churn subprocesses.
@@ -188,7 +191,12 @@ impl GitReader {
         let format_arg = format!("--format={format}");
         let listed = git_text(
             &repo,
-            &["for-each-ref", format_arg.as_str(), "refs/heads/", "refs/remotes/"],
+            &[
+                "for-each-ref",
+                format_arg.as_str(),
+                "refs/heads/",
+                "refs/remotes/",
+            ],
         );
         // Older git (<2.42) rejects the ahead-behind atom outright: retry once
         // without it so listing still works. Ahead/behind then stay zero and
@@ -305,8 +313,11 @@ impl GitReader {
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
         let repo = validate_repo(repo_path)?;
         let repo_key = repo.to_string_lossy().into_owned();
-        let origin_head =
-            git_text(&repo, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).ok();
+        let origin_head = git_text(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        )
+        .ok();
 
         // Cheap listing only: refnames and tips, no history walks here.
         let stdout = git_text(
@@ -400,12 +411,10 @@ impl GitReader {
         let results: Vec<(BranchStatTarget, Option<ComputedBranchChurn>, bool)> = eligible
             .into_par_iter()
             .map(|target| {
-                let (churn, was_cached) = cached_branch_churn(
-                    &repo_key,
-                    &base_oid,
-                    &target.tip_commit_id,
-                    || compute_branch_churn(&repo, &base_oid, &target.tip_commit_id),
-                );
+                let (churn, was_cached) =
+                    cached_branch_churn(&repo_key, &base_oid, &target.tip_commit_id, || {
+                        compute_branch_churn(&repo, &base_oid, &target.tip_commit_id)
+                    });
                 (target, churn, was_cached)
             })
             .collect();

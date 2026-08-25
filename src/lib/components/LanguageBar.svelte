@@ -39,7 +39,7 @@
       <div class="h-1.5 flex-1 flex rounded-full overflow-hidden bg-background ring-1 ring-border/50">
         {#each stats as lang}
           <div
-            style="width: {lang.percentage}%; background-color: {lang.color_hex};"
+            style="width: {Number.isFinite(lang.percentage) ? lang.percentage : 0}%; background-color: {lang.color_hex};"
             title={tipFor(lang)}
           ></div>
         {/each}

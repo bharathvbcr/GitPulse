@@ -1,6 +1,7 @@
 import { VIEW_TABS, type ViewTab } from "../repos/persist";
+import { REGISTERED_VIEWS, type ViewGroupId } from "./viewRegistry";
 
-export type ViewGroupId = "work" | "inspect" | "more";
+export type { ViewGroupId };
 export type ViewNavKind = "tabs" | "menu";
 
 export interface ViewNavItem {
@@ -16,42 +17,24 @@ export interface ViewNavGroup {
 }
 
 /**
- * Header view catalog. Daily work stays as tabs; the rest folds into menus so
- * the title bar cannot grow a new button for every panel.
+ * Header view catalog, derived from the view registry: daily work stays as
+ * tabs; the rest folds into menus so the title bar cannot grow a new button
+ * for every panel. Registering a view with a menuGroup is all it takes to
+ * place it here.
  */
-export const VIEW_NAV: readonly ViewNavGroup[] = [
-  {
-    id: "work",
-    label: "Work",
-    kind: "tabs",
-    items: [
-      { id: "history", label: "Graph" },
-      { id: "diff", label: "Diff" },
-      { id: "conflict", label: "Resolve" },
-    ],
-  },
-  {
-    id: "inspect",
-    label: "Inspect",
-    kind: "menu",
-    items: [
-      { id: "blame", label: "Blame" },
-      { id: "coverage", label: "Coverage" },
-      { id: "health", label: "Health" },
-      { id: "stack", label: "Stack" },
-    ],
-  },
-  {
-    id: "more",
-    label: "More",
-    kind: "menu",
-    items: [
-      { id: "manvi", label: "MANVI" },
-      { id: "github", label: "GitHub" },
-      { id: "reflog", label: "Reflog" },
-    ],
-  },
+const NAV_GROUP_LAYOUT: readonly Pick<ViewNavGroup, "id" | "label" | "kind">[] = [
+  { id: "work", label: "Work", kind: "tabs" },
+  { id: "inspect", label: "Inspect", kind: "menu" },
+  { id: "more", label: "More", kind: "menu" },
 ];
+
+export const VIEW_NAV: readonly ViewNavGroup[] = NAV_GROUP_LAYOUT.map((layout) => ({
+  ...layout,
+  items: REGISTERED_VIEWS.filter((view) => view.menuGroup === layout.id).map((view) => ({
+    id: view.id,
+    label: view.label,
+  })),
+}));
 
 export function flattenedViewNavTabs(groups: readonly ViewNavGroup[] = VIEW_NAV): ViewTab[] {
   return groups.flatMap((group) => group.items.map((item) => item.id));

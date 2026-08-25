@@ -18,6 +18,7 @@
     AlertTriangle,
   } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
+  import { formatDate, shortHash } from "../format";
 
   interface CommitFileChange {
     path: string;
@@ -146,11 +147,6 @@
     };
   });
 
-  function formatDate(ts: number): string {
-    if (!ts) return "";
-    return new Date(ts * 1000).toLocaleString();
-  }
-
   function gpgLabel(status: string): { text: string; ok: boolean } {
     if (status === "G") return { text: "Verified", ok: true };
     if (status === "N" || !status) return { text: "Unsigned", ok: false };
@@ -164,7 +160,7 @@
     <div class="px-4 py-2.5 border-b border-border/60 flex items-center justify-between bg-surfaceHover/30">
       <div class="flex items-center gap-3 min-w-0">
         <GitCommit size={16} class="text-accent shrink-0" />
-        <span class="font-mono text-xs font-semibold text-accent">{selectedCommit.id.substring(0, 8)}</span>
+        <span class="font-mono text-xs font-semibold text-accent">{shortHash(selectedCommit.id, 8)}</span>
         <span class="text-xs font-medium text-textPrimary truncate">{selectedCommit.summary}</span>
       </div>
       <div class="flex items-center gap-4 text-[11px] text-textMuted shrink-0">

@@ -57,3 +57,51 @@ describe("pickLanguageBarStats", () => {
     expect(noFold.every((s) => s.other_languages === undefined)).toBe(true);
   });
 });
+
+describe("pickLanguageBarStats hardening", () => {
+  it("clamps negative maxShown to zero and folds everything into Other", () => {
+    const picked = pickLanguageBarStats([stat("Rust", 60), stat("JSON", 40, "data")], -3);
+    expect(picked.map((s) => s.language)).toEqual(["Other"]);
+    expect(picked[0].percentage).toBe(100);
+  });
+
+  it("treats maxShown of 0 as show-nothing", () => {
+    const picked = pickLanguageBarStats([stat("Rust", 100)], 0);
+    expect(picked.map((s) => s.language)).toEqual(["Other"]);
+  });
+
+  it("floors fractional maxShown", () => {
+    const picked = pickLanguageBarStats(
+      [stat("Rust", 40), stat("Go", 30), stat("JSON", 30, "data")],
+      2.9,
+    );
+    expect(picked.map((s) => s.language)).toEqual(["Rust", "Go", "Other"]);
+  });
+
+  it("treats non-finite maxShown as zero", () => {
+    const picked = pickLanguageBarStats([stat("Rust", 100)], Number.NaN);
+    expect(picked.map((s) => s.language)).toEqual(["Other"]);
+  });
+
+  it("drops NaN percentages from the Other rollup instead of poisoning widths", () => {
+    const poisoned = stat("JSON", Number.NaN, "data");
+    const picked = pickLanguageBarStats([poisoned, stat("Rust", 50)], 1);
+    const other = picked.find((s) => s.language === "Other");
+    expect(other?.percentage ?? 0).not.toBeNaN();
+    for (const entry of picked) {
+      expect(Number.isFinite(entry.percentage)).toBe(true);
+    }
+  });
+
+  it("aggregates duplicate language names before capping", () => {
+    const picked = pickLanguageBarStats(
+      [stat("Rust", 30), stat("Rust", 20), stat("JSON", 25, "data"), stat("Markdown", 15, "prose")],
+      6,
+    );
+    const rustRows = picked.filter((s) => s.language === "Rust");
+    expect(rustRows).toHaveLength(1);
+    expect(rustRows[0].percentage).toBeCloseTo(50);
+    expect(rustRows[0].code_lines).toBe(50);
+    expect(rustRows[0].file_count).toBe(2);
+  });
+});

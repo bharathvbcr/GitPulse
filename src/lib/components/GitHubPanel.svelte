@@ -5,6 +5,7 @@
   import { Github, GitPullRequest, ExternalLink, Play, GitBranch } from "lucide-svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import type { GitHubContextBase, WorkflowRunInfo } from "../github/types";
   import EmptyState from "./EmptyState.svelte";
 
   interface PullRequestInfo {
@@ -18,27 +19,11 @@
     ci_status: string;
   }
 
-  interface WorkflowRunInfo {
-    id: number;
-    name: string;
-    title: string;
-    status: string;
-    conclusion: string;
-    head_branch: string;
-    url: string;
-    created_at: string;
-  }
-
-  interface GitHubContext {
-    available: boolean;
+  interface GitHubContext extends GitHubContextBase {
     cli_present: boolean;
     host: string;
-    owner: string;
-    repo: string;
     html_url: string;
     pull_requests: PullRequestInfo[];
-    workflow_runs: WorkflowRunInfo[];
-    error?: string | null;
   }
 
   let ctx = $state<GitHubContext | null>(null);

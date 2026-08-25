@@ -1,11 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DevPortError,
   PREFERRED_DEV_PORT,
+  RECLAIM_GRACE_MS,
   attachChildLifetime,
   defaultRepoRoot,
   findFreePort,
@@ -14,13 +16,16 @@ import {
   isInsideRepo,
   isPortFree,
   isTauriDevArgs,
+  parseEtimeToMs,
   parseLsofPids,
   parseNetstatPids,
   parseOptionalPort,
+  parseReclaimEnv,
   portFromEnv,
   resolveDevPort,
   shouldReclaimListener,
   tauriConfigForPort,
+  tryListen,
   withTauriDevUrl,
 } from "./dev-port.mjs";
 
@@ -46,6 +51,7 @@ function mockIo(overrides: Record<string, unknown> = {}) {
     listListeners: async () => [],
     processCommand: async () => "",
     processCwd: async () => "",
+    processElapsedMs: async () => null,
     selfPids: () => new Set([process.pid]),
     kill: async () => {},
     isFree: async () => true,
@@ -95,47 +101,104 @@ describe("isDevServerCommand", () => {
 
 describe("shouldReclaimListener", () => {
   const selfPids = new Set([100]);
+  const oldEnough = RECLAIM_GRACE_MS * 10;
 
-  it("reclaims this repo's leftover Vite, not our own pid", () => {
+  function repoVite(overrides: Record<string, unknown> = {}) {
+    return {
+      pid: 42,
+      command: "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+      cwd: "/tmp/gitpulse",
+      repoRoot: "/tmp/gitpulse",
+      selfPids,
+      ...overrides,
+    };
+  }
+
+  it("reclaims this repo's leftover Vite once it is older than the grace window", () => {
     expect(
-      shouldReclaimListener({
-        pid: 42,
-        command: "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
-        cwd: "/tmp/gitpulse",
-        repoRoot: "/tmp/gitpulse",
-        selfPids,
-      }),
+      shouldReclaimListener(repoVite({ startedAgoMs: oldEnough })),
     ).toBe(true);
     expect(
-      shouldReclaimListener({
-        pid: 100,
-        command: "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
-        cwd: "/tmp/gitpulse",
-        repoRoot: "/tmp/gitpulse",
-        selfPids,
-      }),
+      shouldReclaimListener(repoVite({ startedAgoMs: oldEnough, pid: 100 })),
+    ).toBe(false);
+  });
+
+  it("spares young Vite so concurrent starts cannot kill each other", () => {
+    expect(
+      shouldReclaimListener(repoVite({ startedAgoMs: RECLAIM_GRACE_MS - 1 })),
+    ).toBe(false);
+    expect(shouldReclaimListener(repoVite({ startedAgoMs: 0 }))).toBe(false);
+  });
+
+  it("never reclaims when the start time is unknown (fail closed)", () => {
+    expect(shouldReclaimListener(repoVite({}))).toBe(false);
+    expect(
+      shouldReclaimListener(repoVite({ startedAgoMs: null })),
+    ).toBe(false);
+  });
+
+  it("reclaims regardless of age when reclaimAll is opted in (GITPULSE_RECLAIM=1)", () => {
+    expect(shouldReclaimListener(repoVite({ reclaimAll: true }))).toBe(true);
+    expect(
+      shouldReclaimListener(repoVite({ reclaimAll: true, startedAgoMs: 0 })),
+    ).toBe(true);
+  });
+
+  it("honors a custom grace period", () => {
+    expect(
+      shouldReclaimListener(
+        repoVite({ startedAgoMs: 5_000, graceMs: 1_000 }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldReclaimListener(repoVite({ startedAgoMs: 500, graceMs: 1_000 })),
     ).toBe(false);
   });
 
   it("leaves foreign Vite and non-Vite listeners alone", () => {
     expect(
-      shouldReclaimListener({
-        pid: 42,
-        command: "node /other/project/node_modules/vite/bin/vite.js",
-        cwd: "/other/project",
-        repoRoot: "/tmp/gitpulse",
-        selfPids,
-      }),
+      shouldReclaimListener(
+        repoVite({
+          pid: 42,
+          command: "node /other/project/node_modules/vite/bin/vite.js",
+          cwd: "/other/project",
+          startedAgoMs: oldEnough,
+        }),
+      ),
     ).toBe(false);
     expect(
-      shouldReclaimListener({
-        pid: 42,
-        command: "node scripts/fixtures/hold-port.mjs",
-        cwd: "/tmp/gitpulse",
-        repoRoot: "/tmp/gitpulse",
-        selfPids,
-      }),
+      shouldReclaimListener(
+        repoVite({
+          command: "node scripts/fixtures/hold-port.mjs",
+          startedAgoMs: oldEnough,
+        }),
+      ),
     ).toBe(false);
+  });
+});
+
+describe("parseEtimeToMs", () => {
+  it("parses ps etime shapes and rejects garbage", () => {
+    expect(parseEtimeToMs("00:07")).toBe(7_000);
+    expect(parseEtimeToMs("01:02")).toBe(62_000);
+    expect(parseEtimeToMs("01:00:00")).toBe(3_600_000);
+    expect(parseEtimeToMs("2-03:04:05")).toBe(((2 * 24 + 3) * 60 + 4) * 60_000 + 5_000);
+    expect(parseEtimeToMs("")).toBeNull();
+    expect(parseEtimeToMs("7")).toBeNull();
+    expect(parseEtimeToMs("soon")).toBeNull();
+  });
+});
+
+describe("parseReclaimEnv", () => {
+  it("treats GITPULSE_RECLAIM=1 as opt-in and most other things as off", () => {
+    expect(parseReclaimEnv({})).toBe(false);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "" })).toBe(false);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "0" })).toBe(false);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "false" })).toBe(false);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "off" })).toBe(false);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "1" })).toBe(true);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "true" })).toBe(true);
+    expect(parseReclaimEnv({ GITPULSE_RECLAIM: "yes" })).toBe(true);
   });
 });
 
@@ -244,6 +307,7 @@ describe("resolveDevPort", () => {
         processCommand: async () =>
           "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
         processCwd: async () => "/tmp/gitpulse",
+        processElapsedMs: async () => RECLAIM_GRACE_MS * 10,
         isFree: async () => false,
         kill: async (pid: number) => {
           killed.push(pid);
@@ -255,6 +319,64 @@ describe("resolveDevPort", () => {
     expect(result.source).toBe("cleaned");
     expect(result.port).toBe(5173);
     expect(formatResolveMessage(result)).toMatch(/Reclaimed port 5173/);
+  });
+
+  it("spares a just-started repo Vite so concurrent dev starts cannot kill each other", async () => {
+    const killed: number[] = [];
+    let elapsedCalls = 0;
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: {},
+      repoRoot: "/tmp/gitpulse",
+      allowAutoport: true,
+      io: mockIo({
+        listListeners: async () => [{ pid: 4242 }],
+        processCommand: async () =>
+          "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+        processCwd: async () => "/tmp/gitpulse",
+        processElapsedMs: async () => {
+          elapsedCalls += 1;
+          return 1_000; // one second old: someone else's live dev server
+        },
+        isFree: async () => false,
+        kill: async (pid: number) => {
+          killed.push(pid);
+        },
+        findFreePort: async () => 5174,
+      }),
+    });
+    expect(killed).toEqual([]);
+    expect(elapsedCalls).toBe(1);
+    expect(result.source).toBe("autoport");
+    expect(result.port).toBe(5174);
+  });
+
+  it("reclaims even a young Vite when GITPULSE_RECLAIM=1", async () => {
+    const killed: number[] = [];
+    let elapsedCalls = 0;
+    const result = await resolveDevPort({
+      preferred: 5173,
+      env: { GITPULSE_RECLAIM: "1" },
+      repoRoot: "/tmp/gitpulse",
+      io: mockIo({
+        listListeners: async () => [{ pid: 4242 }],
+        processCommand: async () =>
+          "node /tmp/gitpulse/node_modules/vite/bin/vite.js",
+        processCwd: async () => "/tmp/gitpulse",
+        processElapsedMs: async () => {
+          elapsedCalls += 1;
+          return 0;
+        },
+        isFree: async () => false,
+        kill: async (pid: number) => {
+          killed.push(pid);
+        },
+        waitUntilFree: async () => true,
+      }),
+    });
+    expect(elapsedCalls).toBe(0); // opt-in skips the age probe entirely
+    expect(killed).toEqual([4242]);
+    expect(result.source).toBe("cleaned");
   });
 
   it("auto-selects the next free port when a foreign process owns the preferred one", async () => {
@@ -314,6 +436,77 @@ describe("resolveDevPort", () => {
   });
 });
 
+describe("tryListen error matrix", () => {
+  it("reports free only when a bind succeeds", async () => {
+    const port = await findFreePort(19000, 19900);
+    const diagnostics: string[] = [];
+    await expect(tryListen(port, "127.0.0.1", diagnostics)).resolves.toBe(true);
+    expect(diagnostics).toEqual([]);
+  });
+
+  it("reports EADDRINUSE as taken with no diagnostic", async () => {
+    const port = await findFreePort(19000, 19900);
+    const server = await listenOn(port);
+    try {
+      const diagnostics: string[] = [];
+      await expect(tryListen(port, "127.0.0.1", diagnostics)).resolves.toBe(
+        false,
+      );
+      expect(diagnostics).toEqual([]);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("fails closed for unexpected bind errors and records the code", async () => {
+    // Ports above 65535 make Node throw ERR_SOCKET_BAD_PORT synchronously:
+    // a deterministic stand-in for EACCES/EADDRNOTAVAIL-class failures.
+    const diagnostics: string[] = [];
+    await expect(tryListen(70000, undefined, diagnostics)).resolves.toBe(false);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatch(/ERR_SOCKET_BAD_PORT/);
+
+    // The old behavior resolved `true` here, silently claiming a port was
+    // free when the probe itself had failed.
+    await expect(isPortFree(70000)).resolves.toBe(false);
+  });
+
+  it("isPortFree surfaces probe failure codes through diagnostics", async () => {
+    const diagnostics: string[] = [];
+    await expect(isPortFree(70000, diagnostics)).resolves.toBe(false);
+    expect(diagnostics.join("; ")).toMatch(/ERR_SOCKET_BAD_PORT/);
+  });
+});
+
+describe("findFreePort argument handling", () => {
+  it("rejects inverted or invalid ranges with a distinct message", async () => {
+    await expect(findFreePort(5180, 5173)).rejects.toThrow(/invalid port range/);
+    await expect(findFreePort(Number.NaN, 5180)).rejects.toThrow(
+      /invalid port range/,
+    );
+    await expect(findFreePort(0, 10)).rejects.toThrow(/invalid port range/);
+    await expect(findFreePort(60000, 70000)).rejects.toThrow(
+      /invalid port range/,
+    );
+  });
+
+  it("throws an honest all-busy message (not 'could not identify') when the range is exhausted", async () => {
+    const base = await findFreePort(19000, 19900);
+    const first = await listenOn(base);
+    const second = await listenOn(base + 1);
+    try {
+      const err = await findFreePort(base, base + 1).catch((e) => e);
+      expect(err).toBeInstanceOf(DevPortError);
+      expect(err.message).toMatch(new RegExp(`Ports ${base}-${base + 1} are all busy`));
+      expect(err.message).not.toMatch(/could not identify/);
+      expect(Array.isArray(err.diagnostics)).toBe(true);
+    } finally {
+      await closeServer(first);
+      await closeServer(second);
+    }
+  });
+});
+
 describe("live ports", () => {
   it("findFreePort skips an occupied bind", async () => {
     const base = await findFreePort(19000, 19900);
@@ -339,7 +532,9 @@ describe("live ports", () => {
 
       const result = await resolveDevPort({
         preferred: port,
-        env: {},
+        // The holder was spawned milliseconds ago; opting in via
+        // GITPULSE_RECLAIM exercises reclaim regardless of the grace window.
+        env: { GITPULSE_RECLAIM: "1" },
         repoRoot,
         allowAutoport: true,
       });
@@ -375,8 +570,15 @@ describe("live ports", () => {
 });
 
 describe("PREFERRED_DEV_PORT", () => {
-  it("stays aligned with the Tauri template default", () => {
-    expect(PREFERRED_DEV_PORT).toBe(5173);
+  it("stays aligned with src-tauri/tauri.conf.json build.devUrl", () => {
+    const confPath = path.join(repoRoot, "src-tauri", "tauri.conf.json");
+    const conf = JSON.parse(readFileSync(confPath, "utf8")) as {
+      build?: { devUrl?: string };
+    };
+    const devUrl = conf.build?.devUrl;
+    expect(devUrl).toBeDefined();
+    expect(devUrl).toMatch(/:5173$/);
+    expect(Number(new URL(devUrl ?? "").port)).toBe(PREFERRED_DEV_PORT);
   });
 });
 

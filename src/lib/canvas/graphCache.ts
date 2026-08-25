@@ -210,6 +210,16 @@ export function createGraphStaticCache(
     const rowCount = Math.min(rowsPerStrip, totalRows - firstRow);
     if (rowCount <= 0) return null;
 
+    // Make room before allocating: the superseded surface is released before
+    // its replacement exists, so live memory never peaks above the LRU cap.
+    if (strips.size >= maxStrips) {
+      const oldest = strips.entries().next();
+      if (!oldest.done) {
+        strips.delete(oldest.value[0]);
+        oldest.value[1].release?.();
+      }
+    }
+
     const cssHeight = rowCount * rowHeight;
     const surface = createSurface(inputs.cssWidth, cssHeight, inputs.dpr);
     if (!surface) return null;

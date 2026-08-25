@@ -237,20 +237,34 @@ fn test_branch_line_changes_rename_and_revision_history() {
     let branches = GitReader::list_branches(&path).expect("branches");
     let main = branches.iter().find(|b| b.name == "main").expect("main");
     assert!(main.is_default);
-    assert_eq!(main.additions, 0);
-    assert_eq!(main.deletions, 0);
 
+    // Churn left the listing's critical path by design: line counts are zero
+    // on BranchInfo and arrive through branch_stats instead.
     let feature = branches
         .iter()
         .find(|b| b.name == "feat/lines")
         .expect("feature");
-    assert!(
-        feature.additions >= 2,
-        "expected committed line additions on feat/lines, got {}",
-        feature.additions
+    assert_eq!(
+        (feature.additions, feature.deletions, feature.files_changed),
+        (0, 0, 0),
+        "list_branches must not block on churn subprocesses"
     );
     assert!(feature.commits_ahead_of_base >= 1);
     assert_eq!(feature.compared_to.as_deref(), Some("main"));
+
+    let stats = GitReader::branch_stats(&path).expect("branch stats");
+    assert_eq!(stats.compared_to, "main");
+    let feature_stats = stats
+        .updates
+        .iter()
+        .find(|u| u.name == "feat/lines")
+        .expect("feat/lines stats");
+    assert!(
+        feature_stats.additions >= 2,
+        "expected committed line additions on feat/lines, got {}",
+        feature_stats.additions
+    );
+    assert!(feature_stats.commits_ahead_of_base >= 1);
 
     GitWriter::rename_branch(&path, "feat/lines", "feat/renamed").expect("rename");
     let renamed = GitReader::list_branches(&path).expect("after rename");

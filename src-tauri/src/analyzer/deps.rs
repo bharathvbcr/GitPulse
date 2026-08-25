@@ -4,8 +4,10 @@
 //! flags lockfile / engine / install-script issues locally, and — when the
 //! matching CLI is on PATH — runs read-only audits: `npm audit` / `npm outdated`,
 //! `cargo audit`, `pip-audit --no-deps` (pinned requirements files only),
-//! `govulncheck -json`, and `composer audit --locked`. A missing CLI is reported
-//! as such; it is never treated as a clean bill of health.
+//! `govulncheck -json`, `composer audit --locked`, and `bundler-audit check`.
+//! A missing CLI is reported as such; it is never treated as a clean bill of
+//! health. Scanner advisory databases are never refreshed implicitly — a stale
+//! DB is the user's call, not a background write outside the repo.
 
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
@@ -181,6 +183,7 @@ pub struct DepsHealthReport {
     pub pip_audit_present: bool,
     pub govulncheck_present: bool,
     pub composer_present: bool,
+    pub bundler_audit_present: bool,
     pub manifests: Vec<NpmManifest>,
     pub ecosystems: Vec<EcosystemHint>,
     pub issues: Vec<HealthIssue>,
@@ -198,6 +201,7 @@ struct ScanTargets {
     py_requirements: Vec<String>,
     go_mods: Vec<String>,
     composer_locks: Vec<String>,
+    gemfile_locks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +233,7 @@ impl DepsScanner {
             enrich_python(&repo, &targets, &mut report);
             enrich_go(&repo, &targets, &mut report);
             enrich_php(&repo, &targets, &mut report);
+            enrich_ruby(&repo, &targets, &mut report);
         }
         report.audit = AuditSummary::from_vulns(&report.vulnerabilities);
         sort_report(&mut report);
@@ -291,6 +296,8 @@ fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
         && tool_version(govulncheck_program(), &["-version"]).is_some();
     let composer_present = !targets.composer_locks.is_empty()
         && tool_version(composer_program(), &["--version"]).is_some();
+    let bundler_audit_present = !targets.gemfile_locks.is_empty()
+        && tool_version(bundler_audit_program(), &["--version"]).is_some();
 
     if !manifests.is_empty() && !npm_cli_present {
         push_issue(
@@ -352,7 +359,14 @@ fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
                         "Install Composer 2.4+ to run `composer audit` against composer.lock".into()
                     }
                 }
-                "ruby" => "No Bundler audit is wired yet".into(),
+                "ruby" => {
+                    if bundler_audit_present {
+                        "Gemfile.lock will be checked with bundler-audit".into()
+                    } else {
+                        "Install bundler-audit (`gem install bundler-audit`) to scan Gemfile.lock"
+                            .into()
+                    }
+                }
                 _ => "Detected; no scanner wired".into(),
             };
             EcosystemHint {
@@ -373,6 +387,7 @@ fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
             pip_audit_present,
             govulncheck_present,
             composer_present,
+            bundler_audit_present,
             manifests,
             ecosystems,
             issues,
@@ -402,6 +417,15 @@ fn collect_side_target(name: &str, rel: &str, targets: &mut ScanTargets, truncat
             *truncated = true;
         }
         return;
+    }
+    if name == "Gemfile.lock" {
+        // Same per-family cap as composer locks; a repo rarely has more than
+        // a handful of bundler projects.
+        if targets.gemfile_locks.len() < MAX_COMPOSER_LOCKS {
+            targets.gemfile_locks.push(rel.to_string());
+        } else {
+            *truncated = true;
+        }
     }
     // requirements.txt, requirements-dev.txt, requirements/production.txt …
     if name.starts_with("requirements") && name.ends_with(".txt") || name == "constraints.txt" {
@@ -434,6 +458,14 @@ fn composer_program() -> &'static str {
         "composer.bat"
     } else {
         "composer"
+    }
+}
+
+fn bundler_audit_program() -> &'static str {
+    if cfg!(windows) {
+        "bundler-audit.bat"
+    } else {
+        "bundler-audit"
     }
 }
 
@@ -766,6 +798,174 @@ fn enrich_php(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport)
 fn audit_cwd(repo: &Path, rel: &str) -> Result<PathBuf, String> {
     let dir = dir_of(rel);
     npm_cwd(repo, &dir)
+}
+
+/// Runs `bundler-audit check --format json` against every Gemfile.lock.
+///
+/// The advisory database is never refreshed here: `bundler-audit update`
+/// clones into the user's home directory, which is a state change outside the
+/// repository this app has no business making implicitly. A missing DB fails
+/// loudly as an issue instead.
+fn enrich_ruby(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) {
+    if !report.bundler_audit_present {
+        return;
+    }
+    for rel in targets.gemfile_locks.iter().take(MAX_COMPOSER_LOCKS) {
+        let dir = dir_of(rel);
+        let cwd = match npm_cwd(repo, &dir) {
+            Ok(p) => p,
+            Err(msg) => {
+                push_issue(
+                    &mut report.issues,
+                    "error",
+                    "audit_cwd",
+                    msg,
+                    Some(rel.clone()),
+                );
+                continue;
+            }
+        };
+        let out = capture_command(
+            bundler_audit_program(),
+            &["check", "--format", "json"],
+            Some(&cwd),
+            AUDIT_TIMEOUT,
+            &[("NO_COLOR", "1")],
+        );
+        let Some(text) = scanner_stdout(
+            out,
+            &mut report.issues,
+            "bundler_audit_failed",
+            bundler_audit_program(),
+            Some(rel.clone()),
+        ) else {
+            continue;
+        };
+        match parse_bundler_audit_json(&text) {
+            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Err(e) => push_issue(
+                &mut report.issues,
+                "warning",
+                "bundler_audit_failed",
+                e,
+                Some(rel.clone()),
+            ),
+        }
+    }
+}
+
+/// Parses `bundler-audit check --format json` output.
+///
+/// Schema verified against bundler-audit 0.9.3 live capture:
+/// `{version, created_at?, results: [{type, gem: {name, version}, advisory:
+/// {id, url, title, cvss_v2?, cvss_v3?, cve?, ghsa?, patched_versions[]}}]}`.
+/// Severity derives from CVSS when published (`cvss_v3`, falling back to
+/// `cvss_v2`) and is [`SEVERITY_UNKNOWN`] otherwise; `results` may be absent
+/// or empty for a clean lockfile.
+pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("bundler-audit JSON: {e}"))?;
+    let results = match value.get("results") {
+        None => return Ok(Vec::new()),
+        Some(r) => r
+            .as_array()
+            .ok_or_else(|| "bundler-audit JSON `results` must be an array".to_string())?,
+    };
+    let mut out = Vec::new();
+    for result in results {
+        if out.len() >= MAX_VULNS {
+            break;
+        }
+        if !result.is_object() {
+            continue;
+        }
+        let name = result
+            .get("gem")
+            .and_then(|g| g.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let installed_version = result
+            .get("gem")
+            .and_then(|g| g.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let advisory = result.get("advisory");
+        let id = advisory
+            .and_then(|a| a.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // CVSS v3 outranks v2; both are plain numbers in this schema, unlike
+        // cargo audit's string form.
+        let severity = ["cvss_v3", "cvss_v2"]
+            .iter()
+            .find_map(|key| {
+                advisory
+                    .and_then(|a| a.get(key))
+                    .and_then(|v| v.as_f64())
+                    .filter(|score| *score > 0.0)
+                    .map(|score| cvss_to_severity(&score.to_string()))
+            })
+            .unwrap_or_else(|| SEVERITY_UNKNOWN.into());
+        let title = advisory
+            .and_then(|a| opt_json_str(a, "title"))
+            .filter(|t| !t.is_empty())
+            .or_else(|| (!id.is_empty()).then(|| id.clone()))
+            .unwrap_or_else(|| {
+                if name.is_empty() {
+                    "dependency is vulnerable".to_string()
+                } else {
+                    format!("{name} is vulnerable")
+                }
+            });
+        let url = opt_json_str(advisory.unwrap_or(&Value::Null), "url").unwrap_or_default();
+        let patched: Vec<String> = advisory
+            .and_then(|a| a.get("patched_versions"))
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fix_available = if patched.is_empty() {
+            "no".into()
+        } else {
+            patched.join(", ")
+        };
+        let mut via = Vec::new();
+        if !id.is_empty() {
+            via.push(id);
+        }
+        if let Some(ghsa) = advisory
+            .and_then(|a| a.get("ghsa"))
+            .and_then(|v| v.as_str())
+            .filter(|g| !g.is_empty())
+        {
+            let ghsa_id = format!("GHSA-{ghsa}");
+            if !via.contains(&ghsa_id) {
+                via.push(ghsa_id);
+            }
+        }
+        out.push(Vulnerability {
+            name,
+            severity,
+            is_direct: false,
+            title,
+            url,
+            range: format!("=={installed_version}"),
+            fix_available,
+            via,
+            ecosystem: "ruby".into(),
+        });
+    }
+    Ok(out)
 }
 
 /// Unwraps a scanner invocation into its stdout for parsing.
@@ -1746,9 +1946,9 @@ pub(crate) fn parse_composer_audit_json(text: &str) -> Result<Vec<Vulnerability>
     // Verified against Composer 2.10.x captured output: findings come keyed by
     // package name; a clean lockfile reports `"advisories": []` — an empty
     // ARRAY, not an object — which must read as zero findings.
-    let advisories = value.get("advisories").ok_or_else(|| {
-        "composer audit JSON must contain an advisories object".to_string()
-    })?;
+    let advisories = value
+        .get("advisories")
+        .ok_or_else(|| "composer audit JSON must contain an advisories object".to_string())?;
     let Some(map) = advisories.as_object() else {
         if advisories.as_array().is_some_and(|a| a.is_empty()) {
             return Ok(Vec::new());
@@ -2612,7 +2812,10 @@ not-json-at-all
         }"#;
         let vulns = parse_composer_audit_json(json).expect("live-shape parse");
         assert_eq!(vulns.len(), 2);
-        let guzzle = vulns.iter().find(|v| v.name == "guzzlehttp/guzzle").unwrap();
+        let guzzle = vulns
+            .iter()
+            .find(|v| v.name == "guzzlehttp/guzzle")
+            .unwrap();
         assert_eq!(guzzle.severity, "medium");
         assert_eq!(
             guzzle.title,
@@ -2624,10 +2827,7 @@ not-json-at-all
             guzzle.url,
             "https://github.com/advisories/GHSA-h95v-h523-3mw8"
         );
-        let fly = vulns
-            .iter()
-            .find(|v| v.name == "league/flysystem")
-            .unwrap();
+        let fly = vulns.iter().find(|v| v.name == "league/flysystem").unwrap();
         assert_eq!(
             fly.severity, "moderate",
             "severity absent → moderate default"
@@ -2697,7 +2897,112 @@ not-json-at-all
         assert_eq!(summary.total, 3);
     }
 
-    // -- scanner failure surfacing ---------------------------------------------
+    // -- bundler-audit ----------------------------------------------------------
+
+    /// Captured verbatim (abbreviated description) from bundler-audit 0.9.3:
+    /// `bundler-audit check --format json` against a Gemfile.lock pinning
+    /// nokogiri 1.10.3 / rack 2.0.7.
+    #[test]
+    fn parse_bundler_audit_live_0_9_shape() {
+        let json = r#"{
+          "version": "0.9.3",
+          "created_at": "2026-08-25 09:39:24 -0500",
+          "results": [
+            {
+              "type": "unpatched_gem",
+              "gem": { "name": "nokogiri", "version": "1.10.3" },
+              "advisory": {
+                "path": "/Users/x/.local/share/ruby-advisory-db/gems/nokogiri/CVE-2019-13118.yml",
+                "id": "CVE-2019-13118",
+                "url": "https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=15069",
+                "title": "libxslt Type Confusion vulnerability that affects Nokogiri",
+                "cvss_v2": null,
+                "cvss_v3": 7.5,
+                "cve": "2019-13118",
+                "osvdb": null,
+                "ghsa": "cf46-6xxh-pc75",
+                "unaffected_versions": [],
+                "patched_versions": [">= 1.10.5"]
+              },
+              "insecure_version": "1.10.3"
+            },
+            {
+              "type": "unpatched_gem",
+              "gem": { "name": "rack", "version": "2.0.7" },
+              "advisory": {
+                "id": "CVE-2020-8185",
+                "url": "https://github.com/rack/rack/security/advisories/GHSA-j4xc-xh5h-q7pr",
+                "title": "Possible DoS vector in Rack::File",
+                "patched_versions": ["~> 2.1.4", ">= 2.2.3"],
+                "ghsa": "j4xc-xh5h-q7pr"
+              }
+            }
+          ]
+        }"#;
+        let vulns = parse_bundler_audit_json(json).expect("parse");
+        assert_eq!(vulns.len(), 2);
+        let nokogiri = &vulns[0];
+        assert_eq!(nokogiri.name, "nokogiri");
+        assert_eq!(nokogiri.ecosystem, "ruby");
+        assert_eq!(nokogiri.severity, "high", "cvss_v3 7.5 maps to high");
+        assert_eq!(
+            nokogiri.title,
+            "libxslt Type Confusion vulnerability that affects Nokogiri"
+        );
+        assert_eq!(nokogiri.range, "==1.10.3");
+        assert_eq!(nokogiri.fix_available, ">= 1.10.5");
+        assert_eq!(
+            nokogiri.via,
+            vec!["CVE-2019-13118", "GHSA-cf46-6xxh-pc75"],
+            "advisory id plus GHSA alias"
+        );
+        let rack = &vulns[1];
+        assert_eq!(
+            rack.severity, SEVERITY_UNKNOWN,
+            "no cvss fields published → unranked, not fabricated"
+        );
+        assert_eq!(
+            rack.fix_available, "~> 2.1.4, >= 2.2.3",
+            "multiple patched versions join"
+        );
+    }
+
+    #[test]
+    fn parse_bundler_audit_clean_and_degenerate_shapes() {
+        // Clean lockfiles omit or empty `results`.
+        assert!(parse_bundler_audit_json("{\"version\":\"0.9.3\"}")
+            .unwrap()
+            .is_empty());
+        assert!(parse_bundler_audit_json("{\"results\": []}")
+            .unwrap()
+            .is_empty());
+        // Results without an advisory object still surface, unranked.
+        let bare = r#"{"results":[{"type":"insecure_source","gem":{"name":"x","version":"1.0"}}]}"#;
+        let vulns = parse_bundler_audit_json(bare).unwrap();
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].severity, SEVERITY_UNKNOWN);
+        assert_eq!(vulns[0].title, "x is vulnerable");
+        assert_eq!(vulns[0].fix_available, "no");
+        assert!(parse_bundler_audit_json("{\"results\": \"corrupt\"}").is_err());
+        assert!(parse_bundler_audit_json("not json").is_err());
+    }
+
+    #[test]
+    fn parse_bundler_audit_cvss_v2_fallback_and_caps() {
+        let mut results = Vec::new();
+        for i in 0..(MAX_VULNS + 5) {
+            results.push(format!(
+                r#"{{"type":"unpatched_gem","gem":{{"name":"g{i}","version":"1"}},"advisory":{{"id":"A-{i}","cvss_v2":{}}}}}"#,
+                if i == 0 { 4.3 } else { 0.0 }
+            ));
+        }
+        let text = format!(r#"{{"results":[{}]}}"#, results.join(","));
+        let vulns = parse_bundler_audit_json(&text).unwrap();
+        assert_eq!(vulns.len(), MAX_VULNS);
+        // The capped output keeps lexicographically-first ids; just verify
+        // the v2 fallback mapped where present.
+        assert!(vulns.iter().any(|v| v.via.contains(&"A-0".to_string())));
+    }
 
     use crate::engine::git_cli::CapturedOutput;
 

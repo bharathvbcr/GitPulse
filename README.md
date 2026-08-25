@@ -68,7 +68,7 @@ npm run tauri build  # bundles installers for the current platform
 | `npm run dev` | Vite dev server only (no app shell) |
 | `npm run tauri dev` | Full desktop app with hot reload |
 | `npm run build` | Frontend production bundle (`vite build`) |
-| `npm run check` | Type-check the frontend (`svelte-check`) |
+| `npm run check` | Type-check the frontend (`svelte-check`) and node-side config/scripts (`tsc`) |
 | `npm test` | Frontend unit tests (Vitest) |
 | `npm run coverage` | Vitest with v8 coverage |
 | `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | Rust format check |
@@ -76,11 +76,11 @@ npm run tauri build  # bundles installers for the current platform
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit & integration tests |
 
 CI (`.github/workflows/ci.yml`) runs the frontend checks and Rust checks above on Linux, macOS,
-and Windows. All warnings are errors for both `svelte-check` and clippy.
+and Windows. Clippy treats warnings as errors; `svelte-check` reports warnings without failing.
 
 ## Architecture
 
-Two codebases meet at a single IPC seam — 71 registered `cmd_*` command handlers
+Two codebases meet at a single IPC seam — 72 registered `cmd_*` command handlers
 (`src-tauri/src/lib.rs:33`):
 
 ```

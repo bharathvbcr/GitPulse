@@ -35,7 +35,11 @@ export function parseFilterQuery(query: string): ParsedFilterQuery {
       if (value) parsed.sha = value;
     } else if (token.startsWith("type:")) {
       const value = token.slice("type:".length).toLowerCase();
-      if (value) parsed.commitType = value;
+      if (CONVENTIONAL_TYPES.has(value)) {
+        parsed.commitType = value;
+      } else {
+        free.push(token);
+      }
     } else if (token.endsWith(":")) {
       const kind = token.slice(0, -1).toLowerCase();
       if (CONVENTIONAL_TYPES.has(kind)) {

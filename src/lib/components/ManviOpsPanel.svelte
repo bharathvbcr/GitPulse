@@ -110,7 +110,7 @@
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = String(error);
     } finally {
-      if ($repoStore.currentPath === repo) busy = null;
+      busy = null;
     }
   }
 
@@ -127,7 +127,7 @@
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = String(error);
     } finally {
-      if ($repoStore.currentPath === repo) busy = null;
+      busy = null;
     }
   }
 
@@ -148,18 +148,21 @@
     notice = null;
     let deleted = 0;
     const failures: string[] = [];
-    for (const name of names) {
-      if ($repoStore.currentPath !== repo) break;
-      const outcome = await repoStore.deleteBranch(name, false);
-      if (outcome.ok) deleted += 1;
-      else failures.push(`${name}: ${outcome.error ?? "failed"}`);
-    }
-    if ($repoStore.currentPath === repo) {
-      notice = failures.length
-        ? `Deleted ${deleted} of ${names.length}. ${failures.join(" ")}`
-        : `Deleted ${deleted} merged branch${deleted === 1 ? "" : "es"}.`;
+    try {
+      for (const name of names) {
+        if ($repoStore.currentPath !== repo) break;
+        const outcome = await repoStore.deleteBranch(name, false);
+        if (outcome.ok) deleted += 1;
+        else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+      }
+      if ($repoStore.currentPath === repo) {
+        notice = failures.length
+          ? `Deleted ${deleted} of ${names.length}. ${failures.join(" ")}`
+          : `Deleted ${deleted} merged branch${deleted === 1 ? "" : "es"}.`;
+        await scanBranches();
+      }
+    } finally {
       busy = null;
-      await scanBranches();
     }
   }
 
@@ -174,7 +177,7 @@
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = String(error);
     } finally {
-      if ($repoStore.currentPath === repo) busy = null;
+      busy = null;
     }
   }
 

@@ -107,6 +107,11 @@ where
             Ok(_) => {
                 pending = true;
                 last_event = Instant::now();
+                // Drain everything already queued behind that first event:
+                // during a checkout storm thousands can pile up, and one
+                // recv per loop iteration would let the backlog (and memory)
+                // grow unboundedly while never settling faster.
+                for _ in watcher.receiver.try_iter() {}
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if pending && last_event.elapsed() >= Duration::from_millis(400) {
@@ -144,6 +149,14 @@ where
     let canonical = validate_repo(&repo_path)?;
     let key = canonical.to_string_lossy().into_owned();
     let git_dir = resolve_git_dir(&canonical)?;
+    // Bare repos have no separate worktree root (git dir == repo); a normal
+    // checkout and a linked worktree both do. The non-recursive worktree
+    // watch is what makes unstaged edits fire `repo-changed`.
+    let worktree_root = if git_dir == canonical {
+        None
+    } else {
+        Some(canonical.clone())
+    };
 
     {
         let guard = state.lock_sessions()?;
@@ -155,7 +168,7 @@ where
         }
     }
 
-    let watcher = RepoFileWatcher::watch(&git_dir)?;
+    let watcher = RepoFileWatcher::watch_repo(&git_dir, worktree_root.as_deref())?;
 
     let stop = {
         let mut guard = state.lock_sessions()?;
@@ -198,6 +211,7 @@ pub fn unwatch_all(state: &WatcherState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -518,5 +532,87 @@ mod tests {
         assert_eq!(keys, vec![".".to_string()]);
         let keys = watch_lookup_keys("relative/repo");
         assert_eq!(keys, vec!["relative/repo".to_string()]);
+    }
+
+    /// Spawns the real debounce loop over a real watcher and returns a
+    /// receiver of `repo-changed` paths plus a stop handle.
+    fn spawn_loop(dir: &Path) -> (std::sync::mpsc::Receiver<String>, Arc<AtomicBool>, PathBuf) {
+        use std::process::Command;
+
+        let output = Command::new("git")
+            .arg("init")
+            .current_dir(dir)
+            .output()
+            .expect("spawn git init");
+        assert!(output.status.success());
+
+        let canonical = dir.canonicalize().unwrap();
+        let git_dir = resolve_git_dir(&canonical).expect("git dir");
+        let watcher = RepoFileWatcher::watch_repo(&git_dir, Some(&canonical)).expect("watcher");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let emit_path = canonical.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::Builder::new()
+            .name("watch-loop-test".into())
+            .spawn(move || {
+                run_watch_loop(watcher, thread_stop, emit_path.clone(), move |p| {
+                    let _ = tx.send(p);
+                });
+            })
+            .expect("spawn loop");
+        // Give the OS backend time to install its watches before the storm.
+        thread::sleep(Duration::from_millis(300));
+        (rx, stop, canonical)
+    }
+
+    /// Debounce proof: 30 rapid top-level writes must settle into exactly one
+    /// callback after the quiet window, not thirty. A second callback during
+    /// a subsequent quiet window would mean events are being forwarded
+    /// per-write instead of debounced.
+    #[test]
+    fn watch_loop_coalesces_a_write_storm_into_one_settled_callback() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+
+        for i in 0..30 {
+            std::fs::write(root.join(format!("storm_{i}.txt")), "x").unwrap();
+        }
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("at least one settled callback");
+        assert!(!first.is_empty());
+
+        // Quiet window well past the 400ms settle: no further callbacks may
+        // arrive, because no further events exist to debounce.
+        match rx.recv_timeout(Duration::from_millis(900)) {
+            Ok(extra) => panic!("unexpected extra callback for {extra}: not coalesced"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(e) => panic!("channel failed during quiet window: {e}"),
+        }
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// The reason for the second watch: an unstaged top-level edit fires the
+    /// callback even though nothing under `.git` changed — and `.git`-only
+    /// writes still fire as before.
+    #[test]
+    fn worktree_file_event_triggers_and_git_only_events_still_do() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+
+        // 1. Worktree-only write: no index/HEAD traffic involved.
+        std::fs::write(root.join("unstaged-edit.txt"), "dirty\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("unstaged worktree edit must trigger repo-changed");
+
+        // 2. A .git-only write still triggers through the recursive watch.
+        std::fs::write(root.join(".git").join("gitpulse-probe"), "x").unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("git-dir write must still trigger repo-changed");
+
+        stop.store(true, Ordering::SeqCst);
     }
 }

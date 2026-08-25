@@ -128,11 +128,9 @@ function strokeAlphaRecorder() {
 }
 
 /** Row carrying one connection; enough for renderer-driven strip painting. */
-function graphRow(
-  id: string,
-  overrides: Partial<VisualCommitRow> = {},
-): VisualCommitRow {
+function graphRow(id: string, overrides: Partial<VisualCommitRow> = {}): VisualCommitRow {
   return {
+    id,
     parent_ids: [],
     summary: "s",
     author_name: "Dev",
@@ -495,11 +493,24 @@ describe("surface release hygiene", () => {
   });
 
   it("LRU eviction releases evictees while the cap bounds live memory", () => {
-    const { cache, surfaces, released } = makeCache(2);
+    const { factory, surfaces, released } = fakeSurfaceFactory();
+    // Peak concurrency: how many factory surfaces were alive at once. Room is
+    // made *before* each new allocation, so it must never exceed the cap.
+    let peakLive = 0;
+    const trackedFactory: SurfaceFactory = (w, h, dpr) => {
+      const surface = factory(w, h, dpr);
+      peakLive = Math.max(peakLive, surfaces.length - released.length);
+      return surface;
+    };
+    const cache = createGraphStaticCache(recordingPainter().painter, trackedFactory, {
+      stripCssHeight: 20,
+      maxStrips: 2,
+    });
     cache.sync(inputs({ cssWidth: 100 }), { rowHeight: 20, totalRows: 6 });
 
     cache.paint(recordingTarget().ctx, paintReq(0, 120)); // walks strips 0..2
 
+    expect(peakLive).toBeLessThanOrEqual(2);
     // Cap holds and every surface pushed out of the map was released.
     expect(cache.stats().liveStrips).toBe(2);
     expect(released.length + cache.stats().liveStrips).toBe(surfaces.length);

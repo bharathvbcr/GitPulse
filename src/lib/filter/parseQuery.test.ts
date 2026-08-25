@@ -3,6 +3,7 @@ import {
   matchesCommit,
   parseFilterQuery,
   queryNeedsServerFetch,
+  type ParsedFilterQuery,
 } from "./parseQuery";
 
 describe("parseFilterQuery", () => {
@@ -38,6 +39,77 @@ describe("parseFilterQuery", () => {
         filter
       )
     ).toBe(false);
+  });
+
+  it.each([
+    {
+      name: "valid type via type: prefix builds the commitType predicate",
+      query: "type:feat",
+      expected: { commitType: "feat", text: "" },
+    },
+    {
+      name: "invalid type via type: prefix falls back to free text",
+      query: "type:zzz",
+      expected: { text: "type:zzz" },
+    },
+    {
+      name: "valid bare suffix keeps conventional filtering",
+      query: "chore:",
+      expected: { commitType: "chore", text: "" },
+    },
+    {
+      name: "invalid bare suffix stays free text",
+      query: "zzz:",
+      expected: { text: "zzz:" },
+    },
+    {
+      name: "empty query parses to bare text",
+      query: "",
+      expected: { text: "" },
+    },
+    {
+      name: "whitespace-only query parses to bare text",
+      query: "   \t\n  ",
+      expected: { text: "" },
+    },
+    {
+      name: "duplicate keys keep the last value",
+      query: "author:a author:b feat: chore:",
+      expected: { author: "b", commitType: "chore", text: "" },
+    },
+    {
+      name: "regex metachars are stored literally, never compiled",
+      query: "path:(src|lib)* author:^a$.*[x]",
+      expected: { path: "(src|lib)*", author: "^a$.*[x]", text: "" },
+    },
+    {
+      name: "unicode values are lowercased and kept",
+      query: "author:ÅÄÖ type:fix",
+      expected: { author: "åäö", commitType: "fix", text: "" },
+    },
+    {
+      name: "very long tokens survive intact",
+      query: `sha:${"a".repeat(10_000)}`,
+      expected: { sha: "a".repeat(10_000), text: "" },
+    },
+  ] as Array<{ name: string; query: string; expected: Partial<ParsedFilterQuery> }>)(
+    "$name",
+    ({ query, expected }) => {
+      expect(parseFilterQuery(query)).toMatchObject(expected);
+    }
+  );
+
+  it("an invalid type: token filters as plain text instead of an impossible predicate", () => {
+    expect(parseFilterQuery("type:zzz").commitType).toBeUndefined();
+    expect(parseFilterQuery("zzz:").commitType).toBeUndefined();
+    const filter = parseFilterQuery("type:zzz");
+    const row = {
+      id: "abc123",
+      summary: "docs mention the literal type:zzz token here",
+      author_name: "A",
+      author_email: "a@example.com",
+    };
+    expect(matchesCommit(row, filter)).toBe(true);
   });
 });
 

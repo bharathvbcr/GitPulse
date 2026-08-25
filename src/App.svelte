@@ -63,44 +63,51 @@
     applyPlatformClass();
     const unsubs: Array<() => void> = [];
     void (async () => {
-      unsubs.push(
-        await subscribeNativeShell({
-          open: () => void repoStore.pickAndOpenRepo(),
-          clone: () => {
-            isCloneModalOpen = true;
-          },
-          settings: () => {
-            isSettingsModalOpen = true;
-          },
-          refresh: () => void repoStore.refresh(),
-          toggleTheme: () => themeStore.toggle(),
-          themeSystem: () => themeStore.setPreference("system"),
-          themeLight: () => themeStore.setTheme("light"),
-          themeDark: () => themeStore.setTheme("dark"),
-          setTab: (tab) => repoStore.setActiveTab(tab),
-          fetch: () => void repoStore.fetch(),
-          pull: () => void repoStore.pull(),
-          push: () => void repoStore.push(),
-          stash: () => void repoStore.stashSave(),
-          stashPop: () => void repoStore.stashPop(),
-          rebase: () => {
-            isRebaseModalOpen = true;
-          },
-          palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
-          focusFilter: () =>
-            window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
-          openRecent: (path) => void openFromExternal(path),
-          openRepo: (path) => void openFromExternal(path),
-          closeRepoTab: () => void repoStore.closeActiveTab(),
-          nextRepoTab: () => void repoStore.nextTab(),
-          prevRepoTab: () => void repoStore.prevTab(),
-          reopenRepoTab: () => void repoStore.reopenLastClosed(),
-          openError: (message) => repoStore.setError(message),
-          setDropActive: (active) => {
-            dropActive = active;
-          },
-        }),
-      );
+      // A failed native-shell subscription must not abort startup: it unwinds
+      // its own listeners before rethrowing, and skipping the restore below
+      // would lose the persisted session. Log and keep booting.
+      try {
+        unsubs.push(
+          await subscribeNativeShell({
+            open: () => void repoStore.pickAndOpenRepo(),
+            clone: () => {
+              isCloneModalOpen = true;
+            },
+            settings: () => {
+              isSettingsModalOpen = true;
+            },
+            refresh: () => void repoStore.refresh(),
+            toggleTheme: () => themeStore.toggle(),
+            themeSystem: () => themeStore.setPreference("system"),
+            themeLight: () => themeStore.setTheme("light"),
+            themeDark: () => themeStore.setTheme("dark"),
+            setTab: (tab) => repoStore.setActiveTab(tab),
+            fetch: () => void repoStore.fetch(),
+            pull: () => void repoStore.pull(),
+            push: () => void repoStore.push(),
+            stash: () => void repoStore.stashSave(),
+            stashPop: () => void repoStore.stashPop(),
+            rebase: () => {
+              isRebaseModalOpen = true;
+            },
+            palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
+            focusFilter: () =>
+              window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
+            openRecent: (path) => void openFromExternal(path),
+            openRepo: (path) => void openFromExternal(path),
+            closeRepoTab: () => void repoStore.closeActiveTab(),
+            nextRepoTab: () => void repoStore.nextTab(),
+            prevRepoTab: () => void repoStore.prevTab(),
+            reopenRepoTab: () => void repoStore.reopenLastClosed(),
+            openError: (message) => repoStore.setError(message),
+            setDropActive: (active) => {
+              dropActive = active;
+            },
+          }),
+        );
+      } catch (err) {
+        console.error("native shell unavailable; continuing without menu integration", err);
+      }
       const pending = await takePendingOpen();
       await repoStore.restoreWorkspace();
       if (pending) {

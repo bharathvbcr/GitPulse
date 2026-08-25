@@ -1,6 +1,6 @@
 <script lang="ts" generics="T">
   import type { Snippet } from "svelte";
-  import { computeWindow } from "./virtualWindow";
+  import { computeWindow } from "../dom/virtualWindow";
 
   interface Props {
     /** Rows to window over. Omit and pass `itemCount` to render blanks. */

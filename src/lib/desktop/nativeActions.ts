@@ -1,4 +1,5 @@
 import type { RepoState } from "../stores/repoStore";
+import { viewTabForMenuId } from "../views/viewRegistry";
 
 export interface NativeMenuPayload {
   id: string;
@@ -33,18 +34,6 @@ export interface NativeMenuHandlers {
   setDropActive?: (active: boolean) => void;
 }
 
-const TAB_BY_ID: Record<string, RepoState["activeTab"]> = {
-  "tab-history": "history",
-  "tab-diff": "diff",
-  "tab-conflict": "conflict",
-  "tab-blame": "blame",
-  "tab-coverage": "coverage",
-  "tab-health": "health",
-  "tab-stack": "stack",
-  "tab-github": "github",
-  "tab-reflog": "reflog",
-};
-
 export function dispatchNativeMenu(
   payload: NativeMenuPayload,
   handlers: NativeMenuHandlers,
@@ -73,17 +62,6 @@ export function dispatchNativeMenu(
       return true;
     case "theme-dark":
       handlers.themeDark();
-      return true;
-    case "tab-history":
-    case "tab-diff":
-    case "tab-conflict":
-    case "tab-blame":
-    case "tab-coverage":
-    case "tab-health":
-    case "tab-stack":
-    case "tab-github":
-    case "tab-reflog":
-      handlers.setTab(TAB_BY_ID[payload.id]);
       return true;
     case "fetch":
       handlers.fetch();
@@ -127,7 +105,14 @@ export function dispatchNativeMenu(
     case "reopen-repo-tab":
       handlers.reopenRepoTab();
       return true;
-    default:
-      return false;
+    default: {
+      // `tab-<view>` ids resolve through the view registry, so a newly
+      // registered view is navigable without touching this file (this is how
+      // 'tab-manvi' went missing).
+      const tab = viewTabForMenuId(payload.id);
+      if (!tab) return false;
+      handlers.setTab(tab);
+      return true;
+    }
   }
 }

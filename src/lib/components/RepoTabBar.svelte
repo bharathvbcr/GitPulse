@@ -4,6 +4,7 @@
   import { isCaseInsensitiveFs, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
+  import { isImeComposition } from "../keyboard/imeGuard";
   import {
     ChevronDown,
     Pin,
@@ -52,6 +53,7 @@
   }
 
   function handleKey(e: KeyboardEvent) {
+    if (isImeComposition(e)) return;
     const meta = e.metaKey || e.ctrlKey;
     // The native menu owns Cmd/Ctrl+Shift+W under Tauri (CLOSE_REPO_TAB_ACCEL)
     // and closes the active tab through the gitpulse-menu event; a JS handler

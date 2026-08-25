@@ -561,6 +561,15 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as StdCommand;
+
+    /// Git words an empty commit two ways depending on tree state:
+    /// "nothing to commit, working tree clean" and "nothing added to commit
+    /// but untracked files present". Both exit 1; both mean retry.
+    fn is_empty_commit_refusal(error: &str) -> bool {
+        let lower = error.to_lowercase();
+        lower.contains("nothing to commit") || lower.contains("nothing added to commit")
+    }
 
     #[test]
     fn test_validate_ref_name() {
@@ -818,7 +827,10 @@ mod tests {
         let l2 = super::repo_mutation_lock(&canon_a);
         let l3 = super::repo_mutation_lock(&canon_b);
         assert!(Arc::ptr_eq(&l1, &l2), "same repo must yield the same lock");
-        assert!(!Arc::ptr_eq(&l1, &l3), "different repos must not share a lock");
+        assert!(
+            !Arc::ptr_eq(&l1, &l3),
+            "different repos must not share a lock"
+        );
     }
 
     /// Stress: concurrent mutations on one repo must all land, in either
@@ -840,23 +852,33 @@ mod tests {
                     barrier.wait();
                     for i in 0..PER_THREAD {
                         let file = format!("t{t}_f{i}.txt");
-                        std::fs::write(
-                            std::path::Path::new(&path).join(&file),
-                            format!("thread {t} round {i}\n"),
-                        )
-                        .unwrap();
+                        let content = format!("thread {t} round {i}\n");
+                        std::fs::write(std::path::Path::new(&path).join(&file), content.clone())
+                            .unwrap();
                         // Stage→commit spans two lock acquisitions, so a
                         // sibling mutation may consume this thread's staged
                         // entry first and leave `git commit` with nothing to
-                        // do. That is correct shared-index behavior; the
-                        // caller retries until its own content lands.
+                        // do. Once HEAD carries our exact content the work
+                        // has landed (under a sibling's message), and a
+                        // re-stage can never make our own commit non-empty
+                        // again — that outcome is success, not a retry.
                         let mut attempts = 0;
                         loop {
                             GitWriter::stage_file(&path, &file)
                                 .unwrap_or_else(|e| panic!("stage {t}.{i}: {e}"));
                             match GitWriter::commit(&path, &format!("commit t{t}.{i}"), false) {
                                 Ok(_) => break,
-                                Err(e) if e.to_lowercase().contains("nothing to commit") => {
+                                Err(e) if is_empty_commit_refusal(&e) => {
+                                    let landed = StdCommand::new("git")
+                                        .args(["show", &format!("HEAD:{file}")])
+                                        .current_dir(std::path::Path::new(&path))
+                                        .output()
+                                        .expect("git show HEAD:path");
+                                    if landed.status.success()
+                                        && String::from_utf8_lossy(&landed.stdout) == content
+                                    {
+                                        break;
+                                    }
                                     attempts += 1;
                                     assert!(
                                         attempts < 200,
@@ -873,16 +895,27 @@ mod tests {
         for h in handles {
             h.join().expect("worker thread must not panic");
         }
-        let log = std::process::Command::new("git")
-            .args(["rev-list", "--count", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let count: usize = String::from_utf8(log.stdout).unwrap().trim().parse().unwrap();
-        assert_eq!(
-            count,
-            1 + THREADS * PER_THREAD,
-            "seed + every concurrent commit must be present exactly once"
-        );
+        // The invariant is no lost updates, not one commit object per worker
+        // round: under the shared index a sibling's commit legitimately
+        // carries several workers' staged entries in one commit. Pickaxe over
+        // each unique content proves it landed exactly once.
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let file = format!("t{t}_f{i}.txt");
+                let needle = format!("thread {t} round {i}");
+                let log = StdCommand::new("git")
+                    .args(["log", "--format=%H", "-S", &needle, "--", &file])
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8(log.stdout).unwrap();
+                let hits: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "content of {file} must appear in exactly one commit, found {hits:?}"
+                );
+            }
+        }
     }
 }

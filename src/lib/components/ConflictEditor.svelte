@@ -27,6 +27,7 @@
   let conflictedFiles = $derived($repoStore.statuses.filter((s) => s.is_conflicted));
   let selectedFile = $state<string | null>(null);
   let parsedDoc = $state<ConflictDoc | null>(null);
+  let loadError = $state<string | null>(null);
   let resolvedPreview = $state<string>("");
   let isSaving = $state(false);
   let saveError = $state<string | null>(null);
@@ -59,6 +60,7 @@
       resolvedPreview = "";
       isSaving = false;
       saveError = null;
+      loadError = null;
       return;
     }
     const guard = createAsyncGuard();
@@ -76,12 +78,14 @@
           content,
         });
         if (!guard.isLive()) return;
+        loadError = null;
         parsedDoc = doc;
         await updatePreview(doc);
       } catch (err) {
         if (!guard.isLive()) return;
         parsedDoc = null;
         resolvedPreview = "";
+        loadError = String(err);
         console.error("Failed to load conflict:", err);
       }
     })();
@@ -190,6 +194,13 @@
       <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-[11px] flex items-center gap-2">
         <AlertTriangle size={12} class="shrink-0" />
         <span class="truncate">Save failed: {saveError}</span>
+      </div>
+    {/if}
+
+    {#if loadError}
+      <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-[11px] flex items-center gap-2">
+        <AlertTriangle size={12} class="shrink-0" />
+        <span class="truncate">Failed to load conflict: {loadError}</span>
       </div>
     {/if}
 

@@ -61,10 +61,17 @@ fn stress_list_and_stats_over_120_divergent_branches() {
     assert_eq!(branches.len(), 121);
     let main = find(&branches, "main");
     assert!(main.is_default);
-    assert_eq!((main.commits_ahead_of_base, main.commits_behind_base), (0, 0));
+    assert_eq!(
+        (main.commits_ahead_of_base, main.commits_behind_base),
+        (0, 0)
+    );
     for i in 0..120 {
         let b = find(&branches, &format!("feat-{i:03}"));
-        assert_eq!(b.compared_to.as_deref(), Some("main"), "compared_to feat-{i:03}");
+        assert_eq!(
+            b.compared_to.as_deref(),
+            Some("main"),
+            "compared_to feat-{i:03}"
+        );
         let expected_ahead = if i % 3 == 0 { 1 } else { 0 };
         assert_eq!(b.commits_ahead_of_base, expected_ahead, "ahead feat-{i:03}");
         assert_eq!(b.commits_behind_base, 0, "behind feat-{i:03}");
@@ -73,13 +80,20 @@ fn stress_list_and_stats_over_120_divergent_branches() {
         assert!(!b.last_summary.is_empty(), "summary feat-{i:03}");
     }
 
-    // Stats pass 1: everything computed fresh, target cap engaged.
+    // Stats pass 1: cap engaged, every eligible branch accounted for. Branches
+    // sharing a tip oid may be computed concurrently on the cold pass, so the
+    // computed/cached split is not deterministic — the total is.
     let first = GitReader::branch_stats(path).expect("branch_stats");
     assert!(first.capped, ">96 eligible branches must trip the cap");
     assert_eq!(first.compared_to, "main");
     assert_eq!(first.updates.len(), 96);
-    assert_eq!(first.computed, 96);
-    assert_eq!(first.cached, 0);
+    assert_eq!(
+        first.computed + first.cached,
+        96,
+        "computed {} + cached {} must cover every update",
+        first.computed,
+        first.cached
+    );
 
     // Divergent branches carry real churn; pointer-only ones stay zero.
     let divergent = first
@@ -96,7 +110,11 @@ fn stress_list_and_stats_over_120_divergent_branches() {
         .find(|u| u.name == "feat-001")
         .expect("feat-001 update");
     assert_eq!(
-        (plain.additions, plain.deletions, plain.commits_ahead_of_base),
+        (
+            plain.additions,
+            plain.deletions,
+            plain.commits_ahead_of_base
+        ),
         (0, 0, 0)
     );
 
@@ -162,7 +180,10 @@ fn empty_repo_yields_empty_results_without_panicking() {
 
     let report = GitReader::branch_stats(path).expect("branch_stats");
     assert!(report.updates.is_empty());
-    assert_eq!((report.computed, report.cached, report.capped), (0, 0, false));
+    assert_eq!(
+        (report.computed, report.cached, report.capped),
+        (0, 0, false)
+    );
 }
 
 /// Detached HEAD: no ref is current, listing and stats still work.

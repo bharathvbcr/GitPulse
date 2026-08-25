@@ -73,6 +73,7 @@ function fakeSurfaceFactory(): SurfaceFactory {
 
 function row(id: string, overrides: Partial<VisualCommitRow> = {}): VisualCommitRow {
   return {
+    id,
     parent_ids: [],
     summary: "s",
     author_name: "Dev",

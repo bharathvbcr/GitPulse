@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -42,6 +43,10 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(30);
 /// Lines of the child's stderr kept for diagnostics.
 const STDERR_TAIL_LINES: usize = 40;
+/// Grace period between closing the child's stdin (its documented clean
+/// shutdown) and escalating to `kill` in [`Drop for Sidecar`]. A harness that
+/// honors EOF exits in milliseconds; this only bounds the dishonorable case.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// Refuse to send a line the harness would refuse anyway (its cap is 8 MiB).
 /// Ours is lower on purpose: a request this large is a defect in our prompt
 /// budgeting, and finding it here is cheaper than finding it as an E_TOO_LARGE.
@@ -60,6 +65,10 @@ pub enum HarnessError {
     Refused(WireError),
     /// The harness answered something this client could not decode.
     Protocol(String),
+    /// Another gated action already holds the sidecar slot; this request was
+    /// not queued behind it. Deliberately distinct from `Unavailable`: the
+    /// harness may be perfectly healthy, just busy with one serial dispatch.
+    Busy(String),
 }
 
 impl HarnessError {
@@ -70,6 +79,7 @@ impl HarnessError {
             HarnessError::Timeout(m) => m.clone(),
             HarnessError::Refused(e) => e.to_string(),
             HarnessError::Protocol(m) => m.clone(),
+            HarnessError::Busy(m) => m.clone(),
         }
     }
 
@@ -80,6 +90,7 @@ impl HarnessError {
             HarnessError::Timeout(_) => "timeout",
             HarnessError::Refused(_) => "refused",
             HarnessError::Protocol(_) => "protocol",
+            HarnessError::Busy(_) => "busy",
         }
     }
 }
@@ -93,7 +104,10 @@ impl std::fmt::Display for HarnessError {
 /// A running sidecar and the handshake it answered with.
 struct Sidecar {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once stdin has been closed for shutdown. An `Option` is what
+    /// lets [`Drop`] hand the pipe back to the OS without moving out of
+    /// `&mut self`.
+    stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     stderr: std::sync::Arc<Mutex<VecDeque<String>>>,
     hello: HelloResult,
@@ -103,11 +117,34 @@ struct Sidecar {
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Closing stdin is the documented clean shutdown; killing is the
-        // fallback for a child that ignores EOF.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        shutdown_child(&mut self.child, self.stdin.take(), SHUTDOWN_GRACE);
     }
+}
+
+/// Clean-shutdown escalation ladder, factored out of [`Drop for Sidecar`]
+/// because it is testable against arbitrary children.
+///
+/// 1. Close stdin. The harness's documented clean shutdown is EOF on its
+///    request stream; an honorable child exits on its own.
+/// 2. Wait up to `grace` for that exit.
+/// 3. Kill whatever remains, so a wedged child cannot leak past its owner.
+fn shutdown_child(child: &mut Child, stdin: Option<ChildStdin>, grace: Duration) {
+    // Dropping the write end is what sends EOF; there is no explicit close.
+    drop(stdin);
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            // Still running at the deadline, or wait itself failed: either
+            // way the escalation below reaps the process or reports why not.
+            _ => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl Sidecar {
@@ -135,10 +172,14 @@ impl Sidecar {
             )));
         }
 
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| HarnessError::Unavailable("sidecar stdin closed".into()))?;
+        stdin
             .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
             .map_err(|e| HarnessError::Unavailable(format!("sidecar stdin closed: {}", e)))?;
 
         let deadline = Instant::now() + timeout;
@@ -362,7 +403,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
 
     let mut sidecar = Sidecar {
         child,
-        stdin,
+        stdin: Some(stdin),
         lines: rx,
         stderr: tail,
         hello: HelloResult::default(),
@@ -439,10 +480,27 @@ impl Slot {
 /// A transport fault drops the child so the next call starts a fresh one; a
 /// refusal by the harness leaves it running, because the harness is fine and
 /// the request was not.
+///
+/// The slot lock is deliberately held across the whole round trip (serial
+/// dispatch is what makes a stray line attributable), so acquisition uses
+/// `try_lock`: a second caller while one gated action is in flight fails fast
+/// with [`HarnessError::Busy`] instead of silently queueing behind up to 15s
+/// per in-flight request. A poisoned slot is *recovered* rather than
+/// propagated — the guard protects only this process's bookkeeping, and the
+/// data it guards stays valid enough to retry from (a wedged child is dropped
+/// on its next fault).
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
-    let mut guard = slot()
-        .lock()
-        .map_err(|_| HarnessError::Unavailable("harness lock poisoned".into()))?;
+    use std::sync::TryLockError;
+    let mut guard = match slot().try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            return Err(HarnessError::Busy(format!(
+                "another gated action is already in progress; '{op}' was not sent. \
+                 Retry once the current commit/push/pull settles."
+            )));
+        }
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
     let sidecar = guard.ensure()?;
     match sidecar.call(op, params, timeout) {
         Ok(v) => Ok(v),
@@ -478,19 +536,24 @@ pub fn call_typed<T: serde::de::DeserializeOwned>(
 pub fn handshake() -> Result<(String, HelloResult), HarnessError> {
     let mut guard = slot()
         .lock()
-        .map_err(|_| HarnessError::Unavailable("harness lock poisoned".into()))?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sidecar = guard.ensure()?;
     Ok((sidecar.binary.clone(), sidecar.hello.clone()))
 }
 
 /// Forgets the backoff so the next call retries immediately. The UI's
 /// "reconnect" affordance.
+///
+/// A poisoned slot is recovered deterministically: the fields being cleared
+/// are plain bookkeeping, and leaving them stale behind a poisoned lock would
+/// keep the 30s respawn backoff alive with no way to reset it.
 pub fn reset() {
-    if let Ok(mut guard) = slot().lock() {
-        guard.sidecar = None;
-        guard.last_error = None;
-        guard.backoff_until = None;
-    }
+    let mut guard = slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.sidecar = None;
+    guard.last_error = None;
+    guard.backoff_until = None;
 }
 
 /// True when this build knows how to ask for `op` and the running sidecar
@@ -562,5 +625,77 @@ mod tests {
             matches!(outcome, LineOutcome::Fault(_)),
             "expected Fault, got {outcome:?}"
         );
+    }
+
+    /// Regression (slot-lock hardening): while one gated action holds the
+    /// slot, a second caller must fail fast with a distinct Busy error naming
+    /// the situation — not queue behind the in-flight 15s round trip. The old
+    /// body used a blocking `lock()`, so this call only ever returned after
+    /// the holder released.
+    #[test]
+    fn second_caller_while_slot_is_held_fails_fast_with_busy() {
+        let holder = slot().lock().expect("acquire slot to simulate a call");
+        let started = Instant::now();
+        let err =
+            super::call("policy.check", None, Duration::from_millis(50)).expect_err("slot is held");
+        drop(holder);
+        assert!(matches!(err, HarnessError::Busy(ref m) if m.contains("in progress")));
+        assert_eq!(err.code(), "busy");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "fast-fail took {:?}; the caller queued instead",
+            started.elapsed()
+        );
+    }
+
+    /// A child that honors stdin EOF exits on its own inside the grace
+    /// window; no kill is needed and the exit status is its own.
+    #[test]
+    fn shutdown_closes_stdin_and_lets_an_honoring_child_exit_cleanly() {
+        let mut child = Command::new("sh")
+            .args(["-c", "cat > /dev/null; echo done >&2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn honoring child");
+        let stdin = child.stdin.take().expect("piped stdin");
+
+        let started = Instant::now();
+        shutdown_child(&mut child, Some(stdin), Duration::from_millis(500));
+        let status = child.wait().expect("reap");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_000),
+            "clean exit should not wait out the full grace"
+        );
+        assert!(status.success(), "child exited on EOF, not killed");
+    }
+
+    /// A child that ignores EOF is killed at the grace deadline; the total
+    /// shutdown stays bounded by roughly the grace period.
+    #[test]
+    fn shutdown_escalates_to_kill_when_child_ignores_eof() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stubborn child");
+        let stdin = child.stdin.take().expect("piped stdin");
+
+        let started = Instant::now();
+        shutdown_child(&mut child, Some(stdin), Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        let status = child.wait().expect("reap after kill");
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "escalation fired early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3_000),
+            "shutdown exceeded grace materially: {elapsed:?}"
+        );
+        assert!(!status.success(), "a SIGKILLed sleep cannot report success");
     }
 }

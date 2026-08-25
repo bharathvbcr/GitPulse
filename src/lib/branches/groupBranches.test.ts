@@ -7,7 +7,7 @@ import {
   isStaleBranch,
   localNameFor,
 } from "./groupBranches";
-import type { BranchInfo } from "./types";
+import type { BranchFolder, BranchInfo, BranchSection } from "./types";
 
 function branch(partial: Partial<BranchInfo> & Pick<BranchInfo, "name">): BranchInfo {
   return {
@@ -117,5 +117,54 @@ describe("branch name helpers", () => {
     expect(isStaleBranch(now - 10 * 86400, now)).toBe(false);
     expect(isStaleBranch(now - 100 * 86400, now)).toBe(true);
     expect(isStaleBranch(0, now)).toBe(false);
+  });
+});
+
+describe("groupBranches at scale", () => {
+  it("groups and filters 20k mixed-depth branches without quadratic blowup", () => {
+    const branches: BranchInfo[] = [];
+    for (let i = 0; i < 20_000; i++) {
+      // Cycle nesting depths so folder fan-out and reuse are both exercised.
+      const depth = (i % 4) + 1;
+      const folders = Array.from({ length: depth }, (_, d) => `lvl${d}`).join("/");
+      const isRemote = i % 5 === 4;
+      branches.push(
+        branch({
+          name: `${folders}/br${i}`,
+          is_remote: isRemote,
+          remote_name: isRemote ? "origin" : null,
+        })
+      );
+    }
+
+    const t0 = performance.now();
+    const sections = groupBranches(branches);
+    const filtered = filterBranchSections(sections, "br19999");
+    const elapsedMs = performance.now() - t0;
+
+    // Generous bound purely to catch accidental quadratic behavior.
+    expect(elapsedMs).toBeLessThan(2000);
+
+    // Correctness spot checks: every branch lands in exactly one section.
+    const totalGrouped = sections.reduce((n, s) => n + s.branchCount, 0);
+    expect(totalGrouped).toBe(20_000);
+    const local = sections.find((s) => s.id === "local")!;
+    const origin = sections.find((s) => s.id === "remote:origin")!;
+    expect(local.branchCount).toBe(16_000);
+    expect(origin.branchCount).toBe(4_000);
+
+    // "br19999" substring-matches exactly one branch (i=19999, a remote,
+    // depth-4 branch); subsequence matching cannot reach any other leaf
+    // because no other name carries five ordered nines after its last "1".
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].id).toBe("remote:origin");
+    expect(filtered[0].branchCount).toBe(1);
+    let deepest: BranchSection | BranchFolder = filtered[0];
+    for (const label of ["lvl0", "lvl1", "lvl2", "lvl3"]) {
+      const next = deepest.folders.find((f) => f.label === label);
+      expect(next).toBeDefined();
+      deepest = next!;
+    }
+    expect(deepest.branches.map((b) => b.name)).toEqual(["lvl0/lvl1/lvl2/lvl3/br19999"]);
   });
 });

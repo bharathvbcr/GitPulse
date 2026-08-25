@@ -9,8 +9,26 @@ pub struct RepoFileWatcher {
 }
 
 impl RepoFileWatcher {
-    /// Watches a resolved git directory recursively (work-tree `.git`, worktree git dir, or bare repo).
+    /// Watches only a resolved git directory recursively (work-tree `.git`,
+    /// linked-worktree git dir, or bare repo). See [`Self::watch_repo`] for
+    /// the full-repo form.
     pub fn watch(git_dir: &Path) -> Result<Self, String> {
+        Self::watch_repo(git_dir, None)
+    }
+
+    /// Watches a repository for the change detector: the resolved git dir
+    /// recursively, and — when the repository has a separate worktree root —
+    /// that root too.
+    ///
+    /// The worktree watch is deliberately NON-recursive (top-level entries
+    /// only). Recursive watching of a whole checkout is far too hot for the
+    /// debounce loop, but without *some* worktree coverage an unstaged edit
+    /// never fires `repo-changed` and status goes stale. Top-level entries are
+    /// where edits surface first (new/removed files, mtime churn on roots);
+    /// deeper edits still reach us through the index/HEAD writes they cause
+    /// inside `.git`. Both `notify` backends in use here support the mode:
+    /// inotify natively, FSEvents via its own filtering.
+    pub fn watch_repo(git_dir: &Path, worktree_root: Option<&Path>) -> Result<Self, String> {
         if !git_dir.exists() {
             return Err(format!(
                 "Git directory does not exist: {}",
@@ -31,6 +49,20 @@ impl RepoFileWatcher {
         watcher
             .watch(git_dir, RecursiveMode::Recursive)
             .map_err(|e| format!("Failed to watch git directory: {}", e))?;
+
+        if let Some(root) = worktree_root {
+            if !root.exists() {
+                return Err(format!(
+                    "Repository work tree does not exist: {}",
+                    root.display()
+                ));
+            }
+            if root != git_dir {
+                watcher
+                    .watch(root, RecursiveMode::NonRecursive)
+                    .map_err(|e| format!("Failed to watch work tree root: {}", e))?;
+            }
+        }
 
         Ok(Self {
             _watcher: watcher,

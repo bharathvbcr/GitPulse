@@ -4,6 +4,7 @@
   import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { filterStore } from "../stores/filterStore";
+  import { debounce } from "../async/debounce";
   import {
     branchLeafName,
     countFolder,
@@ -12,7 +13,13 @@
     isStaleBranch,
     localNameFor,
   } from "../branches/groupBranches";
-  import type { BranchFolder, BranchSection } from "../branches/types";
+  import {
+    flattenRows,
+    type FolderHeaderRow,
+    type SectionHeaderRow,
+    type TagRow,
+  } from "../branches/flattenRows";
+  import type { BranchSection } from "../branches/types";
   import { portal } from "../dom/portal";
   import ChurnBar from "./ChurnBar.svelte";
   import {
@@ -34,19 +41,32 @@
     Download,
   } from "lucide-svelte";
 
+  // Mirrors Sidebar's FILE_LIST_STEP progressive-mount precedent.
+  const BRANCH_ROW_STEP = 300;
+  const FILTER_DEBOUNCE_MS = 120;
+
   let query = $state("");
+  let debouncedQuery = $state("");
+  const applyFilter = debounce((q: string) => (debouncedQuery = q), FILTER_DEBOUNCE_MS);
   let creating = $state(false);
   let createName = $state("");
   let suggesting = $state(false);
   let collapsed = $state<Record<string, boolean>>({});
   let menu = $state<{ x: number; y: number; branch?: BranchInfo; tag?: TagInfo } | null>(null);
+  let renderLimit = $state(BRANCH_ROW_STEP);
+  let sentinel: HTMLDivElement | undefined = $state();
 
   let workAdd = $derived($repoStore.statuses.reduce((n, s) => n + (s.additions || 0), 0));
   let workDel = $derived($repoStore.statuses.reduce((n, s) => n + (s.deletions || 0), 0));
+  let statsPending = $derived($repoStore.statsPending ?? false);
 
-  let sections = $derived(
-    filterBranchSections(groupBranches($repoStore.branches, $repoStore.tags), query)
-  );
+  // Chained derivations memoize on dependency identity, so typing only
+  // re-runs filter + flatten; grouping waits on real branch/tag changes.
+  let groupedSections = $derived(groupBranches($repoStore.branches, $repoStore.tags));
+  let filteredSections = $derived(filterBranchSections(groupedSections, debouncedQuery));
+  let allRows = $derived(flattenRows(filteredSections, isCollapsed));
+  let visibleRows = $derived(allRows.slice(0, renderLimit));
+  let hiddenRowCount = $derived(allRows.length - visibleRows.length);
 
   function isCollapsed(id: string, kind: BranchSection["kind"]): boolean {
     if (id in collapsed) return collapsed[id];
@@ -150,17 +170,49 @@
     menu = null;
   }
 
+  // Repo switch / filter shrink must drop back to the base window.
+  $effect(() => {
+    if (renderLimit > BRANCH_ROW_STEP && allRows.length < renderLimit) {
+      renderLimit = BRANCH_ROW_STEP;
+    }
+  });
+
+  // Auto-grow window: a sentinel past the last rendered row requests another
+  // step when it nears the viewport. IntersectionObserver/DOM seam is
+  // exercised only in the webview, not unit tests.
+  $effect(() => {
+    const el = sentinel;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) renderLimit += BRANCH_ROW_STEP;
+      },
+      { threshold: 0, rootMargin: "0px 0px 600px 0px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+
   onMount(() => {
     window.addEventListener("click", onWindowClick);
-    return () => window.removeEventListener("click", onWindowClick);
+    return () => {
+      window.removeEventListener("click", onWindowClick);
+      applyFilter.cancel();
+    };
   });
 </script>
 
 {#snippet branchRow(branch: BranchInfo, depth: number)}
   {@const selected = $filterStore.selectedBranch === branch.name}
   {@const leaf = branchLeafName(branch)}
+  {@const statsMissing =
+    branch.additions === 0 &&
+    branch.deletions === 0 &&
+    branch.commits_ahead_of_base === 0 &&
+    !branch.is_current &&
+    !branch.is_default}
   <div
-    class="w-full rounded-full flex items-center gap-1.5 pr-1 group transition-[color,background-color,border-color,box-shadow] duration-150 {branch.is_current
+    class="gp-cv-row w-full rounded-full flex items-center gap-1.5 pr-1 group transition-all duration-150 {branch.is_current
       ? 'bg-accent/15 text-accent font-semibold ring-1 ring-accent/40'
       : selected
         ? 'bg-accent/10 text-textPrimary'
@@ -188,6 +240,10 @@
       {/if}
     </button>
     <div class="flex items-center gap-1.5 shrink-0 opacity-90">
+      {#if statsPending && statsMissing}
+        <!-- Churn stats still loading for this row: skeleton pill. -->
+        <span class="inline-block w-8 h-1 rounded-full bg-border/70 animate-pulse" aria-hidden="true"></span>
+      {/if}
       {#if branch.additions > 0 || branch.deletions > 0}
         <ChurnBar additions={branch.additions} deletions={branch.deletions} />
       {/if}
@@ -222,32 +278,65 @@
   </div>
 {/snippet}
 
-{#snippet folderTree(folders: BranchFolder[], depth: number)}
-  {#each folders as folder (folder.id)}
-    {@const closed = isCollapsed(folder.id, "local")}
-    <button
-      type="button"
-      onclick={() => toggle(folder.id, "local")}
-      class="w-full flex items-center gap-1.5 py-1 text-[11px] font-semibold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
-      style="padding-left: {10 + depth * 12}px"
-    >
-      {#if closed}
-        <ChevronRight size={12} />
-      {:else}
-        <ChevronDown size={12} />
-      {/if}
-      <span class="truncate">{folder.label}</span>
-      <span class="text-textMuted/70 font-normal text-[10px]">({countFolder(folder)})</span>
-    </button>
-    {#if !closed}
-      {@render folderTree(folder.folders, depth + 1)}
-      {#each folder.branches as branch (branch.name)}
-        {@render branchRow(branch, depth + 1)}
-      {/each}
-    {/if}
-  {/each}
+{#snippet tagRow(row: TagRow)}
+  <button
+    type="button"
+    onclick={() => selectRef(row.tag.name)}
+    oncontextmenu={(e) => openTagMenu(e, row.tag)}
+    class="gp-cv-row w-full px-2 py-1 rounded-full flex items-center gap-1.5 text-left transition-colors {$filterStore.selectedBranch === row.tag.name
+      ? 'bg-accent/10 text-accent'
+      : 'text-textPrimary hover:bg-surfaceHover'}"
+  >
+    <Tag size={12} class="text-textMuted shrink-0" />
+    <span class="truncate text-[11px] font-mono">{row.tag.name}</span>
+  </button>
 {/snippet}
 
+<!-- Folder headers stay non-sticky: fighting the shared scroller is not
+     worth it, and sticky inside content-visibility rows misbehaves. -->
+{#snippet folderHeader(row: FolderHeaderRow)}
+  {@const closed = isCollapsed(row.folderId, "local")}
+  <button
+    type="button"
+    onclick={() => toggle(row.folderId, "local")}
+    class="gp-cv-row w-full flex items-center gap-1.5 py-1 text-[11px] font-semibold text-textMuted uppercase tracking-wider hover:text-textPrimary transition-colors"
+    style="padding-left: {10 + row.depth * 12}px"
+  >
+    {#if closed}
+      <ChevronRight size={12} />
+    {:else}
+      <ChevronDown size={12} />
+    {/if}
+    <span class="truncate">{row.folder.label}</span>
+    <span class="text-textMuted/70 font-normal text-[10px]">({countFolder(row.folder)})</span>
+  </button>
+{/snippet}
+
+<!-- Sticky pins each section header while its block scrolls past; opaque
+     bg-surface keeps row text from bleeding through underneath. -->
+{#snippet sectionHeader(row: SectionHeaderRow)}
+  {@const closed = isCollapsed(row.sectionId, row.section.kind)}
+  <button
+    type="button"
+    onclick={() => toggle(row.sectionId, row.section.kind)}
+    class="sticky top-0 z-10 mt-2 first:mt-0 bg-surface w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary"
+  >
+    {#if closed}
+      <ChevronRight size={11} />
+    {:else}
+      <ChevronDown size={11} />
+    {/if}
+    {#if row.section.kind === "remote"}
+      <Cloud size={11} />
+    {:else if row.section.kind === "tags"}
+      <Tag size={11} />
+    {:else}
+      <GitBranch size={11} />
+    {/if}
+    <span>{row.section.label}</span>
+    <span class="font-normal text-textMuted/70">({row.section.branchCount})</span>
+  </button>
+{/snippet}
 
 <div>
   <div class="flex items-center justify-between text-[10px] font-bold text-textMuted uppercase tracking-wider px-2 mb-1">
@@ -263,11 +352,14 @@
   </div>
 
   <div class="px-1 mb-1.5">
-    <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-2 py-1 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)] transition-[border-color,box-shadow] duration-150">
+    <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-2 py-1 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)] transition-all duration-150">
       <Search size={11} class="text-textMuted shrink-0" />
+      <!-- Raw query drives the field for instant ack; filtering waits for
+           the debounced copy. -->
       <input
         type="text"
         bind:value={query}
+        oninput={(e) => applyFilter(e.currentTarget.value)}
         placeholder="Filter branches…"
         class="w-full bg-transparent text-[11px] text-textPrimary placeholder:text-textMuted/60 focus:outline-none"
       />
@@ -300,55 +392,28 @@
     </form>
   {/if}
 
-  <div class="space-y-2">
-    {#each sections as section (section.id)}
-      {@const closed = isCollapsed(section.id, section.kind)}
-      <div>
-        <button
-          type="button"
-          onclick={() => toggle(section.id, section.kind)}
-          class="w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary"
-        >
-          {#if closed}
-            <ChevronRight size={11} />
-          {:else}
-            <ChevronDown size={11} />
-          {/if}
-          {#if section.kind === "remote"}
-            <Cloud size={11} />
-          {:else if section.kind === "tags"}
-            <Tag size={11} />
-          {:else}
-            <GitBranch size={11} />
-          {/if}
-          <span>{section.label}</span>
-          <span class="font-normal text-textMuted/70">({section.branchCount})</span>
-        </button>
-        {#if !closed}
-          {#if section.kind === "tags"}
-            {#each section.tags as tag (tag.name)}
-              <button
-                type="button"
-                onclick={() => selectRef(tag.name)}
-                oncontextmenu={(e) => openTagMenu(e, tag)}
-                class="w-full px-2 py-1 rounded-full flex items-center gap-1.5 text-left transition-colors {$filterStore.selectedBranch === tag.name
-                  ? 'bg-accent/10 text-accent'
-                  : 'text-textPrimary hover:bg-surfaceHover'}"
-              >
-                <Tag size={12} class="text-textMuted shrink-0" />
-                <span class="truncate text-[11px] font-mono">{tag.name}</span>
-              </button>
-            {/each}
-          {:else}
-            {@render folderTree(section.folders, 0)}
-            {#each section.branches as branch (branch.name)}
-              {@render branchRow(branch, 0)}
-            {/each}
-          {/if}
-        {/if}
-      </div>
+  <div>
+    {#each visibleRows as row (row.key)}
+      {#if row.kind === "section-header"}
+        {@render sectionHeader(row)}
+      {:else if row.kind === "folder-header"}
+        {@render folderHeader(row)}
+      {:else if row.kind === "branch"}
+        {@render branchRow(row.branch, row.depth)}
+      {:else}
+        {@render tagRow(row)}
+      {/if}
     {/each}
+    {#if hiddenRowCount > 0}
+      <div bind:this={sentinel} class="h-px" aria-hidden="true"></div>
+    {/if}
   </div>
+
+  {#if hiddenRowCount > 0}
+    <div class="px-2 py-1 text-[10px] text-textMuted/70">
+      Showing first {visibleRows.length.toLocaleString()} of {allRows.length.toLocaleString()}
+    </div>
+  {/if}
 </div>
 
 {#if menu}

@@ -11,16 +11,25 @@ const execFileAsync = promisify(execFile);
 export const PREFERRED_DEV_PORT = 5173;
 export const DEV_PORT_RANGE = 20;
 
+/**
+ * Only Vite listeners at least this old are considered leftovers. A younger
+ * listener is almost certainly another developer's just-started dev server,
+ * and killing it would turn a concurrent start into a kill race.
+ */
+export const RECLAIM_GRACE_MS = 60_000;
+
 export class DevPortError extends Error {
   /**
    * @param {number} port
    * @param {Array<{ pid: number, command?: string, cwd?: string }>} blockers
+   * @param {{ message?: string, diagnostics?: string[] }} [options]
    */
-  constructor(port, blockers = []) {
-    super(formatBlockers(port, blockers));
+  constructor(port, blockers = [], options = {}) {
+    super(options.message ?? formatBlockers(port, blockers, options.diagnostics));
     this.name = "DevPortError";
     this.port = port;
     this.blockers = blockers;
+    this.diagnostics = options.diagnostics ?? [];
   }
 }
 
@@ -30,7 +39,7 @@ export function defaultRepoRoot() {
 
 /**
  * @param {NodeJS.ProcessEnv} [env]
- * @param {number | null} [fallback]
+ * @param {number} [fallback]
  */
 export function portFromEnv(env = process.env, fallback = PREFERRED_DEV_PORT) {
   const parsed = parseOptionalPort(env.GITPULSE_DEV_PORT);
@@ -85,9 +94,44 @@ export function isInsideRepo(cwd, repoRoot) {
 }
 
 /**
- * @param {{ pid: number, command?: string, cwd?: string, repoRoot: string, selfPids: Set<number> }} listener
+ * Decide whether a listener may be reclaimed. Only repo-local Vite processes
+ * qualify, and only when they are old enough to be leftovers (older than
+ * `graceMs`, default {@link RECLAIM_GRACE_MS}) or the operator explicitly opted
+ * in via `reclaimAll` (GITPULSE_RECLAIM=1). Processes with unknown start time
+ * are never reclaimed implicitly.
+ *
+ * @param {{
+ *   pid: number,
+ *   command?: string,
+ *   cwd?: string,
+ *   repoRoot: string,
+ *   selfPids: Set<number>,
+ *   startedAgoMs?: number | null,
+ *   graceMs?: number,
+ *   reclaimAll?: boolean,
+ * }} listener
  */
 export function shouldReclaimListener(listener) {
+  if (!isReclaimCandidate(listener)) return false;
+  if (listener.reclaimAll) return true;
+  if (listener.startedAgoMs == null) return false;
+  return listener.startedAgoMs >= (listener.graceMs ?? RECLAIM_GRACE_MS);
+}
+
+/**
+ * Shape check only: is this a repo-local Vite process that is not ourselves?
+ * Age and opt-in are decided by {@link shouldReclaimListener}.
+ *
+ * @param {{
+ *   pid: number,
+ *   command?: string,
+ *   cwd?: string,
+ *   repoRoot: string,
+ *   selfPids: Set<number>,
+ *   [key: string]: unknown,
+ * }} listener
+ */
+export function isReclaimCandidate(listener) {
   if (!Number.isInteger(listener.pid) || listener.pid <= 1) return false;
   if (listener.selfPids.has(listener.pid)) return false;
   if (!isDevServerCommand(listener.command ?? "")) return false;
@@ -146,6 +190,9 @@ export function withTauriDevUrl(args, port, preferred = PREFERRED_DEV_PORT) {
   return [...args, "--config", JSON.stringify(tauriConfigForPort(port))];
 }
 
+/**
+ * @param {string[]} args
+ */
 export function isTauriDevArgs(args) {
   return args[0] === "dev" && !args.includes("--help") && !args.includes("-h");
 }
@@ -158,6 +205,10 @@ export function isTauriDevArgs(args) {
  * @param {Pick<NodeJS.Process, "on" | "removeListener" | "exit">} [hooks]
  */
 export function attachChildLifetime(child, hooks = process) {
+  /**
+   * @param {NodeJS.Signals} signal
+   * @returns {() => void}
+   */
   const shutdown = (signal) => () => {
     if (child.exitCode != null || child.signalCode) return;
     try {
@@ -170,12 +221,17 @@ export function attachChildLifetime(child, hooks = process) {
   const onTerm = shutdown("SIGTERM");
   hooks.on("SIGINT", onInt);
   hooks.on("SIGTERM", onTerm);
-  child.on("exit", (code, signal) => {
-    hooks.removeListener("SIGINT", onInt);
-    hooks.removeListener("SIGTERM", onTerm);
-    if (signal) hooks.exit(1);
-    else hooks.exit(code ?? 1);
-  });
+  child.on(
+    "exit",
+    /** @type {(code: number | null, signal: NodeJS.Signals | null) => void} */ (
+      (code, signal) => {
+        hooks.removeListener("SIGINT", onInt);
+        hooks.removeListener("SIGTERM", onTerm);
+        if (signal) hooks.exit(1);
+        else hooks.exit(code ?? 1);
+      }
+    ),
+  );
   child.on("error", (err) => {
     console.error(err);
     hooks.exit(1);
@@ -225,31 +281,62 @@ export function formatResolveMessage(result, preferred = PREFERRED_DEV_PORT) {
 }
 
 /**
+ * Probe whether `port` accepts a listener. Fail closed: only a successful
+ * bind reports free. EADDRINUSE means taken; every other error (EACCES,
+ * EADDRNOTAVAIL, ...) is also reported as unusable and its error code is
+ * appended to `diagnostics` so callers can explain *why* a port was skipped.
+ *
  * @param {number} port
  * @param {string} [host]
+ * @param {string[]} [diagnostics]
  * @returns {Promise<boolean>}
  */
-export function tryListen(port, host) {
+export function tryListen(port, host, diagnostics = []) {
   return new Promise((resolve) => {
     const server = net.createServer();
     server.unref();
-    server.once("error", (err) => {
-      resolve(/** @type {NodeJS.ErrnoException} */ (err).code === "EADDRINUSE" ? false : true);
-    });
+    /**
+     * @param {Error} err
+     */
+    const failWith = (err) => {
+      const code =
+        /** @type {NodeJS.ErrnoException} */ (err).code ?? String(err);
+      if (code !== "EADDRINUSE") {
+        diagnostics.push(`${host ?? "*"}:${port} ${code}`);
+      }
+      resolve(false);
+    };
+    server.once("error", failWith);
     server.once("listening", () => {
       server.close(() => resolve(true));
     });
-    if (host == null) server.listen(port);
-    else server.listen(port, host);
+    try {
+      if (host == null) server.listen(port);
+      else server.listen(port, host);
+    } catch (err) {
+      // Node throws synchronously for invalid ports (ERR_SOCKET_BAD_PORT).
+      failWith(/** @type {Error} */ (err));
+    }
   });
 }
 
 /**
  * @param {number} port
+ * @param {string[]} [diagnostics]
  */
-export async function isPortFree(port) {
-  if (!(await tryListen(port, "127.0.0.1"))) return false;
-  if (!(await tryListen(port, "::1"))) return false;
+export async function isPortFree(port, diagnostics = []) {
+  /** @type {string[]} */
+  const v4 = [];
+  if (!(await tryListen(port, "127.0.0.1", v4))) {
+    diagnostics.push(...v4);
+    return false;
+  }
+  /** @type {string[]} */
+  const v6 = [];
+  if (!(await tryListen(port, "::1", v6))) {
+    diagnostics.push(...v6);
+    return false;
+  }
   return true;
 }
 
@@ -258,10 +345,26 @@ export async function isPortFree(port) {
  * @param {number} to
  */
 export async function findFreePort(from, to) {
-  for (let port = from; port <= to; port += 1) {
-    if (await isPortFree(port)) return port;
+  if (
+    !Number.isInteger(from) ||
+    !Number.isInteger(to) ||
+    from <= 0 ||
+    to > 65535 ||
+    from > to
+  ) {
+    throw new Error(
+      `invalid port range: from ${from} to ${to} (need 1-65535 with from <= to)`,
+    );
   }
-  throw new DevPortError(from, []);
+  /** @type {string[]} */
+  const diagnostics = [];
+  for (let port = from; port <= to; port += 1) {
+    if (await isPortFree(port, diagnostics)) return port;
+  }
+  throw new DevPortError(from, [], {
+    message: `Ports ${from}-${to} are all busy. Stop one of the processes holding them, or set GITPULSE_DEV_PORT.`,
+    diagnostics,
+  });
 }
 
 /**
@@ -282,6 +385,7 @@ export function createDefaultIo() {
     listListeners,
     processCommand,
     processCwd,
+    processElapsedMs,
     selfPids: () => {
       const pids = new Set([process.pid]);
       if (process.ppid) pids.add(process.ppid);
@@ -314,12 +418,23 @@ export async function resolveDevPort(options = {}) {
   const range = options.range ?? DEV_PORT_RANGE;
   const allowAutoport =
     options.allowAutoport ?? (preset == null && !isTauriHookEnv(env));
+  const reclaimAll = parseReclaimEnv(env);
 
   const listeners = await describeListeners(target, io);
   const selfPids = io.selfPids();
-  const reclaimable = listeners.filter((listener) =>
-    shouldReclaimListener({ ...listener, repoRoot, selfPids }),
-  );
+  const reclaimable = [];
+  for (const listener of listeners) {
+    // Only pay for a start-time lookup when the process is otherwise a
+    // reclaim candidate (repo-local Vite, not ourselves).
+    const base = { ...listener, repoRoot, selfPids, reclaimAll };
+    if (!isReclaimCandidate(base)) continue;
+    const startedAgoMs = reclaimAll
+      ? Number.POSITIVE_INFINITY
+      : await io.processElapsedMs(listener.pid);
+    if (shouldReclaimListener({ ...base, startedAgoMs })) {
+      reclaimable.push(listener);
+    }
+  }
 
   if (reclaimable.length > 0) {
     for (const listener of reclaimable) {
@@ -334,23 +449,36 @@ export async function resolveDevPort(options = {}) {
     }
   }
 
-  if (await io.isFree(target)) {
-    return {
-      port: target,
-      source: preset != null ? "env" : "preferred",
-    };
+  /** @type {string[]} */
+  const probeDiagnostics = [];
+  if (!(await io.isFree(target, probeDiagnostics))) {
+    if (allowAutoport) {
+      const port = await io.findFreePort(target + 1, target + range);
+      return {
+        port,
+        source: "autoport",
+        blockedBy: listeners,
+      };
+    }
+    throw new DevPortError(target, listeners, {
+      diagnostics: probeDiagnostics,
+    });
   }
 
-  if (allowAutoport) {
-    const port = await io.findFreePort(target + 1, target + range);
-    return {
-      port,
-      source: "autoport",
-      blockedBy: listeners,
-    };
-  }
+  return {
+    port: target,
+    source: preset != null ? "env" : "preferred",
+  };
+}
 
-  throw new DevPortError(target, listeners);
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function parseReclaimEnv(env = process.env) {
+  const raw = env.GITPULSE_RECLAIM;
+  if (raw == null || raw === "") return false;
+  const normalized = String(raw).toLowerCase();
+  return normalized !== "0" && normalized !== "false" && normalized !== "off";
 }
 
 /**
@@ -368,7 +496,12 @@ async function describeListeners(port, io) {
   );
 }
 
-function formatBlockers(port, blockers) {
+/**
+ * @param {number} port
+ * @param {Array<{ pid: number, command?: string, cwd?: string }>} blockers
+ * @param {string[]} [diagnostics]
+ */
+function formatBlockers(port, blockers, diagnostics = []) {
   const lines = [`Port ${port} is already in use.`];
   for (const blocker of blockers) {
     const detail = blocker.command
@@ -377,17 +510,28 @@ function formatBlockers(port, blockers) {
     lines.push(`  pid ${blocker.pid}: ${detail}`);
   }
   if (blockers.length === 0) {
-    lines.push("  (could not identify the process holding the port)");
+    if (diagnostics.length > 0) {
+      lines.push(`  (port probes failed: ${summarizeCommand(diagnostics.join("; "))})`);
+    } else {
+      lines.push("  (could not identify the process holding the port)");
+    }
   }
   lines.push("Stop that process, or run `npm run tauri dev` to pick a free port.");
   return lines.join("\n");
 }
 
+/**
+ * @param {string} command
+ */
 function summarizeCommand(command) {
   const trimmed = command.trim().replace(/\s+/g, " ");
   return trimmed.length > 120 ? `${trimmed.slice(0, 117)}...` : trimmed;
 }
 
+/**
+ * @param {number} port
+ * @returns {Promise<Array<{ pid: number }>>}
+ */
 async function listListeners(port) {
   if (process.platform === "win32") {
     try {
@@ -412,6 +556,10 @@ async function listListeners(port) {
   }
 }
 
+/**
+ * @param {number} pid
+ * @returns {Promise<string>}
+ */
 async function processCommand(pid) {
   if (process.platform === "linux") {
     try {
@@ -429,6 +577,10 @@ async function processCommand(pid) {
   }
 }
 
+/**
+ * @param {number} pid
+ * @returns {Promise<string | undefined>}
+ */
 async function processCwd(pid) {
   if (process.platform === "linux") {
     try {
@@ -454,6 +606,51 @@ async function processCwd(pid) {
   }
 }
 
+/**
+ * Milliseconds since the process started, or null when unknowable (Windows,
+ * ps unavailable, process gone). Used to keep the reclaim grace window honest.
+ *
+ * @param {number} pid
+ * @returns {Promise<number | null>}
+ */
+async function processElapsedMs(pid) {
+  if (process.platform === "win32") return null;
+  try {
+    const { stdout } = await execFileAsync("ps", [
+      "-o",
+      "etime=",
+      "-p",
+      String(pid),
+    ]);
+    return parseEtimeToMs(stdout.trim());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse `ps -o etime` output: `SS`, `MM:SS`, `HH:MM:SS`, or `DD-HH:MM:SS`.
+ * Returns null for anything unparseable rather than guessing.
+ *
+ * @param {string} raw
+ * @returns {number | null}
+ */
+export function parseEtimeToMs(raw) {
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(raw.trim());
+  if (!match) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  if (minutes > 59 || seconds > 59) return null;
+  if (match[1] != null && hours > 23) return null;
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
+/**
+ * @param {number} pid
+ * @returns {Promise<void>}
+ */
 async function killPid(pid) {
   if (!Number.isInteger(pid) || pid <= 1) return;
   if (pid === process.pid || pid === process.ppid) return;
@@ -487,6 +684,10 @@ async function killPid(pid) {
   }
 }
 
+/**
+ * @param {number} pid
+ * @returns {boolean}
+ */
 function pidAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -496,6 +697,10 @@ function pidAlive(pid) {
   }
 }
 
+/**
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

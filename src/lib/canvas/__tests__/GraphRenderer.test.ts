@@ -4,6 +4,7 @@ import {
   GraphRenderer,
   DEFAULT_CONFIG,
   emphasisRingRadius,
+  type LaneConnection,
   type VisualCommitRow,
 } from "../GraphRenderer";
 import { getBranchColor, BRANCH_PALETTE } from "../Palette";
@@ -517,10 +518,10 @@ describe("GraphRenderer and Palette", () => {
 });
 
 describe("drawDanglingStubs overlay API", () => {
-  const DANGLING = { from_lane: 0, to_lane: 0, to_row_offset: 1, is_merge: false, color_index: 3, is_dangling: true };
-  const PLAIN = { from_lane: 0, to_lane: 0, to_row_offset: 1, is_merge: false, color_index: 0 };
+  const DANGLING: LaneConnection = { from_lane: 0, to_lane: 0, to_row_offset: 1, is_merge: false, color_index: 3, is_dangling: true };
+  const PLAIN: LaneConnection = { from_lane: 0, to_lane: 0, to_row_offset: 1, is_merge: false, color_index: 0 };
 
-  function danglingRow(id: string, connections = [DANGLING]): VisualCommitRow {
+  function danglingRow(id: string, connections: LaneConnection[] = [DANGLING]): VisualCommitRow {
     return {
       id,
       parent_ids: [],

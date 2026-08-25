@@ -484,12 +484,18 @@ fn git_timeout(
     let stdout_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !stdout_text.is_empty() {
         if stdout_text.chars().count() > MAX_FAILURE_MESSAGE_CHARS {
-            let cut: String = stdout_text.chars().take(MAX_FAILURE_MESSAGE_CHARS).collect();
+            let cut: String = stdout_text
+                .chars()
+                .take(MAX_FAILURE_MESSAGE_CHARS)
+                .collect();
             return Err(format!("{cut}… (git {} output truncated)", sub));
         }
         return Err(stdout_text);
     }
-    Err(format!("git {} failed with status {}", sub, out.status_code))
+    Err(format!(
+        "git {} failed with status {}",
+        sub, out.status_code
+    ))
 }
 
 /// Upper bound on stdout text embedded in a failure message when git put its

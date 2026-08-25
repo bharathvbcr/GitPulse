@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { filterStore } from "../stores/filterStore";
   import { Search, X } from "lucide-svelte";
+  import { isImeComposition } from "../keyboard/imeGuard";
 
   let inputEl: HTMLInputElement | undefined = $state();
 
@@ -11,6 +12,7 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    if (isImeComposition(e)) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
       focusFilter();

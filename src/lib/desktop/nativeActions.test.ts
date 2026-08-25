@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { dispatchNativeMenu, type NativeMenuHandlers } from "./nativeActions";
 import { repoWindowTitle } from "./windowChrome";
+import { REGISTERED_VIEWS } from "../views/viewRegistry";
 
 function handlers(): NativeMenuHandlers & { calls: string[] } {
   const calls: string[] = [];
@@ -57,6 +58,15 @@ describe("dispatchNativeMenu", () => {
     dispatchNativeMenu({ id: "tab-health" }, h);
     dispatchNativeMenu({ id: "theme-system" }, h);
     expect(h.calls).toEqual(["tab:diff", "tab:github", "tab:coverage", "tab:health", "themeSystem"]);
+  });
+
+  it("routes every registered view tab, including manvi (regression)", () => {
+    const h = handlers();
+    for (const view of REGISTERED_VIEWS) {
+      expect(dispatchNativeMenu({ id: `tab-${view.id}` }, h)).toBe(true);
+      expect(h.calls.at(-1)).toBe(`tab:${view.id}`);
+    }
+    expect(h.calls.some((call) => call === "tab:manvi")).toBe(true);
   });
 
   it("opens a recent path and ignores empty recent", () => {

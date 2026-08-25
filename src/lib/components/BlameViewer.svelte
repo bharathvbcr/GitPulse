@@ -5,6 +5,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import type { FileCoverage } from "../coverage/types";
+  import { shortHash } from "../format";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
 
@@ -160,7 +161,7 @@
                 type="button"
                 class="w-16 px-2 text-[10px] text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0"
                 onclick={() => repoStore.selectCommitDiff(line.commit_id)}
-              >{line.commit_id.substring(0, 7)}</button>
+              >{shortHash(line.commit_id)}</button>
               <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
               <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
               <span class="w-8 px-1 text-right text-[10px] tabular-nums shrink-0 {coverageHits.get(line.line_no) === undefined ? 'text-transparent' : (coverageHits.get(line.line_no) ?? 0) > 0 ? 'text-emerald-400/80' : 'text-red-400/80'}">{coverageHits.get(line.line_no) ?? "·"}</span>

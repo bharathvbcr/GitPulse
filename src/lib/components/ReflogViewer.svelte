@@ -4,6 +4,7 @@
   import { History } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { formatDate, shortHash } from "../format";
 
   interface ReflogEntry {
     index: number;
@@ -64,11 +65,6 @@
       }
     };
   });
-
-  function formatTime(ts: number): string {
-    if (!ts) return "";
-    return new Date(ts * 1000).toLocaleString();
-  }
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
@@ -109,10 +105,10 @@
               onclick={() => repoStore.selectCommitDiff(entry.commit_id)}
             >
               <td class="px-3 py-1.5 font-mono text-accent rounded-l-lg">{entry.selector}</td>
-              <td class="px-3 py-1.5 font-mono">{entry.commit_id.substring(0, 8)}</td>
+              <td class="px-3 py-1.5 font-mono">{shortHash(entry.commit_id, 8)}</td>
               <td class="px-3 py-1.5 text-textPrimary">{entry.action}</td>
               <td class="px-3 py-1.5 text-textMuted truncate max-w-md">{entry.message}</td>
-              <td class="px-3 py-1.5 text-textMuted whitespace-nowrap rounded-r-lg">{formatTime(entry.timestamp)}</td>
+              <td class="px-3 py-1.5 text-textMuted whitespace-nowrap rounded-r-lg">{formatDate(entry.timestamp)}</td>
             </tr>
           {/each}
         </tbody>

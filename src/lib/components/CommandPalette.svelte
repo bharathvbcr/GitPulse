@@ -3,6 +3,8 @@
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
   import { isCaseInsensitiveFs, isPathAmong } from "../repos/paths";
+  import type { ViewTab } from "../repos/persist";
+  import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
   import { themeStore } from "../stores/themeStore";
   import { askText } from "../stores/modalStore";
   import { fadeParams, scaleParams } from "../motion/easing";
@@ -23,6 +25,25 @@
       ?.querySelector('[data-highlighted="true"]')
       ?.scrollIntoView({ block: "nearest" });
   });
+
+  // View-opening commands derive from the view registry: registering a view
+  // with a paletteCommand is all it takes to appear here.
+  const VIEW_COMMAND_ICONS: Partial<Record<ViewTab, typeof ShieldAlert>> = {
+    manvi: ShieldAlert,
+    github: GitBranch,
+    coverage: Percent,
+    health: ShieldAlert,
+    reflog: Search,
+  };
+  const viewCommands = Object.values(VIEW_REGISTRY)
+    .filter((view): view is ViewRegistration & { paletteCommand: string } =>
+      Boolean(view.paletteCommand))
+    .map((view) => ({
+      id: view.id,
+      label: view.paletteCommand,
+      icon: VIEW_COMMAND_ICONS[view.id] ?? GitBranch,
+      action: () => repoStore.setActiveTab(view.id),
+    }));
 
   const commands = [
     { id: "refresh", label: "Refresh Repository Status", icon: RefreshCw, action: () => repoStore.refresh() },
@@ -61,13 +82,9 @@
     { id: "fetch", label: "Fetch All Remotes", icon: Download, action: () => repoStore.fetch() },
     { id: "pull", label: "Pull (fast-forward)", icon: Download, action: () => repoStore.pull() },
     { id: "push", label: "Push Current Branch", icon: Upload, action: () => repoStore.push() },
-    { id: "manvi_ops", label: "Open MANVI View", icon: ShieldAlert, action: () => repoStore.setActiveTab("manvi") },
+    ...viewCommands,
     { id: "stash", label: "Stash Working Tree", icon: Layers, action: () => repoStore.stashSave() },
     { id: "stash_pop", label: "Pop Stash", icon: Layers, action: () => repoStore.stashPop() },
-    { id: "github", label: "Open GitHub Panel", icon: GitBranch, action: () => repoStore.setActiveTab("github") },
-    { id: "coverage", label: "Open Coverage", icon: Percent, action: () => repoStore.setActiveTab("coverage") },
-    { id: "health", label: "Scan npm vulnerabilities and updates", icon: ShieldAlert, action: () => repoStore.setActiveTab("health") },
-    { id: "reflog", label: "Open Reflog", icon: Search, action: () => repoStore.setActiveTab("reflog") },
   ];
 
   let repoCommands = $derived([

@@ -11,3 +11,5 @@ lcov.info
 !.env.example
 .vite/
 *.local
+.claude/
+rust-coverage-summary.txt

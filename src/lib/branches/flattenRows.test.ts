@@ -69,9 +69,21 @@ describe("flattenRows", () => {
       branch({ name: "feat/payments" }),
       branch({ name: "main" }),
     ]);
-    // Deep collapse hides only the auth subtree.
+    // Deep collapse hides only the auth subtree; feat keeps its own header,
+    // the collapsed auth header, and its other leaf payments.
     const deep = flattenRows(sections, (id) => id === "local/feat/auth");
-    expect(deep.map((r) => r.kind)).toEqual(["section-header", "folder-header", "branch"]);
+    expect(deep.map((r) => r.kind)).toEqual([
+      "section-header",
+      "folder-header",
+      "folder-header",
+      "branch",
+      "branch",
+    ]);
+    const deepAuth = deep[2];
+    expect(deepAuth.kind === "folder-header" && deepAuth.folderId).toBe("local/feat/auth");
+    const deepLeaves = deep.flatMap((r) => (r.kind === "branch" ? [r.branch.name] : []));
+    expect(deepLeaves).toEqual(["feat/payments", "main"]);
+    expect(deepLeaves).not.toContain("feat/auth/oauth");
     const mid = flattenRows(sections, (id) => id === "local/feat");
     expect(mid.map((r) => r.kind)).toEqual(["section-header", "folder-header", "branch"]);
     expect(mid[1].kind === "folder-header" && mid[1].folderId).toBe("local/feat");

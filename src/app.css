@@ -315,6 +315,17 @@ html.macos ::-webkit-scrollbar {
   contain: layout paint;
 }
 
+/* Branch list rows skip layout/paint while offscreen (windowing aid for the
+   sidebar's single shared scroller). Supported in WKWebView and WebKitGTK
+   2.40+; engines without content-visibility ignore the rule and simply pay
+   full paint cost — the list still renders correctly. */
+.gp-cv-row {
+  content-visibility: auto;
+  /* Rows are one 16px line (sidebar text-xs) + 2×4px padding; `auto` keeps
+     the last rendered size once a row has been painted. */
+  contain-intrinsic-size: auto 24px;
+}
+
 /* Title-block drag affordance: children ignore the pointer so the block
    itself receives the drag gesture. */
 .gp-drag-children :is(svg, span) {

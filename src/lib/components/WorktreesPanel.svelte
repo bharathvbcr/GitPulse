@@ -35,15 +35,17 @@
   let newBranch = $state("");
   let startPoint = $state("");
 
-  let repoPath = $derived($repoStore.currentPath);
-
   async function load() {
-    if (!repoPath) return;
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
     isLoading = true;
     error = null;
     try {
-      worktrees = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath });
+      const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
+      if ($repoStore.currentPath !== repo) return;
+      worktrees = next;
     } catch (err: unknown) {
+      if ($repoStore.currentPath !== repo) return;
       error = String(err);
     } finally {
       isLoading = false;
@@ -51,17 +53,19 @@
   }
 
   async function create() {
-    if (!repoPath || !newPath.trim()) return;
+    const repo = $repoStore.currentPath;
+    if (!repo || !newPath.trim()) return;
     isCreating = true;
     error = null;
     try {
       await invoke("cmd_add_worktree", {
-        repoPath,
+        repoPath: repo,
         targetPath: newPath.trim(),
         newBranch: newBranch.trim() || null,
         startPoint: startPoint.trim() || null,
         detach: !newBranch.trim(),
       });
+      if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({
         kind: "worktree",
         label: newBranch.trim() ? `${newBranch.trim()} → ${newPath.trim()}` : newPath.trim(),
@@ -73,6 +77,7 @@
       showAddForm = false;
       await load();
     } catch (err: unknown) {
+      if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree", label: newPath.trim(), ok: false });
       error = String(err);
     } finally {
@@ -81,7 +86,8 @@
   }
 
   async function remove(wt: WorktreeInfo) {
-    if (!repoPath) return;
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
     // Two-step confirm: the first click arms, the second removes. No native
     // dialog, so the flow stays keyboard-reachable and testable.
     if (removingPath !== wt.path) {
@@ -93,11 +99,13 @@
     }
     removingPath = null;
     try {
-      await invoke("cmd_remove_worktree", { repoPath, targetPath: wt.path, force: true });
+      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force: true });
+      if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: true });
       if ($repoStore.currentPath === wt.path) return;
       await load();
     } catch (err: unknown) {
+      if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: false });
       error = String(err);
     }
