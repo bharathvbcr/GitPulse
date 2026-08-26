@@ -19,6 +19,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -64,6 +65,7 @@
   let isLoadingFile = $state(false);
   let fileLoaded = $state(false);
   let linesTruncated = $state(false);
+  let scanTruncated = $state(false);
   let reportVersion = $state(0);
   let scanInflight: AsyncGuard | null = null;
 
@@ -83,8 +85,18 @@
       const prev = report;
       report = next;
       reportCache.set(repo, next);
-      if (!selectedPath || !next.files.some((f) => f.path === selectedPath)) {
-        selectedPath = next.files[0]?.path ?? null;
+      // Case-insensitive on purpose: the backend folds case when serving
+      // detail lookups, so a path differing only in case from the artifact's
+      // recorded form must not be reset to files[0].
+      const wanted = selectedPath;
+      const retained =
+        wanted !== null && next.files.some((f) => f.path.toLowerCase() === wanted.toLowerCase());
+      if (!retained) {
+        const first = next.files[0]?.path ?? null;
+        selectedPath = first;
+        // The auto-pick is a real selection: echo it into the per-repo session
+        // store so persistence and the other views agree on what is showing.
+        if (first) repoStore.selectFilePath(first);
       }
       // Only invalidate gutters when the selected file's coverage actually
       // changed: plans/scripts call rescan() after every step, and bumping
@@ -264,6 +276,11 @@
    * matter once the command has settled — pass or fail — so a rescan always
    * follows.
    */
+  /** Appends the tail-truncation note so a clipped log never reads as whole. */
+  function withClipNote(res: TerminalRunResult, base: string): string {
+    return res.truncated ? `${base}\n(output clipped)` : base;
+  }
+
   async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
@@ -283,11 +300,14 @@
       stepResults[step.id] = {
         running: false,
         status: passed ? "passed" : "failed",
-        detail: res.timed_out
-          ? "Timed out and was killed."
-          : passed
-            ? res.stdout_tail || "Command completed successfully (exit 0)"
-            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        detail: withClipNote(
+          res,
+          res.timed_out
+            ? "Timed out and was killed."
+            : passed
+              ? res.stdout_tail || "Command completed successfully (exit 0)"
+              : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        ),
         duration_ms: res.duration_ms,
       };
 
@@ -366,11 +386,14 @@
         label: command,
         running: false,
         status: passed ? "passed" : "failed",
-        detail: res.timed_out
-          ? "Timed out and was killed."
-          : passed
-            ? res.stdout_tail || "Command completed successfully (exit 0)"
-            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        detail: withClipNote(
+          res,
+          res.timed_out
+            ? "Timed out and was killed."
+            : passed
+              ? res.stdout_tail || "Command completed successfully (exit 0)"
+              : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        ),
       };
 
       harnessStore.recordAction({
@@ -436,13 +459,19 @@
       resetManvi();
       return;
     }
-    selectedPath = null;
+    // Seed from the persisted per-repo selection instead of null. This effect
+    // runs after the store-sync effect on mount, so an unconditional wipe here
+    // would discard the selection that effect just restored and make the sync
+    // dead code; scan() still validates membership (case-insensitively) when
+    // the report lands.
+    selectedPath = untrack(() => $repoStore.selectedFilePath);
     fileError = null;
     contentError = null;
     sourceLines = [];
     hitMap = new Map();
     fileLoaded = false;
     linesTruncated = false;
+    scanTruncated = false;
     // Hydrate last-known data synchronously so a revisit renders instantly;
     // the scan below then refreshes in place behind the visible content.
     report = reportCache.get(repo) ?? null;
@@ -473,6 +502,7 @@
       contentError = null;
       fileLoaded = false;
       linesTruncated = false;
+      scanTruncated = false;
       return;
     }
     let cancelled = false;
@@ -481,6 +511,7 @@
     contentError = null;
     fileLoaded = false;
     linesTruncated = false;
+    scanTruncated = false;
     void (async () => {
       try {
         const [detail, contentOutcome] = await Promise.all([
@@ -497,6 +528,9 @@
         if (cancelled) return;
         hitMap = buildHitMap(detail.lines);
         linesTruncated = detail.lines_truncated;
+        // The backend flags a capped scan explicitly so absence here reads as
+        // "unknown", not "uncovered"; surfacing it keeps that contract.
+        scanTruncated = detail.truncated;
         let lines: string[] = [];
         if (contentOutcome.ok) {
           fileLoaded = true;
@@ -517,6 +551,7 @@
           contentError = null;
           fileLoaded = false;
           linesTruncated = false;
+          scanTruncated = false;
         }
       } finally {
         if (!cancelled) isLoadingFile = false;
@@ -666,19 +701,24 @@
       {#if isScanning && !report}
         <div class="flex-1 flex items-center justify-center text-textMuted font-sans">Scanning coverage…</div>
       {:else if report && report.files.length > 0}
-        <div class="flex-1 overflow-auto space-y-0.5">
-          {#each report.files as file (file.path)}
-            <button
-              type="button"
-              onclick={() => selectFile(file.path)}
-              class="w-full px-2.5 py-1.5 rounded-full text-left flex items-center gap-2 transition-colors {selectedPath === file.path ? 'bg-accent/15 ring-1 ring-inset ring-accent/30' : 'hover:bg-surfaceHover'}"
-            >
-              <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {file.color_hex}"></span>
-              <span class="flex-1 truncate font-mono text-[11px] text-textPrimary">{file.path}</span>
-              <span class="tabular-nums shrink-0" style="color: {coverageBarColor(file.percentage)}">{formatCoveragePercent(file.percentage)}</span>
-            </button>
-          {/each}
-        </div>
+        <!-- Virtualized: the scan cap allows 4,000 files, and a keyed each of
+             that size mounts ~20k nodes and re-diffs them on every selection. -->
+        <VirtualList items={report.files} rowHeight={26} overscan={20} class="flex-1">
+          {#snippet row(file)}
+            {#if file}
+              <button
+                type="button"
+                onclick={() => selectFile(file.path)}
+                style="height: 26px;"
+                class="w-full px-2.5 rounded-full text-left flex items-center gap-2 transition-colors {selectedPath === file.path ? 'bg-accent/15 ring-1 ring-inset ring-accent/30' : 'hover:bg-surfaceHover'}"
+              >
+                <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {file.color_hex}"></span>
+                <span class="flex-1 truncate font-mono text-[11px] text-textPrimary">{file.path}</span>
+                <span class="tabular-nums shrink-0" style="color: {coverageBarColor(file.percentage)}">{formatCoveragePercent(file.percentage)}</span>
+              </button>
+            {/if}
+          {/snippet}
+        </VirtualList>
       {:else if report}
         <div class="p-3 text-textMuted font-sans space-y-2">
           <p>No coverage reports for the detected languages.</p>
@@ -730,9 +770,14 @@
     </div>
 
     <div class="flex-1 min-h-0 font-mono flex flex-col">
+      {#if scanTruncated}
+        <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
+          The scan hit a cap before every artifact was read — missing gutters here mean unknown, not uncovered.
+        </div>
+      {/if}
       {#if linesTruncated}
         <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
-          Gutter view capped at 100,000 lines; totals still reflect the full file.
+          Gutter view capped for display; totals still reflect the full file.
         </div>
       {/if}
       {#if isLoadingFile && sourceLines.length === 0}
@@ -763,7 +808,9 @@
           hint={contentError
             ? `The source for this path could not be loaded: ${contentError}`
             : hitMap.size === 0
-              ? "This file was not instrumented by the coverage artifacts found in the repository."
+              ? scanTruncated
+                ? "The scan was capped, so this file's absence may be incomplete rather than a real zero."
+                : "This file was not instrumented by the coverage artifacts found in the repository."
               : "The source for this path could not be loaded."}
         />
       {:else}

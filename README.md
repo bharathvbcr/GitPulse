@@ -54,6 +54,10 @@ Prefer to build it yourself? See [Getting started](#getting-started).
   split per language (e.g. Rust vs TypeScript) with per-language totals
   (LCOV, Cobertura, Go cover, Istanbul JSON, JaCoCo, and Clover reports are matched per language tree,
   including artifacts under nested cargo workspaces like `src-tauri/target/llvm-cov/`).
+  MANVI is one click away: the local model turns the rendered report into a prioritized analysis
+  whose commands are individually runnable, and when a language family has no artifact at all,
+  curated coverage-generating commands (e.g. `cargo llvm-cov --lcov`) are offered and run through
+  the same bounded, journal-recorded terminal runner before an automatic rescan.
 - **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
   objects, reflogs, LFS, submodule stores), build-output and cache directories across
   ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
@@ -233,8 +237,9 @@ speaking NDJSON over stdio. It provides two things:
    stash, and clone operations excepted). Verdicts land on a five-step ladder — allowed, demoted,
    warned, blocked, unchecked; unknown actions fail closed to blocked. They are recorded centrally
    by `runMutating()` in the repo store and surfaced in the header badge.
-2. **Local AI** — commit messages, commit explanations, and branch-name suggestions answered by a
-   locally configured model, with token budgets planned by the harness.
+2. **Local AI** — commit messages, commit explanations, branch-name suggestions, dependency-health
+   remediation plans, and coverage-report analyses answered by a locally configured model, with
+   token budgets planned by the harness.
 
 Degradation is asymmetric by design. With no `manvi` binary installed, mutating commands proceed
 but their verdicts are recorded as `unchecked` — explicitly distinct from an allow. With the
