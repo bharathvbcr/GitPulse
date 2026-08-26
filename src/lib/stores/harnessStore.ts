@@ -320,6 +320,17 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         model: preferred?.model ?? null,
       });
     },
+
+    /** Turns a rendered coverage report into a local-model analysis. */
+    coverageReport: async (repoPath: string, report: string): Promise<AiGeneration> => {
+      const preferred = currentPreferred();
+      return invokeFn<AiGeneration>("cmd_ai_coverage_report", {
+        repoPath,
+        report,
+        baseUrl: preferred?.base_url ?? null,
+        model: preferred?.model ?? null,
+      });
+    },
   };
 }
 

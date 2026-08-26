@@ -127,6 +127,13 @@
   const scanned = { path: "" };
   let inflight: AsyncGuard | null = null;
   let fixInflight: AsyncGuard | null = null;
+  /**
+   * Guards the sequential step runner. Destroying this component does not
+   * abort its in-flight async loops: without a cancellation check between
+   * steps, "Run all" kept executing the remaining commands against whatever
+   * repository became current after a switch.
+   */
+  let stepsInflight: AsyncGuard | null = null;
 
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
@@ -286,16 +293,23 @@
   async function runAllSteps() {
     if (runningAll) return;
     runningAll = true;
-    for (const step of planSteps) {
-      if (step.argv && step.argv.length > 0) {
-        const ok = await runStep(step);
-        if (!ok) {
-          // Stop sequential execution on failure
-          break;
+    const guard = createAsyncGuard();
+    stepsInflight?.cancel();
+    stepsInflight = guard;
+    try {
+      for (const step of planSteps) {
+        if (!guard.isLive()) break;
+        if (step.argv && step.argv.length > 0) {
+          const ok = await runStep(step);
+          if (!ok) {
+            // Stop sequential execution on failure
+            break;
+          }
         }
       }
+    } finally {
+      runningAll = false;
     }
-    runningAll = false;
   }
 
   async function copyPlan() {
@@ -313,6 +327,7 @@
     return () => {
       inflight?.cancel();
       fixInflight?.cancel();
+      stepsInflight?.cancel();
       if (copyTimer !== null) window.clearTimeout(copyTimer);
       if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
     };
@@ -323,6 +338,7 @@
     if (!path) {
       inflight?.cancel();
       fixInflight?.cancel();
+      stepsInflight?.cancel();
       scanned.path = "";
       report = null;
       dependabot = null;

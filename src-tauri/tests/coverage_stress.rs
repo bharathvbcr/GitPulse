@@ -5,6 +5,7 @@
 //! behavior, failing loudly if it reappears.
 
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
+use gitpulse_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin, MAX_OUTPUT_BYTES};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -407,4 +408,87 @@ fn istanbul_parser_handles_float_hit_counts_in_line_map() {
     assert_eq!(report.overall.lines_found, 2);
     assert_eq!(report.overall.lines_hit, 1);
     assert_eq!(report.overall.percentage, 50.0);
+}
+
+// REGRESSION GUARD (audit M3): go-cover range expansion silently dropped
+// ranges once a file's 200k-line allowance was spent, so totals looked
+// authoritative over reduced data. The drop must now surface as
+// report.truncated.
+#[test]
+fn regression_go_cover_allowance_exhaustion_sets_truncated() {
+    let repo = git_repo();
+    write(repo.path(), "src/main.go", "package main\n");
+    // Each block range expands to at most 10_001 lines (per-range policy),
+    // so 25 ranges over one file exhaust the 200_000-line allowance without
+    // a huge fixture: drops happen mid-file well before the input ends.
+    let mut text = String::from("mode: set\n");
+    for i in 0..25usize {
+        let start = i * 10_000 + 1;
+        text.push_str(&format!(
+            "pkg/big.go:{}.1,{}.1 1 1\n",
+            start,
+            start + 10_000
+        ));
+    }
+    write(repo.path(), "coverage.out", &text);
+
+    let (report, merged) =
+        CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), ScanLimits::default())
+            .expect("scan");
+    assert!(
+        report.truncated,
+        "allowance-driven range drops must flag truncation"
+    );
+    let big = merged.get("pkg/big.go").expect("go file recorded");
+    assert!(
+        big.len() <= 200_000,
+        "expansion {} exceeded the per-file allowance",
+        big.len()
+    );
+    assert!(report.files.iter().any(|f| f.path == "pkg/big.go"));
+}
+
+// REGRESSION GUARD (audit H4, machinery side): a git stream past the 64 MB
+// drain cap is an ERROR for plain readers (git_text keeps that contract) but
+// DATA plus a flag for the partial variant the coverage scanner relies on —
+// family detection must degrade to a prefix instead of failing whole scans.
+#[test]
+fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    // One blob just over the drain cap. `hash-object -w --stdin` parks it in
+    // the object database without index/commit; `cat-file` streams it back.
+    let big = "x".repeat(MAX_OUTPUT_BYTES + 1024);
+    let sha_bytes = git_with_stdin(
+        repo.path(),
+        &["hash-object", "-w", "--stdin"],
+        big.as_bytes(),
+    )
+    .expect("hash-object");
+    let sha = String::from_utf8_lossy(&sha_bytes).trim().to_string();
+
+    // Existing contract intact: over-cap output is an error here.
+    assert!(git_text(repo.path(), &["cat-file", "blob", &sha]).is_err());
+
+    // New contract: capped prefix plus truncation flag.
+    let (text, truncated) =
+        git_text_partial(repo.path(), &["cat-file", "blob", &sha]).expect("partial read");
+    assert!(truncated, "over-cap stream must carry the truncation flag");
+    assert_eq!(text.len(), MAX_OUTPUT_BYTES);
+
+    // Small outputs are unaffected on both paths (same flags as
+    // detect_families uses; untracked sources need --others).
+    let (small, small_truncated) = git_text_partial(
+        repo.path(),
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )
+    .expect("small listing");
+    assert!(!small_truncated);
+    assert!(small.contains("src/lib.rs"));
 }

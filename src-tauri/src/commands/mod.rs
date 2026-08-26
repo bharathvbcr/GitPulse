@@ -1537,6 +1537,17 @@ pub async fn cmd_ai_fix_health(
     off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
 }
 
+#[tauri::command(async)]
+pub async fn cmd_ai_coverage_report(
+    repo_path: String,
+    report: String,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<crate::ai::AiGeneration, String> {
+    off_thread(move || crate::ai::coverage_report(&repo_path, &report, selection(base_url, model)))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

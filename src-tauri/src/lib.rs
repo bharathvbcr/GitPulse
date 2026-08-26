@@ -116,6 +116,7 @@ pub fn run() {
             cmd_ai_explain_commit,
             cmd_ai_suggest_branch_name,
             cmd_ai_fix_health,
+            cmd_ai_coverage_report,
             cmd_terminal_spawn,
             cmd_terminal_write,
             cmd_terminal_resize,
