@@ -165,4 +165,19 @@ describe("long-edge rendering under stress", () => {
     expect(counts.stroke ?? 0).toBe(0);
     expect(() => renderer.render(ctx, rows, 0, 6, 0)).not.toThrow();
   });
+
+  it("covers edges landing in the window's bottom fudge band, however far their child sits", () => {
+    // The connector loop runs to endIndex + 5 so partially-scrolled bottom
+    // rows render; the index query that extends the window upward MUST use
+    // the same bound or an edge landing in those extra rows loses its upper
+    // segment whenever its child sits beyond the fixed lookback.
+    const renderer = new GraphRenderer();
+    const rows = historyWithLongEdge(2_000, 10, 900); // child row 10 -> target row 910
+    const { ctx, counts } = countingContext();
+
+    // Window [890, 906): the target row 910 sits inside the +5 fudge band.
+    renderer.render(ctx, rows, 890, 906, 890 * 36);
+
+    expect(counts.bezier).toBe(1);
+  });
 });

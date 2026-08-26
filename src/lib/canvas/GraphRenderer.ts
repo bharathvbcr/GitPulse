@@ -426,20 +426,28 @@ export class GraphRenderer {
     const laneX = (lane: number) => originX + lane * laneWidth;
 
     const viewportHeight = options.viewportHeight ?? this.canvasHeight(ctx);
-    const lookbackStart = Math.max(0, startIndex - LOOKBACK_ROWS);
+    // The connector loop runs five rows past endIndex so partially-scrolled
+    // bottom rows render; the exact-extension query below MUST use that same
+    // bound, or an edge landing inside the fudge band loses its upper segment
+    // whenever its child sits beyond the fixed lookback.
+    //
     // When this pass owns long connectors (any direct render), the window
-    // extends EXACTLY to the deepest child that targets a visible row, so an
-    // edge of any span draws whole from its own child row — there is no scan
-    // cap left to silently drop history behind. Strip painters skip long
-    // connectors entirely (the live overlay owns them), so their fixed
-    // LOOKBACK priming already covers every edge they draw.
-    const renderStart = options.skipLongConnectors
-      ? lookbackStart
-      : Math.min(
-          lookbackStart,
-          deepestChildTargetingRange(buildIncomingEdgeIndex(rows), startIndex, endIndex),
-        );
+    // also extends EXACTLY to the deepest child that targets a rendered row,
+    // so an edge of any span draws whole from its own child row — there is
+    // no scan cap left to silently drop history behind.
+    //
+    // Strip painters pass skipLongConnectors and hand us their PRIMED range:
+    // primedRowRange owns the seam arithmetic, so this pass trusts the given
+    // bounds verbatim. Extending further here would stack a second lookback
+    // on top of the painter's and turn a priming regression into silent
+    // over-draw instead of a caught failure.
     const renderEnd = Math.min(rows.length, endIndex + 5);
+    const renderStart = options.skipLongConnectors
+      ? startIndex
+      : Math.min(
+          Math.max(0, startIndex - LOOKBACK_ROWS),
+          deepestChildTargetingRange(buildIncomingEdgeIndex(rows), startIndex, renderEnd),
+        );
 
     // 1. Pass-through lanes, drawn as one path per unbroken run.
     //
