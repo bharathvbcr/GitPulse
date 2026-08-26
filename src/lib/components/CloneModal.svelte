@@ -2,7 +2,12 @@
   import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
-  import { fadeParams, scaleParams } from "../motion/easing";
+  import {
+    backdropFade,
+    backdropFadeOut,
+    cardScale,
+    cardScaleOut,
+  } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { formatError } from "../ui/formatError";
@@ -62,7 +67,8 @@
     tabindex="-1"
     onclick={requestClose}
     onkeydown={(e) => e.key === "Escape" && requestClose()}
-    transition:fade={fadeParams()}
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
@@ -71,8 +77,8 @@
     <div
       use:trapFocus
       onclick={(e) => e.stopPropagation()}
-      in:scale={scaleParams()}
-      out:scale={scaleParams()}
+      in:scale={cardScale()}
+      out:scale={cardScaleOut()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">

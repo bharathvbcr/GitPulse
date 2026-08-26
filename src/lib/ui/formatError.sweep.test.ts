@@ -21,6 +21,7 @@ const SWEPT_FILES = [
   "../components/CodeStackViewer.svelte",
   "../components/CoverageViewer.svelte",
   "../components/BlameViewer.svelte",
+  "../components/FileExplorer.svelte",
   "../components/CommitDetails.svelte",
   "../components/CommitComposer.svelte",
   "../components/ReflogViewer.svelte",
@@ -34,6 +35,22 @@ const SWEPT_FILES = [
 // start with an error identifier.
 const RAW_ERROR_STRINGIFY = /\bString\(\s*(err|reason|error|e)\b/;
 
+// Panels migrated to the diagnostics seam report through `reportPanelError`,
+// which formats via formatError internally (see src/lib/diagnostics/report.ts)
+// before feeding the ring. Either spelling satisfies the contract; raw
+// String(err) satisfies neither.
+const FORMATTER_SEAM = [
+  { marker: "formatError(", import: 'from "../ui/formatError"' },
+  { marker: "reportPanelError(", import: 'from "../diagnostics/report"' },
+] as const;
+
+function routesThroughFormatter(source: string): boolean {
+  return FORMATTER_SEAM.some(
+    ({ marker, import: importPath }) =>
+      source.includes(marker) && source.includes(importPath),
+  );
+}
+
 describe("formatError sweep", () => {
   it("leaves no raw rejection stringification behind", () => {
     const offenders: string[] = [];
@@ -44,11 +61,12 @@ describe("formatError sweep", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("routes every swept file's rejections through formatError", () => {
+  it("routes every swept file's rejections through formatError or the diagnostics seam", () => {
+    const offenders: string[] = [];
     for (const rel of SWEPT_FILES) {
       const source = readFileSync(join(here, rel), "utf8");
-      expect(source, rel).toContain("formatError(");
-      expect(source, rel).toContain('from "../ui/formatError"');
+      if (!routesThroughFormatter(source)) offenders.push(rel);
     }
+    expect(offenders).toEqual([]);
   });
 });

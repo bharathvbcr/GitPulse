@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { fade, scale } from "svelte/transition";
-  import { fadeParams, scaleParams } from "../motion/easing";
+  import { backdropFade, backdropFadeOut, cardScale } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import {
@@ -61,7 +61,8 @@
     tabindex="-1"
     onclick={cancelPrompt}
     onkeydown={handleKeydown}
-    transition:fade={fadeParams()}
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.PROMPT}"
   >
@@ -73,7 +74,7 @@
     <div
       use:trapFocus={{ autofocus: false }}
       onclick={(e) => e.stopPropagation()}
-      in:scale={scaleParams()}
+      in:scale={cardScale()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">

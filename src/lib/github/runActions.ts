@@ -11,12 +11,20 @@ export function canRerunRun(run: Pick<WorkflowRunInfo, "status">): boolean {
 }
 
 /**
- * An in-flight run can be cancelled (`gh run cancel`). Queued counts: it
- * occupies a runner slot and may sit there for a long time.
+ * An in-flight run can be cancelled (`gh run cancel`). Queued and waiting
+ * count: both occupy the pipeline — `waiting` sits behind deployment
+ * protection rules, `requested` behind an approval — and either can sit
+ * there for a long time.
  */
 export function canCancelRun(run: Pick<WorkflowRunInfo, "status">): boolean {
   const status = run.status.toLowerCase();
-  return status === "in_progress" || status === "queued" || status === "pending";
+  return (
+    status === "in_progress" ||
+    status === "queued" ||
+    status === "pending" ||
+    status === "waiting" ||
+    status === "requested"
+  );
 }
 
 const WORKFLOW_STATE_LABELS: Record<string, string> = {

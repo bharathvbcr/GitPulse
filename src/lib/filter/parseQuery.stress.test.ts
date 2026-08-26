@@ -107,10 +107,12 @@ describe("parseFilterQuery stress: nesting and repetition", () => {
     expect(parsed.text).toBe("rest");
   });
 
-  it("rejects non-conventional types by routing them to free text", () => {
+  it("keeps non-conventional types as predicates, matching the backend filter", () => {
+    // Parity contract with CommitFilter::parse: any non-empty type: value is
+    // a commit-type predicate on BOTH sides of the IPC boundary.
     const parsed = parseFilterQuery("type:wip");
-    expect(parsed.commitType).toBeUndefined();
-    expect(parsed.text).toContain("type:wip");
+    expect(parsed.commitType).toBe("wip");
+    expect(parsed.text).toBe("");
   });
 
   it("searches negative-looking tokens literally — no negation grammar", () => {

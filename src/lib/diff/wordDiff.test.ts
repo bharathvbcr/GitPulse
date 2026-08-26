@@ -3,10 +3,12 @@ import {
   annotateRange,
   annotateUnifiedDiff,
   computeWordDiff,
+  createParseCache,
   emptyDiffCopy,
   filterFilePatch,
   isImagePath,
   parseUnifiedDiff,
+  replacementBlockBounds,
 } from "./wordDiff";
 
 describe("computeWordDiff", () => {
@@ -88,6 +90,226 @@ describe("parseUnifiedDiff", () => {
     const lines = parseUnifiedDiff("-x\n+y\n");
     expect(lines[0].oldNo).toBeUndefined();
     expect(lines[1].newNo).toBeUndefined();
+  });
+
+  it("returns zero rows for empty and nullish input (no phantom row)", () => {
+    // CHANGED: the old split("\n") behavior fabricated one {type:"meta",
+    // content:""} row for "" — a phantom that made the UI's EmptyState
+    // unreachable and inflated row counts. An empty diff is zero rows.
+    expect(parseUnifiedDiff("")).toEqual([]);
+    expect(parseUnifiedDiff(null as unknown as string)).toEqual([]);
+    expect(parseUnifiedDiff(undefined as unknown as string)).toEqual([]);
+  });
+
+  it("drops only the newline-terminator artifact, not genuine blank lines", () => {
+    const trailingCtx = parseUnifiedDiff("@@ -1,2 +1,2 @@\n a\n\n");
+    expect(trailingCtx.map((l) => l.type)).toEqual(["hdr", "ctx", "ctx"]);
+    expect(trailingCtx[2].content).toBe("");
+    // A mid-diff blank context line stays exactly one row.
+    const midBlank = parseUnifiedDiff("@@ -1,3 +1,3 @@\n a\n\n c\n");
+    expect(midBlank).toHaveLength(4);
+  });
+
+  it("flags noNewline on the add/del row each marker annotates", () => {
+    const both = parseUnifiedDiff(
+      [
+        "@@ -1,2 +1,2 @@",
+        " shared",
+        "-old tail",
+        "\\ No newline at end of file",
+        "+new tail",
+        "\\ No newline at end of file",
+      ].join("\n")
+    );
+    const del = both.find((l) => l.type === "del");
+    const add = both.find((l) => l.type === "add");
+    expect(del?.noNewline).toBe(true);
+    expect(add?.noNewline).toBe(true);
+    // The markers themselves stay displayable hdr rows.
+    expect(both.filter((l) => l.content.startsWith("\\")).map((l) => l.type)).toEqual([
+      "hdr",
+      "hdr",
+    ]);
+    // Context rows are never flagged.
+    expect(both[1].noNewline).toBeUndefined();
+  });
+
+  it("does not flag a row when the marker does not immediately follow one", () => {
+    const rows = parseUnifiedDiff("@@ -1,2 +1,2 @@\n-old\n ctx\n\\ No newline at end of file\n");
+    expect(rows[1].noNewline).toBeUndefined();
+    // Marker before any body row: nothing to flag.
+    const leading = parseUnifiedDiff("@@ -1 +1 @@\n\\ No newline at end of file\n+a\n");
+    expect(leading[0].type).toBe("hdr");
+    expect(leading[1].noNewline).toBeUndefined();
+  });
+
+  it("parses padded hunk headers via relaxed whitespace matching", () => {
+    const rows = parseUnifiedDiff("@@  -5 +5  @@ padded\n+five\n");
+    expect(rows[0].type).toBe("hdr");
+    expect(rows[1]).toMatchObject({ type: "add", newNo: 5 });
+  });
+
+  it("resets numbering when an @@ line resists parsing, never inheriting stale counters", () => {
+    // CHANGED: previously the counters from the previous hunk leaked across
+    // the malformed header ("stale +5 kept counting"), so body rows carried
+    // cross-file line numbers. Undefined beats a lie.
+    const rows = parseUnifiedDiff("@@ -5,1 +5,1 @@\n-a\n@@ garbage\n+b\n");
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "del", "hdr", "add"]);
+    expect(rows[1].oldNo).toBe(5);
+    expect(rows[3].oldNo).toBeUndefined();
+    expect(rows[3].newNo).toBeUndefined();
+  });
+
+  it("classifies every GIT binary patch payload line as binary until the next file", () => {
+    // Realistic shape: git emits `literal <size>` then base85 chunks. Those
+    // chunks can begin with '+' or '-'; routing them through the normal
+    // classifier manufactured phantom add/del rows out of opaque payload.
+    const binaryPatch = [
+      "diff --git a/logo.png b/logo.png",
+      "index 8422ab5..bd1e6d4 100644",
+      "GIT binary patch",
+      "literal 1642",
+      "YcmZo$u}yD&7z`?;V0m#F1RM)FhN8C0+00001",
+      "-cmZo%Kx~9QfR!2tLwPqE+b7GdA4jH6sT00000",
+      "",
+      "literal 987",
+      "ZcmZo&Np^1WdXe@#YvU2rS3tM4nB5cD6f00000",
+      "",
+      ].join("\n");
+    const rows = parseUnifiedDiff(binaryPatch);
+    expect(rows[0].type).toBe("meta");
+    expect(rows.find((l) => l.content === "GIT binary patch")?.type).toBe("binary");
+    const payloadTypes = rows.slice(3).map((l) => ({ t: l.type, c: l.content }));
+    expect(payloadTypes).toEqual([
+      { t: "binary", c: "literal 1642" },
+      { t: "binary", c: "YcmZo$u}yD&7z`?;V0m#F1RM)FhN8C0+00001" },
+      { t: "binary", c: "-cmZo%Kx~9QfR!2tLwPqE+b7GdA4jH6sT00000" },
+      // Genuine blank separator line between git's literal chunks.
+      { t: "binary", c: "" },
+      { t: "binary", c: "literal 987" },
+      { t: "binary", c: "ZcmZo&Np^1WdXe@#YvU2rS3tM4nB5cD6f00000" },
+    ]);
+    expect(rows.filter((l) => l.type === "add" || l.type === "del")).toHaveLength(0);
+  });
+
+  it("exits the binary section at the next diff --git header", () => {
+    const twoFiles =
+      "diff --git a/a.bin b/a.bin\nGIT binary patch\nliteral 10\n+payload\n" +
+      "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y";
+    const rows = parseUnifiedDiff(twoFiles);
+    const secondFileStart = rows.findIndex(
+      (l) => l.content === "diff --git a/b.txt b/b.txt"
+    );
+    expect(rows[secondFileStart].type).toBe("meta");
+    expect(rows[secondFileStart + 4]).toMatchObject({ type: "del", oldNo: 1 });
+    expect(rows[secondFileStart + 5]).toMatchObject({ type: "add", newNo: 1 });
+  });
+});
+
+describe("createParseCache", () => {
+  it("returns the identical array for the identical string reference", () => {
+    const cache = createParseCache();
+    const raw = "@@ -1 +1 @@\n-a\n+b\n";
+    const first = cache.parse(raw);
+    const second = cache.parse(raw);
+    expect(second).toBe(first);
+  });
+
+  it("reparses when the input content differs", () => {
+    const cache = createParseCache();
+    const first = cache.parse("@@ -1 +1 @@\n-a\n+b\n");
+    const second = cache.parse("@@ -1 +1 @@\n-c\n+d\n");
+    expect(second).not.toBe(first);
+    expect(second.map((l) => l.content)).toEqual(["@@ -1 +1 @@", "-c", "+d"]);
+  });
+
+  it("misses (and reparses) for non-primitive string inputs", () => {
+    // JS string primitives compare by value, so "reference identity" for
+    // strings means: a store holding one stable string keeps hitting the
+    // cache. Only a boxed String object breaks `===` and forces a reparse —
+    // pinned to show the guard is `===`, not deep equality.
+    const cache = createParseCache();
+    const raw = "@@ -1 +1 @@\n-a\n+b\n";
+    const first = cache.parse(raw);
+    const boxed = new String(raw) as unknown as string;
+    const second = cache.parse(boxed);
+    expect(second).not.toBe(first);
+    expect(second).toEqual(first);
+  });
+
+  it("preserves mutated line objects (segments) across cache hits", () => {
+    const cache = createParseCache();
+    const raw = "@@ -1 +1 @@\n-foo bar\n+foo baz\n";
+    const first = cache.parse(raw);
+    annotateRange(first, 0, first.length);
+    const segmentsBefore = first.map((l) => l.segments);
+    // A background store publication re-parses the same string; the cached
+    // array with its attached word-diff segments comes back untouched.
+    const again = cache.parse(raw);
+    expect(again).toBe(first);
+    expect(again.map((l) => l.segments)).toEqual(segmentsBefore);
+  });
+
+  it("treats null as the empty diff and caches it like any other input", () => {
+    const cache = createParseCache();
+    expect(cache.parse(null)).toEqual([]);
+    expect(cache.parse(null)).toBe(cache.parse(null));
+    const raw = "@@ -1 +1 @@\n+x\n";
+    expect(cache.parse(raw)).toHaveLength(2);
+    expect(cache.parse(null)).toEqual([]);
+  });
+});
+
+describe("replacementBlockBounds", () => {
+  const blockRaw = [
+    "@@ -1,6 +1,6 @@",
+    " lead",
+    "-alpha one",
+    "-beta two",
+    "-gamma three",
+    "+ALPHA one",
+    "+BETA two",
+    "+GAMMA three",
+    " tail",
+  ].join("\n");
+
+  function parsedBlock() {
+    return parseUnifiedDiff(blockRaw);
+  }
+
+  function boundsOfIndex(index: number): [number, number] {
+    const lines = parsedBlock();
+    return replacementBlockBounds(lines, index)!;
+  }
+
+  it("spans the whole del-run plus add-run regardless of entry row", () => {
+    // Rows: 0 hdr, 1 ctx, 2-4 dels, 5-7 adds, 8 ctx.
+    for (const index of [2, 3, 4, 5, 6, 7]) {
+      expect(boundsOfIndex(index)).toEqual([2, 8]);
+    }
+  });
+
+  it("annotating from ANY straddling sub-window pairs the full block correctly", () => {
+    // Regression for the straddling-window mispair: a caller whose visible
+    // window covers only part of the block must still annotate with the
+    // FULL block bounds, else del[2] would pair against add[5] and shift
+    // every subsequent pair by one. Simulate windows anchored at each row.
+    const full = parsedBlock();
+    annotateRange(full, 0, full.length);
+    for (const anchor of [2, 3, 4, 5, 6, 7]) {
+      const sliced = parsedBlock();
+      const [start, end] = replacementBlockBounds(sliced, anchor)!;
+      annotateRange(sliced, start, end);
+      expect(sliced.map((l) => l.segments)).toEqual(full.map((l) => l.segments));
+    }
+  });
+
+  it("returns null for non-content rows and out-of-range indices", () => {
+    const lines = parsedBlock();
+    expect(replacementBlockBounds(lines, 0)).toBeNull(); // hdr
+    expect(replacementBlockBounds(lines, 1)).toBeNull(); // ctx
+    expect(replacementBlockBounds(lines, 99)).toBeNull();
+    expect(replacementBlockBounds([], 0)).toBeNull();
   });
 });
 
@@ -206,10 +428,12 @@ describe("parseUnifiedDiff meta classification", () => {
     expect(binary[0]).not.toContain("GIT binary patch");
   });
 
-  it("classifies GIT binary patch payloads as binary notices too", () => {
+  it("classifies GIT binary patch payload sections as binary rows", () => {
+    // CHANGED: everything after `GIT binary patch` belongs to the opaque
+    // base85 payload; "literal 10" used to fall out as a bare meta row.
     const lines = parseUnifiedDiff("diff --git a/a.bin b/a.bin\nGIT binary patch\nliteral 10\n");
     expect(lines[1].type).toBe("binary");
-    expect(lines[2].type).toBe("meta");
+    expect(lines[2].type).toBe("binary");
   });
 
   it("keeps hunk line numbers intact across a meta boundary", () => {

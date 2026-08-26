@@ -15,6 +15,7 @@
     type VisualCommitRow,
   } from "../canvas/GraphRenderer";
   import { acquireGpu2dContext } from "../canvas/gpuContext";
+  import { diagnostics } from "../diagnostics/diagnostics";
   import {
     createGraphStaticCache,
     createOffscreenSurface,
@@ -23,7 +24,7 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
-  import { filterRowsWithLanes, parseFilterQueryCached } from "../filter/queryMemo";
+  import { createRowFilterMemo, parseFilterQueryCached } from "../filter/queryMemo";
   import { nextLoadLimit } from "../stores/graphLimits";
   import {
     forwardGraphWheel,
@@ -62,8 +63,6 @@
   const scheduler = createFrameScheduler();
 
   let rowHeight = $derived(DENSITY_CONFIGS[$densityStore].rowHeight);
-  let laneWidth = $derived(DENSITY_CONFIGS[$densityStore].laneWidth);
-  let originX = $derived(DENSITY_CONFIGS[$densityStore].originX);
 
   let gpuCtx: CanvasRenderingContext2D | null = null;
   let attachedCanvas: HTMLCanvasElement | null = null;
@@ -71,9 +70,17 @@
   let tooltipRow: (typeof filteredRows)[number] | null = $state(null);
   let tooltipLeft = $state(0);
   let tooltipTop = $state(0);
+  let tooltipAnchorX = $state(16);
   let tooltipPlacement: TooltipPlacement = $state("below");
+  // Measured box of the rendered tooltip; the old hardcoded 320×190 lied
+  // about real height (wrapped summaries, ref-chip rows), so "fits below"
+  // could pin a taller box against the pane bottom with its caret adrift.
+  let tooltipBoxWidth = $state(320);
+  let tooltipBoxHeight = $state(190);
+  let tooltipPointer: { x: number; y: number } | null = null;
   let paintState: GraphPaintState = { ...INITIAL_GRAPH_PAINT };
   let lastSelectedId: string | null = null;
+  let selectionSeen = false;
   let lastFrameTime = 0;
 
   // Theme is resolved from the stylesheet once per theme change, never inside
@@ -85,19 +92,29 @@
   let rootRect: DOMRect | null = null;
   // Pointer events are coalesced: the latest position wins, one hit test/frame.
   let pendingPointer: { x: number; y: number } | null = null;
+  // Last seen cursor position, kept so a scroll can RE-hit instead of
+  // killing the tooltip (wheel-over-gutter forwards here; a null→remount
+  // cycle replayed the tooltip entrance on every scroll frame).
+  let lastPointer: { x: number; y: number } | null = null;
   // Row-data version for the static-layer cache key: bumps when the filtered
   // array identity changes (new payload, filter edit, repo switch).
   let rowsVersion = 0;
   let versionedRows: VisualCommitRow[] | null = null;
 
+  // Identity-stable filtering: without the memo, every graphStore emission
+  // handed derivations a fresh array and bumped rowsVersion, wiping the
+  // strip cache (full re-rasterization) even when history was unchanged.
+  const rowFilter = createRowFilterMemo();
+
   let filtered = $derived.by(() =>
-    filterRowsWithLanes($graphStore.rows, parseFilterQueryCached($filterStore.searchQuery))
+    rowFilter.filter($graphStore.rows, parseFilterQueryCached($filterStore.searchQuery))
   );
   let filteredRows = $derived(filtered.rows);
 
-  let maxActiveLane = $derived(filtered.maxActiveLane);
-
-  let graphColumnWidth = $derived(Math.max(220, (maxActiveLane + 2) * laneWidth + originX));
+  // Single owner of gutter math (GraphRenderer.measureWidth): it counts node
+  // lanes, active lanes AND connection target lanes, so a dangling merged-in
+  // branch's fan-out column can never clip under a hand-rolled formula.
+  let graphColumnWidth = $derived(Math.max(220, renderer.measureWidth(filteredRows)));
 
   /**
    * Ref chips, taken from the graph payload rather than derived from the
@@ -144,8 +161,11 @@
    */
   const graphCache = createGraphStaticCache(
     (req) => {
-      // Prime with LOOKBACK_ROWS so connectors crossing strip seams stay
-      // continuous; render() culls to the strip's own height.
+      // Prime with LOOKBACK_ROWS so short connectors crossing strip seams stay
+      // continuous; render() culls to the strip's own height. Long connectors
+      // are excluded here on purpose — paintGraphFrame draws them whole in the
+      // live overlay, since a span beyond the primed lookback cannot be baked
+      // into a tile without a mid-edge seam clip.
       const range = primedRowRange(req.firstRow, req.rowCount, filteredRows.length);
       renderer.render(
         req.ctx,
@@ -154,7 +174,7 @@
         range.to,
         req.stripTopCss,
         undefined,
-        { theme: currentTheme(), viewportHeight: req.viewportCssHeight },
+        { theme: currentTheme(), viewportHeight: req.viewportCssHeight, skipLongConnectors: true },
         null,
       );
     },
@@ -226,7 +246,10 @@
     if (pointer) processPointer(pointer.x, pointer.y);
 
     const currentSelected = selectedId();
-    const selectionReset = currentSelected !== lastSelectedId;
+    // The first observed frame only LEARNS the selection; treating it as a
+    // change played a phantom grow-in pulse on every mount and repo switch.
+    const selectionReset = selectionSeen && currentSelected !== lastSelectedId;
+    selectionSeen = true;
     lastSelectedId = currentSelected;
 
     const { next, animating } = stepGraphPaint(paintState, {
@@ -248,8 +271,12 @@
     const target = e.target as HTMLDivElement;
     scrollTop = target.scrollTop;
     gutterRect = null;
-    tooltipRow = null;
-    hoveredCommitId = null;
+    if (lastPointer) {
+      pendingPointer = lastPointer;
+    } else {
+      tooltipRow = null;
+      hoveredCommitId = null;
+    }
     schedulePaint();
   }
 
@@ -290,7 +317,8 @@
    * performs at most one hit test per vsync (latest-wins).
    */
   function handleCanvasMouseMove(e: MouseEvent) {
-    pendingPointer = { x: e.clientX, y: e.clientY };
+    lastPointer = { x: e.clientX, y: e.clientY };
+    pendingPointer = lastPointer;
     schedulePaint();
   }
 
@@ -301,26 +329,46 @@
     hoveredCommitId = nextId;
     if (!hit || !root) {
       tooltipRow = null;
+      tooltipPointer = null;
       return;
     }
+    tooltipPointer = { x, y };
+    tooltipRow = hit;
+    placeTooltip(x, y);
+  }
+
+  /** Positions the open tooltip from its MEASURED box, not assumed metrics. */
+  function placeTooltip(pointerX: number, pointerY: number) {
+    if (!root) return;
     if (!rootRect) rootRect = root.getBoundingClientRect();
     const position = positionGraphTooltip(
-      x - rootRect.left,
-      y - rootRect.top,
+      pointerX - rootRect.left,
+      pointerY - rootRect.top,
       root.clientWidth,
       root.clientHeight,
-      320,
-      190,
+      Math.max(32, tooltipBoxWidth),
+      Math.max(32, tooltipBoxHeight),
     );
-    tooltipRow = hit;
     tooltipLeft = position.left;
     tooltipTop = position.top;
+    tooltipAnchorX = position.anchorX;
     tooltipPlacement = position.placement;
   }
+
+  // Late measurement re-placement: the box bindings land a frame after the
+  // tooltip mounts, so the first placement used fallback metrics. Re-run the
+  // placement with real ones (and on every resize of the box thereafter).
+  $effect(() => {
+    void tooltipBoxWidth;
+    void tooltipBoxHeight;
+    const pointer = tooltipPointer;
+    if (tooltipRow && pointer) placeTooltip(pointer.x, pointer.y);
+  });
 
   function handleCanvasMouseLeave() {
     if (canvas) canvas.style.cursor = "default";
     pendingPointer = null;
+    lastPointer = null;
     if (hoveredCommitId !== null) {
       hoveredCommitId = null;
       schedulePaint();
@@ -338,6 +386,12 @@
     $graphStore.headId;
     $densityStore;
     renderer.setDensity($densityStore);
+    // Density flips change the gutter width and can shift layout around it;
+    // the cached pointer rects must not survive the shift or hit-testing
+    // lands offset by exactly whatever moved. Same contract as the theme
+    // effect below.
+    gutterRect = null;
+    rootRect = null;
     schedulePaint();
   });
 
@@ -382,8 +436,33 @@
     };
     watchDpr();
 
+    // GPU pressure can revoke the 2D context mid-session; without handling,
+    // every subsequent paint silently no-ops into the dead context and the
+    // graph freezes. Dropping the cached context + geometry forces
+    // ensureContext() to re-acquire (the browser fires contextrestored once
+    // the context is usable again; until then paints stay cheap no-ops).
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      gpuCtx = null;
+      attachedCanvas = null;
+      gutterRect = null;
+      rootRect = null;
+      graphCache.invalidate();
+      schedulePaint();
+      diagnostics.warn("canvas", "2D context lost; re-acquiring on next paint");
+    };
+    const onContextRestored = () => {
+      graphCache.invalidate();
+      schedulePaint();
+      diagnostics.warn("canvas", "2D context restored");
+    };
+    canvas?.addEventListener("contextlost", onContextLost);
+    canvas?.addEventListener("contextrestored", onContextRestored);
+
     return () => {
       detachDpr();
+      canvas?.removeEventListener("contextlost", onContextLost);
+      canvas?.removeEventListener("contextrestored", onContextRestored);
       observer.disconnect();
       scheduler.cancel();
       graphCache.dispose();
@@ -453,7 +532,11 @@
     </div>
     {#if totalCommits === 0 && !$graphStore.isLoading && !$graphStore.error}
       <div class="absolute inset-0 flex items-center justify-center text-textMuted text-xs pointer-events-none">
-        No commits match the current filters.
+        {#if $filterStore.searchQuery.trim() === "" && !$filterStore.selectedBranch}
+          This repository has no commits yet.
+        {:else}
+          No commits match the current filters.
+        {/if}
       </div>
     {/if}
     {#if $graphStore.hasMore}
@@ -473,8 +556,12 @@
 
   {#if tooltipRow}
     <!-- Positioned via transform: left/top writes invalidate layout at pointer
-         frequency; a composited translate3d does not. -->
+         frequency; a composited translate3d does not. clientWidth/Height bind
+         the REAL box back into placement, so a tall tooltip never gets pinned
+         by stale assumed metrics. -->
     <div
+      bind:clientWidth={tooltipBoxWidth}
+      bind:clientHeight={tooltipBoxHeight}
       class="pointer-events-none absolute left-0 top-0 z-30 w-80 max-w-[calc(100%_-_1rem)]"
       style="transform: translate3d({tooltipLeft}px, {tooltipTop}px, 0);"
     >
@@ -482,6 +569,7 @@
         row={tooltipRow}
         refs={refsByCommit.get(tooltipRow.id) ?? []}
         placement={tooltipPlacement}
+        caretX={tooltipAnchorX}
       />
     </div>
   {/if}

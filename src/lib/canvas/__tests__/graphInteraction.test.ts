@@ -30,12 +30,17 @@ describe("graph interactions", () => {
       left: 32,
       top: 32,
       placement: "below",
+      anchorX: 16,
     });
 
     expect(positionGraphTooltip(790, 490, 800, 500, 320, 160)).toEqual({
       left: 472,
       top: 318,
       placement: "above",
+      // Horizontal clamping shoved the box left of the pointer; the caret
+      // rides toward the pointer but stays INSIDE the box: raw offset
+      // 790-472=318 clamps to width-16=304.
+      anchorX: 304,
     });
   });
 

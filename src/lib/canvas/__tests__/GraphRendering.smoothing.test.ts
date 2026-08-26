@@ -117,8 +117,8 @@ describe("graph smoothing", () => {
     const curve = calls.find((c) => c.op === "bezierCurveTo");
     expect(curve).toBeDefined();
     const { rowHeight } = renderer.getConfig();
-    const mergeY = renderer.getRowY(0, 0, 0, true);
-    const targetY = renderer.getRowY(4, 0, 0, true);
+    const mergeY = renderer.getRowY(0, 0);
+    const targetY = renderer.getRowY(4, 0);
     const curveEndY = curve!.args[5];
     // The turn happens near the merge commit, not halfway down the span, and
     // the straight run to the parent is what follows it.
@@ -146,8 +146,8 @@ describe("graph smoothing", () => {
 
     const curve = calls.find((c) => c.op === "bezierCurveTo");
     expect(curve).toBeDefined();
-    const parentY = renderer.getRowY(3, 0, 0, true);
-    const tipY = renderer.getRowY(0, 0, 0, true);
+    const parentY = renderer.getRowY(3, 0);
+    const tipY = renderer.getRowY(0, 0);
     // The curve ends exactly on the parent node, and it starts in the lower
     // half of the span: the lane runs straight down before it turns.
     expect(curve!.args[5]).toBeCloseTo(parentY, 5);
@@ -166,8 +166,8 @@ describe("graph smoothing", () => {
     // baked into strip tiles they would clip mid-fade at strip seams.
     renderer.drawDanglingStubs(ctx, rows, 0, 2, 0);
 
-    const tipY = renderer.getRowY(0, 0, 0, true);
-    const nextRowY = renderer.getRowY(1, 0, 0, true);
+    const tipY = renderer.getRowY(0, 0);
+    const nextRowY = renderer.getRowY(1, 0);
     const stubEnds = calls
       .filter((c) => c.op === "lineTo")
       .map((c) => c.args[1])

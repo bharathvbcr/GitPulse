@@ -15,6 +15,7 @@ function emptyReport(): DepsHealthReport {
     audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },
     outdated: [],
     truncated: false,
+    scanners_ran: ["npm"],
   };
 }
 
@@ -69,6 +70,7 @@ describe("formatHealthReport", () => {
   it("names the scanners that are present and flags when none ran", () => {
     const report = emptyReport();
     report.npm_cli_present = false;
+    report.scanners_ran = [];
     report.cargo_audit_present = true;
     report.pip_audit_present = true;
     report.govulncheck_present = true;
@@ -81,12 +83,15 @@ describe("formatHealthReport", () => {
     report.pip_audit_present = false;
     report.govulncheck_present = false;
     report.composer_present = false;
-    expect(formatHealthReport(report)).toContain("no audit scanner on PATH");
+    // UPDATED: "no audit scanner on PATH" over-claimed a specific diagnostic
+    // (PATH) that presence flags do not establish.
+    expect(formatHealthReport(report)).toContain("no audit scanner available");
   });
 
   it("names local audits that could not run instead of letting counts read as clean", () => {
     const report = emptyReport();
     report.npm_cli_present = false;
+    report.scanners_ran = [];
     report.manifests = [
       {
         path: "package.json",
@@ -110,6 +115,39 @@ describe("formatHealthReport", () => {
     expect(text).not.toContain(
       "No issues, vulnerabilities or outdated packages were reported.",
     );
+  });
+
+  it("does not claim a clean audit when manifests exist but no scanner ran (field bug)", () => {
+    const report = emptyReport();
+    report.npm_cli_present = false;
+    report.scanners_ran = [];
+    report.manifests = [
+      {
+        path: "package.json",
+        name: "demo",
+        version: "1.0.0",
+        private: true,
+        package_manager: "npm",
+        has_workspaces: false,
+        dep_count: 12,
+        dev_dep_count: 4,
+        optional_dep_count: 0,
+        peer_dep_count: 0,
+        lifecycle_scripts: [],
+      },
+    ];
+    const text = formatHealthReport(report);
+    expect(text).not.toContain("No known vulnerabilities");
+    expect(text).toContain("Audit summary: audit did not run");
+    expect(text).toContain("CLI missing: npm audit/outdated");
+  });
+
+  it("keeps the clean-audit wording only when a scanner actually ran and found nothing", () => {
+    const report = emptyReport();
+    report.scanners_ran = ["npm"];
+    const text = formatHealthReport(report);
+    expect(text).toContain("Audit summary: No known vulnerabilities; 0 outdated.");
+    expect(text).not.toContain("audit did not run");
   });
 
   it("lists ecosystem audits whose CLI was absent while their artifacts exist", () => {
@@ -156,8 +194,10 @@ describe("formatHealthReport", () => {
   it("keeps the all-clear when nothing was skipped and no artifacts await a missing CLI", () => {
     const report = emptyReport();
     report.npm_cli_present = false;
+    report.scanners_ran = [];
     const text = formatHealthReport(report);
     expect(text).not.toContain("did NOT run");
+    expect(text).toContain("audit did not run");
     expect(text).toContain(
       "No issues, vulnerabilities or outdated packages were reported.",
     );

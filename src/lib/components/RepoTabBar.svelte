@@ -8,6 +8,7 @@
   import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
+  import { clampMenuPosition } from "../branches/menuPosition";
   import {
     ChevronDown,
     Pin,
@@ -24,6 +25,10 @@
   } = $props();
 
   let menu: { x: number; y: number; id: string } | null = $state(null);
+  // Measured menu box feeds the shared clamp so the tab menu can never open
+  // off-screen (the old innerWidth-200 guess overflowed on short windows).
+  let menuEl: HTMLDivElement | undefined = $state();
+  let menuPos = $state({ left: 0, top: 0 });
   let recentsOpen = $state(false);
   let dragFrom = $state<number | null>(null);
   // Where a dragged tab would land. `before` picks the left/right half of the
@@ -43,11 +48,34 @@
     recentsOpen = false;
   }
 
+  // A tab closed while its menu was open leaves zombie state that only
+  // Escape could dismiss; drop the menu the moment its tab vanishes.
+  $effect(() => {
+    if (menu && !$repoStore.openTabs.some((tab) => tab.id === menu?.id)) {
+      menu = null;
+    }
+  });
+
   function onContext(e: MouseEvent, id: string) {
     e.preventDefault();
     menu = { x: e.clientX, y: e.clientY, id };
+    // First paint at the raw anchor (clamped by estimate); the effect below
+    // repositions from the real measured box once it exists.
+    menuPos = clampMenuPosition(e.clientX, e.clientY, 176, 150, window.innerWidth, window.innerHeight);
     recentsOpen = false;
   }
+
+  $effect(() => {
+    if (!menu || !menuEl) return;
+    menuPos = clampMenuPosition(
+      menu.x,
+      menu.y,
+      menuEl.offsetWidth,
+      menuEl.offsetHeight,
+      window.innerWidth,
+      window.innerHeight,
+    );
+  });
 
   function isTypingTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
@@ -106,9 +134,13 @@
   onMount(() => {
     window.addEventListener("keydown", handleKey);
     window.addEventListener("pointerdown", handlePointerDown, true);
+    // Same contract as BranchList's menu: a resized window can leave the
+    // clamped position pointing at nothing useful, so close instead.
+    window.addEventListener("resize", closeMenu);
     return () => {
       window.removeEventListener("keydown", handleKey);
       window.removeEventListener("pointerdown", handlePointerDown, true);
+      window.removeEventListener("resize", closeMenu);
     };
   });
 
@@ -310,10 +342,11 @@
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}
   {#if tab}
     <div
+      bind:this={menuEl}
       use:portal={"body"}
       data-repo-menu
       class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
-      style="left: {Math.min(menu.x, window.innerWidth - 200)}px; top: {Math.min(menu.y, window.innerHeight - 260)}px; z-index: {LAYERS.MENU}"
+      style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU}"
     >
       <button class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab

@@ -20,12 +20,27 @@ describe("canRerunRun", () => {
 
 describe("canCancelRun", () => {
   it("allows every in-flight state and refuses finished ones", () => {
-    for (const status of ["in_progress", "queued", "pending", "QUEUED"]) {
+    for (const status of [
+      "in_progress",
+      "queued",
+      "pending",
+      "waiting",
+      "requested",
+      "QUEUED",
+    ]) {
       expect(canCancelRun({ status }), status).toBe(true);
     }
     for (const status of ["completed", "cancelled", "failure", ""]) {
       expect(canCancelRun({ status }), status).toBe(false);
     }
+  });
+
+  it("covers deployment-protection states that used to render as dead rows", () => {
+    // Regression: `waiting` (deployment protection rules) and `requested`
+    // (awaiting approval) runs got neither a cancel nor a rerun affordance —
+    // an unactionable row that could sit for hours.
+    expect(canCancelRun({ status: "waiting" })).toBe(true);
+    expect(canCancelRun({ status: "requested" })).toBe(true);
   });
 });
 

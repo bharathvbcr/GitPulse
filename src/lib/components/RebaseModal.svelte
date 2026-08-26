@@ -1,9 +1,15 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
-  import { graphStore } from "../stores/graphStore";
+  import { graphStore, serverFetchableQuery } from "../stores/graphStore";
+  import { filterStore } from "../stores/filterStore";
   import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
-  import { fadeParams, scaleParams } from "../motion/easing";
+  import {
+    backdropFade,
+    backdropFadeOut,
+    cardScale,
+    cardScaleOut,
+  } from "../ui/transitions";
   import { seedRebasePlan, shouldReseed } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
@@ -87,7 +93,16 @@
       // Both effects are scoped to the captured path, so they land on the
       // rebased repo's session even if the active tab moved mid-run.
       await repoStore.refresh(repoPath);
-      await graphStore.loadGraph(repoPath);
+      // The bare loadGraph(repoPath) form reset the view to query=""/HEAD
+      // while FilterBar still showed the selected filter, and the scheduler
+      // memo then blocked the correction. Reload with the visible context,
+      // sanitized: a client-side query sent here would be filtered into the
+      // cached payload server-side and never refetched (serverFetchableQuery).
+      await graphStore.loadGraph(
+        repoPath,
+        serverFetchableQuery($filterStore.searchQuery),
+        $filterStore.selectedBranch,
+      );
       onClose?.();
     } catch (err: unknown) {
       errorMsg = formatError(err);
@@ -110,7 +125,8 @@
     tabindex="-1"
     onclick={requestClose}
     onkeydown={(e) => e.key === "Escape" && requestClose()}
-    transition:fade={fadeParams()}
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
@@ -120,8 +136,8 @@
     <div
       use:trapFocus
       onclick={(e) => e.stopPropagation()}
-      in:scale={scaleParams()}
-      out:scale={scaleParams()}
+      in:scale={cardScale()}
+      out:scale={cardScaleOut()}
       class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">

@@ -5,13 +5,16 @@
 //! matching CLI is on PATH — runs read-only audits: `npm audit` / `npm outdated`,
 //! `cargo audit`, `pip-audit --no-deps` (pinned requirements files only),
 //! `govulncheck -json`, `composer audit --locked`, and `bundler-audit check`.
-//! A missing CLI is reported as such; it is never treated as a clean bill of
+//! A missing CLI is reported as such — and a CLI that exists but fails to run
+//! (wrong interpreter, non-zero exit, timeout) is reported with its real cause,
+//! never mislabeled as missing. It is never treated as a clean bill of
 //! health. Scanner advisory databases are never refreshed implicitly — a stale
 //! DB is the user's call, not a background write outside the repo.
 
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
-    capture_command, git_text, sandbox_join, sandbox_join_canonical, validate_repo,
+    capture_command_with_env, git_text, resolve_spawn_program_with, sandbox_join,
+    sandbox_join_canonical, validate_repo, CapturedOutput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,6 +187,12 @@ pub struct DepsHealthReport {
     pub govulncheck_present: bool,
     pub composer_present: bool,
     pub bundler_audit_present: bool,
+    /// Scanners that issued at least one real CLI command during this scan
+    /// (`npm`, `cargo`, `pip-audit`, `govulncheck`, `composer`,
+    /// `bundler-audit`). The `*_present` flags say what COULD run; this says
+    /// what DID. `serde(default)` keeps older serialized reports loadable.
+    #[serde(default)]
+    pub scanners_ran: Vec<String>,
     pub manifests: Vec<NpmManifest>,
     pub ecosystems: Vec<EcosystemHint>,
     pub issues: Vec<HealthIssue>,
@@ -204,16 +213,65 @@ struct ScanTargets {
     gemfile_locks: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     /// When false, skip npm audit / outdated and cargo audit. Local inventory
     /// still runs. Tests use this so a missing lockfile does not hit the registry.
     pub run_cli: bool,
+    /// Test seam: when set, replaces the process `PATH` for every probe and
+    /// spawn this scan performs, so a GUI-minimal launch environment can be
+    /// simulated without mutating process state. `None` inherits the real
+    /// environment (app behavior).
+    pub path_var: Option<std::ffi::OsString>,
+    /// Test seam: same contract as [`ScanOptions::path_var`] for `HOME`.
+    pub home: Option<std::ffi::OsString>,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { run_cli: true }
+        Self {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        }
+    }
+}
+
+/// The concrete environment view a scan runs its CLI probes and spawns in.
+///
+/// Production builds it from the process environment ([`ScanOptions`] seams
+/// unset); tests build it from a simulated Finder/Dock-style minimal `PATH`
+/// and a scratch `HOME`. `None` genuinely means "variable unset", matching
+/// the semantics of `build_capture_command`'s parameters.
+#[derive(Debug, Clone)]
+struct ScanEnv {
+    path_var: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+}
+
+impl ScanEnv {
+    /// Environment view implied by the options: an override wins wholesale,
+    /// otherwise the process value is used as-is (`None` stays `None`).
+    fn from_options(options: &ScanOptions) -> Self {
+        Self {
+            path_var: options
+                .path_var
+                .clone()
+                .or_else(|| std::env::var_os("PATH")),
+            home: options
+                .home
+                .clone()
+                .or_else(|| std::env::var_os("HOME"))
+                .or_else(|| std::env::var_os("USERPROFILE")),
+        }
+    }
+
+    fn path(&self) -> Option<&std::ffi::OsStr> {
+        self.path_var.as_deref()
+    }
+
+    fn home(&self) -> Option<&std::ffi::OsStr> {
+        self.home.as_deref()
     }
 }
 
@@ -226,14 +284,32 @@ impl DepsScanner {
 
     pub fn scan_with(repo_path: &str, options: ScanOptions) -> Result<DepsHealthReport, String> {
         let repo = validate_repo(repo_path)?;
-        let (mut report, targets) = local_scan(&repo)?;
+        let env = ScanEnv::from_options(&options);
+        let (mut report, targets) = local_scan(&repo, &env)?;
         if options.run_cli {
-            enrich_npm(&repo, &mut report);
-            enrich_cargo(&repo, &mut report);
-            enrich_python(&repo, &targets, &mut report);
-            enrich_go(&repo, &targets, &mut report);
-            enrich_php(&repo, &targets, &mut report);
-            enrich_ruby(&repo, &targets, &mut report);
+            // A scanner is recorded only once it actually dispatched a
+            // command — presence flags alone never imply execution.
+            let mut ran: Vec<String> = Vec::new();
+            if enrich_npm(&repo, &mut report, &env) {
+                ran.push("npm".into());
+            }
+            if enrich_cargo(&repo, &mut report, &env) {
+                ran.push("cargo".into());
+            }
+            if enrich_python(&repo, &targets, &mut report, &env) {
+                ran.push("pip-audit".into());
+            }
+            if enrich_go(&repo, &targets, &mut report, &env) {
+                ran.push("govulncheck".into());
+            }
+            if enrich_php(&repo, &targets, &mut report, &env) {
+                ran.push("composer".into());
+            }
+            if enrich_ruby(&repo, &targets, &mut report, &env) {
+                ran.push("bundler-audit".into());
+            }
+            ran.sort();
+            report.scanners_ran = ran;
         }
         report.audit = AuditSummary::from_vulns(&report.vulnerabilities);
         sort_report(&mut report);
@@ -242,7 +318,7 @@ impl DepsScanner {
     }
 }
 
-fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
+fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTargets), String> {
     let listed = list_repo_files(repo)?;
     let mut truncated = false;
     let mut other: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -284,27 +360,29 @@ fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
         }
     }
 
-    let node_version = tool_version(node_program(), &["-v"]);
-    let npm_version = tool_version(npm_program(), &["--version"]);
+    let node_probe = probe_tool_version(node_program(), &["-v"], env, VERSION_TIMEOUT);
+    let npm_probe = probe_tool_version(npm_program(), &["--version"], env, VERSION_TIMEOUT);
+    let node_version = node_probe.version().map(str::to_string);
+    let npm_version = npm_probe.version().map(str::to_string);
     let npm_cli_present = npm_version.is_some();
-    let cargo_audit_present = other.contains_key("cargo") && cargo_audit_available();
+    let cargo_audit_present = other.contains_key("cargo") && cargo_audit_available(env);
     // Scanner probes are gated on artifacts: a pure-Node repo never pays for a
     // pip-audit / govulncheck / composer spawn.
-    let pip_audit_present =
-        pip_audit_present(&targets) && tool_version(pip_audit_program(), &["--version"]).is_some();
+    let pip_audit_present = pip_audit_present(&targets)
+        && tool_version(pip_audit_program(), &["--version"], env).is_some();
     let govulncheck_present = govulncheck_present(&targets)
-        && tool_version(govulncheck_program(), &["-version"]).is_some();
+        && tool_version(govulncheck_program(), &["-version"], env).is_some();
     let composer_present = !targets.composer_locks.is_empty()
-        && tool_version(composer_program(), &["--version"]).is_some();
+        && tool_version(composer_program(), &["--version"], env).is_some();
     let bundler_audit_present = !targets.gemfile_locks.is_empty()
-        && tool_version(bundler_audit_program(), &["--version"]).is_some();
+        && tool_version(bundler_audit_program(), &["--version"], env).is_some();
 
     if !manifests.is_empty() && !npm_cli_present {
         push_issue(
             &mut issues,
             "warning",
             "npm_missing",
-            "npm is not installed or not on PATH; vulnerability and outdated checks did not run. Local lockfile and engine checks still apply.".into(),
+            npm_missing_message(&npm_probe, &node_probe, env),
             None,
         );
     }
@@ -388,6 +466,7 @@ fn local_scan(repo: &Path) -> Result<(DepsHealthReport, ScanTargets), String> {
             govulncheck_present,
             composer_present,
             bundler_audit_present,
+            scanners_ran: Vec::new(),
             manifests,
             ecosystems,
             issues,
@@ -493,11 +572,17 @@ fn collect_manifest_issues(manifest: &NpmManifest, issues: &mut Vec<HealthIssue>
     }
 }
 
-fn enrich_npm(repo: &Path, report: &mut DepsHealthReport) {
+/// Runs `npm audit --json` / `npm outdated --json` at every scan root.
+///
+/// Returns true when at least one real npm command was dispatched — the
+/// caller records that in `scanners_ran`. A root whose working directory
+/// cannot be validated dispatches nothing and does not count.
+fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool {
     if !report.npm_cli_present || report.manifests.is_empty() {
-        return;
+        return false;
     }
     let roots = npm_scan_roots(&report.manifests);
+    let mut ran = false;
     for rel_dir in roots {
         let cwd = match npm_cwd(repo, &rel_dir) {
             Ok(p) => p,
@@ -506,7 +591,7 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport) {
                 continue;
             }
         };
-        match run_npm_json(&cwd, &["audit", "--json"]) {
+        match run_npm_json(&cwd, &["audit", "--json"], env) {
             Ok(text) => match parse_npm_audit_json(&text) {
                 Ok((mut vulns, err)) => {
                     if let Some(err) = err {
@@ -536,7 +621,8 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport) {
                 Some(package_label(&rel_dir)),
             ),
         }
-        match run_npm_json(&cwd, &["outdated", "--json"]) {
+        ran = true;
+        match run_npm_json(&cwd, &["outdated", "--json"], env) {
             Ok(text) => match parse_npm_outdated_json(&text) {
                 Ok(mut rows) => report.outdated.append(&mut rows),
                 Err(e) => push_issue(
@@ -556,20 +642,24 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport) {
             ),
         }
     }
+    ran
 }
 
-fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport) {
+/// Runs `cargo audit --json` against the root Cargo.lock. Returns true when
+/// the command was dispatched (whatever its outcome).
+fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool {
     if !report.cargo_audit_present {
-        return;
+        return false;
     }
     let has_lock = sandbox_join(repo, "Cargo.lock")
         .ok()
         .map(|p| p.is_file())
         .unwrap_or(false);
     if !has_lock {
-        return;
+        return false;
     }
-    match capture_command(
+    match capture_scanner_command(
+        env,
         "cargo",
         &["audit", "--json"],
         Some(repo),
@@ -590,7 +680,7 @@ fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport) {
                     },
                     Some("Cargo.lock".into()),
                 );
-                return;
+                return true;
             }
             match parse_cargo_audit_json(&text) {
                 Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
@@ -611,6 +701,7 @@ fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport) {
             Some("Cargo.lock".into()),
         ),
     }
+    true
 }
 
 /// Audits pinned requirements files with `pip-audit --no-deps`.
@@ -618,11 +709,18 @@ fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport) {
 /// Only exact pins are auditable without resolving an environment, so this is
 /// deliberately narrower than a full dependency-tree audit; the ecosystems note
 /// in the report says so. pip-audit still needs network for the advisory
-/// service, exactly like npm audit.
-fn enrich_python(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) {
+/// service, exactly like npm audit. Returns true once at least one real
+/// pip-audit command was dispatched.
+fn enrich_python(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
     if !report.pip_audit_present {
-        return;
+        return false;
     }
+    let mut ran = false;
     for rel in targets.py_requirements.iter().take(MAX_PY_REQUIREMENTS) {
         let cwd = match audit_cwd(repo, rel) {
             Ok(p) => p,
@@ -653,7 +751,8 @@ fn enrich_python(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthRepo
             }
         };
         let req_arg = abs_req.to_string_lossy().into_owned();
-        let out = capture_command(
+        let out = capture_scanner_command(
+            env,
             pip_audit_program(),
             &[
                 "--no-deps",
@@ -669,6 +768,7 @@ fn enrich_python(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthRepo
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1"), ("PIP_AUDIT_PROGRESS_SPINNER", "off")],
         );
+        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -689,14 +789,22 @@ fn enrich_python(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthRepo
             ),
         }
     }
+    ran
 }
 
 /// Runs `govulncheck -json ./...` at each go.mod root and folds the NDJSON
-/// stream into module-level findings.
-fn enrich_go(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) {
+/// stream into module-level findings. Returns true once at least one real
+/// govulncheck command was dispatched.
+fn enrich_go(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
     if !report.govulncheck_present {
-        return;
+        return false;
     }
+    let mut ran = false;
     for rel in targets.go_mods.iter().take(MAX_GO_MODS) {
         let dir = dir_of(rel);
         let cwd = match npm_cwd(repo, &dir) {
@@ -712,13 +820,15 @@ fn enrich_go(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) 
                 continue;
             }
         };
-        let out = capture_command(
+        let out = capture_scanner_command(
+            env,
             govulncheck_program(),
             &["-json", "./..."],
             Some(&cwd),
             AUDIT_TIMEOUT,
             &[("GOFLAGS", "-mod=readonly"), ("GO111MODULE", "on")],
         );
+        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -739,13 +849,21 @@ fn enrich_go(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) 
             ),
         }
     }
+    ran
 }
 
 /// Runs `composer audit --locked` against every composer.lock directory.
-fn enrich_php(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) {
+/// Returns true once at least one real composer command was dispatched.
+fn enrich_php(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
     if !report.composer_present {
-        return;
+        return false;
     }
+    let mut ran = false;
     for rel in targets.composer_locks.iter().take(MAX_COMPOSER_LOCKS) {
         let dir = dir_of(rel);
         let cwd = match npm_cwd(repo, &dir) {
@@ -761,7 +879,8 @@ fn enrich_php(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport)
                 continue;
             }
         };
-        let out = capture_command(
+        let out = capture_scanner_command(
+            env,
             composer_program(),
             &["audit", "--format=json", "--locked", "--no-interaction"],
             Some(&cwd),
@@ -771,6 +890,7 @@ fn enrich_php(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport)
                 ("COMPOSER_DISABLE_NETWORK", "0"),
             ],
         );
+        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -791,6 +911,7 @@ fn enrich_php(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport)
             ),
         }
     }
+    ran
 }
 
 /// Resolves the directory that owns an audit artifact (repo root when the path
@@ -805,11 +926,18 @@ fn audit_cwd(repo: &Path, rel: &str) -> Result<PathBuf, String> {
 /// The advisory database is never refreshed here: `bundler-audit update`
 /// clones into the user's home directory, which is a state change outside the
 /// repository this app has no business making implicitly. A missing DB fails
-/// loudly as an issue instead.
-fn enrich_ruby(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport) {
+/// loudly as an issue instead. Returns true once at least one real
+/// bundler-audit command was dispatched.
+fn enrich_ruby(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
     if !report.bundler_audit_present {
-        return;
+        return false;
     }
+    let mut ran = false;
     for rel in targets.gemfile_locks.iter().take(MAX_COMPOSER_LOCKS) {
         let dir = dir_of(rel);
         let cwd = match npm_cwd(repo, &dir) {
@@ -825,13 +953,15 @@ fn enrich_ruby(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport
                 continue;
             }
         };
-        let out = capture_command(
+        let out = capture_scanner_command(
+            env,
             bundler_audit_program(),
             &["check", "--format", "json"],
             Some(&cwd),
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1")],
         );
+        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -852,6 +982,7 @@ fn enrich_ruby(repo: &Path, targets: &ScanTargets, report: &mut DepsHealthReport
             ),
         }
     }
+    ran
 }
 
 /// Parses `bundler-audit check --format json` output.
@@ -1052,8 +1183,15 @@ fn npm_cwd(repo: &Path, rel_dir: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-fn run_npm_json(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = capture_command(npm_program(), args, Some(cwd), AUDIT_TIMEOUT, NPM_SAFE_ENV)?;
+fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, String> {
+    let out = capture_scanner_command(
+        env,
+        npm_program(),
+        args,
+        Some(cwd),
+        AUDIT_TIMEOUT,
+        NPM_SAFE_ENV,
+    )?;
     let stdout = out.stdout_text();
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -1072,22 +1210,155 @@ fn run_npm_json(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn tool_version(program: &str, args: &[&str]) -> Option<String> {
-    let out = capture_command(program, args, None, VERSION_TIMEOUT, &[]).ok()?;
-    if !out.success {
-        return None;
-    }
-    let text = out.stdout_text();
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(line.to_string())
+/// What a CLI version probe concluded.
+///
+/// Three outcomes, deliberately distinct. Collapsing "ran but failed" into
+/// "not found" is what made a GUI-launched scan report
+/// "`npm is not installed`" while `/opt/homebrew/bin/npm` existed — its
+/// shebang interpreter was missing, which is a completely different problem
+/// with a different fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolProbe {
+    /// Probe exited 0 and printed a non-empty first stdout line.
+    Present(String),
+    /// Nothing spawnpable resolved anywhere on PATH or in the fallback dirs;
+    /// carries the raw spawn error text.
+    NotFound(String),
+    /// The binary was found and launched but could not report a version:
+    /// non-zero exit (with stderr tail), timeout (naming the limit), or empty
+    /// output. Carries the diagnosis.
+    FoundButFailed(String),
+}
+
+impl ToolProbe {
+    fn version(&self) -> Option<&str> {
+        match self {
+            ToolProbe::Present(version) => Some(version),
+            _ => None,
+        }
     }
 }
 
-fn cargo_audit_available() -> bool {
-    capture_command(
+/// Probes `program args` under `env`'s PATH/home view and classifies the run.
+///
+/// Every spawn goes through [`capture_scanner_command`], so probes resolve
+/// exactly like production spawns: PATH first, then the GUI-launch fallback
+/// dirs. The error-string classification mirrors `run_bounded`'s wording:
+/// spawn failures start with `"Failed to spawn "`; timeouts read
+/// `"{program} timed out after {n}s"` (the limit is already in the message).
+fn probe_tool_version(program: &str, args: &[&str], env: &ScanEnv, timeout: Duration) -> ToolProbe {
+    let out = capture_scanner_command(env, program, args, None, timeout, &[]);
+    match out {
+        Ok(out) => {
+            let stdout = out.stdout_text();
+            let line = stdout.lines().next().unwrap_or("").trim();
+            if out.success && !line.is_empty() {
+                ToolProbe::Present(line.to_string())
+            } else {
+                ToolProbe::FoundButFailed(found_but_failed_detail(program, &out))
+            }
+        }
+        Err(e) => {
+            if e.starts_with("Failed to spawn ") {
+                ToolProbe::NotFound(e)
+            } else {
+                // Timeout ("… timed out after …s"), truncation cap, wait
+                // failure: the program was there, the run went wrong.
+                ToolProbe::FoundButFailed(e)
+            }
+        }
+    }
+}
+
+/// Diagnosis for a finished run that yielded no usable version line.
+///
+/// Success is checked before stdout so a non-zero exit can never be promoted
+/// to "present" by incidental output; a mute stderr falls back to naming the
+/// exit status rather than leaving an unexplained failure.
+fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> String {
+    if out.success {
+        return format!("{program} produced no version output");
+    }
+    let err = out.stderr_text();
+    if err.is_empty() {
+        format!("{program} exited {} without a diagnosis", out.status_code)
+    } else {
+        err
+    }
+}
+
+/// First version line a probe reported, if any. Thin wrapper kept so the
+/// presence flags below stay one-liners; diagnostics use [`ToolProbe`].
+fn tool_version(program: &str, args: &[&str], env: &ScanEnv) -> Option<String> {
+    probe_tool_version(program, args, env, VERSION_TIMEOUT)
+        .version()
+        .map(str::to_string)
+}
+
+/// Message for the `npm_missing` issue — honest about WHICH failure occurred.
+///
+/// The frontend keys off severity `warning` + code `npm_missing`; only the
+/// wording differs between the two failure shapes:
+/// - truly unresolved → the long-standing "not installed or not on PATH"
+///   wording, unchanged;
+/// - resolved but broken (missing node interpreter, exit 127, timeout) → says
+///   npm WAS found, includes the resolved path when available, quotes the
+///   underlying error, and — because npm cannot run without its Node
+///   interpreter — mentions when `node` independently did not resolve while
+///   npm itself did.
+fn npm_missing_message(npm_probe: &ToolProbe, node_probe: &ToolProbe, env: &ScanEnv) -> String {
+    let base = match npm_probe {
+        ToolProbe::Present(_) | ToolProbe::NotFound(_) => {
+            "npm is not installed or not on PATH; vulnerability and outdated checks did not run. Local lockfile and engine checks still apply.".to_string()
+        }
+        ToolProbe::FoundButFailed(detail) => {
+            // Resolution re-runs the same PATH/fallback lookup the successful
+            // spawn would have used; a bare-name passthrough means no absolute
+            // location is known, and the message simply omits it.
+            let resolved =
+                resolve_spawn_program_with(npm_program(), env.path(), env.home());
+            let location = if resolved.contains('/') || resolved.contains('\\') {
+                format!(" at {resolved}")
+            } else {
+                String::new()
+            };
+            format!(
+                "npm was found{location} but could not be run: {detail}. Vulnerability and outdated checks did not run; local lockfile and engine checks still apply."
+            )
+        }
+    };
+    let node_note = match node_probe {
+        ToolProbe::NotFound(_) => " The Node.js interpreter (`node`) was not found either — npm is a script that needs `node` to run, so install Node.js."
+            .to_string(),
+        _ => String::new(),
+    };
+    format!("{base}{node_note}")
+}
+
+/// Single choke point for every dependency-scanner spawn so the injectable
+/// PATH/home seams apply uniformly — probes and audits resolve identically.
+fn capture_scanner_command(
+    env: &ScanEnv,
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+) -> Result<CapturedOutput, String> {
+    capture_command_with_env(
+        program,
+        args,
+        cwd,
+        timeout,
+        extra_env,
+        env.path(),
+        env.home(),
+    )
+}
+
+fn cargo_audit_available(env: &ScanEnv) -> bool {
+    capture_scanner_command(
+        env,
         "cargo",
         &["audit", "--version"],
         None,
@@ -2438,7 +2709,11 @@ mod tests {
 
         let report = DepsScanner::scan_with(
             repo.path().to_str().unwrap(),
-            ScanOptions { run_cli: false },
+            ScanOptions {
+                run_cli: false,
+                path_var: None,
+                home: None,
+            },
         )
         .expect("scan");
         assert!(
@@ -2492,7 +2767,11 @@ mod tests {
         git_add(repo.path(), "pnpm-lock.yaml");
         let report = DepsScanner::scan_with(
             repo.path().to_str().unwrap(),
-            ScanOptions { run_cli: false },
+            ScanOptions {
+                run_cli: false,
+                path_var: None,
+                home: None,
+            },
         )
         .unwrap();
         let root = &report.manifests[0];
@@ -2519,7 +2798,11 @@ mod tests {
         git_add(repo.path(), "frontend/package-lock.json");
         let report = DepsScanner::scan_with(
             repo.path().to_str().unwrap(),
-            ScanOptions { run_cli: false },
+            ScanOptions {
+                run_cli: false,
+                path_var: None,
+                home: None,
+            },
         )
         .unwrap();
         assert_eq!(report.manifests.len(), 1);
@@ -2541,7 +2824,11 @@ mod tests {
         git_add(repo.path(), "README.md");
         let report = DepsScanner::scan_with(
             repo.path().to_str().unwrap(),
-            ScanOptions { run_cli: false },
+            ScanOptions {
+                run_cli: false,
+                path_var: None,
+                home: None,
+            },
         )
         .unwrap();
         assert!(report.manifests.is_empty());
@@ -3237,7 +3524,8 @@ not-json-at-all
         write(repo.path(), "go.mod", "module tmp\n\ngo 1.21\n");
         git_add(repo.path(), "requirements.txt");
         git_add(repo.path(), "go.mod");
-        let (report, targets) = local_scan(repo.path()).unwrap();
+        let (report, targets) =
+            local_scan(repo.path(), &ScanEnv::from_options(&ScanOptions::default())).unwrap();
         // Probes are gated on artifacts; when a CLI cannot be run at all,
         // presence must be false — never silently true. The gate goes through
         // production resolution (capture_command), which also searches the
@@ -3315,5 +3603,372 @@ not-json-at-all
             },
         ];
         assert_eq!(npm_scan_roots(&manifests), vec![String::new()]);
+    }
+
+    // -- probe diagnosis & GUI-minimal PATH regressions ------------------------
+
+    /// Writes an executable stub script (chmod 755, unix shebang) for the
+    /// resolution tests below.
+    #[cfg(unix)]
+    fn write_exec(dir: &Path, name: &str, content: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Regression (GUI launch, end-to-end through `scan_with(run_cli: true)`):
+    /// with a Finder/Dock-style minimal PATH, npm must still be found and run.
+    /// The stub directory holds `npm` — a script whose `#!/usr/bin/env node`
+    /// interpreter is a tiny `node` shim placed in the SAME dir — so both the
+    /// top-level resolution and the shebang interpreter lookup go through the
+    /// injected PATH, exactly how the real `/opt/homebrew/bin/npm` +
+    /// `/opt/homebrew/bin/node` pair behaves under a GUI-minimal PATH.
+    ///
+    /// Exact version strings are asserted so a real system npm/node cannot
+    /// serve the probes unnoticed: either the stubs answered or the test fails.
+    #[cfg(unix)]
+    #[test]
+    fn scan_resolves_npm_under_gui_minimal_path_end_to_end() {
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "node",
+            "#!/bin/sh\n# GitPulse test stub: minimal node stand-in.\ncase \"$1\" in\n  -v) echo \"v20.11.0\"; exit 0 ;;\nesac\ncase \"$2\" in\n  --version) echo \"10.9.0\"; exit 0 ;;\nesac\n# audit --json / outdated --json land here.\necho \"{}\"\n",
+        );
+        write_exec(
+            stubs.path(),
+            "npm",
+            "#!/usr/bin/env node\n// GitPulse test stub: valid JS so either node answers identically.\nconst arg = process.argv[2] || \"\";\nif (arg === \"--version\") { console.log(\"10.9.0\"); } else { console.log(\"{}\"); }\n",
+        );
+
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        write(
+            repo.path(),
+            "package-lock.json",
+            r#"{"name":"demo","lockfileVersion":3}"#,
+        );
+        git_add(repo.path(), "package.json");
+        git_add(repo.path(), "package-lock.json");
+
+        // GUI-minimal PATH plus the stub dir PREPENDED, so the stubs win over
+        // any real install sitting in the resolver's fallback dirs.
+        let path_var = std::env::join_paths([
+            stubs.path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+            Path::new("/usr/sbin"),
+            Path::new("/sbin"),
+        ])
+        .unwrap();
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert!(report.npm_cli_present, "issues: {:?}", report.issues);
+        assert_eq!(report.npm_version.as_deref(), Some("10.9.0"));
+        assert_eq!(report.node_version.as_deref(), Some("v20.11.0"));
+        assert_eq!(report.scanners_ran, vec!["npm".to_string()]);
+        assert!(
+            !report.issues.iter().any(|i| i.code == "npm_missing"),
+            "issues: {:?}",
+            report.issues
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.code == "audit_failed" || i.code == "outdated_failed"),
+            "the stubs must answer cleanly: {:?}",
+            report.issues
+        );
+    }
+
+    /// An npm that RESOLVES but cannot run (interpreter gone — the exact shape
+    /// of `/opt/homebrew/bin/npm` whose `env node` fails with exit 127) must be
+    /// reported as found-but-broken, naming the resolved path and quoting the
+    /// underlying error, never mislabeled as "not installed".
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_says_npm_was_found_when_it_exists_but_fails_to_run() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        git_add(repo.path(), "package.json");
+
+        let stubs = TempDir::new().unwrap();
+        let npm_stub = write_exec(
+            stubs.path(),
+            "npm",
+            "#!/bin/sh\necho 'env: node: No such file or directory' >&2\nexit 127\n",
+        );
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: false,
+                path_var: Some(stubs.path().as_os_str().to_os_string()),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert!(!report.npm_cli_present);
+        assert!(report.scanners_ran.is_empty(), "CLI enrichment was skipped");
+        let issue = report
+            .issues
+            .iter()
+            .find(|i| i.code == "npm_missing")
+            .expect("npm_missing must still be raised");
+        assert_eq!(issue.severity, "warning");
+        let msg = &issue.message;
+        assert!(msg.contains("was found"), "{msg}");
+        assert!(
+            msg.contains(npm_stub.to_string_lossy().as_ref()),
+            "resolved path missing: {msg}"
+        );
+        assert!(
+            msg.contains("env: node: No such file or directory"),
+            "underlying error not quoted: {msg}"
+        );
+        assert!(
+            !msg.contains("not installed"),
+            "must not call an existing npm missing: {msg}"
+        );
+    }
+
+    /// Wording contract of [`npm_missing_message`]: found-but-broken says so
+    /// (and mentions the independently-missing node interpreter), while truly
+    /// unresolved keeps the long-standing "not installed" text.
+    #[test]
+    fn npm_missing_message_matches_resolution_truth() {
+        let env = ScanEnv {
+            path_var: None,
+            home: None,
+        };
+        let broken = ToolProbe::FoundButFailed("env: node: No such file or directory".to_string());
+        let node_gone = ToolProbe::NotFound(
+            "Failed to spawn node: No such file or directory (os error 2)".to_string(),
+        );
+        let msg = npm_missing_message(&broken, &node_gone, &env);
+        assert!(msg.contains("was found"), "{msg}");
+        assert!(
+            msg.contains("env: node: No such file or directory"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Node.js interpreter") && msg.contains("was not found"),
+            "node-missing-while-npm-present must be mentioned: {msg}"
+        );
+        assert!(!msg.contains("not installed"), "{msg}");
+
+        let unresolved = ToolProbe::NotFound(
+            "Failed to spawn npm: No such file or directory (os error 2)".to_string(),
+        );
+        let msg = npm_missing_message(&unresolved, &node_gone, &env);
+        assert!(
+            msg.contains("not installed or not on PATH"),
+            "classic wording preserved: {msg}"
+        );
+        assert!(!msg.contains("was found"), "{msg}");
+    }
+
+    /// A timeout is found-but-failed and names the limit, never not-found.
+    /// Empty output likewise classifies as failed-with-diagnosis.
+    #[cfg(unix)]
+    #[test]
+    fn probe_classifies_timeout_and_empty_output_as_found_but_failed() {
+        let dir = TempDir::new().unwrap();
+        write_exec(dir.path(), "gitpulse-silent-probe", "#!/bin/sh\nexit 0\n");
+        let silent_env = ScanEnv {
+            path_var: Some(dir.path().as_os_str().to_os_string()),
+            home: None,
+        };
+        match probe_tool_version(
+            "gitpulse-silent-probe",
+            &["--version"],
+            &silent_env,
+            VERSION_TIMEOUT,
+        ) {
+            ToolProbe::FoundButFailed(detail) => {
+                assert!(detail.contains("no version output"), "{detail}")
+            }
+            other => panic!("expected found-but-failed, got {other:?}"),
+        }
+
+        // Absolute /bin/sleep: the seam PATH deliberately excludes /bin, so a
+        // bare `sleep` would die with "command not found" instead of timing out.
+        write_exec(
+            dir.path(),
+            "gitpulse-slow-probe",
+            "#!/bin/sh\n/bin/sleep 30\n",
+        );
+        let slow_env = ScanEnv {
+            path_var: Some(dir.path().as_os_str().to_os_string()),
+            home: None,
+        };
+        match probe_tool_version(
+            "gitpulse-slow-probe",
+            &["--version"],
+            &slow_env,
+            Duration::from_secs(1),
+        ) {
+            ToolProbe::FoundButFailed(detail) => {
+                assert!(detail.contains("timed out after 1s"), "{detail}");
+                assert!(detail.contains("gitpulse-slow-probe"), "{detail}");
+            }
+            other => panic!("expected timeout classification, got {other:?}"),
+        }
+    }
+
+    /// A binary resolving nowhere carries the raw spawn error text — the input
+    /// for the honest "not installed" wording upstream.
+    #[test]
+    fn probe_reports_not_found_with_spawn_error_text() {
+        let env = ScanEnv {
+            path_var: Some(std::ffi::OsString::new()),
+            home: None,
+        };
+        match probe_tool_version(
+            "gitpulse-nowhere-probe-xyz",
+            &["--version"],
+            &env,
+            Duration::from_secs(2),
+        ) {
+            ToolProbe::NotFound(err) => {
+                assert!(err.starts_with("Failed to spawn "), "{err}");
+                assert!(err.contains("gitpulse-nowhere-probe-xyz"), "{err}");
+            }
+            other => panic!("expected not-found, got {other:?}"),
+        }
+    }
+
+    /// Detail text shapes: non-zero exits quote stderr, fall back to the exit
+    /// status when stderr is mute, and treat successful-but-empty runs as
+    /// their own failure rather than a version.
+    #[test]
+    fn probe_detail_covers_exit_status_stderr_and_mute_success() {
+        let detail = found_but_failed_detail(
+            "npm",
+            &captured(127, false, "", "env: node: No such file or directory"),
+        );
+        assert_eq!(detail, "env: node: No such file or directory");
+
+        let detail = found_but_failed_detail("npm", &captured(137, false, "", ""));
+        assert!(detail.contains("137"), "{detail}");
+        assert!(detail.starts_with("npm exited"), "{detail}");
+
+        let detail = found_but_failed_detail("npm", &captured(0, true, "", ""));
+        assert!(detail.contains("no version output"), "{detail}");
+    }
+
+    /// `scanners_ran` is `serde(default)`-compatible: reports serialized by
+    /// older builds (without the field) deserialize cleanly, and new payloads
+    /// carry the field through a round-trip.
+    #[test]
+    fn deps_report_deserializes_without_scanners_ran_field() {
+        let json = r#"{
+            "node_version": null,
+            "npm_version": null,
+            "npm_cli_present": false,
+            "cargo_audit_present": false,
+            "pip_audit_present": false,
+            "govulncheck_present": false,
+            "composer_present": false,
+            "bundler_audit_present": false,
+            "manifests": [],
+            "ecosystems": [],
+            "issues": [],
+            "vulnerabilities": [],
+            "audit": {"info": 0, "low": 0, "moderate": 0, "high": 0, "critical": 0, "unknown": 0, "total": 0},
+            "outdated": [],
+            "truncated": false
+        }"#;
+        let report: DepsHealthReport = serde_json::from_str(json).expect("older payload loads");
+        assert!(report.scanners_ran.is_empty());
+
+        let mut fresh = report.clone();
+        fresh.scanners_ran.push("npm".to_string());
+        let text = serde_json::to_string(&fresh).unwrap();
+        assert!(text.contains(r#""scanners_ran":["npm"]"#));
+    }
+
+    /// Stress: concurrent scans sharing one repo must not interfere, because
+    /// the seam environment ([`ScanEnv`]) is per-scan and nothing in the
+    /// scanner touches process-global state. If someone later introduces a
+    /// shared cache or env mutation, the distinct stub versions below make the
+    /// cross-talk visible instead of silently corrupting a report.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_scans_with_distinct_envs_stay_isolated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        git_add(repo.path(), "package.json");
+
+        let rounds = 4;
+        let ok = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for round in 0..rounds {
+            let repo_path = repo.path().to_path_buf();
+            let ok = Arc::clone(&ok);
+            handles.push(std::thread::spawn(move || {
+                let stubs = TempDir::new().unwrap();
+                write_exec(
+                    stubs.path(),
+                    "node",
+                    "#!/bin/sh\ncase \"$1\" in -v) exit 0 ;; esac\nexit 0\n",
+                );
+                // Each thread's npm prints its own round number; a scan that
+                // sees another thread's stub has leaked state across scans.
+                let version = format!("9.9.{round}");
+                write_exec(
+                    stubs.path(),
+                    "npm",
+                    &format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; else echo '{{}}'; fi\n"),
+                );
+                let path_var =
+                    std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")])
+                        .unwrap();
+                let report = DepsScanner::scan_with(
+                    repo_path.to_str().unwrap(),
+                    ScanOptions {
+                        run_cli: true,
+                        path_var: Some(path_var),
+                        home: None,
+                    },
+                )
+                .expect("concurrent scan");
+                assert_eq!(report.npm_version.as_deref(), Some(version.as_str()));
+                assert_eq!(report.scanners_ran, vec!["npm".to_string()]);
+                ok.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("scan thread panicked");
+        }
+        assert_eq!(ok.load(Ordering::SeqCst), rounds);
     }
 }

@@ -111,6 +111,91 @@ describe("check:ipc contract", () => {
     expect(bad.stdout).toMatch(/could not be resolved locally/);
   });
 
+  it("recognizes invoke calls whose generic argument nests one level deep", async () => {
+    // Regression: `invoke<Guarded<string>>("cmd_…")` used to be invisible to
+    // the scanner (the old regex could not span the nested `>`), so real call
+    // sites silently vanished and their handlers read as orphaned.
+    const nested = await makeTempDir("generic-nested");
+    await writeFile(
+      path.join(nested, "nested.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\n'
+        + 'interface Guarded<T> { output: T }\n'
+        + 'const r = invoke<Guarded<string>>("cmd_github_cancel_run", { runId: 1 });\n'
+        + 'const s = await invoke<Guarded<Guarded<string>>>("cmd_github_rerun_run", { runId: 2 });\n'
+        + 'const t = await invoke<Guarded<Guarded<string[]>>>("cmd_github_checkout_pr", { number: 3 });\n'
+        + 'console.log(r, s, t);\n',
+    );
+    const ok = await runScript(["--extra-dir", nested]);
+    expect(ok.code).toBe(0);
+    expect(ok.stdout).not.toMatch(/orphaned handlers\s*:\s*[1-9]/);
+    expect(ok.stdout).not.toMatch(/manual-review sites\s*:\s*[1-9]/);
+
+    // One level of nesting is fully scanned: an unregistered command behind
+    // a nested-generic invoke still fails loudly as a missing command.
+    const tooDeep = await makeTempDir("generic-too-deep");
+    await writeFile(
+      path.join(tooDeep, "deep.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\n'
+        + 'type D<A> = A;\n'
+        + 'await invoke<D<string>>("cmd_definitely_not_registered_xyz");\n',
+    );
+    const deep = await runScript(["--extra-dir", tooDeep]);
+    expect(deep.code).toBe(1);
+    expect(deep.stdout).toMatch(/missing commands\s*:\s*1/);
+    expect(deep.stdout).toMatch(/cmd_definitely_not_registered_xyz/);
+
+    // Arbitrarily deep nesting must stay visible too: depth-counted bracket
+    // matching, not a fixed nesting budget. An unregistered name behind three
+    // levels still fails loudly.
+    const triple = await makeTempDir("generic-triple");
+    await writeFile(
+      path.join(triple, "triple.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\n'
+        + 'interface Guarded<T> { output: T }\n'
+        + 'const t = invoke<Guarded<Guarded<string[]>>>("cmd_definitely_not_registered_triple");\n'
+        + 'console.log(t);\n',
+    );
+    const tripleRun = await runScript(["--extra-dir", triple]);
+    expect(tripleRun.code).toBe(1);
+    expect(tripleRun.stdout).toMatch(/missing commands\s*:\s*1/);
+    expect(tripleRun.stdout).toMatch(/cmd_definitely_not_registered_triple/);
+
+    // Generics may span lines (object-typed payloads read better that way):
+    // an unregistered command behind a multi-line generic still fails loudly.
+    const multiline = await makeTempDir("generic-multiline");
+    await writeFile(
+      path.join(multiline, "multiline.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\n'
+        + 'const res = await invoke<{\n'
+        + '  stdout_tail: string;\n'
+        + '  exit_code: number | null;\n'
+        + '}>("cmd_definitely_not_registered_multiline", {});\n'
+        + 'console.log(res);\n',
+    );
+    const multilineRun = await runScript(["--extra-dir", multiline]);
+    expect(multilineRun.code).toBe(1);
+    expect(multilineRun.stdout).toMatch(/missing commands\s*:\s*1/);
+    expect(multilineRun.stdout).toMatch(/cmd_definitely_not_registered_multiline/);
+
+    // String contents are opaque: a `<` inside a literal must not open a
+    // span that blanks later call sites.
+    const quoted = await makeTempDir("generic-quoted");
+    await writeFile(
+      path.join(quoted, "quoted.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\n'
+        + 'const hint = "use x<y then z>w";\n'
+        + 'await invoke("cmd_resolve_git_root", {});\n'
+        + 'await invoke("cmd_definitely_not_registered_quoted", {});\n'
+        + 'console.log(hint);\n',
+    );
+    const quotedRun = await runScript(["--extra-dir", quoted]);
+    expect(quotedRun.code).toBe(1);
+    // Only the genuinely unregistered command fails; the registered one
+    // beside it proves the string's stray brackets hid nothing.
+    expect(quotedRun.stdout).toMatch(/missing commands\s*:\s*1/);
+    expect(quotedRun.stdout).toMatch(/cmd_definitely_not_registered_quoted/);
+  });
+
   it("scans this repo's real src and src-tauri paths by default", () => {
     expect(DEFAULT_LIB_RS).toMatch(/[\\/]src-tauri[\\/]src[\\/]lib\.rs$/);
     expect(DEFAULT_SRC_DIR).toMatch(/[\\/]src$/);

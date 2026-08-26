@@ -1,9 +1,56 @@
+<script module lang="ts">
+  interface TermDims {
+    cols: number;
+    rows: number;
+  }
+
+  /**
+   * Every real fit relayouts the grid and fires the PTY resize IPC, while
+   * ResizeObserver also callbacks on pure style repaints and zero-size
+   * (hidden / mid-layout) states. Refit only when the proposed grid differs
+   * from the live one; an unusable proposal skips rather than guesses.
+   */
+  export function shouldRefit(
+    current: TermDims | null,
+    proposed?: TermDims | null,
+  ): boolean {
+    if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
+      return false;
+    }
+    if (!current || !Number.isFinite(current.cols) || !Number.isFinite(current.rows)) {
+      return true;
+    }
+    return (
+      Math.round(proposed.cols) !== Math.round(current.cols) ||
+      Math.round(proposed.rows) !== Math.round(current.rows)
+    );
+  }
+
+  export type AttachAction = "open" | "adopt" | "skip";
+
+  /**
+   * xterm's open() is once-only: on an already-opened terminal it
+   * early-returns without moving the DOM node, so a swapped container would
+   * leave the buffer hanging off a detached parent (empty box, dead keys).
+   * All of xterm's listeners live inside its own element subtree, so
+   * physically re-parenting that element is safe; only the first attach may
+   * use open().
+   */
+  export function planAttach(
+    openedParent: Element | null | undefined,
+    container: Element,
+  ): AttachAction {
+    if (!openedParent) return "open";
+    return openedParent === container ? "skip" : "adopt";
+  }
+</script>
+
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { listen } from "@tauri-apps/api/event";
   // The class is named Terminal; aliased because lucide exports an icon of
   // the same name below.
   import { Terminal as XTerm } from "@xterm/xterm";
@@ -24,8 +71,10 @@
     ListChecks,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
+  import { themeStore } from "../stores/themeStore";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
+  import { createListenerTracker } from "../dom/listenerTracker";
   import type { PolicyVerdict } from "../stores/harnessStore";
 
   /** Wire shape of `crate::terminal::TerminalRunResult`. */
@@ -81,7 +130,12 @@
   let term: XTerm | null = null;
   let fitAddon: FitAddon | null = null;
   let resizeObserver: ResizeObserver | null = null;
-  let unlisteners: UnlistenFn[] = [];
+  // Tracker, not a bare array: listen() promises can resolve after cleanup
+  // ran (fast tab switch remount), and a late unlisten must fire immediately
+  // instead of landing in a drained array and leaking for the webview life.
+  const unlisteners = createListenerTracker();
+  /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
+  let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Output that arrives between spawn request and id assignment. */
   let earlyOutput: { id: string; bytes: Uint8Array }[] = [];
 
@@ -98,8 +152,11 @@
     };
   }
 
+  /** Creates the single XTerm instance for this panel's lifetime. It does
+   * NOT bind a container: attachment is the attach effect's job, so the
+   * buffer survives Shell↔Console toggles that swap ptyContainer nodes. */
   function ensureTerm(): XTerm | null {
-    if (term || !ptyContainer) return term;
+    if (term) return term;
     const created = new XTerm({
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
@@ -111,12 +168,6 @@
     });
     fitAddon = new FitAddon();
     created.loadAddon(fitAddon);
-    created.open(ptyContainer);
-    try {
-      fitAddon.fit();
-    } catch {
-      /* zero-size container before layout settles; the observer refits */
-    }
     created.onData((data) => {
       if (ptySessionId && !ptyExited) {
         void invoke("cmd_terminal_write", { sessionId: ptySessionId, data }).catch(() => {});
@@ -127,17 +178,19 @@
         void invoke("cmd_terminal_resize", { sessionId: ptySessionId, rows, cols }).catch(() => {});
       }
     });
-    resizeObserver = new ResizeObserver(() => {
-      if (!fitAddon || !ptyContainer) return;
-      try {
-        fitAddon.fit();
-      } catch {
-        /* container collapsed; refit when it has size again */
-      }
-    });
-    resizeObserver.observe(ptyContainer);
     term = created;
     return term;
+  }
+
+  function refitIfResized() {
+    if (!fitAddon || !term) return;
+    try {
+      const proposed = fitAddon.proposeDimensions();
+      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed)) return;
+      fitAddon.fit();
+    } catch {
+      /* container collapsed; refit when it has size again */
+    }
   }
 
   function writePty(bytes: Uint8Array) {
@@ -167,6 +220,7 @@
 
   async function spawnPty(repoPath: string) {
     if (!ensureTerm() || !term) return;
+    const epoch = ++spawnEpoch;
     ptySpawning = true;
     ptyError = null;
     ptyExited = false;
@@ -183,6 +237,13 @@
           cols: Math.max(dims?.cols ?? 80, 2),
         },
       );
+      if (epoch !== spawnEpoch) {
+        // Superseded while pending (repo/mode change, retry, or unmount):
+        // the backend session exists but its owner is gone — kill it here
+        // instead of leaking an orphaned shell.
+        void killPty(spawned.id);
+        return;
+      }
       ptySessionId = spawned.id;
       liveCleanupTarget = spawned.id;
       ptyShell = spawned.shell;
@@ -196,10 +257,14 @@
         ok: true,
       });
     } catch (err) {
-      ptyError = formatError(err);
+      // A stale spawn's failure belongs to no live owner; the current one
+      // owns the error surface.
+      if (epoch === spawnEpoch) ptyError = formatError(err);
     } finally {
-      ptySpawning = false;
-      term?.focus();
+      if (epoch === spawnEpoch) {
+        ptySpawning = false;
+        term?.focus();
+      }
     }
   }
 
@@ -228,12 +293,17 @@
         },
       ),
     ]).then((unlistenFns) => {
-      unlisteners.push(...unlistenFns);
+      for (const fn of unlistenFns) unlisteners.track(fn);
     });
     return () => {
-      for (const fn of unlisteners.splice(0)) fn();
+      unlisteners.dispose();
+      if (copiedResetTimer !== null) {
+        clearTimeout(copiedResetTimer);
+        copiedResetTimer = null;
+      }
       resizeObserver?.disconnect();
       resizeObserver = null;
+      spawnEpoch += 1; // a spawn landing after unmount must kill itself
       void killPty(ptySessionId);
       ptySessionId = null;
       term?.dispose();
@@ -242,19 +312,76 @@
     };
   });
 
+  /**
+   * Keeps the one XTerm attached to whichever container node the Shell
+   * layout currently rendered. Declared above the lifecycle effect so that
+   * on first mount open() has run (and proposeDimensions() is meaningful)
+   * before spawnPty reads it. Session state is read untracked on purpose:
+   * a session id arriving must not re-run attachment.
+   */
+  $effect(() => {
+    const container = ptyContainer;
+    if (!container) return;
+    const t = ensureTerm();
+    if (!t) return;
+    const action = planAttach(t.element?.parentElement ?? null, container);
+    if (action === "open") {
+      t.open(container);
+    } else if (action === "adopt" && t.element) {
+      container.replaceChildren(t.element);
+    }
+    if (!resizeObserver) {
+      resizeObserver = new ResizeObserver(refitIfResized);
+    }
+    // Reconnect per container: the previous node may stay detached forever,
+    // and observing a dead node would silence every future refit.
+    resizeObserver.disconnect();
+    resizeObserver.observe(container);
+    refitIfResized();
+    // Focus is safe after re-parenting — xterm's textarea moves with its
+    // element — but only worth stealing when a shell is actually live.
+    if (action === "adopt" && untrack(() => ptySessionId !== null && !ptyExited)) {
+      t.focus();
+    }
+  });
+
+  /** Theme flips re-resolve the palette from CSS variables; construction
+   * already read them once, this keeps a live buffer in sync afterwards.
+   * The store may flip the html class inside a view-transition callback
+   * after this effect runs; the next emission re-syncs, matching how
+   * CommitTable treats its cached theme. */
+  $effect(() => {
+    $themeStore;
+    if (term) term.options.theme = termTheme();
+  });
+
   /** One live session per repository: switching repos (or leaving the shell
    * tab) kills the old session before a new one spawns. The session id is
    * deliberately kept out of $state here — an effect that read it would
    * re-run on its own spawn and tear down what it just created. */
   let liveCleanupTarget: string | null = null;
+  /** Bumped whenever a pending spawn's owner goes away, so the spawn kills
+   * its backend session instead of adopting it into a dead lifecycle. */
+  let spawnEpoch = 0;
+  /**
+   * Lifecycle inputs the PTY actually depends on ("shell:<path>" or null).
+   * repoStore publishes a fresh object on every status poll (~6s) and stats
+   * drain, and any $repoStore read re-runs this effect — killing and
+   * respawning the user's live shell per emission would be catastrophic, so
+   * teardown fires only when mode or repo path genuinely change.
+   */
+  let ptyLifecycleKey: string | null = null;
   $effect(() => {
     const path = $repoStore.currentPath;
-    if (mode !== "shell" || !path) return;
-    void spawnPty(path);
-    return () => {
-      void killPty(liveCleanupTarget);
-      liveCleanupTarget = null;
-    };
+    const key = mode === "shell" && path ? `shell:${path}` : null;
+    if (key === ptyLifecycleKey) return;
+    ptyLifecycleKey = key;
+    // Genuine lifecycle change: orphan any pending spawn, then drop the
+    // session (if any) owned by the previous inputs before spawning anew.
+    spawnEpoch += 1;
+    void killPty(liveCleanupTarget);
+    liveCleanupTarget = null;
+    if (key && path) void spawnPty(path);
   });
 
   const QUICK_COMMANDS = [
@@ -388,7 +515,9 @@
     }
     if (await copyText(text.trim())) {
       copiedId = entry.id;
-      setTimeout(() => {
+      if (copiedResetTimer !== null) clearTimeout(copiedResetTimer);
+      copiedResetTimer = setTimeout(() => {
+        copiedResetTimer = null;
         if (copiedId === entry.id) copiedId = null;
       }, 1500);
     }
@@ -398,10 +527,6 @@
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(2)}s`;
   }
-
-  onMount(() => {
-    inputEl?.focus();
-  });
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
@@ -468,27 +593,28 @@
         class="h-full w-full rounded-xl border border-border/70 bg-surface overflow-hidden p-1.5"
       ></div>
     </div>
-    {#if ptyError || ptyExited || ptySpawning}
-      <div class="px-4 py-2 border-t border-border/60 bg-surface/60 flex items-center gap-2 shrink-0 text-[11px]">
+    {#if ptyError || ptyExited || ptySpawning || ptyShell}
+      <!-- One fixed-height status row: spawn/error/exited/info content swaps
+           inside it, so the terminal's box never resizes (and the
+           ResizeObserver never refits) merely because the text rotated. -->
+      <div class="shrink-0 border-t border-border/60 bg-surface/60 flex items-center gap-2 px-4 h-8">
         {#if ptySpawning}
-          <LoaderCircle size={13} class="animate-spin text-accent" />
-          <span class="text-textMuted">Starting shell…</span>
+          <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
+          <span class="text-textMuted text-[11px]">Starting shell…</span>
         {:else if ptyError}
-          <AlertCircle size={13} class="text-rose-400" />
-          <span class="text-rose-300 flex-1">{ptyError}</span>
+          <AlertCircle size={13} class="text-rose-400 shrink-0" />
+          <span class="text-rose-300 flex-1 truncate text-[11px]">{ptyError}</span>
           <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => void restartPty()}>
             <RotateCw size={12} /> Retry
           </button>
         {:else if ptyExited}
-          <span class="text-textMuted flex-1">The shell session ended.</span>
+          <span class="text-textMuted flex-1 text-[11px]">The shell session ended.</span>
           <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => void restartPty()}>
             <RotateCw size={12} /> Restart shell
           </button>
+        {:else}
+          <span class="text-[10px] text-textMuted font-mono truncate">{ptyShell} · cwd {$repoStore.currentPath ?? ""}</span>
         {/if}
-      </div>
-    {:else if ptyShell}
-      <div class="px-4 py-1.5 border-t border-border/60 bg-surface/60 text-[10px] text-textMuted font-mono truncate shrink-0">
-        {ptyShell} · cwd {$repoStore.currentPath ?? ""}
       </div>
     {/if}
   {:else}

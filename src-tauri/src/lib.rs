@@ -8,6 +8,7 @@ pub mod engine;
 pub mod github;
 pub mod graph;
 pub mod harness;
+pub mod logging;
 pub mod ops;
 pub mod stack;
 pub mod storage;
@@ -16,16 +17,23 @@ pub mod watcher;
 
 use commands::*;
 use desktop::{cmd_resolve_git_root, cmd_set_recent_menu, cmd_take_pending_open};
+use logging::cmd_diagnostic_log_tail;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logging::init();
+    #[cfg(not(test))]
+    logging::install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(crate::watcher::WatcherState::default())
         .manage(crate::terminal::TerminalSessions::default())
         .manage(desktop::DesktopState::default())
         .setup(|app| {
-            desktop::install_menu(app.handle())?;
+            if let Err(e) = desktop::install_menu(app.handle()) {
+                log::error!(target: "setup", "menu installation failed: {e}");
+                return Err(e.into());
+            }
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -67,6 +75,7 @@ pub fn run() {
             cmd_count_loc,
             cmd_parse_conventional_commit,
             cmd_get_file_blame,
+            cmd_list_repo_files,
             cmd_rebase_interactive,
             cmd_get_stack_hierarchy,
             cmd_get_bezier_connector,
@@ -116,6 +125,7 @@ pub fn run() {
             cmd_ai_explain_commit,
             cmd_ai_suggest_branch_name,
             cmd_ai_fix_health,
+            cmd_ai_coverage_report,
             cmd_terminal_spawn,
             cmd_terminal_write,
             cmd_terminal_resize,
@@ -124,6 +134,7 @@ pub fn run() {
             cmd_take_pending_open,
             cmd_set_recent_menu,
             cmd_resolve_git_root,
+            cmd_diagnostic_log_tail,
         ])
         .build(tauri::generate_context!())
         .expect("error while building GitPulse")

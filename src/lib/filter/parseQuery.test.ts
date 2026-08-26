@@ -41,6 +41,42 @@ describe("parseFilterQuery", () => {
     ).toBe(false);
   });
 
+  it("accepts all four conventional header shapes, matching the backend", () => {
+    // Parity contract with CommitFilter::matches_commit (filter.rs): plain,
+    // scoped, and both breaking variants. Missing the `!` shapes here made
+    // the client drop breaking-change commits the backend kept and solved
+    // around — every divergence shifts row indices under solved lanes.
+    const filter = parseFilterQuery("feat:");
+    const rowWith = (summary: string) => ({
+      id: "aaa111",
+      summary,
+      author_name: "Alice",
+      author_email: "alice@example.com",
+    });
+    expect(matchesCommit(rowWith("feat: add login"), filter)).toBe(true);
+    expect(matchesCommit(rowWith("feat(scope): add login"), filter)).toBe(true);
+    expect(matchesCommit(rowWith("feat!: breaking change"), filter)).toBe(true);
+    expect(matchesCommit(rowWith("feat(scope)!: breaking change"), filter)).toBe(true);
+    expect(matchesCommit(rowWith("fix: typo"), filter)).toBe(false);
+  });
+
+  it("free text searches summary, name, EMAIL, and id as a word conjunction", () => {
+    const filter = parseFilterQuery("oauth flow");
+    const rowWith = (over: Partial<{ id: string; summary: string; author_name: string; author_email: string }>) => ({
+      id: "aaa111",
+      summary: "no keywords here",
+      author_name: "Alice",
+      author_email: "alice@example.com",
+      ...over,
+    });
+    // Word-AND, not contiguous phrase: backend parity (filter.rs).
+    expect(matchesCommit(rowWith({ summary: "fix: flow for oauth" }), filter)).toBe(true);
+    // Email is part of the haystack on the backend; the client must agree.
+    expect(matchesCommit(rowWith({ author_email: "oauth@flow.dev" }), filter)).toBe(true);
+    // One missing word fails the conjunction.
+    expect(matchesCommit(rowWith({ summary: "oauth only" }), filter)).toBe(false);
+  });
+
   it.each([
     {
       name: "valid type via type: prefix builds the commitType predicate",
@@ -48,9 +84,9 @@ describe("parseFilterQuery", () => {
       expected: { commitType: "feat", text: "" },
     },
     {
-      name: "invalid type via type: prefix falls back to free text",
+      name: "non-conventional type: values stay predicates, matching the backend filter",
       query: "type:zzz",
-      expected: { text: "type:zzz" },
+      expected: { commitType: "zzz", text: "" },
     },
     {
       name: "valid bare suffix keeps conventional filtering",
@@ -99,17 +135,31 @@ describe("parseFilterQuery", () => {
     }
   );
 
-  it("an invalid type: token filters as plain text instead of an impossible predicate", () => {
-    expect(parseFilterQuery("type:zzz").commitType).toBeUndefined();
+  it("type: accepts any value, matching the backend filter exactly", () => {
+    // Parity contract (analyzer/filter.rs): CommitFilter::parse takes any
+    // non-empty type: value. The old client-only conventional-set gate made
+    // `type:wip` a free-text token here and a commit-type predicate on the
+    // server — divergent predicates shift which rows survive, corrupting
+    // solved lane geometry under client-side filtering.
+    expect(parseFilterQuery("type:zzz").commitType).toBe("zzz");
+    expect(parseFilterQuery("type:wip").commitType).toBe("wip");
+    // A BARE conventional token still routes through the conventional set.
     expect(parseFilterQuery("zzz:").commitType).toBeUndefined();
     const filter = parseFilterQuery("type:zzz");
-    const row = {
+    const matching = {
       id: "abc123",
+      summary: "zzz: something",
+      author_name: "A",
+      author_email: "a@example.com",
+    };
+    const other = {
+      id: "abc124",
       summary: "docs mention the literal type:zzz token here",
       author_name: "A",
       author_email: "a@example.com",
     };
-    expect(matchesCommit(row, filter)).toBe(true);
+    expect(matchesCommit(matching, filter)).toBe(true);
+    expect(matchesCommit(other, filter)).toBe(false);
   });
 });
 

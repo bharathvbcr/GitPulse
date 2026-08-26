@@ -51,26 +51,33 @@ export function formatHealthReport(
   out.push("# Dependency health report");
   if (repoPath) out.push(`Repository: ${repoPath}`);
 
-  const scanners = [
+  const localScanners = [
     report.npm_cli_present ? "npm audit" : null,
     report.cargo_audit_present ? "cargo-audit" : null,
     report.pip_audit_present ? "pip-audit" : null,
     report.govulncheck_present ? "govulncheck" : null,
     report.composer_present ? "composer-audit" : null,
+  ].filter(Boolean);
+  const scanners = [
+    ...localScanners,
     dependabot?.available ? "github-dependabot" : null,
   ].filter(Boolean);
   out.push(
     line([
       report.node_version ? `node ${report.node_version}` : undefined,
       report.npm_version ? `npm ${report.npm_version}` : undefined,
-      scanners.length ? `scanners: ${scanners.join(", ")}` : "no audit scanner on PATH",
+      scanners.length ? `scanners: ${scanners.join(", ")}` : "no audit scanner available",
       dependabot && !dependabot.available && dependabot.error
         ? `dependabot unavailable (${dependabot.error})`
         : undefined,
     ]),
   );
-  out.push(`Audit summary: ${formatAuditCounts(report.audit)}; ${report.outdated.length} outdated.`);
   const skipped = skippedAudits(report);
+  const auditsRan = (report.scanners_ran ?? []).length > 0;
+  const auditSummary = auditsRan
+    ? formatAuditCounts(report.audit, { ran: true })
+    : `audit did not run${skipped.length > 0 ? ` (CLI missing: ${skipped.join(", ")})` : ""}`;
+  out.push(`Audit summary: ${auditSummary}; ${report.outdated.length} outdated.`);
   if (skipped.length > 0) {
     out.push(
       `NOTE: checks that did NOT run (CLI missing): ${skipped.join(", ")}. The counts above are not complete coverage.`,

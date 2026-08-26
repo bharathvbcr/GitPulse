@@ -321,9 +321,10 @@ html.macos ::-webkit-scrollbar {
    full paint cost — the list still renders correctly. */
 .gp-cv-row {
   content-visibility: auto;
-  /* Rows are one 16px line (sidebar text-xs) + 2×4px padding; `auto` keeps
-     the last rendered size once a row has been painted. */
-  contain-intrinsic-size: auto 24px;
+  /* Fallback only: BranchList sets `contain-intrinsic-size` inline from the
+     density-aware row height in src/lib/sidebar/metrics.ts, which is the
+     single source of truth — this static value covers non-JS edge paints. */
+  contain-intrinsic-size: auto 30px;
 }
 
 /* Title-block drag affordance: children ignore the pointer so the block

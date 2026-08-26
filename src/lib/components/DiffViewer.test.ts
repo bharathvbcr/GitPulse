@@ -58,3 +58,93 @@ describe("DiffViewer row chrome", () => {
     expect(source).toContain("annotateRange(lines, bounds[0], bounds[1])");
   });
 });
+
+describe("DiffViewer store-emission memo guards", () => {
+  it("clears selections and scroll via ONE effect keyed on the composite view key", () => {
+    // repoStore republishes fresh objects every ~6s status poll; resetting
+    // per emission erased selections mid-drag and yanked scroll to the top.
+    // The single guard keys on path + commit + staged side + whitespace
+    // mode, which are exactly the inputs that swap the fetched contents.
+    const effectIdx = source.indexOf('join("\\u0000")');
+    expect(effectIdx).toBeGreaterThan(-1);
+    for (const dep of [
+      "$repoStore.selectedFilePath",
+      "$repoStore.selectedCommitId",
+      "$repoStore.selectedIsStaged",
+      "$repoStore.selectedIgnoreWhitespace",
+    ]) {
+      expect(source.indexOf(dep, 0)).toBeGreaterThan(-1);
+    }
+    const resetIdx = source.indexOf("selectedLines = new Set();", effectIdx);
+    expect(resetIdx).toBeGreaterThan(effectIdx);
+    expect(source.indexOf("unifiedScroll = 0;", resetIdx)).toBeGreaterThan(resetIdx);
+    expect(source.indexOf("splitScroll = 0;", resetIdx)).toBeGreaterThan(resetIdx);
+    expect(source.indexOf("isDragging = false;", resetIdx)).toBeGreaterThan(resetIdx);
+    expect(source.indexOf("dragAnchor = null;", resetIdx)).toBeGreaterThan(resetIdx);
+  });
+
+  it("has no unconditional reset effects left over from the per-effect era", () => {
+    // The old selection-wipe and scroll-reset effects ran on EVERY publish.
+    expect(source).not.toContain("// Reset selection when switching files");
+    expect(source).not.toContain("void $repoStore.selectedFilePath;");
+    expect(source.match(/prevSelPath|prevScrollPath/g)).toBeNull();
+  });
+
+  it("refetches image blobs only when repo, path, or commit change", () => {
+    expect(source).toContain("imageBlobKey");
+    expect(source).toContain(
+      'showingImage && path && repo ? `${repo}\\u0000${path}\\u0000${commitId ?? ""}` : null',
+    );
+    // Stale responses are dropped by request key, not by effect teardown
+    // (which Svelte runs before every re-run, memo hits included).
+    expect(source).toContain("if (imageBlobKey === requestKey)");
+    expect(source.match(/return \(\) => \{\s*cancelled = true;\s*\};/g)).toBeNull();
+  });
+});
+
+describe("DiffViewer parse caching and store-owned whitespace toggle", () => {
+  it("parses through a module-scope reference-identity cache", () => {
+    // Re-parsing up to 300k lines on every background publish — and with it
+    // discarding the word-diff segments cache — was the main jank engine.
+    expect(source).toContain("const parseCache = createParseCache();");
+    expect(source).toContain("$derived(parseCache.parse($repoStore.selectedDiff))");
+    expect(source).not.toContain("parseUnifiedDiff($repoStore.selectedDiff || \"\")");
+  });
+
+  it("delegates the whitespace toggle to the store instead of local state", () => {
+    // The prev*/decideWhitespaceRefetch block double-fetched and showed
+    // stale content after staged flips; the store owns refetching now.
+    expect(source).not.toContain("whitespaceToggle");
+    expect(source).not.toContain("decideWhitespaceRefetch");
+    expect(source).not.toMatch(/let ignoreWhitespace = \$state/);
+    expect(source).toContain("checked={$repoStore.selectedIgnoreWhitespace}");
+    expect(source).toContain("repoStore.setIgnoreWhitespace(e.currentTarget.checked)");
+  });
+
+  it("imports replacementBlockBounds from wordDiff instead of redefining it", () => {
+    expect(source).toMatch(/import \{[^}]*replacementBlockBounds[^}]*\} from "\.\.\/diff\/wordDiff"/s);
+    expect(source).not.toContain("function replacementBlockBounds(index: number)");
+  });
+});
+
+describe("DiffViewer staging safety and stats", () => {
+  it("disables hunk staging when the diff is truncated", () => {
+    expect(source).toContain("disabled={truncatedSource}");
+    expect(source).toContain("Partial data");
+  });
+
+  it("counts only add/del/ctx rows as content lines", () => {
+    const idx = source.indexOf("contentLineCount = $derived");
+    const body = source.slice(idx, idx + 400);
+    for (const kind of ['"add"', '"del"', '"ctx"']) {
+      expect(body).toContain(kind);
+    }
+    // hdr rows are chrome: a hunk header must not inflate the line stat.
+    expect(body).not.toContain('"hdr"');
+  });
+
+  it("keeps the EmptyState branch reachable on zero parsed rows", () => {
+    expect(source).toContain("{#if lines.length === 0}");
+    expect(source).toContain("<EmptyState");
+  });
+});

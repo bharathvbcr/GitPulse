@@ -65,7 +65,10 @@ export interface ReleaseInfo {
 
 /**
  * Fields of the `cmd_github_context` payload that more than one panel reads.
- * Panels extend this with their own sections (PRs, issues, …).
+ * Panels extend this with their own sections (PRs, issues, …). The optional
+ * degradation channels (`*_error`, `warnings`, `*_truncated`) must be
+ * surfaced by consumers: "could not fetch" must never render as a clean,
+ * complete-looking empty state.
  */
 export interface GitHubContextBase {
   available: boolean;
@@ -76,4 +79,13 @@ export interface GitHubContextBase {
   releases_truncated?: boolean;
   releases_error?: string | null;
   error?: string | null;
+  /** Set when the workflow-run listing could not run or be parsed. */
+  runs_error?: string | null;
+  /** True when more workflow runs exist than the display cap kept. */
+  runs_truncated?: boolean;
+  /**
+   * Section-level degradations that did not fail the whole context (e.g. a
+   * PR-listing parse failure). Empty while everything fetched cleanly.
+   */
+  warnings?: string[];
 }

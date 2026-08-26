@@ -1,11 +1,5 @@
-<script lang="ts">
-  import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
-  import { History } from "lucide-svelte";
-  import EmptyState from "./EmptyState.svelte";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import { formatDate, shortHash } from "../format";
-  import { formatError } from "../ui/formatError";
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
 
   interface ReflogEntry {
     index: number;
@@ -15,6 +9,20 @@
     message: string;
     timestamp: number;
   }
+
+  // Survives the per-tab remount so revisiting the reflog view renders the
+  // last-known table instantly; the fetch then refreshes it in place.
+  const reflogCache = createRepoPanelCache<ReflogEntry[]>();
+</script>
+
+<script lang="ts">
+  import { repoStore } from "../stores/repoStore";
+  import { invoke } from "@tauri-apps/api/core";
+  import { History } from "lucide-svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { formatDate, shortHash } from "../format";
+  import { reportPanelError } from "../diagnostics/report";
 
   let entries: ReflogEntry[] = $state([]);
   let loading = $state(false);
@@ -36,9 +44,10 @@
       });
       if (!guard.isLive()) return;
       entries = next;
+      reflogCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("reflog", err);
       entries = [];
     } finally {
       if (guard.isLive()) loading = false;
@@ -49,8 +58,14 @@
     return () => inflight?.cancel();
   });
 
+  // Memoized on currentPath: the ~6s status poll and stats drains re-emit the
+  // store object, so an unguarded rerun would cancel and restart the reflog
+  // IPC on every emission.
+  let prevRepo: string | null = null;
   $effect(() => {
     const repo = $repoStore.currentPath;
+    if (repo === prevRepo) return;
+    prevRepo = repo;
     if (!repo) {
       inflight?.cancel();
       entries = [];
@@ -58,6 +73,10 @@
       loading = false;
       return;
     }
+    // Hydrate last-known entries synchronously so a revisit renders instantly
+    // and the refresh below updates the table in place.
+    const cached = reflogCache.get(repo);
+    if (cached) entries = cached;
     void load();
     const started = inflight;
     return () => {
@@ -78,7 +97,7 @@
   </div>
 
   <div class="flex-1 min-h-0 flex flex-col">
-    {#if loading}
+    {#if loading && entries.length === 0}
       <div class="p-4 text-textMuted">Loading reflog…</div>
     {:else if errorMsg}
       <div class="p-4 text-rose-400">{errorMsg}</div>

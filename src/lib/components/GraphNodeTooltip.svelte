@@ -17,11 +17,18 @@
     row,
     refs = [],
     placement = "below",
+    caretX = 16,
   }: {
     row: VisualCommitRow;
     refs?: RefItem[];
     placement?: TooltipPlacement;
+    /** Pointer X inside the box; the caret tracks it after clamping. */
+    caretX?: number;
   } = $props();
+
+  // The caller clamps the anchor inside its measured box; here it only needs
+  // a finite floor so the rotated caret never renders off the left edge.
+  const safeCaretX = $derived(Number.isFinite(caretX) ? Math.max(8, caretX) : 16);
 
   const visibleRefs = $derived(refs.slice(0, 4));
   const hiddenRefCount = $derived(Math.max(0, refs.length - visibleRefs.length));
@@ -38,12 +45,13 @@
 
 <div
   role="tooltip"
-  class="gp-pop relative rounded-2xl border border-border/70 bg-surface/95 text-textPrimary shadow-pop backdrop-blur-md"
+  class="relative rounded-2xl border border-border/70 bg-surface text-textPrimary shadow-pop"
 >
   <div
-    class="absolute left-4 h-3 w-3 rotate-45 rounded-[2px] border-border bg-surface {placement === 'above'
+    class="absolute h-3 w-3 rotate-45 rounded-[2px] border-border bg-surface {placement === 'above'
       ? '-bottom-1.5 border-b border-r'
       : '-top-1.5 border-l border-t'}"
+    style="left: {safeCaretX - 6}px;"
     aria-hidden="true"
   ></div>
 

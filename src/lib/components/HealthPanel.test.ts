@@ -44,4 +44,23 @@ describe("HealthPanel rendering", () => {
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
   });
+
+  it("feeds scanners_ran into formatAuditCounts so an unrun audit never renders as clean", () => {
+    expect(source).toContain("let auditsRan = $derived");
+    expect(source).toContain("(report?.scanners_ran ?? []).length > 0");
+    expect(source).toContain("formatAuditCounts(report.audit, { ran: auditsRan })");
+  });
+});
+
+describe("HealthPanel flicker contracts", () => {
+  it("hydrates the cached report before rescanning so revisits render instantly", () => {
+    expect(source).toContain("createRepoPanelCache<{");
+    expect(source).toContain("healthCache.set(repoPath, { deps: deps.value, dependabot })");
+    const effectBody = source.slice(source.indexOf("scanned.path = path;"), source.indexOf("async function openExternal"));
+    expect(effectBody).toContain("healthCache.get(path)");
+  });
+
+  it("gates its loading placeholder on having no data yet", () => {
+    expect(source).toContain("{#if loading && !report}");
+  });
 });

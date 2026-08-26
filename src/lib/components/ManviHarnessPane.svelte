@@ -89,7 +89,7 @@
       const result = await harnessStore.suggestBranchName(path);
       branchSuggestion = result.text;
       branchWarnings = result.warnings;
-    } catch (err: any) {
+    } catch (err: unknown) {
       branchError = formatError(err);
     } finally {
       isSuggesting = false;
@@ -101,7 +101,7 @@
     try {
       await repoStore.createBranch(branchSuggestion);
       branchSuggestion = "";
-    } catch (err: any) {
+    } catch (err: unknown) {
       branchError = formatError(err);
     }
   }

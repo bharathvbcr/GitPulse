@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { get, writable } from "svelte/store";
 import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, type BranchInfo, type InvokeFn } from "../repoStore";
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
+import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
 import type { FilterState } from "../filterStore";
 
 function deferred<T>() {
@@ -457,7 +458,7 @@ describe("repoStore tabs", () => {
 
     await store.setCommitDraft("fix: handle");
     await store.setCommitDraft("fix: handle edge");
-    await store.selectFilePath("README.md");
+    await store.setAmending(true);
 
     expect(counts.setItem).toBe(0);
     expect(counts.menu).toBe(0);
@@ -1410,5 +1411,461 @@ describe("repoStore snapshot hydration ordering", () => {
     // Calls: 1 = first incarnation, 2 = hung pre-close fetch, 3 = reopen.
     expect(state.statuses[0]?.path).toBe("fresh-3");
     expect(state.error).toBeNull();
+  });
+});
+
+describe("repoStore status poll publish gating", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not republish when a poll returns byte-identical statuses", async () => {
+    vi.useFakeTimers();
+    let mutate = false;
+    const stable = snapshotFor("/r/gate").statuses;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        // Fresh object identities every call; only field values may differ.
+        const copy = stable.map((item) => ({ ...item }));
+        if (mutate) copy[0] = { ...copy[0], additions: copy[0].additions + 5 };
+        return copy as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    let publishes = 0;
+    const unsub = store.subscribe(() => {
+      publishes += 1;
+    });
+    await store.openRepo("/r/gate");
+    await vi.advanceTimersByTimeAsync(1);
+    const baseline = publishes;
+
+    // Two full ticks of identical payloads: neither may reach subscribers.
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS);
+    expect(publishes).toBe(baseline);
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS);
+    expect(publishes).toBe(baseline);
+
+    // A real change still publishes exactly once per tick.
+    mutate = true;
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS);
+    expect(publishes).toBe(baseline + 1);
+
+    unsub();
+  });
+
+  it("keeps the statuses array identity stable across gated ticks", async () => {
+    vi.useFakeTimers();
+    const stable = snapshotFor("/r/gate-identity").statuses;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => stable.map((item) => ({ ...item })) as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/gate-identity");
+    await vi.advanceTimersByTimeAsync(1);
+    const before = get(store).statuses;
+
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS * 2);
+    expect(get(store).statuses).toBe(before);
+  });
+});
+
+describe("repoStore ignore-whitespace preference", () => {
+  const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  function diffRecordingInvoke(): { invoke: InvokeFn; calls: Array<Record<string, unknown>> } {
+    const calls: Array<Record<string, unknown>> = [];
+    const invoke = makeInvoke({
+      cmd_get_file_diff: async (_cmd, args) => {
+        calls.push({ ...(args as Record<string, unknown>) });
+        return `diff ${String(args?.filePath)}` as never;
+      },
+    });
+    return { invoke, calls };
+  }
+
+  it("refetches an open worktree diff exactly once carrying ignoreWhitespace", async () => {
+    const { invoke, calls } = diffRecordingInvoke();
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/ws-file");
+    await store.selectFileDiff("README.md");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ filePath: "README.md", isStaged: false, ignoreWhitespace: false });
+
+    calls.length = 0;
+    await store.setIgnoreWhitespace(true);
+    expect(get(store).selectedIgnoreWhitespace).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ filePath: "README.md", isStaged: false, ignoreWhitespace: true });
+
+    // Same-value toggle is a no-op: no refetch, no state churn.
+    await store.setIgnoreWhitespace(true);
+    expect(calls).toHaveLength(1);
+
+    // The recorded preference rides along on later file clicks.
+    await store.selectFileDiff("next.txt", true);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ filePath: "next.txt", isStaged: true, ignoreWhitespace: true });
+
+    await flushMicro();
+    expect(get(store).selectedFilePath).toBe("next.txt");
+  });
+
+  it("records the preference for commit-kind selections without fetching any diff", async () => {
+    const { invoke, calls } = diffRecordingInvoke();
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/ws-commit");
+    await store.selectCommitDiff("c1");
+    calls.length = 0;
+
+    await store.setIgnoreWhitespace(true);
+    expect(get(store).selectedIgnoreWhitespace).toBe(true);
+    expect(calls).toHaveLength(0);
+    // The commit selection itself stays untouched.
+    expect(get(store).selectedCommitId).toBe("c1");
+
+    // ...and the next worktree click inherits it.
+    await store.selectFileDiff("later.txt");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ filePath: "later.txt", ignoreWhitespace: true });
+    await flushMicro();
+  });
+
+  it("persists selectedIgnoreWhitespace through selectFileDiff without a third argument", async () => {
+    const { invoke, calls } = diffRecordingInvoke();
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/ws-persist");
+    await store.setIgnoreWhitespace(true);
+    // One refetch from arming the flag with no selection open yet? None —
+    // there was no file-kind selection to refresh.
+    expect(calls).toHaveLength(0);
+
+    await store.selectFileDiff("kept.txt", false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ filePath: "kept.txt", ignoreWhitespace: true });
+    expect(get(store).selectedIgnoreWhitespace).toBe(true);
+  });
+});
+
+describe("repoStore post-mutation selection refetch", () => {
+  const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const patch = { old_path: "a.ts", new_path: "a.ts", hunks: [] };
+
+  it("refetches the open file diff after a stage-patch mutation lands", async () => {
+    const diffPaths: string[] = [];
+    const invoke = makeInvoke({
+      cmd_stage_selective_patch: async () => undefined as never,
+      cmd_get_file_diff: async (_cmd, args) => {
+        diffPaths.push(String(args?.filePath));
+        return `diff ${String(args?.filePath)}` as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/refetch-stage");
+    await store.selectFileDiff("a.ts");
+    expect(diffPaths).toEqual(["a.ts"]);
+
+    await store.stageSelectivePatch(patch, true);
+    // selectFileDiff after refresh is fire-and-forget inside runMutating.
+    await flushMicro();
+    expect(diffPaths).toEqual(["a.ts", "a.ts"]);
+    expect(get(store).selectedDiff).toContain("diff a.ts");
+  });
+
+  it("does not refetch a diff after discard when no file selection is open", async () => {
+    let diffCalls = 0;
+    const invoke = makeInvoke({
+      cmd_discard_changes: async () => undefined as never,
+      cmd_get_file_diff: async () => {
+        diffCalls += 1;
+        return "" as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/refetch-none");
+    await store.discardChanges("gone.txt");
+    await flushMicro();
+    expect(diffCalls).toBe(0);
+    expect(get(store).selectedFilePath).toBeNull();
+  });
+
+  it("does not refetch for mutations outside the refetch set (checkout)", async () => {
+    const diffPaths: string[] = [];
+    const invoke = makeInvoke({
+      cmd_checkout_branch: async () => undefined as never,
+      cmd_get_file_diff: async (_cmd, args) => {
+        diffPaths.push(String(args?.filePath));
+        return "" as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/refetch-checkout");
+    await store.selectFileDiff("a.ts");
+    expect(diffPaths).toEqual(["a.ts"]);
+
+    await store.checkoutBranch("feature");
+    await flushMicro();
+    expect(diffPaths).toEqual(["a.ts"]);
+  });
+});
+
+describe("repoStore watcher echo suppression", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function countingLoads(loaded: Record<string, number>): InvokeFn {
+    return makeInvoke({
+      cmd_list_branches: async (_cmd, args) => {
+        const path = String(args?.repoPath);
+        loaded[path] = (loaded[path] ?? 0) + 1;
+        return [] as never;
+      },
+      cmd_commit: async () => undefined as never,
+    });
+  }
+
+  it("drops watcher events inside the post-mutation window and refreshes after it expires", async () => {
+    vi.useFakeTimers();
+    const loaded: Record<string, number> = {};
+    const { store } = makeStore(countingLoads(loaded));
+    await store.openRepo("/r/echo");
+    await store.commit("feat: echo");
+    loaded["/r/echo"] = 0;
+
+    // Echo arrives immediately after the mutation: suppressed entirely — no
+    // debounce timer armed, so even waiting past the debounce fires nothing.
+    await store.handleRepoChanged("/r/echo");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(loaded["/r/echo"]).toBe(0);
+
+    // Still inside the 2500ms window.
+    await vi.advanceTimersByTimeAsync(2000);
+    await store.handleRepoChanged("/r/echo");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(loaded["/r/echo"]).toBe(0);
+
+    // Window has expired: a genuine external event refreshes again.
+    await vi.advanceTimersByTimeAsync(300);
+    await store.handleRepoChanged("/r/echo");
+    await vi.advanceTimersByTimeAsync(199);
+    expect(loaded["/r/echo"]).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(loaded["/r/echo"]).toBe(1);
+
+    // One-shot window: nothing further without new events.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(loaded["/r/echo"]).toBe(1);
+  });
+});
+
+describe("repoStore background-refresh flicker hardening", () => {
+  const flushMicro = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  // The poll-race test below installs fake timers; without this teardown a
+  // shuffled run can leak them into unrelated async tests (their setTimeout
+  // flushes never fire → 5s hangs).
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not raise isLoading on a refresh of an already-hydrated session", async () => {
+    const hung = deferred<unknown>();
+    let call = 0;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        call += 1;
+        if (call === 2) return hung.promise as never; // the background refresh hangs
+        return snapshotFor("/r/quiet").statuses as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/quiet");
+    expect(get(store).isLoading).toBe(false);
+
+    const settled = store.refresh();
+    // While the background refresh is still in flight, the header spinner
+    // must stay still: content is already rendered from the first hydrate.
+    expect(get(store).isLoading).toBe(false);
+
+    hung.resolve(snapshotFor("/r/quiet").statuses as never);
+    await settled;
+    await flushMicro();
+    expect(get(store).isLoading).toBe(false);
+  });
+
+  it("still shows isLoading for a session that never hydrated", async () => {
+    const hung = deferred<unknown>();
+    let call = 0;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        call += 1;
+        if (call === 1) return hung.promise as never;
+        return snapshotFor("/r/first").statuses as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    void store.openRepo("/r/first");
+    await flushMicro();
+    expect(get(store).isLoading).toBe(true);
+    hung.resolve(snapshotFor("/r/first").statuses as never);
+    await flushMicro();
+    expect(get(store).isLoading).toBe(false);
+  });
+
+  it("does not raise isLoading when activating a cached tab", async () => {
+    const hung = deferred<unknown>();
+    let call = 0;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        call += 1;
+        // Calls: 1 = /r/a hydration, 2 = /r/b hydration, 3 = /r/a's
+        // ACTIVATION hydrate — hang that one so the assertion lands
+        // mid-activation.
+        if (call === 3) return hung.promise as never;
+        const path = call === 2 ? "/r/b" : "/r/a";
+        return snapshotFor(path).statuses as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/a");
+    await store.openRepo("/r/b");
+    const activation = store.activateTab(get(store).openTabs[0].id);
+    await flushMicro();
+    expect(get(store).currentPath).toBe("/r/a");
+    expect(get(store).isLoading).toBe(false); // rows are cached; spinner must stay still
+    hung.resolve(snapshotFor("/r/a").statuses as never);
+    await activation;
+  });
+
+  it("stageAll runs exactly one refresh cycle regardless of file count", async () => {
+    let branchListings = 0;
+    const invoke = makeInvoke({
+      cmd_list_branches: async () => {
+        branchListings += 1;
+        return snapshotFor("/r/bulk").branches as never;
+      },
+      cmd_get_status: async () =>
+        [1, 2, 3].map((n) => ({
+          path: `f${n}.ts`,
+          status_code: "M",
+          is_staged: false,
+          is_conflicted: false,
+          additions: 1,
+          deletions: 0,
+        })) as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/bulk"); // hydration listing #1
+    await store.stageAll();
+    // Pre-fix this was 1 + N (one full refresh per staged file): each cycle
+    // flipped the spinner and re-rendered the sidebar N times in a row.
+    expect(branchListings).toBe(2);
+  });
+
+  it("settles a no-change stats drain without extra publishes", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/noop-stats");
+    await flushMicro(); // let the unawaited first stats drain fully settle
+
+    let publishes = 0;
+    const unsub = store.subscribe(() => {
+      publishes += 1;
+    });
+    await flushMicro(); // writable fires the subscriber once on subscribe
+    const baseline = publishes;
+    await store.refresh();
+    await flushMicro();
+    unsub();
+
+    // Zero delta: the opening patch, hydrate snapshot (churn carried
+    // forward), an unchanged stats drain and its settle are ALL no-ops
+    // against identical live state — a quiet watcher refresh is invisible.
+    expect(publishes - baseline).toBe(0);
+  });
+
+  it("discards a poll result that lands after a newer hydration started", async () => {
+    vi.useFakeTimers();
+    const stalePoll = deferred<unknown>();
+    let call = 0;
+    let armedAt = Number.POSITIVE_INFINITY;
+    const invoke = makeInvoke({
+      cmd_get_status: async () => {
+        call += 1;
+        if (call === armedAt) return stalePoll.promise as never;
+        return [{ path: `probe-${call}`, status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 }] as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/poll-race");
+    await vi.advanceTimersByTimeAsync(1);
+
+    armedAt = call + 1; // the NEXT status fetch hangs — that one is the poll tick
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS);
+    const refreshSettled = store.refresh(); // watcher-driven refresh supersedes mid-flight poll
+    await vi.advanceTimersByTimeAsync(1);
+    await refreshSettled;
+    expect(get(store).statuses[0]?.path).not.toBe("probe-stale");
+
+    stalePoll.resolve([{ path: "probe-stale", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 }] as never);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(get(store).statuses[0]?.path).not.toBe("probe-stale");
+    expect(get(store).isLoading).toBe(false);
+  });
+});
+
+describe("repoStore refresh query forwarding", () => {
+  interface RecordedLoad {
+    path: string;
+    query: string;
+    revision: string | null;
+  }
+  function makeRecordingGraph() {
+    const loads: RecordedLoad[] = [];
+    return {
+      loads,
+      api: {
+        showRepo: (_path: string | null) => {},
+        loadGraph: async (path: string, query = "", revision: string | null = null) => {
+          loads.push({ path, query, revision });
+        },
+        evict: (_path: string) => {},
+      },
+    };
+  }
+
+  it("forwards only server-fetchable queries to the backend on refresh", async () => {
+    const graph = makeRecordingGraph();
+    const filter = makeFilter();
+    const store = createRepoStore({
+      invoke: makeInvoke(),
+      storage: memoryStorage(),
+      caseInsensitive: true,
+      graph: graph.api,
+      filter,
+    });
+    await store.openRepo("/r/launder");
+
+    // author:x is client-side filtering: the backend applies ANY query
+    // server-side, so forwarding it would permanently drop rows into the
+    // cached payload — and clearing the filter reproduces the scheduler's
+    // last-fired key, leaving the pane stuck on partial history.
+    filter.setSearch("author:x");
+    await store.refresh();
+    const authorLoad = graph.loads[graph.loads.length - 1];
+    expect(authorLoad).toEqual({ path: "/r/launder", query: "", revision: null });
+
+    filter.selectBranch("feature");
+    await store.refresh();
+    const branchLoad = graph.loads[graph.loads.length - 1];
+    expect(branchLoad?.revision).toBe("feature");
+
+    // path: filters genuinely need git to walk history, so they pass through.
+    filter.setSearch("path:src");
+    await store.refresh();
+    const pathLoad = graph.loads[graph.loads.length - 1];
+    expect(pathLoad).toEqual({ path: "/r/launder", query: "path:src", revision: "feature" });
   });
 });

@@ -3,6 +3,7 @@ pub mod debouncer;
 pub use debouncer::RepoFileWatcher;
 
 use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir, validate_repo};
+use notify::Event;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -125,6 +126,81 @@ const DEBOUNCE_QUIET: Duration = Duration::from_millis(400);
 /// keep arriving, so a busy repo never goes stale on screen.
 const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(2000);
 
+/// True when `event` carries at least one path that can move repository state.
+///
+/// Events whose every path is git-internal refresh noise (see
+/// [`is_git_internal_noise`]) are dropped before they enter the debounce
+/// accumulation. Without this gate, editors/build tools churning `.lock`
+/// transients or `COMMIT_EDITMSG` force a full app refresh every
+/// [`DEBOUNCE_MAX_WAIT`] indefinitely — the anti-starvation bound turns pure
+/// noise into a constant refresh loop. Events without any path cannot be
+/// classified, so they count as signal (fail open toward refreshing).
+fn event_has_signal(event: &Event, internal_roots: &[std::path::PathBuf]) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| !is_git_internal_noise(path, internal_roots))
+}
+
+/// True when `path` sits inside one of the watched git directories (the
+/// resolved git dir plus the shared common dir of linked worktrees) AND names
+/// a transient git-internals artifact whose churn never moves repo state:
+///
+/// - `*.lock`: lockfiles (`index.lock`, `config.lock`, `packed-refs.lock`,
+///   `COMMIT_EDITMSG.lock`) that exist only for the duration of one git write;
+///   real index/ref changes also emit `index` / `refs/` events themselves.
+/// - `COMMIT_EDITMSG`, `MERGE_MSG`: message files typed into while no commit
+///   has been made yet; an actual commit also moves `refs/heads/...`.
+/// - `ORIG_HEAD`, `FETCH_HEAD`: transient pointers; real ref moves also emit
+///   `refs/` events.
+/// - `gc.log*`: garbage-collection progress logs.
+///
+/// The filter is deliberately scoped to the git directories: identically
+/// named files in the worktree root are tracked content with different
+/// semantics (`Cargo.lock`, `yarn.lock`, `poetry.lock` are dependency state,
+/// not transients) and must keep firing `repo-changed`.
+pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::PathBuf]) -> bool {
+    if !internal_roots.iter().any(|root| path.starts_with(root)) {
+        return false;
+    }
+    is_noise_leaf_name(path)
+}
+
+/// Leaf-name half of the noise rules, applied once the path is known to live
+/// inside a git directory. Paths under `refs/` always matter (branch/tag
+/// moves), even when a component happens to look like noise. A directory that
+/// merely shares a noise name (`refs`-adjacent tooling, odd user dirs) is
+/// kept: the rules target transient FILES, so a deny-list hit is confirmed as
+/// a non-directory via symlink metadata before it is dropped.
+fn is_noise_leaf_name(path: &Path) -> bool {
+    // Conservative containment check: any literal `refs` component wins over
+    // the name rules below.
+    if path.components().any(|c| c.as_os_str() == "refs") {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let matches_deny_list = name.ends_with(".lock")
+        || matches!(
+            &*name,
+            "COMMIT_EDITMSG" | "ORIG_HEAD" | "FETCH_HEAD" | "MERGE_MSG"
+        )
+        || name.starts_with("gc.log");
+    if !matches_deny_list {
+        return false;
+    }
+    // Deleted-already paths (stat fails) are transient-file churn by
+    // definition — exactly what this filter exists to drop.
+    !std::fs::symlink_metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
 /// Whether the loop owes an emission at `now`: events have been quiet for
 /// [`DEBOUNCE_QUIET`], or the oldest unemitted event has waited
 /// [`DEBOUNCE_MAX_WAIT`] — whichever comes first.
@@ -143,17 +219,32 @@ fn should_emit(
     quiet || max_wait
 }
 
+/// Everything the debounce loop needs to know about WHERE it is watching and
+/// WHAT to emit. Bundled so [`run_watch_loop`] stays under the argument cap:
+/// `git_dir` is the liveness probe target, `internal_roots` scopes the
+/// noise filter (always contains `git_dir`, plus the common dir for linked
+/// worktrees), and `emit_path` is the payload handed to `on_change`.
+struct WatchLoopContext {
+    git_dir: std::path::PathBuf,
+    internal_roots: Vec<std::path::PathBuf>,
+    emit_path: String,
+}
+
 fn run_watch_loop<F>(
     watcher: RepoFileWatcher,
+    ctx: WatchLoopContext,
     stop: Arc<AtomicBool>,
     sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
     session_stop: Arc<AtomicBool>,
-    git_dir: std::path::PathBuf,
-    path: String,
     on_change: F,
 ) where
     F: Fn(String),
 {
+    let WatchLoopContext {
+        git_dir,
+        internal_roots,
+        emit_path: path,
+    } = ctx;
     let mut pending = false;
     let mut last_event = Instant::now();
     let mut first_pending: Option<Instant> = None;
@@ -177,17 +268,29 @@ fn run_watch_loop<F>(
             dead_misses = 0;
         }
         match watcher.receiver.recv_timeout(Duration::from_millis(200)) {
-            Ok(_) => {
+            Ok(Ok(event)) => {
+                // Noise gate before any accumulation: a batch whose every
+                // path is git-internal churn must not open or extend the
+                // pending window. Drained leftovers are classified too, so a
+                // real event hiding behind noise in the same queue is never
+                // lost. Backend errors carry no classifiable path and count
+                // as signal (fail open toward refreshing), preserving the
+                // pre-filter treatment.
+                let mut significant = event_has_signal(&event, &internal_roots);
+                for leftover in watcher.receiver.try_iter() {
+                    significant |= match leftover {
+                        Ok(event) => event_has_signal(&event, &internal_roots),
+                        Err(_) => true,
+                    };
+                }
+                if !significant {
+                    continue;
+                }
                 if !pending {
                     first_pending = Some(Instant::now());
                 }
                 pending = true;
                 last_event = Instant::now();
-                // Drain everything already queued behind that first event:
-                // during a checkout storm thousands can pile up, and one
-                // recv per loop iteration would let the backlog (and memory)
-                // grow unboundedly while never settling faster.
-                for _ in watcher.receiver.try_iter() {}
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
                     if !git_dir.exists() {
                         dead_confirmed = true;
@@ -197,6 +300,16 @@ fn run_watch_loop<F>(
                     pending = false;
                     first_pending = None;
                 }
+            }
+            // A notify backend error carries no classifiable path; per the
+            // fail-open rule above it counts as signal — open or extend the
+            // pending window so the missed-events repo still refreshes.
+            Ok(Err(_)) => {
+                if !pending {
+                    first_pending = Some(Instant::now());
+                }
+                pending = true;
+                last_event = Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
@@ -217,13 +330,14 @@ fn run_watch_loop<F>(
         // the same ptr_eq discipline abandon_watch_slot uses, so an unwatch
         // plus rewatch of the same path is never torn down by this ghost.
         if let Some(sessions) = &sessions {
-            if let Ok(mut guard) = sessions.lock() {
-                if guard
-                    .get(&path)
-                    .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
-                {
-                    guard.remove(&path);
-                }
+            let mut guard = sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard
+                .get(&path)
+                .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
+            {
+                guard.remove(&path);
             }
         }
     }
@@ -239,7 +353,9 @@ pub fn start_watch(
     repo_path: String,
 ) -> Result<String, String> {
     start_watch_inner(state, repo_path, move |path| {
-        let _ = app.emit("repo-changed", RepoChangedPayload { path });
+        if let Err(e) = app.emit("repo-changed", RepoChangedPayload { path: path.clone() }) {
+            log::warn!(target: "watcher", "repo-changed emit failed for {path}: {e}");
+        }
     })
 }
 
@@ -275,7 +391,16 @@ where
 
     // Linked worktrees keep refs/heads in the COMMON dir; watch it too so
     // checkouts made in any worktree refresh every view of the repo.
-    let common_dir = resolve_git_common_dir(&canonical).ok();
+    let common_dir = match resolve_git_common_dir(&canonical) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            log::debug!(
+                target: "watcher",
+                "linked-worktree ref watching degraded for {key}: {e}"
+            );
+            None
+        }
+    };
     let watcher =
         RepoFileWatcher::watch_repo(&git_dir, worktree_root.as_deref(), common_dir.as_deref())?;
 
@@ -289,6 +414,15 @@ where
 
     // Release the sessions mutex before spawn. Holding it across spawn can
     // deadlock if the watch thread (or `on_change`) needs the same lock.
+    // The noise filter needs every watched git-internal root (private git dir
+    // plus the shared common dir) to scope its rules; the worktree root is
+    // deliberately NOT in this set — worktree-top-level files are content.
+    let mut internal_roots = vec![git_dir.clone()];
+    if let Some(common) = &common_dir {
+        if common != &git_dir && !internal_roots.contains(common) {
+            internal_roots.push(common.clone());
+        }
+    }
     let emit_path = key.clone();
     let thread_stop = stop.clone();
     let session_stop = stop.clone();
@@ -298,11 +432,14 @@ where
         .spawn(move || {
             run_watch_loop(
                 watcher,
+                WatchLoopContext {
+                    git_dir,
+                    internal_roots,
+                    emit_path,
+                },
                 thread_stop,
                 Some(loop_sessions),
                 session_stop,
-                git_dir,
-                emit_path,
                 on_change,
             );
         })
@@ -756,17 +893,21 @@ mod tests {
         let session_stop = stop.clone();
         let emit_path = canonical.to_string_lossy().into_owned();
         let loop_git_dir = canonical.clone();
+        let internal_roots = vec![canonical.join(".git")];
         let (tx, rx) = std::sync::mpsc::channel();
         thread::Builder::new()
             .name("watch-loop-test".into())
             .spawn(move || {
                 run_watch_loop(
                     watcher,
+                    WatchLoopContext {
+                        git_dir: loop_git_dir,
+                        internal_roots,
+                        emit_path,
+                    },
                     thread_stop,
                     None,
                     session_stop,
-                    loop_git_dir,
-                    emit_path,
                     move |p| {
                         let _ = tx.send(p);
                     },
@@ -1169,5 +1310,244 @@ mod tests {
                  within {PRIME_DEADLINE:?})"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Git-internals noise filter (audit A)
+    // ---------------------------------------------------------------------------
+
+    fn internal_roots_for(dir: &Path) -> Vec<std::path::PathBuf> {
+        vec![dir.join(".git")]
+    }
+
+    /// Every transient the audit names must classify as noise when it lives
+    /// inside the git directory.
+    #[test]
+    fn noise_predicate_drops_git_internal_transients() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+        let roots = internal_roots_for(tmp.path());
+
+        let noisy = [
+            git_dir.join("index.lock"),
+            git_dir.join("packed-refs.lock"),
+            git_dir.join("config.lock"),
+            git_dir.join("COMMIT_EDITMSG"),
+            git_dir.join("COMMIT_EDITMSG.lock"),
+            git_dir.join("ORIG_HEAD"),
+            git_dir.join("FETCH_HEAD"),
+            git_dir.join("MERGE_MSG"),
+            git_dir.join("gc.log"),
+            git_dir.join("gc.log.1.gz"),
+        ];
+        for path in noisy {
+            std::fs::write(&path, b"x").unwrap();
+            assert!(
+                is_git_internal_noise(&path, &roots),
+                "{} must be filtered as git-internal noise",
+                path.display()
+            );
+            // Deletion churn (path already gone) stays noise too.
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                is_git_internal_noise(&path, &roots),
+                "deleted {} (lockfile lifecycle tail) must stay filtered",
+                path.display()
+            );
+        }
+    }
+
+    /// Ref moves, real index/HEAD/packed-refs writes and directories that
+    /// merely share a noise-shaped name must all survive the filter; files
+    /// OUTSIDE the git directories (worktree top level, e.g. Cargo.lock) are
+    /// never classified as noise regardless of their name.
+    #[test]
+    fn noise_predicate_keeps_refs_real_state_dirs_and_worktree_files() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+        let roots = internal_roots_for(tmp.path());
+
+        let meaningful = [
+            git_dir.join("index"),
+            git_dir.join("HEAD"),
+            git_dir.join("packed-refs"),
+            git_dir.join("refs").join("heads").join("main"),
+            // A branch literally named like a noise file lives under refs/.
+            git_dir.join("refs").join("heads").join("ORIG_HEAD"),
+            git_dir.join("refs").join("heads").join("topic.lock"),
+        ];
+        for path in meaningful {
+            std::fs::write(&path, b"x").unwrap();
+            assert!(
+                !is_git_internal_noise(&path, &roots),
+                "{} carries repository state and must not be filtered",
+                path.display()
+            );
+        }
+
+        // Directory carve-out: a directory sharing a noise name is kept.
+        let noise_dir = git_dir.join("gc.log.old");
+        std::fs::create_dir_all(&noise_dir).unwrap();
+        assert!(
+            !is_git_internal_noise(&noise_dir, &roots),
+            "directory {} must not be dropped by the leaf-name rules",
+            noise_dir.display()
+        );
+
+        // Scope check: identically-named entries outside the git dirs are
+        // tracked-content territory (Cargo.lock, yarn.lock, ...) and keep
+        // firing repo-changed.
+        let worktree_lock = tmp.path().join("Cargo.lock");
+        std::fs::write(&worktree_lock, b"x").unwrap();
+        assert!(!is_git_internal_noise(&worktree_lock, &roots));
+    }
+
+    /// Regression (audit A): a continuous stream of pure git-internals noise
+    /// (lockfile create/delete cycles, message-file edits, gc logs) used to
+    /// open the debounce window and force a full refresh every
+    /// DEBOUNCE_MAX_WAIT forever. Filtered paths must never accumulate into
+    /// an emission, while the pipeline stays alive for real events.
+    #[test]
+    fn watch_loop_pure_noise_stream_emits_nothing_and_stays_alive() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+        let git_dir = root.join(".git");
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        // Pump ONLY noise for well past the anti-starvation bound (2s max
+        // wait + settle margin): an unfiltered event would be forced out as
+        // an emission within ~2s of arriving, so 3s of pumping plus polling
+        // the receiver throughout is enough to catch a broken filter.
+        let pump_deadline = Instant::now() + Duration::from_secs(3);
+        let mut i = 0u32;
+        let mut leaked = None;
+        while Instant::now() < pump_deadline {
+            for name in [
+                "index.lock",
+                "COMMIT_EDITMSG",
+                "ORIG_HEAD",
+                "FETCH_HEAD",
+                "MERGE_MSG",
+                "gc.log.9",
+            ] {
+                let _ = std::fs::write(git_dir.join(name), format!("noise-{i}"));
+            }
+            i += 1;
+            let _ = std::fs::remove_file(git_dir.join("index.lock"));
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(path) => {
+                    leaked = Some(path);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(
+            leaked.is_none(),
+            "git-internals noise must not trigger repo-changed (got {leaked:?})"
+        );
+
+        // Drain any straggler deliveries racing the OS backend, then prove
+        // the loop is still alive with a real worktree edit (retry-bounded).
+        await_watcher_quiescence(&rx);
+        let alive_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::write(root.join(format!("post-noise-alive-{n}.txt")), "x").unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < alive_deadline,
+                "real edits must still trigger after the noise gate ({n} probes)"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Mixed burst: noise paths next to a genuine `.git/index` write settle
+    /// into exactly one emission — the noise half is swallowed, the state
+    /// half still debounces like any real change.
+    #[test]
+    fn watch_loop_mixed_noise_and_index_write_emits_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+        let git_dir = root.join(".git");
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        let burst_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut attempt = 0u32;
+        loop {
+            assert!(
+                Instant::now() < burst_deadline,
+                "no cleanly coalesced mixed burst within {PRIME_DEADLINE:?} ({attempt} attempts)"
+            );
+            for i in 0..10 {
+                let _ = std::fs::write(
+                    git_dir.join("index.lock"),
+                    format!("transient lock {attempt}-{i}"),
+                );
+                let _ = std::fs::remove_file(git_dir.join("index.lock"));
+                let _ = std::fs::write(git_dir.join("COMMIT_EDITMSG"), "wip");
+            }
+            // The one significant event: a real index write.
+            std::fs::write(git_dir.join("index"), b"mixed-burst-index").unwrap();
+            attempt += 1;
+
+            // Exactly one settled callback for the whole burst.
+            let Ok(first) = rx.recv_timeout(Duration::from_secs(10)) else {
+                continue; // backend delivered nothing yet: retry
+            };
+            assert!(!first.is_empty());
+
+            // Quiet window well past the 400ms settle: no further callbacks
+            // may arrive, because the noise half produced nothing to debounce.
+            match rx.recv_timeout(Duration::from_millis(900)) {
+                Ok(_) => {
+                    // Stray late delivery split the burst: quiesce and retry.
+                    await_watcher_quiescence(&rx);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(e) => panic!("channel failed during quiet window: {e}"),
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// The leaf-name rules target transient FILES: a directory whose name
+    /// matches the deny list (`gc.log*`, `*.lock`, ...) must still fire
+    /// repo-changed when it appears inside the git directory.
+    #[test]
+    fn watch_loop_directory_named_like_noise_still_triggers() {
+        let temp = TempDir::new().unwrap();
+        let (rx, stop, root) = spawn_loop(temp.path());
+        let git_dir = root.join(".git");
+        prime_watcher(&rx, &root, PRIME_DEADLINE);
+
+        let dir_deadline = Instant::now() + PRIME_DEADLINE;
+        let mut n = 0u32;
+        loop {
+            std::fs::create_dir_all(git_dir.join(format!("gc.log.attempt-{n}"))).unwrap();
+            n += 1;
+            if rx
+                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < dir_deadline,
+                "directory creation inside .git must not be swallowed by the noise filter \
+                 ({n} attempts within {PRIME_DEADLINE:?})"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
     }
 }

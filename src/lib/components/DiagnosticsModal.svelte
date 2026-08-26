@@ -7,10 +7,17 @@
     type DiagnosticEntry,
     type DiagnosticSeverity,
   } from "../diagnostics/diagnostics";
-  import { fadeParams, scaleParams } from "../motion/easing";
+  import {
+    backdropFade,
+    backdropFadeOut,
+    cardScale,
+    cardScaleOut,
+  } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { copyText } from "../desktop/clipboard";
+  import { invoke } from "@tauri-apps/api/core";
+  import { withBackendLogSection } from "../diagnostics/report";
   import { TriangleAlert, CircleAlert, ClipboardCopy, Trash2, Activity, Check } from "lucide-svelte";
 
   let {
@@ -60,8 +67,18 @@
     ),
   );
 
-  function copyReport() {
-    void copyText(formatDiagnosticReport($diagnostics)).then((ok) => {
+  async function copyReport() {
+    // Backend context is best-effort: the command may not be registered yet,
+    // and ANY failure (including IPC rejection) degrades to no section — the
+    // clipboard write itself must still succeed.
+    let backendLines: string[] = [];
+    try {
+      backendLines = await invoke<string[]>("cmd_diagnostic_log_tail", {});
+    } catch {
+      backendLines = [];
+    }
+    const report = withBackendLogSection(formatDiagnosticReport($diagnostics), backendLines);
+    void copyText(report).then((ok) => {
       if (!ok) {
         copyFailed = true;
         if (copyFailedTimer) clearTimeout(copyFailedTimer);
@@ -83,7 +100,8 @@
     tabindex="-1"
     onclick={onClose}
     onkeydown={(e) => e.key === "Escape" && onClose?.()}
-    transition:fade={fadeParams()}
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
@@ -92,8 +110,8 @@
     <div
       use:trapFocus
       onclick={(e) => e.stopPropagation()}
-      in:scale={scaleParams()}
-      out:scale={scaleParams()}
+      in:scale={cardScale()}
+      out:scale={cardScaleOut()}
       class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between gap-3">

@@ -173,6 +173,119 @@ function escapeRegex(name) {
   return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const IDENT_CHAR = /[A-Za-z0-9_$]/;
+
+/**
+ * Returns the index just past the string / template literal / comment that
+ * starts at `start`. Their contents are opaque to generic detection: text
+ * like `"a<b"` must never open a span that swallows unrelated code.
+ *
+ * @param {string} content
+ * @param {number} start
+ * @returns {number}
+ */
+function skipOpaque(content, start) {
+  const n = content.length;
+  const opener = content[start];
+  if (opener === "/" && content[start + 1] === "/") {
+    const nl = content.indexOf("\n", start);
+    return nl === -1 ? n : nl; // the newline itself stays
+  }
+  if (opener === "/" && content[start + 1] === "*") {
+    const end = content.indexOf("*/", start + 2);
+    return end === -1 ? n : end + 2;
+  }
+  let i = start + 1;
+  while (i < n) {
+    const ch = content[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === opener) return i + 1;
+    if (opener === "`" && ch === "$" && content[i + 1] === "{") {
+      // Template interpolation: ride out the balanced braces.
+      let depth = 0;
+      i += 1;
+      while (i < n) {
+        if (content[i] === "{") depth += 1;
+        else if (content[i] === "}") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        i += 1;
+      }
+    }
+    i += 1;
+  }
+  return i;
+}
+
+/**
+ * Blanks every balanced generic parameter list attached to an identifier
+ * (`invoke<Guarded<string>>` → `invoke` + spaces), leaving all other
+ * characters — and every character offset — exactly where they were, so line
+ * numbers computed from match indexes stay correct.
+ *
+ * Depth-counted rather than nesting-budgeted: the earlier one-level regex
+ * made `invoke<Guarded<string[]>>` visible but three levels invisible, so
+ * real call sites silently vanished and their handlers read as orphaned. A
+ * `<` only opens a span when it directly hugs identifier characters, which
+ * leaves comparison operators (`a < b`) alone; string literals and comments
+ * are opaque, and an unterminated span is left untouched. Spans may cross
+ * newlines (multi-line generics are real call sites); the newline characters
+ * themselves survive blanking so line numbering holds.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+export function blankGenericParameters(content) {
+  const chars = content.split("");
+  const n = content.length;
+  let i = 0;
+  while (i < n) {
+    const ch = content[i];
+    if (ch === '"' || ch === "'" || ch === "`" || (ch === "/" && (content[i + 1] === "/" || content[i + 1] === "*"))) {
+      i = skipOpaque(content, i);
+      continue;
+    }
+    if (!IDENT_CHAR.test(ch)) {
+      i += 1;
+      continue;
+    }
+    while (i < n && IDENT_CHAR.test(content[i])) i += 1;
+    // A generic opens only immediately after an identifier.
+    if (content[i] !== "<") continue;
+    let depth = 0;
+    let close = -1;
+    let j = i;
+    while (j < n) {
+      const c = content[j];
+      if (c === '"' || c === "'" || c === "`") {
+        // String-literal types inside a generic stay opaque.
+        j = skipOpaque(content, j);
+        continue;
+      }
+      if (c === "<") depth += 1;
+      else if (c === ">") {
+        depth -= 1;
+        if (depth === 0) {
+          close = j;
+          break;
+        }
+      }
+      j += 1;
+    }
+    // Unterminated: not a generic; leave the text untouched.
+    if (close === -1) continue;
+    for (let k = i; k <= close; k += 1) {
+      if (chars[k] !== "\n") chars[k] = " ";
+    }
+    i = close + 1;
+  }
+  return chars.join("");
+}
+
 /**
  * Scan frontend files for invoke-style call sites.
  *
@@ -208,20 +321,24 @@ export function scanInvokeCallSites(files) {
     siteCount += 1;
   };
   // Literal first argument: 'x' / "x" / `x` (backticks rejected if interpolated).
-  const literalCall =
-    /\b([A-Za-z_$][\w$]*)((?:<[^>()]*>)?)\s*\(\s*(['"`])([^'"`\n]*)\3/g;
+  // Generic parameter lists are stripped from each line before matching, so
+  // `invoke<Guarded<string>>("x")` matches the same shape as `invoke("x")`
+  // at any nesting depth.
+  const literalCall = /\b([A-Za-z_$][\w$]*)\s*\(\s*(['"`])([^'"`\n]*)\2/g;
   // Identifier first argument: possibly-dynamic command name.
-  const dynamicCall =
-    /\b([A-Za-z_$][\w$]*)((?:<[^>()]*>)?)\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)\n]/g;
+  const dynamicCall = /\b([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)\n]/g;
 
   for (const file of files) {
     const content = readFileSync(file, "utf8");
     const relFile = path.relative(REPO_ROOT, file);
+    // Offset-preserving, so line numbers derived from match indexes remain
+    // exact against the original file.
+    const callable = blankGenericParameters(content);
 
-    for (const match of content.matchAll(literalCall)) {
-      const [, callee, , , arg] = match;
+    for (const match of callable.matchAll(literalCall)) {
+      const [, callee, , arg] = match;
       if (!INVOKE_CALLEE.test(callee)) continue;
-      const line = lineNumber(content, match.index);
+      const line = lineNumber(callable, match.index);
       if (arg.includes("${")) {
         manualReviews.push({
           file: relFile,
@@ -234,14 +351,14 @@ export function scanInvokeCallSites(files) {
       record(arg, { file: relFile, line });
     }
 
-    for (const match of content.matchAll(dynamicCall)) {
-      const [, callee, , argIdent] = match;
+    for (const match of callable.matchAll(dynamicCall)) {
+      const [, callee, argIdent] = match;
       if (!INVOKE_CALLEE.test(callee)) continue;
       const declRe = new RegExp(
         `(?:^|[^\\w$.])(?:const|let|var)\\s+${escapeRegex(argIdent)}\\s*(?::[^=;\\n]+)?=\\s*(['"\`])([^'"\\\`\n]+)\\1`,
       );
-      const decl = declRe.exec(content);
-      const line = lineNumber(content, match.index);
+      const decl = declRe.exec(callable);
+      const line = lineNumber(callable, match.index);
       if (decl && !decl[2].includes("${")) {
         record(decl[2], { file: relFile, line });
       } else {

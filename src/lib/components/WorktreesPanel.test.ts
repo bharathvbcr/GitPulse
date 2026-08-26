@@ -48,3 +48,24 @@ describe("WorktreesPanel removal safety", () => {
     expect(fn).toContain("await load()");
   });
 });
+
+describe("WorktreesPanel store-emission churn guards", () => {
+  it("keeps exactly one mount trigger for the worktree list load", () => {
+    // The load effect runs on mount; a second onMount(load) double-fetched.
+    expect(source).not.toContain("onMount");
+    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    expect(effect).toContain("void load();");
+  });
+
+  it("memo-guards the load effect so unrelated store emissions are no-ops", () => {
+    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    expect(effect).toContain("if (repo === prevRepoPath && generation === prevGeneration) return;");
+  });
+
+  it("resets the armed remove confirm only on real repo/generation change or unmount", () => {
+    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    expect(effect).toContain("clearTimeout(confirmTimer)");
+    // Clearing the timer without disarming would strand a permanently armed confirm.
+    expect(effect).toContain("removingPath = null;");
+  });
+});

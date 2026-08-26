@@ -59,3 +59,16 @@ describe("StoragePanel rendering", () => {
     expect(body).toContain("Open a repository to measure its disk usage.");
   });
 });
+
+describe("StoragePanel flicker contracts", () => {
+  it("hydrates the cached report before rescanning so revisits render instantly", () => {
+    expect(source).toContain("createRepoPanelCache<StorageReport>()");
+    expect(source).toContain("storageReportCache.set(repoPath, next);");
+    const effectBody = source.slice(source.indexOf("scanned.path = path;"), source.lastIndexOf("</script>"));
+    expect(effectBody).toContain("storageReportCache.get(path) ?? null");
+  });
+
+  it("gates its loading placeholder on having no data yet", () => {
+    expect(source).toContain("{#if loading && !report}");
+  });
+});

@@ -43,13 +43,15 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     let Some(action) = NativeAction::parse(id) else {
         return;
     };
-    let _ = app.emit(
+    if let Err(e) = app.emit(
         MENU_EVENT,
         NativeEvent {
             id: action.event_id().to_string(),
             path: action.path().map(str::to_string),
         },
-    );
+    ) {
+        log::warn!(target: "desktop", "menu event {id} emit failed: {e}");
+    }
 }
 
 pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
@@ -105,7 +107,12 @@ pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
     match find_git_root(path) {
         Some(root) => {
             let root_str = root.to_string_lossy().into_owned();
-            if let Ok(mut pending) = app.state::<DesktopState>().pending_open.lock() {
+            {
+                let desktop_state = app.state::<DesktopState>();
+                let mut pending = desktop_state
+                    .pending_open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *pending = Some(root_str.clone());
             }
             reveal_main(app);
@@ -124,16 +131,25 @@ pub fn queue_and_emit_open<R: Runtime>(app: &AppHandle<R>, path: &Path) {
                 )
                 .is_ok()
             {
-                if let Ok(mut pending) = app.state::<DesktopState>().pending_open.lock() {
-                    *pending = None;
-                }
+                let desktop_state = app.state::<DesktopState>();
+                let mut pending = desktop_state
+                    .pending_open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *pending = None;
             }
         }
         None => {
-            let _ = app.emit(
+            if let Err(e) = app.emit(
                 OPEN_ERROR_EVENT,
                 format!("Not a Git repository: {}", path.display()),
-            );
+            ) {
+                log::warn!(
+                    target: "desktop",
+                    "open-error emit failed for {}: {e}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -147,7 +163,11 @@ fn reveal_main<R: Runtime>(app: &AppHandle<R>) {
 
 #[tauri::command(async)]
 pub fn cmd_take_pending_open(state: State<DesktopState>) -> Option<String> {
-    state.pending_open.lock().ok()?.take()
+    let mut pending = state
+        .pending_open
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.take()
 }
 
 #[tauri::command(async)]

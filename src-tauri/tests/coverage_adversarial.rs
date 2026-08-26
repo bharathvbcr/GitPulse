@@ -287,3 +287,199 @@ fn concurrent_scans_and_details_agree() {
         handle.join().expect("thread must not panic");
     }
 }
+
+/// REGRESSION GUARD (audit M2, user-visible side): the generated-junk flood a
+/// real Python repo produces (htmlcov full of .html pages) used to permanently
+/// show "scan capped" because ANY over-64 probe directory flagged. Junk beyond
+/// the window must not flag; real coverage must still be found.
+#[test]
+fn htmlcov_junk_flood_does_not_flag_scan_capped() {
+    let repo = git_repo();
+    write(repo.path(), "pkg/mod.py", "def f():\n    return 1\n");
+    write(
+        repo.path(),
+        "coverage.xml",
+        r#"<coverage><class filename="pkg/mod.py"><line number="1" hits="4"/><line number="2" hits="0"/></class></coverage>"#,
+    );
+    // 128 = 2 × MAX_DIR_ENTRIES; the const is private to the scanner.
+    for i in 0..128usize {
+        write(
+            repo.path(),
+            &format!("htmlcov/page_{i:03}.html"),
+            "<html></html>\n",
+        );
+    }
+    let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+    assert!(
+        !report.truncated,
+        "junk-only overflow must not flag truncation"
+    );
+    let file = report
+        .files
+        .iter()
+        .find(|f| f.path == "pkg/mod.py")
+        .expect("python coverage must survive the junk flood");
+    assert_eq!(file.lines_hit, 1);
+}
+
+/// Cache invalidation on DELETION: modification and addition were pinned by
+/// other tests; removing an artifact must make it vanish from the next scan
+/// instead of being served stale from the fingerprint cache (an empty
+/// fingerprint — nothing present — must never count as a cache hit).
+#[test]
+fn deleted_artifact_disappears_from_rescan() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
+    );
+    let root = repo.path().to_str().unwrap();
+
+    let first = CoverageScanner::scan(root).expect("first scan");
+    assert!(first.files.iter().any(|f| f.path == "src/lib.rs"));
+
+    fs::remove_file(repo.path().join("lcov.info")).expect("remove artifact");
+
+    let second = CoverageScanner::scan(root).expect("rescan after delete");
+    assert!(
+        !second.artifacts.iter().any(|a| a.path == "lcov.info"),
+        "deleted artifact must vanish entirely: {:?}",
+        second.artifacts
+    );
+    assert!(second.files.is_empty());
+    assert_eq!(second.overall.lines_found, 0);
+}
+
+/// Detail lookups must resolve non-normalized spellings of one and the same
+/// file — Windows separators, "./"-prefixed, trailing slash — onto the
+/// artifact's canonical hit map rather than reporting "no coverage".
+/// (`normalize_rel_path` handles all three forms.)
+#[test]
+fn detail_lookup_accepts_non_normalized_path_forms() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\nfn b() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:src/lib.rs\nDA:1,5\nDA:2,0\nend_of_record\n",
+    );
+    let root = repo.path().to_str().unwrap();
+    let canonical = CoverageScanner::file_coverage(root, "src/lib.rs").expect("canonical detail");
+    assert!(!canonical.lines.is_empty(), "fixture must have data");
+    for form in ["src\\lib.rs", "./src/lib.rs", "src/lib.rs/"] {
+        let detail = CoverageScanner::file_coverage(root, form)
+            .unwrap_or_else(|e| panic!("form {form:?} rejected: {e}"));
+        assert_eq!(detail.path, canonical.path, "{form}: canonical key");
+        assert_eq!(detail.totals, canonical.totals, "{form}");
+        assert_eq!(detail.lines, canonical.lines, "{form}");
+    }
+}
+
+/// lcov SF paths recorded OUTSIDE the repository (a CI machine's build dir)
+/// must map onto the existing repo file via longest-suffix fallback; when
+/// several suffixes exist, the most specific (longest) EXISTING match wins,
+/// deterministically. Pins both the fallback and its ambiguity tradeoff so
+/// either regressing to "no match" or flipping resolution order screams.
+#[test]
+fn lcov_paths_outside_repo_map_via_deterministic_suffix_fallback() {
+    // Foreign absolute prefix falls back to the single existing suffix match.
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:/ci/build/src/lib.rs\nDA:1,3\nend_of_record\n",
+    );
+    let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+    let file = report
+        .files
+        .iter()
+        .find(|f| f.path == "src/lib.rs")
+        .expect("outside path must map onto the existing repo file");
+    assert_eq!(file.lines_hit, 1);
+
+    // Ambiguity: both `crates/src/lib.rs` and `src/lib.rs` exist; the
+    // longest-suffix-first rule must pick `crates/src/lib.rs`, every run.
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    write(repo.path(), "crates/src/lib.rs", "fn b() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:/opt/ci/crates/src/lib.rs\nDA:1,7\nend_of_record\n",
+    );
+    let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+    assert!(
+        report.files.iter().any(|f| f.path == "crates/src/lib.rs"),
+        "longest existing suffix must win: {:?}",
+        report
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !report.files.iter().any(|f| f.path == "src/lib.rs"),
+        "shorter suffix must not steal the match"
+    );
+}
+
+/// Present-before-absent partitioning: static spec paths that don't exist on
+/// disk must never consume the artifact cap, so a parseable artifact late in
+/// the spec order survives even with max_artifacts = 1. The boundary is
+/// pinned too: a PRESENT-but-skipped row does consume the cap.
+#[test]
+fn absent_spec_paths_do_not_starve_late_present_artifacts() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    // Late in the rust spec table; every earlier spec stays absent.
+    write(
+        repo.path(),
+        "target/llvm-cov/cobertura.xml",
+        r#"<coverage><class filename="src/lib.rs"><line number="1" hits="2"/></class></coverage>"#,
+    );
+    let limits = ScanLimits {
+        max_artifacts: 1,
+        ..ScanLimits::default()
+    };
+    let root = repo.path().to_str().unwrap();
+
+    let (report, _) = CoverageScanner::scan_with_limits(root, limits).expect("scan");
+    let row = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == "target/llvm-cov/cobertura.xml")
+        .expect("present artifact must be reached despite tiny cap");
+    assert!(!row.skipped, "{row:?}");
+    assert!(
+        !report.truncated,
+        "absent specs must not burn the cap: {:?}",
+        report.artifacts
+    );
+    assert!(report.files.iter().any(|f| f.path == "src/lib.rs"));
+
+    // Contrast: a PRESENT artifact that gets skipped (binary junk ahead of it
+    // in spec order) DOES consume slot zero of a cap this small.
+    write(
+        repo.path(),
+        "cobertura.xml",
+        "<coverage>\0not really xml</coverage>",
+    );
+    let (report, _) = CoverageScanner::scan_with_limits(root, limits).expect("scan");
+    let junk_row = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == "cobertura.xml")
+        .expect("skipped row still reported");
+    assert!(junk_row.skipped, "{junk_row:?}");
+    assert!(
+        !report
+            .artifacts
+            .iter()
+            .any(|a| a.path == "target/llvm-cov/cobertura.xml" && !a.skipped),
+        "present skipped rows consume the cap (documented boundary)"
+    );
+    assert!(report.truncated);
+}

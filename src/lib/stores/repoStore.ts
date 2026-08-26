@@ -5,7 +5,7 @@ import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import type { BranchInfo, TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
-import { graphStore } from "./graphStore";
+import { graphStore, serverFetchableQuery } from "./graphStore";
 import type { InvokeFn } from "./graphStore";
 import {
   disambiguateLabels,
@@ -39,9 +39,12 @@ import {
   type StorageLike,
   type ViewTab,
 } from "../repos/persist";
+import { summarizeBulkOutcome } from "../repos/bulkOps";
 import {
   STATUS_POLL_INTERVAL_MS,
+  shallowRecordListEqual,
   shouldRunStatusPoll,
+  statusesEqual,
 } from "../repos/statusPoll";
 import { debounce, type Debounced } from "../async/debounce";
 import { beginGeneration } from "../async/guard";
@@ -58,6 +61,9 @@ export interface MutationOutcome<T = unknown> {
 
 export type { BranchInfo, TagInfo, ViewTab };
 export type { InvokeFn };
+
+/** How the current selection was created; decides what a preference flip may refetch. */
+export type SelectionKind = "file" | "commit" | "range";
 
 export interface FileStatus {
   path: string;
@@ -128,6 +134,14 @@ export interface RepoSession {
   selectedFilePath: string | null;
   /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
   selectedIsStaged: boolean;
+  /** Whether `selectedDiff` was fetched with whitespace-only changes ignored. */
+  selectedIgnoreWhitespace: boolean;
+  /**
+   * Internal-only: how the current selection was made. Worktree-file
+   * selections can be refetched when the whitespace preference flips; a
+   * commit/range selection merely records the preference for the next click.
+   */
+  selectionKind: SelectionKind;
   selectedDiff: string | null;
   activeTab: ViewTab;
   searchQuery: string;
@@ -137,6 +151,8 @@ export interface RepoSession {
   isLoading: boolean;
   error: string | null;
   generation: number;
+  /** True once this session's first snapshot has landed and rendered. */
+  hasHydrated: boolean;
   /** True while this session's progressive branch-stats fetch is in flight. */
   statsPending: boolean;
   /**
@@ -160,6 +176,7 @@ export interface RepoState {
   selectedCommitId: string | null;
   selectedFilePath: string | null;
   selectedIsStaged: boolean;
+  selectedIgnoreWhitespace: boolean;
   selectedDiff: string | null;
   activeTab: ViewTab;
   isLoading: boolean;
@@ -224,6 +241,30 @@ export const STATS_DRAIN_MAX_BATCHES = 64;
 export const STATS_PUBLISH_EVERY = 8;
 /** Trailing window that collapses watcher-event storms into one refresh. */
 const WATCHER_REFRESH_DEBOUNCE_MS = 200;
+/**
+ * Watcher events for a repo are dropped for this long after one of our own
+ * mutations succeeds there: they are echoes of the mutation's own `.git`
+ * writes, and honoring them means every mutation costs TWO full refreshes.
+ * The window exceeds Rust DEBOUNCE_MAX_WAIT=2000ms plus this file's 200ms
+ * watcher debounce, so a real echo can never slip past it. Trade-off: an
+ * unrelated external change landing inside the window is picked up by the
+ * next status poll or later watcher event instead of refreshing immediately —
+ * accepted, because it halves per-mutation load.
+ */
+const WATCHER_ECHO_SUPPRESS_MS = 2500;
+/**
+ * Mutation kinds that rewrite what the open worktree diff pane shows (the
+ * staged/unstaged split moves, or the file disappears). After these, the open
+ * selection is refetched so the pane stops displaying pre-mutation content.
+ */
+const REFETCH_SELECTION_KINDS = new Set([
+  "stage",
+  "unstage",
+  "stage-patch",
+  "unstage-patch",
+  "discard",
+  "commit",
+]);
 
 function emptyProjected(): RepoState {
   return {
@@ -240,6 +281,7 @@ function emptyProjected(): RepoState {
     selectedCommitId: null,
     selectedFilePath: null,
     selectedIsStaged: false,
+    selectedIgnoreWhitespace: false,
     selectedDiff: null,
     activeTab: "history",
     isLoading: false,
@@ -268,6 +310,8 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     selectedCommitId: extras.selectedCommitId ?? null,
     selectedFilePath: extras.selectedFilePath ?? null,
     selectedIsStaged: extras.selectedIsStaged ?? false,
+    selectedIgnoreWhitespace: extras.selectedIgnoreWhitespace ?? false,
+    selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
     activeTab: extras.activeTab ?? "history",
     searchQuery: extras.searchQuery ?? "",
@@ -277,6 +321,7 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
     generation: extras.generation ?? nextSessionGeneration(),
+    hasHydrated: extras.hasHydrated ?? false,
     statsPending: extras.statsPending ?? false,
     statsFailed: extras.statsFailed ?? false,
   };
@@ -321,6 +366,7 @@ function project(internal: InternalState): RepoState {
     selectedCommitId: active?.selectedCommitId ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
     selectedIsStaged: active?.selectedIsStaged ?? false,
+    selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
     selectedDiff: active?.selectedDiff ?? null,
     activeTab: active?.activeTab ?? "history",
     isLoading: active?.isLoading ?? false,
@@ -359,6 +405,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // active session could plausibly have drifted.
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let pollInflight = false;
+  /** Monotonic poll ordering; a superseded tick's result is discarded. */
+  let pollSequenceSource = 0;
+  const pollRuns = new Map<string, number>();
 
   // Monotonic token source for diff-selection requests. Session `generation`
   // only moves on tab activation, so it cannot order two rapid selections of
@@ -397,13 +446,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
     const path = session!.path;
     const generation = session!.generation;
+    const sessionId = session!.id;
+    // Ordering tokens: the result must lose to BOTH a newer poll and any
+    // hydrate started after this tick — otherwise a slow poll lands after a
+    // watcher refresh's snapshot and clobbers fresher statuses for up to a
+    // full poll interval.
+    pollSequenceSource += 1;
+    const run = pollSequenceSource;
+    const snapshotRunAtStart = snapshotRuns.get(sessionId);
+    pollRuns.set(sessionId, run);
     pollInflight = true;
     try {
       const statuses = await invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path });
-      applyToSession(session!.id, generation, { statuses });
+      if (pollRuns.get(sessionId) !== run) return;
+      if (snapshotRuns.get(sessionId) !== snapshotRunAtStart) return;
+      // A quiet repo returns byte-identical statuses every 6s; republishing
+      // them would re-run every subscriber effect app-wide (visible churn in
+      // the diff pane). Skip when the session still holds exactly these
+      // statuses — a generation change re-applies via applyToSession below.
+      const live = internal.sessions[sessionId];
+      if (
+        live &&
+        live.generation === generation &&
+        statusesEqual(statuses, live.statuses)
+      ) {
+        return;
+      }
+      applyToSession(sessionId, generation, { statuses });
     } catch {
       /* a repo that vanished reports through the next full refresh */
     } finally {
+      if (pollRuns.get(sessionId) === run) pollRuns.delete(sessionId);
       pollInflight = false;
     }
   }
@@ -486,9 +559,40 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return id ? internal.sessions[id] : undefined;
   }
 
+  /**
+   * True when `patch` would leave the session's RENDERED state untouched.
+   * IPC snapshots arrive with fresh array identities every cycle; without
+   * this gate every watcher refresh republished new root state app-wide,
+   * re-running each subscriber effect even though nothing visible changed.
+   * Array fields compare element-wise over all own keys, so a deep-equal
+   * snapshot is recognized and dropped while any new backend field still
+   * forces a (safe-direction) publish.
+   */
+  function patchIsNoop(session: RepoSession, patch: Partial<RepoSession>): boolean {
+    for (const key of Object.keys(patch) as (keyof RepoSession)[]) {
+      const incoming = patch[key];
+      if (incoming === session[key]) continue;
+      if (
+        Array.isArray(incoming) &&
+        Array.isArray(session[key]) &&
+        shallowRecordListEqual(
+          session[key] as unknown as Record<string, unknown>[],
+          incoming as unknown as Record<string, unknown>[],
+        )
+      ) {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
   function applyToSession(id: string, generation: number, patch: Partial<RepoSession>) {
     const session = internal.sessions[id];
     if (!session || session.generation !== generation) return false;
+    // A no-op patch must not publish: subscribers treat every store emission
+    // as invalidation. Report "advanced" so callers do not retry the work.
+    if (patchIsNoop(session, patch)) return false;
     putSession({ ...session, ...patch });
     publish();
     return true;
@@ -593,13 +697,51 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    */
   const snapshotRuns = new Map<string, number>();
 
+  /**
+   * Folds live churn (branch stats merged after previous drains) into a fresh
+   * snapshot so content-identical cycles compare equal. The backend snapshot
+   * carries bare branches; without this merge every refresh differed from the
+   * enriched live state by `compared_to`/churn fields alone and republished
+   * forever. A branch keeps its live object when name+remote+tip all match —
+   * the same identity the stats drain merges under — and otherwise takes the
+   * snapshot's (tip moved ⇒ stale churn must not survive).
+   */
+  function withCarriedChurn(live: RepoSession, snapshot: {
+    branches: BranchInfo[];
+    statuses: FileStatus[];
+    tags: TagInfo[];
+    currentBranch: string | null;
+    defaultBranch: string | null;
+  }) {
+    if (live.branches.length === 0) return snapshot;
+    const key = (b: Pick<BranchInfo, "name" | "is_remote" | "remote_name">) =>
+      `${b.is_remote ? "remote" : "local"}:${b.remote_name ?? ""}:${b.name}`;
+    const liveByKey = new Map(live.branches.map((b) => [key(b), b]));
+    const branches = snapshot.branches.map((b) => {
+      const carried = liveByKey.get(key(b));
+      return carried && carried.tip_commit_id === b.tip_commit_id ? carried : b;
+    });
+    return { ...snapshot, branches };
+  }
+
   async function hydrate(id: string, path: string, generation: number) {
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
     try {
-      const snapshot = await loadSnapshot(path);
+      const raw = await loadSnapshot(path);
       if (snapshotRuns.get(id) !== run) return;
-      if (applyToSession(id, generation, { ...snapshot, isLoading: false, error: null })) {
+      const live = internal.sessions[id];
+      const snapshot = live ? withCarriedChurn(live, raw) : raw;
+      applyToSession(id, generation, {
+        ...snapshot,
+        isLoading: false,
+        error: null,
+        hasHydrated: true,
+      });
+      // Stats re-drain even when the snapshot was a no-op: a previously
+      // failed drain must retry on the next refresh, and the backend
+      // memoizes per-tip so an unchanged repo costs one cheap call.
+      if (internal.sessions[id]?.generation === generation) {
         void fetchBranchStats(id, path, generation);
       }
     } catch (err: unknown) {
@@ -622,7 +764,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   async function fetchBranchStats(id: string, path: string, generation: number) {
     if (statsInflight.has(id)) return;
     statsInflight.add(id);
-    applyToSession(id, generation, { statsPending: true });
+    // Raise the churn marker only when some branch actually misses stats
+    // (or the last attempt failed): after a completed drain every rendered
+    // row carries stats, and flipping the flag on every refresh cycle made
+    // those markers blink on quiet repos.
+    const liveNow = internal.sessions[id];
+    if (
+      liveNow &&
+      liveNow.generation === generation &&
+      (liveNow.statsFailed || liveNow.branches.some((b) => b.compared_to === undefined))
+    ) {
+      applyToSession(id, generation, { statsPending: true });
+    }
     const start = internal.sessions[id];
     if (!start || start.generation !== generation) {
       statsInflight.delete(id);
@@ -634,6 +787,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     // `failed` lands only on the final settle so a mid-drain hiccup that a
     // later batch recovers from never flashes the failure marker.
     const flush = (pending: boolean, failed: boolean) => {
+      // A settle that changes nothing must not publish: the pending/failed
+      // flip is what makes sidebar churn markers blink on every refresh.
+      const live = internal.sessions[id];
+      if (
+        !dirty &&
+        live &&
+        live.generation === generation &&
+        live.statsPending === pending &&
+        live.statsFailed === failed
+      ) {
+        return;
+      }
       if (dirty) {
         applyToSession(id, generation, { branches, statsPending: pending, statsFailed: failed });
         dirty = false;
@@ -703,6 +868,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // One trailing debounce per changed repo path; a later event re-arms the
   // same timer instead of queueing overlapping refreshes.
   const watcherRefreshTimers = new Map<string, Debounced<[]>>();
+
+  /**
+   * Per-repo deadline until which watcher events count as echoes of our own
+   * just-landed mutation rather than external changes; see
+   * WATCHER_ECHO_SUPPRESS_MS.
+   */
+  const mutationEchoUntil = new Map<string, number>();
 
   function scheduleWatcherRefresh(key: string, run: () => void) {
     let timer = watcherRefreshTimers.get(key);
@@ -822,7 +994,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             name: resolved?.name ?? existing.name,
             isBare: resolved?.is_bare ?? existing.isBare,
             pinned: opened.workspace.tabs.find((tab) => tab.id === opened.id)?.pinned ?? existing.pinned,
-            isLoading: true,
+            isLoading: !existing.hasHydrated,
             error: resolved ? null : String(internal.workspaceError ?? "Repository is unavailable"),
           }
         : createSession(
@@ -884,7 +1056,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       syncFilterFromSession(session);
       const activation = bumped(session);
-      putSession({ ...activation, isLoading: true });
+      // Only a session with nothing rendered yet presents a spinner; a
+      // background refresh of rendered content must not strobe it.
+      putSession({ ...activation, isLoading: !session.hasHydrated });
       publish();
       revealGraph(activation);
       await hydrate(id, session.path, activation.generation);
@@ -1012,11 +1186,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         : activeSession();
       if (!session) return;
       const generation = session.generation;
-      applyToSession(session.id, generation, { isLoading: true, error: null });
+      // Spinner only while nothing is rendered; a rendered error stays until
+      // this refresh's own outcome replaces or retires it (hydrate settle).
+      applyToSession(session.id, generation, { isLoading: !session.hasHydrated });
       await hydrate(session.id, session.path, generation);
       const latest = internal.sessions[session.id];
       if (latest && internal.workspace.activeId === session.id) {
-        void graph.loadGraph(latest.path, latest.searchQuery, latest.selectedBranch);
+        // The backend filters ANY query server-side, but non-path queries are
+        // scheduler keys' no-ops (client-side filtering owns those rows).
+        // Forwarding one here launders filtered rows into the cached payload
+        // for good: clearing the filter reproduces the last-fired key and
+        // nothing refetches.
+        void graph.loadGraph(
+          latest.path,
+          serverFetchableQuery(latest.searchQuery),
+          latest.selectedBranch,
+        );
       }
     },
     handleRepoChanged: async (changedPath?: string | null) => {
@@ -1031,6 +1216,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         sameRepo(item.path, changedPath, options),
       );
       if (!session) return;
+      // Drop echoes of our own recent writes: the explicit refresh() in
+      // runMutating already fetched fresh state, so acting on the echo would
+      // refresh the whole session twice per mutation. An unrelated external
+      // change inside the window is picked up by the next poll or event.
+      const echoUntil = mutationEchoUntil.get(session.path);
+      if (echoUntil !== undefined && Date.now() < echoUntil) return;
       scheduleWatcherRefresh(session.path, () => void store.refresh(session.path));
     },
     restoreWorkspace: async () => {
@@ -1087,10 +1278,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         publish();
       }
     },
-    selectFileDiff: async (filePath: string, isStaged: boolean = false, ignoreWhitespace: boolean = false) => {
+    selectFileDiff: async (filePath: string, isStaged: boolean = false) => {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      // The whitespace preference lives on the session, not on call sites:
+      // every refetch of this diff must carry whatever the user last chose.
+      const ignoreWhitespace = session.selectedIgnoreWhitespace;
       const token = selectionGeneration.next();
       try {
         const diff = await invokeFn<string>("cmd_get_file_diff", {
@@ -1105,12 +1299,42 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedCommitId: null,
           selectedDiff: diff,
           selectedIsStaged: isStaged,
+          selectedIgnoreWhitespace: ignoreWhitespace,
+          selectionKind: "file",
           activeTab: "diff",
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: formatError(err) });
       }
+    },
+    selectFilePath: (filePath: string) => {
+      const session = activeSession();
+      if (!session) return;
+      // Records the shared file selection WITHOUT fetching a diff or moving
+      // tabs: Coverage's file list and Blame's explorer converge on this one
+      // site so the selection survives tab switches, and whichever viewer is
+      // open reacts through its own effect. The diff fetch remains
+      // selectFileDiff's job.
+      applyToSession(session.id, session.generation, {
+        selectedFilePath: filePath,
+        selectedCommitId: null,
+        selectionKind: "file",
+      });
+    },
+    setIgnoreWhitespace: (next: boolean) => {
+      const session = activeSession();
+      if (!session) return;
+      const previous = session.selectedIgnoreWhitespace;
+      if (previous === next) return;
+      // Read the old session's fields BEFORE applyToSession: putSession
+      // replaces the stored object with a fresh immutable copy.
+      const { selectedFilePath: filePath, selectedIsStaged: isStaged, selectionKind } = session;
+      applyToSession(session.id, session.generation, { selectedIgnoreWhitespace: next });
+      // Only worktree-file selections can be refetched with -w; commit/range
+      // selections just record the preference for the next file click.
+      if (selectionKind !== "file" || !filePath) return;
+      void store.selectFileDiff(filePath, isStaged);
     },
     selectCommitDiff: async (commitId: string) => {
       const session = activeSession();
@@ -1128,6 +1352,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: null,
           selectedDiff: diff,
           selectedIsStaged: false,
+          selectionKind: "commit",
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
@@ -1154,6 +1379,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: filePath,
           selectedDiff: fileDiff,
           selectedIsStaged: false,
+          selectionKind: "commit",
           activeTab: "diff",
         });
       } catch (err: unknown) {
@@ -1178,6 +1404,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedCommitId: null,
           selectedDiff: diff,
           selectedIsStaged: false,
+          selectionKind: "range",
           activeTab: "diff",
         });
       } catch (err: unknown) {
@@ -1204,19 +1431,39 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const session = activeSession();
       if (!session) return { ok: false, error: "No active repository" };
       const unstaged = session.statuses.filter((s) => !s.is_staged);
+      // One refresh cycle after the whole batch: per-file refreshes ran N
+      // sequential spinner/progress storms for what is one user action.
+      const outcomes: MutationOutcome[] = [];
       for (const f of unstaged) {
-        await runMutating("stage", f.path, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }));
+        outcomes.push(
+          await runMutating(
+            "stage",
+            f.path,
+            (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }),
+            { skipRefresh: true },
+          ),
+        );
       }
-      return { ok: true };
+      if (unstaged.length > 0) await store.refresh(session.path);
+      return summarizeBulkOutcome(outcomes, "staged");
     },
     unstageAll: async () => {
       const session = activeSession();
       if (!session) return { ok: false, error: "No active repository" };
       const staged = session.statuses.filter((s) => s.is_staged);
+      const outcomes: MutationOutcome[] = [];
       for (const f of staged) {
-        await runMutating("unstage", f.path, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath: f.path }));
+        outcomes.push(
+          await runMutating(
+            "unstage",
+            f.path,
+            (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath: f.path }),
+            { skipRefresh: true },
+          ),
+        );
       }
-      return { ok: true };
+      if (staged.length > 0) await store.refresh(session.path);
+      return summarizeBulkOutcome(outcomes, "unstaged");
     },
     discardChanges: async (filePath: string) =>
       runMutating("discard", filePath, (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath })),
@@ -1265,11 +1512,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     stashSave: async (message?: string) =>
       runMutating("stash", message ?? "", (path) => invokeFn("cmd_stash_save", { repoPath: path, message })),
     stashPop: async () => runMutating("unstash", "", (path) => invokeFn("cmd_stash_pop", { repoPath: path })),
-    selectFilePath: (filePath: string) => {
-      const session = activeSession();
-      if (!session) return;
-      applyToSession(session.id, session.generation, { selectedFilePath: filePath });
-    },
     setActiveTab: (tab: ViewTab) => {
       const session = activeSession();
       if (!session) return;
@@ -1286,6 +1528,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedFilePath: null,
         selectedDiff: null,
         selectedIsStaged: false,
+        selectionKind: "commit",
         activeTab: "history",
       });
       flushPersist();
@@ -1316,7 +1559,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   async function runMutating<T = unknown>(
     kind: string,
     label: string,
-    action: (path: string) => Promise<unknown>
+    action: (path: string) => Promise<unknown>,
+    opts: { skipRefresh?: boolean } = {}
   ): Promise<MutationOutcome<T>> {
     const session = activeSession();
     if (!session) return { ok: false, error: "No repository is open." };
@@ -1324,11 +1568,30 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const generation = session.generation;
     try {
       const result = await action(path);
+      // Arm the echo window BEFORE anything downstream observes the change:
+      // the mutation's own `.git` writes are about to bounce back as watcher
+      // events (see WATCHER_ECHO_SUPPRESS_MS).
+      mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
       const policy = recordPolicyVerdict(result);
       harnessStore.recordAction({ kind, label, ok: true, verdict: policy ?? null });
       const still = internal.sessions[session.id];
-      if (still && still.generation === generation) {
+      if (still && still.generation === generation && !opts.skipRefresh) {
         await store.refresh(path);
+        // The refresh updates statuses/branches but nothing refetches the
+        // open diff pane, which would otherwise show pre-mutation content
+        // (e.g. after partial staging) until the user clicked elsewhere.
+        // Commit/range selections have no worktree diff to refetch — and
+        // neither does a closed diff pane: refetching one unconditionally
+        // would yank the user back to Diff from wherever they navigated.
+        if (
+          REFETCH_SELECTION_KINDS.has(kind) &&
+          still.selectionKind === "file" &&
+          still.selectedFilePath &&
+          !still.selectedCommitId &&
+          still.activeTab === "diff"
+        ) {
+          void store.selectFileDiff(still.selectedFilePath, still.selectedIsStaged);
+        }
       }
       const output = mutationOutput<T>(result);
       return output === undefined ? { ok: true, policy } : { ok: true, policy, output };

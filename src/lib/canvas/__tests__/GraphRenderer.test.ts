@@ -80,14 +80,15 @@ describe("GraphRenderer and Palette", () => {
   });
 
 
-  it("calculates getRowY correctly for absolute and relative scrolls", () => {
+  it("calculates getRowY correctly for scrolled viewports", () => {
     const renderer = new GraphRenderer({ rowHeight: 36 });
     // Row 0 at scrollTop = 0 -> center is 18
-    expect(renderer.getRowY(0, 0, 0, true)).toBe(18);
+    expect(renderer.getRowY(0, 0)).toBe(18);
     // Row 1 at scrollTop = 36 -> center is 36 + 18 - 36 = 18
-    expect(renderer.getRowY(1, 1, 36, true)).toBe(18);
-    // Relative scroll calculation
-    expect(renderer.getRowY(2, 0, 10, false)).toBe(2 * 36 + 18 - 10);
+    expect(renderer.getRowY(1, 36)).toBe(18);
+    // With startIndex 0 the old relative branch coincided with absolute:
+    // row 2 scrolled 10px -> center is 2*36 + 18 - 10.
+    expect(renderer.getRowY(2, 10)).toBe(2 * 36 + 18 - 10);
   });
 
   it("calculates getLaneX correctly", () => {
@@ -146,7 +147,7 @@ describe("GraphRenderer and Palette", () => {
 
     // Row 5 centre in content space is 5*36+18 = 198. After 180px of scroll
     // that node sits at viewport y 18 — the same place row 0 occupies at rest.
-    expect(renderer.getRowY(5, 0, 180, true)).toBe(18);
+    expect(renderer.getRowY(5, 180)).toBe(18);
     const hit = renderer.getCommitAtPoint(20, 18, rows, 0, 10, 180);
     expect(hit?.id).toBe("c5");
 
@@ -490,8 +491,7 @@ describe("GraphRenderer and Palette", () => {
     expect(overlay.bezierCurveTo).not.toHaveBeenCalled(); // no connectors either
   });
 
-  it("reuses module scratch state without leaking between consecutive renders", () => {
-    const renderer = new GraphRenderer();
+  it("reuses module scratch state without leaking between consecutive renders", () => {    const renderer = new GraphRenderer();
     const rows: VisualCommitRow[] = [
       {
         id: "a",
@@ -600,7 +600,7 @@ describe("drawDanglingStubs overlay API", () => {
 
     renderer.drawDanglingStubs(ctx, rows, 0, 1, 0);
 
-    const tipY = renderer.getRowY(0, 0, 0, true);
+    const tipY = renderer.getRowY(0, 0);
     const x = renderer.getLaneX(0);
     expect(moves[0]).toEqual([x, tipY]);
     expect(lines[0][1]).toBeCloseTo(tipY + 36 * 0.62 * 0.6, 5);
@@ -654,8 +654,7 @@ describe("drawDanglingStubs overlay API", () => {
 });
 
 /** Records every path op so two renders can be compared byte-for-byte. */
-function createRecordingContextForScratch() {
-  const calls: Array<{ op: string; args: unknown[] }> = [];
+function createRecordingContextForScratch() {  const calls: Array<{ op: string; args: unknown[] }> = [];
   const record = (op: string) => (...args: unknown[]) => calls.push({ op, args });
   return {
     calls,
@@ -680,3 +679,94 @@ function createRecordingContextForScratch() {
     } as unknown as CanvasRenderingContext2D,
   };
 }
+
+describe("long connectors: strip/overlay ownership split", () => {
+  /** 400 plain rows plus one merge edge spanning row 5 -> row 300 (offset 295). */
+  function longEdgeRows() {
+    const rows: VisualCommitRow[] = Array.from({ length: 400 }, (_, i) => ({
+      id: `c${i}`,
+      parent_ids: [],
+      summary: `Commit ${i}`,
+      author_name: "Dev",
+      author_email: "dev@example.com",
+      timestamp: 1000 - i,
+      lane: 0,
+      color_index: 0,
+      active_lanes: [0],
+      active_lane_colors: [0],
+      connections: [],
+      is_merge: false,
+      is_root: i === 399,
+    }));
+    rows[5].parent_ids = ["c300"];
+    rows[5].connections.push({
+      from_lane: 0,
+      to_lane: 1,
+      to_row_offset: 295,
+      is_merge: true,
+      color_index: 3,
+    });
+    return rows;
+  }
+
+  it("strip painting skips long connectors — they cannot be baked across seams", () => {
+    const renderer = new GraphRenderer();
+    const ctx = createMockContext();
+    renderer.render(ctx, longEdgeRows(), 290, 310, 300 * 36, undefined, {
+      skipLongConnectors: true,
+    });
+    // The window's own rows have no connections at all; a baked long edge
+    // would be the ONLY source of moveTo/bezier ops here.
+    expect(ctx.bezierCurveTo).not.toHaveBeenCalled();
+  });
+
+  it("direct renders draw the whole long edge via the exact index window", () => {
+    const renderer = new GraphRenderer();
+    // Viewport over rows ~295-315; the edge's child sits at row 5, far above
+    // every fixed lookback. Default options (no skip) must still stroke it.
+    const ctx = createMockContext();
+    renderer.render(ctx, longEdgeRows(), 295, 315, 295 * 36);
+    expect(ctx.bezierCurveTo).toHaveBeenCalled();
+  });
+
+  it("drawLongConnectors strokes edges landing in view and repairs overlapped nodes", () => {
+    const renderer = new GraphRenderer();
+    const rows = longEdgeRows();
+    const ctx = createMockContext();
+    let strokesAfterEdges = 0;
+    let sawBezier = false;
+    (ctx.stroke as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      strokesAfterEdges += 1;
+    });
+    (ctx.bezierCurveTo as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      sawBezier = true;
+    });
+
+    renderer.drawLongConnectors(ctx, rows, 295, 315, 295 * 36, 800, {});
+
+    expect(sawBezier).toBe(true); // corner-at-start geometry for merge edges
+    // Repair pass re-stamps cutout + body for both endpoints: fills happen
+    // after the connector stroke, restoring nodes-over-edges layering.
+    expect((ctx.fill as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0);
+    expect(strokesAfterEdges).toBeGreaterThan(2);
+  });
+
+  it("drawLongConnectors is silent when no long edge touches the window", () => {
+    const renderer = new GraphRenderer();
+    const rows = longEdgeRows();
+    const ctx = createMockContext();
+    renderer.drawLongConnectors(ctx, rows, 10, 30, 10 * 36, 800, {});
+    expect(ctx.stroke).not.toHaveBeenCalled();
+    expect(ctx.fill).not.toHaveBeenCalled();
+  });
+
+  it("drawLongConnectors culls edges entirely outside the viewport band", () => {
+    const renderer = new GraphRenderer();
+    const rows = longEdgeRows();
+    const ctx = createMockContext();
+    // Window whose rows sit far below row 300 with a tiny viewport: the
+    // edge spans rows 5-300, viewport shows y of rows 350+ only.
+    renderer.drawLongConnectors(ctx, rows, 350, 370, 350 * 36, 36, {});
+    expect(ctx.stroke).not.toHaveBeenCalled();
+  });
+});

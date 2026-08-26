@@ -145,10 +145,24 @@ pub fn sweep(explicit: Option<&str>) -> Vec<DiscoveredEndpoint> {
 
     let handles: Vec<_> = candidates
         .into_iter()
-        .map(|url| std::thread::spawn(move || list_models(&url)))
+        .map(|url| {
+            let probe_url = url.clone();
+            let handle = std::thread::spawn(move || list_models(&probe_url));
+            (url, handle)
+        })
         .collect();
 
-    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    let mut endpoints = Vec::with_capacity(handles.len());
+    for (url, handle) in handles {
+        match handle.join() {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(_) => log::warn!(
+                target: "ai::discovery",
+                "model-discovery probe thread panicked for endpoint {url}"
+            ),
+        }
+    }
+    endpoints
 }
 
 /// The first reachable endpoint, preferring one that serves `preferred_model`.

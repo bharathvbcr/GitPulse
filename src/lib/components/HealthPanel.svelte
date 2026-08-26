@@ -1,7 +1,22 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import type {
+    DepsHealthReport,
+    DependabotReport,
+  } from "../health/types";
+
+  // Survives the per-tab remount so revisiting the Health view renders the
+  // last scan instantly; the fetch then refreshes it in place.
+  const healthCache = createRepoPanelCache<{
+    deps: DepsHealthReport;
+    dependabot: DependabotReport;
+  }>();
+</script>
+
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { openUrl } from "@tauri-apps/plugin-opener";
+  import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,
     RefreshCw,
@@ -25,9 +40,7 @@
   import { formatHealthReport, skippedAudits } from "../health/report";
   import { extractPlanSteps, tokenizeCommand } from "../terminal/tokenize";
   import type {
-    DepsHealthReport,
     Vulnerability,
-    DependabotReport,
   } from "../health/types";
   import {
     formatAuditCounts,
@@ -37,6 +50,7 @@
     updateKindClass,
   } from "../health/format";
   import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
@@ -111,6 +125,9 @@
   /** Audits that could not run because their CLI was missing. */
   let skipped = $derived(report ? skippedAudits(report) : []);
 
+  /** True only when the backend recorded at least one scanner dispatch. */
+  let auditsRan = $derived((report?.scanners_ran ?? []).length > 0);
+
   /** Open Dependabot alerts, for the header badge. */
   let openDependabotCount = $derived(
     dependabot?.available ? dependabot.alerts.length : 0,
@@ -171,6 +188,9 @@
             truncated: false,
             error: formatError(alerts.reason),
           };
+    if (deps.status === "fulfilled") {
+      healthCache.set(repoPath, { deps: deps.value, dependabot });
+    }
     if (guard.isLive()) loading = false;
   }
 
@@ -334,18 +354,24 @@
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    // Hydrate last-known data synchronously so a revisit renders instantly
+    // (the placeholder below only fires when there is no cached report).
+    const cached = healthCache.get(path);
+    if (cached) {
+      report = cached.deps;
+      dependabot = cached.dependabot;
+    }
     void scan(path);
   });
 
   async function openExternal(url: string) {
-    // No window.open fallback: inside a Tauri webview it can navigate the
-    // app shell itself, and these URLs come from advisory/GitHub payloads.
-    // If the opener plugin fails, surfacing the failure beats handing the
-    // webview to an arbitrary URL.
+    // The shared opener throws on failure (no window.open fallback: inside a
+    // Tauri webview it can navigate the app shell itself). Surface it
+    // in-place on the panel error banner and in the diagnostics ring.
     try {
-      await openUrl(url);
+      await openExternalUrl(url);
     } catch (err) {
-      console.error("openUrl failed for", url, err);
+      errorMsg = reportPanelError("health", err);
     }
   }
 </script>
@@ -437,7 +463,7 @@
       <span class="font-semibold text-textPrimary">Health</span>
       {#if report}
         <span class="text-textMuted truncate">
-          {formatAuditCounts(report.audit)}
+          {formatAuditCounts(report.audit, { ran: auditsRan })}
           {#if report.outdated.length > 0}
             · {report.outdated.length} outdated
           {/if}
@@ -642,7 +668,8 @@
               <button
                 type="button"
                 onclick={() => void scan()}
-                class="gp-btn !py-1 text-xs shrink-0"
+                disabled={loading}
+                class="gp-btn !py-1 text-xs shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="Rescan repository health"
               >
                 <RefreshCw size={11} class={loading ? "animate-spin" : ""} />

@@ -290,6 +290,33 @@ pub fn health_fix_user(report: &str) -> String {
     )
 }
 
+/// System prompt for turning rendered test-coverage findings into a
+/// prioritized analysis and action plan.
+pub fn coverage_report_system() -> String {
+    String::from(
+        "You turn test-coverage findings into an analysis a developer can act on.\n\
+         Rules:\n\
+         - Reply with a short prose summary of overall coverage health first.\n\
+         - Then give a numbered plan of concrete steps. Where a step is a command, show the\n\
+           exact command in an inline code span.\n\
+         - Use only what the report shows. Never invent percentages, file names or counts; when\n\
+           the report says artifacts are missing or skipped, address generating them instead of\n\
+           pretending the data exists.\n\
+         - Order steps by impact: the lowest-percentage and largest uncovered areas first, and\n\
+           say which language each step concerns.\n\
+         - End with one short verification step the developer can run to confirm progress.",
+    )
+}
+
+/// User turn carrying the rendered test-coverage report.
+pub fn coverage_report_user(report: &str) -> String {
+    format!(
+        "Test-coverage report for this repository:\n\n```\n{}\n```\n\n\
+         Write the coverage analysis.",
+        report
+    )
+}
+
 /// System prompt for branch-name suggestion.
 pub fn branch_name_system() -> String {
     String::from(
@@ -568,5 +595,21 @@ mod tests {
         let user = health_fix_user("REPORT BODY");
         assert!(user.contains("```\nREPORT BODY\n```"));
         assert!(user.ends_with("Write the remediation plan."));
+    }
+
+    /// The frontend parses numbered steps with backtick commands into runnable
+    /// actions, so the system prompt must demand inline code spans, and it
+    /// must forbid invented numbers — a coverage analysis full of percentages
+    /// the report never stated is worse than none.
+    #[test]
+    fn coverage_report_prompts_bind_the_plan_to_the_report() {
+        let system = coverage_report_system();
+        assert!(system.contains("inline code span"));
+        assert!(system.contains("Never invent percentages"));
+        assert!(system.contains("verification step"));
+
+        let user = coverage_report_user("REPORT BODY");
+        assert!(user.contains("```\nREPORT BODY\n```"));
+        assert!(user.ends_with("Write the coverage analysis."));
     }
 }

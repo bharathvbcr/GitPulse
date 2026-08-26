@@ -26,6 +26,13 @@ export interface GraphCacheInputs {
   themeSignature: string;
   /** Device pixel ratio the strips are rasterized at. */
   dpr: number;
+  /**
+   * Theme background painted into each strip before geometry. Strip surfaces
+   * are opaque (`alpha:false`) and zero-initialize to black; without this
+   * fill every blit pastes black bands over the themed visible canvas —
+   * glaring on light themes, banding/strobing as strips evict on dark ones.
+   */
+  backgroundCssColor?: string;
 }
 
 /** Structural equality; a changed field means "drop every strip". */
@@ -36,14 +43,16 @@ export function sameCacheInputs(a: GraphCacheInputs | null, b: GraphCacheInputs)
     a.cssWidth === b.cssWidth &&
     a.densitySignature === b.densitySignature &&
     a.themeSignature === b.themeSignature &&
-    a.dpr === b.dpr
+    a.dpr === b.dpr &&
+    a.backgroundCssColor === b.backgroundCssColor
   );
 }
 
 /** Stable, human-readable key — mainly an aid for debugging and tests. */
 export function computeCacheKey(inputs: GraphCacheInputs): string {
   const dpr = Number(inputs.dpr.toFixed(4));
-  return `${inputs.dataVersion}:${inputs.cssWidth}:${inputs.densitySignature}:${inputs.themeSignature}:${dpr}`;
+  const bg = inputs.backgroundCssColor ?? "none";
+  return `${inputs.dataVersion}:${inputs.cssWidth}:${inputs.densitySignature}:${inputs.themeSignature}:${dpr}:${bg}`;
 }
 
 /** One stable signature string for a resolved theme. */
@@ -61,6 +70,13 @@ export interface StripPaintRequest {
   stripTopCss: number;
   /** CSS height of the strip surface, for culling. */
   viewportCssHeight: number;
+  /**
+   * CSS width of the strip surface. Surfaces are allocated with
+   * `alpha: false`, so every pixel starts BLACK until painted — painters must
+   * fill the full rect with the theme background before drawing content or
+   * light themes show opaque black bands behind the graph.
+   */
+  cssWidth: number;
 }
 
 /**
@@ -168,6 +184,13 @@ export function createGraphStaticCache(
   let stripRenders = 0;
   /** Insertion-ordered map doubles as the LRU list (oldest first). */
   const strips = new Map<number, CachedSurface>();
+  /**
+   * Rows actually painted into each live strip, parallel to `strips`. A strip
+   * cached when totalRows was smaller covers fewer rows than its bucket now
+   * claims; without this record the blit would silently clip to the old
+   * texture and report coverage over a hole.
+   */
+  const paintedRows = new Map<number, number>();
 
   function computeRowsPerStrip(): number {
     if (rowHeight <= 0) return 0;
@@ -190,6 +213,7 @@ export function createGraphStaticCache(
       const oldest = strips.entries().next();
       if (oldest.done) break;
       strips.delete(oldest.value[0]);
+      paintedRows.delete(oldest.value[0]);
       oldest.value[1].release?.();
     }
   }
@@ -199,11 +223,22 @@ export function createGraphStaticCache(
     if (strips.size === 0) return;
     for (const surface of strips.values()) surface.release?.();
     strips.clear();
+    paintedRows.clear();
   }
 
   function ensureStrip(index: number): CachedSurface | null {
     const cached = strips.get(index);
-    if (cached) return touch(index, cached);
+    if (cached) {
+      // A texture painted when totalRows was smaller covers fewer rows than
+      // its bucket claims after a grow; blitting it would report coverage
+      // over an unpainted hole, so repaint instead of trusting the cache.
+      const needed = Math.min(rowsPerStrip, totalRows - index * rowsPerStrip);
+      if ((paintedRows.get(index) ?? 0) >= needed) {
+        return touch(index, cached);
+      }
+      strips.delete(index);
+      cached.release?.();
+    }
 
     if (!inputs) return null;
     const firstRow = index * rowsPerStrip;
@@ -216,6 +251,7 @@ export function createGraphStaticCache(
       const oldest = strips.entries().next();
       if (!oldest.done) {
         strips.delete(oldest.value[0]);
+        paintedRows.delete(oldest.value[0]);
         oldest.value[1].release?.();
       }
     }
@@ -226,16 +262,28 @@ export function createGraphStaticCache(
 
     const scale = inputs.dpr > 0 ? inputs.dpr : 1;
     surface.ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    // Opaque surfaces zero-initialize to black; prime with the theme
+    // background BEFORE geometry so blits composite as the page does.
+    if (inputs.backgroundCssColor) {
+      surface.ctx.fillStyle = inputs.backgroundCssColor;
+      surface.ctx.fillRect(0, 0, inputs.cssWidth, cssHeight);
+    }
     painter({
       ctx: surface.ctx,
       firstRow,
       rowCount,
       stripTopCss: firstRow * rowHeight,
       viewportCssHeight: cssHeight,
+      cssWidth: inputs.cssWidth,
     });
     stripRenders += 1;
 
     strips.set(index, surface);
+    // Record the coverage this texture actually carries: a later sync that
+    // only GROWS totalRows keeps old strips, and the cache-hit path below
+    // must repaint any whose texture covers fewer rows than its bucket
+    // would now claim.
+    paintedRows.set(index, rowCount);
     evictOverflow();
     return surface;
   }
@@ -256,7 +304,12 @@ export function createGraphStaticCache(
     if (!usable() || !inputs) return false;
     const dpr = inputs.dpr;
 
-    const viewTop = req.contentTopCss;
+    // Elastic overscroll reports negative scrollTop (macOS rubber-band does
+    // not honor overscroll-behavior for an element's own bounce). Clamping to
+    // zero keeps the first strip at its natural offset — the content rides
+    // down with the bounce — instead of computing strip index -1, allocating
+    // a junk surface, and blitting a blank band over the header rows.
+    const viewTop = Math.max(0, req.contentTopCss);
     const viewBottom = viewTop + req.viewportHeightCss;
     const contentBottom = totalRows * rowHeight;
     const clippedBottom = Math.min(viewBottom, contentBottom);

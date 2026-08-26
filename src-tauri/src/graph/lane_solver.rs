@@ -175,7 +175,8 @@ impl LaneSolver {
                         // A merged-in branch is drawn to the right of the
                         // commit that merges it, so its edge fans out rather
                         // than crossing back over the lanes to its left.
-                        let free_col = self.find_or_create_free_column_from(current_lane + 1);
+                        let free_col =
+                            self.find_or_create_free_column_strictly_after(current_lane + 1);
                         let color = self.allocate_color();
                         self.active_columns[free_col] = Some(parent_id.clone());
                         self.column_colors[free_col] = color;
@@ -266,6 +267,31 @@ impl LaneSolver {
         }
         if let Some(free_idx) = self.active_columns.iter().position(|col| col.is_none()) {
             return free_idx;
+        }
+        self.active_columns.push(None);
+        self.column_colors.push(0);
+        self.active_columns.len() - 1
+    }
+
+    /// The first free column at or after `min_col`, pushing a brand-new column
+    /// when none is free there — never a column below `min_col`.
+    ///
+    /// The loose search's fallback to lower columns exists to keep first-parent
+    /// chains compact, but for a merged-in branch it would place the branch to
+    /// the LEFT of the commit that merges it as soon as every column to the
+    /// right is taken while a lower one has been recycled — dragging its edge
+    /// back across all the lanes in between and breaking the merged-branch-
+    /// right invariant above. Only second-and-later parents use this variant;
+    /// first-parent and own-column placement keep the loose search because
+    /// graph compactness matters there.
+    fn find_or_create_free_column_strictly_after(&mut self, min_col: usize) -> usize {
+        if min_col < self.active_columns.len() {
+            if let Some(offset) = self.active_columns[min_col..]
+                .iter()
+                .position(|col| col.is_none())
+            {
+                return min_col + offset;
+            }
         }
         self.active_columns.push(None);
         self.column_colors.push(0);
@@ -421,5 +447,41 @@ mod tests {
             lanes_used.insert(row.lane);
         }
         assert_eq!(lanes_used.len(), 10);
+    }
+
+    /// Regression (merged-branch-right invariant): when every column right of
+    /// a merge commit is occupied and a lower column has freed up, the loose
+    /// free-column search handed the merged branch a lane LEFT of the merge,
+    /// dragging its edge back across every lane in between.
+    ///
+    /// Shape that triggers it: `e` hands `m` its own high lane; `y`'s own row
+    /// frees a lower lane just before `m` renders; and `m`'s first parent `z`
+    /// already lives on lane 0, so `m`'s just-cleared lane stays empty when
+    /// the second parent is placed — which the loose search then grabs.
+    #[test]
+    fn test_second_parent_never_lands_left_of_the_merge_commit() {
+        let mut solver = LaneSolver::new(12);
+        let commits = vec![
+            make_commit("b1", vec!["z"]),     // b1 takes lane 0; z inherits lane 0
+            make_commit("h", vec!["y"]),      // h takes lane 1; y inherits lane 1
+            make_commit("e", vec!["m"]),      // e takes lane 2; m is pre-assigned lane 2
+            make_commit("y", vec![]),         // y's own row frees lane 1
+            make_commit("m", vec!["z", "t"]), // merge at lane 2; z already lives on lane 0
+            make_commit("z", vec![]),
+            make_commit("t", vec![]),
+        ];
+        let rows = solver.solve(&commits);
+        let merge_row = rows.iter().find(|r| r.id == "m").expect("merge row");
+        let merge_edge = merge_row
+            .connections
+            .iter()
+            .find(|c| c.is_merge)
+            .expect("merge commit has a second-parent edge");
+        assert!(
+            merge_edge.to_lane > merge_edge.from_lane,
+            "merged branch went to lane {} from lane {}",
+            merge_edge.to_lane,
+            merge_edge.from_lane
+        );
     }
 }

@@ -15,15 +15,15 @@ use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, TagInfo, WorktreeInfo,
 };
 use crate::github::{
-    checkout_pull_request, create_issue, discover_github_remote, gh_repo_flags,
-    load_dependabot_alerts, load_github_context, validate_issue_payload, DependabotReport,
-    GitHubContext,
+    checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
+    load_dependabot_alerts, load_github_context, pr_checkout_argv, validate_issue_payload,
+    DependabotReport, GitHubContext,
 };
 use crate::graph::{
     BezierGeometryCalculator, BranchFoldingEngine, CubicBezierCurve, FoldedBranchRun, LaneSolver,
     VisualCommitRow,
 };
-use crate::stack::{StackTreeEngine, StackedBranchNode};
+use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -105,8 +105,12 @@ pub async fn cmd_get_commit_graph(
 ) -> Result<CommitGraphPayload, String> {
     off_thread(move || {
         // One row over the cap: the extra row is the has_more probe and is
-        // dropped before lanes are solved.
-        let fetch_limit = max_commits.clamp(1, GitReader::MAX_HISTORY_COMMITS) + 1;
+        // dropped before lanes are solved. This arithmetic and the reader's
+        // page_count_limit clamp must stay in lockstep — if the clamp swallows
+        // the extra row, has_more dies at exactly MAX_HISTORY_COMMITS and a
+        // ceiling-scale repository truncates silently (both helpers carry
+        // tests pinning their side of the contract).
+        let fetch_limit = graph_fetch_limit(max_commits);
         let repo = repo_path.clone();
         let rev = revision.clone();
         // History is the long pole; HEAD and ref decorations are independent of
@@ -146,10 +150,14 @@ pub async fn cmd_get_commit_graph(
             .map(CommitFilter::parse)
             .unwrap_or_default();
         if let Some(ref path) = filter.path {
-            let touching: HashSet<String> =
-                GitReader::commits_touching_path(&repo_path, path, fetch_limit)?
-                    .into_iter()
-                    .collect();
+            let touching: HashSet<String> = GitReader::commits_touching_path(
+                &repo_path,
+                path,
+                fetch_limit,
+                revision.as_deref(),
+            )?
+            .into_iter()
+            .collect();
             raw_commits.retain(|c| touching.contains(&c.id));
         }
         if !filter.is_empty() {
@@ -171,6 +179,12 @@ pub async fn cmd_get_commit_graph(
         })
     })
     .await
+}
+
+/// Rows to request from the history walker for one graph page: the user's cap
+/// plus one has_more probe row (dropped before lanes are solved).
+fn graph_fetch_limit(max_commits: usize) -> usize {
+    max_commits.clamp(1, GitReader::MAX_HISTORY_COMMITS) + 1
 }
 
 #[tauri::command(async)]
@@ -498,6 +512,11 @@ pub async fn cmd_get_file_blame(
 }
 
 #[tauri::command(async)]
+pub async fn cmd_list_repo_files(repo_path: String) -> Result<Vec<String>, String> {
+    off_thread(move || GitReader::list_repo_files(&repo_path)).await
+}
+
+#[tauri::command(async)]
 pub async fn cmd_rebase_interactive(
     repo_path: String,
     onto_commit: String,
@@ -540,15 +559,24 @@ pub async fn cmd_rebase_interactive(
 #[tauri::command(async)]
 pub async fn cmd_get_stack_hierarchy(
     repo_path: String,
-    default_branch: String,
-) -> Result<Vec<StackedBranchNode>, String> {
+) -> Result<crate::stack::StackHierarchyPayload, String> {
     off_thread(move || {
         let branches = GitReader::list_branches(&repo_path)?;
+        // Ground truth for the root designation comes from the backend, not a
+        // frontend guess: list_branches already resolved the default branch
+        // from the primary remote's HEAD (origin, gitlab, company forks all
+        // resolve). A nonexistent name here would leave every node rootless.
+        let locals: Vec<&BranchInfo> = branches.iter().filter(|b| !b.is_remote).collect();
+        let default_branch = locals
+            .iter()
+            .find(|b| b.is_default)
+            .or_else(|| locals.iter().find(|b| b.is_current))
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "main".to_string());
+
         let mut branch_tips = HashMap::new();
-        for b in branches {
-            if !b.is_remote {
-                branch_tips.insert(b.name, b.tip_commit_id);
-            }
+        for b in &locals {
+            branch_tips.insert(b.name.clone(), b.tip_commit_id.clone());
         }
 
         let raw_commits = GitReader::read_commit_history(&repo_path, 2000, None)?;
@@ -557,11 +585,61 @@ pub async fn cmd_get_stack_hierarchy(
             commit_parents.insert(c.id, c.parent_ids);
         }
 
-        Ok(StackTreeEngine::build_stack_hierarchy(
-            &branch_tips,
-            &commit_parents,
-            &default_branch,
-        ))
+        let mut nodes =
+            StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, &default_branch);
+
+        // Deep-history repair: the global window truncates long-lived repos,
+        // which used to silently misreport deep-stacked branches as roots.
+        // Each still-unresolved branch gets ONE bounded first-parent walk that
+        // stops at any known tip; discovered edges are merged into the parent
+        // map and the hierarchy is rebuilt once. A walk that exhausts its cap
+        // leaves the branch honestly parentless — no invented hierarchy.
+        const WALK_CAP: usize = GitReader::MAX_HISTORY_COMMITS;
+        let tip_oids: HashSet<String> = branch_tips.values().cloned().collect();
+        let mut enriched = false;
+        for node in &nodes {
+            if node.parent_branch_name.is_some() || node.branch_name == default_branch {
+                continue;
+            }
+            let mut stop_at = tip_oids.clone();
+            stop_at.remove(&node.tip_commit_id);
+            if let Ok(Some(chain)) =
+                GitReader::first_parent_chain(&repo_path, &node.tip_commit_id, &stop_at, WALK_CAP)
+            {
+                for edge in chain.windows(2) {
+                    // Never overwrite richer multi-parent data already
+                    // present from the global window.
+                    commit_parents
+                        .entry(edge[1].clone())
+                        .or_insert_with(|| vec![edge[0].clone()]);
+                }
+                enriched = true;
+                // Ok(None) (cap exhausted) and Err (git failed) leave the
+                // branch honestly parentless rather than inventing a base.
+            }
+        }
+        if enriched {
+            nodes = StackTreeEngine::build_stack_hierarchy(
+                &branch_tips,
+                &commit_parents,
+                &default_branch,
+            );
+        }
+
+        // The breadcrumb trail describes the checked-out branch's ancestry;
+        // with nothing checked out it degrades to the default branch.
+        let focus = locals
+            .iter()
+            .find(|b| b.is_current)
+            .map(|b| b.name.as_str())
+            .unwrap_or(default_branch.as_str());
+        let breadcrumb = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, focus);
+
+        Ok(crate::stack::StackHierarchyPayload {
+            nodes,
+            breadcrumb,
+            default_branch,
+        })
     })
     .await
 }
@@ -733,16 +811,28 @@ pub async fn cmd_restack(
     onto: String,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        // GitWriter::restack executes `rebase --onto <onto> <upstream>
-        // <branch>` after resolving upstream from the reflog; the gate sees
-        // that full line, not a truncated prefix. The resolution mirrors
-        // restack's exactly (fork-point, then plain merge-base, then onto);
-        // residual TOCTOU: HEAD could move between this read and the
-        // writer's own re-resolution under the mutation lock.
-        let planned = restack_planned_argv(&repo_path, &branch, &onto)?;
-        let refs: Vec<&str> = planned.iter().map(String::as_str).collect();
-        let policy = guard(&repo_path, &refs)?;
-        let output = GitWriter::restack(&repo_path, &branch, &onto)?;
+        // Plan, judge, and execute under ONE mutation-lock span: the upstream
+        // resolved here is frozen into both the argv the gate judges and the
+        // argv GitWriter executes, so the verdict can no longer describe a
+        // line that did not run (the old plan-then-lock TOCTOU).
+        let repo = validate_repo(&repo_path)?;
+        let repo_lock = crate::engine::git_writer::repo_mutation_lock(&repo);
+        let _lock_guard = repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        validate_ref_name(&branch)?;
+        validate_ref_name(&onto)?;
+        let upstream = GitWriter::prepare_restack(&repo, &branch, &onto)?;
+        let planned = [
+            "git",
+            "rebase",
+            "--onto",
+            onto.as_str(),
+            upstream.as_str(),
+            branch.as_str(),
+        ];
+        let policy = guard(&repo_path, &planned)?;
+        let output = GitWriter::execute_restack(&repo, &branch, &onto, &upstream)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -789,8 +879,10 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
             repo: String::new(),
             html_url: String::new(),
             pull_requests: Vec::new(),
+            prs_truncated: false,
             workflow_runs: Vec::new(),
             runs_error: None,
+            runs_truncated: false,
             error: Some(e),
             issues: Vec::new(),
             issues_error: None,
@@ -828,34 +920,17 @@ pub async fn cmd_github_create_issue(
     labels: Vec<String>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
+        // Validate before anything external runs, then judge the exact argv
+        // create_issue executes — built once by the shared `issue_create_argv`
+        // builder (program name included) and consumed by both the gate and
+        // the executor, so the judged line can never drift from the run one.
         validate_issue_payload(&title, &body, &labels)?;
-        // Judge the exact argv create_issue runs. github::run_gh appends the
-        // remote pinning flags (--repo, and --hostname off github.com) after
-        // the user-shaped arguments, so they are part of the executed line
-        // and belong in the judged one too.
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
-        let mut argv = vec![
-            "gh".to_string(),
-            "issue".to_string(),
-            "create".to_string(),
-            "--title".to_string(),
-            title.trim().to_string(),
-            "--body".to_string(),
-            body.clone(),
-        ];
-        for label in labels
-            .iter()
-            .map(|label| label.trim())
-            .filter(|label| !label.is_empty())
-        {
-            argv.push("--label".to_string());
-            argv.push(label.to_string());
-        }
-        argv.extend(gh_repo_flags(&remote));
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let argv_owned = issue_create_argv(&remote, &title, &body, &labels);
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
-        let output = create_issue(&repo_path, &title, &body, &labels)?;
+        let output = create_issue(&repo_path, &remote, &title, &body, &labels)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -867,19 +942,16 @@ pub async fn cmd_github_checkout_pr(
     number: u64,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let n = number.to_string();
-        // checkout_pull_request runs `gh pr checkout <n> --repo <slug>
-        // [--hostname <host>]`; the pinning flags are judged with it. A
-        // missing GitHub remote fails here exactly as it would inside
-        // checkout_pull_request, just before the gate instead of after.
+        // pr_checkout_argv refuses a fabricated number before discovery, so
+        // an invalid request never produces a judged-but-unexecutable line.
+        // One remote discovery feeds both the gate and the executor: the
+        // `--repo` the gate approved is exactly the one gh is pinned to.
         let remote = discover_github_remote(&repo_path)?
             .ok_or_else(|| "No GitHub remote configured".to_string())?;
-        let mut argv_owned: Vec<String> =
-            vec!["gh".into(), "pr".into(), "checkout".into(), n.clone()];
-        argv_owned.extend(gh_repo_flags(&remote));
+        let argv_owned = pr_checkout_argv(&remote, number)?;
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
-        let output = checkout_pull_request(&repo_path, number)?;
+        let output = checkout_pull_request(&repo_path, &remote, number)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -1080,7 +1152,13 @@ pub async fn cmd_watch_repo(
     state: State<'_, WatcherState>,
     repo_path: String,
 ) -> Result<String, String> {
-    start_watch(app, &state, repo_path)
+    // start_watch shells out to git (validate_repo, resolve_git_dir/common
+    // dir) and installs OS watches — the same blocking profile as every other
+    // reader command, so it belongs on the blocking pool rather than an async
+    // worker thread. WatcherState is an Arc-backed Clone; snapshot it so the
+    // 'static closure does not borrow the request-scoped State.
+    let watcher_state = state.inner().clone();
+    off_thread(move || start_watch(app, &watcher_state, repo_path)).await
 }
 
 #[tauri::command(async)]
@@ -1396,37 +1474,6 @@ fn rebase_planned_commands(
     Ok(planned)
 }
 
-/// The full argv [`GitWriter::restack`] executes, including the upstream it
-/// resolves from the reflog (fork-point, plain merge-base, then onto).
-/// Mirrors that private resolution; residual TOCTOU between this read and the
-/// writer's re-resolution under the mutation lock is accepted and documented
-/// at the call site.
-fn restack_planned_argv(repo_path: &str, branch: &str, onto: &str) -> Result<Vec<String>, String> {
-    let repo = validate_repo(repo_path)?;
-    validate_ref_name(branch)?;
-    validate_ref_name(onto)?;
-    let upstream = [
-        vec!["merge-base", "--fork-point", onto, branch],
-        vec!["merge-base", onto, branch],
-    ]
-    .into_iter()
-    .find_map(|argv| {
-        git_text(&repo, &argv)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-    .unwrap_or_else(|| onto.to_string());
-    Ok(vec![
-        "git".into(),
-        "rebase".into(),
-        "--onto".into(),
-        onto.into(),
-        upstream,
-        branch.into(),
-    ])
-}
-
 /// Degraded status used when the probe task itself failed to run (pool join
 /// error). Mirrors the shape `HarnessStatus::probe` produces for a dead
 /// sidecar, so the UI cannot tell the two apart by structure.
@@ -1537,6 +1584,17 @@ pub async fn cmd_ai_fix_health(
     off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
 }
 
+#[tauri::command(async)]
+pub async fn cmd_ai_coverage_report(
+    repo_path: String,
+    report: String,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<crate::ai::AiGeneration, String> {
+    off_thread(move || crate::ai::coverage_report(&repo_path, &report, selection(base_url, model)))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,6 +1652,21 @@ mod tests {
         assert_eq!(reworded_message("subject only", "new"), "new");
     }
 
+    /// Lockstep contract with GitReader::page_count_limit: the probe row this
+    /// fetch-limit appends must survive the reader's clamp, including at
+    /// exactly MAX_HISTORY_COMMITS, or has_more dies at the ceiling.
+    #[test]
+    fn graph_fetch_limit_yields_the_probe_row_even_at_the_ceiling() {
+        let max = GitReader::MAX_HISTORY_COMMITS;
+        assert_eq!(
+            graph_fetch_limit(max),
+            max + 1,
+            "probe row must exist at exactly the ceiling"
+        );
+        assert_eq!(graph_fetch_limit(max + 10), max + 1);
+        assert_eq!(graph_fetch_limit(0), 2);
+    }
+
     fn init_repo_with_branch_commits() -> (tempfile::TempDir, String, String, String) {
         let dir = tempfile::TempDir::new().unwrap();
         let git = |args: &[&str]| {
@@ -1624,6 +1697,21 @@ mod tests {
         git(&["commit", "-m", "B"]);
         let c_b = git(&["rev-parse", "HEAD"]);
         (dir, base, c_a, c_b)
+    }
+
+    /// Bare git runner for tests that only need a side effect (no output).
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The planned sequence for pick+squash on a branch mirrors
@@ -1773,33 +1861,19 @@ mod tests {
         assert!(err.contains("Invalid revision"), "{err}");
     }
 
-    /// The restack planner resolves the same upstream restack does (here:
-    /// the fork base of feature from main) and renders the full four-arg
-    /// rebase line, not a prefix.
+    /// The restack upstream resolver finds the fork point (here: where feature
+    /// branched from main) and refuses invalid refs before anything is judged.
+    /// The full rebase line is assembled in [`cmd_restack`] from this frozen
+    /// value under one lock span, so planner and executor cannot drift.
     #[test]
-    fn restack_planned_argv_includes_resolved_upstream() {
+    fn restack_upstream_resolution_resolves_fork_point() {
         let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            String::from_utf8(output.stdout).unwrap().trim().to_string()
-        };
-        git(&["branch", "feature", &base]);
-        let argv = restack_planned_argv(dir.path().to_str().unwrap(), "feature", "main").unwrap();
-        assert_eq!(
-            argv.iter().take(4).map(String::as_str).collect::<Vec<_>>(),
-            vec!["git", "rebase", "--onto", "main"]
-        );
-        assert_eq!(argv.len(), 6);
-        assert_eq!(argv[5], "feature");
-        // Upstream resolves to the fork point (the common ancestor), a full oid.
-        assert_eq!(argv[4], base, "upstream must resolve to the fork base");
+        run_git(dir.path(), &["branch", "feature", &base]);
+        let canon = validate_repo(dir.path().to_str().unwrap()).unwrap();
+        let upstream = GitWriter::prepare_restack(&canon, "feature", "main").unwrap();
+        assert_eq!(upstream, base, "upstream must resolve to the fork base");
         // Invalid refs are refused before anything is rendered or judged.
-        assert!(restack_planned_argv(dir.path().to_str().unwrap(), "-evil", "main").is_err());
+        assert!(GitWriter::prepare_restack(&canon, "-evil", "main").is_err());
     }
 }
 

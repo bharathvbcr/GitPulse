@@ -4,7 +4,7 @@ use crate::engine::git_cli::{run_captured, validate_repo, RunOutcome};
 use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -59,6 +59,10 @@ pub struct TerminalExitPayload {
 struct SessionEntry {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    /// Signal handle for the shell, split off the child before the owned
+    /// child moves into the reader thread. Keeps kill_session able to
+    /// terminate the process and prevents an unreapable zombie.
+    killer: Box<dyn ChildKiller + Send>,
     dead: Arc<AtomicBool>,
 }
 
@@ -78,6 +82,60 @@ fn default_shell() -> String {
 }
 
 static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Snapshot of the parts of [`portable_pty::ExitStatus`] the exit event
+/// reports, extracted so the finalize logic is unit-testable without
+/// spawning a real PTY-backed process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitStatusLike {
+    code: u32,
+    signal: Option<String>,
+}
+
+impl From<&portable_pty::ExitStatus> for ExitStatusLike {
+    fn from(status: &portable_pty::ExitStatus) -> Self {
+        // On Unix a signal death surfaces as a fallback code (see vendored
+        // lib.rs From<std::process::ExitStatus>) plus Some(signal name), so
+        // both fields carry honest data.
+        ExitStatusLike {
+            code: status.exit_code(),
+            signal: status.signal().map(str::to_string),
+        }
+    }
+}
+
+/// Reaps the shell and emits exactly one authoritative "terminal-exit" event.
+///
+/// `wait` blocks until the child terminates; the reader thread calls this only
+/// after the master side hit EOF/error/dead-flag, so the child is already gone
+/// or dying. A successful wait reports the real exit code — on Unix a killed
+/// shell yields the fallback code with the signal name attached — while a
+/// failed wait degrades honestly to `exit_code: None` instead of inventing a
+/// status.
+fn finalize_pty_session<E, W>(session_id: &str, wait: W, mut emit: E)
+where
+    W: FnOnce() -> std::io::Result<ExitStatusLike>,
+    E: FnMut(TerminalExitPayload),
+{
+    let (exit_code, signal) = match wait() {
+        Ok(status) => (
+            Some(i32::try_from(status.code).unwrap_or(-1)),
+            status.signal.unwrap_or_default(),
+        ),
+        Err(e) => {
+            log::warn!(
+                target: "terminal",
+                "terminal session '{session_id}': could not reap shell process: {e}"
+            );
+            (None, String::new())
+        }
+    };
+    emit(TerminalExitPayload {
+        id: session_id.to_string(),
+        exit_code,
+        signal,
+    });
+}
 
 /// Spawns a PTY session running an interactive shell in `repo_path`.
 pub fn spawn_session(
@@ -103,10 +161,14 @@ pub fn spawn_session(
     let mut cmd = CommandBuilder::new(&shell);
     cmd.cwd(&repo);
 
-    let _child = pair
+    // The child handle is owned: the killer is split off for SessionEntry
+    // (kill_session), and the child itself moves into the reader thread,
+    // which reaps it after EOF so no zombie survives.
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("Failed to spawn shell '{shell}': {e}"))?;
+    let killer: Box<dyn ChildKiller + Send> = child.clone_killer();
 
     // Drop slave explicitly; master remains open.
     drop(pair.slave);
@@ -126,6 +188,7 @@ pub fn spawn_session(
     let entry = SessionEntry {
         master: pair.master,
         writer,
+        killer,
         dead: dead.clone(),
     };
 
@@ -153,31 +216,39 @@ pub fn spawn_session(
                     Ok(0) => break,
                     Ok(n) => {
                         let data_b64 = BASE64_STANDARD.encode(&buf[..n]);
-                        let _ = app_handle.emit(
+                        if let Err(e) = app_handle.emit(
                             "terminal-output",
                             TerminalOutputPayload {
                                 id: sid_for_thread.clone(),
                                 data_b64,
                             },
-                        );
+                        ) {
+                            log::warn!(
+                                target: "terminal",
+                                "failed to emit terminal-output for '{sid_for_thread}': {e}"
+                            );
+                        }
                     }
                     Err(_) => break,
                 }
             }
 
             dead_flag.store(true, Ordering::SeqCst);
-            // Clean up session entry from map.
-            if let Ok(mut guard) = sessions_map.lock() {
-                guard.remove(&sid_for_exit);
-            }
+            // Clean up session entry from map; a poisoned lock (a sibling
+            // panicked mid-write) must not skip cleanup or reaping.
+            let mut guard = sessions_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&sid_for_exit);
 
-            // Emit exit event.
-            let _ = app_handle.emit(
-                "terminal-exit",
-                TerminalExitPayload {
-                    id: sid_for_exit,
-                    exit_code: None,
-                    signal: String::new(),
+            // Reap the shell and report its real exit status.
+            finalize_pty_session(
+                &sid_for_exit,
+                move || child.wait().map(|status| ExitStatusLike::from(&status)),
+                |payload| {
+                    if let Err(e) = app_handle.emit("terminal-exit", payload) {
+                        log::warn!(target: "terminal", "failed to emit terminal-exit event: {e}");
+                    }
                 },
             );
         })
@@ -244,17 +315,28 @@ pub fn resize_session(
 }
 
 /// Kills a PTY session.
+///
+/// Signals the shell via the split [`ChildKiller`] handle, then drops the
+/// master/writer (hanging up the PTY). The reader thread observes EOF, waits
+/// the killed child, and emits the real exit status — so the process is
+/// reaped rather than left as a zombie.
 pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
     let mut guard = state
         .sessions
         .lock()
         .map_err(|e| format!("Lock error: {e}"))?;
-    if let Some(session) = guard.remove(session_id) {
+    if let Some(mut session) = guard.remove(session_id) {
         session.dead.store(true, Ordering::SeqCst);
-        Ok(())
-    } else {
-        Ok(())
+        // Best-effort signal; a failure here is logged but must not fail the
+        // kill — dropping the PTY master still hangs up the slave side.
+        if let Err(e) = session.killer.kill() {
+            log::warn!(
+                target: "terminal",
+                "kill: could not signal shell of terminal session '{session_id}': {e}"
+            );
+        }
     }
+    Ok(())
 }
 
 /// One-shot bounded command execution in `repo_path`.
@@ -486,5 +568,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PTY-free tests for the post-EOF finalize logic: the exit payload must
+    /// carry the real status when wait succeeds and degrade honestly to
+    /// `exit_code: None` when reaping fails.
+    #[test]
+    fn finalize_propagates_clean_exit_code() {
+        let mut emitted = Vec::new();
+        finalize_pty_session(
+            "term-t1",
+            || {
+                Ok(ExitStatusLike {
+                    code: 0,
+                    signal: None,
+                })
+            },
+            |p| emitted.push(p),
+        );
+        assert_eq!(emitted.len(), 1, "exactly one exit event");
+        assert_eq!(emitted[0].id, "term-t1");
+        assert_eq!(emitted[0].exit_code, Some(0));
+        assert_eq!(emitted[0].signal, "");
+    }
+
+    #[test]
+    fn finalize_propagates_nonzero_exit_code() {
+        let mut emitted = Vec::new();
+        finalize_pty_session(
+            "term-t2",
+            || {
+                Ok(ExitStatusLike {
+                    code: 127,
+                    signal: None,
+                })
+            },
+            |p| emitted.push(p),
+        );
+        assert_eq!(emitted[0].exit_code, Some(127));
+    }
+
+    #[test]
+    fn finalize_surfaces_signal_name_from_status() {
+        let mut emitted = Vec::new();
+        finalize_pty_session(
+            "term-t3",
+            || {
+                Ok(ExitStatusLike {
+                    code: 1,
+                    signal: Some("Hangup".to_string()),
+                })
+            },
+            |p| emitted.push(p),
+        );
+        assert_eq!(emitted[0].exit_code, Some(1));
+        assert_eq!(emitted[0].signal, "Hangup");
+    }
+
+    #[test]
+    fn finalize_reports_unknown_exit_when_wait_fails() {
+        let mut emitted = Vec::new();
+        finalize_pty_session(
+            "term-t4",
+            || Err(std::io::Error::other("waitpid failed")),
+            |p| emitted.push(p),
+        );
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0].exit_code, None,
+            "failed reap must not invent a status"
+        );
+        assert_eq!(emitted[0].signal, "");
+    }
+
+    /// The adapter must mirror the vendored portable-pty ExitStatus exactly:
+    /// plain deaths expose `exit_code()`, signal deaths keep the fallback code
+    /// plus the signal name (vendored lib.rs `From<std::process::ExitStatus>`).
+    #[test]
+    fn exit_status_like_adapter_matches_vendored_api() {
+        let ok = portable_pty::ExitStatus::with_exit_code(42);
+        let like = ExitStatusLike::from(&ok);
+        assert_eq!(
+            like,
+            ExitStatusLike {
+                code: 42,
+                signal: None
+            }
+        );
+
+        let killed = portable_pty::ExitStatus::with_signal("Terminated");
+        let like = ExitStatusLike::from(&killed);
+        assert_eq!(like.code, 1, "vendored fallback code for signals is 1");
+        assert_eq!(like.signal.as_deref(), Some("Terminated"));
+    }
+
+    /// kill_session on an unknown id stays a silent no-op success — killing a
+    /// session that already exited (and was removed by its reader thread) must
+    /// not surface as an error to the frontend.
+    #[test]
+    fn kill_session_of_unknown_id_is_ok_noop() {
+        let state = TerminalSessions::default();
+        assert!(kill_session(&state, "term-missing").is_ok());
     }
 }

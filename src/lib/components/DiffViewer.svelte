@@ -1,3 +1,12 @@
+<script lang="ts" module>
+  // One cache per app: re-parses only when selectedDiff's string identity
+  // changes, so unrelated store publications cost O(1) and the exact parsed
+  // row objects survive (keeping memoized word-diff segments attached).
+  import { createParseCache } from "../diff/wordDiff";
+
+  const parseCache = createParseCache();
+</script>
+
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
@@ -11,14 +20,13 @@
     computeWordDiff,
     emptyDiffCopy,
     isImagePath,
-    parseUnifiedDiff,
+    replacementBlockBounds,
     type AnnotatedDiffLine,
   } from "../diff/wordDiff";
   import {
     buildFilePatchForHunk,
     buildFilePatchFromLines,
   } from "../diff/patchBuilder";
-  import { decideWhitespaceRefetch } from "../diff/whitespaceToggle";
 
   interface FileBlob {
     path: string;
@@ -37,20 +45,24 @@
   const MAX_RENDER_LINES = 300_000;
 
   let viewMode = $state<"unified" | "split">("unified");
-  let ignoreWhitespace = $state(false);
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
   let selectedLines = $state<Set<number>>(new Set());
   let dragAnchor = $state<number | null>(null);
   let isDragging = $state(false);
 
-  let allLines = $derived(parseUnifiedDiff($repoStore.selectedDiff || ""));
+  let allLines = $derived(parseCache.parse($repoStore.selectedDiff));
   let truncatedSource = $derived(allLines.length > MAX_RENDER_LINES);
   let lines = $derived(truncatedSource ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
-  // Metadata and binary notices are chrome, not content: they must not move
-  // the "N lines" stat any more than they move the line-number gutters.
+  // Only add/del/ctx rows are diff lines: hdr/meta/binary are chrome, so the
+  // "N lines" stat means what a diff reader expects it to mean (and an empty
+  // parse — no rows at all — reaches the EmptyState branch).
   let contentLineCount = $derived(
-    lines.reduce((count, line) => (line.type === "meta" || line.type === "binary" ? count : count + 1), 0)
+    lines.reduce(
+      (count, line) =>
+        line.type === "add" || line.type === "del" || line.type === "ctx" ? count + 1 : count,
+      0
+    )
   );
 
   let isWorkingTreeFile = $derived(
@@ -58,15 +70,6 @@
       $repoStore.statuses.some((s) => s.path === $repoStore.selectedFilePath)
   );
   let isStaged = $derived($repoStore.selectedIsStaged);
-
-  $effect(() => {
-    // Reset selection when switching files or diff contents
-    $repoStore.selectedFilePath;
-    $repoStore.selectedDiff;
-    selectedLines = new Set();
-    isDragging = false;
-    dragAnchor = null;
-  });
 
   function lineSelectable(index: number): boolean {
     const line = lines[index];
@@ -146,23 +149,28 @@
    * replacement blocks are paired as a unit (min(del, add) lines), not just
    * the first adjacent pair.
    */
-  function replacementBlockBounds(index: number): [number, number] | null {
-    const line = lines[index];
-    if (!line || (line.type !== "del" && line.type !== "add")) return null;
-    let start = index;
-    while (start > 0 && lines[start - 1].type === "add") start -= 1;
-    while (start > 0 && lines[start - 1].type === "del") start -= 1;
-    let end = index + 1;
-    while (end < lines.length && lines[end].type === "del") end += 1;
-    while (end < lines.length && lines[end].type === "add") end += 1;
-    return [start, end];
-  }
+  // Per-render memo for the block bounds of the visible window: consecutive
+  // rows inside one large replacement block reuse the bounds computed by the
+  // first row (O(1) per row instead of O(block)). Keyed on the array
+  // identity so a genuinely new diff recomputes from scratch.
+  let lastBoundsBlock: { source: AnnotatedDiffLine[]; start: number; end: number } | null = null;
 
   function unifiedRow(index: number): AnnotatedDiffLine | undefined {
     const line = lines[index];
     if (!line) return undefined;
-    const bounds = replacementBlockBounds(index);
-    if (bounds) annotateRange(lines, bounds[0], bounds[1]);
+    const cached =
+      lastBoundsBlock &&
+      lastBoundsBlock.source === lines &&
+      index >= lastBoundsBlock.start &&
+      index < lastBoundsBlock.end
+        ? lastBoundsBlock
+        : null;
+    const bounds = cached
+      ? [cached.start, cached.end]
+      : replacementBlockBounds(lines, index);
+    if (!bounds) return line;
+    if (!cached) lastBoundsBlock = { source: lines, start: bounds[0], end: bounds[1] };
+    annotateRange(lines, bounds[0], bounds[1]);
     return line;
   }
 
@@ -236,61 +244,53 @@
   let unifiedScroll = $state(0);
   let splitScroll = $state(0);
 
+  // One guarded reset keyed on the composite identity of the shown diff.
+  // repoStore republishes a fresh object on every background poll (~6s) but
+  // these fields stay referentially equal, so the key only changes when the
+  // user actually switches file, commit, staged side, or whitespace mode —
+  // each of which swaps the fetched contents. This is what keeps scroll from
+  // jumping to the top and selections from vanishing mid-drag.
+  let viewKey = $state<string | null>(null);
+
   $effect(() => {
-    void $repoStore.selectedFilePath;
-    void $repoStore.selectedCommitId;
+    const key = [
+      $repoStore.selectedFilePath,
+      $repoStore.selectedCommitId,
+      $repoStore.selectedIsStaged,
+      $repoStore.selectedIgnoreWhitespace,
+    ].join("\u0000");
+    if (key === viewKey) return;
+    viewKey = key;
+    selectedLines = new Set();
+    isDragging = false;
+    dragAnchor = null;
     unifiedScroll = 0;
     splitScroll = 0;
   });
 
-  let prevIgnore = $state(false);
-  let prevSelectedPath = $state<string | null>(null);
-  let prevCommitId = $state<string | null>(null);
-  let prevStaged = $state(false);
-
-  $effect(() => {
-    const currentPath = $repoStore.selectedFilePath;
-    const currentCommit = $repoStore.selectedCommitId;
-    const currentStaged = $repoStore.selectedIsStaged;
-    const pathChanged =
-      currentPath !== prevSelectedPath ||
-      currentCommit !== prevCommitId ||
-      currentStaged !== prevStaged;
-    const ignoreChanged = ignoreWhitespace !== prevIgnore;
-
-    if (!pathChanged && !ignoreChanged) return;
-
-    prevIgnore = ignoreWhitespace;
-    prevSelectedPath = currentPath;
-    prevCommitId = currentCommit;
-    prevStaged = currentStaged;
-
-    if (!ignoreWhitespace && !ignoreChanged) return;
-
-    const decision = decideWhitespaceRefetch({
-      filePath: currentPath,
-      commitId: currentCommit,
-      statuses: $repoStore.statuses,
-      isStaged: currentStaged,
-    });
-    if (!decision.refetch || !$repoStore.currentPath) return;
-    repoStore.selectFileDiff(
-      currentPath as string,
-      decision.isStaged,
-      ignoreWhitespace
-    );
-  });
+  // Key of the blob request that currently owns oldSrc/newSrc. Memo-guarded
+  // like the reset above: re-downloading both image versions on every store
+  // emission is pure waste, so only a real repo/file/commit change refetches.
+  // Staleness is dropped by comparing the request key, NOT by effect
+  // teardown — Svelte runs the previous teardown before every re-run,
+  // memo hits included, which would cancel in-flight fetches that are still
+  // current.
+  let imageBlobKey = $state<string | null>(null);
 
   $effect(() => {
     const path = $repoStore.selectedFilePath;
     const repo = $repoStore.currentPath;
     const commitId = $repoStore.selectedCommitId;
-    if (!showingImage || !path || !repo) {
+    const key =
+      showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
+    if (key === imageBlobKey) return;
+    imageBlobKey = key;
+    if (!key) {
       oldSrc = null;
       newSrc = null;
       return;
     }
-    let cancelled = false;
+    const requestKey = key;
     (async () => {
       const blobUrl = (blob: FileBlob | null): string | null => {
         if (!blob?.base64) return null;
@@ -312,20 +312,17 @@
         } catch {
           oldBlob = null;
         }
-        if (!cancelled) {
+        if (imageBlobKey === requestKey) {
           newSrc = blobUrl(newBlob);
           oldSrc = blobUrl(oldBlob);
         }
       } catch {
-        if (!cancelled) {
+        if (imageBlobKey === requestKey) {
           oldSrc = null;
           newSrc = null;
         }
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   });
 </script>
 
@@ -344,7 +341,12 @@
 
     <div class="flex items-center gap-3">
       <label class="flex items-center gap-1.5 text-textMuted cursor-pointer hover:text-textPrimary text-xs font-sans">
-        <input type="checkbox" bind:checked={ignoreWhitespace} class="rounded bg-surface border-border text-accent focus:ring-0" />
+        <input
+          type="checkbox"
+          checked={$repoStore.selectedIgnoreWhitespace}
+          onchange={(e) => repoStore.setIgnoreWhitespace(e.currentTarget.checked)}
+          class="rounded bg-surface border-border text-accent focus:ring-0"
+        />
         <span>Ignore Whitespace</span>
       </label>
 
@@ -401,6 +403,10 @@
               {#if isWorkingTreeFile && line.content.startsWith("@@")}
                 <button
                   onclick={() => stageHunk(index)}
+                  disabled={truncatedSource}
+                  title={truncatedSource
+                    ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
+                    : undefined}
                   class="ml-2 shrink-0 px-2 py-0.5 text-[10px] rounded bg-surface border border-border/80 text-accent hover:bg-accent/15 transition-colors font-sans"
                 >
                   {isStaged ? "Unstage Hunk" : "Stage Hunk"}

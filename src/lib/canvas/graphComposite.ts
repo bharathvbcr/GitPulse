@@ -56,6 +56,7 @@ export function paintGraphFrame(
       densitySignature: req.densitySignature,
       themeSignature: themeSignatureOf(req.theme),
       dpr: req.dpr,
+      backgroundCssColor: req.theme.background,
     },
     { rowHeight, totalRows: req.rows.length },
   );
@@ -77,6 +78,22 @@ export function paintGraphFrame(
     req.scrollTop,
     req.heightCss,
   );
+
+  // Long connectors are likewise overlay-owned: a span beyond LOOKBACK_ROWS
+  // cannot be baked into tiles without its middle landing on no strip seam
+  // contract, so when strips covered the frame the overlay supplies those
+  // edges whole here (the bypass path below draws everything itself).
+  if (staticBlitted) {
+    renderer.drawLongConnectors(
+      ctx,
+      req.rows,
+      req.startIndex,
+      req.endIndex,
+      req.scrollTop,
+      req.heightCss,
+      { theme: req.theme },
+    );
+  }
 
   renderer.render(
     ctx,
