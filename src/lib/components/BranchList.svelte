@@ -25,7 +25,8 @@
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
   import { clampMenuPosition } from "../branches/menuPosition";
-  import { parsePinned, pinnedKey, serializePinned } from "../branches/pins";
+  import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
+  import { browserStorage } from "../repos/persist";
   import { branchRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
   import { densityStore } from "../stores/densityStore";
   import { portal } from "../dom/portal";
@@ -216,9 +217,10 @@
   function savePinned() {
     const path = $repoStore.currentPath;
     if (!path) return;
-    try {
-      localStorage.setItem(pinnedKey(path), serializePinned(pinnedNames));
-    } catch {}
+    // saveRepoPins writes the blob and bumps the repo to the front of the
+    // pinned-index (MRU), which is what lets prunePinnedIndex later evict
+    // stale repos' keys without knowing their paths up front.
+    saveRepoPins(browserStorage(), path, serializePinned(pinnedNames));
   }
 
   function locateCurrentBranch() {
@@ -565,6 +567,10 @@
   });
 
   onMount(() => {
+    // One-shot eviction sweep: bounds the per-repo pin keys on disk even if
+    // the user never pins anything this session (a lazy first-save hook
+    // would leave stale repos' keys accumulating forever).
+    prunePinnedIndex(browserStorage());
     window.addEventListener("click", onWindowClick);
     window.addEventListener("contextmenu", onWindowContextmenu);
     window.addEventListener("resize", onWindowResize);

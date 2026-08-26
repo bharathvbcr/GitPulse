@@ -48,6 +48,13 @@ pub struct CommitGraphPayload {
     /// True when the walk hit its row cap and older commits exist. The client
     /// offers "load more" instead of silently hiding the rest of history.
     pub has_more: bool,
+    /// Degradations recorded while assembling this payload: probes that failed
+    /// without failing the load (HEAD resolution, ref decoration listing), so a
+    /// degraded facet is never indistinguishable from an honest empty set.
+    /// Same shape as `AiGeneration::warnings`; `default` keeps payloads from
+    /// before this field deserializable.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[tauri::command(async)]
@@ -111,12 +118,13 @@ pub async fn cmd_get_commit_graph(
         // ceiling-scale repository truncates silently (both helpers carry
         // tests pinning their side of the contract).
         let fetch_limit = graph_fetch_limit(max_commits);
+        let mut warnings: Vec<String> = Vec::new();
         let repo = repo_path.clone();
         let rev = revision.clone();
         // History is the long pole; HEAD and ref decorations are independent of
         // it, so they run concurrently instead of serializing three walks behind
         // one another on a large repository.
-        let (history, head_id, refs) = std::thread::scope(|scope| {
+        let (history, head, refs) = std::thread::scope(|scope| {
             let history = scope.spawn(move || {
                 GitReader::read_commit_history_paged(
                     &repo,
@@ -126,18 +134,53 @@ pub async fn cmd_get_commit_graph(
                 )
             });
             let repo2 = repo_path.clone();
-            let head = scope.spawn(move || GitReader::head_id(&repo2).ok());
+            let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
-            let refs =
-                scope.spawn(move || crate::graph::list_ref_decorations(&repo3).unwrap_or_default());
+            let refs = scope.spawn(move || crate::graph::list_ref_decorations(&repo3));
             (
                 history
                     .join()
                     .unwrap_or_else(|_| Err("history walker panicked".into())),
-                head.join().unwrap_or(None),
-                refs.join().unwrap_or_default(),
+                head.join(),
+                refs.join(),
             )
         });
+        // A failed HEAD or decoration probe degrades exactly one facet of an
+        // otherwise-good payload; record it instead of rendering a fallback
+        // indistinguishable from an honest empty set (ai's warnings pattern).
+        let head_id = match head {
+            Ok(Ok(id)) => Some(id),
+            Ok(Err(err)) => {
+                warnings
+                    .push(format!("HEAD unavailable ({err}); commit graph may lack the HEAD marker"));
+                None
+            }
+            Err(_) => {
+                warnings.push(
+                    "background task failed (thread panic): HEAD probe died; commit graph may \
+                     lack the HEAD marker"
+                        .into(),
+                );
+                None
+            }
+        };
+        let refs = match refs {
+            Ok(Ok(refs)) => refs,
+            Ok(Err(err)) => {
+                warnings.push(format!(
+                    "ref decorations unavailable ({err}); branches/tags will not be labeled"
+                ));
+                Vec::new()
+            }
+            Err(_) => {
+                warnings.push(
+                    "background task failed (thread panic): ref decoration walk died; \
+                     branches/tags will not be labeled"
+                        .into(),
+                );
+                Vec::new()
+            }
+        };
 
         let mut raw_commits = history?;
         let has_more = raw_commits.len() > max_commits;
@@ -176,6 +219,7 @@ pub async fn cmd_get_commit_graph(
             head_id,
             refs,
             has_more,
+            warnings,
         })
     })
     .await
@@ -1874,6 +1918,33 @@ mod tests {
         assert_eq!(upstream, base, "upstream must resolve to the fork base");
         // Invalid refs are refused before anything is rendered or judged.
         assert!(GitWriter::prepare_restack(&canon, "-evil", "main").is_err());
+    }
+
+    /// The payload carries assembly warnings through a serde round trip when
+    /// present, and a payload from before the field existed still deserializes
+    /// to an empty vec instead of failing (the `#[serde(default)]` contract).
+    #[test]
+    fn commit_graph_payload_round_trips_warnings() {
+        let warning = "HEAD unavailable (bad object HEAD); commit graph may lack the HEAD marker";
+        let payload = CommitGraphPayload {
+            rows: Vec::new(),
+            folds: Vec::new(),
+            head_id: None,
+            refs: Vec::new(),
+            has_more: false,
+            warnings: vec![warning.to_string()],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            json.contains(&format!(r#""warnings":["{warning}"]"#)),
+            "warnings must serialize verbatim, got {json}"
+        );
+        let back: CommitGraphPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warnings, vec![warning]);
+
+        let legacy = r#"{"rows":[],"folds":[],"head_id":null,"refs":[],"has_more":false}"#;
+        let back: CommitGraphPayload = serde_json::from_str(legacy).unwrap();
+        assert!(back.warnings.is_empty(), "absent field defaults to empty");
     }
 }
 

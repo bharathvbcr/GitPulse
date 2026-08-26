@@ -230,6 +230,21 @@ struct WatchLoopContext {
     emit_path: String,
 }
 
+/// Why the debounce loop ended. The spawn-site supervisor logs every
+/// variant: a watch thread that dies silently leaves a stale UI and a leaked
+/// session slot — the failure mode nobody can diagnose after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchLoopExit {
+    /// `stop` flag set: deliberate teardown (unwatch).
+    Stopped,
+    /// Watched git directory confirmed gone; the loop already reaped its own
+    /// session slot.
+    DeadRepo,
+    /// Event channel closed: the notify backend is gone and nothing will
+    /// ever fire again for this path until it is re-watched.
+    EventStreamClosed,
+}
+
 fn run_watch_loop<F>(
     watcher: RepoFileWatcher,
     ctx: WatchLoopContext,
@@ -237,7 +252,7 @@ fn run_watch_loop<F>(
     sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
     session_stop: Arc<AtomicBool>,
     on_change: F,
-) where
+) -> WatchLoopExit where
     F: Fn(String),
 {
     let WatchLoopContext {
@@ -257,11 +272,13 @@ fn run_watch_loop<F>(
     const DEAD_MISSES: u32 = 3;
     let mut dead_misses: u32 = 0;
     let mut dead_confirmed = false;
-    while !stop.load(Ordering::Relaxed) {
+    let mut exit = WatchLoopExit::Stopped;
+    'outer: while !stop.load(Ordering::Relaxed) {
         if !git_dir.exists() {
             dead_misses += 1;
             if dead_misses >= DEAD_MISSES {
                 dead_confirmed = true;
+                exit = WatchLoopExit::DeadRepo;
                 break;
             }
         } else {
@@ -294,7 +311,8 @@ fn run_watch_loop<F>(
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
                     if !git_dir.exists() {
                         dead_confirmed = true;
-                        break;
+                        exit = WatchLoopExit::DeadRepo;
+                        break 'outer;
                     }
                     on_change(path.clone());
                     pending = false;
@@ -315,14 +333,18 @@ fn run_watch_loop<F>(
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
                     if !git_dir.exists() {
                         dead_confirmed = true;
-                        break;
+                        exit = WatchLoopExit::DeadRepo;
+                        break 'outer;
                     }
                     on_change(path.clone());
                     pending = false;
                     first_pending = None;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                exit = WatchLoopExit::EventStreamClosed;
+                break;
+            }
         }
     }
     if dead_confirmed {
@@ -341,6 +363,17 @@ fn run_watch_loop<F>(
             }
         }
     }
+    exit
+}
+
+/// Flattens a panic payload for log output (mirror of the logging hook's
+/// downcast chain; kept local so the watcher has no logging-internal deps).
+fn panic_payload_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 /// Debounced git-directory watcher that emits `repo-changed` after writes settle.
@@ -430,18 +463,54 @@ where
     if let Err(e) = thread::Builder::new()
         .name("gitpulse-fs-watch".into())
         .spawn(move || {
-            run_watch_loop(
-                watcher,
-                WatchLoopContext {
-                    git_dir,
-                    internal_roots,
-                    emit_path,
-                },
-                thread_stop,
-                Some(loop_sessions),
-                session_stop,
-                on_change,
-            );
+            // The loop runs under catch_unwind so a panic inside it can
+            // neither kill its thread silently nor leak the session slot:
+            // the supervisor logs the outcome and, on panic, performs the
+            // same ptr_eq-guarded reap the DeadRepo path uses.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_watch_loop(
+                    watcher,
+                    WatchLoopContext {
+                        git_dir,
+                        internal_roots,
+                        emit_path: emit_path.clone(),
+                    },
+                    thread_stop,
+                    Some(loop_sessions.clone()),
+                    session_stop.clone(),
+                    on_change,
+                )
+            }));
+            match result {
+                Ok(WatchLoopExit::Stopped) => {
+                    log::debug!(target: "watcher", "watch on {emit_path} stopped by request");
+                }
+                Ok(WatchLoopExit::DeadRepo) => {
+                    log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
+                }
+                Ok(WatchLoopExit::EventStreamClosed) => {
+                    log::warn!(
+                        target: "watcher",
+                        "watch event stream closed unexpectedly for {emit_path}; \
+                         UI refresh for this repo is dead until it is re-watched"
+                    );
+                }
+                Err(panic) => {
+                    log::error!(
+                        target: "watcher",
+                        "fs-watch thread PANICKED for {emit_path}: {}; reaping session slot",
+                        panic_payload_text(&*panic)
+                    );
+                    if let Ok(mut guard) = loop_sessions.lock() {
+                        if guard
+                            .get(&emit_path)
+                            .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
+                        {
+                            guard.remove(&emit_path);
+                        }
+                    }
+                }
+            }
         })
     {
         let _ = state.abandon_watch_slot(&key, &stop);
@@ -1167,6 +1236,49 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let _ = writer.join();
         got.expect("continuous churn must still yield a refresh within the max wait");
+    }
+
+    /// Regression (supervisor): a panicking `on_change` used to kill the
+    /// watch thread with no trace and leak the MAX_WATCHES slot forever.
+    /// The spawn-site catch_unwind must contain the panic, reap the session,
+    /// and leave the state consistent for a re-watch of the same path.
+    #[test]
+    fn panicking_on_change_cannot_leak_the_watch_slot() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let state = WatcherState::default();
+        let key = start_watch_inner(
+            &state,
+            dir.path().to_string_lossy().into_owned(),
+            |_| panic!("emit explosion probe"),
+        )
+        .expect("watch live repo");
+        assert_eq!(state.watch_count().unwrap(), 1);
+
+        // Poke the worktree until the debounce pipeline delivers to the
+        // panicking callback (single writes race stream installation; see
+        // prime_watcher for why retries are required).
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut n = 0u32;
+        loop {
+            std::fs::write(dir.path().join(format!("panic-probe-{n}.txt")), "x").unwrap();
+            n += 1;
+            if state.watch_count().unwrap() == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "panicking on_change must lead to session reaping ({n} probes)"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // The slot is free again: a re-watch of the same path succeeds.
+        let key2 = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {})
+            .expect("re-watch after panic");
+        assert_eq!(state.watch_count().unwrap(), 1);
+        unwatch_all(&state).unwrap();
+        drop(key2);
     }
 
     /// Regression (audit D1): once the watched git directory is gone, notify

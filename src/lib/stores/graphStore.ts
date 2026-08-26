@@ -79,6 +79,12 @@ export interface CommitGraphPayload {
   refs?: RefDecoration[];
   /** True when older commits exist beyond this page. */
   has_more?: boolean;
+  /**
+   * Degradations the backend hit while assembling this page (HEAD resolution
+   * or ref decoration listing failing without failing the load). Optional:
+   * payloads from before the field existed omit it.
+   */
+  warnings?: string[];
 }
 
 export interface GraphState {
@@ -304,8 +310,11 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           s.selectedCommit?.id === commitId ? { ...s, selectedCommitDetails: details } : s
         );
       }
-    } catch {
-      /* details are best-effort; the row itself already renders */
+    } catch (err) {
+      // Details are best-effort: the row itself already renders, so a
+      // failure only costs the lower pane's content — but it must still
+      // leave a breadcrumb instead of looking like an eternal blank.
+      reportFailure("graph-details", `${repoPath}/${commitId}: ${formatError(err)}`);
     }
   }
 
@@ -395,6 +404,13 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
             update((s) => ({ ...s, isLoading: false }));
           }
           return;
+        }
+
+        // Assembly warnings ride along with an otherwise-good payload: each
+        // one marks a degraded facet (HEAD marker, ref labels) that would
+        // otherwise render as if it were honestly empty.
+        for (const w of payload.warnings ?? []) {
+          reportFailure("graph", w);
         }
 
         const keepId = previous?.selectedCommit?.id;

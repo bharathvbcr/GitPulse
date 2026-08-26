@@ -755,9 +755,9 @@ pub fn run_captured(
         home.as_deref(),
     );
     // Spawn/wait failures stay errors. The timeout is detected from the error
-    // `run_bounded` formats for exactly that case ("{label} timed out after
-    // {n}s"); the regression test below pins this contract so a rewording
-    // cannot silently turn timeouts into spawn errors again.
+    // `run_bounded` formats for exactly that case (see TIMEOUT_MARKER); the
+    // regression test below pins this contract so a rewording cannot silently
+    // turn timeouts into spawn errors again.
     match run_bounded(cmd, program, timeout, None) {
         Ok(out) => Ok(RunOutcome::Finished(CapturedRun {
             stdout_tail: byte_tail(&out.stdout, tail_cap),
@@ -766,11 +766,20 @@ pub fn run_captured(
             status_code: out.status_code,
             truncated: out.truncated || out.stdout.len() > tail_cap || out.stderr.len() > tail_cap,
         })),
-        Err(e) if e.starts_with(program) && e.contains(" timed out after ") => {
-            Ok(RunOutcome::TimedOut(timeout))
-        }
+        Err(e) if is_timeout_error(program, &e) => Ok(RunOutcome::TimedOut(timeout)),
         Err(e) => Err(e),
     }
+}
+
+/// The exact phrase [`run_bounded`] embeds when a deadline kills a child and
+/// the only marker [`run_captured`] matches to classify a timeout. Formatter
+/// and matcher both go through this constant, so the two sides of the
+/// stringly-typed seam cannot drift apart silently; the regression test
+/// additionally pins the whole behavior end to end.
+const TIMEOUT_MARKER: &str = " timed out after ";
+
+fn is_timeout_error(program: &str, err: &str) -> bool {
+    err.starts_with(program) && err.contains(TIMEOUT_MARKER)
 }
 
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
@@ -852,7 +861,10 @@ pub(crate) fn run_bounded(
                 if start.elapsed() > timeout {
                     kill_process_tree(&mut child);
                     let _ = child.wait();
-                    break Err(format!("{} timed out after {}s", label, timeout.as_secs()));
+                    break Err(format!(
+                        "{label}{TIMEOUT_MARKER}{}s",
+                        timeout.as_secs()
+                    ));
                 }
                 thread::sleep(Duration::from_millis(15));
             }
@@ -1249,6 +1261,26 @@ mod tests {
         // characters at the head of the tail.
         let prefix = "é".repeat(5000); // 2 bytes each
         assert!(!byte_tail(prefix.as_bytes(), 9999).starts_with('\u{FFFD}'));
+    }
+
+    /// The formatter in `run_bounded` and the matcher behind `run_captured`
+    /// share TIMEOUT_MARKER; this pins the round trip so neither side can
+    /// drift without breaking here first, even on a platform where the
+    /// end-to-end timeout test above does not run. Production always formats
+    /// with `label == program`, and the starts_with guard rejects errors
+    /// from any other program.
+    #[test]
+    fn timeout_marker_round_trips_between_formatter_and_matcher() {
+        let formatted = format!("sleep{TIMEOUT_MARKER}3s");
+        assert!(is_timeout_error("sleep", &formatted));
+        // Same contract when the program is spelled as a path: the label is
+        // then the full path too, so the prefix still matches.
+        let path_formatted = format!("/usr/bin/sleep{TIMEOUT_MARKER}3s");
+        assert!(is_timeout_error("/usr/bin/sleep", &path_formatted));
+        // A spawn failure with unrelated text must not classify as a timeout…
+        assert!(!is_timeout_error("sleep", "Failed to spawn sleep: No such file"));
+        // …and another program's timeout must not match either.
+        assert!(!is_timeout_error("git", &formatted));
     }
 
     fn git_in(dir: &Path, args: &[&str]) {

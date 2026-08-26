@@ -102,6 +102,17 @@ pub fn cmd_diagnostic_log_tail(max_lines: Option<usize>) -> Vec<String> {
 }
 
 pub fn install_panic_hook() {
+    // Capture the handle at install time rather than looking up the static
+    // per-panic: a hook installed before init() used to silently record
+    // nothing forever, because `LOGGER.get()` stayed empty on every fire.
+    let logger = LOGGER.get_or_init(|| RingLogger::new(configured_level()));
+    install_panic_hook_for(Arc::new(logger.clone()));
+}
+
+/// Core of [`install_panic_hook`], parameterized over the destination so a
+/// test can point it at its own ring without polluting the global one. Still
+/// global process state — callers must serialize and restore the prior hook.
+pub(crate) fn install_panic_hook_for(logger: Arc<RingLogger>) {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
@@ -114,13 +125,11 @@ pub fn install_panic_hook() {
             .location()
             .map(|l| l.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        if let Some(logger) = LOGGER.get() {
-            logger.write_entry(
-                Level::Error,
-                "panic",
-                &format!("panic at {location}: {payload}"),
-            );
-        }
+        logger.write_entry(
+            Level::Error,
+            "panic",
+            &format!("panic at {location}: {payload}"),
+        );
         original(info);
     }));
 }
@@ -386,5 +395,35 @@ mod tests {
             assert!(line.contains("[round-trip] hello"), "{line}");
             assert_parses(line);
         }
+    }
+
+    /// The panic hook must actually record what it observes. set_hook is
+    /// global process state, so the test serializes on a mutex and restores
+    /// the prior (test-harness) hook before any assertion can fail.
+    #[test]
+    fn panic_hook_records_payload_and_location_through_its_logger() {
+        static HOOK_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HOOK_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let original = std::panic::take_hook();
+        let logger = Arc::new(RingLogger::new(LevelFilter::Trace));
+        install_panic_hook_for(logger.clone());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("boom-gap-probe");
+        }));
+        std::panic::set_hook(original);
+
+        assert!(caught.is_err(), "the panic must still unwind");
+        let lines = logger.snapshot_tail(50);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("[panic]") && l.contains("boom-gap-probe")),
+            "hook must record payload under the [panic] target: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("panic at ")),
+            "hook must record a location: {lines:?}"
+        );
     }
 }

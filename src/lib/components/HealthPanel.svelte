@@ -547,6 +547,14 @@
       </div>
       {@render dependabotSection()}
     {:else if report}
+      <!-- Action failures (e.g. "open on GitHub") must stay visible even
+           while a report is on screen: the else-if chain above would
+           otherwise swallow them behind the healthy-report rendering. -->
+      {#if errorMsg}
+        <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
+          {errorMsg}
+        </div>
+      {/if}
       {#if planError}
         <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-3xl">
           Fix with MANVI failed: {planError}
