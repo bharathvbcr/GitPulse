@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  coverageCommandsAreCumulative,
   coverageFamilyRunLabel,
   missingCoveragePipelines,
   setupCoverageCommands,
@@ -47,6 +48,8 @@ describe("suggestedCoverageCommands", () => {
       "cargo install cargo-llvm-cov --locked",
       "pytest --cov --cov-report=xml",
       "go test ./... -coverprofile=coverage.out",
+      "go -C backend/go_orchestrator test ./... -coverprofile=coverage.out",
+      "npm run test:coverage",
       "./gradlew test jacocoTestReport",
       "mvn verify",
     ];
@@ -166,6 +169,19 @@ describe("missingCoveragePipelines", () => {
       }),
     ]);
     expect(rust[0]?.mode).toBe("all");
+
+    const go = missingCoveragePipelines([
+      family({
+        family: "go",
+        suggested_commands: [
+          "go -C api test ./... -coverprofile=coverage.out",
+          "go -C cli test ./... -coverprofile=coverage.out",
+        ],
+      }),
+    ]);
+    expect(go[0]?.mode).toBe("all");
+    expect(coverageCommandsAreCumulative("go")).toBe(true);
+    expect(coverageCommandsAreCumulative("javascript")).toBe(false);
   });
 
   it("does not invent setup when tool_ready is omitted", () => {

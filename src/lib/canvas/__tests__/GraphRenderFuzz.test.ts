@@ -91,14 +91,31 @@ describe("render pipeline fuzz", () => {
           ? cleanRows
           : Array.from({ length: Math.floor(rnd() * 60) + 1 }, (_, i) => hostileRow(`h${frame}-${i}`, rnd));
       const { ctx } = makeRecordingCtx(400);
+      const scroll = Math.floor(rnd() * 200);
       expect(() =>
-        renderer.render(ctx, rows, 0, rows.length, Math.floor(rnd() * 200), undefined, {
+        renderer.render(ctx, rows, 0, rows.length, scroll, undefined, {
           theme: THEME,
           viewportHeight: 400,
           showAvatars: frame % 2 === 0,
           avatarX: frame % 2 === 0 ? 180 : null,
         }),
       ).not.toThrow();
+      // The live overlay passes and the hit test share the same hostile
+      // payloads in production frames; they must be exactly as unshakable
+      // as render() itself.
+      expect(() => {
+        renderer.drawLongConnectors(ctx, rows, 0, rows.length, scroll, 400, { theme: THEME });
+        renderer.drawDanglingStubs(ctx, rows, 0, rows.length, scroll, 400);
+        renderer.getGraphHitAtPoint(
+          rnd() * 300 - 50,
+          rnd() * 500 - 50,
+          rows,
+          0,
+          rows.length,
+          scroll,
+          frame % 2 === 0 ? 180 : null,
+        );
+      }).not.toThrow();
       if (frame === 299) {
         const traceCtx = makeRecordingCtx(400);
         renderer.render(traceCtx.ctx, cleanRows, 0, cleanRows.length, 0);

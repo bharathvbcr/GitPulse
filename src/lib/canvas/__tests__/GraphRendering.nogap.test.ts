@@ -275,6 +275,90 @@ describe("no-gap oracle: production frame composition", () => {
     }
   });
 
+  it("paints the middle of a long closing connector whose span crosses the window", () => {
+    // A closing descent carries NO occupancy entries (active_lanes lists
+    // nodes and reservations only) — the connector stroke is its sole
+    // pixels. A span longer than LOOKBACK is excluded from strips, so if
+    // the overlay only enumerates edges LANDING in the window, a window
+    // strictly inside the span (child above, merge point below) shows the
+    // lane simply vanishing — the artifact reported from the real app on
+    // scholarlm rows 332..415 (span 83).
+    const N = 400;
+    const rows: VisualCommitRow[] = Array.from({ length: N }, (_, i) => ({
+      id: `c${i}`,
+      parent_ids: i + 1 < N ? [`c${i + 1}`] : [],
+      summary: `c${i}`,
+      author_name: "ada",
+      author_email: "ada@example.com",
+      timestamp: 1,
+      lane: 0,
+      color_index: 0,
+      active_lanes: [0],
+      active_lane_colors: [0],
+      connections:
+        i + 1 < N
+          ? [{ from_lane: 0, to_lane: 0, to_row_offset: 1, is_merge: false, color_index: 0 }]
+          : [],
+      is_merge: false,
+      is_root: i + 1 === N,
+    }));
+    // The closer: row 5 on lane 1, merging into the mainline 300 rows down.
+    rows[5] = {
+      ...rows[5],
+      id: "closer",
+      lane: 1,
+      color_index: 1,
+      active_lanes: [0, 1],
+      active_lane_colors: [0, 1],
+      parent_ids: ["c305"],
+      connections: [
+        { from_lane: 1, to_lane: 0, to_row_offset: 300, is_merge: false, color_index: 1 },
+      ],
+    };
+
+    const renderer = new GraphRenderer();
+    const laneX = renderer.laneXForRow(rows[5], 1);
+
+    // Windows landing in, starting at, and strictly inside the span.
+    for (const winStart of [0, 100, 200, 290]) {
+      const winEnd = Math.min(N, winStart + 25);
+      const passes = replayProductionFrame(renderer, rows, winStart, winEnd);
+      const covered = passes.some(({ offset, paths }) =>
+        paths.some((p) => {
+          const touchesLane = p.points.some((pt) => Math.abs(pt.x - laneX) < 0.5);
+          if (!touchesLane) return false;
+          const ys = p.points.map((pt) => pt.y + offset);
+          const top = Math.min(...ys);
+          const bottom = Math.max(...ys);
+          // The stroke must cover the window's slice of the span.
+          const sliceTop = Math.max(yOf(6, 0), yOf(winStart, 0));
+          const sliceBottom = Math.min(yOf(305, 0), yOf(winEnd - 1, 0));
+          return top <= sliceTop + 0.5 && bottom >= sliceBottom - 0.5;
+        }),
+      );
+      expect(
+        covered,
+        `window [${winStart},${winEnd}): the closing descent's lane vanished mid-span`,
+      ).toBe(true);
+    }
+
+    // The bypass path (single direct render) must cover a mid-span window too.
+    {
+      const winStart = 150;
+      const { ctx, paths } = pathRecordingContext();
+      renderer.render(ctx, rows, winStart, winStart + 20, winStart * ROW_HEIGHT, undefined, {
+        viewportHeight: 720,
+      });
+      const covered = paths.some(
+        (p) =>
+          p.points.some((pt) => Math.abs(pt.x - laneX) < 0.5) &&
+          Math.min(...p.points.map((pt) => pt.y)) <= yOf(winStart, winStart * ROW_HEIGHT) &&
+          Math.max(...p.points.map((pt) => pt.y)) >= yOf(winStart + 19, winStart * ROW_HEIGHT),
+      );
+      expect(covered, "bypass render dropped the crossing long connector").toBe(true);
+    }
+  });
+
   it("ownership is exclusive: strips never bake a long edge the overlay also owns", () => {
     const renderer = new GraphRenderer();
     const rows = boundaryHistory();

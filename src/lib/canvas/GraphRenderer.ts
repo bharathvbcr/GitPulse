@@ -3,6 +3,7 @@ import { getBranchColor } from "./Palette";
 import { authorColor, authorIdentity } from "../authors/authorIdentity";
 import {
   buildIncomingEdgeIndex,
+  collectLongEdges,
   deepestChildTargetingRange,
   isLongConnection,
   connectionTargetIndex,
@@ -667,12 +668,24 @@ export class GraphRenderer {
     // on top of the painter's and turn a priming regression into silent
     // over-draw instead of a caught failure.
     const renderEnd = Math.min(rows.length, endIndex + 5);
-    const renderStart = options.skipLongConnectors
-      ? startIndex
-      : Math.min(
-          Math.max(0, startIndex - LOOKBACK_ROWS),
-          deepestChildTargetingRange(buildIncomingEdgeIndex(rows), startIndex, renderEnd),
-        );
+    let renderStart = startIndex;
+    if (!options.skipLongConnectors) {
+      // Deepest child whose edge LANDS in the window…
+      let deepest = deepestChildTargetingRange(
+        buildIncomingEdgeIndex(rows),
+        startIndex,
+        renderEnd,
+      );
+      // …and children of long edges whose spans CROSS the window without
+      // landing in it: their strokes are this pass's responsibility too,
+      // and only reaching back to the child row draws them whole.
+      for (const e of collectLongEdges(rows, LOOKBACK_ROWS)) {
+        if (e.child < startIndex && e.target >= renderEnd && e.child < deepest) {
+          deepest = e.child;
+        }
+      }
+      renderStart = Math.min(Math.max(0, startIndex - LOOKBACK_ROWS), deepest);
+    }
 
     // 1. Pass-through lanes, drawn as one straight vertical per unbroken run.
     //
@@ -1074,13 +1087,15 @@ export class GraphRenderer {
     const viewHeight = viewportHeight ?? this.canvasHeight(ctx);
     const calcY = this.yForRow(scrollOffset);
 
-    const index = buildIncomingEdgeIndex(rows);
     const lo = Math.max(0, startIndex);
     const hi = Math.min(rows.length, Math.max(endIndex, startIndex));
 
-    // Visible target -> child rows reaching it, straight off the index; each
-    // child's matching connection is found by scanning its own (tiny) list.
-    type LongEdge = {
+    // Every long edge whose span INTERSECTS the window — landing in it,
+    // starting in it, or crossing clean through. Enumerating only edges
+    // that LAND here (the old incoming-index walk) dropped the other two
+    // cases; a closing descent has no occupancy entries, so its lane
+    // simply vanished for any window strictly inside the span.
+    type VisibleLongEdge = {
       j: number;
       t: number;
       fromLane: number;
@@ -1090,40 +1105,27 @@ export class GraphRenderer {
       colorIndex: number;
       isMerge: boolean;
     };
-    const edges: LongEdge[] = [];
-    for (let t = lo; t < hi; t++) {
-      for (let p = index.starts[t]; p < index.starts[t + 1]; p++) {
-        const j = index.children[p];
-        if (j >= t) continue;
-        const child = rows[j];
-        if (!child.connections) continue;
-        for (const conn of child.connections) {
-          if (conn.is_dangling) continue;
-          if (!isLongConnection(conn, LOOKBACK_ROWS)) continue;
-          if (connectionTargetIndex(j, conn.to_row_offset, rows.length) !== t) continue;
-          if (!Number.isFinite(conn.to_lane)) continue;
-          const yTo = calcY(t);
-          const yFrom = calcY(j);
-          if (
-            Math.max(yFrom, yTo) < -rowHeight ||
-            Math.min(yFrom, yTo) > viewHeight + rowHeight
-          ) {
-            continue;
-          }
-          const fromLane = Number.isFinite(conn.from_lane) ? conn.from_lane : child.lane;
-          if (!Number.isFinite(fromLane)) continue;
-          edges.push({
-            j,
-            t,
-            fromLane,
-            toLane: conn.to_lane,
-            yFrom,
-            yTo,
-            colorIndex: conn.color_index,
-            isMerge: conn.is_merge,
-          });
-        }
+    const edges: VisibleLongEdge[] = [];
+    for (const e of collectLongEdges(rows, LOOKBACK_ROWS)) {
+      if (e.child >= hi || e.target < lo) continue;
+      const yFrom = calcY(e.child);
+      const yTo = calcY(e.target);
+      if (
+        Math.max(yFrom, yTo) < -rowHeight ||
+        Math.min(yFrom, yTo) > viewHeight + rowHeight
+      ) {
+        continue;
       }
+      edges.push({
+        j: e.child,
+        t: e.target,
+        fromLane: e.fromLane,
+        toLane: e.toLane,
+        yFrom,
+        yTo,
+        colorIndex: e.colorIndex,
+        isMerge: e.isMerge,
+      });
     }
     if (edges.length === 0) return;
 

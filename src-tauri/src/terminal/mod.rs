@@ -596,6 +596,20 @@ fn command_is_one_of(args: &[String], allowed: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// `go test ...` or `go -C <dir> test ...`. `-C` must be first (see `go help`).
+fn go_coverage_test_allowed(args: &[String]) -> bool {
+    match args.get(1).map(String::as_str) {
+        Some("test") => true,
+        Some("-C") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            !dir.is_empty()
+                && !dir.starts_with('-')
+                && args.get(3).map(String::as_str) == Some("test")
+        }
+        _ => false,
+    }
+}
+
 /// Coverage generation may mutate the host toolchain in exactly one way:
 /// `cargo install cargo-llvm-cov --locked` (flag order may swap). Extra
 /// crates, `--git`, `--path`, or a missing `--locked` are refused. Analysis
@@ -836,7 +850,7 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
         "go" => match kind {
             ManviActionKind::Health => command_is_one_of(args, &["get", "mod", "test", "list"]),
             ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => {
-                command_is_one_of(args, &["test"])
+                go_coverage_test_allowed(args)
             }
         },
         "govulncheck" => kind == ManviActionKind::Health,
@@ -902,6 +916,7 @@ fn validate_manvi_paths(
         "--constraint",
         "-r",
         "-c",
+        "-C",
     ];
     const PREFIX_PATH_FLAGS: &[&str] = &[
         "--manifest-path=",
@@ -1225,6 +1240,15 @@ mod tests {
                 "./...".into(),
                 "-coverprofile=coverage.out".into(),
             ],
+            vec![
+                "go".into(),
+                "-C".into(),
+                "backend/go_orchestrator".into(),
+                "test".into(),
+                "./...".into(),
+                "-coverprofile=coverage.out".into(),
+            ],
+            vec!["npm".into(), "run".into(), "test:coverage".into()],
             vec!["./gradlew".into(), "test".into(), "jacocoTestReport".into()],
             vec!["mvn".into(), "verify".into()],
         ] {
@@ -1245,6 +1269,31 @@ mod tests {
             npx_without_no_install.contains("allowlist"),
             "npx must require --no-install: {npx_without_no_install}"
         );
+    }
+
+    #[test]
+    fn coverage_generator_allowlist_refuses_go_chdir_without_test() {
+        for argv in [
+            vec![
+                "go".into(),
+                "-C".into(),
+                "backend/go_orchestrator".into(),
+                "run".into(),
+                ".".into(),
+            ],
+            vec!["go".into(), "-C".into(), "backend".into()],
+            vec![
+                "go".into(),
+                "-C".into(),
+                "-modcache".into(),
+                "test".into(),
+                "./...".into(),
+            ],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err("only go -C <dir> test is allowed");
+            assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
     }
 
     // REGRESSION GUARD: repo-local wrapper spellings are the only executable
@@ -1412,6 +1461,21 @@ mod tests {
         ];
         let err = validate_manvi_paths(&repo, &args, ManviActionKind::Coverage).unwrap_err();
         assert!(err.contains("escapes the open repository"), "{err}");
+
+        let chdir = vec![
+            "go".into(),
+            "-C".into(),
+            "coverage-link".into(),
+            "test".into(),
+            "./...".into(),
+            "-coverprofile=coverage.out".into(),
+        ];
+        let chdir_err =
+            validate_manvi_paths(&repo, &chdir, ManviActionKind::CoverageGenerator).unwrap_err();
+        assert!(
+            chdir_err.contains("escapes the open repository"),
+            "{chdir_err}"
+        );
     }
 
     #[test]

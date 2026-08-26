@@ -877,11 +877,26 @@ describe("long connectors: strip/overlay ownership split", () => {
     expect(strokesAfterEdges).toBeGreaterThan(2);
   });
 
-  it("drawLongConnectors is silent when no long edge touches the window", () => {
+  it("drawLongConnectors draws a span CROSSING the window, not only one landing in it", () => {
+    // The edge spans rows 5..300; a window over rows 10..30 sits strictly
+    // inside that span, so its descent genuinely passes through the
+    // viewport. The old contract ("only edges landing here") left those
+    // pixels drawn by nobody — the vanishing-lane artifact from the real
+    // app — so silence here is a bug, not thrift.
     const renderer = new GraphRenderer();
     const rows = longEdgeRows();
     const ctx = createMockContext();
     renderer.drawLongConnectors(ctx, rows, 10, 30, 10 * 36, 800, {});
+    expect(ctx.stroke).toHaveBeenCalled();
+  });
+
+  it("drawLongConnectors is silent when the window is fully below every span", () => {
+    const renderer = new GraphRenderer();
+    const rows = longEdgeRows();
+    const ctx = createMockContext();
+    // Rows 320-340 sit below the edge's merge point (row 300): the span
+    // does not intersect the window, so nothing may draw.
+    renderer.drawLongConnectors(ctx, rows, 320, 340, 320 * 36, 800, {});
     expect(ctx.stroke).not.toHaveBeenCalled();
     expect(ctx.fill).not.toHaveBeenCalled();
   });

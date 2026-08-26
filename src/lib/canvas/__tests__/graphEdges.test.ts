@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { VisualCommitRow } from "../GraphRenderer";
 import {
   buildIncomingEdgeIndex,
+  collectLongEdges,
   connectionTargetIndex,
   deepestChildTargetingRange,
   isLongConnection,
@@ -130,5 +131,60 @@ describe("connectionTargetIndex", () => {
     expect(connectionTargetIndex(2, -3, 6)).toBeNull();
     expect(connectionTargetIndex(2, Number.NaN, 6)).toBeNull();
     expect(connectionTargetIndex(2, 99, 6)).toBeNull();
+  });
+});
+
+describe("collectLongEdges", () => {
+  const conn = (over: Partial<VisualCommitRow["connections"][number]>) => ({
+    from_lane: 0,
+    to_lane: 1,
+    to_row_offset: 1,
+    is_merge: false,
+    color_index: 2,
+    ...over,
+  });
+  const rowsWith = (
+    connections: VisualCommitRow["connections"],
+    length = 200,
+  ): VisualCommitRow[] => {
+    const rows = Array.from({ length }, (_, i) => row(`c${i}`));
+    rows[3] = { ...rows[3], connections };
+    return rows;
+  };
+
+  it("collects only live edges past the threshold, resolved to row indices", () => {
+    const rows = rowsWith([
+      conn({ to_row_offset: 100 }), // long, live
+      conn({ to_row_offset: 60 }), // exactly the threshold: strip-owned
+      conn({ to_row_offset: 100, is_dangling: true }), // stub, never a line
+      conn({ to_row_offset: 100_000 }), // past the end: no real endpoint
+      conn({ to_row_offset: Number.NaN }),
+      conn({ to_row_offset: 100, to_lane: Number.NaN }), // unusable geometry
+    ]);
+    const edges = collectLongEdges(rows, 60);
+    expect(edges).toEqual([
+      { child: 3, target: 103, fromLane: 0, toLane: 1, colorIndex: 2, isMerge: false },
+    ]);
+  });
+
+  it("falls back to the row's own lane when from_lane is hostile", () => {
+    const rows = rowsWith([conn({ to_row_offset: 100, from_lane: Number.NaN })]);
+    rows[3] = { ...rows[3], lane: 4 };
+    expect(collectLongEdges(rows, 60)[0]?.fromLane).toBe(4);
+  });
+
+  it("memoizes on payload identity", () => {
+    const rows = rowsWith([conn({ to_row_offset: 100 })]);
+    const first = collectLongEdges(rows, 60);
+    expect(collectLongEdges(rows, 60)).toBe(first);
+  });
+
+  it("refuses a second threshold for the same payload instead of serving a stale cache", () => {
+    // Every production caller shares LOOKBACK_ROWS; a divergent threshold
+    // would silently return edges computed for the OTHER boundary, so the
+    // cache fails closed and loud.
+    const rows = rowsWith([conn({ to_row_offset: 100 })]);
+    collectLongEdges(rows, 60);
+    expect(() => collectLongEdges(rows, 30)).toThrow(/threshold/);
   });
 });

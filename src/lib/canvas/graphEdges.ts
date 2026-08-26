@@ -118,3 +118,76 @@ export function isLongConnection(
 ): boolean {
   return conn.to_row_offset > lookbackRows;
 }
+
+/** One overlay-owned edge, resolved to row indices. Sorted by child row. */
+export interface LongEdge {
+  child: number;
+  target: number;
+  fromLane: number;
+  toLane: number;
+  colorIndex: number;
+  isMerge: boolean;
+}
+
+const longEdgeCache = new WeakMap<VisualCommitRow[], LongEdge[]>();
+
+/**
+ * Every live connection longer than {@link isLongConnection}'s threshold,
+ * as a flat list the overlay can intersect with any window.
+ *
+ * The overlay must draw a long edge when its span INTERSECTS the visible
+ * window — landing in it, starting in it, or crossing clean through it.
+ * Enumerating only edges that LAND in the window (via the incoming-edge
+ * index) silently dropped the other two cases: a closing descent has no
+ * occupancy entries, so a window strictly inside its span showed the lane
+ * simply vanishing. Long edges are rare (a handful per loaded history), so
+ * a linear scan of this memoized list per frame is O(few), and no clever
+ * index can quietly reintroduce a coverage hole.
+ *
+ * The threshold is passed per call but the cache is keyed on the rows
+ * array alone: every production caller uses the LOOKBACK_ROWS constant.
+ * A second threshold for the same payload would poison the cache, so it
+ * is rejected loudly.
+ */
+const longEdgeCacheThreshold = new WeakMap<VisualCommitRow[], number>();
+
+export function collectLongEdges(
+  rows: VisualCommitRow[],
+  lookbackRows: number,
+): LongEdge[] {
+  const cached = longEdgeCache.get(rows);
+  if (cached) {
+    const cachedThreshold = longEdgeCacheThreshold.get(rows);
+    if (cachedThreshold !== lookbackRows) {
+      throw new Error(
+        `collectLongEdges called with threshold ${lookbackRows} after caching ${cachedThreshold}`,
+      );
+    }
+    return cached;
+  }
+  const edges: LongEdge[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const conns = rows[i].connections;
+    if (!conns) continue;
+    for (const conn of conns) {
+      if (conn.is_dangling) continue;
+      if (!isLongConnection(conn, lookbackRows)) continue;
+      const target = connectionTargetIndex(i, conn.to_row_offset, rows.length);
+      if (target === null) continue;
+      if (!Number.isFinite(conn.to_lane)) continue;
+      const fromLane = Number.isFinite(conn.from_lane) ? conn.from_lane : rows[i].lane;
+      if (!Number.isFinite(fromLane)) continue;
+      edges.push({
+        child: i,
+        target,
+        fromLane,
+        toLane: conn.to_lane,
+        colorIndex: conn.color_index,
+        isMerge: conn.is_merge,
+      });
+    }
+  }
+  longEdgeCache.set(rows, edges);
+  longEdgeCacheThreshold.set(rows, lookbackRows);
+  return edges;
+}

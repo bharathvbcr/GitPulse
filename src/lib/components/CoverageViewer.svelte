@@ -629,10 +629,10 @@
   }
 
   /**
-   * Setup then generate for one language. Rust workspace commands are
-   * cumulative and all must pass; other ecosystems expose alternative runners,
-   * so stop at the first success instead of overwriting artifacts by running
-   * every alternative sequentially.
+   * Setup then generate for one language. Rust workspace and Go module
+   * commands are cumulative and all must pass; other ecosystems expose
+   * alternative runners, so stop at the first success instead of overwriting
+   * artifacts by running every alternative sequentially.
    */
   async function runCoveragePipeline(
     pipeline: MissingCoveragePipeline,

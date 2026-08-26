@@ -1,4 +1,5 @@
 import { formatCoveragePercent } from "./format";
+import { coverageCommandsAreCumulative } from "./scripts";
 import type {
   CoverageArtifact,
   CoverageFamilyStatus,
@@ -150,7 +151,7 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
         parts.push(`setup ${setup.map((cmd) => `\`${cmd}\``).join(" then ")}`);
       }
       if (commands.length > 0) {
-        const separator = family.family === "rust" ? " then " : " or ";
+        const separator = coverageCommandsAreCumulative(family.family) ? " then " : " or ";
         parts.push(`run ${commands.map((cmd) => `\`${cmd}\``).join(separator)}`);
       }
       if (duration) parts.push(duration);
@@ -257,6 +258,53 @@ export interface FailedCoverageDiagnosticsOptions {
   scanError?: string | null;
 }
 
+const GO_MISSING_MODULE =
+  /directory prefix\s+\S+\s+does not contain main module/i;
+
+const TEST_SUITE_RAN_FAILURE = [
+  /Test Files\s+\d+\s+failed/i,
+  /Failed Tests/i,
+  /\bFAIL\s+\S+\.(t|j)sx?\b/i,
+  /Tests:\s+\d+\s+failed/i,
+  /not wrapped in act\s*\(/i,
+  /React does not recognize the `[A-Za-z0-9$_]+` prop on a DOM element/i,
+  /^FAILED\s+\S+/m,
+  /^--- FAIL:/m,
+];
+
+/**
+ * Classifies a failed coverage command so copied diagnostics name the real
+ * problem: a missing Go module root, or a generator that ran and whose tests
+ * failed — never "try a different ecosystem command" for those cases.
+ */
+export function coverageFailureHint(
+  command: unknown,
+  detail: unknown,
+): string | null {
+  const output = typeof detail === "string" ? detail : "";
+  if (!output.trim()) return null;
+  if (GO_MISSING_MODULE.test(output)) {
+    return "Go was run from a directory without go.mod. Generate coverage from the module root with `go -C <module-dir> test ./... -coverprofile=coverage.out`.";
+  }
+  if (TEST_SUITE_RAN_FAILURE.some((pattern) => pattern.test(output))) {
+    const cmd = typeof command === "string" ? command : "";
+    const runner = /\bvitest\b|\bjest\b|npm run/.test(cmd)
+      ? "The coverage generator ran; tests failed."
+      : "Tests ran and failed.";
+    return `${runner} This is a test failure, not the wrong ecosystem command.`;
+  }
+  return null;
+}
+
+function appendFailureBlock(out: string[], label: string, detail: string | null | undefined): void {
+  out.push(`Command: ${label}`);
+  out.push("Status: failed");
+  const hint = coverageFailureHint(label, detail);
+  if (hint) out.push(`Hint: ${hint}`);
+  out.push("Output:");
+  out.push(detail ? detail.trim() : "(no output recorded)");
+}
+
 /**
  * Formats failed coverage commands, generator scripts, and scan errors into a
  * clean plain-text diagnostic report suitable for copying to clipboard.
@@ -285,10 +333,7 @@ export function formatFailedCoverageDiagnostics(
   if (validFailures.length === 1) {
     const f = validFailures[0];
     if (scanErr) out.push("");
-    out.push(`Command: ${f.label}`);
-    out.push("Status: failed");
-    out.push("Output:");
-    out.push(f.detail ? f.detail.trim() : "(no output recorded)");
+    appendFailureBlock(out, f.label, f.detail);
   } else if (validFailures.length > 1) {
     if (scanErr) out.push("");
     out.push(`Failed coverage commands (${validFailures.length}):`);
@@ -296,6 +341,8 @@ export function formatFailedCoverageDiagnostics(
       out.push("");
       out.push(`[${idx + 1}] Command: ${f.label}`);
       out.push("Status: failed");
+      const hint = coverageFailureHint(f.label, f.detail);
+      if (hint) out.push(`Hint: ${hint}`);
       out.push("Output:");
       out.push(f.detail ? f.detail.trim() : "(no output recorded)");
     });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCoverageIssueDraft,
+  coverageFailureHint,
   formatCoverageReport,
   formatFailedCoverageDiagnostics,
   type FailedCoverageScript,
@@ -267,6 +268,14 @@ describe("formatCoverageReport", () => {
         found: false,
         suggested_commands: ["npm run coverage", "npx --no-install jest --coverage"],
       }),
+      family({
+        family: "go",
+        found: false,
+        suggested_commands: [
+          "go -C api test ./... -coverprofile=coverage.out",
+          "go -C cli test ./... -coverprofile=coverage.out",
+        ],
+      }),
     ];
     const text = formatCoverageReport(report, "/repo");
     expect(text).toContain(
@@ -274,6 +283,9 @@ describe("formatCoverageReport", () => {
     );
     expect(text).toContain(
       "- javascript (expected: lcov.info, cobertura.xml) — run `npm run coverage` or `npx --no-install jest --coverage`",
+    );
+    expect(text).toContain(
+      "- go (expected: lcov.info, cobertura.xml) — run `go -C api test ./... -coverprofile=coverage.out` then `go -C cli test ./... -coverprofile=coverage.out`",
     );
   });
 
@@ -452,5 +464,57 @@ describe("formatFailedCoverageDiagnostics", () => {
     const text = formatFailedCoverageDiagnostics(failures);
     expect(text).toContain("Command: npm test");
     expect(text).toContain("(no output recorded)");
+  });
+
+  it("hints when go test ran outside a module", () => {
+    const text = formatFailedCoverageDiagnostics(
+      [
+        {
+          label: "go test ./... -coverprofile=coverage.out",
+          detail:
+            "# ./...\npattern ./...: directory prefix . does not contain main module or its selected dependencies",
+        },
+      ],
+      { repoPath: "/Users/bharath/Code/scholarlm" },
+    );
+    expect(text).toContain("Hint:");
+    expect(text).toContain("go -C <module-dir> test ./... -coverprofile=coverage.out");
+    expect(text).not.toContain("wrong ecosystem command");
+    expect(
+      coverageFailureHint(
+        "go test ./... -coverprofile=coverage.out",
+        "# ./...\npattern ./...: directory prefix . does not contain main module or its selected dependencies",
+      ),
+    ).toContain("go.mod");
+  });
+
+  it("hints when vitest ran and tests failed", () => {
+    const detail = [
+      "FAIL  frontend/App.test.tsx > renders",
+      "React does not recognize the `featureKey` prop on a DOM element",
+      "An update to App inside a test was not wrapped in act(...)",
+      " Test Files  2 failed | 10 passed (12)",
+    ].join("\n");
+    const text = formatFailedCoverageDiagnostics([
+      {
+        label: "npx --no-install vitest run --coverage",
+        detail,
+      },
+    ]);
+    expect(text).toContain(
+      "Hint: The coverage generator ran; tests failed. This is a test failure, not the wrong ecosystem command.",
+    );
+    expect(
+      coverageFailureHint("npx --no-install vitest run --coverage", detail),
+    ).toContain("not the wrong ecosystem command");
+  });
+
+  it("does not hint on missing-script or compile noise", () => {
+    expect(
+      coverageFailureHint("npm run coverage", "npm ERR! missing script: coverage"),
+    ).toBeNull();
+    expect(
+      coverageFailureHint("cargo llvm-cov", "error: failed to compile test harness"),
+    ).toBeNull();
   });
 });

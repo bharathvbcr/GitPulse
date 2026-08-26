@@ -14,7 +14,7 @@ export interface MissingCoveragePipeline {
   toolReady: boolean;
   toolDetail: string;
   durationHint: string;
-  /** Rust workspace commands are cumulative; other ecosystem commands are alternatives. */
+  /** Rust workspace and Go module commands are cumulative; other ecosystem commands are alternatives. */
   mode: "all" | "first_success";
   steps: CoveragePipelineStep[];
 }
@@ -22,6 +22,15 @@ export interface MissingCoveragePipeline {
 function stringCommands(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((cmd): cmd is string => typeof cmd === "string" && cmd.trim().length > 0);
+}
+
+/**
+ * Rust workspace and Go module commands are cumulative (every module must
+ * run). Other ecosystems expose alternative runners, so the pipeline stops
+ * at the first success.
+ */
+export function coverageCommandsAreCumulative(family: string): boolean {
+  return family === "rust" || family === "go";
 }
 
 /**
@@ -103,7 +112,7 @@ export function missingCoveragePipelines(
       toolReady,
       toolDetail,
       durationHint,
-      mode: name === "rust" ? "all" : "first_success",
+      mode: coverageCommandsAreCumulative(name) ? "all" : "first_success",
       steps,
     });
   }

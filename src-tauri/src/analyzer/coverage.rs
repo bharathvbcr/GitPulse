@@ -447,7 +447,7 @@ impl CoverageScanner {
 
         let mut truncated = detected.listing_partial;
         let candidates = {
-            let mut c = collect_candidates(&families, &detected.cargo_dirs);
+            let mut c = collect_candidates(&families, &detected.cargo_dirs, &detected.go_mod_dirs);
             if extend_directory_candidates(&repo, &families, &detected.cargo_dirs, &mut c) {
                 // A probed directory dropped an artifact-shaped entry beyond
                 // the MAX_DIR_ENTRIES window; readdir order is arbitrary, so
@@ -520,7 +520,13 @@ impl CoverageScanner {
         if let Some((mut report, maps)) = cache_hit {
             // Suggestions read live manifests (package.json, Cargo.toml), not
             // the artifact fingerprint, so a cache hit must still refresh them.
-            fill_suggested_commands(&repo, &mut report.families, &detected.cargo_dirs);
+            fill_suggested_commands(
+                &repo,
+                &mut report.families,
+                &detected.cargo_dirs,
+                &detected.go_mod_dirs,
+                detected.go_work_at_root,
+            );
             return Ok((report, maps));
         }
 
@@ -702,7 +708,13 @@ impl CoverageScanner {
 
         let mut family_list: Vec<CoverageFamilyStatus> = families.into_values().collect();
         family_list.sort_by(|a, b| a.family.cmp(&b.family));
-        fill_suggested_commands(&repo, &mut family_list, &detected.cargo_dirs);
+        fill_suggested_commands(
+            &repo,
+            &mut family_list,
+            &detected.cargo_dirs,
+            &detected.go_mod_dirs,
+            detected.go_work_at_root,
+        );
 
         let report = CoverageReport {
             families: family_list,
@@ -875,6 +887,9 @@ fn extra_dirs_for(family: &str) -> &'static [&'static str] {
 /// Cap on cargo workspaces we emit a coverage command for. A monorepo with
 /// dozens of `Cargo.toml` files must not drown the UI in buttons.
 const MAX_RUST_COVERAGE_COMMANDS: usize = 4;
+/// Cap on Go modules we emit a coverage command for. Matches the health
+/// scanner's `MAX_GO_MODS` bound so a polyglot monorepo cannot drown the UI.
+const MAX_GO_COVERAGE_COMMANDS: usize = 4;
 /// Bound on `package.json` we will parse for a coverage script. A hostile
 /// multi-megabyte manifest is skipped and we fall back to generic runners.
 const MAX_PACKAGE_JSON_BYTES: u64 = 256 * 1024;
@@ -943,16 +958,25 @@ fn package_has_dep(pkg: &serde_json::Value, name: &str) -> bool {
         .any(|key| pkg.get(*key).and_then(|deps| deps.get(name)).is_some())
 }
 
+fn package_script<'a>(pkg: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    pkg.get("scripts")
+        .and_then(|s| s.get(name))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+}
+
 fn javascript_coverage_commands(repo: &Path) -> Vec<String> {
     let mut commands = Vec::new();
     if let Some(pkg) = read_root_package_json(repo) {
-        let has_script = pkg
-            .get("scripts")
-            .and_then(|s| s.get("coverage"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        if has_script {
+        // Prefer a declared coverage script over a generic vitest/jest argv.
+        // `coverage` is the historical name; `test:coverage` is the npm
+        // convention ScholarLM and others actually ship. Do not pick every
+        // script whose name contains "coverage" (`test:rust:coverage` is not
+        // a JavaScript generator).
+        if package_script(&pkg, "coverage").is_some() {
             commands.push("npm run coverage".into());
+        } else if package_script(&pkg, "test:coverage").is_some() {
+            commands.push("npm run test:coverage".into());
         } else {
             if package_has_dep(&pkg, "vitest") || package_has_dep(&pkg, "@vitest/coverage-v8") {
                 commands.push("npx --no-install vitest run --coverage".into());
@@ -1009,8 +1033,45 @@ fn python_coverage_commands() -> Vec<String> {
     vec!["pytest --cov --cov-report=xml".into()]
 }
 
-fn go_coverage_commands() -> Vec<String> {
-    vec!["go test ./... -coverprofile=coverage.out".into()]
+fn go_test_cover_command(dir: &str) -> Option<String> {
+    let command = if dir.is_empty() {
+        "go test ./... -coverprofile=coverage.out".to_string()
+    } else {
+        let module = quote_rel(dir);
+        format!("go -C {module} test ./... -coverprofile=coverage.out")
+    };
+    command_line_is_argv_safe(&command).then_some(command)
+}
+
+fn go_coverage_commands(repo: &Path, go_mod_dirs: &[String], go_work_at_root: bool) -> Vec<String> {
+    // A root go.work is a workspace: `go test ./...` from the repo root
+    // covers every `use`d module. Nested `-C` commands would duplicate work
+    // and write coverprofiles into each module instead of the workspace root.
+    if go_work_at_root {
+        return vec!["go test ./... -coverprofile=coverage.out".into()];
+    }
+    let mut dirs: Vec<String> = go_mod_dirs
+        .iter()
+        .filter(|d| !rel_is_command_unsafe(d))
+        .cloned()
+        .collect();
+    if dirs.is_empty() {
+        // Listing missed every go.mod (ignored, or only `.go` files). A root
+        // go.work still lets `./...` resolve; otherwise fall back to CWD.
+        if manifest_is_file(repo, "go.work") || manifest_is_file(repo, "go.mod") {
+            dirs.push(String::new());
+        }
+    }
+    let mut commands = Vec::new();
+    for dir in dirs.into_iter().take(MAX_GO_COVERAGE_COMMANDS) {
+        if let Some(command) = go_test_cover_command(&dir) {
+            commands.push(command);
+        }
+    }
+    if commands.is_empty() {
+        commands.push("go test ./... -coverprofile=coverage.out".into());
+    }
+    commands
 }
 
 fn jvm_coverage_commands(repo: &Path) -> Vec<String> {
@@ -1112,9 +1173,13 @@ fn python_coverage_plan() -> LanguageCoveragePlan {
     )
 }
 
-fn go_coverage_plan() -> LanguageCoveragePlan {
+fn go_coverage_plan(
+    repo: &Path,
+    go_mod_dirs: &[String],
+    go_work_at_root: bool,
+) -> LanguageCoveragePlan {
     LanguageCoveragePlan::ready(
-        go_coverage_commands(),
+        go_coverage_commands(repo, go_mod_dirs, go_work_at_root),
         "Go coverage can take a few minutes.",
     )
 }
@@ -1220,12 +1285,14 @@ fn apply_language_plan(status: &mut CoverageFamilyStatus, plan: LanguageCoverage
 
 /// Fills generate/setup commands from the checkout's actual manifests and a
 /// live toolchain probe so the UI never offers `cargo llvm-cov` at a repo
-/// root that has no Cargo.toml, or pretends Rust generation is ready when
-/// cargo-llvm-cov is missing.
+/// root that has no Cargo.toml, `go test ./...` at a root with no go.mod, or
+/// pretends Rust generation is ready when cargo-llvm-cov is missing.
 fn fill_suggested_commands(
     repo: &Path,
     families: &mut [CoverageFamilyStatus],
     cargo_dirs: &[String],
+    go_mod_dirs: &[String],
+    go_work_at_root: bool,
 ) {
     let rust_present = families.iter().any(|status| status.family == "rust");
     let llvm_cov_ready = if rust_present {
@@ -1236,7 +1303,7 @@ fn fill_suggested_commands(
     let javascript = javascript_coverage_plan(repo);
     let rust = rust_coverage_plan(repo, cargo_dirs, llvm_cov_ready);
     let python = python_coverage_plan();
-    let go = go_coverage_plan();
+    let go = go_coverage_plan(repo, go_mod_dirs, go_work_at_root);
     let jvm = jvm_coverage_plan(repo);
     let native = native_coverage_plan(repo);
     let swift = swift_coverage_plan();
@@ -1263,18 +1330,20 @@ fn fill_suggested_commands(
     }
 }
 
-/// Output of [`detect_families`]: seeded families, cargo workspace dirs, and
+/// Output of [`detect_families`]: seeded families, cargo/Go module dirs, and
 /// whether the `ls-files` listing was cut short (git's 64 MB cap or
 /// [`LISTING_ENTRY_CAP`] entries).
 struct FamilyScan {
     families: BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: Vec<String>,
+    go_mod_dirs: Vec<String>,
+    go_work_at_root: bool,
     listing_partial: bool,
 }
 
 /// Returns the detected coverage families, every directory that holds a
-/// `Cargo.toml` (repo root as `""`), and whether the `ls-files` listing was
-/// incomplete.
+/// `Cargo.toml` or `go.mod` (repo root as `""`), whether a root `go.work`
+/// is present, and whether the `ls-files` listing was incomplete.
 ///
 /// The listing degrades to a prefix instead of failing: on a huge checkout,
 /// erroring here would kill the whole coverage scan even though family
@@ -1294,6 +1363,8 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     )?;
     let mut families: BTreeMap<String, CoverageFamilyStatus> = BTreeMap::new();
     let mut cargo_dirs: Vec<String> = Vec::new();
+    let mut go_mod_dirs: Vec<String> = Vec::new();
+    let mut go_work_at_root = false;
     let mut classified = 0usize;
     for rel in stdout.split('\0') {
         let rel = LanguageDetector::normalize_rel_path(rel);
@@ -1307,14 +1378,19 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
             break;
         }
         classified += 1;
-        if file_name_of_rel(&rel) == "Cargo.toml" {
-            let dir = std::path::Path::new(&rel)
-                .parent()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
+        let name = file_name_of_rel(&rel);
+        if name == "Cargo.toml" {
+            let dir = rel_parent_dir(&rel);
             if !cargo_dirs.contains(&dir) {
                 cargo_dirs.push(dir);
             }
+        } else if name == "go.mod" {
+            let dir = rel_parent_dir(&rel);
+            if !go_mod_dirs.contains(&dir) {
+                go_mod_dirs.push(dir);
+            }
+        } else if name == "go.work" && rel_parent_dir(&rel).is_empty() {
+            go_work_at_root = true;
         }
         let info = LanguageDetector::detect_from_path(&rel);
         let Some(family) = LanguageDetector::coverage_family_hint(&rel, &info) else {
@@ -1361,9 +1437,12 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
         status.languages.sort();
     }
     cargo_dirs.sort();
+    go_mod_dirs.sort();
     Ok(FamilyScan {
         families,
         cargo_dirs,
+        go_mod_dirs,
+        go_work_at_root,
         listing_partial,
     })
 }
@@ -1371,6 +1450,7 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
 fn collect_candidates(
     families: &BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: &[String],
+    go_mod_dirs: &[String],
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
     // One candidate per artifact PATH: several families can list the same
@@ -1404,7 +1484,31 @@ fn collect_candidates(
             }
         }
     }
+    for dir in go_mod_dirs {
+        if dir.is_empty() {
+            continue; // root specs already cover the repo root
+        }
+        for (tail, format) in nested_go_specs() {
+            let rel = format!("{dir}/{tail}");
+            if seen.insert(rel.clone()) {
+                out.push(Candidate {
+                    rel,
+                    format: *format,
+                    family: "go".to_string(),
+                });
+            }
+        }
+    }
     out
+}
+
+/// Artifact locations relative to a non-root Go module directory.
+fn nested_go_specs() -> &'static [(&'static str, CoverageFormat)] {
+    &[
+        ("coverage.out", CoverageFormat::GoCover),
+        ("cover.out", CoverageFormat::GoCover),
+        ("coverage.txt", CoverageFormat::GoCover),
+    ]
 }
 
 /// Artifact locations relative to a non-root cargo workspace directory.
@@ -2165,6 +2269,13 @@ fn file_name_of_rel(rel: &str) -> &str {
     rel.rsplit('/').next().unwrap_or(rel)
 }
 
+fn rel_parent_dir(rel: &str) -> String {
+    std::path::Path::new(rel)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
 /// Rolls per-file coverage up into per-language totals (the language split).
 /// Sorted by volume (lines found, descending) so the UI lists the dominant
 /// language first; ties break alphabetically for stable output.
@@ -2432,7 +2543,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[]);
+        let cands = collect_candidates(&families, &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "lcov.info"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
@@ -2457,7 +2568,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[]);
+        let cands = collect_candidates(&families, &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "coverage.xml"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
@@ -3140,6 +3251,53 @@ src/main.go:4.1,4.8 1 0
     }
 
     #[test]
+    fn javascript_test_coverage_script_beats_vitest_fallback() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"app","scripts":{"test:coverage":"vitest run --coverage","test:rust:coverage":"cargo llvm-cov"},"devDependencies":{"vitest":"2.0.0"}}"#,
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert_eq!(
+            js.suggested_commands,
+            vec!["npm run test:coverage".to_string()]
+        );
+        assert!(
+            !js.suggested_commands
+                .iter()
+                .any(|c| c.contains("vitest") || c.contains("test:rust")),
+            "declared test:coverage must win over vitest argv and rust scripts: {:?}",
+            js.suggested_commands
+        );
+        assert_argv_safe(&js.suggested_commands);
+    }
+
+    #[test]
+    fn javascript_coverage_script_still_wins_over_test_coverage() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"app","scripts":{"coverage":"vitest run --coverage","test:coverage":"vitest run --coverage --project frontend"},"devDependencies":{"vitest":"2.0.0"}}"#,
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert_eq!(js.suggested_commands, vec!["npm run coverage".to_string()]);
+    }
+
+    #[test]
     fn python_go_and_jvm_keep_curated_commands_native_has_none() {
         let repo = git_repo();
         write(repo.path(), "pkg/mod.py", "def f():\n    return 1\n");
@@ -3197,6 +3355,160 @@ src/main.go:4.1,4.8 1 0
             assert_argv_safe(&family.suggested_commands);
             assert_argv_safe(&family.setup_commands);
         }
+    }
+
+    #[test]
+    fn nested_go_mod_plans_chdir_coverprofile() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "backend/go_orchestrator/go.mod",
+            "module example.com/orch\n\ngo 1.22\n",
+        );
+        write(
+            repo.path(),
+            "backend/go_orchestrator/main.go",
+            "package main\nfunc main() {}\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let go = report
+            .families
+            .iter()
+            .find(|f| f.family == "go")
+            .expect("go family");
+        assert_eq!(
+            go.suggested_commands,
+            vec!["go -C backend/go_orchestrator test ./... -coverprofile=coverage.out".to_string()]
+        );
+        assert!(
+            !go.suggested_commands
+                .iter()
+                .any(|c| c == "go test ./... -coverprofile=coverage.out"),
+            "root ./... must not be planned when go.mod is nested: {:?}",
+            go.suggested_commands
+        );
+        assert_argv_safe(&go.suggested_commands);
+    }
+
+    #[test]
+    fn root_go_mod_keeps_root_cover_command() {
+        let repo = git_repo();
+        write(repo.path(), "go.mod", "module example.com/app\n\ngo 1.22\n");
+        write(repo.path(), "main.go", "package main\nfunc main() {}\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let go = report
+            .families
+            .iter()
+            .find(|f| f.family == "go")
+            .expect("go family");
+        assert_eq!(
+            go.suggested_commands,
+            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        );
+    }
+
+    #[test]
+    fn go_work_at_root_uses_workspace_not_nested_chdir() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "go.work",
+            "go 1.22\n\nuse ./backend/go_orchestrator\n",
+        );
+        write(
+            repo.path(),
+            "backend/go_orchestrator/go.mod",
+            "module example.com/orch\n\ngo 1.22\n",
+        );
+        write(
+            repo.path(),
+            "backend/go_orchestrator/main.go",
+            "package main\nfunc main() {}\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let go = report
+            .families
+            .iter()
+            .find(|f| f.family == "go")
+            .expect("go family");
+        assert_eq!(
+            go.suggested_commands,
+            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        );
+        assert!(
+            !go.suggested_commands.iter().any(|c| c.contains("-C")),
+            "workspace root must not emit per-module -C: {:?}",
+            go.suggested_commands
+        );
+    }
+
+    #[test]
+    fn two_go_modules_plan_both_cover_commands() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "api/go.mod",
+            "module example.com/api\n\ngo 1.22\n",
+        );
+        write(repo.path(), "api/main.go", "package main\nfunc main() {}\n");
+        write(
+            repo.path(),
+            "cli/go.mod",
+            "module example.com/cli\n\ngo 1.22\n",
+        );
+        write(repo.path(), "cli/main.go", "package main\nfunc main() {}\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let go = report
+            .families
+            .iter()
+            .find(|f| f.family == "go")
+            .expect("go family");
+        assert_eq!(
+            go.suggested_commands,
+            vec![
+                "go -C api test ./... -coverprofile=coverage.out".to_string(),
+                "go -C cli test ./... -coverprofile=coverage.out".to_string(),
+            ]
+        );
+        assert_argv_safe(&go.suggested_commands);
+    }
+
+    #[test]
+    fn nested_go_cover_artifact_is_found() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "backend/go_orchestrator/go.mod",
+            "module example.com/orch\n\ngo 1.22\n",
+        );
+        write(
+            repo.path(),
+            "backend/go_orchestrator/main.go",
+            "package main\nfunc main() {}\n",
+        );
+        write(
+            repo.path(),
+            "backend/go_orchestrator/coverage.out",
+            "mode: set\nbackend/go_orchestrator/main.go:1.1,1.20 1 1\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert!(
+            report.families.iter().any(|f| f.family == "go" && f.found),
+            "nested coverage.out must mark go found: {:?}",
+            report.families
+        );
+        assert!(
+            report
+                .artifacts
+                .iter()
+                .any(|a| a.path == "backend/go_orchestrator/coverage.out" && !a.skipped),
+            "nested go cover artifact: {:?}",
+            report.artifacts
+        );
+        assert!(report
+            .files
+            .iter()
+            .any(|f| f.path == "backend/go_orchestrator/main.go"));
     }
 
     #[test]
