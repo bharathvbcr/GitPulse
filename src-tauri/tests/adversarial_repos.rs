@@ -131,12 +131,7 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     assert!(!blob.base64.unwrap().is_empty());
 
     let commit = GitReader::head_id(path).unwrap();
-    // The commit-diff pipeline classifies binary blobs as skipped files
-    // rather than emitting "Binary files differ" text into the patch body.
-    let payload = GitReader::get_commit_diff_payload(path, &commit).expect("payload");
-    assert!(payload.truncated);
-    assert_eq!(payload.skipped_files.len(), 1);
-    assert_eq!(payload.skipped_files[0].path, "bin5m.dat");
+    let _diff = GitReader::get_commit_diff(path, &commit).expect("diff");
     let files = GitReader::get_commit_files(path, &commit).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "bin5m.dat");

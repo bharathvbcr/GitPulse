@@ -19,18 +19,18 @@ describe("WorktreesPanel", () => {
   it("gives the two-step remove button a spoken label, including the arm state", () => {
     // Rows render from backend data (absent in SSR), so the remove control is
     // asserted at source level like DiffViewer.test.ts does.
-    expect(source).toContain('aria-label={removingPath === wt.path');
+    expect(source).toContain("aria-label={removeArmTitle(wt)}");
     expect(source).toContain("Click again to remove");
-    expect(source).toContain(`Remove worktree \${wt.name}`);
+    expect(source).toContain("Remove this worktree");
   });
 
-  it("drops stale cmd_list_worktrees responses via an epoch counter", () => {
+  it("drops stale cmd_list_worktrees responses via async guard", () => {
     // Overlapping loads after rapid create/remove must not land out of order:
-    // every apply path re-checks the epoch captured at trigger time.
-    expect(source).toContain("loadEpoch");
-    expect(source).toMatch(/epoch !== loadEpoch/);
+    // every apply path re-checks the guard captured at trigger time.
+    expect(source).toContain("createAsyncGuard()");
+    expect(source).toContain("if (!guard.isLive()) return;");
     // A superseded load's finally must not clear the newer load's spinner.
-    expect(source).toContain("if (epoch === loadEpoch) isLoading = false;");
+    expect(source).toContain("if (guard.isLive()) isLoading = false;");
   });
 });
 

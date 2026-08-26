@@ -215,6 +215,7 @@
       <button
         onclick={() => (showAddForm = !showAddForm)}
         title="Create a linked worktree for a parallel task"
+        aria-label="Create worktree"
         class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
       >
         <Plus size={12} />

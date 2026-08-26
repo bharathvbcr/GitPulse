@@ -8,7 +8,7 @@ use crate::diff::{
 };
 use crate::engine::git_cli::{git_text, resolve_repo, sandbox_write, validate_repo, ResolvedRepo};
 use crate::engine::git_reader::{
-    BlameLine, CommitDetails, CommitFileChange, FileBlob, ReflogEntry, RepoLanguageStat,
+    BlameLine, CommitDetails, CommitFileChange, FileBlob, LanguageStatsReport, ReflogEntry,
 };
 use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
@@ -715,7 +715,7 @@ pub async fn cmd_get_reflog(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_get_language_stats(repo_path: String) -> Result<Vec<RepoLanguageStat>, String> {
+pub async fn cmd_get_language_stats(repo_path: String) -> Result<LanguageStatsReport, String> {
     off_thread(move || GitReader::get_repo_language_stats(&repo_path)).await
 }
 

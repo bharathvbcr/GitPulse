@@ -17,6 +17,9 @@ const MAX_BRANCH_STAT_TARGETS: usize = 96;
 /// are silently omitted until one lands.
 const TAG_LIST_CAP: usize = 400;
 
+/// Commit graph ref decoration tag ceiling: newest-first, capped so massive tag histories do not bloat the graph payload.
+pub const REFS_TAG_CAP: usize = 200;
+
 /// Bound for the process-wide churn memo. Entries are content-addressed by
 /// oids so they cannot go stale; the cap only bounds memory.
 const CHURN_CACHE_CAPACITY: usize = 8192;

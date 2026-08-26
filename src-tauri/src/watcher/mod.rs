@@ -1247,7 +1247,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();
-        let key = start_watch_inner(
+        let _key = start_watch_inner(
             &state,
             dir.path().to_string_lossy().into_owned(),
             |_| panic!("emit explosion probe"),
