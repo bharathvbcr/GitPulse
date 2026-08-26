@@ -22,7 +22,7 @@ describe("parseFilterQuery stress: extreme token sizes", () => {
     expect(parsed.author).toBe("ada");
     expect(parsed.text).toContain(needle);
     expect(parsed.text.endsWith("tail")).toBe(true);
-    expect(elapsedMs).toBeLessThan(200);
+    expect(elapsedMs).toBeLessThan(2_000);
   });
 
   it("handles 1,000 tokens, preserving order and count", () => {

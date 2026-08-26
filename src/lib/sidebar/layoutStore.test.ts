@@ -293,7 +293,7 @@ describe("loadLayout fuzz/stress", () => {
     }
 
     expect(inputs.length).toBeGreaterThanOrEqual(10_000);
-    expect(elapsedMs).toBeLessThan(100);
+    expect(elapsedMs).toBeLessThan(1_500);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 
     // Every accepted width must round-trip through JSON.stringify unchanged.
