@@ -418,32 +418,16 @@ fn create_scratch_under(root: &std::path::Path, unique: &str) -> Result<PathBuf,
     Ok(dir)
 }
 
-/// Resolves the `manvi` binary: explicit override, then `PATH`, then the
-/// conventional user-local install directory.
+/// Resolves the `manvi` binary: explicit override, then the shared
+/// PATH + GUI-fallback search (one canonical owner of those semantics, in
+/// [`crate::engine::git_cli`]).
 pub fn resolve_binary() -> Option<String> {
     if let Ok(explicit) = std::env::var("GITPULSE_MANVI_BIN") {
         let path = PathBuf::from(&explicit);
-        if path.is_file() {
-            return Some(explicit);
-        }
-        return None;
+        return if path.is_file() { Some(explicit) } else { None };
     }
     let bin_name = if cfg!(windows) { "manvi.exe" } else { "manvi" };
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(bin_name);
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let candidate = PathBuf::from(home).join(".local/bin").join(bin_name);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
+    crate::engine::git_cli::find_external_tool(bin_name)
 }
 
 /// Reads one newline-terminated frame without ever buffering more than

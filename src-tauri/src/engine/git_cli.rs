@@ -397,6 +397,210 @@ pub fn run_command_in(
     Err(err)
 }
 
+/// Fallback directories searched when a bare tool name is missing from the
+/// inherited `PATH`, and appended to the child's PATH so nested lookups (a
+/// shebang script's interpreter, `govulncheck` shelling out to `go`) resolve
+/// the same way.
+///
+/// GUI launches on macOS (Finder, Dock, `open`) hand the app a minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) that omits Homebrew and user-local bin
+/// directories, so `Command::new("gh")` failed to resolve even though the CLI
+/// was installed — every GitHub view then reported "`gh` is not installed".
+/// Terminal launches never saw this. Superset of the convention mirrored from
+/// [`crate::harness::sidecar::resolve_binary`] with Go toolchain locations for
+/// scanners that spawn `go` themselves; nonexistent entries are harmlessly skipped.
+fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ];
+    if let Some(home) = home {
+        dirs.push(PathBuf::from(home).join(".local/bin"));
+        // Standard GOBIN/GOPATH install locations (`go install ...` defaults).
+        dirs.push(PathBuf::from("/usr/local/go/bin"));
+        dirs.push(PathBuf::from(home).join("go/bin"));
+    }
+    dirs
+}
+
+/// First entry of `dirs` holding a spawnpable file named `program`.
+///
+/// Deliberately stricter than an `is_file()` scan so resolution matches what
+/// the OS PATH walk would have done:
+/// - relative directory entries are ignored. POSIX reads an empty entry as
+///   "the current directory", and a relative candidate would be resolved by
+///   the spawn against the child's post-`chdir` working directory (`cwd`
+///   argument), silently searching the wrong tree;
+/// - on Unix the candidate must carry an execute bit — `execvp` skips
+///   non-executable matches rather than failing the whole lookup, and picking
+///   one would turn "tool found" into a PermissionDenied spawn error;
+/// - broken symlinks and directories named like the tool are skipped;
+/// - on Windows the bare name is tried before the `.exe`-suffixed one, and
+///   never double-suffixed (`npm.cmd`, `gh.exe`).
+fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut names = vec![program.to_string()];
+    if cfg!(windows) && !program.to_ascii_lowercase().ends_with(".exe") {
+        names.push(format!("{program}.exe"));
+    }
+    dirs.iter().filter(|dir| dir.is_absolute()).find_map(|dir| {
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| is_executable_file(candidate))
+    })
+}
+
+/// True when `path` is a regular, executable file (symlinks followed; broken
+/// links, directories and non-executable files are false).
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Windows counterpart: any regular file counts (extension handling is the
+/// caller's job via [`find_in_dirs`]' name list).
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+}
+
+/// Child-side `PATH` value: inherited entries first (precedence preserved),
+/// then the [`gui_launch_fallback_dirs`] that are not already present.
+///
+/// Resolving the top-level program is not enough. Shebang scripts re-resolve
+/// their interpreter through `env` against the CHILD's PATH, and tools such as
+/// `npm` (`#!/usr/bin/env node`), `composer` (`php`) and `bundler-audit`
+/// (`ruby`) live exactly where a GUI-minimal PATH cannot see. Without this,
+/// resolving `/opt/homebrew/bin/npm` succeeds and the spawn still dies with
+/// "env: node: No such file or directory" (exit 127) — which reads downstream
+/// as "npm is not installed".
+///
+/// Returns `None` when the joined value cannot be built (an entry with a
+/// disallowed character); the caller then leaves the inherited PATH untouched
+/// rather than degrading the child to an empty one.
+fn extended_child_path(
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    // Empty entries are dropped: POSIX reads one as "the current directory",
+    // which would let whatever repo the user has open inject executables into
+    // every spawned tool's lookup path.
+    let mut entries: Vec<PathBuf> = path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    if path_var.is_none() && cfg!(unix) {
+        // PATH entirely absent (daemon/launchd-style contexts): seed the Unix
+        // default search set (confstr `_CS_PATH`) so appending fallbacks does
+        // not leave children with nothing but Homebrew dirs.
+        entries.push(PathBuf::from("/usr/bin"));
+        entries.push(PathBuf::from("/bin"));
+    }
+    for dir in gui_launch_fallback_dirs(home) {
+        if !entries.contains(&dir) {
+            entries.push(dir);
+        }
+    }
+    std::env::join_paths(entries).ok()
+}
+
+/// Resolves the `program` argument of [`capture_command`] to a spawner-ready
+/// form.
+///
+/// A name containing a path separator is honored verbatim. A bare name is
+/// searched in `path_var` first (preserving normal PATH precedence), then in
+/// the [`gui_launch_fallback_dirs`]. Found anywhere, its path is returned;
+/// found nowhere, the bare name passes through unchanged so the existing
+/// "Failed to spawn …" error keeps naming the tool the caller asked for.
+fn resolve_spawn_program_with(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> String {
+    if program.contains('/') || program.contains('\\') {
+        return program.to_string();
+    }
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    dirs.extend(gui_launch_fallback_dirs(home));
+    find_in_dirs(program, &dirs)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
+}
+
+/// Shared lookup for subsystems that need to *find* an external tool without
+/// spawning it (the harness sidecar's `manvi`, presence checks that want the
+/// resolved path). Single owner of PATH + GUI-fallback resolution semantics;
+/// bare names only — anything with a separator is not searched.
+pub(crate) fn find_external_tool(program: &str) -> Option<String> {
+    if program.is_empty() || program.contains('/') || program.contains('\\') {
+        return None;
+    }
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let mut dirs: Vec<PathBuf> = path_var
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    dirs.extend(gui_launch_fallback_dirs(home.as_deref()));
+    find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Assembles the `capture_command` child with injectable `PATH`/home lookups,
+/// mirroring the seam [`resolve_spawn_program_with`] gives the resolver.
+///
+/// Bare names are resolved up front: the child inherits our environment, but
+/// `Command` performs its PATH walk with it, so a GUI-minimal PATH cannot be
+/// patched from inside the child. The resolved script's own interpreter lookup
+/// (`env node` inside npm) walks the same inherited PATH, so the fallback dirs
+/// are appended to the child's PATH too — non-Windows only, where setting
+/// "PATH" via `.env()` cannot collide with the case-insensitive "Path"
+/// variable in the Windows environment block.
+pub(crate) fn build_capture_command(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Command {
+    let resolved = resolve_spawn_program_with(program, path_var, home);
+    let mut cmd = Command::new(&resolved);
+    cmd.args(args)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    if !cfg!(windows) {
+        // Applied before `extra_env` so an explicit caller-provided PATH wins.
+        if let Some(child_path) = extended_child_path(path_var, home) {
+            cmd.env("PATH", child_path);
+        }
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 /// Runs `program` with a hard timeout and bounded pipes.
 ///
 /// `cwd` is optional. When set, it must already be a directory the caller has
@@ -409,19 +613,16 @@ pub fn capture_command(
     timeout: Duration,
     extra_env: &[(&str, &str)],
 ) -> Result<CapturedOutput, String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let cmd = build_capture_command(
+        program,
+        args,
+        cwd,
+        extra_env,
+        path_var.as_deref(),
+        home.as_deref(),
+    );
 
     let out = run_bounded(cmd, program, timeout, None)?;
     if out.truncated {
@@ -435,15 +636,93 @@ pub fn capture_command(
     })
 }
 
+/// Tail of one byte stream as display text, cut on a char boundary so a
+/// multibyte character split at the cap does not render as replacement
+/// garbage. Shared by every surface that shows capped tool output.
+pub fn byte_tail(bytes: &[u8], cap: usize) -> String {
+    let start = bytes.len().saturating_sub(cap);
+    let tail = &bytes[start..];
+    let boundary = tail
+        .iter()
+        .position(|b| (*b & 0xC0) != 0x80)
+        .unwrap_or(tail.len());
+    String::from_utf8_lossy(&tail[boundary..]).into_owned()
+}
+
+/// A finished run (any exit code) with capped per-stream tails.
+#[derive(Debug)]
+pub struct CapturedRun {
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub success: bool,
+    pub status_code: i32,
+    /// True when output hit [`MAX_OUTPUT_BYTES`] and was cut — the tails are
+    /// what survived, and the flag says so rather than implying completeness.
+    pub truncated: bool,
+}
+
+/// Outcome of [`run_captured`]. A timeout is an outcome, not an error: the
+/// terminal surfaces "killed at N s" next to normal exits, and collapsing it
+/// into a spawn-style error string would make the two indistinguishable.
+#[derive(Debug)]
+pub enum RunOutcome {
+    Finished(CapturedRun),
+    TimedOut(Duration),
+}
+
+/// Like [`capture_command`], but truncation keeps capped tails instead of
+/// erroring away everything, and the timeout is reported as an outcome.
+///
+/// `tail_cap` bounds each returned tail in bytes; pass [`MAX_OUTPUT_BYTES`]
+/// to keep everything up to the drain cap. Built for callers that show raw
+/// tool output to a user (the terminal); `capture_command` stays the right
+/// shape for JSON-scraping scanners.
+pub fn run_captured(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+    tail_cap: usize,
+) -> Result<RunOutcome, String> {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let cmd = build_capture_command(
+        program,
+        args,
+        cwd,
+        extra_env,
+        path_var.as_deref(),
+        home.as_deref(),
+    );
+    // Spawn/wait failures stay errors. The timeout is detected from the error
+    // `run_bounded` formats for exactly that case ("{label} timed out after
+    // {n}s"); the regression test below pins this contract so a rewording
+    // cannot silently turn timeouts into spawn errors again.
+    match run_bounded(cmd, program, timeout, None) {
+        Ok(out) => Ok(RunOutcome::Finished(CapturedRun {
+            stdout_tail: byte_tail(&out.stdout, tail_cap),
+            stderr_tail: byte_tail(&out.stderr, tail_cap),
+            success: out.success,
+            status_code: out.status_code,
+            truncated: out.truncated || out.stdout.len() > tail_cap || out.stderr.len() > tail_cap,
+        })),
+        Err(e) if e.starts_with(program) && e.contains(" timed out after ") => {
+            Ok(RunOutcome::TimedOut(timeout))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
 #[derive(Debug)]
-struct BoundedRun {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    success: bool,
-    status_code: i32,
+pub(crate) struct BoundedRun {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub success: bool,
+    pub status_code: i32,
     /// True when stdout was cut off at [`MAX_OUTPUT_BYTES`].
-    truncated: bool,
+    pub truncated: bool,
 }
 
 /// Shared engine behind `git_timeout` and `capture_command`: spawns `cmd`,
@@ -453,7 +732,7 @@ struct BoundedRun {
 /// own wording for truncation). When `stdin_bytes` is set, the child gets a
 /// piped stdin fed from a dedicated thread, so the deadline loop below stays
 /// responsive even while megabytes are still being pushed into the child.
-fn run_bounded(
+pub(crate) fn run_bounded(
     mut cmd: Command,
     label: &str,
     timeout: Duration,
@@ -842,6 +1121,59 @@ mod tests {
         assert!(validate_repo("/definitely/missing-gitpulse-validate-repo").is_err());
     }
 
+    #[test]
+    fn run_captured_reports_a_finished_run_with_tails() {
+        let outcome = run_captured(
+            "git",
+            &["--version"],
+            None,
+            DEFAULT_TIMEOUT,
+            &[],
+            MAX_OUTPUT_BYTES,
+        )
+        .unwrap();
+        match outcome {
+            RunOutcome::Finished(run) => {
+                assert!(run.success);
+                assert_eq!(run.status_code, 0);
+                assert!(run.stdout_tail.contains("git version"));
+                assert!(!run.truncated);
+            }
+            RunOutcome::TimedOut(_) => panic!("git --version must not time out"),
+        }
+    }
+
+    /// Pins the timeout contract of [`run_captured`]: a deadline kill is an
+    /// outcome (`TimedOut`), never laundered into a spawn-style error. If
+    /// `run_bounded`'s message wording changes, this fails and the detector
+    /// in `run_captured` has to be updated with it.
+    #[cfg(unix)]
+    #[test]
+    fn run_captured_reports_timeout_as_an_outcome() {
+        let outcome = run_captured(
+            "sleep",
+            &["5"],
+            None,
+            Duration::from_secs(1),
+            &[],
+            MAX_OUTPUT_BYTES,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, RunOutcome::TimedOut(d) if d.as_secs() == 1),
+            "expected TimedOut(1s), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn byte_tail_keeps_the_end_and_stays_char_safe() {
+        assert_eq!(byte_tail(b"hello world", 5), "world");
+        // A multibyte sequence split at the cap must not leak replacement
+        // characters at the head of the tail.
+        let prefix = "é".repeat(5000); // 2 bytes each
+        assert!(!byte_tail(prefix.as_bytes(), 9999).starts_with('\u{FFFD}'));
+    }
+
     fn git_in(dir: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .args([
@@ -1117,6 +1449,326 @@ mod tests {
         )
         .expect_err("nonzero");
         assert!(err.contains("boom"));
+    }
+
+    /// Regression: a GUI launch (Finder/Dock/ScholarLM) hands the app a minimal
+    /// PATH without `/opt/homebrew/bin`, so bare names like `gh` failed to
+    /// resolve and every GitHub view reported the CLI as "not installed". With
+    /// an empty PATH the resolver must fall back to the conventional install
+    /// directories (`~/.local/bin` here, standing in for Homebrew's).
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_finds_tool_in_fallback_dir_when_path_is_empty() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("gitpulse-fake-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let resolved = resolve_spawn_program_with(
+            "gitpulse-fake-tool",
+            Some(std::ffi::OsStr::new("")),
+            Some(home.path().as_os_str()),
+        );
+        assert_eq!(
+            Path::new(&resolved),
+            &tool,
+            "bare name must resolve through the fallback dir on an empty PATH"
+        );
+    }
+
+    /// PATH order wins: a name present on the inherited PATH must not be
+    /// shadowed by a fallback-directory copy. Both candidates are executable
+    /// so the strict `find_in_dirs` scan considers them at all.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_prefers_path_over_fallback_dirs() {
+        let path_dir = tempfile::TempDir::new().unwrap();
+        let home_dir = tempfile::TempDir::new().unwrap();
+        for dir in [path_dir.path(), &home_dir.path().join(".local/bin")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("gitpulse-shadowed"), "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(
+                dir.join("gitpulse-shadowed"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let resolved = resolve_spawn_program_with(
+            "gitpulse-shadowed",
+            Some(path_dir.path().as_os_str()),
+            Some(home_dir.path().as_os_str()),
+        );
+        assert_eq!(
+            Path::new(&resolved),
+            path_dir.path().join("gitpulse-shadowed")
+        );
+    }
+
+    /// A non-executable file must not win the lookup: `execvp` skips it and
+    /// keeps searching, so an executable copy later in the search order has to
+    /// be picked instead of failing the eventual spawn with PermissionDenied.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_skips_non_executable_candidate_for_later_match() {
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        std::fs::write(first.path().join("gitpulse-exec-probe"), "data, not code").unwrap();
+        let good = second.path().join("gitpulse-exec-probe");
+        std::fs::write(&good, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&good, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let path_var = std::env::join_paths([first.path(), second.path()]).expect("join dirs");
+        let resolved = resolve_spawn_program_with("gitpulse-exec-probe", Some(&path_var), None);
+        assert_eq!(
+            Path::new(&resolved),
+            &good,
+            "executable copy in a later dir must beat a non-executable earlier one"
+        );
+    }
+
+    /// Empty PATH entries mean CWD (POSIX) and relative entries resolve
+    /// against whatever cwd the child ends up with — both must be ignored by
+    /// the resolver even when they really contain the tool.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_ignores_empty_and_relative_path_entries() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let rel = Cleanup(PathBuf::from("gitpulse-rel-probe-dir"));
+        std::fs::create_dir_all(&rel.0).unwrap();
+        std::fs::write(rel.0.join("gitpulse-rel-probe-tool"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            rel.0.join("gitpulse-rel-probe-tool"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        for hostile in ["", "::", "gitpulse-rel-probe-dir"] {
+            let resolved = resolve_spawn_program_with(
+                "gitpulse-rel-probe-tool",
+                Some(std::ffi::OsStr::new(hostile)),
+                None,
+            );
+            assert_eq!(
+                resolved, "gitpulse-rel-probe-tool",
+                "entry {hostile:?} must not resolve a relative candidate"
+            );
+        }
+    }
+
+    /// Broken symlinks and directories that merely share the tool's name are
+    /// not spawnpable candidates.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_skips_broken_symlink_and_directory_named_like_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely/does/not/exist",
+            dir.path().join("gitpulse-dangling"),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("gitpulse-dirname")).unwrap();
+
+        for name in ["gitpulse-dangling", "gitpulse-dirname"] {
+            let resolved = resolve_spawn_program_with(name, Some(dir.path().as_os_str()), None);
+            assert_eq!(
+                resolved, name,
+                "{name} must be skipped rather than selected as a candidate"
+            );
+        }
+    }
+
+    /// The child PATH never carries CWD-searching empty entries, and a fully
+    /// absent PATH is seeded with the Unix default set instead of leaving
+    /// children with only Homebrew/fallback dirs.
+    #[cfg(unix)]
+    #[test]
+    fn extended_child_path_drops_cwd_entries_and_seeds_default_when_unset() {
+        let home = tempfile::TempDir::new().unwrap();
+        let colon_joined = extended_child_path(
+            Some(std::ffi::OsStr::new("::")),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join");
+        let entries: Vec<PathBuf> = std::env::split_paths(&colon_joined).collect();
+        assert!(
+            entries.iter().all(|e| !e.as_os_str().is_empty()),
+            "empty CWD entries must be dropped: {entries:?}"
+        );
+        assert_eq!(
+            entries.first(),
+            Some(&PathBuf::from("/opt/homebrew/bin")),
+            "with nothing inherited, fallbacks start immediately"
+        );
+
+        let unset = extended_child_path(None, Some(home.path().as_os_str())).expect("join");
+        let seeded: Vec<PathBuf> = std::env::split_paths(&unset).collect();
+        assert_eq!(
+            &seeded[..2],
+            [Path::new("/usr/bin"), Path::new("/bin")],
+            "unset PATH must seed the Unix default search set"
+        );
+    }
+
+    /// The extended child PATH appends only the fallback dirs that are not
+    /// already present, preserving inherited order and precedence.
+    #[cfg(unix)]
+    #[test]
+    fn extended_child_path_appends_missing_fallback_dirs_only() {
+        let home = tempfile::TempDir::new().unwrap();
+        let extended = extended_child_path(
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join must succeed for plain entries");
+        let entries: Vec<PathBuf> = std::env::split_paths(&extended).collect();
+        assert_eq!(entries[0], PathBuf::from("/usr/bin"));
+        assert_eq!(entries[1], PathBuf::from("/bin"));
+        for fallback in [
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            home.path().join(".local/bin"),
+            // Go toolchain locations so govulncheck's own `go` spawn resolves.
+            PathBuf::from("/usr/local/go/bin"),
+            home.path().join("go/bin"),
+        ] {
+            assert!(
+                entries.contains(&fallback),
+                "fallback dir must be appended: {} in {entries:?}",
+                fallback.display()
+            );
+        }
+
+        // Already-present entries are never duplicated.
+        let deduped = extended_child_path(
+            Some(std::ffi::OsStr::new("/opt/homebrew/bin")),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join must succeed");
+        let count = std::env::split_paths(&deduped)
+            .filter(|p| p == Path::new("/opt/homebrew/bin"))
+            .count();
+        assert_eq!(count, 1, "must not duplicate an existing entry");
+    }
+
+    /// An explicit caller-provided PATH (via `extra_env`) outranks the child
+    /// PATH extension — the extension only fills an absent decision.
+    #[test]
+    fn extra_env_path_overrides_child_path_extension() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cmd = build_capture_command(
+            "sh",
+            &[],
+            None,
+            &[("PATH", "/caller/chosen")],
+            Some(std::ffi::OsStr::new("")),
+            Some(home.path().as_os_str()),
+        );
+        let path_values: Vec<String> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .filter_map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(path_values, vec!["/caller/chosen".to_string()]);
+    }
+
+    /// Regression (GUI launch + shebang scripts): resolving the top-level
+    /// program through the fallback dirs is not enough. `/opt/homebrew/bin/npm`
+    /// is a symlink to a `#!/usr/bin/env node` script; under a GUI-minimal
+    /// inherited PATH the spawn's own `env` interpreter lookup fails (exit 127,
+    /// "env: node: No such file or directory"), which reads downstream as
+    /// "npm is not installed". The child must see the fallback dirs on its own
+    /// PATH too.
+    #[cfg(unix)]
+    #[test]
+    fn shebang_tool_in_fallback_dir_finds_interpreter_through_child_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let interpreter = bin.join("gitpulse-fake-interp");
+        std::fs::write(&interpreter, "#!/bin/sh\necho INTERP_OK\n").unwrap();
+        std::fs::set_permissions(
+            &interpreter,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let tool = bin.join("gitpulse-fake-shebang-tool");
+        std::fs::write(&tool, "#!/usr/bin/env gitpulse-fake-interp\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // An empty inherited PATH stands in for a Finder/Dock launch: the tool
+        // resolves via ~/.local/bin and its interpreter must resolve the same
+        // way inside the child.
+        let cmd = build_capture_command(
+            "gitpulse-fake-shebang-tool",
+            &[],
+            None,
+            &[],
+            Some(std::ffi::OsStr::new("")),
+            Some(home.path().as_os_str()),
+        );
+        let out = run_bounded(
+            cmd,
+            "gitpulse-fake-shebang-tool",
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("spawn");
+        assert!(
+            out.success,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("INTERP_OK"),
+            "stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Absolute paths pass through untouched, and a name found nowhere comes
+    /// back unchanged so the spawn error keeps naming the requested tool.
+    #[test]
+    fn spawn_resolution_passes_through_separators_and_total_misses() {
+        assert_eq!(
+            resolve_spawn_program_with("/bin/sh", Some(std::ffi::OsStr::new("")), None),
+            "/bin/sh"
+        );
+        assert_eq!(
+            resolve_spawn_program_with(
+                "gitpulse-no-such-tool",
+                Some(std::ffi::OsStr::new("")),
+                None
+            ),
+            "gitpulse-no-such-tool"
+        );
+    }
+
+    /// The failure contract is preserved: an unresolvable program still fails
+    /// `capture_command` with the original tool name in the message.
+    #[test]
+    fn capture_command_error_still_names_unresolvable_tool() {
+        let err = capture_command(
+            "gitpulse-no-such-tool-xyz",
+            &[],
+            None,
+            Duration::from_secs(5),
+            &[],
+        )
+        .expect_err("unresolvable tool must error");
+        assert!(
+            err.contains("gitpulse-no-such-tool-xyz"),
+            "error must keep the bare tool name, got: {err}"
+        );
     }
 
     #[test]

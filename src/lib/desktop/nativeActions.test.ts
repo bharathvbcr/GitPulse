@@ -67,6 +67,7 @@ describe("dispatchNativeMenu", () => {
       expect(h.calls.at(-1)).toBe(`tab:${view.id}`);
     }
     expect(h.calls.some((call) => call === "tab:manvi")).toBe(true);
+    expect(h.calls.some((call) => call === "tab:terminal")).toBe(true);
   });
 
   it("opens a recent path and ignores empty recent", () => {

@@ -160,15 +160,7 @@ const NPM_CI_ENV: &[(&str, &str)] = &[
 fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
     let mut combined = stdout.to_vec();
     combined.extend_from_slice(stderr);
-    let start = combined.len().saturating_sub(OUTPUT_TAIL_BYTES);
-    let tail = &combined[start..];
-    // Trim forward to a char boundary so a multibyte character cut in half
-    // does not render as replacement garbage.
-    let boundary = tail
-        .iter()
-        .position(|b| (*b & 0xC0) != 0x80)
-        .unwrap_or(tail.len());
-    String::from_utf8_lossy(&tail[boundary..])
+    crate::engine::git_cli::byte_tail(&combined, OUTPUT_TAIL_BYTES)
         .lines()
         .collect::<Vec<_>>()
         .join("\n")

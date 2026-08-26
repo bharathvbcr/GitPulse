@@ -28,6 +28,7 @@
   import CoverageViewer from "./lib/components/CoverageViewer.svelte";
   import HealthPanel from "./lib/components/HealthPanel.svelte";
   import StoragePanel from "./lib/components/StoragePanel.svelte";
+  import TerminalPanel from "./lib/components/TerminalPanel.svelte";
   import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
@@ -379,6 +380,8 @@
                 <StoragePanel />
               {:else if $repoStore.activeTab === "stack"}
                 <CodeStackViewer />
+              {:else if $repoStore.activeTab === "terminal"}
+                <TerminalPanel />
               {:else if $repoStore.activeTab === "github"}
                 <GitHubPanel />
               {:else if $repoStore.activeTab === "manvi"}

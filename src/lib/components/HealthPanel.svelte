@@ -11,11 +11,19 @@
     Clipboard,
     LoaderCircle,
     Sparkles,
+    Play,
+    Check,
+    Terminal,
   } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import { harnessStore, type AiGeneration } from "../stores/harnessStore";
+  import {
+    harnessStore,
+    type AiGeneration,
+    type PolicyVerdict,
+  } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
-  import { formatHealthReport } from "../health/report";
+  import { formatHealthReport, skippedAudits } from "../health/report";
+  import { extractPlanSteps, tokenizeCommand } from "../terminal/tokenize";
   import type {
     DepsHealthReport,
     Vulnerability,
@@ -41,6 +49,56 @@
   let planError = $state<string | null>(null);
   let planCopied = $state(false);
 
+  interface RunnableStep {
+    id: string;
+    number: number | null;
+    text: string;
+    command: string | null;
+    argv: string[] | null;
+    error?: string;
+  }
+
+  let planSteps = $derived.by<RunnableStep[]>(() => {
+    if (!plan?.text) return [];
+    const raw = extractPlanSteps(plan.text);
+    return raw.map((step, idx) => {
+      const firstCmd = step.commands[0] ?? null;
+      let argv: string[] | null = null;
+      let error: string | undefined;
+
+      if (firstCmd) {
+        const tokenized = tokenizeCommand(firstCmd);
+        if (tokenized.ok) {
+          argv = tokenized.argv;
+        } else {
+          error = tokenized.error;
+        }
+      }
+
+      return {
+        id: `step-${step.number ?? idx + 1}`,
+        number: step.number ?? idx + 1,
+        text: step.text,
+        command: firstCmd,
+        argv,
+        error,
+      };
+    });
+  });
+
+  let stepResults = $state<
+    Record<
+      string,
+      {
+        running: boolean;
+        status?: "passed" | "failed";
+        detail?: string;
+        duration_ms?: number;
+      }
+    >
+  >({});
+  let runningAll = $state(false);
+
   let visibleVulns = $derived.by(() => {
     const current = report;
     if (!current) return [] as Vulnerability[];
@@ -49,6 +107,9 @@
     }
     return current.vulnerabilities;
   });
+
+  /** Audits that could not run because their CLI was missing. */
+  let skipped = $derived(report ? skippedAudits(report) : []);
 
   /** Open Dependabot alerts, for the header badge. */
   let openDependabotCount = $derived(
@@ -136,7 +197,7 @@
 
   /**
    * Sends the health report through the harness's local-AI plane for a
-   * remediation plan. Advisory only — GitPulse applies nothing by itself.
+   * remediation plan.
    */
   async function fixWithManvi() {
     const text = renderedReport();
@@ -147,6 +208,7 @@
     fixing = true;
     planError = null;
     plan = null;
+    stepResults = {};
     try {
       const next = await harnessStore.fixHealth($repoStore.currentPath!, text);
       if (!guard.isLive()) return;
@@ -157,6 +219,83 @@
     } finally {
       if (guard.isLive()) fixing = false;
     }
+  }
+
+  async function runStep(step: RunnableStep): Promise<boolean> {
+    const repoPath = $repoStore.currentPath;
+    if (!step.argv || step.argv.length === 0 || !repoPath) return false;
+    stepResults[step.id] = { running: true };
+
+    try {
+      // Wire shape of `crate::terminal::TerminalRunResult`.
+      const res = await invoke<{
+        command: string;
+        gated: boolean;
+        policy?: PolicyVerdict | null;
+        timed_out: boolean;
+        exit_code: number | null;
+        stdout_tail: string;
+        stderr_tail: string;
+        truncated: boolean;
+        duration_ms: number;
+      }>("cmd_terminal_run", {
+        repoPath,
+        args: step.argv,
+        // Long enough for a cold install/build; the backend clamps to [1s, 30min].
+        timeoutSecs: 600,
+      });
+
+      const passed = !res.timed_out && res.exit_code === 0;
+      stepResults[step.id] = {
+        running: false,
+        status: passed ? "passed" : "failed",
+        detail: res.timed_out
+          ? "Timed out and was killed."
+          : passed
+            ? res.stdout_tail || "Command completed successfully (exit 0)"
+            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        duration_ms: res.duration_ms,
+      };
+
+      harnessStore.recordAction({
+        kind: "remediation-step",
+        label: step.command ?? step.text,
+        ok: passed,
+        verdict: res.policy ?? null,
+      });
+
+      return passed;
+    } catch (err) {
+      const msg = formatError(err);
+      stepResults[step.id] = {
+        running: false,
+        status: "failed",
+        detail: msg,
+      };
+
+      harnessStore.recordAction({
+        kind: "remediation-step",
+        label: step.command ?? step.text,
+        ok: false,
+      });
+
+      return false;
+    }
+  }
+
+  async function runAllSteps() {
+    if (runningAll) return;
+    runningAll = true;
+    for (const step of planSteps) {
+      if (step.argv && step.argv.length > 0) {
+        const ok = await runStep(step);
+        if (!ok) {
+          // Stop sequential execution on failure
+          break;
+        }
+      }
+    }
+    runningAll = false;
   }
 
   async function copyPlan() {
@@ -373,18 +512,46 @@
       {/if}
 
       {#if plan || fixing}
-        <section class="space-y-2 max-w-4xl rounded-2xl border border-accent/30 bg-surface shadow-card p-4">
+        <section class="space-y-3 max-w-4xl rounded-2xl border border-accent/30 bg-surface shadow-card p-4">
           <div class="flex items-center justify-between gap-2">
             <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
               <Sparkles size={11} class="text-accent" />
               MANVI remediation plan
             </h3>
-            {#if plan}
-              <button type="button" onclick={copyPlan} class="gp-btn !py-1 !text-[11px]" title="Copy the remediation plan">
-                <Clipboard size={12} />
-                {planCopied ? "Copied" : "Copy plan"}
-              </button>
-            {/if}
+            <div class="flex items-center gap-2">
+              {#if plan}
+                {#if planSteps.some((s) => s.argv)}
+                  <button
+                    type="button"
+                    onclick={runAllSteps}
+                    disabled={runningAll || Object.values(stepResults).some((r) => r.running)}
+                    class="gp-btn-primary !py-1 !text-[11px]"
+                    title="Execute all executable plan steps sequentially"
+                  >
+                    {#if runningAll}
+                      <LoaderCircle size={12} class="animate-spin" />
+                      <span>Running all…</span>
+                    {:else}
+                      <Play size={12} />
+                      <span>Run all steps</span>
+                    {/if}
+                  </button>
+                {/if}
+                <button
+                  type="button"
+                  onclick={() => repoStore.setActiveTab("terminal")}
+                  class="gp-btn !py-1 !text-[11px]"
+                  title="Open Terminal view"
+                >
+                  <Terminal size={12} />
+                  <span>Terminal</span>
+                </button>
+                <button type="button" onclick={copyPlan} class="gp-btn !py-1 !text-[11px]" title="Copy the remediation plan">
+                  <Clipboard size={12} />
+                  {planCopied ? "Copied" : "Copy plan"}
+                </button>
+              {/if}
+            </div>
           </div>
           {#if fixing && !plan}
             <div class="flex items-center gap-2 text-textMuted py-2">
@@ -398,9 +565,90 @@
             {#each plan.warnings as warning}
               <div class="text-amber-400 leading-relaxed">{warning}</div>
             {/each}
-            <!-- whitespace-pre-wrap keeps the model's numbered steps intact. -->
-            <div class="whitespace-pre-wrap leading-relaxed text-textSecondary">{plan.text}</div>
-            <p class="text-textMuted">Advisory only — nothing is applied automatically.</p>
+
+            {#if planSteps.length > 0}
+              <div class="space-y-2.5 pt-1">
+                {#each planSteps as step (step.id)}
+                  {@const res = stepResults[step.id]}
+                  <div class="p-3 rounded-xl border border-border/70 bg-background/60 space-y-2">
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="space-y-1 min-w-0">
+                        <div class="flex items-center gap-2">
+                          {#if step.number !== null}
+                            <span class="px-1.5 py-0.2 rounded bg-surface border border-border text-[10px] font-bold text-accent">
+                              {step.number}
+                            </span>
+                          {/if}
+                          <span class="font-medium text-textPrimary text-xs">{step.text}</span>
+                        </div>
+                      </div>
+
+                      {#if step.argv}
+                        <button
+                          type="button"
+                          onclick={() => void runStep(step)}
+                          disabled={res?.running || runningAll}
+                          class="gp-btn !py-1 !px-2.5 text-xs shrink-0 disabled:opacity-50"
+                          title="Execute this command step directly"
+                        >
+                          {#if res?.running}
+                            <LoaderCircle size={12} class="animate-spin text-accent" />
+                            <span>Running…</span>
+                          {:else if res?.status === "passed"}
+                            <Check size={12} class="text-emerald-400" />
+                            <span>Run again</span>
+                          {:else if res?.status === "failed"}
+                            <Play size={12} class="text-rose-400" />
+                            <span>Retry</span>
+                          {:else}
+                            <Play size={12} class="text-accent" />
+                            <span>Run</span>
+                          {/if}
+                        </button>
+                      {/if}
+                    </div>
+
+                    {#if step.command}
+                      <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-surface border border-border/60 font-mono text-[11px]">
+                        <span class="text-textPrimary truncate">{step.command}</span>
+                        {#if res?.status}
+                          <span class="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0 {res.status === 'passed' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30' : 'bg-rose-500/10 text-rose-300 border border-rose-500/30'}">
+                            {res.status} {res.duration_ms ? `(${res.duration_ms}ms)` : ""}
+                          </span>
+                        {/if}
+                      </div>
+                    {/if}
+
+                    {#if step.error}
+                      <div class="text-[10px] text-amber-300">
+                        {step.error}
+                      </div>
+                    {/if}
+
+                    {#if res?.detail}
+                      <div class="p-2 rounded bg-surface/80 border border-border/40 font-mono text-[10px] text-textMuted whitespace-pre-wrap max-h-32 overflow-y-auto">
+                        {res.detail}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <div class="whitespace-pre-wrap leading-relaxed text-textSecondary">{plan.text}</div>
+            {/if}
+
+            <div class="pt-2 border-t border-border/40 flex items-center justify-between text-textMuted text-[11px]">
+              <p>Review each remediation step. Run commands individually or execute all sequentially.</p>
+              <button
+                type="button"
+                onclick={() => void scan()}
+                class="gp-btn !py-1 text-xs shrink-0"
+                title="Rescan repository health"
+              >
+                <RefreshCw size={11} class={loading ? "animate-spin" : ""} />
+                <span>Rescan Health</span>
+              </button>
+            </div>
           {/if}
         </section>
       {/if}
@@ -502,7 +750,11 @@
           <p class="text-textMuted max-w-2xl">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</p>
         {:else if visibleVulns.length === 0}
           <p class="text-textMuted">
-            {report.audit.total === 0 ? "No vulnerabilities reported." : "No direct dependencies are vulnerable."}
+            {report.audit.total === 0
+              ? skipped.length > 0
+                ? `No vulnerabilities found by the scanners that ran (not run: ${skipped.join(", ")}).`
+                : "No vulnerabilities reported."
+              : "No direct dependencies are vulnerable."}
           </p>
         {:else}
           <div class="border border-border/70 rounded-2xl overflow-hidden max-w-5xl shadow-card">

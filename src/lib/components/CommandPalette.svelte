@@ -12,7 +12,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug } from "lucide-svelte";
+  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug, Terminal } from "lucide-svelte";
 
   let isOpen = $state(false);
   let query = $state("");
@@ -32,6 +32,7 @@
   // View-opening commands derive from the view registry: registering a view
   // with a paletteCommand is all it takes to appear here.
   const VIEW_COMMAND_ICONS: Partial<Record<ViewTab, typeof ShieldAlert>> = {
+    terminal: Terminal,
     manvi: ShieldAlert,
     github: GitBranch,
     coverage: Percent,

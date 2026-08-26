@@ -20,6 +20,7 @@ export type ViewTab =
   | "health"
   | "storage"
   | "stack"
+  | "terminal"
   | "github"
   | "manvi"
   | "reflog";
@@ -33,6 +34,7 @@ export const VIEW_TABS: readonly ViewTab[] = [
   "health",
   "storage",
   "stack",
+  "terminal",
   "github",
   "manvi",
   "reflog",

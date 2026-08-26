@@ -3238,12 +3238,14 @@ not-json-at-all
         git_add(repo.path(), "requirements.txt");
         git_add(repo.path(), "go.mod");
         let (report, targets) = local_scan(repo.path()).unwrap();
-        // Probes are gated on artifacts; on this machine neither CLI exists so
-        // presence must be false — never silently true.
-        if which_missing("pip-audit") {
+        // Probes are gated on artifacts; when a CLI cannot be run at all,
+        // presence must be false — never silently true. The gate goes through
+        // production resolution (capture_command), which also searches the
+        // GUI-launch fallback dirs such as ~/go/bin.
+        if unrunnable("pip-audit") {
             assert!(!report.pip_audit_present);
         }
-        if which_missing("govulncheck") {
+        if unrunnable("govulncheck") {
             assert!(!report.govulncheck_present);
         }
         assert_eq!(
@@ -3261,11 +3263,19 @@ not-json-at-all
         );
     }
 
-    fn which_missing(program: &str) -> bool {
-        std::process::Command::new(program)
-            .arg("--version")
-            .output()
-            .is_err()
+    /// True when `program` cannot be spawned and exited-for at all — decided
+    /// through the production spawn path so fallback-dir resolution (GUI
+    /// launches, ~/go/bin, …) is honored exactly as in the app.
+    fn unrunnable(program: &str) -> bool {
+        crate::engine::git_cli::capture_command(
+            program,
+            &["--version"],
+            None,
+            std::time::Duration::from_secs(5),
+            &[],
+        )
+        .map(|out| !out.success)
+        .unwrap_or(true)
     }
 
     #[test]

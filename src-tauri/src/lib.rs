@@ -11,6 +11,7 @@ pub mod harness;
 pub mod ops;
 pub mod stack;
 pub mod storage;
+pub mod terminal;
 pub mod watcher;
 
 use commands::*;
@@ -21,6 +22,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(crate::watcher::WatcherState::default())
+        .manage(crate::terminal::TerminalSessions::default())
         .manage(desktop::DesktopState::default())
         .setup(|app| {
             desktop::install_menu(app.handle())?;
@@ -114,6 +116,11 @@ pub fn run() {
             cmd_ai_explain_commit,
             cmd_ai_suggest_branch_name,
             cmd_ai_fix_health,
+            cmd_terminal_spawn,
+            cmd_terminal_write,
+            cmd_terminal_resize,
+            cmd_terminal_kill,
+            cmd_terminal_run,
             cmd_take_pending_open,
             cmd_set_recent_menu,
             cmd_resolve_git_root,

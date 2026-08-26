@@ -220,6 +220,8 @@ pub fn build_native_menu<R: Runtime>(
                 VIEW_TAB_BINDINGS[8].1,
                 Some(VIEW_TAB_BINDINGS[8].2),
             )?,
+            &item(app, actions::TAB_TERMINAL, "Terminal", None)?,
+            &item(app, actions::TAB_MANVI, "MANVI", None)?,
             &PredefinedMenuItem::separator(app)?,
             &item(
                 app,

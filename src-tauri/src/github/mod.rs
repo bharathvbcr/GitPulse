@@ -963,7 +963,9 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             releases_handle
                 .join()
                 .unwrap_or_else(|_| (Vec::new(), false, Some("thread panic".into()))),
-            pr_handle.join().unwrap_or_else(|_| Err("thread panic".into())),
+            pr_handle
+                .join()
+                .unwrap_or_else(|_| Err("thread panic".into())),
             runs_handle
                 .join()
                 .unwrap_or_else(|_| (Vec::new(), Some("thread panic".into()))),

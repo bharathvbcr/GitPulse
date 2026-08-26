@@ -83,6 +83,8 @@ export function actionKindForCommand(cmd: string): string {
       return "worktree";
     case "write_file_content":
       return "edit";
+    case "terminal_run":
+      return "terminal";
     default:
       return stripped || "action";
   }

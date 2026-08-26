@@ -34,8 +34,10 @@ describe("viewNav", () => {
     expect(viewNavGroupFor("history")?.id).toBe("work");
     expect(viewNavGroupFor("coverage")?.id).toBe("inspect");
     expect(viewNavGroupFor("github")?.id).toBe("more");
+    expect(viewNavGroupFor("terminal")?.id).toBe("more");
     expect(viewNavItemFor("history")?.label).toBe("Graph");
     expect(viewNavItemFor("conflict")?.label).toBe("Resolve");
+    expect(viewNavItemFor("terminal")?.label).toBe("Terminal");
   });
 
   it("uses the active child as the menu trigger, otherwise the group label", () => {

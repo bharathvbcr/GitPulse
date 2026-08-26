@@ -50,6 +50,7 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     paletteCommand: "Scan repository disk usage",
   },
   stack: { id: "stack", label: "Stack", menuGroup: "inspect" },
+  terminal: { id: "terminal", label: "Terminal", menuGroup: "more", paletteCommand: "Open Terminal" },
   manvi: { id: "manvi", label: "MANVI", menuGroup: "more", paletteCommand: "Open MANVI View" },
   github: { id: "github", label: "GitHub", menuGroup: "more", paletteCommand: "Open GitHub Panel" },
   reflog: { id: "reflog", label: "Reflog", menuGroup: "more", paletteCommand: "Open Reflog" },

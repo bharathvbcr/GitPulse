@@ -18,6 +18,8 @@ rayon = "1.10"
 notify = "8.0"
 regex = "1.10"
 rfd = "0.15"
+portable-pty = "0.9"
+base64 = "0.22"
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }

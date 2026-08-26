@@ -16,6 +16,8 @@ pub const TAB_STACK: &str = "tab-stack";
 pub const TAB_GITHUB: &str = "tab-github";
 pub const TAB_COVERAGE: &str = "tab-coverage";
 pub const TAB_HEALTH: &str = "tab-health";
+pub const TAB_TERMINAL: &str = "tab-terminal";
+pub const TAB_MANVI: &str = "tab-manvi";
 pub const TAB_REFLOG: &str = "tab-reflog";
 pub const FETCH: &str = "fetch";
 pub const PULL: &str = "pull";
@@ -51,6 +53,8 @@ pub enum NativeAction {
     TabGitHub,
     TabCoverage,
     TabHealth,
+    TabTerminal,
+    TabManvi,
     TabReflog,
     Fetch,
     Pull,
@@ -92,6 +96,8 @@ impl NativeAction {
             TAB_GITHUB => Self::TabGitHub,
             TAB_COVERAGE => Self::TabCoverage,
             TAB_HEALTH => Self::TabHealth,
+            TAB_TERMINAL => Self::TabTerminal,
+            TAB_MANVI => Self::TabManvi,
             TAB_REFLOG => Self::TabReflog,
             FETCH => Self::Fetch,
             PULL => Self::Pull,
@@ -128,6 +134,8 @@ impl NativeAction {
             Self::TabGitHub => TAB_GITHUB,
             Self::TabCoverage => TAB_COVERAGE,
             Self::TabHealth => TAB_HEALTH,
+            Self::TabTerminal => TAB_TERMINAL,
+            Self::TabManvi => TAB_MANVI,
             Self::TabReflog => TAB_REFLOG,
             Self::Fetch => FETCH,
             Self::Pull => PULL,
@@ -188,6 +196,11 @@ mod tests {
             NativeAction::parse(TAB_HEALTH),
             Some(NativeAction::TabHealth)
         );
+        assert_eq!(
+            NativeAction::parse(TAB_TERMINAL),
+            Some(NativeAction::TabTerminal)
+        );
+        assert_eq!(NativeAction::parse(TAB_MANVI), Some(NativeAction::TabManvi));
         assert_eq!(NativeAction::parse("nope"), None);
         assert_eq!(NativeAction::parse(RECENT_EMPTY), None);
         assert_eq!(NativeAction::parse(RECENT_PREFIX), None);

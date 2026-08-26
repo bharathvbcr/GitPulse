@@ -84,6 +84,85 @@ describe("formatHealthReport", () => {
     expect(formatHealthReport(report)).toContain("no audit scanner on PATH");
   });
 
+  it("names local audits that could not run instead of letting counts read as clean", () => {
+    const report = emptyReport();
+    report.npm_cli_present = false;
+    report.manifests = [
+      {
+        path: "package.json",
+        name: "demo",
+        version: "1.0.0",
+        private: true,
+        package_manager: "npm",
+        has_workspaces: false,
+        dep_count: 1,
+        dev_dep_count: 0,
+        optional_dep_count: 0,
+        peer_dep_count: 0,
+        lifecycle_scripts: [],
+      },
+    ];
+    const text = formatHealthReport(report);
+    expect(text).toContain(
+      "NOTE: checks that did NOT run (CLI missing): npm audit/outdated.",
+    );
+    // A skipped check must never coexist with the explicit all-clear.
+    expect(text).not.toContain(
+      "No issues, vulnerabilities or outdated packages were reported.",
+    );
+  });
+
+  it("lists ecosystem audits whose CLI was absent while their artifacts exist", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = false;
+    report.pip_audit_present = false;
+    report.ecosystems = [
+      { family: "cargo", manifests: ["Cargo.lock"], note: "" },
+      { family: "python", manifests: ["requirements-dev.txt"], note: "" },
+    ];
+    const text = formatHealthReport(report);
+    expect(text).toContain("cargo-audit");
+    expect(text).toContain("pip-audit");
+    // Nothing was skipped for families whose scanner IS present.
+    expect(text).not.toContain("govulncheck,");
+  });
+
+  it("does not name a scanner as skipped when its family has no auditable artifact", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = false;
+    // A lone source file hints the cargo family but gives cargo-audit
+    // nothing to scan.
+    report.ecosystems = [{ family: "cargo", manifests: ["src/main.rs"], note: "" }];
+    const text = formatHealthReport(report);
+    expect(text).not.toContain("did NOT run");
+    expect(text).toContain(
+      "No issues, vulnerabilities or outdated packages were reported.",
+    );
+  });
+
+  it("recognizes audit artifacts in subdirectories", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = false;
+    report.govulncheck_present = false;
+    report.ecosystems = [
+      { family: "cargo", manifests: ["backend/Cargo.lock"], note: "" },
+      { family: "go", manifests: ["services/api/go.mod"], note: "" },
+    ];
+    const text = formatHealthReport(report);
+    expect(text).toContain("cargo-audit");
+    expect(text).toContain("govulncheck");
+  });
+
+  it("keeps the all-clear when nothing was skipped and no artifacts await a missing CLI", () => {
+    const report = emptyReport();
+    report.npm_cli_present = false;
+    const text = formatHealthReport(report);
+    expect(text).not.toContain("did NOT run");
+    expect(text).toContain(
+      "No issues, vulnerabilities or outdated packages were reported.",
+    );
+  });
+
   it("carries severity, fix version, transitive chain and advisory link for vulnerabilities", () => {
     const report = emptyReport();
     report.audit = { info: 0, low: 1, moderate: 0, high: 1, critical: 1, total: 3 };

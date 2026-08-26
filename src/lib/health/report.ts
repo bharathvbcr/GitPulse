@@ -6,6 +6,38 @@ function line(items: (string | undefined | null)[]): string {
 }
 
 /**
+ * Audits whose artifacts exist but whose CLI was unavailable — a check that
+ * could not run must never read as one that ran clean.
+ *
+ * Gated on each scanner's actual artifact (mirroring the Rust enrichers), not
+ * just the ecosystem hint: a lone `.rs` file hints "cargo" without giving
+ * cargo-audit anything to scan.
+ */
+export function skippedAudits(report: DepsHealthReport): string[] {
+  const files = report.ecosystems.flatMap((eco) => eco.manifests);
+  const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+  const has = (name: string) => files.some((f) => base(f) === name);
+  const skipped: string[] = [];
+  if (!report.npm_cli_present && report.manifests.length > 0) {
+    skipped.push("npm audit/outdated");
+  }
+  if (!report.cargo_audit_present && has("Cargo.lock")) skipped.push("cargo-audit");
+  if (
+    !report.pip_audit_present &&
+    files.some((f) => {
+      const b = base(f);
+      return (b.startsWith("requirements") && b.endsWith(".txt")) || b === "constraints.txt";
+    })
+  ) {
+    skipped.push("pip-audit");
+  }
+  if (!report.govulncheck_present && has("go.mod")) skipped.push("govulncheck");
+  if (!report.composer_present && has("composer.lock")) skipped.push("composer audit");
+  if (!report.bundler_audit_present && has("Gemfile.lock")) skipped.push("bundler-audit");
+  return skipped;
+}
+
+/**
  * Renders the health report as plain markdown-ish text that survives a paste
  * into an issue, an agent prompt or a notes file: every finding keeps its
  * severity, fix version and advisory link, and capped scans say so.
@@ -38,6 +70,12 @@ export function formatHealthReport(
     ]),
   );
   out.push(`Audit summary: ${formatAuditCounts(report.audit)}; ${report.outdated.length} outdated.`);
+  const skipped = skippedAudits(report);
+  if (skipped.length > 0) {
+    out.push(
+      `NOTE: checks that did NOT run (CLI missing): ${skipped.join(", ")}. The counts above are not complete coverage.`,
+    );
+  }
   if (dependabot?.available) {
     out.push(`GitHub Dependabot: ${dependabot.alerts.length} open alert(s).`);
   }
@@ -102,7 +140,7 @@ export function formatHealthReport(
     report.vulnerabilities.length === 0 &&
     report.outdated.length === 0 &&
     (!dependabot?.available || dependabot.alerts.length === 0);
-  if (nothingReported) {
+  if (nothingReported && skipped.length === 0) {
     out.push("", "No issues, vulnerabilities or outdated packages were reported.");
   }
 

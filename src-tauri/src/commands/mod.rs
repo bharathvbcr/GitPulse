@@ -1811,3 +1811,70 @@ pub async fn cmd_ai_suggest_branch_name(
 ) -> Result<crate::ai::AiGeneration, String> {
     off_thread(move || crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))).await
 }
+
+// ---------------------------------------------------------------------------
+// Terminal: interactive PTY sessions plus bounded one-shot execution.
+// The interactive shell is intentionally *not* gate-routed (a shell can run
+// anything, so claiming otherwise would be a check that cannot run reporting
+// what a check that ran reports); one-shot git commands still pass through
+// harness::guard_command. See `terminal/mod.rs` for the full story.
+// ---------------------------------------------------------------------------
+
+/// Spawns an interactive shell in the open repository inside a real PTY.
+/// Output streams back as `terminal-output` events; exit lands as
+/// `terminal-exit`, both keyed by the returned session id.
+#[tauri::command(async)]
+pub async fn cmd_terminal_spawn(
+    app: AppHandle,
+    state: State<'_, crate::terminal::TerminalSessions>,
+    repo_path: String,
+    rows: u16,
+    cols: u16,
+) -> Result<crate::terminal::TerminalSpawned, String> {
+    // Fast allocation work only; nothing here blocks long enough to need the
+    // thread pool.
+    crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols)
+}
+
+/// Feeds keystrokes into a live session's PTY.
+#[tauri::command(async)]
+pub async fn cmd_terminal_write(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    crate::terminal::write_to_session(&state, &session_id, &data)
+}
+
+/// Resizes a live session's PTY to the frontend grid.
+#[tauri::command(async)]
+pub async fn cmd_terminal_resize(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    crate::terminal::resize_session(&state, &session_id, rows, cols)
+}
+
+/// Kills a session's shell and frees its slot.
+#[tauri::command(async)]
+pub async fn cmd_terminal_kill(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+) -> Result<(), String> {
+    crate::terminal::kill_session(&state, &session_id)
+}
+
+/// Runs one argv to completion with a hard timeout and capped tails.
+///
+/// Blocking by definition (up to MAX_RUN_TIMEOUT), so this belongs on the
+/// same pool as every other long-running reader.
+#[tauri::command(async)]
+pub async fn cmd_terminal_run(
+    repo_path: String,
+    args: Vec<String>,
+    timeout_secs: Option<u64>,
+) -> Result<crate::terminal::TerminalRunResult, String> {
+    off_thread(move || crate::terminal::run_terminal(&repo_path, &args, timeout_secs)).await
+}
