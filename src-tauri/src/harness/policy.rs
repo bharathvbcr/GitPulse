@@ -164,9 +164,15 @@ impl PolicyVerdict {
 }
 
 /// Evaluates one command line against the command gate.
+///
+/// Verdicts go through [`sidecar::call_policy`]: they are milliseconds of
+/// harness work, so one transport fault is retried once on a fresh connection
+/// before this reports unchecked. Without that retry, a single slow verdict
+/// would start the respawn backoff and leave every mutation unchecked for
+/// thirty seconds.
 pub fn check_command(root: &str, command: &str) -> PolicyVerdict {
     let params = serde_json::json!({ "command": command, "root": root });
-    match sidecar::call_typed::<RawDecision>(OP_POLICY_CHECK_COMMAND, params, POLICY_TIMEOUT) {
+    match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_COMMAND, params, POLICY_TIMEOUT) {
         Ok(d) => PolicyVerdict::from_decision(command, d),
         Err(e) => PolicyVerdict::unchecked(command, &e),
     }
@@ -175,10 +181,11 @@ pub fn check_command(root: &str, command: &str) -> PolicyVerdict {
 /// Evaluates one file write against the write gate.
 ///
 /// `op` is create, modify, delete, or write; an unknown value is refused by the
-/// harness rather than guessed at here.
+/// harness rather than guessed at here. Like [`check_command`], the verdict is
+/// retried once on a fresh connection before being reported unchecked.
 pub fn check_file(root: &str, path: &str, op: &str) -> PolicyVerdict {
     let params = serde_json::json!({ "root": root, "path": path, "op": op });
-    match sidecar::call_typed::<RawDecision>(OP_POLICY_CHECK_FILE, params, POLICY_TIMEOUT) {
+    match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_FILE, params, POLICY_TIMEOUT) {
         Ok(d) => PolicyVerdict::from_decision(path, d),
         Err(e) => PolicyVerdict::unchecked(path, &e),
     }

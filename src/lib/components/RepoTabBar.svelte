@@ -5,6 +5,7 @@
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { classifyShortcut, shouldSkipWebviewShortcut } from "../ui/webviewShortcuts";
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
@@ -150,6 +151,23 @@
   }
 
   /**
+   * Arrow-key roving focus across the tablist (ARIA tabs pattern): focus
+   * moves and wraps without changing the active repo; Home/End jump to the
+   * edges. Focus on the container itself enters the list in travel direction.
+   */
+  function onTablistKeydown(e: KeyboardEvent) {
+    const key = e.key as RovingKey;
+    if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
+    const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index]") ?? [];
+    if (tabs.length === 0) return;
+    const current = Array.from(tabs).findIndex((el) => el === document.activeElement);
+    const next = nextRovingIndex(current, tabs.length, key);
+    if (next === null) return;
+    e.preventDefault();
+    tabs[next]?.focus();
+  }
+
+  /**
    * Container-level dragover: one handler computes the insertion point for
    * whatever tab (or gap) is under the pointer, so the indicator can't go
    * stale between child elements. Adjacent-to-self positions are no-op moves
@@ -210,23 +228,29 @@
       role="tablist"
       tabindex="0"
       aria-label="Open repositories"
+      onkeydown={onTablistKeydown}
       ondragover={onScrollerDragOver}
       ondrop={onScrollerDrop}
     >
       {#each $repoStore.openTabs as tab, index (tab.id)}
         <div
           role="tab"
-          tabindex="0"
+          tabindex={tab.isActive ? 0 : -1}
           aria-selected={tab.isActive}
+          aria-keyshortcuts="Enter p"
           data-active-repo={tab.isActive ? "true" : "false"}
           data-tab-index={index}
-          title={tab.path}
+          title={`${tab.path}\n←/→ move tabs · P to ${tab.pinned ? "unpin" : "pin"}`}
           draggable="true"
           onclick={() => repoStore.activateTab(tab.id)}
           onkeydown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               repoStore.activateTab(tab.id);
+            } else if (e.key === "p" || e.key === "P") {
+              // Keyboard twin of the double-click pin affordance.
+              e.preventDefault();
+              repoStore.pinTab(tab.id, !tab.pinned);
             }
           }}
           onauxclick={(e) => {
@@ -269,6 +293,7 @@
           <button
             type="button"
             title="Close"
+            aria-label={`Close ${tab.label}`}
             onclick={(e) => {
               e.stopPropagation();
               void repoStore.closeTab(tab.id);

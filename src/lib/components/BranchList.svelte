@@ -351,6 +351,9 @@
   }
 
   async function suggestName() {
+    // In-flight flag guards same-tick double clicks: the disabled attribute
+    // only updates after Svelte flushes, so two rapid clicks could both pass.
+    if (suggesting) return;
     const repo = $repoStore.currentPath;
     if (!repo) return;
     suggesting = true;
@@ -780,6 +783,7 @@
         type="button"
         onclick={locateCurrentBranch}
         title="Locate checked-out branch"
+        aria-label="Locate checked-out branch"
         class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors"
       >
         <Crosshair size={12} />
@@ -788,6 +792,7 @@
         type="button"
         onclick={expandAll}
         title="Expand all folders"
+        aria-label="Expand all folders"
         class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
       >
         +All
@@ -796,6 +801,7 @@
         type="button"
         onclick={collapseAll}
         title="Collapse all folders"
+        aria-label="Collapse all folders"
         class="px-1 py-0.5 text-[9px] rounded hover:bg-surfaceHover hover:text-textPrimary text-textMuted transition-colors"
       >
         -All
@@ -804,6 +810,7 @@
         type="button"
         onclick={() => (creating = !creating)}
         title="Create branch"
+        aria-label="Create branch"
         class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors ml-0.5"
       >
         <Plus size={12} />
@@ -903,6 +910,7 @@
         type="button"
         onclick={() => void suggestName()}
         title="Suggest name"
+        aria-label="Suggest branch name"
         class="p-1 rounded-full hover:bg-surfaceHover text-textMuted transition-colors"
         disabled={suggesting}
       >

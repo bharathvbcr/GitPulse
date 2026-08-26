@@ -131,8 +131,12 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     assert!(!blob.base64.unwrap().is_empty());
 
     let commit = GitReader::head_id(path).unwrap();
-    let show = GitReader::get_commit_diff(path, &commit).expect("binary commit diff");
-    assert!(show.contains("Binary files") || show.contains("GIT binary patch"));
+    // The commit-diff pipeline classifies binary blobs as skipped files
+    // rather than emitting "Binary files differ" text into the patch body.
+    let payload = GitReader::get_commit_diff_payload(path, &commit).expect("payload");
+    assert!(payload.truncated);
+    assert_eq!(payload.skipped_files.len(), 1);
+    assert_eq!(payload.skipped_files[0].path, "bin5m.dat");
     let files = GitReader::get_commit_files(path, &commit).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "bin5m.dat");
@@ -406,6 +410,15 @@ fn watcher_storm_keeps_session_responsive() {
     let receiver = &watcher.receiver;
     // Give the OS backend time to install its watches before the storm.
     std::thread::sleep(Duration::from_millis(300));
+
+    // Warmup handshake: prove the backend stream is live before any timing
+    // assertion. macOS FSEvents can start late or stall under load; without
+    // this, that startup race reads as a wedge.
+    std::fs::write(path.join(".gitpulse-warmup"), "warm").unwrap();
+    let _ = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("watcher must deliver a warmup event once live");
+    while receiver.try_recv().is_ok() {}
 
     // 200 rapid create/delete pairs at the watched (non-recursive) root.
     // Drain opportunistically between chunks so the queue cannot wedge, the

@@ -57,6 +57,9 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   // have no UI affordance yet.
   cmd_create_tag: "tag creation backend-complete; UI pending",
   cmd_delete_tag: "tag deletion backend-complete; UI pending",
+  // Blame range walk (HEAD hardening wave): backend capability for a future
+  // ranged blame view; the current BlameViewer renders single-commit blame.
+  cmd_blame_range: "ranged blame backend-complete; no ranged blame UI wired yet",
   // Direct policy verdicts flow through runMutating()'s gate; this explicit
   // per-command check is reserved for harness diagnostics surfaces.
   cmd_policy_check_command: "policy gate reached via store mutations; direct endpoint reserved",

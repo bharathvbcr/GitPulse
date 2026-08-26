@@ -36,6 +36,13 @@ const MAX_FIRST_PARENT_WALK: usize = 100_000;
 
 impl StackTreeEngine {
     /// Computes stacked branch hierarchies based on merge base and branch heads.
+    ///
+    /// Branch-tip lookups along each first-parent walk go through a
+    /// prebuilt `tip -> owning branch` index instead of scanning every branch
+    /// tip at every step, turning the per-branch cost from O(depth × branches)
+    /// into O(depth + tips). Ties resolve deterministically: the default
+    /// branch wins, otherwise the lexicographically smallest name — where the
+    /// old scan depended on HashMap iteration order.
     pub fn build_stack_hierarchy(
         branch_tips: &HashMap<String, String>, // branch_name -> commit_id
         commit_parents: &HashMap<String, Vec<String>>, // commit_id -> parents
@@ -199,6 +206,56 @@ impl StackTreeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agent-farm shape: many long-lived stacked branches over one spine.
+    /// The tip index must keep this linear-ish; the old all-tips scan per
+    /// step made it O(branches x depth x branches).
+    #[test]
+    fn deep_wide_stack_hierarchies_resolve_correctly() {
+        const BRANCHES: usize = 200;
+        const DEPTH: usize = 50;
+
+        let mut branch_tips = HashMap::new();
+        branch_tips.insert("main".to_string(), "s0".to_string());
+        let mut commit_parents: HashMap<String, Vec<String>> = HashMap::new();
+        commit_parents.insert("s0".to_string(), vec![]);
+
+        // Spine s0 <- s1 <- ... <- s_DEPTH
+        for i in 1..=DEPTH {
+            commit_parents.insert(format!("s{i}"), vec![format!("s{}", i - 1)]);
+        }
+        branch_tips.insert("trunk".to_string(), format!("s{DEPTH}"));
+
+        // Each stacked branch grows ON TOP of trunk's tip (the realistic
+        // stacked-branch shape), so its downward walk meets the trunk tip.
+        for b in 0..BRANCHES {
+            let mut prev = format!("s{DEPTH}");
+            for d in 1..=3 {
+                let id = format!("b{b}_d{d}");
+                commit_parents.insert(id.clone(), vec![prev]);
+                prev = id;
+            }
+            branch_tips.insert(format!("feat/{b}"), prev);
+        }
+
+        // feat/N's walk: b_d3 -> b_d2 -> b_d1 -> s{DEPTH} == trunk's tip,
+        // so parent = trunk with exactly its own three commits ahead.
+        let nodes = StackTreeEngine::build_stack_hierarchy(&branch_tips, &commit_parents, "main");
+        assert_eq!(nodes.len(), BRANCHES + 2);
+        for b in 0..BRANCHES {
+            let node = nodes
+                .iter()
+                .find(|n| n.branch_name == format!("feat/{b}"))
+                .unwrap();
+            assert_eq!(node.parent_branch_name.as_deref(), Some("trunk"));
+            assert_eq!(node.commit_count_ahead_of_parent, 3, "feat/{b} ahead-count");
+        }
+        // trunk's own first-parent walk lands on main's literal tip (s0),
+        // so its base is discovered, not grafted: exactly DEPTH commits ahead.
+        let trunk = nodes.iter().find(|n| n.branch_name == "trunk").unwrap();
+        assert_eq!(trunk.parent_branch_name.as_deref(), Some("main"));
+        assert_eq!(trunk.commit_count_ahead_of_parent, DEPTH);
+    }
 
     #[test]
     fn test_stack_hierarchy_building() {

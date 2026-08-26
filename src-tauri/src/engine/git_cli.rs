@@ -7,6 +7,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Ceiling for network-bound operations (`clone`, `fetch`, `push`, remote
+/// `ls-remote`) where multi-gigabyte transfers are legitimate. Local plumbing
+/// keeps [`DEFAULT_TIMEOUT`].
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Grace window [`run_bounded`] grants pipe EOF after a timeout kill before
@@ -287,11 +291,17 @@ fn is_injected_git_env(name: &str) -> bool {
 
 fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
+    // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
+    // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
+    // porcelain text output arrives C-quoted ("\\346\\226\\207...") while `-z`
+    // output emits raw bytes, so the same file matches under two different
+    // spellings. Harmless for commands whose output has no paths at all.
     // Inherited CI-style environments can export GIT_* pointers that redirect
     // git's index, object database, alternates, common dir, namespace, or
     // config away from the repository the user actually picked. Strip them all
     // so a GUI-initiated git call always operates on the repo it was given.
-    cmd.args(args)
+    cmd.args(["-c", "core.quotepath=false"])
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -355,6 +365,35 @@ pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
 
 pub fn git_with_stdin(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>, String> {
     git_timeout(Some(repo), args, DEFAULT_TIMEOUT, Some(stdin_bytes))
+}
+
+/// Runs `git` in `repo` with an explicit deadline instead of
+/// [`DEFAULT_TIMEOUT`].
+///
+/// Use for network-bound work (`clone`, `fetch`, `push`) where a multi-gigabyte
+/// transfer is legitimate and a short default cap would kill healthy traffic.
+pub fn git_with_timeout(repo: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+    git_timeout(Some(repo), args, timeout, None)
+}
+
+/// Like [`git_with_timeout`], but for repo-less global invocations.
+pub fn git_global_with_timeout(args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+    git_timeout(None, args, timeout, None)
+}
+
+/// [`git_with_timeout`] with UTF-8 (lossy) text output.
+pub fn git_text_with_timeout(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let bytes = git_with_timeout(repo, args, timeout)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Runs network-bound git plumbing in `repo` under [`NETWORK_TIMEOUT`].
+pub fn git_text_network(repo: &Path, args: &[&str]) -> Result<String, String> {
+    git_text_with_timeout(repo, args, NETWORK_TIMEOUT)
 }
 
 /// Captured stdout/stderr from a bounded external process.
@@ -1906,6 +1945,68 @@ mod tests {
         ] {
             assert!(removed.contains(key), "git_command must remove {key}");
         }
+    }
+
+    /// Regression: without `-c core.quotepath=false`, `diff --numstat` quotes
+    /// non-ASCII paths ("\\346...") while porcelain `-z` emits raw bytes, so
+    /// the same file matches under two spellings. The config must ride every
+    /// invocation assembled by `git_command`.
+    #[test]
+    fn git_command_disables_path_quoting() {
+        let cmd = git_command(Some(Path::new("/tmp")), &["status"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.len() >= 2 && args[0] == "-c" && args[1] == "core.quotepath=false",
+            "expected leading -c core.quotepath=false args, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn network_timeout_exceeds_default_and_is_30_minutes() {
+        assert_eq!(NETWORK_TIMEOUT, Duration::from_secs(30 * 60));
+        assert!(NETWORK_TIMEOUT > DEFAULT_TIMEOUT);
+    }
+
+    /// A call that outlives its deadline must fail with the bounded runner's
+    /// timeout wording (the same engine `git_with_timeout` drives), not hang.
+    #[test]
+    fn short_timeout_kills_slow_command_with_timeout_error() {
+        let started = Instant::now();
+        let outcome = run_bounded(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            "sh sleep 30",
+            Duration::from_millis(300),
+            None,
+        );
+        let Err(err) = outcome else {
+            panic!("slow command must hit the deadline");
+        };
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "kill must be prompt, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn capture_command_surfaces_timeout_wording() {
+        let err = capture_command(
+            "sh",
+            &["-c", "sleep 30"],
+            None,
+            Duration::from_millis(250),
+            &[],
+        )
+        .expect_err("must time out");
+        assert!(err.contains("timed out after"), "got: {err}");
     }
 
     /// Regression (audit A4): the numbered-config channel injects arbitrary

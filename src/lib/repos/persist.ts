@@ -11,6 +11,9 @@ export const STORAGE_KEY_WORKSPACE = "gitpulse_workspace_v1";
 export const STORAGE_KEY_RECENT = "gitpulse_recent_repos";
 export const STORAGE_KEY_LAST_PATH = "gitpulse_last_repo";
 
+/** The workspace schema version this build writes and understands. */
+export const WORKSPACE_VERSION = 1 as const;
+
 export type ViewTab =
   | "history"
   | "diff"
@@ -88,12 +91,68 @@ export function isViewTab(value: unknown): value is ViewTab {
   return typeof value === "string" && (VIEW_TABS as readonly string[]).includes(value);
 }
 
+/** A raw, not-yet-validated persisted workspace blob. */
+type WorkspaceBlob = Record<string, unknown>;
+
+/**
+ * Upgrades a blob written in version N to version N+1. Keyed by the version
+ * the blob is written IN; a new schema version ships its step here and old
+ * clients keep loading instead of discarding the user's state.
+ */
+const MIGRATIONS: Record<number, (blob: WorkspaceBlob) => WorkspaceBlob> = {
+  1: (v1) => v1,
+};
+
+let warnedFutureVersion = false;
+
+/**
+ * Walks a raw workspace blob's `version` up to the target schema by applying
+ * the registered migrations in order, then validates the result. Returns null
+ * when the version is unreadable or from a NEWER GitPulse — the caller then
+ * falls back to the legacy recovery keys rather than dropping user state
+ * silently. Future-version blobs warn exactly once per session.
+ *
+ * `migrations` and `targetVersion` are seams for tests (and callers that need
+ * to preview an upgrade); production uses the module map up to
+ * `WORKSPACE_VERSION`.
+ */
+export function loadMigrated(
+  blob: WorkspaceBlob,
+  options: PathIdentityOptions,
+  migrations: Record<number, (blob: WorkspaceBlob) => WorkspaceBlob> = MIGRATIONS,
+  targetVersion: number = WORKSPACE_VERSION,
+): PersistedWorkspace | null {
+  const version = typeof blob.version === "number" ? Math.trunc(blob.version) : Number.NaN;
+  if (!Number.isInteger(version) || version < 0) return null;
+  if (version > targetVersion) {
+    // Written by a newer build: migrating down would corrupt it, and wiping
+    // it would too — ignore this blob but say why, once, not on every read.
+    if (!warnedFutureVersion) {
+      warnedFutureVersion = true;
+      console.warn(
+        `[gitpulse] saved workspace version ${version} is newer than supported ${targetVersion}; falling back to legacy state`,
+      );
+    }
+    return null;
+  }
+  let current = blob;
+  for (let v = version; v < targetVersion; v += 1) {
+    const migrate = migrations[v];
+    if (!migrate) return null;
+    current = migrate(current);
+  }
+  // The migrated shape is still untrusted wire input; sanitize decides what
+  // survives into typed state.
+  if (!Array.isArray(current.tabs)) return null;
+  return sanitizePersisted(current, options);
+}
+
 export function loadPersistedWorkspace(
   storage: StorageLike | null,
   options: PathIdentityOptions,
 ): PersistedWorkspace {
   const empty: PersistedWorkspace = {
-    version: 1,
+    version: WORKSPACE_VERSION,
     tabs: [],
     activePath: null,
     recents: [],
@@ -102,8 +161,9 @@ export function loadPersistedWorkspace(
   if (!storage) return empty;
 
   const parsed = readJsonObject(storage.getItem(STORAGE_KEY_WORKSPACE));
-  if (parsed && parsed.version === 1 && Array.isArray(parsed.tabs)) {
-    return sanitizePersisted(parsed, options);
+  if (parsed) {
+    const migrated = loadMigrated(parsed, options);
+    if (migrated) return migrated;
   }
 
   const recents = sanitizePathList(readJsonValue(storage.getItem(STORAGE_KEY_RECENT)), options, MAX_RECENT_REPOS);
@@ -112,7 +172,7 @@ export function loadPersistedWorkspace(
     ? [{ path: last, pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null }]
     : [];
   return {
-    version: 1,
+    version: WORKSPACE_VERSION,
     tabs,
     activePath: last,
     recents: last ? [last, ...recents.filter((path) => identityKey(path, options) !== identityKey(last, options))] : recents,
@@ -150,7 +210,7 @@ export function workspaceToPersisted(
 ): PersistedWorkspace {
   const active = ws.tabs.find((tab) => tab.id === ws.activeId);
   return {
-    version: 1,
+    version: WORKSPACE_VERSION,
     tabs: ws.tabs.map((tab) => {
       const session = sessions[tab.id];
       return {
@@ -193,7 +253,7 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
   const activePath = normalizeRepoPath(typeof raw.activePath === "string" ? raw.activePath : "");
   const activeExists = activePath && tabs.some((tab) => identityKey(tab.path, options) === identityKey(activePath, options));
   return {
-    version: 1,
+    version: WORKSPACE_VERSION,
     tabs,
     activePath: activeExists ? activePath : tabs[0]?.path ?? null,
     recents,

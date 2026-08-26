@@ -195,6 +195,103 @@ fn session_id(feature: Feature, repo_path: &str) -> String {
     format!("gitpulse:{}:{}", feature.slug(), repo_path)
 }
 
+/// Positive probes live a minute; negative ones only ten seconds, so a model
+/// server that was still starting up is asked again soon rather than locked
+/// out by its own earlier absence.
+const PROBE_CACHE_TTL: Duration = Duration::from_secs(60);
+const PROBE_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+
+/// One capability probe, kept until its TTL runs out.
+#[derive(Clone)]
+struct CachedProbe {
+    fetched_at: Instant,
+    outcome: Result<ProbeResult, String>,
+}
+
+impl CachedProbe {
+    fn fresh(&self) -> bool {
+        let ttl = if self.outcome.is_ok() {
+            PROBE_CACHE_TTL
+        } else {
+            PROBE_CACHE_NEGATIVE_TTL
+        };
+        self.fetched_at.elapsed() < ttl
+    }
+}
+
+fn probe_cache() -> &'static Mutex<HashMap<(String, String), CachedProbe>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), CachedProbe>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Asks the harness for a model's real dimensions, memoized per
+/// (base_url, model).
+///
+/// `status` polls and every generation used to re-run the probe — up to ten
+/// seconds each — for dimensions that rarely change within a session. A hit
+/// inside the TTL answers instantly; expired entries and unknown endpoints
+/// re-probe, and a failed probe is remembered only briefly so a server that
+/// comes back is noticed quickly.
+fn probe_model(base_url: &str, model: &str) -> Result<ProbeResult, String> {
+    let key = (base_url.to_string(), model.to_string());
+    if let Some(hit) = probe_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).filter(|entry| entry.fresh()).cloned())
+    {
+        return hit.outcome;
+    }
+    let outcome = fetch_probe(base_url, model);
+    if let Ok(mut cache) = probe_cache().lock() {
+        // Entries for (url, model) pairs nobody asks about anymore would
+        // otherwise accumulate one per selection ever made; drop them here.
+        cache.retain(|_, entry| entry.fresh());
+        cache.insert(
+            key,
+            CachedProbe {
+                fetched_at: Instant::now(),
+                outcome: outcome.clone(),
+            },
+        );
+    }
+    outcome
+}
+
+/// The uncached probe: one harness `capability.probe` round trip.
+fn fetch_probe(base_url: &str, model: &str) -> Result<ProbeResult, String> {
+    #[cfg(test)]
+    if let Some(outcome) = test_probe_override(base_url, model) {
+        return outcome;
+    }
+    let params = serde_json::json!({
+        "base_url": base_url,
+        "model": model,
+        "declared_context_window": FALLBACK_CONTEXT_WINDOW,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "timeout_ms": PROBE_TIMEOUT_MS,
+    });
+    sidecar::call_typed::<ProbeResult>(
+        OP_CAPABILITY_PROBE,
+        params,
+        Duration::from_millis(PROBE_TIMEOUT_MS as u64 + 4_000),
+    )
+    .map_err(|e| e.message())
+}
+
+/// Test seam standing in for the harness's `capability.probe`, so cache
+/// behavior is testable without a sidecar. Exists only in test builds.
+#[cfg(test)]
+type FakeProbe = std::sync::Arc<dyn Fn(&str, &str) -> Result<ProbeResult, String> + Send + Sync>;
+
+#[cfg(test)]
+static FAKE_PROBE: Mutex<Option<FakeProbe>> = Mutex::new(None);
+
+#[cfg(test)]
+fn test_probe_override(base_url: &str, model: &str) -> Option<Result<ProbeResult, String>> {
+    let fake = FAKE_PROBE.lock().ok().and_then(|slot| slot.clone())?;
+    Some(fake(base_url, model))
+}
+
 /// Discovers what is available, without sending a prompt anywhere.
 pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) -> AiStatus {
     let harness = HarnessStatus::probe();
@@ -246,23 +343,6 @@ pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) ->
         ready,
         detail,
     }
-}
-
-/// Asks the harness for a model's real dimensions.
-fn probe_model(base_url: &str, model: &str) -> Result<ProbeResult, String> {
-    let params = serde_json::json!({
-        "base_url": base_url,
-        "model": model,
-        "declared_context_window": FALLBACK_CONTEXT_WINDOW,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-        "timeout_ms": PROBE_TIMEOUT_MS,
-    });
-    sidecar::call_typed::<ProbeResult>(
-        OP_CAPABILITY_PROBE,
-        params,
-        Duration::from_millis(PROBE_TIMEOUT_MS as u64 + 4_000),
-    )
-    .map_err(|e| e.message())
 }
 
 /// One assembled request, before it goes out.
@@ -772,6 +852,144 @@ pub fn coverage_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serializes the tests below: they swap the fake probe and share the
+    /// process-wide cache.
+    static PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    type Hits = Arc<AtomicUsize>;
+
+    /// Installs a fake uncached probe that counts every call, so a test can
+    /// assert exactly how many probes a sequence of `probe_model` calls ran.
+    fn install_fake_probe(outcome: Result<ProbeResult, String>) -> Hits {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let per_call = outcome;
+        *FAKE_PROBE.lock().expect("fake probe registry") = Some(Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            per_call.clone()
+        }));
+        hits
+    }
+
+    struct ClearFakeProbe;
+    impl Drop for ClearFakeProbe {
+        fn drop(&mut self) {
+            *FAKE_PROBE.lock().expect("fake probe registry") = None;
+        }
+    }
+
+    #[test]
+    fn positive_probe_is_served_from_cache_within_ttl() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+
+        let info = ProbeResult {
+            context_window: 131_072,
+            describe: "probed once".into(),
+            ..Default::default()
+        };
+        let hits = install_fake_probe(Ok(info));
+
+        let first = probe_model("http://127.0.0.1:9", "cache-hit").expect("first probe");
+        let second = probe_model("http://127.0.0.1:9", "cache-hit").expect("cached probe");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "two probes inside the TTL must reach the harness once"
+        );
+        assert_eq!(first.context_window, second.context_window);
+        assert_eq!(first.describe, second.describe);
+    }
+
+    #[test]
+    fn expired_probe_entry_is_refetched() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+
+        let info = ProbeResult {
+            context_window: 8_192,
+            ..Default::default()
+        };
+        let hits = install_fake_probe(Ok(info));
+
+        let key = ("http://127.0.0.1:9".to_string(), "cache-expiry".to_string());
+        probe_model(&key.0, &key.1).expect("first probe");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Age the cache entry past its TTL, then ask again.
+        let stale = Instant::now()
+            .checked_sub(PROBE_CACHE_TTL + Duration::from_secs(1))
+            .expect("representable timestamp");
+        probe_cache()
+            .lock()
+            .expect("probe cache")
+            .get_mut(&key)
+            .expect("entry cached")
+            .fetched_at = stale;
+
+        probe_model(&key.0, &key.1).expect("refetched probe");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "an expired entry must re-run the probe"
+        );
+    }
+
+    #[test]
+    fn negative_probe_is_cached_without_a_second_hit() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+
+        let hits = install_fake_probe(Err("model server unreachable".into()));
+
+        let first_err =
+            probe_model("http://127.0.0.1:9", "cache-negative").expect_err("server is down");
+        let second_err =
+            probe_model("http://127.0.0.1:9", "cache-negative").expect_err("still cached as down");
+
+        assert_eq!(first_err, second_err);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a quick retry after a failure must be served from the negative cache"
+        );
+
+        // But only briefly: the negative TTL must be shorter than the
+        // positive one, so a recovering server is not locked out.
+        assert!(PROBE_CACHE_NEGATIVE_TTL < PROBE_CACHE_TTL);
+
+        // Once the (short) negative TTL lapses, the harness is asked again.
+        let key = (
+            "http://127.0.0.1:9".to_string(),
+            "cache-negative".to_string(),
+        );
+        let stale = Instant::now()
+            .checked_sub(PROBE_CACHE_NEGATIVE_TTL + Duration::from_secs(1))
+            .expect("representable timestamp");
+        probe_cache()
+            .lock()
+            .expect("probe cache")
+            .get_mut(&key)
+            .expect("negative entry cached")
+            .fetched_at = stale;
+
+        probe_model(&key.0, &key.1).expect_err("server is still down");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a lapsed negative entry must re-run the probe"
+        );
+    }
 
     /// The calibration ledger must stay bounded: inserting past the capacity
     /// evicts oldest-inserted sessions deterministically, re-observing a
