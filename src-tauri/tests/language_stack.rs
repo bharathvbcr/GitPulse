@@ -59,7 +59,7 @@ fn run_git(cwd: &Path, args: &[&str]) {
 fn untracked_rust_is_detected() {
     let repo = TestRepo::init();
     repo.write("src/lib.rs", "pub fn ready() {}\n");
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats");
+    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
     let rust = stats
         .iter()
         .find(|s| s.language == "Rust")
@@ -93,7 +93,7 @@ fn tauri_layout_detects_rust_despite_lockfiles_and_frontend() {
     );
     repo.commit_all("chore: mixed tauri tree");
 
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats");
+    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
     assert!(
         stats
             .iter()
@@ -143,7 +143,7 @@ fn rust_survives_many_earlier_prose_files() {
     }
     repo.write("zzz-backend/src/lib.rs", "pub fn late() { let y = 2; }\n");
     repo.commit_all("chore: drown then rust");
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats");
+    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
     assert!(
         stats.iter().any(|s| s.language == "Rust"),
         "late rust path dropped: {:?}",

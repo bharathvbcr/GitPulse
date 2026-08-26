@@ -408,6 +408,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /** Monotonic poll ordering; a superseded tick's result is discarded. */
   let pollSequenceSource = 0;
   const pollRuns = new Map<string, number>();
+  /** Whether the `pagehide` persist-flush listener is currently attached. */
+  let pagehideWired = false;
 
   // Monotonic token source for diff-selection requests. Session `generation`
   // only moves on tab activation, so it cannot order two rapid selections of
@@ -419,8 +421,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     pollTimer = setInterval(() => void runStatusPoll(), STATUS_POLL_INTERVAL_MS);
     // Quitting inside the persist debounce window would drop the newest
     // search query / view tab; `pagehide` fires on close and navigation.
-    if (typeof document !== "undefined") {
+    // Added and removed symmetrically with the poll so repeated
+    // stop/start cycles cannot accumulate duplicate listeners.
+    if (typeof document !== "undefined" && !pagehideWired) {
       document.addEventListener("pagehide", flushPersist);
+      pagehideWired = true;
     }
   }
 
@@ -429,6 +434,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (pollTimer === null) return;
     clearInterval(pollTimer);
     pollTimer = null;
+    if (pagehideWired && typeof document !== "undefined") {
+      document.removeEventListener("pagehide", flushPersist);
+      pagehideWired = false;
+    }
   }
 
   async function runStatusPoll() {

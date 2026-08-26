@@ -190,6 +190,11 @@
   }
 
   $effect(() => {
+    // Re-run on activation changes, not just on element binding — otherwise
+    // the newly active tab never scrolls into view (mirrors ViewTabBar).
+    const tabs = $repoStore.openTabs;
+    const activeId = tabs.find((tab) => tab.isActive)?.id ?? null;
+    void activeId;
     const active = scroller?.querySelector("[data-active-repo='true']");
     if (active instanceof HTMLElement) {
       active.scrollIntoView({ block: "nearest", inline: "nearest" });

@@ -72,6 +72,7 @@
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import { themeStore } from "../stores/themeStore";
+  import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { createListenerTracker } from "../dom/listenerTracker";
@@ -135,7 +136,7 @@
   // instead of landing in a drained array and leaking for the webview life.
   const unlisteners = createListenerTracker();
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
-  let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Output that arrives between spawn request and id assignment. */
   let earlyOutput: { id: string; bytes: Uint8Array }[] = [];
 
@@ -297,9 +298,10 @@
     });
     return () => {
       unlisteners.dispose();
-      if (copiedResetTimer !== null) {
-        clearTimeout(copiedResetTimer);
-        copiedResetTimer = null;
+      if (copyResetTimer !== null) {
+        clearTimeout(copyResetTimer);
+        copyResetTimer = null;
+      }
       }
       resizeObserver?.disconnect();
       resizeObserver = null;
@@ -474,6 +476,9 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    // Enter/Arrow keys during an IME conversion belong to the composition,
+    // not to command execution or history navigation.
+    if (isImeComposition(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void execute();
@@ -515,9 +520,9 @@
     }
     if (await copyText(text.trim())) {
       copiedId = entry.id;
-      if (copiedResetTimer !== null) clearTimeout(copiedResetTimer);
-      copiedResetTimer = setTimeout(() => {
-        copiedResetTimer = null;
+      if (copyResetTimer !== null) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        copyResetTimer = null;
         if (copiedId === entry.id) copiedId = null;
       }, 1500);
     }

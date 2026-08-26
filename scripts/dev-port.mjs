@@ -73,6 +73,11 @@ export function isTauriHookEnv(env = process.env) {
  * @param {string} command
  */
 export function isDevServerCommand(command) {
+  // Deliberately broad on the "/vite/" branch: npm shim argv varies
+  // (node_modules/.bin/vite, vite/bin/vite.js, pnpm/yarn wrappers), and a
+  // missed real server just falls through to auto-port while a wrongly
+  // killed process would be data loss. Reclaim additionally requires
+  // repo-local cwd, non-self pid, and an age check before any signal.
   if (!command) return false;
   const normalized = command.replace(/\\/g, "/").toLowerCase();
   return (
@@ -392,6 +397,13 @@ export function createDefaultIo() {
       return pids;
     },
     kill: killPid,
+    /** Identity-checked kill: refuses if the pid no longer runs a matching command. */
+    killVerified:
+      /**
+       * @param {number} pid
+       * @param {string | null} needle
+       */
+      (pid, needle) => killPid(pid, needle),
     isFree: isPortFree,
     waitUntilFree,
     findFreePort,
@@ -438,7 +450,11 @@ export async function resolveDevPort(options = {}) {
 
   if (reclaimable.length > 0) {
     for (const listener of reclaimable) {
-      await io.kill(listener.pid);
+      // Identity-checked: between the listing above and this kill, the pid
+      // could have exited and been recycled by an unrelated process. The
+      // needle is the command we vetted; a mismatch aborts the kill.
+      const needle = (listener.command ?? "").trim().toLowerCase();
+      await io.killVerified(listener.pid, needle || null);
     }
     if (await io.waitUntilFree(target)) {
       return {
@@ -648,12 +664,44 @@ export function parseEtimeToMs(raw) {
 }
 
 /**
+ * Reads the current command line of `pid` (empty when gone or unreadable).
+ *
  * @param {number} pid
- * @returns {Promise<void>}
+ * @returns {Promise<string>}
  */
-async function killPid(pid) {
+async function currentCommand(pid) {
+  if (process.platform === "win32") return "";
+  try {
+    const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
+    return stdout.trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Kills `pid`, but only while it still runs the command it was vetted as.
+ * `expectNeedle` closes most of the pid-reuse window between listing a stale
+ * listener and delivering signals: a recycled pid running anything else is
+ * left alone. Null/empty needle skips the check (used by non-reclaim paths).
+ *
+ * @param {number} pid
+ * @param {string | null} [expectNeedle]
+ * @returns {Promise<void>}
+ * @internal exported for tests only
+ */
+export async function killPid(pid, expectNeedle = null) {
   if (!Number.isInteger(pid) || pid <= 1) return;
   if (pid === process.pid || pid === process.ppid) return;
+  /** @returns {Promise<boolean>} false = do not signal this pid anymore */
+  const stillUs = async () => {
+    if (!expectNeedle) return true;
+    const cmd = await currentCommand(pid);
+    // Empty output means the process is already gone (fine) or ps could not
+    // read it — either way we must not send it a signal.
+    return cmd !== "" && cmd.includes(expectNeedle);
+  };
+  if (!(await stillUs())) return;
   if (process.platform === "win32") {
     try {
       await execFileAsync("taskkill", ["/PID", String(pid), "/T"]);
@@ -677,6 +725,7 @@ async function killPid(pid) {
     if (!pidAlive(pid)) return;
     await sleep(50);
   }
+  if (!(await stillUs())) return;
   try {
     process.kill(pid, "SIGKILL");
   } catch (err) {

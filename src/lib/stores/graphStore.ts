@@ -102,6 +102,8 @@ export interface GraphState {
   error: string | null;
   /** True when older history exists past the current page. */
   hasMore: boolean;
+  /** Backend reads that failed this load (HEAD, ref decorations). */
+  warnings: string[];
 }
 
 interface CachedGraph {
@@ -116,6 +118,7 @@ interface CachedGraph {
   revision: string | null;
   maxCommits: number;
   hasMore: boolean;
+  warnings: string[];
 }
 function emptyVisible(
   path: string | null,
@@ -135,6 +138,7 @@ function emptyVisible(
     visiblePath: path,
     error: null,
     hasMore: false,
+    warnings: [],
   };
 }
 
@@ -339,6 +343,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           selectedCommitDetails: cached.selectedCommitDetails,
           maxCommits: cached.maxCommits,
           hasMore: cached.hasMore,
+          warnings: cached.warnings,
           error: null,
           isLoading: false,
           visiblePath: path,
@@ -435,6 +440,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           revision,
           maxCommits: max,
           hasMore: payload.has_more === true,
+          warnings: payload.warnings ?? [],
         };
         cache.set(repoPath, next);
         if (visiblePath === repoPath) {
@@ -449,10 +455,17 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
             selectedCommitDetails: next.selectedCommitDetails,
             maxCommits: max,
             hasMore: next.hasMore,
+            warnings: next.warnings,
             error: null,
             isLoading: false,
             visiblePath: repoPath,
           }));
+        }
+        // Backend reads that failed land in the diagnostics channel; a graph
+        // without decorations must never be silently indistinguishable from
+        // a repository that has none.
+        for (const warning of next.warnings) {
+          console.warn(`[graph:${repoPath}] ${warning}`);
         }
 
         if (selectedCommit) {
