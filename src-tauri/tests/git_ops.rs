@@ -141,7 +141,7 @@ fn test_open_repo_history_status_and_details() {
     assert_eq!(details.summary, history[0].summary);
     assert_eq!(details.gpg_status, "N");
 
-    let stats = GitReader::get_repo_language_stats(&path).expect("stats");
+    let stats = GitReader::get_repo_language_stats(&path).expect("stats").stats;
     let rust = stats
         .iter()
         .find(|s| s.language == "Rust")

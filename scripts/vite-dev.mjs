@@ -14,7 +14,8 @@ try {
 } catch (err) {
   // A garbage GITPULSE_DEV_PORT must fail with a readable message and a
   // nonzero exit, not a raw unhandled rejection.
-  console.error(`vite-dev: ${err.message}`);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`vite-dev: ${message}`);
   process.exit(2);
 }
 const result = await resolveDevPort({

@@ -398,7 +398,12 @@ export function createDefaultIo() {
     },
     kill: killPid,
     /** Identity-checked kill: refuses if the pid no longer runs a matching command. */
-    killVerified: (pid, needle) => killPid(pid, needle),
+    killVerified:
+      /**
+       * @param {number} pid
+       * @param {string | null} needle
+       */
+      (pid, needle) => killPid(pid, needle),
     isFree: isPortFree,
     waitUntilFree,
     findFreePort,

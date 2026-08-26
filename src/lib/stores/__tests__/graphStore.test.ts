@@ -153,4 +153,51 @@ describe("graphStore generation", () => {
     await staleLoad;
     expect(get(store).rows[0]?.id).toBe("fresh");
   });
+
+  it("surfaces backend read warnings in state and the diagnostics channel", async () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (msg?: unknown) => {
+      warned.push(String(msg));
+    };
+    try {
+      const withWarnings = {
+        ...payload("w"),
+        refs: [],
+        has_more: false,
+        warnings: ["ref decorations unavailable: fatal: broken ref"],
+      };
+      const invoke: InvokeFn = async (cmd) => {
+        if (cmd === "cmd_get_commit_graph") return withWarnings as never;
+        if (cmd === "cmd_get_commit_details")
+          return { id: "x", summary: "d", changed_files: [] } as never;
+        throw new Error(cmd);
+      };
+      const store = createGraphStore({ invoke });
+      store.showRepo("/r/a");
+      await store.loadGraph("/r/a");
+      expect(get(store).warnings).toEqual([
+        "ref decorations unavailable: fatal: broken ref",
+      ]);
+      expect(
+        warned.some((w) => w.includes("ref decorations unavailable")),
+        "warnings must reach the console/diagnostics channel"
+      ).toBe(true);
+    } finally {
+      console.warn = original;
+    }
+  });
+
+  it("defaults warnings to empty for payloads without them", async () => {
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") return payload("p") as never;
+      if (cmd === "cmd_get_commit_details")
+        return { id: "x", summary: "d", changed_files: [] } as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).warnings).toEqual([]);
+  });
 });

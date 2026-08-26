@@ -96,7 +96,9 @@ fn test_git_workflow_lifecycle() {
 
     // 9. Language stats
     let lang_stats =
-        GitReader::get_repo_language_stats(path).expect("get_repo_language_stats failed");
+        GitReader::get_repo_language_stats(path)
+        .expect("get_repo_language_stats failed")
+        .stats;
     assert!(!lang_stats.is_empty());
     assert_eq!(lang_stats[0].language, "Markdown");
 }
@@ -233,7 +235,9 @@ fn test_language_stats_skip_oversized_files_without_reading() {
     GitWriter::commit(path, "feat: sizes", false).unwrap();
 
     let started = std::time::Instant::now();
-    let stats = GitReader::get_repo_language_stats(path).expect("language stats failed");
+    let stats = GitReader::get_repo_language_stats(path)
+        .expect("language stats failed")
+        .stats;
     let elapsed = started.elapsed();
 
     let names: Vec<_> = stats.iter().map(|s| s.language.as_str()).collect();

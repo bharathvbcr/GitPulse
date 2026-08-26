@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
@@ -167,6 +168,24 @@ pub struct RepoLanguageStat {
     pub code_lines: usize,
     pub file_count: usize,
     pub percentage: f64,
+}
+
+/// Whole-scan budget for language statistics. Per-file caps (1 MiB reads) do
+/// not bound the total: 10k files x 1 MiB is a legitimate multi-gigabyte
+/// synchronous read inside one IPC call. The deadline stops the walk and the
+/// report says so instead of presenting a capped sample as complete coverage.
+pub const LANG_STATS_DEADLINE: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageStatsReport {
+    pub stats: Vec<RepoLanguageStat>,
+    /// True when the scan stopped early: deadline hit, or fewer files counted
+    /// than candidates selected.
+    pub truncated: bool,
+    /// Files actually read and counted.
+    pub scanned_files: usize,
+    /// Candidate files selected before scanning began.
+    pub candidate_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -864,7 +883,21 @@ impl GitReader {
         Ok(entries)
     }
 
-    pub fn get_repo_language_stats(repo_path: &str) -> Result<Vec<RepoLanguageStat>, String> {
+    pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
+        Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+    }
+
+    /// Like [`Self::get_repo_language_stats`] with an explicit budget;
+    /// `None` means unbounded (tests).
+    pub fn get_repo_language_stats_bounded(
+        repo_path: &str,
+        deadline: Option<Duration>,
+    ) -> Result<LanguageStatsReport, String> {
+        let started = Instant::now();
+        let expired = || match deadline {
+            Some(d) => started.elapsed() >= d,
+            None => false,
+        };
         let repo = validate_repo(repo_path)?;
         let stdout = git_text(
             &repo,
@@ -889,13 +922,23 @@ impl GitReader {
             }
             candidates.push((rel_path, lang_info));
         }
+        let candidate_files = candidates.len();
         let selected = LanguageDetector::prioritize_for_stats(candidates, 10_000);
+        let selected_len = selected.len();
 
         let mut lang_counts: HashMap<&'static str, (usize, usize, &'static str, &'static str)> =
             HashMap::new();
         let mut total_lines = 0usize;
+        let mut scanned_files = 0usize;
+        let mut attempted_files = 0usize;
+        let mut deadline_hit = false;
 
         for (rel_path, path_info) in selected {
+            if expired() {
+                deadline_hit = true;
+                break;
+            }
+            attempted_files += 1;
             // Resolve through symlinks so a tracked file that is really a link
             // pointing outside the repo is refused instead of read.
             let full_path = match git_cli::sandbox_join_canonical(&repo, &rel_path) {
@@ -920,6 +963,7 @@ impl GitReader {
                     continue;
                 }
             };
+            scanned_files += 1;
             if bytes.len() > 1_048_576 {
                 record_lang(&mut lang_counts, path_info, 0);
                 continue;
@@ -962,7 +1006,14 @@ impl GitReader {
                 .then_with(|| b.code_lines.cmp(&a.code_lines))
                 .then_with(|| a.language.cmp(&b.language))
         });
-        Ok(stats)
+        Ok(LanguageStatsReport {
+            stats,
+            // Deadline hit, or the 10k prioritization cap dropped candidates,
+            // mean the reported numbers cover only part of the worktree.
+            truncated: deadline_hit || attempted_files < selected_len,
+            scanned_files,
+            candidate_files,
+        })
     }
 }
 
@@ -1789,6 +1840,59 @@ fn b64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_stats_repo(dir: &std::path::Path) {
+        let output = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let rs = dir.join("app.rs");
+        std::fs::write(&rs, "fn main() {}\n").expect("write file");
+        let output = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .expect("git add");
+        assert!(output.status.success());
+    }
+
+    /// The language scan must report honestly when it stopped early: a
+    /// zero deadline reads nothing, and the report must say truncated
+    /// rather than presenting an empty scan as complete coverage.
+    #[test]
+    fn language_stats_report_truncates_honestly_under_a_zero_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let report = GitReader::get_repo_language_stats_bounded(
+            dir.path().to_str().unwrap(),
+            Some(Duration::ZERO),
+        )
+        .expect("report");
+        assert_eq!(report.scanned_files, 0);
+        assert!(
+            report.candidate_files >= 1,
+            "the seeded .rs file is a candidate"
+        );
+        assert!(report.truncated, "a scan that read nothing is truncated");
+    }
+
+    #[test]
+    fn language_stats_report_is_complete_on_a_small_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let report = GitReader::get_repo_language_stats_bounded(
+            dir.path().to_str().unwrap(),
+            Some(Duration::from_secs(30)),
+        )
+        .expect("report");
+        assert!(!report.truncated);
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.candidate_files, 1);
+        assert_eq!(report.stats.len(), 1);
+        assert_eq!(report.stats[0].language, "Rust");
+    }
 
     #[test]
     fn test_parse_co_authors() {

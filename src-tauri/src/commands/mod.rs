@@ -8,7 +8,7 @@ use crate::diff::{
 };
 use crate::engine::git_cli::{git_text, resolve_repo, sandbox_write, validate_repo, ResolvedRepo};
 use crate::engine::git_reader::{
-    BlameLine, CommitDetails, CommitFileChange, FileBlob, ReflogEntry, RepoLanguageStat,
+    BlameLine, CommitDetails, CommitFileChange, FileBlob, ReflogEntry,
 };
 use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
@@ -48,6 +48,40 @@ pub struct CommitGraphPayload {
     /// True when the walk hit its row cap and older commits exist. The client
     /// offers "load more" instead of silently hiding the rest of history.
     pub has_more: bool,
+    /// Non-fatal reads that failed this load (HEAD, ref decorations). A graph
+    /// with missing decorations must be distinguishable from a repository
+    /// that genuinely has none — an empty default is a claim, not a fact.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Resolves HEAD and ref-decoration results into payload fields, converting
+/// failures into explicit warnings. A read that could not run never reports
+/// the same output as one that ran and found nothing.
+fn graph_extras(
+    head: Result<String, String>,
+    refs: Result<Vec<crate::graph::RefDecoration>, String>,
+) -> (
+    Option<String>,
+    Vec<crate::graph::RefDecoration>,
+    Vec<String>,
+) {
+    let mut warnings = Vec::new();
+    let head_id = match head {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warnings.push(format!("HEAD unavailable: {e}"));
+            None
+        }
+    };
+    let refs = match refs {
+        Ok(decorations) => decorations,
+        Err(e) => {
+            warnings.push(format!("ref decorations unavailable: {e}"));
+            Vec::new()
+        }
+    };
+    (head_id, refs, warnings)
 }
 
 #[tauri::command(async)]
@@ -111,8 +145,9 @@ pub async fn cmd_get_commit_graph(
         let rev = revision.clone();
         // History is the long pole; HEAD and ref decorations are independent of
         // it, so they run concurrently instead of serializing three walks behind
-        // one another on a large repository.
-        let (history, head_id, refs) = std::thread::scope(|scope| {
+        // one another on a large repository. Head/refs failures become payload
+        // warnings instead of silent empty defaults.
+        let (history, extras) = std::thread::scope(|scope| {
             let history = scope.spawn(move || {
                 GitReader::read_commit_history_paged(
                     &repo,
@@ -122,18 +157,20 @@ pub async fn cmd_get_commit_graph(
                 )
             });
             let repo2 = repo_path.clone();
-            let head = scope.spawn(move || GitReader::head_id(&repo2).ok());
+            let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
-            let refs =
-                scope.spawn(move || crate::graph::list_ref_decorations(&repo3).unwrap_or_default());
-            (
-                history
-                    .join()
-                    .unwrap_or_else(|_| Err("history walker panicked".into())),
-                head.join().unwrap_or(None),
-                refs.join().unwrap_or_default(),
-            )
+            let refs = scope.spawn(move || crate::graph::list_ref_decorations(&repo3));
+            let history = history
+                .join()
+                .unwrap_or_else(|_| Err("history walker panicked".into()));
+            let extras = graph_extras(
+                head.join().unwrap_or_else(|_| Err("HEAD reader panicked".into())),
+                refs.join()
+                    .unwrap_or_else(|_| Err("ref decoration walker panicked".into())),
+            );
+            (history, extras)
         });
+        let (head_id, refs, warnings) = extras;
 
         let mut raw_commits = history?;
         let has_more = raw_commits.len() > max_commits;
@@ -168,6 +205,7 @@ pub async fn cmd_get_commit_graph(
             head_id,
             refs,
             has_more,
+            warnings,
         })
     })
     .await
@@ -593,7 +631,9 @@ pub async fn cmd_get_reflog(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_get_language_stats(repo_path: String) -> Result<Vec<RepoLanguageStat>, String> {
+pub async fn cmd_get_language_stats(
+    repo_path: String,
+) -> Result<crate::engine::git_reader::LanguageStatsReport, String> {
     off_thread(move || GitReader::get_repo_language_stats(&repo_path)).await
 }
 
@@ -1540,6 +1580,38 @@ pub async fn cmd_ai_fix_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_extras_passes_clean_reads_through_without_warnings() {
+        let (head, refs, warnings) = graph_extras(
+            Ok("abc123".into()),
+            Ok(vec![crate::graph::RefDecoration {
+                name: "main".into(),
+                kind: crate::graph::RefKind::Local,
+                commit_id: "abc123".into(),
+                is_head: true,
+            }]),
+        );
+        assert_eq!(head.as_deref(), Some("abc123"));
+        assert_eq!(refs.len(), 1);
+        assert!(warnings.is_empty(), "clean reads must carry no warnings");
+    }
+
+    #[test]
+    fn graph_extras_reports_failed_reads_instead_of_empty_defaults() {
+        let (head, refs, warnings) = graph_extras(
+            Err("fatal: not a git repository".into()),
+            Err("warning: ignoring broken refs".into()),
+        );
+        // A read that could not run must NOT look identical to one that ran
+        // and found nothing: the fields default, but warnings say why.
+        assert_eq!(head, None);
+        assert!(refs.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("HEAD unavailable"));
+        assert!(warnings[0].contains("not a git repository"));
+        assert!(warnings[1].contains("ref decorations unavailable"));
+    }
 
     fn verdict(status: crate::harness::PolicyStatus) -> crate::harness::PolicyVerdict {
         crate::harness::PolicyVerdict {

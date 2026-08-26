@@ -3,23 +3,42 @@
   import { invoke } from "@tauri-apps/api/core";
   import { pickLanguageBarStats, type LanguageStat } from "../language/barStats";
 
+  /** Wire shape of `crate::engine::git_reader::LanguageStatsReport`. */
+  interface LanguageStatsReport {
+    stats: LanguageStat[];
+    /** True when the backend scan stopped early (deadline or cap). */
+    truncated: boolean;
+    scanned_files: number;
+    candidate_files: number;
+  }
+
   let stats: LanguageStat[] = $state([]);
+  /** Non-null when the shown percentages cover only part of the worktree. */
+  let partialNotice: string | null = $state(null);
 
   $effect(() => {
     const path = $repoStore.currentPath;
     if (!path) {
       stats = [];
+      partialNotice = null;
       return;
     }
     let cancelled = false;
-    invoke<LanguageStat[]>("cmd_get_language_stats", {
+    invoke<LanguageStatsReport>("cmd_get_language_stats", {
       repoPath: path,
     })
-      .then((s) => {
-        if (!cancelled) stats = pickLanguageBarStats(s);
+      .then((report) => {
+        if (cancelled) return;
+        stats = pickLanguageBarStats(report.stats);
+        partialNotice = report.truncated
+          ? `Partial scan: ${report.scanned_files} of ${report.candidate_files} files counted`
+          : null;
       })
       .catch(() => {
-        if (!cancelled) stats = [];
+        if (!cancelled) {
+          stats = [];
+          partialNotice = null;
+        }
       });
     return () => {
       cancelled = true;
@@ -46,6 +65,14 @@
       </div>
     </div>
     <div class="flex items-center gap-4 text-textMuted">
+      {#if partialNotice}
+        <span
+          class="text-[10px] text-amber-400/90"
+          title="The scan stopped early (time budget); percentages cover only the files counted"
+        >
+          ⚠ {partialNotice}
+        </span>
+      {/if}
       {#each stats as lang}
         <div class="flex items-center gap-1.5" title={tipFor(lang)}>
           <span class="w-2 h-2 rounded-full shadow-sm" style="background-color: {lang.color_hex};"></span>
