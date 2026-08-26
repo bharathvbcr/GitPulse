@@ -1,5 +1,11 @@
 import { clamp01 } from "../motion/easing";
 import { getBranchColor } from "./Palette";
+import { authorColor, authorIdentity } from "../authors/authorIdentity";
+import {
+  buildIncomingEdgeIndex,
+  deepestChildTargetingRange,
+  isLongConnection,
+} from "./graphEdges";
 
 export interface LaneConnection {
   from_lane: number;
@@ -127,6 +133,24 @@ export interface RenderOptions {
    * pre-rendered static layer (graphCache) without re-stroking the graph.
    */
   emphasisOnly?: boolean;
+  /**
+   * Draw author avatars in a dedicated column right of the lanes. The column
+   * centre X is supplied by the caller (it owns gutter sizing) via
+   * {@link RenderOptions.avatarX}; when either field is missing no avatars
+   * are drawn. Avatars belong to the static layer: emphasis-only passes skip
+   * them exactly like nodes.
+   */
+  showAvatars?: boolean;
+  /** Canvas X of the avatar column centre; see {@link RenderOptions.showAvatars}. */
+  avatarX?: number | null;
+  /**
+   * Skip connectors whose span exceeds {@link LOOKBACK_ROWS} (they are owned
+   * by the live overlay; see graphEdges.ts). The strip painter must set this:
+   * a long connector baked into a tile is clipped mid-edge at the seam, which
+   * is exactly the floating-fragment artifact this split exists to prevent.
+   * Default false — direct renders draw every edge themselves.
+   */
+  skipLongConnectors?: boolean;
 }
 
 /** Outer radius of the hover/selection ring at a given animation strength. */
@@ -134,12 +158,33 @@ export function emphasisRingRadius(nodeRadius: number, strength = 1): number {
   return nodeRadius + 2 + 1.5 * clamp01(strength);
 }
 
+/**
+ * Author-avatar geometry per density. Radii are CSS pixels; the avatar disc
+ * carries the author's initial so dense graphs stay attributable at a glance.
+ */
+export interface AvatarStyle {
+  radius: number;
+  fontPx: number;
+}
+
+export const AVATAR_STYLES: Record<DensityMode, AvatarStyle> = {
+  spacious: { radius: 8, fontPx: 9 },
+  compact: { radius: 6, fontPx: 7 },
+};
+
+/** Extra hit slop around the avatar disc, matching the node's forgiveness. */
+export const AVATAR_HIT_SLOP = 3;
+
 /** How far a dangling edge protrudes below its commit, as a fraction of a row. */
 const DANGLING_STUB_RATIO = 0.62;
 /**
  * Rows of lookback for edges that start above the viewport and cross into it.
- * Exported because the static-layer strip cache primes each tile with the same
- * lookback so connectors crossing tile seams stay continuous.
+ * Doubles as the OWNERSHIP BOUNDARY of the static strip cache: connectors
+ * with a span at or under this many rows are baked into tiles (the primed
+ * range covers them, so no seam can clip mid-edge); anything longer is drawn
+ * whole by the live overlay ({@link GraphRenderer.drawLongConnectors}),
+ * because priming tiles back past this bound would blow the canvas-height
+ * budget and leave the edge's middle drawn by nobody.
  */
 export const LOOKBACK_ROWS = 60;
 
@@ -200,17 +245,24 @@ function acquireRun(lane: number, colorIndex: number, top: number, bottom: numbe
 }
 
 function releaseLaneScratch(): void {
+  // The two collections MUST be disjoint before pooling: render()'s final
+  // flush moves still-open runs into scratchRuns; if they stayed in the map
+  // as well, each was pooled twice and the second acquireRun() of a recycled
+  // object silently re-pointed a lane that another run still referenced —
+  // losing lanes on every subsequent paint. Draining the map here makes the
+  // invariant structural rather than call-site discipline.
+  for (const run of scratchOpenRuns.values()) scratchRuns.push(run);
+  resetLaneScratch();
   for (const run of scratchRuns) {
     if (runPool.length < RUN_POOL_MAX) runPool.push(run);
   }
-  for (const run of scratchOpenRuns.values()) {
-    if (runPool.length < RUN_POOL_MAX) runPool.push(run);
-  }
-  resetLaneScratch();
+  scratchRuns.length = 0;
 }
 
 export class GraphRenderer {
   private config: GraphRenderConfig;
+  /** Avatar disc metrics; follows the active density so compact rows shrink. */
+  private avatarStyle: AvatarStyle = AVATAR_STYLES.spacious;
 
   constructor(config: Partial<GraphRenderConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -226,23 +278,27 @@ export class GraphRenderer {
 
   public setDensity(mode: DensityMode): void {
     this.config = { ...this.config, ...DENSITY_CONFIGS[mode] };
+    this.avatarStyle = AVATAR_STYLES[mode];
+  }
+
+  /** The avatar metrics matching the current density (exposed for hit-testing parity). */
+  public getAvatarStyle(): AvatarStyle {
+    return { ...this.avatarStyle };
   }
 
 
   /**
    * Computes the Y-coordinate on the canvas for a given row index.
+   *
+   * Single owner of row arithmetic: render(), dangling stubs, avatars and
+   * hit-testing all resolve coordinates through here. The old dual-mode
+   * (absolute/relative) branch was unreachable for every real caller — both
+   * modes coincide or absolute always won — and keeping it invited drift
+   * between paint and hit-testing.
    */
-  public getRowY(
-    rowIdx: number,
-    startIndex: number,
-    scrollOffset: number = 0,
-    isAbsoluteScroll: boolean = true
-  ): number {
+  public getRowY(rowIdx: number, scrollOffset: number = 0): number {
     const { rowHeight } = this.config;
-    if (isAbsoluteScroll) {
-      return rowIdx * rowHeight + rowHeight / 2 - scrollOffset;
-    }
-    return (rowIdx - startIndex) * rowHeight + rowHeight / 2 - scrollOffset;
+    return rowIdx * rowHeight + rowHeight / 2 - scrollOffset;
   }
 
   /**
@@ -254,22 +310,22 @@ export class GraphRenderer {
   }
 
   /**
-   * Row-index → canvas-y, shared by render() and drawDanglingStubs so the
-   * cached static layer and the live overlay can never disagree about where
-   * a row sits.
+   * Row-index → canvas-y closure shared by every painter and by
+   * getCommitAtPoint, so the cached static layer, live overlay and hit test
+   * can never disagree about where a row sits.
    */
-  private yForRow(startIndex: number, scrollOffset: number): (r: number) => number {
-    const { rowHeight } = this.config;
-    const isAbsoluteScroll = scrollOffset >= startIndex * rowHeight || startIndex === 0;
-    return (r: number) => this.getRowY(r, startIndex, scrollOffset, isAbsoluteScroll);
+  private yForRow(scrollOffset: number): (r: number) => number {
+    return (r: number) => this.getRowY(r, scrollOffset);
   }
 
   /**
-   * The commit whose node covers a canvas point, or null.
+   * The commit whose node — or author avatar — covers a canvas point, or null.
    *
    * The hit area is the node plus a few pixels: a 5px disc is a hard target
    * with a mouse and an impossible one on a trackpad, and a click that lands
-   * one pixel out should still select the commit the user aimed at.
+   * one pixel out should still select the commit the user aimed at. When
+   * `avatarX` is supplied the avatar column is hit-tested with the same
+   * slop, so hovering an avatar yields the same tooltip as its node.
    */
   public getCommitAtPoint(
     x: number,
@@ -277,22 +333,35 @@ export class GraphRenderer {
     rows: VisualCommitRow[],
     startIndex: number,
     endIndex: number,
-    scrollOffset: number = 0
+    scrollOffset: number = 0,
+    avatarX: number | null = null,
   ): VisualCommitRow | null {
-    const { rowHeight, nodeRadius, mergeNodeRadius } = this.config;
+    const { nodeRadius, mergeNodeRadius } = this.config;
     if (!rows || rows.length === 0) return null;
-    const isAbsoluteScroll = scrollOffset >= startIndex * rowHeight || startIndex === 0;
+    // Normalize once: the loop below reads the center X on every hit check,
+    // and a bare truthiness guard on `avatar` does not narrow `avatarX`.
+    const avatarCenterX =
+      avatarX !== null && Number.isFinite(avatarX) ? avatarX : null;
+    const avatar = avatarCenterX === null ? null : this.avatarStyle;
     const limit = Math.min(rows.length, Math.max(endIndex, startIndex));
 
     for (let i = startIndex; i < limit; i++) {
       const row = rows[i];
-      const nodeY = this.getRowY(i, startIndex, scrollOffset, isAbsoluteScroll);
+      const nodeY = this.getRowY(i, scrollOffset);
+      // Node first: it is the primary target when both discs overlap a point.
       const nodeX = this.getLaneX(row.lane);
       const radius = (row.is_merge ? mergeNodeRadius : nodeRadius) + 4;
       const dx = x - nodeX;
       const dy = y - nodeY;
       if (dx * dx + dy * dy <= radius * radius) {
         return row;
+      }
+      if (avatarCenterX !== null && avatar) {
+        const adx = x - avatarCenterX;
+        const ar = avatar.radius + AVATAR_HIT_SLOP;
+        if (adx * adx + dy * dy <= ar * ar) {
+          return row;
+        }
       }
     }
     return null;
@@ -351,12 +420,25 @@ export class GraphRenderer {
     ctx.lineJoin = "round";
     ctx.imageSmoothingEnabled = true;
 
-    // Auto-detect absolute scroll (scrollTop >= startIndex * rowHeight or startIndex === 0)
-    const calcY = this.yForRow(startIndex, scrollOffset);
+    // Row arithmetic resolves through the shared yForRow closure; every
+    // painter and the hit test see identical coordinates by construction.
+    const calcY = this.yForRow(scrollOffset);
     const laneX = (lane: number) => originX + lane * laneWidth;
 
     const viewportHeight = options.viewportHeight ?? this.canvasHeight(ctx);
-    const renderStart = Math.max(0, startIndex - LOOKBACK_ROWS);
+    const lookbackStart = Math.max(0, startIndex - LOOKBACK_ROWS);
+    // When this pass owns long connectors (any direct render), the window
+    // extends EXACTLY to the deepest child that targets a visible row, so an
+    // edge of any span draws whole from its own child row — there is no scan
+    // cap left to silently drop history behind. Strip painters skip long
+    // connectors entirely (the live overlay owns them), so their fixed
+    // LOOKBACK priming already covers every edge they draw.
+    const renderStart = options.skipLongConnectors
+      ? lookbackStart
+      : Math.min(
+          lookbackStart,
+          deepestChildTargetingRange(buildIncomingEdgeIndex(rows), startIndex, endIndex),
+        );
     const renderEnd = Math.min(rows.length, endIndex + 5);
 
     // 1. Pass-through lanes, drawn as one path per unbroken run.
@@ -392,7 +474,13 @@ export class GraphRenderer {
           }
         }
       }
-      for (const run of scratchOpenRuns.values()) scratchRuns.push(run);
+      // Flush surviving runs and drain the map in the same pass: leaving
+      // entries here made releaseLaneScratch pool each of them twice, which
+      // aliased two lanes onto one recycled object on the next paint.
+      for (const [lane, run] of scratchOpenRuns) {
+        scratchRuns.push(run);
+        scratchOpenRuns.delete(lane);
+      }
 
       for (const run of scratchRuns) {
         const x = laneX(run.lane);
@@ -421,6 +509,11 @@ export class GraphRenderer {
             // (drawDanglingStubs), never here: baked into strip tiles the
             // translucent geometry would clip at every strip edge and show
             // alpha seams. See paintGraphFrame for the frame composition.
+            continue;
+          }
+          if (options.skipLongConnectors && isLongConnection(conn, LOOKBACK_ROWS)) {
+            // Owned by drawLongConnectors: baking a span longer than the
+            // primed lookback into a tile guarantees a mid-edge seam clip.
             continue;
           }
 
@@ -465,12 +558,7 @@ export class GraphRenderer {
 
       // Cutout so lanes passing behind the node do not touch it. Skipped in
       // emphasis-only mode: punching a hole here would erase the static layer.
-      if (!options.emphasisOnly) {
-        ctx.fillStyle = theme.background;
-        ctx.beginPath();
-        ctx.arc(x, y, r + 2.5, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      if (!options.emphasisOnly) this.paintNodeCutout(ctx, x, y, r, theme);
 
       if (isHovered && !isSelected && hoverStrength > 0) {
         const previousAlpha = ctx.globalAlpha ?? 1;
@@ -503,30 +591,23 @@ export class GraphRenderer {
 
       if (options.emphasisOnly) continue;
 
-      ctx.fillStyle = color;
-      ctx.strokeStyle = theme.nodeStroke;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-
-      // A merge is hollow and a root is ringed: two shapes a reader can tell
-      // apart at a glance, in either theme, without a legend.
-      if (row.is_merge) {
-        ctx.fillStyle = theme.background;
-        ctx.beginPath();
-        ctx.arc(x, y, Math.max(1.4, r * 0.42), 0, Math.PI * 2);
-        ctx.fill();
-      } else if (row.is_root) {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.arc(x, y, r + 2, 0, Math.PI * 2);
-        ctx.stroke();
+      this.paintNodeBodyAndMarks(ctx, row, x, y, color, theme);
+    }
+    // 4. Author avatars. A dedicated column right of the lanes: the caller
+    //    owns its X (it sizes the gutter), rows align by node Y, so authorship
+    //    stays attributable without ever colliding with dense lane traffic.
+    //    Static-layer only — emphasis passes must not stamp avatars over
+    //    blitted strips.
+    if (!options.emphasisOnly && options.showAvatars && options.avatarX !== null && options.avatarX !== undefined) {
+      const avatarX = options.avatarX;
+      if (Number.isFinite(avatarX)) {
+        for (let i = startIndex; i < renderEnd && i < rows.length; i++) {
+          const row = rows[i];
+          const y = calcY(i);
+          if (y < -rowHeight || y > viewportHeight + rowHeight) continue;
+          this.drawAuthorAvatar(ctx, avatarX, y, this.avatarStyle.radius, this.avatarStyle.fontPx, theme, row);
+        }
       }
-
-      ctx.lineWidth = lineWidth;
     }
   } finally {
     ctx.restore();
@@ -555,7 +636,7 @@ export class GraphRenderer {
     if (!rows || rows.length === 0) return;
     const { rowHeight } = this.config;
     const viewHeight = viewportHeight ?? this.canvasHeight(ctx);
-    const calcY = this.yForRow(startIndex, scrollOffset);
+    const calcY = this.yForRow(scrollOffset);
 
     ctx.save();
     ctx.lineWidth = this.config.lineWidth;
@@ -605,6 +686,241 @@ export class GraphRenderer {
     ctx.lineTo(xFrom, yFrom + rowHeight * DANGLING_STUB_RATIO);
     ctx.stroke();
     ctx.globalAlpha = previousAlpha;
+  }
+
+  /**
+   * One author avatar: a hue-coded disc carrying the author's initials, ringed
+   * so it separates from the background in either theme. Identity resolution
+   * (hash, hue, initials) is owned by authors/authorIdentity — the renderer
+   * only places pixels, so canvas avatars can never drift from their DOM
+   * counterparts.
+   */
+  private drawAuthorAvatar(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    radius: number,
+    fontPx: number,
+    theme: GraphTheme,
+    row: VisualCommitRow,
+  ): void {
+    const identity = authorIdentity(row.author_name, row.author_email);
+    ctx.save();
+    try {
+      // Ring first: keeps the disc legible over same-hue lane lines beneath.
+      ctx.strokeStyle = theme.nodeStroke;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 1.25, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = authorColor(identity.hue);
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (radius >= 5 && identity.initials) {
+        ctx.fillStyle = "#ffffff";
+        ctx.font = `700 ${fontPx}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(identity.initials, x, y + fontPx * 0.05);
+      }
+    } finally {
+      ctx.restore();
+    }
+  }
+
+  /** The background disc punched under a node so lanes do not touch it. */
+  private paintNodeCutout(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    r: number,
+    theme: GraphTheme,
+  ): void {
+    ctx.fillStyle = theme.background;
+    ctx.beginPath();
+    ctx.arc(x, y, r + 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  /**
+   * Node body and shape marks (hollow merge / ringed root), shared by the
+   * render loop and the long-connector repair pass so both produce
+   * pixel-identical nodes. Restores the configured line width on exit.
+   */
+  private paintNodeBodyAndMarks(
+    ctx: CanvasRenderingContext2D,
+    row: VisualCommitRow,
+    x: number,
+    y: number,
+    color: string,
+    theme: GraphTheme,
+  ): void {
+    const { nodeRadius, mergeNodeRadius, lineWidth } = this.config;
+    const r = row.is_merge ? mergeNodeRadius : nodeRadius;
+    ctx.fillStyle = color;
+    ctx.strokeStyle = theme.nodeStroke;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // A merge is hollow and a root is ringed: two shapes a reader can tell
+    // apart at a glance, in either theme, without a legend.
+    if (row.is_merge) {
+      ctx.fillStyle = theme.background;
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(1.4, r * 0.42), 0, Math.PI * 2);
+      ctx.fill();
+    } else if (row.is_root) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(x, y, r + 2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.lineWidth = lineWidth;
+  }
+
+  /**
+   * Draws the connectors the static strip cache does not own — every edge
+   * whose span exceeds {@link LOOKBACK_ROWS} and lands on a row in
+   * `[startIndex, endIndex)` — whole, regardless of how far above the window
+   * its child sits.
+   *
+   * Why these cannot live in the tiles: the tile showing an edge's parent
+   * would have to rasterize all the way back to the child, and a span longer
+   * than the primed lookback leaves the edge's middle drawn by NO tile — the
+   * floating line fragments at strip seams this pass exists to kill. The
+   * incoming-edge index makes enumeration exact and bounded by what is
+   * visible: O(edges touching the window) per frame, never O(history).
+   *
+   * Edges are stroked OVER the blitted strips, so afterwards every visible
+   * node the drawn geometry can touch gets its cutout and body re-stamped —
+   * the same under-lanes/over-nothing relationship nodes had inside the
+   * strips, restored per frame for just the affected rows.
+   */
+  public drawLongConnectors(
+    ctx: CanvasRenderingContext2D,
+    rows: VisualCommitRow[],
+    startIndex: number,
+    endIndex: number,
+    scrollOffset: number = 0,
+    viewportHeight?: number,
+    options?: RenderOptions,
+  ): void {
+    if (!rows || rows.length === 0) return;
+    const { rowHeight, laneWidth, originX, lineWidth } = this.config;
+    const theme = options?.theme ?? DEFAULT_THEME;
+    const viewHeight = viewportHeight ?? this.canvasHeight(ctx);
+    const calcY = this.yForRow(scrollOffset);
+    const laneX = (lane: number) => originX + lane * laneWidth;
+
+    const index = buildIncomingEdgeIndex(rows);
+    const lo = Math.max(0, startIndex);
+    const hi = Math.min(rows.length, Math.max(endIndex, startIndex));
+
+    // Visible target -> child rows reaching it, straight off the index; each
+    // child's matching connection is found by scanning its own (tiny) list.
+    type LongEdge = { j: number; t: number; xFrom: number; yFrom: number; xTo: number; yTo: number; colorIndex: number };
+    const edges: LongEdge[] = [];
+    for (let t = lo; t < hi; t++) {
+      for (let p = index.starts[t]; p < index.starts[t + 1]; p++) {
+        const j = index.children[p];
+        if (j >= t) continue;
+        const child = rows[j];
+        if (!child.connections) continue;
+        for (const conn of child.connections) {
+          if (conn.is_dangling) continue;
+          if (!isLongConnection(conn, LOOKBACK_ROWS)) continue;
+          if (j + conn.to_row_offset !== t) continue;
+          const yTo = calcY(t);
+          const yFrom = calcY(j);
+          if (
+            Math.max(yFrom, yTo) < -rowHeight ||
+            Math.min(yFrom, yTo) > viewHeight + rowHeight
+          ) {
+            continue;
+          }
+          edges.push({
+            j,
+            t,
+            xFrom: laneX(child.lane),
+            yFrom,
+            xTo: laneX(conn.to_lane),
+            yTo,
+            colorIndex: conn.color_index,
+          });
+        }
+      }
+    }
+    if (edges.length === 0) return;
+
+    ctx.save();
+    try {
+      ctx.lineWidth = lineWidth;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      for (const e of edges) {
+        ctx.strokeStyle = getBranchColor(e.colorIndex);
+        ctx.beginPath();
+        if (e.xFrom === e.xTo) {
+          ctx.moveTo(e.xFrom, e.yFrom);
+          ctx.lineTo(e.xTo, e.yTo);
+        } else {
+          // Corner ownership mirrors render(): a merged-in branch peels out
+          // just under its child; a closing lane stays straight until arrival.
+          const childRow = rows[e.j];
+          const isMergeConn = childRow.connections.some(
+            (c) =>
+              !c.is_dangling &&
+              isLongConnection(c, LOOKBACK_ROWS) &&
+              e.j + c.to_row_offset === e.t &&
+              c.is_merge,
+          );
+          if (isMergeConn) this.cornerAtStart(ctx, e.xFrom, e.yFrom, e.xTo, e.yTo);
+          else this.cornerAtEnd(ctx, e.xFrom, e.yFrom, e.xTo, e.yTo);
+        }
+        ctx.stroke();
+      }
+
+      // Re-stamp every visible node the drawn geometry could overlap:
+      // endpoints (the stroke starts and ends on their centres) and any node
+      // whose disc sits inside an edge's bounding box.
+      const { nodeRadius, mergeNodeRadius } = this.config;
+      const pad = Math.max(nodeRadius, mergeNodeRadius) + 2.5 + lineWidth;
+      const affected = new Set<number>();
+      for (const e of edges) {
+        const xMin = Math.min(e.xFrom, e.xTo) - pad;
+        const xMax = Math.max(e.xFrom, e.xTo) + pad;
+        const yMin = Math.min(e.yFrom, e.yTo) - pad;
+        const yMax = Math.max(e.yFrom, e.yTo) + pad;
+        for (let t = lo; t < hi; t++) {
+          if (t < e.j || t > e.t) continue;
+          const x = laneX(rows[t].lane);
+          const y = calcY(t);
+          if (x < xMin || x > xMax || y < yMin || y > yMax) continue;
+          affected.add(t);
+        }
+      }
+      const ordered = [...affected].sort((a, b) => a - b);
+      for (const t of ordered) {
+        const row = rows[t];
+        const x = laneX(row.lane);
+        const y = calcY(t);
+        if (y < -rowHeight || y > viewHeight + rowHeight) continue;
+        const r = row.is_merge ? mergeNodeRadius : nodeRadius;
+        this.paintNodeCutout(ctx, x, y, r, theme);
+        this.paintNodeBodyAndMarks(ctx, row, x, y, getBranchColor(row.color_index), theme);
+      }
+    } finally {
+      ctx.restore();
+    }
   }
 
   /** Corner just below the child: the edge peels out, then runs straight down. */

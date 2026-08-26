@@ -81,6 +81,9 @@ pub struct GitHubContext {
     pub repo: String,
     pub html_url: String,
     pub pull_requests: Vec<PullRequestInfo>,
+    /// True when more open pull requests exist than the display cap kept.
+    #[serde(default)]
+    pub prs_truncated: bool,
     pub issues: Vec<IssueInfo>,
     pub issues_truncated: bool,
     pub issues_error: Option<String>,
@@ -89,6 +92,9 @@ pub struct GitHubContext {
     /// while the rest of the context is still usable.
     #[serde(default)]
     pub runs_error: Option<String>,
+    /// True when more workflow runs exist than the display cap kept.
+    #[serde(default)]
+    pub runs_truncated: bool,
     #[serde(default)]
     pub releases: Vec<ReleaseInfo>,
     #[serde(default)]
@@ -147,30 +153,55 @@ pub struct DependabotReport {
     pub error: Option<String>,
 }
 
+/// Drops a trailing `.git` the way git itself does: case-insensitively
+/// (`Repo.GIT` and `repo.git` both clone into `repo`).
+fn trim_git_suffix(path: &str) -> &str {
+    if path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
+        &path[..path.len() - 4]
+    } else {
+        path
+    }
+}
+
 /// Parses GitHub / GHES clone URLs (HTTPS, SSH, git protocol).
+///
+/// Scheme matching is case-insensitive (Windows checkouts routinely carry
+/// `HTTPS://GITHUB.COM/...`), ports are stripped only where they are legal
+/// (`ssh://`/`git://`; a port on an https remote means it is *not* plain
+/// github.com and must not be trusted as such), and every surviving
+/// component must pass the argv/endpoint-safety rules below.
 pub fn parse_github_remote_url(url: &str) -> Option<GitHubRepoRef> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let without_git = trimmed.strip_prefix("git://").unwrap_or(trimmed);
-    let normalized = without_git.trim_end_matches('/').trim_end_matches(".git");
-
-    if let Some(rest) = normalized.strip_prefix("git@") {
+    // scp-like syntax: git@host:path — no scheme, no port slot (the first
+    // ':' already separates the path).
+    if let Some(rest) = trimmed.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
-        return split_owner_repo(host, path);
+        let path = trim_git_suffix(path.trim_end_matches('/'));
+        return split_owner_repo(&format!("{host}/{path}"), false);
     }
 
-    let rest = normalized
-        .strip_prefix("ssh://git@")
-        .or_else(|| normalized.strip_prefix("ssh://"))
-        .or_else(|| normalized.strip_prefix("https://"))
-        .or_else(|| normalized.strip_prefix("http://"))?;
-
-    let rest = rest.strip_prefix("git@").unwrap_or(rest);
-    let (host, path) = rest.split_once('/')?;
-    split_owner_repo(host, path)
+    // Scheme forms, matched on the lowercased prefix; ASCII lowercasing
+    // preserves byte offsets, so the original text is sliced at the same
+    // position to keep the host/path's case intact.
+    const SCHEMES: [(&str, bool); 4] = [
+        ("ssh://", true),
+        ("git://", true),
+        ("https://", false),
+        ("http://", false),
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    for (scheme, strip_port) in SCHEMES {
+        if lower.starts_with(scheme) {
+            let remainder = trim_git_suffix(trimmed[scheme.len()..].trim().trim_end_matches('/'));
+            let remainder = remainder.strip_prefix("git@").unwrap_or(remainder);
+            return split_owner_repo(remainder, strip_port);
+        }
+    }
+    None
 }
 
 /// Hard upper bound for each parsed remote component (host, owner, name).
@@ -182,24 +213,51 @@ const MAX_REMOTE_COMPONENT_LEN: usize = 100;
 /// A remote component is argv-safe and endpoint-safe: no leading `-` (it
 /// would be re-parsed as a flag by `gh`'s CLI — e.g. `--repo -inbox/x`),
 /// no whitespace or control characters (they would corrupt argv, endpoint
-/// paths, built URLs, and error messages alike), and bounded length.
-fn is_valid_remote_component(component: &str) -> bool {
+/// paths, built URLs, and error messages alike), no leftover `:` (a port or
+/// junk that survived where none is legal), and bounded length.
+fn is_valid_remote_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_REMOTE_COMPONENT_LEN
+        && !host.starts_with('-')
+        && !host.contains(':')
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Owner/name vocabulary: GitHub names are ASCII letters, digits, `.`, `_`
+/// and `-`. Anything else cannot appear in a real repository slug, while
+/// letting it through would let dot-segments (`..`) bend REST endpoint
+/// paths and built release/issue URLs away from the intended repo.
+fn is_valid_repo_component(component: &str) -> bool {
     !component.is_empty()
         && component.len() <= MAX_REMOTE_COMPONENT_LEN
         && !component.starts_with('-')
-        && !component
+        && !component.starts_with('.')
+        && component
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn split_owner_repo(host: &str, path: &str) -> Option<GitHubRepoRef> {
-    let host = host.split(':').next().unwrap_or(host).trim();
+/// Splits `host[:port]/owner/name` into a [`GitHubRepoRef`]. The port is
+/// dropped only when `strip_port` says this URL form may carry one and the
+/// suffix is all digits; anything else keeps its `:` and is refused by the
+/// host rules, so trust decisions and display always agree with what the
+/// user actually configured.
+fn split_owner_repo(host_and_path: &str, strip_port: bool) -> Option<GitHubRepoRef> {
+    let (raw_host, path) = host_and_path.split_once('/')?;
+    let mut host = raw_host.trim();
+    if strip_port {
+        if let Some((h, port)) = host.split_once(':') {
+            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                host = h.trim();
+            }
+        }
+    }
     let mut parts = path.split('/').filter(|p| !p.is_empty());
     let owner = parts.next()?;
     let name = parts.next()?;
-    if !(is_valid_remote_component(host)
-        && is_valid_remote_component(owner)
-        && is_valid_remote_component(name))
+    if !(is_valid_remote_host(host)
+        && is_valid_repo_component(owner)
+        && is_valid_repo_component(name))
     {
         return None;
     }
@@ -251,29 +309,48 @@ pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
     flags
 }
 
-pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, String> {
-    let repo = validate_repo(repo_path)?;
-    let stdout = git_text(&repo, &["remote", "-v"])?;
-    let mut first: Option<GitHubRepoRef> = None;
+/// Selects the trusted GitHub remote from `git remote -v` output.
+///
+/// Only **fetch** URLs are eligible. `remote -v` lists every remote twice —
+/// a fetch line and a push line, told apart by the trailing `(fetch)` /
+/// `(push)` marker — and the push URL is whatever the user (or a crafted
+/// `.git/config`) pointed it at: trusting it would aim every gh call
+/// (`--repo`, Dependabot endpoints, checkout, issue creation) at a
+/// repository the user never pulls from. Origin wins over other remotes;
+/// among the rest, the first listed fetch URL is used.
+pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
     let mut origin: Option<GitHubRepoRef> = None;
-    for line in stdout.lines() {
+    let mut first: Option<GitHubRepoRef> = None;
+    for line in remote_v_output.lines() {
         let mut parts = line.split_whitespace();
         let name = parts.next();
-        if let Some(url) = parts.next() {
-            if let Some(parsed) = parse_github_remote_url(url) {
-                if is_github_host(&parsed.host) {
-                    if name == Some("origin") {
-                        origin = Some(parsed);
-                        break;
-                    }
-                    if first.is_none() {
-                        first = Some(parsed);
-                    }
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        // The marker decides eligibility; its absence reads as a fetch line
+        // (every git release prints it, but be liberal about bare output).
+        if matches!(parts.next(), Some("(push)")) {
+            continue;
+        }
+        if let Some(parsed) = parse_github_remote_url(url) {
+            if is_github_host(&parsed.host) {
+                if name == Some("origin") {
+                    origin = Some(parsed);
+                    break;
+                }
+                if first.is_none() {
+                    first = Some(parsed);
                 }
             }
         }
     }
-    Ok(origin.or(first))
+    origin.or(first)
+}
+
+pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, String> {
+    let repo = validate_repo(repo_path)?;
+    let stdout = git_text(&repo, &["remote", "-v"])?;
+    Ok(pick_github_remote(&stdout))
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +369,31 @@ struct GhPullRequest {
     status_check_rollup: Option<serde_json::Value>,
 }
 
+/// GitHub's check/conclusion vocabulary that means the pipeline is broken.
+/// `TIMED_OUT`, `ACTION_REQUIRED`, `STARTUP_FAILURE` and `STALE` contain no
+/// "FAIL" substring yet are genuine failures; rendering them green used to
+/// tell the user a timed-out pipeline was healthy.
+fn check_state_is_failure(state: &str) -> bool {
+    matches!(
+        state,
+        "FAILURE"
+            | "ERROR"
+            | "CANCELLED"
+            | "TIMED_OUT"
+            | "ACTION_REQUIRED"
+            | "STARTUP_FAILURE"
+            | "STALE"
+    )
+}
+
+/// States that mean work is still in flight.
+fn check_state_is_pending(state: &str) -> bool {
+    matches!(
+        state,
+        "PENDING" | "IN_PROGRESS" | "QUEUED" | "EXPECTED" | "WAITING"
+    )
+}
+
 fn summarize_checks(value: &Option<serde_json::Value>) -> String {
     let Some(v) = value else {
         return "unknown".into();
@@ -305,6 +407,7 @@ fn summarize_checks(value: &Option<serde_json::Value>) -> String {
     }
     let mut pending = false;
     let mut failed = false;
+    let mut unknown = false;
     for check in &checks {
         let state = check
             .get("state")
@@ -313,21 +416,24 @@ fn summarize_checks(value: &Option<serde_json::Value>) -> String {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_ascii_uppercase();
-        if state.contains("FAIL") || state == "FAILURE" || state == "ERROR" || state == "CANCELLED"
-        {
+        if state.is_empty() {
+            // An entry with no readable state is a check we could not run
+            // our logic on — it must never count as a pass.
+            unknown = true;
+        } else if check_state_is_failure(&state) {
             failed = true;
-        } else if state == "PENDING"
-            || state == "IN_PROGRESS"
-            || state == "QUEUED"
-            || state == "EXPECTED"
-        {
+        } else if check_state_is_pending(&state) {
             pending = true;
         }
+        // SUCCESS / NEUTRAL / SKIPPED / COMPLETED fall through as passing:
+        // a rollup of only those genuinely has nothing red or in flight.
     }
     if failed {
         "failure".into()
     } else if pending {
         "pending".into()
+    } else if unknown {
+        "unknown".into()
     } else {
         "success".into()
     }
@@ -339,6 +445,19 @@ fn gh_argv(remote: &GitHubRepoRef, leading: &[&str]) -> Vec<String> {
     args
 }
 
+/// Upper bound for error text surfaced from a `gh` invocation (stderr,
+/// API messages). The engine's drain caps already bound these at megabytes;
+/// this keeps what flows into reports, warnings, and the UI at display size.
+pub(crate) const MAX_GH_ERROR_BYTES: usize = 4 * 1024;
+
+/// Keeps the tail of an oversized error message, cut on a char boundary.
+fn bounded_error(message: String) -> String {
+    if message.len() <= MAX_GH_ERROR_BYTES {
+        return message;
+    }
+    crate::engine::git_cli::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
+}
+
 fn run_gh(
     remote: &GitHubRepoRef,
     leading: &[&str],
@@ -347,7 +466,7 @@ fn run_gh(
 ) -> Result<Vec<u8>, String> {
     let args = gh_argv(remote, leading);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_in("gh", &refs, timeout, cwd)
+    run_command_in("gh", &refs, timeout, cwd).map_err(bounded_error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,6 +533,30 @@ fn parse_issue_list(stdout: &[u8], display_limit: usize) -> Result<(Vec<IssueInf
     Ok((issues, truncated))
 }
 
+/// Display cap for the open-PR list. One extra row is fetched so a capped
+/// result is flagged instead of silently looking complete.
+const PR_DISPLAY_LIMIT: usize = 50;
+
+fn list_pull_requests(remote: &GitHubRepoRef) -> Result<(Vec<PullRequestInfo>, bool), String> {
+    let fetch_limit = (PR_DISPLAY_LIMIT + 1).to_string();
+    let stdout = run_gh(
+        remote,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &fetch_limit,
+            "--json",
+            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup",
+        ],
+        Duration::from_secs(45),
+        None,
+    )?;
+    parse_pr_list(&stdout, PR_DISPLAY_LIMIT)
+}
+
 #[derive(Debug, Deserialize)]
 struct GhWorkflowRun {
     #[serde(rename = "databaseId")]
@@ -425,6 +568,7 @@ struct GhWorkflowRun {
     conclusion: Option<String>,
     #[serde(rename = "headBranch")]
     head_branch: Option<String>,
+    #[serde(default)]
     url: String,
     #[serde(rename = "createdAt")]
     created_at: Option<String>,
@@ -432,27 +576,37 @@ struct GhWorkflowRun {
     display_title: Option<String>,
 }
 
-fn list_workflow_runs(remote: &GitHubRepoRef) -> Result<Vec<WorkflowRunInfo>, String> {
+/// Display cap for the recent workflow-run list; one extra row is fetched so
+/// capping is reported, matching every other section's convention.
+const RUN_DISPLAY_LIMIT: usize = 20;
+
+fn list_workflow_runs(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowRunInfo>, bool), String> {
+    let fetch_limit = (RUN_DISPLAY_LIMIT + 1).to_string();
     let stdout = run_gh(
         remote,
         &[
             "run",
             "list",
             "--limit",
-            "20",
+            &fetch_limit,
             "--json",
             "databaseId,name,status,conclusion,headBranch,url,createdAt,displayTitle",
         ],
         Duration::from_secs(45),
         None,
     )?;
-    parse_workflow_runs(&stdout)
+    parse_workflow_runs(&stdout, RUN_DISPLAY_LIMIT)
 }
 
-fn parse_pr_list(stdout: &[u8]) -> Result<Vec<PullRequestInfo>, String> {
-    let prs: Vec<GhPullRequest> = serde_json::from_slice(stdout)
+fn parse_pr_list(
+    stdout: &[u8],
+    display_limit: usize,
+) -> Result<(Vec<PullRequestInfo>, bool), String> {
+    let mut prs: Vec<GhPullRequest> = serde_json::from_slice(stdout)
         .map_err(|e| format!("could not parse gh pull-request output: {e}"))?;
-    Ok(prs
+    let truncated = prs.len() > display_limit;
+    prs.truncate(display_limit);
+    let prs = prs
         .into_iter()
         .map(|pr| PullRequestInfo {
             number: pr.number,
@@ -464,13 +618,19 @@ fn parse_pr_list(stdout: &[u8]) -> Result<Vec<PullRequestInfo>, String> {
             is_draft: pr.is_draft,
             ci_status: summarize_checks(&pr.status_check_rollup),
         })
-        .collect())
+        .collect();
+    Ok((prs, truncated))
 }
 
-fn parse_workflow_runs(stdout: &[u8]) -> Result<Vec<WorkflowRunInfo>, String> {
-    let runs: Vec<GhWorkflowRun> = serde_json::from_slice(stdout)
+fn parse_workflow_runs(
+    stdout: &[u8],
+    display_limit: usize,
+) -> Result<(Vec<WorkflowRunInfo>, bool), String> {
+    let mut runs: Vec<GhWorkflowRun> = serde_json::from_slice(stdout)
         .map_err(|e| format!("could not parse gh workflow-run output: {e}"))?;
-    Ok(runs
+    let truncated = runs.len() > display_limit;
+    runs.truncate(display_limit);
+    let runs = runs
         .into_iter()
         .map(|run| WorkflowRunInfo {
             id: run.database_id,
@@ -482,7 +642,8 @@ fn parse_workflow_runs(stdout: &[u8]) -> Result<Vec<WorkflowRunInfo>, String> {
             url: run.url,
             created_at: run.created_at.unwrap_or_default(),
         })
-        .collect())
+        .collect();
+    Ok((runs, truncated))
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +696,23 @@ fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), Str
     parse_release_list(&stdout, &remote.html_url(), RELEASE_DISPLAY_LIMIT)
 }
 
+/// Percent-encodes every byte outside a URL-safe tag vocabulary so a
+/// repo-controlled tag name (`v1..<script>`, spaces, `#`) can only ever
+/// produce a well-formed link, never a mangled or misparsed one. `/` is
+/// kept verbatim: slash-bearing tags are real and encode to themselves.
+fn percent_encode_tag(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    for byte in tag.bytes() {
+        let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/');
+        if safe {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn parse_release_list(
     stdout: &[u8],
     base_html_url: &str,
@@ -550,7 +728,11 @@ fn parse_release_list(
             let url = if let Some(u) = rel.url.filter(|s| !s.trim().is_empty()) {
                 u
             } else if !rel.tag_name.trim().is_empty() {
-                format!("{}/releases/tag/{}", base_html_url, rel.tag_name.trim())
+                format!(
+                    "{}/releases/tag/{}",
+                    base_html_url,
+                    percent_encode_tag(rel.tag_name.trim())
+                )
             } else {
                 format!("{}/releases", base_html_url)
             };
@@ -667,7 +849,8 @@ fn capture_gh_api(remote: &GitHubRepoRef, endpoint: &str) -> Result<CapturedOutp
 /// Shapes a failing `gh api` invocation into its most useful message: the
 /// API's JSON `message` body says *why* Dependabot data is unavailable
 /// (missing permission, alerts disabled), while gh's stderr often only names
-/// the HTTP status.
+/// the HTTP status. Both channels are tail-capped so a chatty failure cannot
+/// ship megabytes of stderr into a report.
 fn gh_api_error_message(output: &CapturedOutput) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(output.stdout_text().trim()) {
         if let Some(message) = value.get("message").and_then(Value::as_str) {
@@ -676,7 +859,7 @@ fn gh_api_error_message(output: &CapturedOutput) -> String {
             }
         }
     }
-    let stderr = output.stderr_text();
+    let stderr = bounded_error(output.stderr_text());
     if stderr.is_empty() {
         format!("gh exited {}", output.status_code)
     } else {
@@ -699,9 +882,12 @@ fn parse_dependabot_alerts(
     // hide a critical advisory behind a run of lows. The fetched window is
     // already bounded server-side by the per_page limit.
     let mut alerts: Vec<DependabotAlertInfo> = rows.iter().map(alert_from_json).collect();
+    // GitHub publishes severities lowercase, but rank case-insensitively so a
+    // capitalized or future-vocabulary value still sorts by its real tier
+    // instead of landing in the unknown bucket that capping drops first.
     alerts.sort_by(|a, b| {
-        severity_rank(&a.severity)
-            .cmp(&severity_rank(&b.severity))
+        severity_rank(&a.severity.to_ascii_lowercase())
+            .cmp(&severity_rank(&b.severity.to_ascii_lowercase()))
             .then_with(|| a.number.cmp(&b.number))
     });
     alerts.truncate(display_limit);
@@ -760,25 +946,48 @@ fn alert_from_json(row: &Value) -> DependabotAlertInfo {
     }
 }
 
-pub fn checkout_pull_request(repo_path: &str, number: u64) -> Result<String, String> {
+/// The exact argv [`checkout_pull_request`] runs, program name included —
+/// the single source both the command gate and the executor render from.
+pub fn pr_checkout_argv(remote: &GitHubRepoRef, number: u64) -> Result<Vec<String>, String> {
+    // Validate before the gate so a fabricated number is refused without a
+    // judged line that could never execute.
     if number == 0 {
         return Err("Invalid pull request number".into());
     }
+    let mut args = vec![
+        "gh".to_string(),
+        "pr".to_string(),
+        "checkout".to_string(),
+        number.to_string(),
+    ];
+    args.extend(gh_repo_flags(remote));
+    Ok(args)
+}
+
+pub fn checkout_pull_request(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    number: u64,
+) -> Result<String, String> {
     let repo = validate_repo(repo_path)?;
-    let remote = discover_github_remote(repo_path)?
-        .ok_or_else(|| "No GitHub remote configured".to_string())?;
     if !gh_cli_present() {
         return Err("GitHub CLI (`gh`) is not installed or not on PATH".into());
     }
-    let n = number.to_string();
-    let stdout = run_gh(
-        &remote,
-        &["pr", "checkout", &n],
-        Duration::from_secs(90),
-        Some(&repo),
-    )?;
+    let args = pr_checkout_argv(remote, number)?;
+    let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let stdout =
+        run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)).map_err(bounded_error)?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
+
+/// Unicode bidirectional-override characters: in a title or label they can
+/// visually reorder rendered text around them, so `#12 fixed` can read as
+/// something it is not. Bodies keep them (quoting bidi text is legitimate
+/// when reporting i18n bugs) — titles and labels are identifiers.
+const BIDI_OVERRIDE_CHARS: &[char] = &[
+    '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+    '\u{2069}',
+];
 
 pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Result<(), String> {
     let title = title.trim();
@@ -788,8 +997,28 @@ pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Res
     if title.chars().count() > 256 {
         return Err("Issue title exceeds the 256 character limit".into());
     }
+    if title.chars().any(|c| c.is_control()) {
+        return Err("Issue title must not contain control characters".into());
+    }
+    if let Some(bidi) = title.chars().find(|c| BIDI_OVERRIDE_CHARS.contains(c)) {
+        return Err(format!(
+            "Issue title must not contain the bidirectional override U+{:04X}",
+            bidi as u32
+        ));
+    }
     if body.len() > 64 * 1024 {
         return Err("Issue body exceeds the 64 KiB limit".into());
+    }
+    // Newlines and tabs shape markdown; every other control character
+    // (NUL included) corrupts argv or rendering and has no legitimate use.
+    if let Some(ctrl) = body
+        .chars()
+        .find(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(format!(
+            "Issue body must not contain control characters (found U+{:04X})",
+            ctrl as u32
+        ));
     }
     if labels.len() > 10 {
         return Err("At most 10 issue labels may be supplied".into());
@@ -807,28 +1036,31 @@ pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Res
         if label.starts_with('-') {
             return Err(format!("Issue label '{label}' must not start with '-'"));
         }
-        if label.chars().count() > 128 || label.contains(['\n', '\r', '\0']) {
-            return Err("Issue label is invalid or exceeds 128 characters".into());
+        if label.chars().count() > 128 {
+            return Err("Issue label exceeds the 128 character limit".into());
+        }
+        if label
+            .chars()
+            .any(|c| c.is_control() || BIDI_OVERRIDE_CHARS.contains(&c))
+        {
+            return Err(format!(
+                "Issue label '{label}' must not contain control or bidirectional override characters"
+            ));
         }
     }
     Ok(())
 }
 
-pub fn create_issue(
-    repo_path: &str,
+/// The exact argv [`create_issue`] runs, program name included — the single
+/// source both the command gate and the executor render from.
+pub fn issue_create_argv(
+    remote: &GitHubRepoRef,
     title: &str,
     body: &str,
     labels: &[String],
-) -> Result<String, String> {
-    validate_issue_payload(title, body, labels)?;
-    let repo = validate_repo(repo_path)?;
-    let remote = discover_github_remote(repo_path)?
-        .ok_or_else(|| "No GitHub remote configured".to_string())?;
-    if !gh_cli_present() {
-        return Err("GitHub CLI (`gh`) is not installed or not on PATH".into());
-    }
-
+) -> Vec<String> {
     let mut args = vec![
+        "gh".to_string(),
         "issue".to_string(),
         "create".to_string(),
         "--title".to_string(),
@@ -844,8 +1076,27 @@ pub fn create_issue(
         args.push("--label".to_string());
         args.push(label.to_string());
     }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let stdout = run_gh(&remote, &refs, Duration::from_secs(90), Some(&repo))?;
+    args.extend(gh_repo_flags(remote));
+    args
+}
+
+pub fn create_issue(
+    repo_path: &str,
+    remote: &GitHubRepoRef,
+    title: &str,
+    body: &str,
+    labels: &[String],
+) -> Result<String, String> {
+    validate_issue_payload(title, body, labels)?;
+    let repo = validate_repo(repo_path)?;
+    if !gh_cli_present() {
+        return Err("GitHub CLI (`gh`) is not installed or not on PATH".into());
+    }
+
+    let args = issue_create_argv(remote, title, body, labels);
+    let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let stdout =
+        run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)).map_err(bounded_error)?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -862,11 +1113,13 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 repo: String::new(),
                 html_url: String::new(),
                 pull_requests: Vec::new(),
+                prs_truncated: false,
                 issues: Vec::new(),
                 issues_truncated: false,
                 runs_error: None,
                 issues_error: None,
                 workflow_runs: Vec::new(),
+                runs_truncated: false,
                 releases: Vec::new(),
                 releases_truncated: false,
                 releases_error: None,
@@ -883,11 +1136,13 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 repo: String::new(),
                 html_url: String::new(),
                 pull_requests: Vec::new(),
+                prs_truncated: false,
                 issues: Vec::new(),
                 issues_truncated: false,
                 runs_error: None,
                 issues_error: None,
                 workflow_runs: Vec::new(),
+                runs_truncated: false,
                 releases: Vec::new(),
                 releases_truncated: false,
                 releases_error: None,
@@ -906,11 +1161,13 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             repo: remote.name.clone(),
             html_url: remote.html_url(),
             pull_requests: Vec::new(),
+            prs_truncated: false,
             issues: Vec::new(),
             issues_truncated: false,
             runs_error: None,
             issues_error: None,
             workflow_runs: Vec::new(),
+            runs_truncated: false,
             releases: Vec::new(),
             releases_truncated: false,
             releases_error: None,
@@ -924,7 +1181,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         (issues, issues_truncated, issues_error),
         (releases, releases_truncated, releases_error),
         pr_outcome,
-        (workflow_runs, runs_error),
+        run_outcome,
     ) = std::thread::scope(|s| {
         let issues_handle = s.spawn(|| match list_issues(&remote) {
             Ok((issues, truncated)) => (issues, truncated, None),
@@ -934,27 +1191,8 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
             Ok((releases, truncated)) => (releases, truncated, None),
             Err(error) => (Vec::new(), false, Some(error)),
         });
-        let pr_handle = s.spawn(|| {
-            run_gh(
-                &remote,
-                &[
-                    "pr",
-                    "list",
-                    "--state",
-                    "open",
-                    "--limit",
-                    "50",
-                    "--json",
-                    "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup",
-                ],
-                Duration::from_secs(45),
-                None,
-            )
-        });
-        let runs_handle = s.spawn(|| match list_workflow_runs(&remote) {
-            Ok(runs) => (runs, None),
-            Err(e) => (Vec::new(), Some(e)),
-        });
+        let pr_handle = s.spawn(|| list_pull_requests(&remote));
+        let runs_handle = s.spawn(|| list_workflow_runs(&remote));
 
         (
             issues_handle
@@ -968,74 +1206,82 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 .unwrap_or_else(|_| Err("thread panic".into())),
             runs_handle
                 .join()
-                .unwrap_or_else(|_| (Vec::new(), Some("thread panic".into()))),
+                .unwrap_or_else(|_| Err("thread panic".into())),
         )
     });
 
+    // Degrade each section independently: a fetch/parse failure keeps the
+    // repository facts and carries its reason in both the structured field
+    // and `warnings`, never masquerading as an empty-but-complete list.
+    let (pull_requests, prs_truncated, pr_error) = match pr_outcome {
+        Ok((prs, truncated)) => (prs, truncated, None),
+        Err(e) => (Vec::new(), false, Some(e)),
+    };
+    let (workflow_runs, runs_truncated, runs_error) = match run_outcome {
+        Ok((runs, truncated)) => (runs, truncated, None),
+        Err(e) => (Vec::new(), false, Some(e)),
+    };
+
+    // When every listing failed together — the classic expired-token or
+    // rate-limit signature — "four empty sections plus warnings" would
+    // understate the situation: report the context itself as unavailable.
+    let every_section_failed = pr_error.is_some()
+        && issues_error.is_some()
+        && releases_error.is_some()
+        && runs_error.is_some();
+
     let mut warnings: Vec<String> = Vec::new();
-    if let Some(ref issue_error) = issues_error {
-        warnings.push(format!("Issue listing failed: {issue_error}"));
-    }
-    if let Some(ref release_error) = releases_error {
-        warnings.push(format!("Release listing failed: {release_error}"));
-    }
-    if let Some(ref run_error) = runs_error {
-        warnings.push(format!("Workflow run listing failed: {run_error}"));
+    if !every_section_failed {
+        if let Some(ref pr_err) = pr_error {
+            warnings.push(format!(
+                "Pull request listing failed: {pr_err}. The list may be incomplete."
+            ));
+        }
+        if let Some(ref issue_error) = issues_error {
+            warnings.push(format!("Issue listing failed: {issue_error}"));
+        }
+        if let Some(ref release_error) = releases_error {
+            warnings.push(format!("Release listing failed: {release_error}"));
+        }
+        if let Some(ref run_error) = runs_error {
+            warnings.push(format!("Workflow run listing failed: {run_error}"));
+        }
     }
 
-    match pr_outcome {
-        Ok(stdout) => {
-            // A parse failure no longer poisons the whole context: the
-            // repository facts are still real, so degrade the PR section and
-            // carry the reason in `warnings` where the UI can show it.
-            let pull_requests = match parse_pr_list(&stdout) {
-                Ok(prs) => prs,
-                Err(e) => {
-                    warnings.push(format!(
-                        "Pull request listing failed: {e}. The list may be incomplete."
-                    ));
-                    Vec::new()
-                }
-            };
-            GitHubContext {
-                available: true,
-                cli_present: true,
-                host: remote.host,
-                owner: remote.owner,
-                repo: remote.name,
-                html_url,
-                pull_requests,
-                issues,
-                issues_truncated,
-                issues_error,
-                workflow_runs,
-                runs_error,
-                releases,
-                releases_truncated,
-                releases_error,
-                error: None,
-                warnings,
-            }
-        }
-        Err(e) => GitHubContext {
-            available: false,
-            cli_present: true,
-            host: remote.host,
-            owner: remote.owner,
-            repo: remote.name,
-            html_url,
-            pull_requests: Vec::new(),
-            issues,
-            issues_truncated,
-            issues_error,
-            workflow_runs: Vec::new(),
-            runs_error: None,
-            releases,
-            releases_truncated,
-            releases_error,
-            error: Some(e),
-            warnings,
-        },
+    let (available, error) = if every_section_failed {
+        (
+            false,
+            Some(
+                pr_error
+                    .clone()
+                    .or_else(|| issues_error.clone())
+                    .unwrap_or_else(|| "GitHub queries failed".into()),
+            ),
+        )
+    } else {
+        (true, None)
+    };
+
+    GitHubContext {
+        available,
+        cli_present: true,
+        host: remote.host,
+        owner: remote.owner,
+        repo: remote.name,
+        html_url,
+        pull_requests,
+        prs_truncated,
+        issues,
+        issues_truncated,
+        issues_error,
+        workflow_runs,
+        runs_error,
+        runs_truncated,
+        releases,
+        releases_truncated,
+        releases_error,
+        error,
+        warnings,
     }
 }
 
@@ -1055,12 +1301,12 @@ mod tests {
             b"{\"unexpected\":true}",
         ] {
             assert!(
-                parse_pr_list(garbage).is_err(),
+                parse_pr_list(garbage, PR_DISPLAY_LIMIT).is_err(),
                 "pr parse must fail loudly on {:?}",
                 String::from_utf8_lossy(garbage)
             );
             assert!(
-                parse_workflow_runs(garbage).is_err(),
+                parse_workflow_runs(garbage, RUN_DISPLAY_LIMIT).is_err(),
                 "run parse must fail loudly on {:?}",
                 String::from_utf8_lossy(garbage)
             );
@@ -1069,26 +1315,58 @@ mod tests {
 
     #[test]
     fn valid_gh_output_maps_into_context_types() {
-        let prs = parse_pr_list(
+        let (prs, prs_truncated) = parse_pr_list(
             br#"[{"number":7,"title":"Fix it","state":"OPEN","headRefName":"f",
                  "baseRefName":"main","url":"https://x/7","isDraft":true,
                  "statusCheckRollup":null}]"#,
+            PR_DISPLAY_LIMIT,
         )
         .unwrap();
+        assert!(!prs_truncated);
         let pr = prs.first().expect("one pr");
         assert_eq!(pr.number, 7);
         assert!(pr.is_draft);
         assert_eq!(pr.ci_status, "unknown");
 
-        let runs = parse_workflow_runs(
+        let (runs, runs_truncated) = parse_workflow_runs(
             br#"[{"databaseId":42,"name":"ci","status":"completed",
                   "conclusion":"success","headBranch":"main","url":"https://x/42",
                   "createdAt":"2026-01-01","displayTitle":"build"}]"#,
+            RUN_DISPLAY_LIMIT,
         )
         .unwrap();
+        assert!(!runs_truncated);
         let run = runs.first().expect("one run");
         assert_eq!(run.id, 42);
         assert_eq!(run.title, "build");
+    }
+
+    /// Regression: the PR and workflow-run sections fetch LIMIT+1 rows and
+    /// report capping like issues/releases/workflows/alerts always did; a
+    /// capped list must never silently pose as complete.
+    #[test]
+    fn pr_and_run_lists_flag_capping_instead_of_hiding_it() {
+        let prs_json: Vec<serde_json::Value> = (1..=4)
+            .map(|n| {
+                serde_json::json!({
+                    "number": n, "title": format!("PR {n}"), "state": "OPEN",
+                    "headRefName": format!("f{n}"), "baseRefName": "main",
+                    "url": "", "isDraft": false, "statusCheckRollup": null
+                })
+            })
+            .collect();
+        let text = serde_json::to_vec(&prs_json).unwrap();
+        let (prs, truncated) = parse_pr_list(&text, 3).unwrap();
+        assert!(truncated);
+        assert_eq!(prs.len(), 3);
+
+        let runs_json: Vec<serde_json::Value> = (1..=3)
+            .map(|n| serde_json::json!({ "databaseId": n }))
+            .collect();
+        let text = serde_json::to_vec(&runs_json).unwrap();
+        let (runs, truncated) = parse_workflow_runs(&text, 2).unwrap();
+        assert!(truncated);
+        assert_eq!(runs.len(), 2);
     }
 
     #[test]
@@ -1166,13 +1444,122 @@ mod tests {
         }
     }
 
+    /// Regression: git-protocol remotes used to fall through every scheme
+    /// strip and vanish; uppercase schemes (common on Windows checkouts)
+    /// were never recognized at all.
+    #[test]
+    fn git_protocol_and_uppercase_schemes_parse() {
+        let parsed = parse_github_remote_url("git://github.com/acme/repo.git").unwrap();
+        assert_eq!(parsed.slug(), "acme/repo");
+        assert_eq!(parsed.host, "github.com");
+
+        let upper = parse_github_remote_url("HTTPS://GITHUB.COM/Acme/Repo.Git").unwrap();
+        assert_eq!(upper.owner, "Acme");
+        assert_eq!(upper.name, "Repo");
+        // Host trust matching is case-insensitive downstream.
+        assert!(is_github_host(&upper.host));
+
+        let ssh_upper = parse_github_remote_url("SSH://git@github.com/acme/repo").unwrap();
+        assert_eq!(ssh_upper.slug(), "acme/repo");
+    }
+
+    /// Regression: a port on an https remote means it is NOT plain
+    /// github.com; stripping it before the trust decision let a same-named
+    /// service on a nonstandard port pass as github.com while display and
+    /// endpoint disagreed with what was configured.
+    #[test]
+    fn web_scheme_ports_are_never_stripped_or_trusted() {
+        assert!(parse_github_remote_url("https://github.com:8443/acme/repo.git").is_none());
+        assert!(parse_github_remote_url("http://github.com:8080/acme/repo").is_none());
+        assert!(parse_github_remote_url("https://acme.ghe.com:9000/o/r").is_none());
+        // ssh forms legitimately carry ports and keep working.
+        let ssh = parse_github_remote_url("ssh://git@github.com:22/acme/repo.git").unwrap();
+        assert_eq!(ssh.host, "github.com");
+        let ghes = parse_github_remote_url("ssh://git@ghe.acme.corp:2222/o/r").unwrap();
+        assert_eq!(ghes.host, "ghe.acme.corp");
+        // Non-numeric junk after ':' is refused everywhere.
+        assert!(parse_github_remote_url("ssh://git@github.com:junk/acme/repo").is_none());
+    }
+
+    /// Dot-segments in owner/name would bend REST endpoint paths
+    /// (`repos/../etc/...`) and built URLs away from the intended repo.
+    #[test]
+    fn dot_segment_components_are_refused() {
+        for url in [
+            "https://github.com/../etc/passwd",
+            "https://github.com/./repo",
+            "https://github.com/acme/.gitignore",
+            "https://github.com/.hidden/repo",
+            "git@github.com:../upstream.git",
+        ] {
+            assert!(
+                parse_github_remote_url(url).is_none(),
+                "dot-shaped remote {url} must not parse"
+            );
+        }
+    }
+
+    /// Release URLs are rebuilt from repo-controlled tag names; unsafe bytes
+    /// must be percent-encoded so a crafted tag cannot mangle the link.
+    #[test]
+    fn release_tag_urls_are_percent_encoded() {
+        let json =
+            br#"[{"tagName":"v1..<script>","name":"x"},{"tagName":"v1.2+build~rc/a","name":"y"}]"#;
+        let (releases, _) = parse_release_list(json, "https://github.com/acme/repo", 50).unwrap();
+        assert_eq!(
+            releases[0].url,
+            "https://github.com/acme/repo/releases/tag/v1..%3Cscript%3E"
+        );
+        assert_eq!(
+            releases[1].url,
+            "https://github.com/acme/repo/releases/tag/v1.2%2Bbuild~rc/a"
+        );
+    }
+
     /// The empty host that used to be special-cased is covered by the
     /// component rule, and so is an owner-less or name-less path.
     #[test]
     fn degenerate_remote_shapes_stay_refused() {
-        assert!(split_owner_repo("", "a/b").is_none());
-        assert!(split_owner_repo("github.com", "").is_none());
-        assert!(split_owner_repo("github.com", "only-owner").is_none());
+        assert!(split_owner_repo("/a/b", false).is_none());
+        assert!(split_owner_repo("github.com/", false).is_none());
+        assert!(split_owner_repo("github.com/only-owner", false).is_none());
+    }
+
+    /// Regression: `git remote -v` lists every remote twice — fetch and push
+    /// lines. The push URL is an attacker-chosen redirect target; trusting it
+    /// aimed every gh call (`--repo`, Dependabot endpoints, checkout) at a
+    /// repository the user never pulls from.
+    #[test]
+    fn push_urls_are_never_selected_as_the_github_remote() {
+        // Fetch is GitLab, push is GitHub: the push line must not win.
+        let mixed = "origin\thttps://gitlab.com/victim/real.git (fetch)\n\
+                     origin\tgit@github.com:attacker/copy.git (push)\n";
+        assert!(pick_github_remote(mixed).is_none());
+
+        // Fetch is GitHub, push points elsewhere: the fetch line wins.
+        let normal = "origin\tgit@github.com:acme/repo.git (fetch)\n\
+                      origin\thttps://gitlab.com/mirror/repo.git (push)\n";
+        let picked = pick_github_remote(normal).expect("fetch url selected");
+        assert_eq!(picked.slug(), "acme/repo");
+
+        // A GitHub push URL with no GitHub fetch anywhere stays untrusted.
+        let push_only = "upstream\thttps://gitlab.com/x/y.git (fetch)\n\
+                         upstream\tgit@github.com:evil/pwned.git (push)\n\
+                         origin\thttps://gitlab.com/x/y.git (fetch)\n\
+                         origin\thttps://gitlab.com/x/y.git (push)\n";
+        assert!(pick_github_remote(push_only).is_none());
+
+        // Origin preference among multiple GitHub remotes still holds.
+        let two = "upstream\thttps://github.com/a/up.git (fetch)\n\
+                   upstream\thttps://github.com/a/up.git (push)\n\
+                   origin\thttps://github.com/b/origin-repo.git (fetch)\n\
+                   origin\thttps://github.com/b/origin-repo.git (push)\n";
+        assert_eq!(pick_github_remote(two).unwrap().slug(), "b/origin-repo");
+
+        // Degenerate lines are skipped, not fatal.
+        let messy = "\nnot-a-remote-line\n\n\
+                     origin\tgit@github.com:o/r.git (fetch)\n";
+        assert_eq!(pick_github_remote(messy).unwrap().slug(), "o/r");
     }
 
     #[test]
@@ -1191,6 +1578,42 @@ mod tests {
         let ok = Some(serde_json::json!([{"state": "SUCCESS"}]));
         assert_eq!(summarize_checks(&ok), "success");
         assert_eq!(summarize_checks(&None), "unknown");
+    }
+
+    /// Regression: GitHub conclusions that carry no "FAIL" substring —
+    /// TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE, STALE — used to fall
+    /// through to "success", painting a broken pipeline green.
+    #[test]
+    fn non_success_conclusions_never_render_as_green() {
+        for conclusion in [
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
+            "FAILURE",
+            "ERROR",
+            "CANCELLED",
+        ] {
+            let rollup = Some(serde_json::json!([
+                {"state": "SUCCESS"},
+                {"conclusion": conclusion}
+            ]));
+            assert_eq!(
+                summarize_checks(&rollup),
+                "failure",
+                "conclusion {conclusion} must not read as success"
+            );
+        }
+        // `waiting` (deployment-protection gates) is in-flight, not done.
+        let waiting = Some(serde_json::json!([{"state": "WAITING"}]));
+        assert_eq!(summarize_checks(&waiting), "pending");
+        // An entry with no readable state is unknown, never a pass.
+        let opaque = Some(serde_json::json!([{"unrelated": true}]));
+        assert_eq!(summarize_checks(&opaque), "unknown");
+        let mixed = Some(serde_json::json!([
+            {"conclusion": "SUCCESS"}, {"weird": 1}
+        ]));
+        assert_eq!(summarize_checks(&mixed), "unknown");
     }
 
     #[test]
@@ -1247,8 +1670,18 @@ mod tests {
 
     #[test]
     fn test_checkout_pull_request_rejects_zero() {
-        let err = checkout_pull_request("/tmp", 0).unwrap_err();
+        let remote = GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "gitpulse".into(),
+        };
+        // The builder refuses a fabricated number before any external work.
+        let err = pr_checkout_argv(&remote, 0).unwrap_err();
         assert!(err.to_lowercase().contains("invalid"));
+        assert_eq!(
+            pr_checkout_argv(&remote, 7).unwrap(),
+            vec!["gh", "pr", "checkout", "7", "--repo", "acme/gitpulse"]
+        );
     }
 
     /// The matcher must trust exactly github.com, *.github.com and *.ghe.com.
@@ -1273,9 +1706,86 @@ mod tests {
 
     #[test]
     fn test_create_issue_rejects_invalid_payload_before_external_work() {
-        assert!(create_issue("/tmp", " ", "body", &[]).is_err());
-        assert!(create_issue("/tmp", &"x".repeat(257), "body", &[]).is_err());
-        assert!(create_issue("/tmp", "title", &"x".repeat(65 * 1024), &[]).is_err());
+        assert!(validate_issue_payload(" ", "body", &[]).is_err());
+        assert!(validate_issue_payload(&"x".repeat(257), "body", &[]).is_err());
+        assert!(validate_issue_payload("title", &"x".repeat(65 * 1024), &[]).is_err());
+    }
+
+    /// Regression: control and bidirectional-override characters used to
+    /// pass validation into `--title`/`--label` argv, GitHub's stored issue,
+    /// and every list that renders it — letting a title visually reorder
+    /// the text around it.
+    #[test]
+    fn hostile_title_and_label_characters_are_refused() {
+        // Control characters in the title.
+        assert!(validate_issue_payload("\u{7}bell", "body", &[]).is_err());
+        assert!(validate_issue_payload("title\u{0}", "body", &[]).is_err());
+        // Bidi overrides in the title (spoofing: "fixed" rendered reordered).
+        assert!(validate_issue_payload("\u{202E}eltit", "body", &[]).is_err());
+        assert!(validate_issue_payload("title \u{2066}x", "body", &[]).is_err());
+        // Labels: every control character (tab included) is refused, NUL
+        // along with them.
+        assert!(validate_issue_payload("t", "b", &["a\u{0}b".into()]).is_err());
+        assert!(validate_issue_payload("t", "b", &["a\tb".into()]).is_err());
+        // Bidi overrides in labels are refused too.
+        assert!(validate_issue_payload("t", "b", &["\u{202D}bug".into()]).is_err());
+        // Bodies keep newlines/tabs but not other controls.
+        assert!(validate_issue_payload("t", "line\nline\r\n\ttabbed", &[]).is_ok());
+        assert!(validate_issue_payload("t", "bad\u{1B}esc", &[]).is_err());
+        assert!(validate_issue_payload("t", "bad\u{0}nul", &[]).is_err());
+        // Ordinary unicode content stays welcome.
+        assert!(
+            validate_issue_payload("Ünïcode – title ✓", "body ✓", &["label_1.x".into()]).is_ok()
+        );
+    }
+
+    /// Both gated executors render their line from one shared builder that
+    /// includes the program name, so the harness judges what actually runs
+    /// and the judged `--repo` cannot drift from the executed one.
+    #[test]
+    fn gated_executors_render_their_line_from_the_shared_builders() {
+        let remote = GitHubRepoRef {
+            host: "acme.ghe.com".into(),
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let labels = vec!["bug".to_string(), "  ".to_string(), "  ui ".to_string()];
+        let argv = issue_create_argv(&remote, "  Title  ", "Body", &labels);
+        assert_eq!(argv.first().map(String::as_str), Some("gh"));
+        assert_eq!(
+            argv,
+            vec![
+                "gh",
+                "issue",
+                "create",
+                "--title",
+                "Title",
+                "--body",
+                "Body",
+                "--label",
+                "bug",
+                "--label",
+                "ui",
+                "--repo",
+                "o/r",
+                "--hostname",
+                "acme.ghe.com"
+            ]
+        );
+        let checkout = pr_checkout_argv(&remote, 42).unwrap();
+        assert_eq!(
+            checkout,
+            vec![
+                "gh",
+                "pr",
+                "checkout",
+                "42",
+                "--repo",
+                "o/r",
+                "--hostname",
+                "acme.ghe.com"
+            ]
+        );
     }
 
     /// A label beginning with '-' is option-shaped and could be parsed as a
@@ -1430,6 +1940,63 @@ mod tests {
         assert_eq!(alerts[0].number, 3);
         assert_eq!(alerts[0].severity, "critical");
         assert_eq!(alerts[1].number, 1);
+    }
+
+    /// Regression: severity ranking was case-sensitive, so a capitalized
+    /// "HIGH" landed in the unknown bucket — sorted last and first dropped
+    /// by the display cap.
+    #[test]
+    fn dependabot_severity_ranking_is_case_insensitive() {
+        let rows = vec![
+            dependabot_row(1, "a", "HIGH"),
+            dependabot_row(2, "b", "Critical"),
+            dependabot_row(3, "c", "low"),
+        ];
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, _) = parse_dependabot_alerts(&text, 50).unwrap();
+        assert_eq!(
+            alerts.iter().map(|alert| alert.number).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+    }
+
+    /// Error text surfaced from gh is tail-capped: a chatty failure cannot
+    /// ship megabytes of stderr into reports and warnings.
+    #[test]
+    fn oversized_gh_errors_are_tail_capped_on_char_boundaries() {
+        let big = "x".repeat(MAX_GH_ERROR_BYTES * 3);
+        let capped = bounded_error(big.clone());
+        assert!(capped.len() <= MAX_GH_ERROR_BYTES + 4); // boundary slack only
+        assert!(big.ends_with(capped.trim_end()), "tail must be kept");
+
+        // Multibyte characters are not split mid-codepoint.
+        let multibyte = "é".repeat(MAX_GH_ERROR_BYTES); // 2 bytes each
+        let capped = bounded_error(multibyte);
+        assert!(!capped.contains('\u{FFFD}') || capped.is_empty());
+
+        let output = CapturedOutput {
+            stdout: Vec::new(),
+            stderr: format!(
+                "{}\nreal reason at the end",
+                "y".repeat(MAX_GH_ERROR_BYTES * 2)
+            )
+            .into_bytes(),
+            success: false,
+            status_code: 1,
+        };
+        let message = gh_api_error_message(&output);
+        assert!(
+            message.len() <= MAX_GH_ERROR_BYTES + 8,
+            "error message must stay bounded, got {}",
+            message.len()
+        );
+        assert!(message.ends_with("real reason at the end"));
+    }
+
+    #[test]
+    fn bounded_error_passes_small_messages_through() {
+        assert_eq!(bounded_error("short".into()), "short");
+        assert_eq!(bounded_error(String::new()), "");
     }
 
     #[test]
@@ -1590,5 +2157,214 @@ mod tests {
                 "field '{field}' is not a gh release list JSON field; fetching would fail"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stress: parsers must survive hostile shapes at scale without panicking,
+    // laundering garbage into success, or running unbounded.
+    // -----------------------------------------------------------------------
+
+    /// A deterministic pseudo-random byte generator (no external deps, fully
+    /// reproducible failures).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+    }
+
+    /// Fuzz-ish sweep: thousands of mutated/truncated/corrupted inputs across
+    /// every parser must return Err (or valid data), never panic. Intact
+    /// seeds are asserted first, so the corpus demonstrably exercises both
+    /// outcomes.
+    #[test]
+    fn stress_parsers_survive_corrupted_inputs_without_panicking() {
+        let seed_prs = serde_json::to_vec(&serde_json::json!([{
+            "number": 1, "title": "t", "state": "OPEN", "headRefName": "f",
+            "baseRefName": "m", "url": "u", "isDraft": false,
+            "statusCheckRollup": [{"state": "SUCCESS"}]
+        }]))
+        .unwrap();
+        let seed_runs = serde_json::to_vec(&serde_json::json!([{
+            "databaseId": 1, "name": "n", "status": "s",
+            "conclusion": "c", "headBranch": "b", "url": "u",
+            "createdAt": "t", "displayTitle": "d"
+        }]))
+        .unwrap();
+        let seed_alert = serde_json::to_string(&vec![dependabot_row(1, "p", "high")]).unwrap();
+
+        // Intact inputs parse cleanly on all three parsers.
+        assert!(parse_pr_list(&seed_prs, 50).is_ok());
+        assert!(parse_workflow_runs(&seed_runs, 20).is_ok());
+        assert!(parse_dependabot_alerts(&seed_alert, 50).is_ok());
+
+        let seeds: Vec<Vec<u8>> = vec![seed_prs, seed_runs, seed_alert.into_bytes()];
+        let mut rng = Lcg(0x0061_7564_6974_6f72);
+        for iteration in 0..4000usize {
+            let mut payload = seeds[iteration % seeds.len()].clone();
+            // Corrupt: truncate at a random offset and/or splice random bytes.
+            let cut = (rng.next_u64() as usize) % (payload.len() + 1);
+            payload.truncate(cut);
+            if rng.next_u64().is_multiple_of(2) {
+                let inject = (rng.next_u64() as usize) % 32;
+                for _ in 0..inject {
+                    payload.push((rng.next_u64() % 256) as u8);
+                }
+            }
+            // Every outcome is acceptable except a panic or a false success:
+            // a capped list must carry the truncation flag, always.
+            if let Ok((prs, truncated)) = parse_pr_list(&payload, 50) {
+                assert!(truncated || prs.len() <= 50);
+            }
+            let _ = parse_workflow_runs(&payload, 20);
+            let _ = parse_dependabot_alerts(&String::from_utf8_lossy(&payload), 50);
+        }
+    }
+
+    /// Large-but-bounded payloads: 20k PRs / runs / alerts parse, cap, sort,
+    /// and flag truncation within a generous wall-clock bound.
+    #[test]
+    fn stress_large_listings_parse_cap_and_stay_bounded() {
+        let started = std::time::Instant::now();
+
+        let prs_json: Vec<serde_json::Value> = (1..=20_000usize)
+            .map(|n| {
+                serde_json::json!({
+                    "number": n, "title": format!("PR #{n} — {}", "detail".repeat(3)),
+                    "state": "OPEN", "headRefName": format!("feature/branch-{n}"),
+                    "baseRefName": "main", "url": "", "isDraft": n % 2 == 0,
+                    "statusCheckRollup": [{"state": "SUCCESS"}, {"conclusion": "FAILURE"}]
+                })
+            })
+            .collect();
+        let text = serde_json::to_vec(&prs_json).unwrap();
+        let (prs, truncated) = parse_pr_list(&text, PR_DISPLAY_LIMIT).unwrap();
+        assert_eq!(prs.len(), PR_DISPLAY_LIMIT);
+        assert!(truncated);
+        // Failure wins regardless of position in the fetched window.
+        assert!(prs.iter().any(|pr| pr.ci_status == "failure"));
+
+        let alerts_json: Vec<serde_json::Value> = (1..=20_000usize)
+            .map(|n| dependabot_row(n as u64, "pkg", ["low", "high", "critical"][n % 3]))
+            .collect();
+        let text = serde_json::to_string(&alerts_json).unwrap();
+        let (alerts, truncated) = parse_dependabot_alerts(&text, ALERT_DISPLAY_LIMIT).unwrap();
+        assert_eq!(alerts.len(), ALERT_DISPLAY_LIMIT);
+        assert!(truncated);
+        // Worst-first ordering survives the scale.
+        assert_eq!(alerts[0].severity, "critical");
+
+        let releases_json: Vec<serde_json::Value> = (1..=5_000usize)
+            .map(|n| {
+                serde_json::json!({
+                    "tagName": format!("v1.0.{n}/build {n}<x>"),
+                    "name": format!("Release {n}"), "isDraft": false,
+                    "isPrerelease": true, "isLatest": n == 5_000,
+                    "publishedAt": null, "createdAt": null
+                })
+            })
+            .collect();
+        let text = serde_json::to_vec(&releases_json).unwrap();
+        let (releases, truncated) =
+            parse_release_list(&text, "https://github.com/a/r", RELEASE_DISPLAY_LIMIT).unwrap();
+        assert_eq!(releases.len(), RELEASE_DISPLAY_LIMIT);
+        assert!(truncated);
+        assert!(releases.iter().all(|release| release
+            .url
+            .starts_with("https://github.com/a/r/releases/tag/v1.0.")));
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "stress parsing must stay bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The remote-URL parser under an adversarial matrix: every hostile
+    /// shape must refuse, every ordinary shape must keep working, across a
+    /// few thousand mutations — no panics, no half-parsed trust decisions.
+    #[test]
+    fn stress_remote_parser_matrix_stays_total_and_safe() {
+        let hostile = [
+            "",
+            "   ",
+            "\u{0}",
+            "https://",
+            "https://github.com",
+            "https://github.com/",
+            "https://github.com//",
+            "https:///acme/repo",
+            "git@",
+            "git@:",
+            "git@:/repo",
+            "git@github.com:",
+            "git@github.com:/",
+            "ssh://",
+            "ssh://github.com",
+            "ssh://git@github.com:/acme/repo",
+            "ftp://github.com/acme/repo",
+            "https://github.com:acme/repo",
+            "https://user:pass@github.com/acme/repo",
+            "https://github.com/acme/repo/extra/deep/path",
+        ];
+        for url in hostile {
+            // Refusal or a well-formed ref; never a panic, never a ref with
+            // whitespace/flag-shaped/dot components inside.
+            if let Some(parsed) = parse_github_remote_url(url) {
+                for component in [&parsed.host, &parsed.owner, &parsed.name] {
+                    assert!(!component.is_empty());
+                    assert!(!component.starts_with('-'));
+                    assert!(!component.starts_with('.'));
+                    assert!(!component.contains(':'));
+                    assert!(!component
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control()));
+                }
+            }
+        }
+
+        let mut rng = Lcg(42);
+        let base = b"https://github.com/acme/repo.git";
+        let mut accepted = 0;
+        for _ in 0..2000 {
+            let mut url = base.to_vec();
+            let cut = (rng.next_u64() as usize) % (base.len() + 1);
+            url.truncate(cut);
+            let inject = (rng.next_u64() as usize) % 8;
+            let alphabet = b" -/.:@abc\x7f\x01";
+            for _ in 0..inject {
+                url.push(alphabet[(rng.next_u64() as usize) % alphabet.len()]);
+            }
+            let candidate = String::from_utf8_lossy(&url);
+            if let Some(parsed) = parse_github_remote_url(candidate.trim()) {
+                accepted += 1;
+                for component in [&parsed.host, &parsed.owner, &parsed.name] {
+                    assert!(!component.starts_with('-'));
+                    assert!(!component
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control()));
+                }
+            }
+        }
+        let _ = accepted; // both outcomes are fine; panics are not
+    }
+
+    /// pick_github_remote at scale: hundreds of remotes with mixed markers
+    /// resolve deterministically and origin still wins.
+    #[test]
+    fn stress_many_remotes_resolve_deterministically() {
+        let mut lines = Vec::new();
+        for i in 0..500 {
+            lines.push(format!("r{i}\thttps://github.com/o{i}/r{i}.git (fetch)"));
+            lines.push(format!("r{i}\thttps://github.com/o{i}/r{i}.git (push)"));
+        }
+        lines.push("origin\thttps://github.com/winner/origin.git (fetch)".into());
+        lines.push("origin\thttps://github.com/winner/origin.git (push)".into());
+        let picked = pick_github_remote(&lines.join("\n")).expect("origin wins");
+        assert_eq!(picked.slug(), "winner/origin");
     }
 }

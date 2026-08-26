@@ -1,3 +1,12 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import type { StorageReport } from "../storage/types";
+
+  // Survives the per-tab remount so revisiting the Storage view renders the
+  // last scan instantly; the fetch then refreshes it in place.
+  const storageReportCache = createRepoPanelCache<StorageReport>();
+</script>
+
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -16,9 +25,9 @@
   } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { copyText } from "../desktop/clipboard";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
-  import type { StorageReport, ArtifactDir } from "../storage/types";
+  import type { ArtifactDir } from "../storage/types";
   import {
     deltaClass,
     formatAge,
@@ -82,13 +91,14 @@
       const next = await invoke<StorageReport>("cmd_storage_scan", { repoPath });
       if (!guard.isLive()) return;
       report = next;
+      storageReportCache.set(repoPath, next);
       // Record the snapshot so the usage history grows with real scans.
       const map = recordSnapshot(readHistory(), repoKey(repoPath), toSnapshot(next));
       saveHistory(persistentStorage(), map);
       historyVersion += 1;
     } catch (err) {
       if (!guard.isLive()) return;
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("storage", err);
       report = null;
       scanned.path = "";
     } finally {
@@ -289,6 +299,9 @@
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    // Hydrate last-known data synchronously so a revisit renders instantly
+    // (the placeholder below only fires when there is no cached report).
+    report = storageReportCache.get(path) ?? null;
     void scan(path);
   });
 </script>

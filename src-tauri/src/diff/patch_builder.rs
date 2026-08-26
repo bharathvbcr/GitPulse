@@ -24,6 +24,14 @@ pub struct UnifiedDiffLine {
     pub new_line_no: Option<u32>,
     pub content: String,
     pub is_selected: bool, // Used for partial/single-line staging
+    /// True when git's source diff carried `\ No newline at end of file`
+    /// directly after this line. The marker describes the CONTENT, not the
+    /// sign: it must ride along wherever this line lands in the rebuilt
+    /// patch (+/-/context), or `git apply` cannot match blobs whose final
+    /// line lacks a trailing newline. Serde-defaulted so older payloads
+    /// without the field keep deserializing.
+    #[serde(default)]
+    pub no_newline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +71,11 @@ impl PatchBuilder {
     /// header lines (`--- a/…`) or break hunk arithmetic. Absolute paths,
     /// traversal segments, backslashes, NUL bytes and embedded newlines are
     /// therefore rejected here — once, at the single owner of the rules.
+    ///
+    /// Carriage returns inside line content are ALLOWED: the frontend now
+    /// preserves CR bytes deliberately so CRLF files stage byte-exactly (the
+    /// CR rides inside the logical line; the builder's own `\n` terminates
+    /// it). Only `\n` and NUL remain rejected.
     pub fn validate_file_patch(file_patch: &FilePatch) -> Result<(), String> {
         if !Self::has_selected_lines(file_patch) {
             return Err("No lines selected in patch".to_string());
@@ -75,7 +88,7 @@ impl PatchBuilder {
         }
         for hunk in &file_patch.hunks {
             for line in &hunk.lines {
-                if line.content.contains('\n') || line.content.contains('\r') {
+                if line.content.contains('\n') {
                     return Err(format!(
                         "diff line content contains a line break; staging needs one \
                          logical line per entry (got {:?})",
@@ -141,29 +154,41 @@ impl PatchBuilder {
             let mut hunk_lines_out = Vec::new();
             let mut old_count = 0;
             let mut new_count = 0;
+            // The `\ No newline at end of file` marker attaches to the line
+            // content in every direction git emits it, so a row flagged by the
+            // parser keeps its marker whichever sign this selection turns it
+            // into. Emitting it only "when staging" or only for additions
+            // would desync preimage/postimage blob endings and fail apply.
+            fn render(prefix: char, line: &UnifiedDiffLine) -> String {
+                if line.no_newline {
+                    format!("{prefix}{}\n\\ No newline at end of file", line.content)
+                } else {
+                    format!("{prefix}{}", line.content)
+                }
+            }
 
             for line in &hunk.lines {
                 match line.line_type {
                     DiffLineType::Context => {
-                        hunk_lines_out.push(format!(" {}", line.content));
+                        hunk_lines_out.push(render(' ', line));
                         old_count += 1;
                         new_count += 1;
                     }
                     DiffLineType::Addition => {
                         if line.is_selected {
                             if is_staging {
-                                hunk_lines_out.push(format!("+{}", line.content));
+                                hunk_lines_out.push(render('+', line));
                                 new_count += 1;
                             } else {
                                 // For unstaging an addition: it becomes a deletion in the reverse patch
-                                hunk_lines_out.push(format!("-{}", line.content));
+                                hunk_lines_out.push(render('-', line));
                                 old_count += 1;
                             }
                         } else if is_staging {
                             // Skipped addition: keep in original working tree, do not add to index
                         } else {
                             // Unstaging skipped addition: treat as unchanged context in the reverse index
-                            hunk_lines_out.push(format!(" {}", line.content));
+                            hunk_lines_out.push(render(' ', line));
                             old_count += 1;
                             new_count += 1;
                         }
@@ -171,16 +196,16 @@ impl PatchBuilder {
                     DiffLineType::Deletion => {
                         if line.is_selected {
                             if is_staging {
-                                hunk_lines_out.push(format!("-{}", line.content));
+                                hunk_lines_out.push(render('-', line));
                                 old_count += 1;
                             } else {
                                 // For unstaging a deletion: restore it
-                                hunk_lines_out.push(format!("+{}", line.content));
+                                hunk_lines_out.push(render('+', line));
                                 new_count += 1;
                             }
                         } else if is_staging {
                             // Skipped deletion: keep the line as context in the staged patch
-                            hunk_lines_out.push(format!(" {}", line.content));
+                            hunk_lines_out.push(render(' ', line));
                             old_count += 1;
                             new_count += 1;
                         } else {
@@ -239,6 +264,7 @@ mod tests {
                         new_line_no: Some(1),
                         content: "fn main() {".to_string(),
                         is_selected: false,
+                        no_newline: false,
                     },
                     UnifiedDiffLine {
                         line_type: DiffLineType::Addition,
@@ -246,6 +272,7 @@ mod tests {
                         new_line_no: Some(2),
                         content: "    println!(\"First\");".to_string(),
                         is_selected: true, // Stage this addition
+                        no_newline: false,
                     },
                     UnifiedDiffLine {
                         line_type: DiffLineType::Addition,
@@ -253,6 +280,7 @@ mod tests {
                         new_line_no: Some(3),
                         content: "    println!(\"Second\");".to_string(),
                         is_selected: false, // Do not stage this addition
+                        no_newline: false,
                     },
                     UnifiedDiffLine {
                         line_type: DiffLineType::Context,
@@ -260,6 +288,7 @@ mod tests {
                         new_line_no: Some(4),
                         content: "}".to_string(),
                         is_selected: false,
+                        no_newline: false,
                     },
                 ],
             }],
@@ -279,7 +308,99 @@ mod tests {
             new_line_no: None,
             content: content.to_string(),
             is_selected: selected,
+            no_newline: false,
         }
+    }
+
+    fn line_no_newline(t: DiffLineType, content: &str, selected: bool) -> UnifiedDiffLine {
+        UnifiedDiffLine {
+            no_newline: true,
+            ..line(t, content, selected)
+        }
+    }
+
+    const MARKER: &str = "\\ No newline at end of file";
+
+    /// The EOF marker rides the CONTENT, not the sign: whichever direction
+    /// staging/unstaging transforms a flagged row into, the rebuilt patch must
+    /// carry the marker so `git apply` matches blob endings byte-exactly.
+    #[test]
+    fn no_newline_marker_survives_every_direction() {
+        let cases = [
+            (DiffLineType::Addition, true, true, "+last"),
+            (DiffLineType::Addition, true, false, "-last"),
+            (DiffLineType::Deletion, true, true, "-last"),
+            (DiffLineType::Deletion, true, false, "+last"),
+            (DiffLineType::Context, false, true, " last"),
+            (DiffLineType::Context, false, false, " last"),
+        ];
+        for (kind, selected, staging, expected_prefix_line) in cases {
+            let fp = FilePatch {
+                old_path: "f.txt".to_string(),
+                new_path: "f.txt".to_string(),
+                hunks: vec![UnifiedDiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    header: String::new(),
+                    lines: vec![line_no_newline(kind.clone(), "last", selected)],
+                }],
+            };
+            let patch = PatchBuilder::build_selective_patch(&fp, staging);
+            assert!(
+                patch.contains(&format!("{expected_prefix_line}\n{MARKER}")),
+                "kind={kind:?} selected={selected} staging={staging} lost its marker:\n{patch}"
+            );
+        }
+    }
+
+    /// A flagged row that the selection SKIPS must not leak its marker into
+    /// the context line that replaces it... unless it stays context (both
+    /// sides keep the missing newline), which is the one skip that renders.
+    #[test]
+    fn no_newline_marker_follows_rendered_context_on_skip() {
+        // Staging skips additions entirely (no output) — nothing to leak.
+        let staged_skip = FilePatch {
+            old_path: "f.txt".to_string(),
+            new_path: "f.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![line_no_newline(DiffLineType::Addition, "tail", false)],
+            }],
+        };
+        assert!(!PatchBuilder::build_selective_patch(&staged_skip, true).contains(MARKER));
+
+        // Unstaging turns the skipped addition into context — both sides of
+        // that context still end without a newline, so the marker MUST stay.
+        let unstaged_ctx = PatchBuilder::build_selective_patch(&staged_skip, false);
+        assert!(
+            unstaged_ctx.contains(&format!(" tail\n{MARKER}")),
+            "context replacing a flagged row keeps the marker:\n{unstaged_ctx}"
+        );
+
+        // Staging a skipped deletion renders context too — marker stays.
+        let deletion_skip = FilePatch {
+            old_path: "f.txt".to_string(),
+            new_path: "f.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![line_no_newline(DiffLineType::Deletion, "tail", false)],
+            }],
+        };
+        let staged_ctx = PatchBuilder::build_selective_patch(&deletion_skip, true);
+        assert!(
+            staged_ctx.contains(&format!(" tail\n{MARKER}")),
+            "context from a skipped flagged deletion keeps the marker:\n{staged_ctx}"
+        );
     }
 
     /// Documents the hazard the validation closes: a newline inside one
@@ -358,7 +479,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_line_breaks_and_nul_in_content() {
-        for evil in ["alpha\nbeta", "carriage\rreturn", "nul\0byte"] {
+        for evil in ["alpha\nbeta", "nul\0byte"] {
             let fp = FilePatch {
                 old_path: "a.txt".to_string(),
                 new_path: "a.txt".to_string(),
@@ -376,6 +497,64 @@ mod tests {
                 "content {evil:?} must be rejected"
             );
         }
+    }
+
+    /// Regression (audit E): CR bytes inside line content were rejected
+    /// outright, making partial staging impossible for legitimate CRLF files.
+    /// The frontend preserves CR bytes deliberately, so a trailing `\r` on a
+    /// logical line must validate, survive `build_selective_patch`, and land
+    /// in the patch text as `+...\r\n` — one physical line per logical line,
+    /// with hunk arithmetic intact. Bare `\n` and NUL stay rejected.
+    #[test]
+    fn crlf_content_is_accepted_end_to_end() {
+        let crlf_lines = ["fn first() {\r", "}\r"];
+        let lines: Vec<UnifiedDiffLine> =
+            std::iter::once(line(DiffLineType::Context, "ctx", false))
+                .chain(
+                    crlf_lines
+                        .iter()
+                        .map(|c| line(DiffLineType::Addition, c, true)),
+                )
+                .collect();
+        let fp = FilePatch {
+            old_path: "win.rs".to_string(),
+            new_path: "win.rs".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 3,
+                header: String::new(),
+                lines,
+            }],
+        };
+        PatchBuilder::validate_file_patch(&fp).expect("CRLF content must pass validation");
+        let patch = PatchBuilder::build_selective_patch(&fp, true);
+        assert!(patch.contains("+fn first() {\r\n"), "got:\n{patch:?}");
+        assert!(patch.contains("+}\r\n"), "got:\n{patch:?}");
+        // One physical body line per logical line: the embedded CR must not
+        // have split anything.
+        let body_physical = patch
+            .lines()
+            .filter(|l| !l.starts_with("---") && !l.starts_with("+++") && !l.starts_with("@@"))
+            .count();
+        assert_eq!(body_physical, 3, "context + two CRLF additions");
+
+        // A lone \r without \n is equally legal content.
+        let lone_cr = FilePatch {
+            old_path: "a.txt".to_string(),
+            new_path: "a.txt".to_string(),
+            hunks: vec![UnifiedDiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                lines: vec![line(DiffLineType::Addition, "carriage\rreturn", true)],
+            }],
+        };
+        PatchBuilder::validate_file_patch(&lone_cr)
+            .expect("lone CR inside content is not a line break");
     }
 
     #[test]

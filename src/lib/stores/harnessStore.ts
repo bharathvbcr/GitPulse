@@ -207,7 +207,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         isProbing: false,
       }));
       return ai;
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (token !== probeToken) return null;
       update((s) => ({ ...s, isProbing: false, error: s.error ?? formatError(err) }));
       return null;
@@ -224,7 +224,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         const harness = await invokeFn<HarnessStatus>("cmd_harness_status");
         if (token !== probeToken) return null;
         update((s) => ({ ...s, harness }));
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (token !== probeToken) return null;
         update((s) => ({ ...s, error: formatError(err) }));
       }
@@ -241,7 +241,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         const harness = await invokeFn<HarnessStatus>("cmd_harness_reconnect");
         if (token !== probeToken) return null;
         update((s) => ({ ...s, harness }));
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (token !== probeToken) return null;
         update((s) => ({ ...s, error: formatError(err) }));
       }
@@ -314,6 +314,17 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     fixHealth: async (repoPath: string, report: string): Promise<AiGeneration> => {
       const preferred = currentPreferred();
       return invokeFn<AiGeneration>("cmd_ai_fix_health", {
+        repoPath,
+        report,
+        baseUrl: preferred?.base_url ?? null,
+        model: preferred?.model ?? null,
+      });
+    },
+
+    /** Turns a rendered coverage report into a local-model analysis. */
+    coverageReport: async (repoPath: string, report: string): Promise<AiGeneration> => {
+      const preferred = currentPreferred();
+      return invokeFn<AiGeneration>("cmd_ai_coverage_report", {
         repoPath,
         report,
         baseUrl: preferred?.base_url ?? null,

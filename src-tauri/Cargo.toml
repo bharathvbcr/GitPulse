@@ -22,6 +22,7 @@ regex = "1.10"
 rfd = "0.15"
 portable-pty = "0.9"
 base64 = "0.22"
+log = "0.4"
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }

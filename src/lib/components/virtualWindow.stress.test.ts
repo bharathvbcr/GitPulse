@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { computeWindow } from "../dom/virtualWindow";
+import {
+  clampScrollTop,
+  computeWindow,
+  ensureNonEmptyWindow,
+} from "../dom/virtualWindow";
 
 /**
  * Attacks computeWindow through the exact shape VirtualList.svelte calls it
@@ -182,5 +186,117 @@ describe("computeWindow stress: start>end inversion guard", () => {
     expect(computeWindow(0, 600, 100, 20, 8)).toEqual({ start: 0, end: 38 });
     expect(computeWindow(50 * 20, 600, 100, 20, 8)).toEqual({ start: 42, end: 88 });
     expect(computeWindow(95 * 20, 600, 100, 20, 8)).toEqual({ start: 87, end: 100 });
+  });
+});
+
+/**
+ * Node-env encoding of VirtualList's per-frame derivation after the
+ * blank-frame fix. The component cannot run here (pure functions only), so
+ * the component-level invariant is asserted as a pure-function property:
+ * every frame the component derives `effectiveScrollTop` then `win` exactly
+ * like this — spacer height and DOM clamping are outside this simulation.
+ */
+function frame(
+  rawScrollTop: number,
+  itemCount: number,
+  rowHeight = 20,
+  viewportHeight = 600,
+  overscan = 8
+): { clamped: number; win: { start: number; end: number } } {
+  const clamped = clampScrollTop(rawScrollTop, itemCount, rowHeight, viewportHeight);
+  const win = ensureNonEmptyWindow(
+    computeWindow(clamped, viewportHeight, itemCount, rowHeight, overscan),
+    itemCount,
+    rowHeight,
+    viewportHeight
+  );
+  return { clamped, win };
+}
+
+describe("VirtualList derivation stress: item-array identity churn", () => {
+  const ROW_H = 20;
+  const VIEWPORT = 600;
+
+  it("ratchets monotonically to a fixed point through 1 <-> 50000 churn and never blanks", () => {
+    // User parked deep in a 50k-row list (bottom-anchored, past the cap so
+    // every direction of movement is visible).
+    let anchor = 50_000 * ROW_H - VIEWPORT + 5_000;
+    let prevAnchor = Number.POSITIVE_INFINITY;
+    let settledAt: number | undefined;
+
+    for (let i = 0; i < 2_000; i++) {
+      // Fresh identity every iteration — Svelte sees a brand-new array whose
+      // length oscillates between the collapsed and expanded diff.
+      const items = new Array(i % 2 === 0 ? 50_000 : 1);
+
+      const { clamped, win } = frame(anchor, items.length, ROW_H, VIEWPORT);
+
+      // Monotone convergence: the browser-clamp feedback only ever moves the
+      // effective anchor DOWN (clamp is a projection onto [0, maxScroll]);
+      // regrowing the list never yanks it back up.
+      expect(clamped).toBeLessThanOrEqual(anchor);
+      expect(anchor).toBeLessThanOrEqual(prevAnchor);
+
+      // Never a blank pane post-clamp while any content exists.
+      expect(win.start).toBeGreaterThanOrEqual(0);
+      expect(win.end).toBeGreaterThanOrEqual(win.start);
+      expect(win.end).toBeLessThanOrEqual(items.length);
+      expect(win.start).toBeLessThan(win.end);
+
+      // Convergence: once two consecutive frames agree, the ratchet has
+      // reached its fixed point and must hold it for all remaining frames.
+      if (settledAt !== undefined) {
+        expect(clamped).toBe(settledAt);
+      } else if (clamped === anchor) {
+        settledAt = anchor;
+      }
+
+      prevAnchor = anchor;
+      anchor = clamped; // scroll event round-trip: bind converges on the clamp
+    }
+
+    expect(settledAt).toBe(0);
+    expect(anchor).toBe(0);
+  });
+
+  it("collapses a 300k-line diff to 5 lines with zero blank frames", () => {
+    const deep = 300_000 * ROW_H - VIEWPORT; // parked at the very bottom
+    let anchor = deep;
+
+    // First frame after the toggle: raw bindable still holds the stale deep
+    // offset that used to paint {300000, 300000}. The clamp pins it to 0
+    // (5 rows x 20px underfill the 600px viewport), so the whole short list
+    // paints instead of a blank pane.
+    const first = frame(anchor, 5, ROW_H, VIEWPORT);
+    expect(first.clamped).toBe(0);
+    expect(first.win).toEqual({ start: 0, end: 5 });
+
+    // Browser clamp round-trips; every later frame is an identical non-blank
+    // fixed point.
+    anchor = first.clamped;
+    for (let i = 0; i < 10; i++) {
+      const settled = frame(anchor, 5, ROW_H, VIEWPORT);
+      expect(settled.clamped).toBe(anchor);
+      expect(settled.win).toEqual({ start: 0, end: 5 });
+    }
+  });
+
+  it("keeps translate offsets inside honest spacer bounds during churn", () => {
+    // Pure-function stand-in for the template invariant: the rendered band
+    // occupies pixels [start * rowHeight, end * rowHeight) inside a spacer of
+    // exactly total * rowHeight (the template keeps that spacer height
+    // untouched by this change), so the band must sit within it.
+    const lengths = [50_000, 1, 50_000, 7, 1, 3, 50_000];
+    let anchor = 1e6;
+    for (const length of lengths) {
+      const items = new Array(length); // fresh identity per frame
+      const { win } = frame(anchor, items.length, ROW_H, VIEWPORT);
+      const spacerPx = items.length * ROW_H;
+      if (items.length > 0) {
+        expect(win.start * ROW_H).toBeLessThan(spacerPx);
+      }
+      expect(win.end * ROW_H).toBeLessThanOrEqual(spacerPx);
+      anchor = clampScrollTop(anchor, items.length, ROW_H, VIEWPORT);
+    }
   });
 });

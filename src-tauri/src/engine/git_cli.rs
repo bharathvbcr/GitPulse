@@ -340,6 +340,15 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Like [`git_text`], but an over-cap stream is data rather than an error:
+/// returns what arrived plus the truncation flag. For callers whose input
+/// tolerates a prefix (coverage family detection), where failing the whole
+/// scan would be worse than reading part of the listing.
+pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), String> {
+    let (bytes, truncated) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
 pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
     git_timeout(None, args, DEFAULT_TIMEOUT, None)
 }
@@ -519,7 +528,11 @@ fn extended_child_path(
 /// the [`gui_launch_fallback_dirs`]. Found anywhere, its path is returned;
 /// found nowhere, the bare name passes through unchanged so the existing
 /// "Failed to spawn …" error keeps naming the tool the caller asked for.
-fn resolve_spawn_program_with(
+///
+/// Crate-visible so the dependency scanner can quote the resolved location of
+/// a tool that exists but fails to run, under the same injectable seams its
+/// spawns use.
+pub(crate) fn resolve_spawn_program_with(
     program: &str,
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
@@ -580,9 +593,38 @@ pub(crate) fn build_capture_command(
 ) -> Command {
     let resolved = resolve_spawn_program_with(program, path_var, home);
     let mut cmd = Command::new(&resolved);
-    cmd.args(args)
+    // The same injected-GIT-* strip [`git_command`] applies: captured tools
+    // shell out to git themselves (`gh pr checkout` fetches and merges in the
+    // repo; npm/go/cargo read git config), and CI-style inherited pointers
+    // (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would redirect
+    // them off the repository the caller picked. Applied before `extra_env`,
+    // so a caller that explicitly passes one of these still wins.
+    for (name, _) in std::env::vars_os() {
+        if is_injected_git_env(&name.to_string_lossy()) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_SEQUENCE_EDITOR")
+        .env_remove("GIT_EXEC_PATH")
         .env("GH_PROMPT_DISABLED", "1")
+        // gh consults this before printing update notices; keep subprocess
+        // output deterministic instead of interleaving a self-update banner.
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -615,14 +657,31 @@ pub fn capture_command(
 ) -> Result<CapturedOutput, String> {
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let cmd = build_capture_command(
+    capture_command_with_env(
         program,
         args,
         cwd,
+        timeout,
         extra_env,
         path_var.as_deref(),
         home.as_deref(),
-    );
+    )
+}
+
+/// [`capture_command`] with injectable `PATH`/home lookups — the seam its
+/// callers fill from the process environment by default. Tests use it to run
+/// the exact production spawn path under a simulated GUI-minimal environment
+/// without mutating process-global state.
+pub(crate) fn capture_command_with_env(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<CapturedOutput, String> {
+    let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
 
     let out = run_bounded(cmd, program, timeout, None)?;
     if out.truncated {
@@ -893,12 +952,19 @@ fn lock_retry_backoff_ms(attempt: usize) -> u64 {
     base + (std::process::id() as u64 % 20)
 }
 
-fn git_timeout(
+/// Shared bounded-invocation loop behind [`git_timeout`] and
+/// [`git_text_partial`]: spawns git with the lock-retry backoff and returns
+/// its stdout plus whether stdout hit [`MAX_OUTPUT_BYTES`] and was cut.
+/// A run that FAILED never flows through the data path — partial output
+/// from a failed command is not trustworthy — so failures surface git's
+/// own diagnosis (stderr first, then stdout, then the bare status) exactly
+/// as before; only successful runs carry the truncation flag.
+fn git_run(
     repo: Option<&Path>,
     args: &[&str],
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, bool), String> {
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
     let mut attempts = 0;
@@ -907,15 +973,8 @@ fn git_timeout(
     loop {
         let cmd = git_command(repo, args);
         let out = run_bounded(cmd, &label, timeout, stdin_bytes)?;
-        if out.truncated {
-            return Err(format!(
-                "git {} output exceeded {} MB",
-                sub,
-                MAX_OUTPUT_BYTES / (1024 * 1024)
-            ));
-        }
         if out.success {
-            return Ok(out.stdout);
+            return Ok((out.stdout, out.truncated));
         }
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !err.is_empty() {
@@ -947,6 +1006,24 @@ fn git_timeout(
             sub, out.status_code
         ));
     }
+}
+
+fn git_timeout(
+    repo: Option<&Path>,
+    args: &[&str],
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let sub = args.first().unwrap_or(&"");
+    let (stdout, truncated) = git_run(repo, args, timeout, stdin_bytes)?;
+    if truncated {
+        return Err(format!(
+            "git {} output exceeded {} MB",
+            sub,
+            MAX_OUTPUT_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(stdout)
 }
 
 /// Upper bound on stdout text embedded in a failure message when git put its
@@ -1834,25 +1911,71 @@ mod tests {
         }
     }
 
-    /// Regression (M4): a planted GIT_CONFIG_PARAMETERS value must not
-    /// survive into the spawned environment. The Command's env map marks a
-    /// stripped variable with a `None` value; this asserts that marker.
+    /// Regression (M4): GIT_CONFIG_PARAMETERS must be marked stripped on the
+    /// spawned command. `env_remove` records the removal whether or not the
+    /// parent environment carries the variable, so this needs no process-global
+    /// mutation — which would race every other test that reads or spawns with
+    /// the real environment in parallel.
     #[test]
     fn planted_git_config_parameters_is_removed_from_spawn_env() {
         let key = "GIT_CONFIG_PARAMETERS";
-        // Process-global mutation is tolerable here: every other test that
-        // spawns git through this module also strips exactly this variable
-        // (that is the behavior under test), so even if the cleanup below is
-        // skipped on a panic the value cannot influence a spawned git.
-        std::env::set_var(key, "'alias.st=!echo PWNED'");
         let cmd = git_command(Some(Path::new("/tmp")), &["status"]);
         let removed = cmd
             .get_envs()
             .any(|(k, v)| k == std::ffi::OsStr::new(key) && v.is_none());
-        std::env::remove_var(key);
         assert!(
             removed,
             "planted GIT_CONFIG_PARAMETERS must be stripped from the spawned env"
+        );
+    }
+
+    /// Captured external tools (`gh pr checkout` shells to git; npm/go/cargo
+    /// read git config) inherit no injected-GIT-* redirection either, while an
+    /// explicitly passed `extra_env` value still wins over the strip.
+    #[test]
+    fn capture_children_strip_injected_git_env_but_extra_env_wins() {
+        let explicit_git_dir = "/explicit/caller-chosen";
+        let cmd = build_capture_command(
+            "gh",
+            &["--version"],
+            None,
+            &[("GIT_DIR", explicit_git_dir)],
+            None,
+            None,
+        );
+        let value_of = |key: &str| -> Option<Option<std::ffi::OsString>> {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .map(|(_, v)| v.map(|v| v.to_os_string()))
+        };
+        for key in [
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_EXEC_PATH",
+        ] {
+            assert_eq!(
+                value_of(key),
+                Some(None),
+                "{key} must be stripped from captured-tool children"
+            );
+        }
+        assert_eq!(
+            value_of("GIT_DIR").and_then(|v| v.map(|s| s.to_string_lossy().into_owned())),
+            Some(explicit_git_dir.to_string()),
+            "caller-supplied extra_env must override the strip"
+        );
+        // gh-specific prompt suppression travels with every captured child.
+        assert_eq!(
+            value_of("GH_PROMPT_DISABLED").map(|v| v.is_some()),
+            Some(true)
         );
     }
 

@@ -41,6 +41,7 @@ fn addition(content: &str, selected: bool) -> UnifiedDiffLine {
         new_line_no: Some(2),
         content: content.to_string(),
         is_selected: selected,
+        no_newline: false,
     }
 }
 
@@ -65,6 +66,7 @@ fn selective_staging_applies_a_valid_patch_to_the_index() {
                     new_line_no: Some(1),
                     content: "fn a() {}".to_string(),
                     is_selected: false,
+                    no_newline: false,
                 },
                 addition("fn staged() {}", true),
                 UnifiedDiffLine {
@@ -73,6 +75,7 @@ fn selective_staging_applies_a_valid_patch_to_the_index() {
                     new_line_no: Some(3),
                     content: "fn b() {}".to_string(),
                     is_selected: false,
+                    no_newline: false,
                 },
             ],
         }],
@@ -724,4 +727,203 @@ fn worktree_list_add_remove_roundtrip_on_a_temp_repo() {
         remove_worktree(&repo, target_str, false).is_err(),
         "double remove must surface as an error"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stack hierarchy stress: adversarial grids over StackTreeEngine
+// ---------------------------------------------------------------------------
+
+use gitpulse_lib::stack::{StackTreeEngine, StackedBranchNode};
+use std::collections::{HashMap, HashSet};
+
+/// Invariants every build_stack_hierarchy output must satisfy, applied across
+/// the whole adversarial grid.
+fn expect_stack_invariants(
+    nodes: &[StackedBranchNode],
+    tips: &HashMap<String, String>,
+    default_branch: &str,
+) {
+    let mut seen = HashSet::new();
+    let mut parent_edges = HashSet::new();
+    for node in nodes {
+        // Every input branch appears exactly once.
+        assert!(
+            seen.insert(node.branch_name.clone()),
+            "duplicate node for {}",
+            node.branch_name
+        );
+        let expected_tip = tips
+            .get(&node.branch_name)
+            .unwrap_or_else(|| panic!("branch {} missing from input", node.branch_name));
+        assert_eq!(&node.tip_commit_id, expected_tip);
+        // A parent must be a real branch and never the branch itself.
+        if let Some(ref parent) = node.parent_branch_name {
+            assert!(tips.contains_key(parent), "phantom parent {parent}");
+            assert_ne!(parent, &node.branch_name, "self-parent");
+            // Zero-ahead is legal only when the two branches share a tip.
+            let zero_ahead_ok = tips.get(parent) == Some(&node.tip_commit_id);
+            assert!(
+                node.commit_count_ahead_of_parent > 0 || zero_ahead_ok,
+                "inflated/zero count for {}",
+                node.branch_name
+            );
+            assert!(
+                parent_edges.insert((node.branch_name.clone(), parent.clone())),
+                "duplicate edge"
+            );
+        } else {
+            // Parentless nodes report zero ahead — never an invented depth.
+            assert_eq!(node.commit_count_ahead_of_parent, 0);
+        }
+    }
+    // The default branch is always root-designated.
+    let def = nodes.iter().find(|n| n.branch_name == default_branch);
+    if let Some(def) = def {
+        assert!(def.parent_branch_name.is_none());
+        assert_eq!(def.commit_count_ahead_of_parent, 0);
+    }
+    // Child lists mirror parent edges exactly.
+    let mut expected_children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for n in nodes {
+        if let Some(ref p) = n.parent_branch_name {
+            expected_children
+                .entry(p.as_str())
+                .or_default()
+                .push(&n.branch_name);
+        }
+    }
+    for n in nodes {
+        let got = expected_children
+            .get(n.branch_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut sorted_got = n
+            .child_branch_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        sorted_got.sort();
+        let mut sorted_expected = got;
+        sorted_expected.sort();
+        assert_eq!(
+            sorted_got, sorted_expected,
+            "child list drift for {}",
+            n.branch_name
+        );
+    }
+}
+
+/// 400 branches over a lattice of shared tips, cycles, orphans, twins, and
+/// deep chains. The engine must stay total, deterministic, and invariant-clean
+/// within a wall-clock budget.
+#[test]
+fn stack_engine_survives_adversarial_lattice() {
+    let started = std::time::Instant::now();
+
+    // Deterministic pseudo-random lattice.
+    let mut seed: u64 = 0x5eed;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    let mut tips: HashMap<String, String> = HashMap::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+
+    // One long spine c0 <- c1 <- ... <- c1999.
+    parents.insert("c0".to_string(), vec![]);
+    for i in 1..2000usize {
+        parents.insert(format!("c{i}"), vec![format!("c{}", i - 1)]);
+    }
+    tips.insert("main".to_string(), "c1999".to_string());
+
+    // 400 branches: some stacked on spine nodes, some twins sharing a tip,
+    // some orphans on private lines, some pointing at the same tip as main.
+    for b in 0..400usize {
+        match b % 5 {
+            0 => {
+                // Stacked onto a random spine node.
+                let at = format!("c{}", next() % 2000);
+                tips.insert(format!("feat-{b}"), at);
+            }
+            1 => {
+                // Twin pair: even/odd share one private tip.
+                let id = format!("twin-{}", b / 2);
+                tips.insert(format!("feat-{b}"), id.clone());
+                parents.entry(id).or_insert_with(|| vec!["c0".to_string()]);
+            }
+            2 => {
+                // Orphan line: tip -> orphan-parent -> nothing.
+                let tip = format!("orph-{b}");
+                parents.insert(tip.clone(), vec![format!("orphp-{b}")]);
+                parents.insert(format!("orphp-{b}"), vec![]);
+                tips.insert(format!("feat-{b}"), tip);
+            }
+            3 => {
+                // Same tip as main (twin of the default branch).
+                tips.insert(format!("feat-{b}"), "c1999".to_string());
+            }
+            _ => {
+                // Hostile-ish names still resolve safely.
+                let name = format!("feat-ünïcode-{b}/nested/deep");
+                tips.insert(name, format!("c{}", next() % 2000));
+            }
+        }
+    }
+
+    // A parent cycle somewhere off to the side.
+    parents.insert("x1".to_string(), vec!["x2".to_string()]);
+    parents.insert("x2".to_string(), vec!["x1".to_string()]);
+    tips.insert("feat-cycle".to_string(), "x1".to_string());
+
+    let first = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+    expect_stack_invariants(&first, &tips, "main");
+
+    // Determinism: byte-identical rebuild from identical inputs.
+    let second = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+    assert_eq!(first, second);
+
+    // Every node resolvable by breadcrumbs stays finite and acyclic.
+    for node in &first {
+        let chain = StackTreeEngine::get_ancestry_breadcrumbs(&first, &node.branch_name);
+        assert!(chain.breadcrumb_chain.len() <= 256);
+        let unique: HashSet<&String> = chain.breadcrumb_chain.iter().collect();
+        assert_eq!(unique.len(), chain.breadcrumb_chain.len(), "cycle in trail");
+    }
+
+    let elapsed = started.elapsed().as_millis();
+    assert!(
+        elapsed < 2_000,
+        "adversarial lattice ({}) nodes must resolve fast, took {}ms",
+        first.len(),
+        elapsed
+    );
+}
+
+/// Twin fan-out at scale: N branches all sitting on ONE commit collapse into
+/// a single owner plus N-1 zero-ahead children of that owner.
+#[test]
+fn massive_twin_fanout_resolves_to_owner_plus_zero_ahead_children() {
+    let mut tips: HashMap<String, String> = HashMap::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    parents.insert("root".to_string(), vec![]);
+    tips.insert("main".to_string(), "root".to_string());
+    for i in 0..500usize {
+        tips.insert(format!("twin-{i:03}"), "root".to_string());
+    }
+
+    let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+    expect_stack_invariants(&nodes, &tips, "main");
+
+    let main = nodes.iter().find(|n| n.branch_name == "main").unwrap();
+    assert!(main.parent_branch_name.is_none());
+    // Every twin stacks directly on main (or whatever won ownership) at +0.
+    let twins: Vec<_> = nodes.iter().filter(|n| n.branch_name != "main").collect();
+    assert_eq!(twins.len(), 500);
+    for t in &twins {
+        assert_eq!(t.parent_branch_name.as_deref(), Some("main"));
+        assert_eq!(t.commit_count_ahead_of_parent, 0);
+    }
 }

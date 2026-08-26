@@ -119,6 +119,10 @@ pub enum Feature {
     ExplainCommit,
     BranchName,
     HealthFix,
+    /// Its own feature rather than a HealthFix mode: the calibration ledger is
+    /// keyed per feature, so coverage analyses calibrate on their report shape
+    /// instead of inheriting dependency-plan estimates.
+    CoverageReport,
 }
 
 impl Feature {
@@ -128,6 +132,7 @@ impl Feature {
             Feature::ExplainCommit => "explain-commit",
             Feature::BranchName => "branch-name",
             Feature::HealthFix => "health-fix",
+            Feature::CoverageReport => "coverage-report",
         }
     }
 }
@@ -734,6 +739,36 @@ pub fn fix_health(
     Ok(generation)
 }
 
+/// Asks the local model for an analysis of a rendered test-coverage report.
+///
+/// The report arrives already rendered by the frontend's formatter; this only
+/// budgets it against the context window. The output is advisory — GitPulse
+/// never applies anything itself.
+pub fn coverage_report(
+    repo_path: &str,
+    report_text: &str,
+    selection: Option<AiSelection>,
+) -> Result<AiGeneration, String> {
+    if report_text.trim().is_empty() {
+        return Err("The coverage report is empty, so there is nothing to analyze.".into());
+    }
+    let mut generation = run(Feature::CoverageReport, repo_path, selection, |budget| {
+        let budgeted = prompt::budget_text(report_text, budget.min(48_000));
+        Ok(Turn {
+            system: prompt::coverage_report_system(),
+            user: prompt::coverage_report_user(&budgeted.text),
+            diff: budgeted,
+        })
+    })?;
+    generation.text = prompt::strip_think_tags(&generation.text)
+        .trim()
+        .to_string();
+    if generation.text.is_empty() {
+        return Err("The model returned an empty coverage analysis.".into());
+    }
+    Ok(generation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +810,18 @@ mod tests {
             store.get(&key(2)),
             None,
             "un-refreshed oldest must be evicted"
+        );
+    }
+
+    /// The empty-report guard sits before `run` in coverage_report's control
+    /// flow, so a whitespace-only report must fail locally — no endpoint
+    /// discovery, no sidecar, no HTTP — with the coverage-specific error.
+    #[test]
+    fn coverage_report_rejects_a_whitespace_only_report_without_a_server() {
+        let err = coverage_report("/definitely/not/a/repository", "   \n\t ", None).unwrap_err();
+        assert_eq!(
+            err,
+            "The coverage report is empty, so there is nothing to analyze."
         );
     }
 }

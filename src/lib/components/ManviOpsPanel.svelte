@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { openUrl } from "@tauri-apps/plugin-opener";
+  import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import {
     AlertTriangle,
     ArrowDownToLine,
@@ -28,23 +29,14 @@
     type BranchCleanupPlan,
     type CommitReviewReport,
     type IssueInfo,
-    type ReleaseInfo,
   } from "../ops/model";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
-  import type { WorkflowRunInfo } from "../github/types";
+  import type { WorkflowRunInfo, GitHubContextBase } from "../github/types";
 
-  interface OpsGitHubContext {
-    available: boolean;
-    owner: string;
-    repo: string;
+  interface OpsGitHubContext extends GitHubContextBase {
     issues: IssueInfo[];
     issues_truncated: boolean;
     issues_error?: string | null;
-    releases: ReleaseInfo[];
-    releases_truncated: boolean;
-    releases_error?: string | null;
-    workflow_runs: WorkflowRunInfo[];
-    error?: string | null;
   }
 
   const ISSUE_REFRESH_MS = 60_000;
@@ -64,7 +56,23 @@
   let review = $state<CommitReviewReport | null>(null);
   let github = $state<OpsGitHubContext | null>(null);
   let busy = $state<string | null>(null);
+  /**
+   * Set only while the once-a-minute poll refreshes issues in the
+   * background. Unlike `busy`, it disables nothing and spins nothing: an
+   * automatic refresh must not freeze every quick-action card or spin the
+   * header icon once a minute.
+   */
+  let backgroundRefreshing = $state(false);
+  /**
+   * Repo whose issue load was requested while an operation held `busy`
+   * (e.g. switching repos mid-op). The repo-change effect below fires once
+   * per real change; without this queue the new repo's issues would not
+   * load until the next interval tick.
+   */
+  let pendingIssueRepo: string | null = null;
   let notice = $state<string | null>(null);
+  /** Background-poll failures, kept apart from action feedback. */
+  let pollError = $state<string | null>(null);
   let issueTitle = $state("");
   let issueBody = $state("");
   let issueLabels = $state("bug");
@@ -90,24 +98,67 @@
       : [...selectedBranches, name];
   }
 
+  /**
+   * Opens issue/release/run URLs through the canonical OS opener. The shared
+   * opener throws on failure; there is deliberately no in-webview navigation
+   * fallback — it could replace the whole app shell with the target URL.
+   * Failures surface on the panel notice and in the diagnostics ring.
+   */
   async function openExternal(url: string) {
     try {
-      await openUrl(url);
-    } catch {
-      window.open(url, "_blank", "noopener,noreferrer");
+      await openExternalUrl(url);
+    } catch (err) {
+      notice = reportPanelError("ops", err);
     }
   }
 
-  async function loadIssues(repo: string = $repoStore.currentPath ?? "") {
-    if (!repo || busy !== null) return;
-    busy = "issues";
+  /** Releases `busy` and drains any issue load an op had deferred. */
+  function settleBusy() {
+    busy = null;
+    const wanted = pendingIssueRepo;
+    if (wanted !== null) {
+      pendingIssueRepo = null;
+      void loadIssues(wanted);
+    }
+  }
+
+  async function loadIssues(
+    repo: string = $repoStore.currentPath ?? "",
+    opts: { background?: boolean } = {},
+  ) {
+    if (!repo) return;
+    if (busy !== null) {
+      // An operation owns `busy`: a user-initiated request is remembered and
+      // run on settle; the background poll simply waits for its next tick.
+      if (!opts.background) {
+        pendingIssueRepo = repo;
+      }
+      return;
+    }
+    if (opts.background) {
+      if (backgroundRefreshing) return;
+      backgroundRefreshing = true;
+    } else {
+      busy = "issues";
+    }
     try {
       const next = await invoke<OpsGitHubContext>("cmd_github_context", { repoPath: repo });
-      if ($repoStore.currentPath === repo) github = next;
+      if ($repoStore.currentPath === repo) {
+        github = next;
+        if (opts.background) pollError = null;
+      }
     } catch (error) {
-      if ($repoStore.currentPath === repo) notice = formatError(error);
+      if ($repoStore.currentPath !== repo) return;
+      if (opts.background) {
+        // A background poll must not clobber action feedback ("Issue
+        // reported…"); its failures get their own quieter slot.
+        pollError = formatError(error);
+      } else {
+        notice = formatError(error);
+      }
     } finally {
-      busy = null;
+      if (opts.background) backgroundRefreshing = false;
+      else settleBusy();
     }
   }
 
@@ -124,7 +175,7 @@
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = formatError(error);
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -159,7 +210,7 @@
         await scanBranches();
       }
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -174,7 +225,7 @@
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = formatError(error);
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -192,7 +243,7 @@
       // instead of console-only, matching scanBranches/reportIssue.
       notice = formatError(error);
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -220,7 +271,7 @@
     } catch (error) {
       notice = formatError(error);
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -243,7 +294,7 @@
     } catch (error) {
       notice = formatError(error);
     } finally {
-      busy = null;
+      settleBusy();
     }
   }
 
@@ -253,11 +304,20 @@
 
   onMount(() => {
     const timer = window.setInterval(() => {
-      if (!document.hidden && $repoStore.currentPath) void loadIssues();
+      // Only poll while the ops pane is visible: the harness pane renders
+      // this panel's data away, and each tick costs four parallel gh round
+      // trips on the backend.
+      if (!document.hidden && pane === "ops" && $repoStore.currentPath) {
+        void loadIssues(undefined, { background: true });
+      }
     }, ISSUE_REFRESH_MS);
     return () => window.clearInterval(timer);
   });
 
+  // `lastRepo` memoizes this effect's real dependency: repoStore republishes
+  // fresh objects on every status poll (~6s), and re-running the resets per
+  // emission would thrash panel state. A load skipped because an op holds
+  // `busy` is queued in pendingIssueRepo and drained by settleBusy().
   $effect(() => {
     const repo = $repoStore.currentPath;
     if (repo === lastRepo) return;
@@ -267,9 +327,11 @@
     review = null;
     github = null;
     notice = null;
+    pollError = null;
     releaseTag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
     releaseMessage = `Release ${releaseTag}`;
     releaseConfirmed = false;
+    pendingIssueRepo = null; // a queued request for an older repo is obsolete
     if (repo) void loadIssues(repo);
   });
 </script>
@@ -300,6 +362,12 @@
 
     {#if notice}
       <div class="rounded-xl border border-border bg-surface px-3 py-2 text-textSecondary">{notice}</div>
+    {/if}
+
+    {#if pollError}
+      <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-300">
+        Background refresh failed: {pollError}
+      </div>
     {/if}
 
     {#if pane === "harness"}

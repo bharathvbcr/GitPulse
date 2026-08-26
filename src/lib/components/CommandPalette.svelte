@@ -8,7 +8,12 @@
   import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
   import { themeStore } from "../stores/themeStore";
   import { askText, promptState } from "../stores/modalStore";
-  import { fadeParams, scaleParams } from "../motion/easing";
+  import {
+    backdropFade,
+    backdropFadeOut,
+    cardScale,
+    cardScaleOut,
+  } from "../ui/transitions";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
@@ -196,7 +201,8 @@
     tabindex="-1"
     onclick={() => (isOpen = false)}
     onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
-    transition:fade={fadeParams()}
+    in:fade={backdropFade()}
+    out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-start justify-center pt-24 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
@@ -206,8 +212,8 @@
     <div
       use:trapFocus={{ initial: () => inputEl ?? null }}
       onclick={(e) => e.stopPropagation()}
-      in:scale={scaleParams()}
-      out:scale={scaleParams()}
+      in:scale={cardScale()}
+      out:scale={cardScaleOut()}
       class="w-full max-w-lg gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu"
     >
       <div class="p-3.5 border-b border-border/60 flex items-center gap-2.5">

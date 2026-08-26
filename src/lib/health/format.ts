@@ -69,15 +69,20 @@ export function updateKindClass(kind: UpdateKind): string {
   }
 }
 
-export function formatAuditCounts(summary: {
-  critical: number;
-  high: number;
-  moderate: number;
-  low: number;
-  unknown?: number;
-  total: number;
-}): string {
-  if (summary.total === 0) return "No known vulnerabilities";
+export function formatAuditCounts(
+  summary: {
+    critical: number;
+    high: number;
+    moderate: number;
+    low: number;
+    unknown?: number;
+    total: number;
+  },
+  options?: { ran?: boolean },
+): string {
+  if (summary.total === 0) {
+    return options?.ran ? "No known vulnerabilities" : "Audit did not run";
+  }
   const parts: string[] = [];
   if (summary.critical) parts.push(`${summary.critical} critical`);
   if (summary.high) parts.push(`${summary.high} high`);

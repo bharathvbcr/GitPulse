@@ -83,9 +83,15 @@ fn live_pip_audit_reports_flask_advisories() {
     git_add(repo.path(), "requirements.txt");
     git_add(repo.path(), "app.py");
 
-    let report =
-        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
-            .expect("scan");
+    let report = DepsScanner::scan_with(
+        repo.path().to_str().unwrap(),
+        ScanOptions {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        },
+    )
+    .expect("scan");
 
     assert!(
         report.pip_audit_present,
@@ -142,9 +148,15 @@ fn live_bundler_audit_reports_nokogiri_advisory() {
     git_add(repo.path(), "Gemfile");
     git_add(repo.path(), "Gemfile.lock");
 
-    let report =
-        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
-            .expect("scan");
+    let report = DepsScanner::scan_with(
+        repo.path().to_str().unwrap(),
+        ScanOptions {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        },
+    )
+    .expect("scan");
 
     assert!(
         report.bundler_audit_present,
@@ -213,9 +225,15 @@ fn live_cargo_audit_reports_time_rustsec() {
     git_add(repo.path(), "Cargo.toml");
     git_add(repo.path(), "Cargo.lock");
 
-    let report =
-        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
-            .expect("scan");
+    let report = DepsScanner::scan_with(
+        repo.path().to_str().unwrap(),
+        ScanOptions {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        },
+    )
+    .expect("scan");
 
     assert!(
         report.cargo_audit_present,
@@ -276,9 +294,15 @@ fn live_npm_audit_reports_lodash_advisories() {
     git_add(repo.path(), "package.json");
     git_add(repo.path(), "package-lock.json");
 
-    let report =
-        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
-            .expect("scan");
+    let report = DepsScanner::scan_with(
+        repo.path().to_str().unwrap(),
+        ScanOptions {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        },
+    )
+    .expect("scan");
 
     assert!(
         report.npm_cli_present,
@@ -339,9 +363,15 @@ fn live_govulncheck_reports_xtext_module_findings() {
     }
     git_add(repo.path(), "main.go");
 
-    let report =
-        DepsScanner::scan_with(repo.path().to_str().unwrap(), ScanOptions { run_cli: true })
-            .expect("scan");
+    let report = DepsScanner::scan_with(
+        repo.path().to_str().unwrap(),
+        ScanOptions {
+            run_cli: true,
+            path_var: None,
+            home: None,
+        },
+    )
+    .expect("scan");
 
     assert!(
         report.govulncheck_present,

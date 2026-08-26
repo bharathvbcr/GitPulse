@@ -1,3 +1,12 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+
+  // Survives remounts ({#key} on currentPath re-creates this bar on every
+  // repo switch) so switching back to a repo renders its bar instantly; the
+  // fetch then refreshes it in place.
+  const statsCache = createRepoPanelCache<LanguageStat[]>();
+</script>
+
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -5,21 +14,32 @@
 
   let stats: LanguageStat[] = $state([]);
 
+  // Memoized on currentPath: store emissions from the ~6s status poll and
+  // branch-stats drains would otherwise cancel and refetch the language
+  // stats on every tick.
+  let prevPath: string | null = null;
   $effect(() => {
     const path = $repoStore.currentPath;
+    if (path === prevPath) return;
+    prevPath = path;
     if (!path) {
       stats = [];
       return;
     }
+    const cached = statsCache.get(path);
+    if (cached) stats = cached;
     let cancelled = false;
     invoke<LanguageStat[]>("cmd_get_language_stats", {
       repoPath: path,
     })
       .then((s) => {
-        if (!cancelled) stats = pickLanguageBarStats(s);
+        if (!cancelled) {
+          stats = pickLanguageBarStats(s);
+          statsCache.set(path, stats);
+        }
       })
       .catch(() => {
-        if (!cancelled) stats = [];
+        if (!cancelled && !cached) stats = [];
       });
     return () => {
       cancelled = true;

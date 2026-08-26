@@ -116,9 +116,21 @@ export interface AnnotatedDiffLine {
   /** Line number in the new file, when the hunk header knows it. */
   newNo?: number;
   segments?: DiffSegment[];
+  /**
+   * True when git's `\ No newline at end of file` marker followed this
+   * add/del row: the file side this row belongs to lacks a trailing newline.
+   * The patch builder turns this back into the marker text so EOF-hunk
+   * staging produces byte-exact blobs.
+   */
+  noNewline?: boolean;
 }
 
-const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+/**
+ * Tolerates git's occasional padded form (`@@  -5 +5 @@`) by allowing any
+ * whitespace run where a single space used to be required. Unanchored at the
+ * end so trailing section headings (`@@ ... @@ fn main()`) still match.
+ */
+const HUNK_RE = /^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/;
 
 /**
  * Commit-level metadata that `git show` interleaves with per-file patches.
@@ -167,17 +179,43 @@ export function classifyMetaLine(line: string): "meta" | "binary" | null {
  * window instead. Hunk headers are tracked here, so line numbers come from
  * git rather than being faked with row indices.
  */
-export function parseUnifiedDiff(raw: string): AnnotatedDiffLine[] {
+export function parseUnifiedDiff(raw: string | null | undefined): AnnotatedDiffLine[] {
   const out: AnnotatedDiffLine[] = [];
   let oldNo = 0;
   let newNo = 0;
   let inHunk = false;
-  for (const line of (raw || "").split("\n")) {
+  /** Set by a `GIT binary patch` line; cleared by the next `diff --git`. */
+  let inBinaryPayload = false;
+  // split("\n") appends one trailing "" to every newline-terminated input
+  // (and yields [""] for ""). That empty element is the terminator, not a
+  // line: keeping it used to fabricate a phantom context row inside the last
+  // hunk, which corrupted built patches and inflated every count derived
+  // from them. Exactly one trailing "" is dropped; genuine blank lines mid-
+  // diff are unaffected.
+  const rows = (raw || "").split("\n");
+  if (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+  for (const line of rows) {
+    if (inBinaryPayload) {
+      if (line.startsWith("diff --git ")) {
+        inBinaryPayload = false;
+      } else {
+        // Base85 payload lines may begin with '+' or '-'; classifying them
+        // through the normal path turned them into phantom add/del rows.
+        out.push({ type: "binary", content: line });
+        continue;
+      }
+    }
     if (line.startsWith("@@")) {
       const match = HUNK_RE.exec(line);
       if (match) {
         oldNo = parseInt(match[1], 10);
         newNo = parseInt(match[2], 10);
+      } else {
+        // A @@-prefixed line that resists parsing must not inherit the
+        // previous hunk's numbering: reset so body rows get undefined
+        // numbers instead of cross-file stale ones.
+        oldNo = 0;
+        newNo = 0;
       }
       out.push({ type: "hdr", content: line });
       inHunk = true;
@@ -187,6 +225,7 @@ export function parseUnifiedDiff(raw: string): AnnotatedDiffLine[] {
     if (metaKind) {
       if (line.startsWith("diff --git ")) inHunk = false;
       out.push({ type: metaKind, content: line });
+      if (line === "GIT binary patch") inBinaryPayload = true;
       continue;
     }
     // File headers only ever appear between `diff --git` and the first `@@`.
@@ -203,7 +242,13 @@ export function parseUnifiedDiff(raw: string): AnnotatedDiffLine[] {
       out.push({ type: "del", content: line, oldNo: oldNo || undefined });
       if (oldNo) oldNo += 1;
     } else if (line.startsWith("\\")) {
-      // "\ No newline at end of file"
+      // "\ No newline at end of file": still displayed as a hdr-style row,
+      // but it also flags the row it annotates so staging can reproduce the
+      // missing trailing newline exactly.
+      if (inHunk) {
+        const prev = out[out.length - 1];
+        if (prev && (prev.type === "add" || prev.type === "del")) prev.noNewline = true;
+      }
       out.push({ type: "hdr", content: line });
     } else if (inHunk) {
       out.push({
@@ -221,6 +266,57 @@ export function parseUnifiedDiff(raw: string): AnnotatedDiffLine[] {
     }
   }
   return out;
+}
+
+export interface ParseCache {
+  parse(input: string | null): AnnotatedDiffLine[];
+}
+
+/**
+ * Memoizes the LAST parse by string reference identity.
+ *
+ * repoStore republishes a fresh state object on every background poll while
+ * `selectedDiff` stays the same string; reference-stable strings make re-runs
+ * O(1) instead of re-parsing up to 300k lines — and because the cached array
+ * keeps the exact line objects, memoized word-diff segments survive across
+ * unrelated publications instead of being discarded with each re-parse.
+ */
+export function createParseCache(): ParseCache {
+  let lastInput: string | null = null;
+  let lastOutput: AnnotatedDiffLine[] = [];
+  return {
+    parse(input: string | null): AnnotatedDiffLine[] {
+      if (input === lastInput) return lastOutput;
+      lastInput = input;
+      lastOutput = parseUnifiedDiff(input ?? "");
+      return lastOutput;
+    },
+  };
+}
+
+/**
+ * Full extent of the replacement block containing `index`, as `[start, end)`
+ * bounds into `lines`, or null for non add/del rows.
+ *
+ * A block is a run of dels followed by a run of adds; both runs pair as a
+ * unit (min(del, add) lines). Computing it from ANY row inside the block
+ * yields identical bounds, which is what lets a window that merely straddles
+ * part of the block still annotate the whole thing correctly instead of
+ * mispairing a sub-range of dels against a sub-range of adds.
+ */
+export function replacementBlockBounds(
+  lines: AnnotatedDiffLine[],
+  index: number
+): [number, number] | null {
+  const line = lines[index];
+  if (!line || (line.type !== "del" && line.type !== "add")) return null;
+  let start = index;
+  while (start > 0 && lines[start - 1].type === "add") start -= 1;
+  while (start > 0 && lines[start - 1].type === "del") start -= 1;
+  let end = index + 1;
+  while (end < lines.length && lines[end].type === "del") end += 1;
+  while (end < lines.length && lines[end].type === "add") end += 1;
+  return [start, end];
 }
 
 /**

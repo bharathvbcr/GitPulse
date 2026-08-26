@@ -261,16 +261,14 @@ describe("parseUnifiedDiff + annotateRange stress: 200-line document", () => {
 // ---------------------------------------------------------------------------
 
 describe("parseUnifiedDiff stress: header degeneracy", () => {
-  it("reduces an empty payload to a single phantom meta row (characterization)", () => {
-    // "".split("\n") is [""], and the empty string falls into the
-    // outside-hunk else branch → one {type:"meta", content:""} row. The UI
-    // filters meta rows, so this is invisible today — pinned so a renderer
-    // that starts trusting row counts knows.
-    expect(parseUnifiedDiff("")).toEqual([{ type: "meta", content: "" }]);
-    // `raw || ""` also guards nullish callers.
-    expect(parseUnifiedDiff(undefined as unknown as string)).toEqual([
-      { type: "meta", content: "" },
-    ]);
+  it("reduces empty and nullish payloads to zero rows", () => {
+    // CHANGED (bug fix): "".split("\n") used to yield [""], and the empty
+    // string fell into the outside-hunk else branch → one {type:"meta",
+    // content:""} phantom row. That row made the UI's EmptyState branch
+    // unreachable and inflated every count. An empty diff is zero rows.
+    expect(parseUnifiedDiff("")).toEqual([]);
+    expect(parseUnifiedDiff(undefined as unknown as string)).toEqual([]);
+    expect(parseUnifiedDiff(null as unknown as string)).toEqual([]);
   });
 
   it("classifies a lone '@' outside a hunk as meta, not content", () => {
@@ -294,13 +292,22 @@ describe("parseUnifiedDiff stress: header degeneracy", () => {
   });
 
   it("treats any '@@'-prefixed line as a header even when HUNK_RE cannot parse numbers", () => {
-    // "@@" alone or "@@ garbage" becomes a hdr row with inHunk set, but the
-    // counters are NEVER reset — subsequent body lines are numbered against
-    // the STALE previous header. Characterized, not endorsed.
+    // CHANGED (bug fix): "@@" alone or "@@ garbage" becomes a hdr row with
+    // inHunk set, but the counters are now RESET instead of silently
+    // inheriting the previous hunk's numbering. Body rows after an
+    // unparseable header carry undefined numbers — never a cross-file lie.
     const rows = parseUnifiedDiff("@@ -5,1 +5,1 @@\n-a\n@@\n+b");
     expect(rows.map((r) => r.type)).toEqual(["hdr", "del", "hdr", "add"]);
     expect(rows[1].oldNo).toBe(5);
-    expect(rows[3].newNo).toBe(5); // stale "+5" header kept counting from 5
+    expect(rows[3].oldNo).toBeUndefined();
+    expect(rows[3].newNo).toBeUndefined();
+  });
+
+  it("accepts git's padded hunk headers through the relaxed HUNK_RE", () => {
+    const rows = parseUnifiedDiff("@@  -12,3 +14,4 @@ fn padded()\n ctx\n+added\n");
+    expect(rows[0].type).toBe("hdr");
+    expect(rows[1]).toMatchObject({ type: "ctx", oldNo: 12, newNo: 14 });
+    expect(rows[2]).toMatchObject({ type: "add", newNo: 15 });
   });
 
   it("never throws on '@@' with NUL bytes or lone surrogates embedded", () => {
@@ -352,16 +359,16 @@ describe("parseUnifiedDiff stress: CR handling", () => {
 
   it("parses CRLF hunk headers because HUNK_RE is end-unanchored", () => {
     const rows = parseUnifiedDiff("@@ -3,1 +3,1 @@\r\n ctx\r\n-old\r\n+new\r\n");
-    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "del", "add", "ctx"]);
+    expect(rows.map((r) => r.type)).toEqual(["hdr", "ctx", "del", "add"]);
     expect(rows[0].content.endsWith("\r")).toBe(true);
     expect(rows[1].oldNo).toBe(3);
     expect(rows[3].content).toBe("+new\r");
     // The leading ctx already consumed one number from each side.
     expect(rows[3].newNo).toBe(4);
-    // The final "" from the trailing \n lands inside the hunk → one phantom
-    // ctx row that bumps both counters. Characterized; renderers show it as
-    // an empty line exactly like git's own blank context lines.
-    expect(rows[4]).toEqual({ type: "ctx", content: "", oldNo: 5, newNo: 5 });
+    // CHANGED (bug fix): the final "" split artifact from the trailing \n
+    // used to land inside the hunk as one phantom ctx row bumping both
+    // counters. It was the line terminator, not a line, and is now dropped.
+    expect(rows).toHaveLength(4);
   });
 
   it("handles mixed LF and CRLF endings in one payload without throwing", () => {
@@ -451,6 +458,55 @@ describe("parseUnifiedDiff stress: \\ No newline markers", () => {
     // The markers must not disturb the counters feeding neighboring rows.
     expect(rows[2].oldNo).toBe(2);
     expect(rows[4].newNo).toBe(2);
+    // Each marker flags exactly its own preceding row.
+    expect(rows[2].noNewline).toBe(true);
+    expect(rows[4].noNewline).toBe(true);
+  });
+
+  it("never lets a marker flag a row across an intervening row type", () => {
+    const rows = parseUnifiedDiff(
+      ["@@ -1,3 +1,3 @@", "-gone", "index 111..222 100644", "+born", "\\ No newline at end of file"].join("\n")
+    );
+    expect(rows[1].type).toBe("del");
+    expect(rows[1].noNewline).toBeUndefined();
+    // The meta row between del and add breaks adjacency; only "+born"
+    // (immediately before the marker) gets flagged.
+    expect(rows[2].type).toBe("meta");
+    expect(rows[3].noNewline).toBe(true);
+  });
+});
+
+describe("parseUnifiedDiff stress: GIT binary payload sections", () => {
+  it("swallows hostile-looking base85 payloads without phantom diff rows", () => {
+    // Adversarial payload: every line begins with a patch-body character.
+    // Before the binary-section rule these became add/del/meta soup and
+    // corrupted numbering for any file that followed.
+    const raw = [
+      "diff --git a/blob.bin b/blob.bin",
+      "index 1111111..2222222 100644",
+      "GIT binary patch",
+      "literal 96",
+      "-cmZ<+q0u~000000",
+      "+cmZ>+r1v!111111",
+      "\\ No newline at end of file",
+      "@@ -1 +1 @@",
+      "",
+      "diff --git a/after.txt b/after.txt",
+      "--- a/after.txt",
+      "+++ b/after.txt",
+      "@@ -7 +7 @@",
+      "+after edit",
+    ].join("\n");
+    const rows = parseUnifiedDiff(raw);
+    // Everything from GIT binary patch up to (not including) the next
+    // diff --git is binary chrome — even lines starting with '-', '\\', '@@'.
+    const start = rows.findIndex((l) => l.content === "GIT binary patch");
+    const end = rows.findIndex((l) => l.content === "diff --git a/after.txt b/after.txt");
+    for (let i = start; i < end; i += 1) {
+      expect(rows[i].type).toBe("binary");
+    }
+    expect(rows.filter((l) => l.type === "add" || l.type === "del")).toHaveLength(1);
+    expect(rows.at(-1)).toMatchObject({ type: "add", newNo: 7 });
   });
 });
 
@@ -511,9 +567,9 @@ describe("classifyMetaLine vs filterFilePatch agreement", () => {
     expect(filterFilePatch(twoFilePayload, "nope/missing.txt")).toBe("");
     expect(filterFilePatch(twoFilePayload, "")).toBe("");
     expect(filterFilePatch("", "any.txt")).toBe("");
-    // Empty input reduces to the single phantom meta row (see header
-    // degeneracy suite) — never a throw.
-    expect(parseUnifiedDiff("")).toEqual([{ type: "meta", content: "" }]);
+    // Empty input parses to zero rows (see header degeneracy suite) — never
+    // a throw, never a phantom row.
+    expect(parseUnifiedDiff("")).toEqual([]);
   });
 
   it("agrees with classifyMetaLine: meta-classified lines never leak into a kept patch body", () => {

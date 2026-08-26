@@ -14,7 +14,10 @@ export const BRANCH_PALETTE = [
 ];
 
 export function getBranchColor(colorIndex: number): string {
-  if (colorIndex < 0 || isNaN(colorIndex)) return BRANCH_PALETTE[0];
+  // ±Infinity slips past the NaN check and poisons the modulo (Infinity % n
+  // is NaN), which used to hand strokeStyle an undefined and silently inherit
+  // whatever colour the previous edge left behind.
+  if (!Number.isFinite(colorIndex) || colorIndex < 0) return BRANCH_PALETTE[0];
   return BRANCH_PALETTE[colorIndex % BRANCH_PALETTE.length];
 }
 

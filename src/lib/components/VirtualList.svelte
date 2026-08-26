@@ -1,6 +1,10 @@
 <script lang="ts" generics="T">
   import type { Snippet } from "svelte";
-  import { computeWindow } from "../dom/virtualWindow";
+  import {
+    clampScrollTop,
+    computeWindow,
+    ensureNonEmptyWindow,
+  } from "../dom/virtualWindow";
 
   interface Props {
     /** Rows to window over. Omit and pass `itemCount` to render blanks. */
@@ -33,7 +37,23 @@
   let viewportHeight = $state(0);
 
   let total = $derived(itemCount ?? items?.length ?? 0);
-  let win = $derived(computeWindow(scrollTop, viewportHeight, total, rowHeight, overscan));
+  // Render from the clamped anchor: when the list shrinks under a deep
+  // scroll (whitespace collapse, file switch), the raw bindable sits past
+  // the content for a frame until the browser's async clamp round-trips.
+  // Window AND translate both derive from the clamped value so the tail
+  // paints immediately, and ensureNonEmptyWindow absorbs the residual float
+  // edge where the clamped cap rounds past the last row. The spacer below
+  // stays at total * rowHeight, so the scrollbar keeps telling the truth and
+  // the 0.5px sync guard lets the bindable converge on its own.
+  let effectiveScrollTop = $derived(clampScrollTop(scrollTop, total, rowHeight, viewportHeight));
+  let win = $derived(
+    ensureNonEmptyWindow(
+      computeWindow(effectiveScrollTop, viewportHeight, total, rowHeight, overscan),
+      total,
+      rowHeight,
+      viewportHeight
+    )
+  );
 
   function handleScroll(event: Event) {
     scrollTop = (event.target as HTMLDivElement).scrollTop;
@@ -43,7 +63,11 @@
     const el = scroller;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
-      viewportHeight = entries[0]?.contentRect.height || 0;
+      // A bogus measurement (NaN / ±Infinity / negative) collapses to 0,
+      // exactly how computeWindow treats degenerate viewports — it must not
+      // poison the window math.
+      const measured = entries[0]?.contentRect.height;
+      viewportHeight = Number.isFinite(measured) && measured > 0 ? measured : 0;
     });
     observer.observe(el);
     return () => observer.disconnect();

@@ -1,40 +1,6 @@
-<script lang="ts">
-  import { SvelteSet } from "svelte/reactivity";
-  import { repoStore } from "../stores/repoStore";
-  import { graphStore } from "../stores/graphStore";
-  import { invoke } from "@tauri-apps/api/core";
-  import {
-    Github,
-    GitPullRequest,
-    ExternalLink,
-    Play,
-    GitBranch,
-    Tag,
-    Workflow,
-    RotateCcw,
-    Square,
-    Terminal,
-  } from "lucide-svelte";
-  import { openUrl } from "@tauri-apps/plugin-opener";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import type {
-    GitHubContextBase,
-    WorkflowInfo,
-    WorkflowRunInfo,
-    WorkflowsReport,
-    CiLocalReport,
-  } from "../github/types";
-  import {
-    canCancelRun,
-    canRerunRun,
-    ciLocalVerdict,
-    ciStepClass,
-    isWorkflowDispatchable,
-    workflowStateLabel,
-  } from "../github/runActions";
-  import { formatReleaseDate } from "../ops/model";
-  import { formatError } from "../ui/formatError";
-  import EmptyState from "./EmptyState.svelte";
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import type { WorkflowsReport, GitHubContextBase } from "../github/types";
 
   interface PullRequestInfo {
     number: number;
@@ -52,7 +18,56 @@
     host: string;
     html_url: string;
     pull_requests: PullRequestInfo[];
+    /** True when more open PRs exist than the display cap kept. */
+    prs_truncated?: boolean;
   }
+
+  // Survive the per-tab remount so revisiting the GitHub view renders the
+  // last-known context and workflow listing instantly; the fetches then
+  // refresh them in place.
+  const ctxCache = createRepoPanelCache<GitHubContext>();
+  const workflowsCache = createRepoPanelCache<WorkflowsReport>();
+</script>
+
+<script lang="ts">
+  import { SvelteSet } from "svelte/reactivity";
+  import { repoStore } from "../stores/repoStore";
+  import { graphStore, serverFetchableQuery } from "../stores/graphStore";
+  import { filterStore } from "../stores/filterStore";
+  import { invoke } from "@tauri-apps/api/core";
+  import {
+    Github,
+    GitPullRequest,
+    ExternalLink,
+    Play,
+    GitBranch,
+    Tag,
+    Workflow,
+    RotateCcw,
+    Square,
+    Terminal,
+    LoaderCircle,
+  } from "lucide-svelte";
+  import { openExternal as openExternalUrl } from "../desktop/openExternal";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { harnessStore, verdictLabel, type Guarded } from "../stores/harnessStore";
+  import type {
+    WorkflowInfo,
+    WorkflowRunInfo,
+    CiLocalReport,
+  } from "../github/types";
+  import {
+    canCancelRun,
+    canRerunRun,
+    ciLocalVerdict,
+    ciStepClass,
+    isWorkflowDispatchable,
+    workflowStateLabel,
+  } from "../github/runActions";
+  import { formatReleaseDate } from "../ops/model";
+  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
+  import EmptyState from "./EmptyState.svelte";
 
   let ctx = $state<GitHubContext | null>(null);
   let loading = $state(false);
@@ -76,6 +91,8 @@
   let ciRunning = $state(false);
   let ciReport = $state<CiLocalReport | null>(null);
   let ciError = $state<string | null>(null);
+  /** A CI run outlives branch switches; the guard retires superseded runs. */
+  let ciInflight: AsyncGuard | null = null;
 
   /** Panel-scoped feedback for the last attempted action; cleared on reload. */
   let actionNotice = $state<string | null>(null);
@@ -90,10 +107,14 @@
       repo: "",
       html_url: "",
       pull_requests: [],
+      prs_truncated: false,
       workflow_runs: [],
+      runs_error: null,
+      runs_truncated: false,
       releases: [],
       releases_truncated: false,
       releases_error: null,
+      warnings: [],
       error,
     };
   }
@@ -107,6 +128,7 @@
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
       if (!guard.isLive()) return;
       ctx = next;
+      ctxCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
       ctx = emptyContext(formatError(err));
@@ -124,6 +146,7 @@
       const next = await invoke<WorkflowsReport>("cmd_github_workflows", { repoPath: repo });
       if (!guard.isLive()) return;
       workflows = next;
+      workflowsCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
       workflows = {
@@ -150,14 +173,28 @@
     return () => {
       inflight?.cancel();
       workflowsInflight?.cancel();
+      ciInflight?.cancel();
     };
   });
 
+  // Reload context + workflows only when the real dependencies change (repo,
+  // checked-out branch for the dispatch-ref default). Every status-poll /
+  // stats-drain emission re-runs this effect otherwise, blanking ctx
+  // mid-flight, clearing checkout spinners, and clobbering the dispatchRef
+  // input the user may be editing.
+  let prevRepo: string | null = null;
+  let prevBranch: string | null = null;
   $effect(() => {
     const repo = $repoStore.currentPath;
-    ctx = null;
+    const branch = $repoStore.currentBranch;
+    if (repo === prevRepo && branch === prevBranch) return;
+    prevRepo = repo;
+    prevBranch = branch;
+    // Hydrate last-known data synchronously so a revisit renders instantly;
+    // the fetches below then refresh it in place.
+    ctx = ctxCache.get(repo ?? "") ?? null;
+    workflows = workflowsCache.get(repo ?? "") ?? null;
     checkingOut.clear();
-    workflows = null;
     ciReport = null;
     ciError = null;
     ciRunning = false;
@@ -168,6 +205,7 @@
     if (!repo) {
       inflight?.cancel();
       workflowsInflight?.cancel();
+      ciInflight?.cancel();
       loading = false;
       workflowsLoading = false;
       return;
@@ -186,7 +224,10 @@
     const s = status.toLowerCase();
     if (s === "success" || s === "completed") return "text-green-400";
     if (s === "failure" || s === "cancelled" || s === "timed_out") return "text-red-400";
-    if (s === "pending" || s === "in_progress" || s === "queued") return "text-amber-400";
+    // `waiting`/`requested` sit behind deployment protections/approvals —
+    // in flight, never a verdict.
+    if (s === "pending" || s === "in_progress" || s === "queued" || s === "waiting" || s === "requested")
+      return "text-amber-400";
     return "text-textMuted";
   }
 
@@ -194,16 +235,34 @@
     return run.conclusion || run.status || "unknown";
   }
 
+  /**
+   * Opens advisory/GitHub URLs through the canonical OS opener. The shared
+   * opener throws on failure (no window.open fallback: it could navigate the
+   * app shell); here the failure is surfaced in-place via the action banner
+   * and the persistent diagnostics ring.
+   */
   async function openExternal(url: string) {
-    // No window.open fallback: inside a Tauri webview it can navigate the
-    // app shell itself, and these URLs come from advisory/GitHub payloads.
-    // If the opener plugin fails, surfacing the failure beats handing the
-    // webview to an arbitrary URL.
     try {
-      await openUrl(url);
+      await openExternalUrl(url);
     } catch (err) {
-      console.error("openUrl failed for", url, err);
+      actionError = reportPanelError("github", err);
     }
+  }
+
+  /**
+   * Files a gated action's policy verdict with the harness store so the
+   * journal records what the gate decided — including "no gate present".
+   * These actions bypass repoStore.runMutating, so without this the verdict
+   * would be dropped on the floor.
+   */
+  function fileVerdict(result: Guarded<string> | null) {
+    harnessStore.recordVerdict(result?.policy ?? null);
+  }
+
+  /** Builds the action notice from gh's output, with verdict context. */
+  function actionMessage(result: Guarded<string>, fallback: string): string {
+    const base = result.output || fallback;
+    return `${base}${result.policy ? ` — ${verdictLabel(result.policy)}` : ""}`;
   }
 
   async function checkoutPr(number: number) {
@@ -213,14 +272,24 @@
     // spinner state; while any is running every button is disabled.
     checkingOut.add(number);
     try {
-      await invoke("cmd_github_checkout_pr", {
+      const result = await invoke<Guarded<string>>("cmd_github_checkout_pr", {
         repoPath: repo,
         number,
       });
+      fileVerdict(result);
       if ($repoStore.currentPath !== repo) return;
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
-      await graphStore.loadGraph(repo);
+      // Post-mutation reload keeps the visible filter context, sanitized:
+      // a bare loadGraph(repo) reset the graph to query=""/HEAD while
+      // FilterBar still showed the selection, and a client-side query sent
+      // unsanitized would be laundered into the cached payload server-side
+      // (see serverFetchableQuery).
+      await graphStore.loadGraph(
+        repo,
+        serverFetchableQuery($filterStore.searchQuery),
+        $filterStore.selectedBranch,
+      );
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) {
         repoStore.setError(formatError(err));
@@ -246,14 +315,18 @@
     actionError = null;
     actionNotice = null;
     try {
-      const output = await invoke<string>("cmd_github_trigger_workflow", {
+      // The backend returns { policy, output }; treating that object as a
+      // string used to render "[object Object]" in the success banner.
+      const result = await invoke<Guarded<string>>("cmd_github_trigger_workflow", {
         repoPath: repo,
         workflow: workflow.path,
         gitRef: refName,
       });
-      actionNotice =
-        output ||
-        `Dispatched ${workflow.name || workflow.path} at ${refName}. It may take a moment to appear.`;
+      fileVerdict(result);
+      actionNotice = actionMessage(
+        result,
+        `Dispatched ${workflow.name || workflow.path} at ${refName}. It may take a moment to appear.`,
+      );
       await Promise.all([loadFor(repo), loadWorkflowsFor(repo)]);
     } catch (err: unknown) {
       actionError = formatError(err);
@@ -269,11 +342,12 @@
     actionError = null;
     actionNotice = null;
     try {
-      const output = await invoke<string>("cmd_github_rerun_run", {
+      const result = await invoke<Guarded<string>>("cmd_github_rerun_run", {
         repoPath: repo,
         runId: run.id,
       });
-      actionNotice = output || `Re-running “${run.title || run.name}”.`;
+      fileVerdict(result);
+      actionNotice = actionMessage(result, `Re-running “${run.title || run.name}”.`);
       await loadFor(repo);
     } catch (err: unknown) {
       actionError = formatError(err);
@@ -289,11 +363,15 @@
     actionError = null;
     actionNotice = null;
     try {
-      const output = await invoke<string>("cmd_github_cancel_run", {
+      const result = await invoke<Guarded<string>>("cmd_github_cancel_run", {
         repoPath: repo,
         runId: run.id,
       });
-      actionNotice = output || `Cancellation requested for “${run.title || run.name}”.`;
+      fileVerdict(result);
+      actionNotice = actionMessage(
+        result,
+        `Cancellation requested for “${run.title || run.name}”.`,
+      );
       await loadFor(repo);
     } catch (err: unknown) {
       actionError = formatError(err);
@@ -305,15 +383,24 @@
   async function runCiLocally() {
     const repo = $repoStore.currentPath;
     if (!repo || ciRunning) return;
+    // A CI run outlives branch switches (a PR checkout re-fires the mount
+    // effect); the guard makes a superseded run's late result inert instead
+    // of letting two pipelines race to write ciReport last.
+    ciInflight?.cancel();
+    const guard = createAsyncGuard();
+    ciInflight = guard;
     ciRunning = true;
     ciReport = null;
     ciError = null;
     try {
-      ciReport = await invoke<CiLocalReport>("cmd_ci_local", { repoPath: repo });
+      const report = await invoke<CiLocalReport>("cmd_ci_local", { repoPath: repo });
+      if (!guard.isLive()) return;
+      ciReport = report;
     } catch (err: unknown) {
+      if (!guard.isLive()) return;
       ciError = formatError(err);
     } finally {
-      ciRunning = false;
+      if (guard.isLive()) ciRunning = false;
     }
   }
 </script>
@@ -339,7 +426,14 @@
           {ciRunning ? "Running…" : "Run CI locally"}
         </span>
       </button>
-      <button type="button" onclick={loadAll} class="gp-btn">Refresh</button>
+      <button type="button" onclick={loadAll} class="gp-btn">
+        <span class="inline-flex items-center gap-1.5">
+          {#if (loading && !ctx) || (workflowsLoading && !workflows)}
+            <LoaderCircle size={13} class="animate-spin" />
+          {/if}
+          Refresh
+        </span>
+      </button>
     </div>
   </div>
 
@@ -381,7 +475,7 @@
     </div>
   {/if}
 
-  {#if loading || workflowsLoading}
+  {#if (loading && !ctx) || (workflowsLoading && !workflows)}
     <div class="text-textMuted">Loading GitHub status…</div>
   {:else if ctx?.error}
     <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs max-w-xl">
@@ -402,11 +496,20 @@
         {actionError ?? actionNotice}
       </div>
     {/if}
+    {#if (ctx.warnings?.length ?? 0) > 0}
+      <div class="mb-4 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs max-w-3xl space-y-1">
+        {#each ctx.warnings as warning}
+          <div>{warning}</div>
+        {/each}
+      </div>
+    {/if}
     <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-5 max-w-7xl">
       <section>
         <h3 class="text-[11px] uppercase tracking-wider text-textMuted mb-2">Open pull requests</h3>
-        {#if ctx.pull_requests.length === 0}
+        {#if ctx.pull_requests.length === 0 && !ctx.prs_truncated}
           <EmptyState icon={GitPullRequest} title="No open pull requests" compact />
+        {:else if ctx.pull_requests.length === 0}
+          <EmptyState icon={GitPullRequest} title="No open pull requests shown" compact />
         {:else}
           <div class="space-y-2">
             {#each ctx.pull_requests as pr}
@@ -448,6 +551,9 @@
               </div>
             {/each}
           </div>
+          {#if ctx.prs_truncated}
+            <div class="mt-2 text-amber-400 text-[11px]">Showing {ctx.pull_requests.length} pull requests; more open PRs exist. This is not complete coverage.</div>
+          {/if}
         {/if}
       </section>
 
@@ -457,7 +563,16 @@
           <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs">
             Workflow listing unavailable: {workflows.error}
           </div>
-        {:else if !workflows || workflows.workflows.length === 0}
+        {:else if !workflows}
+          {#if workflowsLoading}
+            <div class="flex items-center gap-1.5 text-textMuted text-[11px]">
+              <LoaderCircle size={12} class="animate-spin" />
+              Loading workflows…
+            </div>
+          {:else}
+            <EmptyState icon={Workflow} title="No Actions workflows" compact />
+          {/if}
+        {:else if workflows.workflows.length === 0}
           <EmptyState icon={Workflow} title="No Actions workflows" compact />
         {:else}
           <div class="flex items-center gap-2 mb-2">
@@ -568,7 +683,11 @@
 
       <section>
         <h3 class="text-[11px] uppercase tracking-wider text-textMuted mb-2">Workflow runs</h3>
-        {#if ctx.workflow_runs.length === 0}
+        {#if ctx.runs_error}
+          <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs">
+            Run listing unavailable: {ctx.runs_error}
+          </div>
+        {:else if ctx.workflow_runs.length === 0}
           <EmptyState icon={Play} title="No recent Actions runs" compact />
         {:else}
           <div class="space-y-2">
@@ -624,6 +743,9 @@
               </div>
             {/each}
           </div>
+          {#if ctx.runs_truncated}
+            <div class="mt-2 text-amber-400 text-[11px]">Showing the {ctx.workflow_runs.length} most recent runs; older runs exist.</div>
+          {/if}
         {/if}
       </section>
     </div>

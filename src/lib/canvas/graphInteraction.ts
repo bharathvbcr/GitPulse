@@ -4,6 +4,14 @@ export interface GraphTooltipPosition {
   left: number;
   top: number;
   placement: TooltipPlacement;
+  /**
+   * X of the pointer inside the tooltip box — where the caret belongs so it
+   * keeps pointing at the cursor even after horizontal clamping shoves the
+   * box away from the pointer. Always within [16, width-16] when the box is
+   * at least 32px wide; callers render the caret at this offset instead of a
+   * fixed left edge that silently detaches near the right border.
+   */
+  anchorX: number;
 }
 
 export interface VerticalScroller {
@@ -66,6 +74,19 @@ export function positionGraphTooltip(
   tooltipWidth: number,
   tooltipHeight: number,
 ): GraphTooltipPosition {
+  // A NaN pointer used to flow through clamp() and freeze the tooltip at a
+  // translate3d(NaN) position; sibling normalizeWheelDelta already guards,
+  // so mirror it here for parity.
+  if (
+    !Number.isFinite(pointerX) ||
+    !Number.isFinite(pointerY) ||
+    !Number.isFinite(viewportWidth) ||
+    !Number.isFinite(viewportHeight) ||
+    !Number.isFinite(tooltipWidth) ||
+    !Number.isFinite(tooltipHeight)
+  ) {
+    return { left: TOOLTIP_EDGE_GAP, top: TOOLTIP_EDGE_GAP, placement: "below", anchorX: 16 };
+  }
   const maxLeft = Math.max(TOOLTIP_EDGE_GAP, viewportWidth - tooltipWidth - TOOLTIP_EDGE_GAP);
   const left = clamp(
     pointerX + TOOLTIP_POINTER_GAP,
@@ -79,10 +100,14 @@ export function positionGraphTooltip(
     ? pointerY + TOOLTIP_POINTER_GAP
     : pointerY - TOOLTIP_POINTER_GAP - tooltipHeight;
   const maxTop = Math.max(TOOLTIP_EDGE_GAP, viewportHeight - tooltipHeight - TOOLTIP_EDGE_GAP);
+  // Caret tracks the pointer within the clamped box; inset keeps the rotated
+  // square (12px) fully inside the rounded corner radius at both ends.
+  const anchorX = clamp(pointerX - left, 16, Math.max(16, tooltipWidth - 16));
 
   return {
     left,
     top: clamp(preferredTop, TOOLTIP_EDGE_GAP, maxTop),
     placement,
+    anchorX,
   };
 }

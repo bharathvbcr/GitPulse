@@ -10,7 +10,7 @@
 //! these subcommands inherit only `--repo` (verified against gh 2.95.0), not
 //! the separate `--hostname` flag the older repo-context calls use.
 
-use super::{discover_github_remote, gh_cli_present, GitHubRepoRef};
+use super::{discover_github_remote, gh_cli_present, GitHubRepoRef, MAX_GH_ERROR_BYTES};
 use crate::engine::git_cli::{capture_command, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
 use serde::{Deserialize, Serialize};
@@ -138,11 +138,11 @@ pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = capture_command("gh", &refs, None, GH_CALL_TIMEOUT, &[])?;
     if !stdout.success {
-        let err = stdout.stderr_text();
+        let err = crate::engine::git_cli::byte_tail(&stdout.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
             format!("gh exited {}", stdout.status_code)
         } else {
-            err
+            err.trim().to_string()
         });
     }
     parse_workflow_list(&stdout.stdout, WORKFLOW_DISPLAY_LIMIT)
@@ -178,8 +178,8 @@ pub fn validate_workflow_selector(selector: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// The exact argv [`trigger_workflow`] runs. Kept separate from execution so
-/// the command gate judges the real line, not a rendering of it.
+/// The exact argv [`trigger_workflow`] runs — program name included — so
+/// the command gate judges the real line and executor cannot drift from it.
 pub fn trigger_workflow_argv(
     remote: &GitHubRepoRef,
     selector: &str,
@@ -190,6 +190,7 @@ pub fn trigger_workflow_argv(
     // vocabulary here and already refuse flag-shaped or malformed names.
     validate_ref_name(r#ref)?;
     let mut args = vec![
+        "gh".to_string(),
         "workflow".to_string(),
         "run".to_string(),
         selector,
@@ -213,7 +214,12 @@ pub fn trigger_workflow(
 /// The exact argv [`rerun_workflow_run`] runs.
 pub fn rerun_run_argv(remote: &GitHubRepoRef, run_id: u64) -> Result<Vec<String>, String> {
     validate_run_id(run_id)?;
-    let mut args = vec!["run".to_string(), "rerun".to_string(), run_id.to_string()];
+    let mut args = vec![
+        "gh".to_string(),
+        "run".to_string(),
+        "rerun".to_string(),
+        run_id.to_string(),
+    ];
     append_repo_flags(&mut args, remote);
     Ok(args)
 }
@@ -230,7 +236,12 @@ pub fn rerun_workflow_run(
 /// The exact argv [`cancel_workflow_run`] runs.
 pub fn cancel_run_argv(remote: &GitHubRepoRef, run_id: u64) -> Result<Vec<String>, String> {
     validate_run_id(run_id)?;
-    let mut args = vec!["run".to_string(), "cancel".to_string(), run_id.to_string()];
+    let mut args = vec![
+        "gh".to_string(),
+        "run".to_string(),
+        "cancel".to_string(),
+        run_id.to_string(),
+    ];
     append_repo_flags(&mut args, remote);
     Ok(args)
 }
@@ -253,17 +264,23 @@ fn validate_run_id(run_id: u64) -> Result<(), String> {
 }
 
 /// Runs one gh invocation inside the repository with the module's timeout.
-/// Non-zero exits surface gh's stderr, which carries the API's own reason.
+/// `args` is a full argv line starting with the program name; everything
+/// after it is passed to gh verbatim. Non-zero exits surface gh's stderr,
+/// tail-capped so a chatty failure cannot flood a report.
 fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
+    debug_assert!(
+        args.first().map(String::as_str) == Some("gh"),
+        "argv builders must include the program name"
+    );
     let repo = validate_repo(repo_path)?;
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let output = capture_command("gh", &refs, Some(&repo), GH_CALL_TIMEOUT, &[])?;
     if !output.success {
-        let err = output.stderr_text();
+        let err = crate::engine::git_cli::byte_tail(&output.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
             format!("gh exited {}", output.status_code)
         } else {
-            err
+            err.trim().to_string()
         });
     }
     Ok(output.stdout_text().trim().to_string())
@@ -381,6 +398,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
+                "gh",
                 "workflow",
                 "run",
                 ".github/workflows/ci.yml",
@@ -402,11 +420,18 @@ mod tests {
         let ghes = remote("acme.ghe.com");
         assert_eq!(
             rerun_run_argv(&ghes, 42).unwrap(),
-            vec!["run", "rerun", "42", "--repo", "acme.ghe.com/acme/gitpulse"]
+            vec![
+                "gh",
+                "run",
+                "rerun",
+                "42",
+                "--repo",
+                "acme.ghe.com/acme/gitpulse"
+            ]
         );
         assert_eq!(
             cancel_run_argv(&remote("github.com"), 7).unwrap(),
-            vec!["run", "cancel", "7", "--repo", "acme/gitpulse"]
+            vec!["gh", "run", "cancel", "7", "--repo", "acme/gitpulse"]
         );
         assert_eq!(
             rerun_run_argv(&remote("github.com"), 0).unwrap_err(),
@@ -416,5 +441,19 @@ mod tests {
             cancel_run_argv(&remote("github.com"), 0).unwrap_err(),
             "Invalid workflow run id"
         );
+    }
+
+    /// The gate must judge the real process line: every builder's first
+    /// element is the program name, matching what `run_gh_in` spawns.
+    #[test]
+    fn action_builders_always_lead_with_the_program_name() {
+        let r = remote("github.com");
+        for argv in [
+            trigger_workflow_argv(&r, "ci.yml", "main").unwrap(),
+            rerun_run_argv(&r, 1).unwrap(),
+            cancel_run_argv(&r, 1).unwrap(),
+        ] {
+            assert_eq!(argv.first().map(String::as_str), Some("gh"));
+        }
     }
 }

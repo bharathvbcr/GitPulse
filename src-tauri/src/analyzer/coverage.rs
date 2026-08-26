@@ -6,7 +6,7 @@
 //! not searched for `coverage.out`.
 
 use crate::analyzer::language::LanguageDetector;
-use crate::engine::git_cli::{git_text, sandbox_join, validate_repo};
+use crate::engine::git_cli::{git_text_partial, sandbox_join, validate_repo};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -16,6 +16,11 @@ type FileHitMaps = HashMap<String, HitMap>;
 
 const MAX_LINE_NO: usize = 2_000_000;
 const MAX_DIR_ENTRIES: usize = 64;
+/// Cap on how many `ls-files` entries family detection classifies. Giant
+/// monorepos can hold millions of paths; the prefix is plenty to seed
+/// families and cargo dirs, so beyond it we stop splitting and flag the
+/// report truncated instead of burning seconds of CPU per scan.
+const LISTING_ENTRY_CAP: usize = 500_000;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_MAX_ARTIFACTS: usize = 48;
 const DEFAULT_MAX_FILES: usize = 4_000;
@@ -372,7 +377,8 @@ impl CoverageScanner {
         limits: ScanLimits,
     ) -> Result<(CoverageReport, FileHitMaps), String> {
         let repo = validate_repo(repo_path)?;
-        let (mut families, cargo_dirs) = detect_families(&repo)?;
+        let detected = detect_families(&repo)?;
+        let mut families = detected.families;
         if families.is_empty() {
             return Ok((
                 CoverageReport {
@@ -381,19 +387,21 @@ impl CoverageScanner {
                     artifacts: Vec::new(),
                     files: Vec::new(),
                     overall: CoverageTotals::default(),
-                    truncated: false,
+                    // An empty report from a cut listing is "unknown", not a
+                    // clean "nothing to scan".
+                    truncated: detected.listing_partial,
                 },
                 HashMap::new(),
             ));
         }
 
-        let mut truncated = false;
+        let mut truncated = detected.listing_partial;
         let candidates = {
-            let mut c = collect_candidates(&families, &cargo_dirs);
-            if extend_directory_candidates(&repo, &families, &cargo_dirs, &mut c) {
-                // A probed directory had more entries than MAX_DIR_ENTRIES;
-                // readdir order is arbitrary, so real artifacts may have been
-                // dropped unseen.
+            let mut c = collect_candidates(&families, &detected.cargo_dirs);
+            if extend_directory_candidates(&repo, &families, &detected.cargo_dirs, &mut c) {
+                // A probed directory dropped an artifact-shaped entry beyond
+                // the MAX_DIR_ENTRIES window; readdir order is arbitrary, so
+                // real artifacts may have been left unseen.
                 truncated = true;
             }
             c
@@ -440,20 +448,36 @@ impl CoverageScanner {
             limits_tag: limits_tag(&limits),
         };
         let cache = COVERAGE_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
-        if let Ok(guard) = cache.lock() {
-            if let Some((entry, _tick)) = guard.get(&key) {
-                if entry.fingerprint == fingerprint && !fingerprint.is_empty() {
-                    return Ok((
+        // Scope the lookup so the lock is released before the scan body runs:
+        // this same mutex is re-acquired to publish the result, and holding a
+        // std Mutex across that path deadlocks against itself.
+        let cache_hit = {
+            let guard = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.get(&key) {
+                Some((entry, _tick))
+                    if entry.fingerprint == fingerprint && !fingerprint.is_empty() =>
+                {
+                    Some((
                         entry.report.as_ref().clone(),
                         entry.hit_maps.as_ref().clone(),
-                    ));
+                    ))
                 }
+                _ => None,
             }
+        };
+        if let Some(hit) = cache_hit {
+            return Ok(hit);
         }
 
         let mut artifacts = Vec::new();
         let mut merged: FileHitMaps = HashMap::new();
         let mut budget = EntryBudget::new(limits.max_total_entries);
+        // Set by parse_go_cover when a file's expansion allowance dropped
+        // ranges or range tails; OR-ed into `truncated` below so totals over
+        // reduced go-cover data don't read as authoritative.
+        let mut go_expansion_capped = false;
 
         for (considered, cand) in present.into_iter().enumerate() {
             if considered >= limits.max_artifacts {
@@ -489,7 +513,13 @@ impl CoverageScanner {
                     }
                     #[cfg(test)]
                     SCAN_PARSE_COUNT.with(|c| c.set(c.get() + 1));
-                    match parse_artifact(cand.format, &text, &repo, &mut budget) {
+                    match parse_artifact(
+                        cand.format,
+                        &text,
+                        &repo,
+                        &mut budget,
+                        &mut go_expansion_capped,
+                    ) {
                         Ok(map) => {
                             // A parse that yields no records is not "0%
                             // covered" data — it's an artifact we understood
@@ -543,6 +573,10 @@ impl CoverageScanner {
         }
         // Candidates that did not exist at partition time were no-ops; they
         // never consumed the artifact cap above.
+
+        if go_expansion_capped {
+            truncated = true;
+        }
 
         if merged.len() > limits.max_files {
             truncated = true;
@@ -617,39 +651,40 @@ impl CoverageScanner {
             truncated,
         };
 
-        if let Ok(mut guard) = cache.lock() {
-            let tick = CACHE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            guard.insert(
-                key,
-                (
-                    CoverageCacheEntry {
-                        fingerprint,
-                        report: std::sync::Arc::new(report.clone()),
-                        hit_maps: std::sync::Arc::new(merged.clone()),
-                    },
-                    tick,
-                ),
-            );
-            let mut evictions = 0usize;
-            while guard.len() > CACHE_MAX_REPOS {
-                #[cfg(test)]
-                if EVICTION_FROZEN.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tick = CACHE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        guard.insert(
+            key,
+            (
+                CoverageCacheEntry {
+                    fingerprint,
+                    report: std::sync::Arc::new(report.clone()),
+                    hit_maps: std::sync::Arc::new(merged.clone()),
+                },
+                tick,
+            ),
+        );
+        let mut evictions = 0usize;
+        while guard.len() > CACHE_MAX_REPOS {
+            #[cfg(test)]
+            if EVICTION_FROZEN.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let oldest = guard
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    guard.remove(&k);
+                    evictions += 1;
                 }
-                let oldest = guard
-                    .iter()
-                    .min_by_key(|(_, (_, t))| *t)
-                    .map(|(k, _)| k.clone());
-                match oldest {
-                    Some(k) => {
-                        guard.remove(&k);
-                        evictions += 1;
-                    }
-                    None => break,
-                }
-                if evictions > CACHE_MAX_REPOS * 2 {
-                    break; // paranoia: never loop forever
-                }
+                None => break,
+            }
+            if evictions > CACHE_MAX_REPOS * 2 {
+                break; // paranoia: never loop forever
             }
         }
 
@@ -733,14 +768,26 @@ fn extra_dirs_for(family: &str) -> &'static [&'static str] {
     }
 }
 
-/// Returns the detected coverage families plus every directory that holds a
-/// `Cargo.toml` (repo root as `""`). Nested workspace roots get their own
-/// artifact candidates: a Tauri app's `cargo llvm-cov` writes under
-/// `<workspace>/target/llvm-cov/`, not `<repo>/target/llvm-cov/`.
-fn detect_families(
-    repo: &Path,
-) -> Result<(BTreeMap<String, CoverageFamilyStatus>, Vec<String>), String> {
-    let stdout = git_text(
+/// Output of [`detect_families`]: seeded families, cargo workspace dirs, and
+/// whether the `ls-files` listing was cut short (git's 64 MB cap or
+/// [`LISTING_ENTRY_CAP`] entries).
+struct FamilyScan {
+    families: BTreeMap<String, CoverageFamilyStatus>,
+    cargo_dirs: Vec<String>,
+    listing_partial: bool,
+}
+
+/// Returns the detected coverage families, every directory that holds a
+/// `Cargo.toml` (repo root as `""`), and whether the `ls-files` listing was
+/// incomplete.
+///
+/// The listing degrades to a prefix instead of failing: on a huge checkout,
+/// erroring here would kill the whole coverage scan even though family
+/// seeding from a partial path list is still useful. The caller surfaces the
+/// partial flag through the report's `truncated` so the UI says "scan capped"
+/// rather than presenting a silently reduced view as complete.
+fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
+    let (stdout, mut listing_partial) = git_text_partial(
         repo,
         &[
             "ls-files",
@@ -752,11 +799,19 @@ fn detect_families(
     )?;
     let mut families: BTreeMap<String, CoverageFamilyStatus> = BTreeMap::new();
     let mut cargo_dirs: Vec<String> = Vec::new();
+    let mut classified = 0usize;
     for rel in stdout.split('\0') {
         let rel = LanguageDetector::normalize_rel_path(rel);
         if rel.is_empty() || skip_source(&rel) {
             continue;
         }
+        if classified >= LISTING_ENTRY_CAP {
+            // Enough entries to seed every family; further splitting is pure
+            // cost. Flag rather than fail — see the doc comment above.
+            listing_partial = true;
+            break;
+        }
+        classified += 1;
         if file_name_of_rel(&rel) == "Cargo.toml" {
             let dir = std::path::Path::new(&rel)
                 .parent()
@@ -806,7 +861,11 @@ fn detect_families(
         status.languages.sort();
     }
     cargo_dirs.sort();
-    Ok((families, cargo_dirs))
+    Ok(FamilyScan {
+        families,
+        cargo_dirs,
+        listing_partial,
+    })
 }
 
 fn collect_candidates(
@@ -872,8 +931,16 @@ fn nested_rust_dirs() -> &'static [&'static str] {
     ]
 }
 
-/// Returns true when any probed directory held more than MAX_DIR_ENTRIES
-/// entries (so candidates may have been dropped unseen).
+/// Returns true when any probed directory held an artifact-shaped filename
+/// beyond its MAX_DIR_ENTRIES window (so a real artifact may have been
+/// dropped unseen).
+///
+/// Contract (audit M2): junk beyond the window must NOT raise the flag.
+/// Flagging every over-64 probe dir marked nearly every Python repo (large
+/// generated `htmlcov/`) "scan capped" forever, teaching users to ignore the
+/// chip. Within the window behavior is unchanged; past it we stop collecting
+/// candidates but still screen names, so a genuinely missed artifact still
+/// fires exactly once, at the first hit.
 fn extend_directory_candidates(
     repo: &Path,
     families: &BTreeMap<String, CoverageFamilyStatus>,
@@ -891,12 +958,20 @@ fn extend_directory_candidates(
                 return;
             };
             for (idx, entry) in entries.filter_map(|e| e.ok()).enumerate() {
-                if idx >= MAX_DIR_ENTRIES {
-                    was_truncated = true;
-                    break;
-                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
+                if idx >= MAX_DIR_ENTRIES {
+                    // Beyond the window we no longer collect candidates (the
+                    // window bounds the probe), but an artifact-shaped name
+                    // here is precisely the "dropped unseen" case the flag
+                    // exists for. Junk (.html pages and friends) is noise,
+                    // not signal.
+                    if format_from_filename(&name).is_some() {
+                        was_truncated = true;
+                        break;
+                    }
+                    continue;
+                }
                 let Some(format) = format_from_filename(&name) else {
                     continue;
                 };
@@ -1032,13 +1107,14 @@ fn parse_artifact(
     text: &str,
     repo: &Path,
     budget: &mut EntryBudget,
+    go_expansion_capped: &mut bool,
 ) -> Result<HashMap<String, BTreeMap<usize, u64>>, String> {
     clear_existence_memo();
     let text = text.trim_start_matches('\u{feff}');
     match format {
         CoverageFormat::Lcov => Ok(parse_lcov(text, repo, budget)),
         CoverageFormat::Cobertura => Ok(parse_cobertura(text, repo, budget)),
-        CoverageFormat::GoCover => Ok(parse_go_cover(text, repo, budget)),
+        CoverageFormat::GoCover => Ok(parse_go_cover(text, repo, budget, go_expansion_capped)),
         CoverageFormat::Istanbul => parse_istanbul(text, repo, budget),
         CoverageFormat::Jacoco => Ok(parse_jacoco(text, repo, budget)),
         CoverageFormat::Clover => Ok(parse_clover(text, repo, budget)),
@@ -1143,12 +1219,14 @@ fn parse_go_cover(
     text: &str,
     repo: &Path,
     budget: &mut EntryBudget,
+    expansion_capped: &mut bool,
 ) -> HashMap<String, BTreeMap<usize, u64>> {
     // A few KB of go-cover text can describe tens of millions of covered
     // lines via block ranges. Expanding them all would explode memory and
     // CPU, so each file gets a hard expansion budget; once spent, further
     // ranges for that file are ignored (coverage stays representative, the
-    // scan stays bounded).
+    // scan stays bounded). Those drops set `expansion_capped` (audit M3):
+    // without the signal, totals over reduced data read as authoritative.
     const MAX_EXPANDED_LINES_PER_FILE: usize = 200_000;
     let mut out = HashMap::new();
     let mut expansion: HashMap<String, usize> = HashMap::new();
@@ -1197,6 +1275,9 @@ fn parse_go_cover(
             .entry(path.clone())
             .or_insert(MAX_EXPANDED_LINES_PER_FILE);
         if *allowance == 0 {
+            // Allowance spent: this range (and any later ones for the file)
+            // never reach the map. Surface it instead of dropping silently.
+            *expansion_capped = true;
             continue;
         }
         let file = out.entry(path.clone()).or_default();
@@ -1211,7 +1292,13 @@ fn parse_go_cover(
             .min(end);
         if span_end < start_line {
             *allowance = 0;
+            *expansion_capped = true;
             continue;
+        }
+        if span_end < end {
+            // The allowance, not the parser's own per-range policy, cut this
+            // range: the tail is real coverage data the map will not hold.
+            *expansion_capped = true;
         }
         let expanded = span_end - start_line + 1;
         *allowance -= expanded;
@@ -1482,10 +1569,19 @@ fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 /// hit count rather than summing: lcov tools emit repeated SF/DA blocks for
 /// concatenated test runs, and max keeps counts stable under re-merges of
 /// overlapping data (presence/absence — what the UI gates on — is identical).
+///
+/// Hits are clamped to u32::MAX before storage: the counts cross Tauri IPC
+/// into JavaScript, where values beyond Number.MAX_SAFE_INTEGER (2^53) — and
+/// u64::MAX especially, which serde_json renders as a corrupted float like
+/// 18446744073709552000 — cannot be displayed faithfully in the gutter badge.
+/// u32::MAX stays exact end to end while remaining far above any real
+/// per-line execution count; presence/percentage semantics are unchanged
+/// because any value >= 1 stays >= 1.
 fn record_hit(lines: &mut BTreeMap<usize, u64>, ln: usize, hits: u64, budget: &mut EntryBudget) {
     if ln == 0 || ln > MAX_LINE_NO {
         return;
     }
+    let hits = hits.min(u32::MAX as u64);
     match lines.entry(ln) {
         std::collections::btree_map::Entry::Vacant(slot) => {
             if budget.spend() {
@@ -1877,7 +1973,12 @@ mode: set
 src/main.go:1.1,2.10 2 1
 src/main.go:4.1,4.8 1 0
 ";
-        let map = parse_go_cover(text, repo.path(), &mut EntryBudget::new(usize::MAX));
+        let map = parse_go_cover(
+            text,
+            repo.path(),
+            &mut EntryBudget::new(usize::MAX),
+            &mut false,
+        );
         assert_eq!(map["src/main.go"].get(&1), Some(&1));
         assert_eq!(map["src/main.go"].get(&2), Some(&1));
         assert_eq!(map["src/main.go"].get(&4), Some(&0));
@@ -2123,9 +2224,11 @@ src/main.go:4.1,4.8 1 0
 "#;
         let map = parse_jacoco(jacoco, repo.path(), &mut EntryBudget::new(usize::MAX));
         // ci + mi overflows u64 on both lines; saturating math must treat
-        // them as covered instead of panicking in debug builds.
-        assert_eq!(map["com/foo/Big.java"].get(&1), Some(&u64::MAX));
-        assert_eq!(map["com/foo/Big.java"].get(&2), Some(&u64::MAX));
+        // them as covered instead of panicking in debug builds. Saturation
+        // now clamps at u32::MAX (record_hit) because anything above 2^53
+        // corrupts over IPC into JS; u64::MAX must never reach the map.
+        assert_eq!(map["com/foo/Big.java"].get(&1), Some(&(u32::MAX as u64)));
+        assert_eq!(map["com/foo/Big.java"].get(&2), Some(&(u32::MAX as u64)));
     }
 
     #[test]
@@ -2608,24 +2711,94 @@ src/main.go:4.1,4.8 1 0
         assert_ne!(first.overall.lines_hit, second.overall.lines_hit);
     }
 
-    /// A probed directory with more entries than MAX_DIR_ENTRIES must raise
-    /// the truncated flag — readdir order is arbitrary, artifacts may have
-    /// been silently dropped.
+    /// CONTRACT CHANGE (audit M2): the old behavior flagged ANY probe
+    /// directory holding more than MAX_DIR_ENTRIES entries, so generated-junk
+    /// floods (Python `htmlcov/*.html`) permanently showed "scan capped" and
+    /// taught users to ignore the chip. The new two-sided contract:
+    ///
+    /// 1. junk-only overflow (nothing artifact-shaped beyond the window)
+    ///    must NOT flag;
+    /// 2. an artifact-shaped name beyond the window must ALWAYS flag —
+    ///    readdir order is arbitrary, so we cannot know which names fell
+    ///    past the window; a directory whose every overflow entry is
+    ///    artifact-shaped makes "at least one dropped artifact-shaped name"
+    ///    deterministic.
     #[test]
-    fn dir_listing_over_cap_sets_truncated_flag() {
+    fn dir_listing_over_cap_flags_only_artifact_shaped_entries_beyond_window() {
+        // Side 1: over-cap probe dir of pure junk → no truncation flag.
         let repo = git_repo();
         write(repo.path(), "src/lib.rs", "fn a() {}\n");
         write(
             repo.path(),
-            "coverage/lcov.info",
+            "lcov.info",
             "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
         );
-        for i in 0..MAX_DIR_ENTRIES + 5 {
+        for i in 0..MAX_DIR_ENTRIES + 20 {
             write(repo.path(), &format!("coverage/junk_{i}.txt"), "noise\n");
         }
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
-        assert!(report.truncated, "over-cap probe dir must flag truncation");
+        assert!(
+            !report.truncated,
+            "junk beyond the window must not flag: {:?}",
+            report
+                .artifacts
+                .iter()
+                .map(|a| a.path.clone())
+                .collect::<Vec<_>>()
+        );
         assert!(report.files.iter().any(|f| f.path == "src/lib.rs"));
+
+        // Side 2: over-cap probe dir where EVERY entry is artifact-shaped
+        // (.info) → at least MAX_DIR_ENTRIES-window entries were dropped
+        // unseen, so the flag must fire. max_artifacts is raised above the
+        // candidate count so the artifact cap cannot fake this pass.
+        let repo = git_repo();
+        write(repo.path(), "src/lib.rs", "fn a() {}\n");
+        write(
+            repo.path(),
+            "lcov.info",
+            "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
+        );
+        for i in 0..MAX_DIR_ENTRIES + 6 {
+            write(
+                repo.path(),
+                &format!("coverage/part_{i:03}.info"),
+                "SF:src/lib.rs\nDA:1,1\nend_of_record\n",
+            );
+        }
+        let limits = ScanLimits {
+            max_artifacts: MAX_DIR_ENTRIES * 4,
+            ..ScanLimits::default()
+        };
+        let (report, _) =
+            CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits).expect("scan");
+        assert!(
+            report.truncated,
+            "artifact-shaped overflow must flag truncation"
+        );
+        assert!(report.files.iter().any(|f| f.path == "src/lib.rs"));
+    }
+
+    /// Percentage rounding contract at the boundaries callers render:
+    /// one-decimal rounding, never 100% unless fully covered, and an empty
+    /// denominator is 0.0 rather than NaN or 100.
+    #[test]
+    fn percentage_boundaries_round_to_one_decimal() {
+        let cases: [((usize, usize), f64); 6] = [
+            ((3, 2), 66.7),
+            ((3, 1), 33.3),
+            ((1000, 1), 0.1),
+            ((10, 10), 100.0),
+            ((8, 5), 62.5),
+            ((0, 0), 0.0),
+        ];
+        for ((found, hit), expected) in cases {
+            assert_eq!(
+                CoverageTotals::from_counts(found, hit).percentage,
+                expected,
+                "{hit}/{found}"
+            );
+        }
     }
 
     /// Fuzz: every byte-prefix of a valid artifact parses without panicking
@@ -2673,7 +2846,8 @@ src/main.go:4.1,4.8 1 0
                 clear_existence_memo();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut budget = EntryBudget::new(10_000);
-                    parse_artifact(*format, prefix, repo.path(), &mut budget)
+                    let mut go_capped = false;
+                    parse_artifact(*format, prefix, repo.path(), &mut budget, &mut go_capped)
                 }));
                 assert!(
                     result.is_ok(),
@@ -2725,7 +2899,12 @@ src/main.go:4.1,4.8 1 0
                     repo.path(),
                     &mut EntryBudget::new(50_000),
                 );
-                let _ = parse_go_cover(&body, repo.path(), &mut EntryBudget::new(50_000));
+                let _ = parse_go_cover(
+                    &body,
+                    repo.path(),
+                    &mut EntryBudget::new(50_000),
+                    &mut false,
+                );
             }));
             assert!(result.is_ok(), "{name} panicked parser pipeline");
         }

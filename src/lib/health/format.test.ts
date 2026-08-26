@@ -33,8 +33,23 @@ describe("health format", () => {
   });
 
   it("summarises audit counts without implying a clean scan when empty", () => {
+    // UPDATED: a bare zero used to read as "No known vulnerabilities", which
+    // claimed a clean scan even when no scanner had run. Absence of the ran
+    // signal now fails closed to "Audit did not run".
     expect(
       formatAuditCounts({ critical: 0, high: 0, moderate: 0, low: 0, total: 0 }),
+    ).toBe("Audit did not run");
+    expect(
+      formatAuditCounts(
+        { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
+        { ran: false },
+      ),
+    ).toBe("Audit did not run");
+    expect(
+      formatAuditCounts(
+        { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
+        { ran: true },
+      ),
     ).toBe("No known vulnerabilities");
     expect(
       formatAuditCounts({ critical: 1, high: 2, moderate: 0, low: 4, total: 7 }),

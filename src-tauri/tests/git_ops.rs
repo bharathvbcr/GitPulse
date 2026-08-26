@@ -114,6 +114,97 @@ fn history_survives_0x01_byte_inside_commit_subject() {
     assert_ne!(history[1].id, history[2].id);
 }
 
+/// Regression (\x01-safe field framing, live-git half): a 0x01 byte inside an
+/// AUTHOR NAME used to shift every later positional field — the email came
+/// back as a fragment of the name. The record's risky fields are parsed from
+/// the right now, so the timestamp and email must survive intact.
+#[test]
+fn history_survives_0x01_byte_inside_author_name() {
+    let repo = TestRepo::init();
+    repo.write("src/lib.rs", "fn first() {}\n");
+    repo.commit_all("feat: clean seed");
+
+    let output = Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "feat: hostile author"])
+        .current_dir(repo.dir.path())
+        .env("GIT_AUTHOR_NAME", "Ev\u{1}il Name")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("spawn hostile-author commit");
+    assert!(
+        output.status.success(),
+        "git must accept a 0x01-bearing author name: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let path = repo.path_str();
+    let history = GitReader::read_commit_history(&path, 10, None).expect("history");
+    assert_eq!(history.len(), 2, "{history:?}");
+    // Newest row is the hostile-author commit.
+    let hostile = &history[0];
+    // A 0x01 inside the author name may leave that name's leading fragment
+    // glued to the summary text (bounded degradation, documented); the
+    // structurally protected fields must still come back exact.
+    assert!(
+        hostile.summary.starts_with("feat: hostile author"),
+        "summary must keep the subject text: {:?}",
+        hostile.summary
+    );
+    assert!(
+        hostile.timestamp > 0,
+        "timestamp must be structurally immune to author-name corruption"
+    );
+    assert_eq!(
+        hostile.author_email, "test@example.com",
+        "email is the record's final field and must not shift"
+    );
+}
+
+/// Regression (revision parity for path filtering): the graph walk uses
+/// `--all` or the user-selected revision, but the path filter's allow-set was
+/// built from a plain HEAD-only walk. Commits on OTHER branches touching the
+/// path were therefore retained OUT of the graph — whole lanes vanished.
+#[test]
+fn commits_touching_path_honors_all_and_selected_revision() {
+    let repo = TestRepo::init();
+    repo.write("shared.txt", "base\n");
+    repo.commit_all("feat: base shared");
+    let base_commit = GitReader::read_commit_history(&repo.path_str(), 1, None)
+        .expect("base tip")
+        .remove(0);
+
+    run_git(repo.dir.path(), &["checkout", "-q", "-b", "feature"]);
+    repo.write("shared.txt", "base\nfeature edit\n");
+    repo.commit_all("feat: feature edits shared");
+    let feature_edit = GitReader::read_commit_history(&repo.path_str(), 1, None)
+        .expect("feature tip")
+        .remove(0);
+    // Back on main: the feature commit is invisible to HEAD.
+    run_git(repo.dir.path(), &["checkout", "-q", "main"]);
+
+    let path = repo.path_str();
+
+    // Default semantics must match the graph walk (`--all`): branch commits
+    // touching the path stay in the allow-set.
+    let all = GitReader::commits_touching_path(&path, "shared.txt", 10, None).expect("--all walk");
+    assert!(
+        all.contains(&feature_edit.id),
+        "--all walk must include other-branch commits touching the path: {all:?}"
+    );
+    assert!(all.contains(&base_commit.id));
+
+    // An explicit revision keeps HEAD-only semantics available.
+    let head_only =
+        GitReader::commits_touching_path(&path, "shared.txt", 10, Some("HEAD")).expect("HEAD walk");
+    assert!(
+        !head_only.contains(&feature_edit.id),
+        "explicit HEAD must stay a HEAD-only walk: {head_only:?}"
+    );
+    assert!(head_only.contains(&base_commit.id));
+}
+
 #[test]
 fn test_open_repo_history_status_and_details() {
     let repo = TestRepo::init();
@@ -199,6 +290,7 @@ fn test_patch_builder_applies_selected_line() {
                     new_line_no: Some(1),
                     content: "fn main() {".into(),
                     is_selected: false,
+                    no_newline: false,
                 },
                 UnifiedDiffLine {
                     line_type: DiffLineType::Addition,
@@ -206,6 +298,7 @@ fn test_patch_builder_applies_selected_line() {
                     new_line_no: Some(2),
                     content: "    println!(\"First\");".into(),
                     is_selected: true,
+                    no_newline: false,
                 },
                 UnifiedDiffLine {
                     line_type: DiffLineType::Addition,
@@ -213,6 +306,7 @@ fn test_patch_builder_applies_selected_line() {
                     new_line_no: Some(3),
                     content: "    println!(\"Second\");".into(),
                     is_selected: false,
+                    no_newline: false,
                 },
                 UnifiedDiffLine {
                     line_type: DiffLineType::Context,
@@ -220,6 +314,7 @@ fn test_patch_builder_applies_selected_line() {
                     new_line_no: Some(4),
                     content: "}".into(),
                     is_selected: false,
+                    no_newline: false,
                 },
             ],
         }],
@@ -670,7 +765,8 @@ fn test_glob_shaped_paths_match_literally() {
 
     // A widened glob would match both files' history; literal matches only
     // the star-named file's single commit.
-    let touching = GitReader::commits_touching_path(&path, "weird*.txt", 10).expect("log pathspec");
+    let touching =
+        GitReader::commits_touching_path(&path, "weird*.txt", 10, None).expect("log pathspec");
     assert_eq!(
         touching.len(),
         1,
@@ -710,7 +806,7 @@ fn test_reader_read_paths_refuse_symlink_escape() {
     let err = GitReader::get_file_diff(&path, "leak/secret.txt", false, false)
         .expect_err("symlink escape must fail");
     assert!(err.contains("escapes the repository"), "got: {err}");
-    assert!(GitReader::commits_touching_path(&path, "leak/secret.txt", 10).is_err());
+    assert!(GitReader::commits_touching_path(&path, "leak/secret.txt", 10, None).is_err());
     assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
 }
 
@@ -1038,6 +1134,7 @@ fn empty_selective_patch_is_rejected_before_git_apply() {
                 new_line_no: Some(1),
                 content: "nope".into(),
                 is_selected: false,
+                no_newline: false,
             }],
         }],
     };
@@ -1099,6 +1196,7 @@ fn selective_staging_new_file_via_dev_null() {
                 new_line_no: Some(1),
                 content: "hello from patch".into(),
                 is_selected: true,
+                no_newline: false,
             }],
         }],
     };
@@ -1153,4 +1251,175 @@ fn linked_worktree_mutations_serialize_without_lock_failures() {
     let branches = git_out(repo.dir.path(), &["branch", "--list"]);
     assert!(branches.contains("from-main"), "got: {branches}");
     assert!(branches.contains("from-wt"), "got: {branches}");
+}
+
+// ---------------------------------------------------------------------------
+// Stack page: restack hardening + deep-history ancestry walk
+// ---------------------------------------------------------------------------
+
+/// The targeted first-parent walk must stop AT a known tip (inclusive) and
+/// return oldest-first, so consecutive pairs are parent edges the hierarchy
+/// engine can consume directly.
+#[test]
+fn first_parent_chain_stops_at_known_tip_oldest_first() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "b\n");
+    repo.commit_all("root");
+    let root = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    repo.write("mid.txt", "m\n");
+    repo.commit_all("mid");
+    repo.write("top.txt", "t\n");
+    repo.commit_all("top");
+    let tip = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+
+    let stop: std::collections::HashSet<String> = [root.clone()].into_iter().collect();
+    let chain = GitReader::first_parent_chain(&repo.path_str(), &tip, &stop, 100)
+        .expect("walk succeeds")
+        .expect("stop id is reachable");
+    // Oldest-first: root (the stop id) -> mid -> tip.
+    let mid = git_out(repo.dir.path(), &["rev-parse", "HEAD~"]);
+    assert_eq!(chain, vec![root.clone(), mid, tip.clone()]);
+
+    // A stop set that never matches exhausts the cap and reports None —
+    // "no discoverable base", never a fabricated root.
+    let miss: std::collections::HashSet<String> = ["deadbeef".to_string()].into_iter().collect();
+    let unresolved = GitReader::first_parent_chain(&repo.path_str(), &tip, &miss, 100).unwrap();
+    assert!(unresolved.is_none());
+}
+
+/// Regression (audit dirty-tree): restacking with uncommitted changes used to
+/// hand `git rebase` a dirty tree; now it is refused before any state moves.
+#[test]
+fn restack_refuses_dirty_worktree_without_moving_refs() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("base");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feature work");
+    let feature_before = git_out(repo.dir.path(), &["rev-parse", "feature"]);
+
+    repo.write("dirty.txt", "uncommitted\n");
+
+    let err = GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect_err("dirty tree must be refused");
+    assert!(
+        err.contains("uncommitted"),
+        "error must name the real cause: {err}"
+    );
+    let feature_after = git_out(repo.dir.path(), &["rev-parse", "feature"]);
+    assert_eq!(feature_before, feature_after, "refs must not move");
+}
+
+/// A conflicting rebase must roll back cleanly: no half-applied state, HEAD
+/// back where the user was, branch ref untouched, error says what happened.
+#[test]
+fn restack_conflict_aborts_and_restores_original_checkout() {
+    let repo = TestRepo::init();
+    repo.write("shared.txt", "base\n");
+    repo.commit_all("base");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("shared.txt", "feature version\n");
+    repo.commit_all("feature edit");
+    let feature_before = git_out(repo.dir.path(), &["rev-parse", "feature"]);
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("other.txt", "main advance\n");
+    repo.commit_all("main work");
+    // main's new commit conflicts with feature's edit of shared.txt
+    repo.write("shared.txt", "main version\n");
+    repo.commit_all("main conflicts");
+    let main_tip = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+
+    let err = GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect_err("conflicting restack must fail");
+    assert!(
+        err.contains("rolled back"),
+        "error must promise rollback: {err}"
+    );
+    // No rebase may linger mid-flight.
+    assert!(
+        !repo.dir.path().join(".git").join("rebase-merge").exists(),
+        "rebase-merge state must be gone"
+    );
+    // The user was on main when they clicked restack; they must still be.
+    let head_branch = git_out(repo.dir.path(), &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(head_branch, "main");
+    // And feature must point exactly where it did before.
+    let feature_after = git_out(repo.dir.path(), &["rev-parse", "feature"]);
+    assert_eq!(feature_before, feature_after);
+    // Sanity: the conflicting base really was main's new tip.
+    assert_ne!(main_tip, feature_before);
+}
+
+/// Success path: rebase leaves `branch` checked out by default, which would
+/// silently switch the user's working copy; the original checkout must come
+/// back.
+#[test]
+fn restack_success_restores_previous_checkout() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "v1\n");
+    repo.commit_all("base");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feature work");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("f.txt", "v1 changed\n");
+    repo.commit_all("rewrite base content");
+
+    GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect("non-conflicting restack must succeed");
+
+    // The user was on main; rebase would have left them on feature.
+    let current = git_out(repo.dir.path(), &["branch", "--show-current"]);
+    assert_eq!(current, "main", "original checkout must be restored");
+
+    // And the child really moved onto the rewritten parent.
+    let count = git_out(repo.dir.path(), &["rev-list", "--count", "main..feature"]);
+    assert_eq!(count, "1");
+}
+
+/// An in-progress rebase must be detected and refused instead of corrupted.
+#[test]
+fn restack_refuses_when_a_rebase_is_already_in_progress() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "one\n");
+    repo.commit_all("base");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("f.txt", "feature version\n");
+    repo.write("g.txt", "g\n");
+    repo.commit_all("feature work");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("f.txt", "conflicting one\n");
+    repo.commit_all("conflict on f");
+
+    // Manufacture a mid-rebase state that the client did not create: main
+    // replayed onto feature collides on f.txt.
+    run_git_expect_failure(repo.dir.path(), &["rebase", "feature"]);
+    assert!(repo.dir.path().join(".git").join("rebase-merge").exists());
+
+    let err = GitWriter::restack(&repo.path_str(), "feature", "main")
+        .expect_err("must refuse while another rebase is in flight");
+    assert!(
+        err.contains("already in progress"),
+        "error must name the blocker: {err}"
+    );
+
+    // Clean up for the temp dir assertion hygiene.
+    run_git(repo.dir.path(), &["rebase", "--abort"]);
+}
+
+fn run_git_expect_failure(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("spawn git");
+    assert!(
+        !output.status.success(),
+        "git {args:?} was expected to fail but succeeded"
+    );
 }

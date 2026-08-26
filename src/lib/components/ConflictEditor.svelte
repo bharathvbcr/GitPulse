@@ -1,13 +1,4 @@
-<script lang="ts">
-  import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
-  import { harnessStore } from "../stores/harnessStore";
-  import { Check, ShieldAlert, AlertTriangle } from "lucide-svelte";
-  import EmptyState from "./EmptyState.svelte";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import { planConflictSave } from "../diff/conflictSave";
-  import { formatError } from "../ui/formatError";
-
+<script module lang="ts">
   /**
    * Mirrors the Rust `ConflictResolutionChoice` enum's serde form: unit
    * variants travel as plain strings, the tuple variant as an externally
@@ -32,6 +23,43 @@
     segments: Array<{ Normal?: string; Conflict?: ConflictChunk }>;
     total_conflicts: number;
   }
+
+  /**
+   * A fresh parse lands every chunk back at Unresolved. When it belongs to
+   * the file the user is already editing (e.g. they flipped files and came
+   * back mid-merge), assigning it wholesale would silently discard their
+   * chunk resolutions — so carry any made choices over by chunk index.
+   * A different file starts from its own parse untouched.
+   */
+  export function adoptResolutions(next: ConflictDoc, current: ConflictDoc | null): ConflictDoc {
+    if (!current || current.file_path !== next.file_path) return next;
+    const carried = new Map<number, ConflictResolution>();
+    for (const seg of current.segments) {
+      const chunk = seg.Conflict;
+      if (chunk && chunk.resolution !== "Unresolved") {
+        carried.set(chunk.chunk_index, chunk.resolution);
+      }
+    }
+    if (carried.size === 0) return next;
+    for (const seg of next.segments) {
+      const chunk = seg.Conflict;
+      const carriedResolution = chunk ? carried.get(chunk.chunk_index) : undefined;
+      if (chunk && carriedResolution) chunk.resolution = carriedResolution;
+    }
+    return next;
+  }
+</script>
+
+<script lang="ts">
+  import { repoStore } from "../stores/repoStore";
+  import { invoke } from "@tauri-apps/api/core";
+  import { harnessStore } from "../stores/harnessStore";
+  import { Check, ShieldAlert, AlertTriangle } from "lucide-svelte";
+  import EmptyState from "./EmptyState.svelte";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import { planConflictSave } from "../diff/conflictSave";
+  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
 
   let conflictedFiles = $derived($repoStore.statuses.filter((s) => s.is_conflicted));
   let selectedFile = $state<string | null>(null);
@@ -71,9 +99,19 @@
     };
   });
 
+  /** Repo+file pair whose parse is currently loaded; see the effect below. */
+  let loadedKey: string | null = null;
+
   $effect(() => {
     const repo = $repoStore.currentPath;
     const file = selectedFile;
+    // Memo on the load's real dependencies only. repoStore republishes a
+    // fresh object on every status poll (~6s) and stats drain; reloading per
+    // emission would churn IPC and replace parsedDoc — discarding the user's
+    // chunk resolutions mid-edit.
+    const key = repo && file ? `${repo}\u0000${file}` : null;
+    if (key === loadedKey) return;
+    loadedKey = key;
     if (!file || !repo) {
       loadGuard?.cancel();
       previewGuard?.cancel();
@@ -86,6 +124,12 @@
       previewError = null;
       return;
     }
+    // Deliberately no teardown here: Svelte runs an effect's previous
+    // teardown before EVERY re-run, memo hits included, and cancelling an
+    // in-flight load that still owns the screen is wrong. The previous
+    // request is cancelled explicitly above; unmount cancels via the
+    // dedicated cleanup effect.
+    loadGuard?.cancel();
     const guard = createAsyncGuard();
     loadGuard = guard;
     void (async () => {
@@ -102,19 +146,17 @@
         });
         if (!guard.isLive()) return;
         loadError = null;
-        parsedDoc = doc;
-        await updatePreview(doc);
+        parsedDoc = adoptResolutions(doc, parsedDoc);
+        await updatePreview(parsedDoc);
       } catch (err) {
         if (!guard.isLive()) return;
         parsedDoc = null;
         resolvedPreview = "";
-        loadError = formatError(err);
-        console.error("Failed to load conflict:", err);
+        // reportPanelError already routes through formatError for the banner;
+        // no console.error beside it — the diagnostics ring is the record.
+        loadError = reportPanelError("conflict", err);
       }
     })();
-    return () => {
-      guard.cancel();
-    };
   });
 
   function setChunkResolution(chunkIndex: number, choice: ConflictResolution) {

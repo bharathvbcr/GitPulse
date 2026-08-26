@@ -74,6 +74,12 @@ export interface DepsHealthReport {
   govulncheck_present?: boolean;
   composer_present?: boolean;
   bundler_audit_present?: boolean;
+  /**
+   * Scanners that actually dispatched a command this scan ("npm", "cargo",
+   * "pip-audit", "govulncheck", "composer", "bundler-audit").
+   * Empty or absent means nothing ran — zero findings then mean nothing.
+   */
+  scanners_ran?: string[];
   manifests: NpmManifest[];
   ecosystems: EcosystemHint[];
   issues: HealthIssue[];

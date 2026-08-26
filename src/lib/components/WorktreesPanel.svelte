@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -41,15 +40,28 @@
   let inflight: AsyncGuard | null = null;
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Load trigger keyed on the real dependencies: active repo + its hydration
+  // epoch. Memoized because every store emission re-runs the effect — an
+  // unguarded rerun cancels in-flight loads and disarms the row-delete
+  // confirm on each ~6s poll tick.
+  let prevRepoPath: string | null = null;
+  let prevGeneration: number | null = null;
   $effect(() => {
-    $repoStore.currentPath;
-    $repoStore.generation;
+    const repo = $repoStore.currentPath;
+    const generation = $repoStore.generation;
+    if (repo === prevRepoPath && generation === prevGeneration) return;
+    prevRepoPath = repo;
+    prevGeneration = generation;
     void load();
     return () => {
       // A load that outlives its repo/generation must not apply: the next
       // effect run (or unmount) cancels it here, and load() re-checks below.
       inflight?.cancel();
+      // Disarm any pending removal confirm; it must not leak across repos
+      // and there is no teardown left that would otherwise fire per tick.
       if (confirmTimer !== null) clearTimeout(confirmTimer);
+      confirmTimer = null;
+      removingPath = null;
     };
   });
 
@@ -67,7 +79,7 @@
       worktrees = next;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      error = formatError(err);
+      error = reportPanelError("worktrees", err);
     } finally {
       if (guard.isLive()) isLoading = false;
     }
@@ -84,7 +96,7 @@
       }
       await load();
     } catch (err: unknown) {
-      error = formatError(err);
+      error = reportPanelError("worktrees", err);
     }
   }
 
@@ -95,7 +107,7 @@
       await invoke("cmd_prune_worktree", { repoPath: repo });
       await load();
     } catch (err: unknown) {
-      error = formatError(err);
+      error = reportPanelError("worktrees", err);
     }
   }
 
@@ -126,7 +138,7 @@
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree", label: newPath.trim(), ok: false });
-      error = formatError(err);
+      error = reportPanelError("worktrees", err);
     } finally {
       isCreating = false;
     }
@@ -177,17 +189,13 @@
     } catch (err: unknown) {
       if ($repoStore.currentPath !== repo) return;
       harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: false });
-      error = formatError(err);
+      error = reportPanelError("worktrees", err);
     }
   }
 
   function open(wt: WorktreeInfo) {
     void repoStore.openRepo(wt.path);
   }
-
-  onMount(() => {
-    void load();
-  });
 </script>
 
 <div>

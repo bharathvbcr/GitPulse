@@ -1,12 +1,11 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
   import { graphStore } from "./lib/stores/graphStore";
   import { themeStore } from "./lib/stores/themeStore";
   import { filterStore } from "./lib/stores/filterStore";
   import { applyPlatformClass, isMacOS } from "./lib/platform";
-  import { queryNeedsServerFetch } from "./lib/filter/parseQuery";
   import { displayName } from "./lib/repos/paths";
   import { formatError } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
@@ -52,15 +51,61 @@
     Bug,
   } from "lucide-svelte";
   import { interfaceStore } from "./lib/stores/interfaceStore";
+  import {
+    GRAPH_FETCH_DEBOUNCE_MS,
+    createGraphFetchScheduler,
+  } from "./lib/graph/graphFetchScheduler";
+  import {
+    runBootSequence,
+    type NativeShellHandlers,
+  } from "./lib/boot/bootSequence";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
   let isSettingsModalOpen = $state(false);
   let isDiagnosticsOpen = $state(false);
   let dropActive = $state(false);
+  /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
+  let lastModalRepoPath: string | null = null;
   const macos = isMacOS();
-  /** Last repo/revision(/path-query) the graph actually fetched for. */
-  let lastGraphKey: string | null = null;
+
+  // --- terminal keep-alive --------------------------------------------------
+  // The PTY and xterm instance must survive view-tab switches (a shell dies
+  // the moment its pane unmounts). Mounted once on first visit per repo,
+  // hidden afterwards; the outer {#key currentPath} tears it down on a real
+  // repo switch.
+  let terminalMounted = $state(false);
+  const terminalActive = $derived($repoStore.activeTab === "terminal");
+
+  $effect(() => {
+    if (!$repoStore.currentPath) {
+      terminalMounted = false;
+      return;
+    }
+    if (terminalActive) terminalMounted = true;
+  });
+
+  // --- drag-drop overlay grace ----------------------------------------------
+  // enter/leave pairs fire in bursts near the window edge; hiding after a
+  // short grace window stops the full-screen blur from strobing.
+  const DROP_HIDE_GRACE_MS = 120;
+  let dropHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function setDropOverlay(active: boolean) {
+    if (active) {
+      if (dropHideTimer !== null) {
+        clearTimeout(dropHideTimer);
+        dropHideTimer = null;
+      }
+      dropActive = true;
+      return;
+    }
+    if (dropHideTimer !== null) return;
+    dropHideTimer = setTimeout(() => {
+      dropHideTimer = null;
+      dropActive = false;
+    }, DROP_HIDE_GRACE_MS);
+  }
 
   let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
 
@@ -95,98 +140,100 @@
     };
     window.addEventListener("gitpulse:diagnostics", openDiagnostics);
     track(() => window.removeEventListener("gitpulse:diagnostics", openDiagnostics));
-    void (async () => {
-      // A failed native-shell subscription must not abort startup: it unwinds
-      // its own listeners before rethrowing, and skipping the restore below
-      // would lose the persisted session. Log and keep booting.
-      try {
-        track(
-          await subscribeNativeShell({
-            open: () => void repoStore.pickAndOpenRepo(),
-            clone: () => {
-              isCloneModalOpen = true;
-            },
-            settings: () => {
-              isSettingsModalOpen = true;
-            },
-            refresh: () => void repoStore.refresh(),
-            toggleTheme: () => themeStore.toggle(),
-            themeSystem: () => themeStore.setPreference("system"),
-            themeLight: () => themeStore.setTheme("light"),
-            themeDark: () => themeStore.setTheme("dark"),
-            setTab: (tab) => repoStore.setActiveTab(tab),
-            fetch: () => void repoStore.fetch(),
-            pull: () => void repoStore.pull(),
-            push: () => void repoStore.push(),
-            stash: () => void repoStore.stashSave(),
-            stashPop: () => void repoStore.stashPop(),
-            rebase: () => {
-              isRebaseModalOpen = true;
-            },
-            palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
-            focusFilter: () =>
-              window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
-            openRecent: (path) => void openFromExternal(path),
-            openRepo: (path) => void openFromExternal(path),
-            closeRepoTab: () => void repoStore.closeActiveTab(),
-            nextRepoTab: () => void repoStore.nextTab(),
-            prevRepoTab: () => void repoStore.prevTab(),
-            reopenRepoTab: () => void repoStore.reopenLastClosed(),
-            openError: (message) => repoStore.setError(message),
-            setDropActive: (active) => {
-              dropActive = active;
-            },
-          }),
-        );
-      } catch (err) {
-        console.error("native shell unavailable; continuing without menu integration", err);
-      }
-      const pending = await takePendingOpen();
-      await repoStore.restoreWorkspace();
-      if (pending) {
-        await openFromExternal(pending);
-      }
-      await syncRecentMenu($repoStore.recentRepos);
-      try {
-        track(
-          await listen<{ path?: string }>("repo-changed", (event) => {
-            void repoStore.handleRepoChanged(event.payload?.path);
-          }),
-        );
-      } catch {
-        /* vite preview has no Tauri event bus */
-      }
-    })();
+    const shellHandlers: NativeShellHandlers = {
+      open: () => void repoStore.pickAndOpenRepo(),
+      clone: () => {
+        isCloneModalOpen = true;
+      },
+      settings: () => {
+        isSettingsModalOpen = true;
+      },
+      refresh: () => void repoStore.refresh(),
+      toggleTheme: () => themeStore.toggle(),
+      themeSystem: () => themeStore.setPreference("system"),
+      themeLight: () => themeStore.setTheme("light"),
+      themeDark: () => themeStore.setTheme("dark"),
+      setTab: (tab) => repoStore.setActiveTab(tab),
+      fetch: () => void repoStore.fetch(),
+      pull: () => void repoStore.pull(),
+      push: () => void repoStore.push(),
+      stash: () => void repoStore.stashSave(),
+      stashPop: () => void repoStore.stashPop(),
+      rebase: () => {
+        isRebaseModalOpen = true;
+      },
+      palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
+      focusFilter: () =>
+        window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
+      openRecent: (path) => void openFromExternal(path),
+      openRepo: (path) => void openFromExternal(path),
+      closeRepoTab: () => void repoStore.closeActiveTab(),
+      nextRepoTab: () => void repoStore.nextTab(),
+      prevRepoTab: () => void repoStore.prevTab(),
+      reopenRepoTab: () => void repoStore.reopenLastClosed(),
+      openError: (message) => repoStore.setError(message),
+      setDropActive: (active) => {
+        setDropOverlay(active);
+      },
+    };
+    // Every boot step fails independently: a throw in restoreWorkspace must
+    // not take down, say, the repo-changed listener registration with it.
+    // Boot errors surface between renders, so unlike reportPaneCrash they
+    // need no setTimeout deferral.
+    void runBootSequence(
+      {
+        subscribeNativeShell,
+        takePendingOpen,
+        restoreWorkspace: () => repoStore.restoreWorkspace(),
+        openRepo: openFromExternal,
+        syncRecentMenu,
+        handleRepoChanged: (path) => void repoStore.handleRepoChanged(path),
+        listenRepoChanged: (changed) =>
+          listen<{ path?: string }>("repo-changed", (event) =>
+            changed(event.payload?.path),
+          ),
+        track,
+        onError: (step, err) => diagnostics.warn(`boot:${step}`, err),
+      },
+      [...$repoStore.recentRepos],
+      shellHandlers,
+    );
     return () => {
       disposed = true;
+      if (dropHideTimer !== null) {
+        clearTimeout(dropHideTimer);
+        dropHideTimer = null;
+      }
       for (const unsub of unsubs) unsub();
     };
   });
 
+  /**
+   * Fetch ownership: path/revision/query changes re-walk history here.
+   * Activation does NOT: cached rows render instantly via showRepo, and
+   * freshness comes from refresh()'s own loadGraph (watcher events,
+   * post-mutation refreshes), so switching tabs never re-walks.
+   *
+   * The scheduler exists because a naive inline effect cannot: repoStore
+   * emits on every publish (hydrate, branch-stats batches, the status poll),
+   * each emission tears the effect down, and teardown used to clear the armed
+   * fetch timer before the memo-guarded body would refuse to reschedule —
+   * dropping the one fetch a freshly opened repository needed and leaving the
+   * graph loader spinning. Identical requests now leave the armed timer
+   * untouched; only a real key change re-arms the window.
+   */
+  const graphScheduler = createGraphFetchScheduler({
+    load: ({ path, query, revision }) => void graphStore.loadGraph(path, query, revision),
+    debounceMs: GRAPH_FETCH_DEBOUNCE_MS,
+  });
+  onDestroy(() => graphScheduler.reset());
+
   $effect(() => {
-    const path = $repoStore.currentPath;
-    // Fetch ownership: path/revision/query changes re-walk history here.
-    // Activation does NOT: cached rows render instantly via showRepo, and
-    // freshness comes from refresh()'s own loadGraph (watcher events,
-    // post-mutation refreshes), so switching tabs never re-walks.
-    const query = $filterStore.searchQuery;
-    const revision = $filterStore.selectedBranch;
-    if (!path) {
-      lastGraphKey = null;
-      return;
-    }
-    // Only `path:` filters need git to walk history; every other filter runs
-    // client-side over the rows already loaded, so keystrokes do not re-walk
-    // a large repository per character.
-    const needsServer = queryNeedsServerFetch(query);
-    const repoRevisionKey = `${path}\u241f${revision ?? ""}`;
-    const key = needsServer ? `${repoRevisionKey}\u241f${query}` : repoRevisionKey;
-    if (key === lastGraphKey) return;
-    lastGraphKey = key;
-    const handle = setTimeout(() => {
-      void graphStore.loadGraph(path, query, revision);
-    }, 200);
-    return () => clearTimeout(handle);
+    graphScheduler.sync({
+      path: $repoStore.currentPath,
+      query: $filterStore.searchQuery,
+      revision: $filterStore.selectedBranch,
+    });
   });
 
   $effect(() => {
@@ -197,7 +244,12 @@
   });
 
   $effect(() => {
-    $repoStore.currentPath;
+    // Only a genuine repo switch closes the Rebase modal: this effect re-runs
+    // on every repoStore emission (status poll, stats batches) and must not
+    // dismiss a modal the user is working in.
+    const path = $repoStore.currentPath;
+    if (path === lastModalRepoPath) return;
+    lastModalRepoPath = path;
     isRebaseModalOpen = false;
   });
 </script>
@@ -287,11 +339,14 @@
   <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />
 
   {#if $repoStore.error}
-    <div class="px-3 pt-1.5">
-      <div class="gp-pop rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-300 flex items-center justify-between">
-        <span class="truncate">{$repoStore.error}</span>
-        <button type="button" class="shrink-0 px-1.5 hover:text-white" onclick={() => repoStore.setError(null)}>Dismiss</button>
-      </div>
+    <!-- Overlay toast, not in-flow: an in-flow banner shoved the entire app
+         up/down on every transient failure and its auto-clear. -->
+    <div
+      class="absolute bottom-3 right-3 max-w-md gp-pop rounded-xl border border-rose-500/30 bg-surface px-3 py-2 text-[11px] text-rose-300 shadow-float flex items-center gap-2"
+      style="z-index: {LAYERS.MODAL}"
+    >
+      <span class="min-w-0 flex-1 break-words">{$repoStore.error}</span>
+      <button type="button" class="shrink-0 px-1.5 hover:text-white" onclick={() => repoStore.setError(null)}>Dismiss</button>
     </div>
   {/if}
 
@@ -358,8 +413,11 @@
           <Sidebar />
         </svelte:boundary>
         <svelte:boundary failed={paneFailed}>
-          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane">
-          {#key $repoStore.activeTab}
+          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={terminalActive}>
+            <!-- No {#key activeTab}: keying here destroyed and rebuilt the
+                 entire pane on every view switch and replayed the .gp-view
+                 entrance fade — a full-screen flicker per tab. The {#if}
+                 chain alone swaps panes; state lives in stores. -->
             <div class="gp-view flex-1 flex flex-col min-h-0">
               {#if $repoStore.activeTab === "history"}
                 <div class="flex-1 flex flex-col min-h-0">
@@ -380,8 +438,6 @@
                 <StoragePanel />
               {:else if $repoStore.activeTab === "stack"}
                 <CodeStackViewer />
-              {:else if $repoStore.activeTab === "terminal"}
-                <TerminalPanel />
               {:else if $repoStore.activeTab === "github"}
                 <GitHubPanel />
               {:else if $repoStore.activeTab === "manvi"}
@@ -390,9 +446,17 @@
                 <ReflogViewer />
               {/if}
             </div>
-          {/key}
-        </main>
+          </main>
         </svelte:boundary>
+        {#if terminalMounted}
+          <!-- Kept mounted across tab switches so the PTY/xterm session
+               survives; display:none pauses rendering, not the process. -->
+          <svelte:boundary failed={paneFailed}>
+            <div class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={!terminalActive}>
+              <TerminalPanel />
+            </div>
+          </svelte:boundary>
+        {/if}
       </div>
     {/key}
   {/if}
@@ -411,11 +475,16 @@
   {/if}
 
   <!-- Modals -->
-  <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
-  <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
-  <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
-  <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
-  <PromptModal />
-  <CommandPalette />
-  <Tooltip />
+  <!-- One boundary around the whole overlay cluster: a render crash inside a
+       modal must not take down the repo views beneath it — the pane
+       boundaries above stay alive and offer Reset. -->
+  <svelte:boundary failed={paneFailed}>
+    <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
+    <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
+    <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
+    <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
+    <PromptModal />
+    <CommandPalette />
+    <Tooltip />
+  </svelte:boundary>
 </div>

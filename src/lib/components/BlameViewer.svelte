@@ -1,14 +1,15 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { FileCode, Search } from "lucide-svelte";
+  import { FileCode, PanelLeftClose, PanelLeftOpen, Search } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
   import { shortHash } from "../format";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import FileExplorer from "./FileExplorer.svelte";
 
   interface BlameLine {
     line_no: number;
@@ -19,11 +20,19 @@
     content: string;
   }
 
+  // Worktree-only blame lines carry an all-zero OID from --line-porcelain;
+  // they have no commit to inspect and must not render as a dead link.
+  const ZERO_OID_RE = /^0+$/;
+
   let filePath = $state("");
   let blameLines: BlameLine[] = $state([]);
   let coverageHits = $state<Map<number, number>>(new Map());
+  // Distinguishes "file has no coverage data" (dim dots) from "the coverage
+  // lookup itself failed" — a silent catch would conflate the two.
+  let coverageFailed = $state(false);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
+  let explorerOpen = $state(true);
   let inflight: AsyncGuard | null = null;
 
   async function loadBlameFor(repo: string, path: string) {
@@ -33,24 +42,29 @@
     inflight = guard;
     isLoading = true;
     errorMsg = null;
+    // The previous file's verdict must not bleed into the loading frame:
+    // old lines linger until the guard applies, so clear eagerly.
+    coverageFailed = false;
     try {
-      const [next, hits] = await Promise.all([
+      const [next, coverage] = await Promise.all([
         invoke<BlameLine[]>("cmd_get_file_blame", {
           repoPath: repo,
           filePath: path,
         }),
         fetchFileCoverage(repo, path)
-          .then((coverage) => buildHitMap(coverage.lines))
-          .catch(() => new Map<number, number>()),
+          .then((res) => ({ ok: true as const, hits: buildHitMap(res.lines) }))
+          .catch(() => ({ ok: false as const, hits: new Map<number, number>() })),
       ]);
       if (!guard.isLive()) return;
       blameLines = next;
-      coverageHits = hits;
+      coverageHits = coverage.hits;
+      coverageFailed = !coverage.ok;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("blame", err);
       blameLines = [];
       coverageHits = new Map();
+      coverageFailed = false;
     } finally {
       if (guard.isLive()) isLoading = false;
     }
@@ -60,28 +74,51 @@
     const repo = $repoStore.currentPath;
     const path = filePath.trim();
     if (!repo || !path) return;
-    void loadBlameFor(repo, path);
+    if ($repoStore.selectedFilePath === path) {
+      // Explicit resubmit of the loaded file (retry after error): the store
+      // will not notify for an unchanged value, so reload directly. New
+      // values go through selectFilePath so exactly one site loads.
+      void loadBlameFor(repo, path);
+      return;
+    }
+    repoStore.selectFilePath(path);
   }
 
   $effect(() => {
     return () => inflight?.cancel();
   });
 
+  // Selection- and freshness-driven blame load, memoized on a fingerprint of
+  // its real dependencies. Status-poll emissions re-run this effect body but
+  // skip the IPC unless something that can change blame output moved: the
+  // selection, the file's worktree/index status, or the checked-out branch's
+  // tip (external commits land through watcher refreshes).
+  let prevKey: string | null = null;
   $effect(() => {
     const selected = $repoStore.selectedFilePath;
     const repo = $repoStore.currentPath;
+    const statusCode = selected
+      ? ($repoStore.statuses.find((s) => s.path === selected)?.status_code ?? "")
+      : "";
+    const tip =
+      $repoStore.branches.find((b) => b.is_current)?.tip_commit_id ?? "";
+    const key = `${repo ?? ""}\u0000${selected ?? ""}\u0000${statusCode}\u0000${tip}`;
+    if (key === prevKey) return;
+    prevKey = key;
     if (selected) {
       filePath = selected;
     }
-    if (!repo) {
-      inflight?.cancel();
-      blameLines = [];
-      coverageHits = new Map();
-      errorMsg = null;
-      isLoading = false;
+    if (!repo || !selected) {
+      if (!repo) {
+        inflight?.cancel();
+        blameLines = [];
+        coverageHits = new Map();
+        coverageFailed = false;
+        errorMsg = null;
+        isLoading = false;
+      }
       return;
     }
-    if (!selected) return;
     void loadBlameFor(repo, selected);
     const started = inflight;
     return () => {
@@ -105,8 +142,20 @@
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
-  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans">
-    <div class="flex items-center gap-3">
+  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
+    <div class="flex items-center gap-3 min-w-0">
+      <button
+        type="button"
+        onclick={() => (explorerOpen = !explorerOpen)}
+        title={explorerOpen ? "Hide file explorer" : "Show file explorer"}
+        class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-surfaceHover transition-colors"
+      >
+        {#if explorerOpen}
+          <PanelLeftClose size={15} />
+        {:else}
+          <PanelLeftOpen size={15} />
+        {/if}
+      </button>
       <FileCode size={16} class="text-accent" />
       <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-3 py-1 focus-within:border-accent/60 transition-colors">
         <input
@@ -114,6 +163,7 @@
           bind:value={filePath}
           onkeydown={(e) => e.key === "Enter" && loadBlame()}
           placeholder="Path to file in repo..."
+          spellcheck="false"
           class="w-64 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none font-mono"
         />
         <button onclick={loadBlame} class="p-1 rounded-full hover:text-accent hover:bg-surfaceHover">
@@ -123,7 +173,15 @@
     </div>
 
     <!-- Legend -->
-    <div class="flex items-center gap-3 text-[11px] text-textMuted">
+    <div class="flex items-center gap-3 text-[11px] text-textMuted shrink-0">
+      {#if coverageFailed && blameLines.length > 0}
+        <span
+          class="flex items-center gap-1 text-amber-400/80"
+          title="Coverage data could not be loaded; hit badges are unavailable."
+        >
+          <span class="w-2 h-2 rounded-full bg-amber-400/70"></span> Coverage unavailable
+        </span>
+      {/if}
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-red-500/40"></span> &lt; 7d</span>
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-amber-500/40"></span> &lt; 30d</span>
       <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-blue-500/40"></span> &lt; 90d</span>
@@ -131,45 +189,63 @@
     </div>
   </div>
 
-  <!-- Blame Lines -->
-  <div class="flex-1 min-h-0 flex flex-col">
-    {#if isLoading}
-      <div class="h-full flex items-center justify-center text-textMuted font-sans text-xs">
-        Loading blame for {filePath}...
+  <!-- Body -->
+  <div class="flex-1 min-h-0 flex">
+    {#if explorerOpen}
+      <div class="w-64 shrink-0 border-r border-border/60 min-h-0">
+        <FileExplorer />
       </div>
-    {:else if errorMsg}
-      <div class="h-full flex items-center justify-center text-rose-400 font-sans text-xs p-4">
-        {errorMsg}
-      </div>
-    {:else if blameLines.length > 0}
-      <VirtualList items={blameLines} rowHeight={24} overscan={15} class="h-full px-1.5 py-1">
-        {#snippet row(line)}
-          {#if line}
-            <div
-              class="flex items-center h-6 rounded-md px-1 hover:bg-surfaceHover/80 transition-colors"
-              style="background-color: {getHeatmapColor(line.timestamp)}"
-            >
-              <button
-                type="button"
-                class="w-16 px-2 text-[10px] text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0"
-                onclick={() => {
-                  repoStore.inspectCommitInHistory(line.commit_id);
-                }}
-              >{shortHash(line.commit_id)}</button>
-              <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
-              <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
-              <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
-              <span class="px-3 whitespace-pre overflow-hidden text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
-            </div>
-          {/if}
-        {/snippet}
-      </VirtualList>
-    {:else}
-      <EmptyState
-        icon={Search}
-        title="No blame loaded"
-        hint="Enter a file path above to view git blame heatmaps."
-      />
     {/if}
+
+    <!-- Blame Lines -->
+    <div class="flex-1 min-w-0 flex flex-col">
+      {#if isLoading}
+        <div class="h-full flex items-center justify-center text-textMuted font-sans text-xs">
+          Loading blame for {filePath}...
+        </div>
+      {:else if errorMsg}
+        <div class="h-full flex items-center justify-center text-rose-400 font-sans text-xs p-4">
+          {errorMsg}
+        </div>
+      {:else if blameLines.length > 0}
+        <VirtualList items={blameLines} rowHeight={24} overscan={15} class="h-full px-1.5 py-1">
+          {#snippet row(line)}
+            {#if line}
+              <div
+                class="flex items-center h-6 rounded-md px-1 hover:bg-surfaceHover/80 transition-colors"
+                style="background-color: {getHeatmapColor(line.timestamp)}"
+              >
+                {#if ZERO_OID_RE.test(line.commit_id)}
+                  <span
+                    class="w-16 px-2 text-[10px] font-mono text-textMuted/50 italic text-left shrink-0"
+                    title="Not committed yet"
+                  >uncommitted</span>
+                {:else}
+                  <button
+                    type="button"
+                    class="w-16 px-2 text-[10px] text-accent/80 font-mono select-none cursor-pointer hover:underline text-left shrink-0"
+                    onclick={() => {
+                      repoStore.inspectCommitInHistory(line.commit_id);
+                    }}
+                  >{shortHash(line.commit_id)}</button>
+                {/if}
+                <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
+                <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
+                <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
+                <span class="px-3 whitespace-pre overflow-hidden text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
+              </div>
+            {/if}
+          {/snippet}
+        </VirtualList>
+      {:else}
+        <EmptyState
+          icon={Search}
+          title="No blame loaded"
+          hint={explorerOpen
+            ? "Pick a file in the explorer or enter a path above."
+            : "Enter a file path above to view git blame heatmaps."}
+        />
+      {/if}
+    </div>
   </div>
 </div>

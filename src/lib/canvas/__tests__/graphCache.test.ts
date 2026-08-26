@@ -245,6 +245,25 @@ describe("strip tiling and slicing", () => {
     expect(surfaces[0].canvas.height).toBe(40); // round(20 * 2)
   });
 
+  it("clamps negative overscroll scrollTop to strip 0 instead of a junk index -1", () => {
+    // macOS rubber-band reports negative scrollTop; the old arithmetic
+    // computed firstStrip = floor(-6/20) = -1, allocated a garbage surface,
+    // and blitted a blank band over the top rows.
+    const { cache, surfaces } = makeCache();
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 5 });
+    const target = recordingTarget();
+
+    const blitted = cache.paint(target.ctx, paintReq(-6, 15));
+
+    expect(blitted).toBe(true);
+    expect(target.blits).toEqual([
+      // Strip 0 painted at its natural offset: with viewTop clamped to 0 the
+      // whole 15px viewport is covered by strip 0's first rows.
+      { src: [0, 0, 220, 15], dst: [0, 0, 220, 15] },
+    ]);
+    expect(surfaces).toHaveLength(1); // strip 0 only — no phantom strip -1
+  });
+
   it("handles non-integer dpr without producing zero-height sources", () => {
     const { cache, surfaces } = makeCache();
     cache.sync(inputs({ dpr: 1.5 }), { rowHeight: 10, totalRows: 5 });
@@ -651,5 +670,128 @@ describe("static layer carries no dangling-stub ops", () => {
       // from the seam always finds its origin row inside the painted range.
       expect(range.to).toBe(Math.min(9, req.firstRow + req.rowCount - 1));
     }
+  });
+});
+
+describe("graphCache strip background fill", () => {
+  function bgSurfaceFactory() {
+    const ops: string[] = [];
+    const surfaces: CachedSurface[] = [];
+    const factory: SurfaceFactory = (cssWidth, cssHeight, dpr) => {
+      const canvas = {
+        width: Math.max(1, Math.round(cssWidth * dpr)),
+        height: Math.max(1, Math.round(cssHeight * dpr)),
+      } as HTMLCanvasElement;
+      const ctx = {
+        setTransform: vi.fn(),
+        fillRect: vi.fn(() => ops.push("fill")),
+        beginPath: vi.fn(() => ops.push("begin")),
+        arc: vi.fn(),
+        fill: vi.fn(() => ops.push("dot")),
+        lineWidth: 2,
+        lineCap: "round",
+        lineJoin: "round",
+        imageSmoothingEnabled: true,
+        globalAlpha: 1,
+        strokeStyle: "",
+        fillStyle: "",
+      } as unknown as CanvasRenderingContext2D;
+      const surface: CachedSurface = { canvas, ctx };
+      surfaces.push(surface);
+      return surface;
+    };
+    return { factory, surfaces, ops };
+  }
+
+  const painter = (req: StripPaintRequest) => {
+    req.ctx.beginPath();
+    req.ctx.arc(5, 5, 2, 0, Math.PI * 2);
+    req.ctx.fill();
+  };
+
+  it("fills the strip with the theme background before painting geometry", () => {
+    const { factory, surfaces, ops } = bgSurfaceFactory();
+    const cache = createGraphStaticCache(painter, factory);
+    cache.sync(
+      inputs({ backgroundCssColor: "rgb(243 244 250)" }),
+      { rowHeight: 10, totalRows: 5 },
+    );
+    cache.paint(recordingTarget().ctx, paintReq(0, 50));
+
+    expect(surfaces.length).toBeGreaterThan(0);
+    // The opaque surface zero-initializes to black; an unfilled strip blits
+    // black bands over the themed visible canvas (light theme glaring, dark
+    // theme banding). The fill must precede any geometry.
+    expect(ops[0]).toBe("fill");
+    expect(ops.indexOf("fill")).toBeLessThan(ops.indexOf("begin"));
+    expect((surfaces[0].ctx.fillStyle as unknown)).toBe("rgb(243 244 250)");
+  });
+
+  it("does not fill when no background color is provided", () => {
+    const { factory, ops } = bgSurfaceFactory();
+    const cache = createGraphStaticCache(painter, factory);
+    cache.sync(inputs(), { rowHeight: 10, totalRows: 5 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 50));
+    expect(ops).not.toContain("fill");
+  });
+
+  it("drops strips when the background color changes", () => {
+    const { factory } = bgSurfaceFactory();
+    const cache = createGraphStaticCache(painter, factory);
+    cache.sync(inputs({ backgroundCssColor: "#111111" }), { rowHeight: 10, totalRows: 5 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 50));
+    const rendersAfterFirst = cache.stats().stripRenders;
+
+    cache.sync(inputs({ backgroundCssColor: "#eeeeee" }), { rowHeight: 10, totalRows: 5 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 50));
+    expect(cache.stats().stripRenders).toBeGreaterThan(rendersAfterFirst);
+  });
+
+  it("repaints a short tail strip whose bucket grew with totalRows", () => {
+    // rowsPerStrip = 2 (stripCssHeight 20 / rowHeight 10). With 5 total rows,
+    // strip 2 paints rowCount 1. Growing to 6 rows keeps strip 2 alive (sync
+    // only clears on shrink), but its bucket now claims 2 rows — blitting the
+    // old 1-row texture would report coverage over an unpainted hole.
+    const { factory, surfaces } = bgSurfaceFactory();
+    const { painter: recPainter, requests } = recordingPainter();
+    let active = recPainter;
+    const cache = createGraphStaticCache((req) => active(req), factory, {
+      stripCssHeight: 20,
+    });
+
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 5 });
+    cache.paint(recordingTarget().ctx, paintReq(40, 10));
+    const rendersBeforeGrow = cache.stats().stripRenders;
+    expect(requests.map((r) => r.rowCount)).toEqual([1]);
+
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 6 });
+    cache.paint(recordingTarget().ctx, paintReq(40, 20));
+
+    // The stale short texture was rejected and repainted at full coverage.
+    expect(cache.stats().stripRenders).toBe(rendersBeforeGrow + 1);
+    expect(requests).toHaveLength(2);
+    expect(requests[1].rowCount).toBe(2);
+    expect(surfaces).toHaveLength(2); // released the short surface, made one
+  });
+
+  it("keeps a fully-covered strip cached across a totalRows grow", () => {
+    const { factory } = bgSurfaceFactory();
+    const { painter: recPainter, requests } = recordingPainter();
+    let active = recPainter;
+    const cache = createGraphStaticCache((req) => active(req), factory, {
+      stripCssHeight: 20,
+    });
+
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 4 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 20));
+    const rendersBeforeGrow = cache.stats().stripRenders;
+    expect(requests.map((r) => r.rowCount)).toEqual([2]);
+
+    // Strip 0 already covers its whole bucket; growth must not repaint it.
+    cache.sync(inputs({ dpr: 1 }), { rowHeight: 10, totalRows: 6 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 20));
+
+    expect(cache.stats().stripRenders).toBe(rendersBeforeGrow);
+    expect(requests).toHaveLength(1);
   });
 });

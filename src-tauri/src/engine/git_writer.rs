@@ -306,11 +306,14 @@ impl GitWriter {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let restore = |repo: &std::path::Path| {
+        // Recovery must never swallow its own failure: the checkout outcome is
+        // captured so a locked index or full disk cannot hide that HEAD was
+        // left detached mid-rebase.
+        let restore = |repo: &std::path::Path| -> Result<(), String> {
             if let Some(ref branch) = original_branch {
-                let _ = git_text(repo, &["checkout", "-f", branch]);
+                git_text(repo, &["checkout", "-f", branch]).map(|_| ())
             } else {
-                let _ = git_text(repo, &["checkout", "-f", &original_head]);
+                git_text(repo, &["checkout", "-f", &original_head]).map(|_| ())
             }
         };
 
@@ -354,15 +357,51 @@ impl GitWriter {
         })();
 
         if let Err(e) = result {
-            let _ = git_text(&repo, &["cherry-pick", "--abort"]);
-            restore(&repo);
-            return Err(e);
+            // git_text yields stdout on success; normalize to () so the
+            // composer only ever sees recovery outcomes.
+            let abort_result = git_text(&repo, &["cherry-pick", "--abort"]).map(|_| ());
+            if let Err(abort_err) = &abort_result {
+                log::warn!(
+                    target: "engine",
+                    "rebase recovery: cherry-pick --abort failed in {}: {abort_err}",
+                    repo.display()
+                );
+            }
+            let restore_result = restore(&repo);
+            if let Err(restore_err) = &restore_result {
+                log::warn!(
+                    target: "engine",
+                    "rebase recovery: checkout -f restore failed in {}: {restore_err}",
+                    repo.display()
+                );
+            }
+            return Err(combine_step_failure_with_recovery(
+                &e,
+                Some(&abort_result),
+                &restore_result,
+                original_branch.as_deref(),
+                &original_head,
+            ));
         }
 
         if let Some(ref branch) = original_branch {
             if let Err(e) = git_text(&repo, &["branch", "-f", branch, "HEAD"]) {
-                restore(&repo);
-                return Err(e);
+                let restore_result = restore(&repo);
+                if let Err(restore_err) = &restore_result {
+                    log::warn!(
+                        target: "engine",
+                        "rebase recovery: checkout -f restore after failed 'branch -f' in {}: {restore_err}",
+                        repo.display()
+                    );
+                }
+                // No cherry-pick was mid-flight here, so abort_result is None.
+                return Err(combine_step_failure_with_recovery(
+                    &e,
+                    None,
+                    &restore_result,
+                    original_branch.as_deref(),
+                    &original_head,
+                ));
             }
             // The rebase is durably applied once `branch -f` succeeded; only
             // the working-tree checkout remains. Retry once, and if it still
@@ -476,35 +515,172 @@ impl GitWriter {
         }
     }
 
-    pub fn restack(repo_path: &str, branch: &str, onto: &str) -> Result<String, String> {
-        let repo = validate_repo(repo_path)?;
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Resolves the upstream for a restack of `branch` onto `onto`: where
+    /// `branch` forked, NOT the new base itself. After the parent branch was
+    /// rewritten, `onto..branch` still contains the stale pre-image commits
+    /// and replaying them conflicts. --fork-point recovers the pre-rewrite
+    /// fork from the reflog; plain merge-base covers reflog-less clones;
+    /// unrelated histories fall back to `onto`.
+    ///
+    /// Caller MUST hold the repo mutation lock: the value returned here is
+    /// frozen into the argv the harness gate judges AND the argv executed,
+    /// closing the plan-vs-execute TOCTOU.
+    pub fn prepare_restack(repo_canon: &Path, branch: &str, onto: &str) -> Result<String, String> {
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
-        // The upstream must be where `branch` forked, not the new base itself:
-        // after the parent branch was rewritten, `onto..branch` still contains
-        // the stale pre-image commits and replaying them conflicts. --fork-point
-        // recovers the pre-rewrite fork from the reflog; plain merge-base covers
-        // reflog-less clones; unrelated histories fall back to the old behavior.
-        let upstream = [
+        Ok([
             vec!["merge-base", "--fork-point", onto, branch],
             vec!["merge-base", onto, branch],
         ]
         .into_iter()
         .find_map(|argv| {
-            git_text(&repo, &argv)
+            git_text(repo_canon, &argv)
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or_else(|| onto.to_string());
-        git_text(
-            &repo,
-            &["rebase", "--onto", onto, upstream.as_str(), branch],
-        )
+        .unwrap_or_else(|| onto.to_string()))
+    }
+
+    /// True when a rebase or merge is mid-flight (`rebase-merge`,
+    /// `rebase-apply`, `MERGE_HEAD`). Stacking on top of one corrupts both
+    /// operations; refuse before touching anything.
+    fn rebase_or_merge_in_progress(repo_canon: &Path) -> Result<bool, String> {
+        for state in ["rebase-merge", "rebase-apply", "MERGE_HEAD"] {
+            let raw = git_text(repo_canon, &["rev-parse", "--git-path", state])?;
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let path = std::path::Path::new(raw);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo_canon.join(path)
+            };
+            if path.exists() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Executes a restack with full preflight and rollback semantics. Caller
+    /// MUST hold the repo mutation lock.
+    ///
+    /// - Preflight refuses a dirty worktree and an in-progress rebase/merge
+    ///   before any state is touched.
+    /// - On failure the half-applied rebase is aborted and the user's
+    ///   original checkout restored; the error says what was rolled back.
+    /// - On success `git rebase <branch>` leaves `branch` checked out, which
+    ///   would silently switch the user's working copy; the original branch
+    ///   is restored, and a failed restore is reported as partial success —
+    ///   never as total failure.
+    pub fn execute_restack(
+        repo_canon: &Path,
+        branch: &str,
+        onto: &str,
+        upstream: &str,
+    ) -> Result<String, String> {
+        validate_ref_name(branch)?;
+        validate_ref_name(onto)?;
+        // Upstream is either the validated `onto` fallback or a git-emitted
+        // OID from merge-base; anything else must never reach argv.
+        if upstream != onto {
+            validate_oid(upstream)?;
+        }
+
+        // In-progress detection runs BEFORE the dirty-tree check: a mid-rebase
+        // worktree is by definition dirty, and "finish the other rebase" is
+        // the actionable cause while "commit your changes" is its symptom.
+        if Self::rebase_or_merge_in_progress(repo_canon)? {
+            return Err(
+                "A rebase or merge is already in progress in this repository; \
+                 finish it before restacking"
+                    .into(),
+            );
+        }
+        let dirty = git_text(repo_canon, &["status", "--porcelain"])?;
+        if !dirty.trim().is_empty() {
+            return Err(
+                "Working tree has uncommitted changes; commit or stash before restacking".into(),
+            );
+        }
+
+        // symbolic-ref fails on detached HEAD; then there is no branch to restore.
+        let original_head = git_text(repo_canon, &["symbolic-ref", "--quiet", "HEAD"])
+            .ok()
+            .map(|s| {
+                s.trim()
+                    .trim_start_matches("refs/heads/")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty());
+
+        let restore_checkout = |repo_canon: &Path, target: &str| -> Result<(), String> {
+            if git_text(repo_canon, &["checkout", target]).is_ok() {
+                return Ok(());
+            }
+            // One retry: index refresh races are the common transient cause.
+            if git_text(repo_canon, &["checkout", target]).is_ok() {
+                return Ok(());
+            }
+            Err(format!("checkout '{target}' failed"))
+        };
+
+        match git_text(repo_canon, &["rebase", "--onto", onto, upstream, branch]) {
+            Ok(output) => {
+                if original_head.as_deref() != Some(branch) {
+                    if let Some(ref orig) = original_head {
+                        if let Err(checkout_err) = restore_checkout(repo_canon, orig) {
+                            return Err(format!(
+                                "Restack succeeded: '{branch}' was rebased onto '{onto}', but \
+                                 restoring your previous branch '{orig}' failed ({checkout_err}). \
+                                 The repository is left on '{branch}'."
+                            ));
+                        }
+                    }
+                }
+                Ok(output)
+            }
+            Err(rebase_err) => {
+                // Abort the half-applied rebase, then put the user back on
+                // their original branch (--abort lands on `branch`, not where
+                // the user was). Neither cleanup failure hides the primary
+                // error; the message names the true end-state instead.
+                let _ = git_text(repo_canon, &["rebase", "--abort"]);
+                let end_state = match &original_head {
+                    Some(orig) if orig != branch => {
+                        if restore_checkout(repo_canon, orig).is_err() {
+                            format!("'{branch}' is checked out (restore of '{orig}' failed)")
+                        } else {
+                            format!("the repository is back on '{orig}'")
+                        }
+                    }
+                    _ => format!("'{branch}' is checked out"),
+                };
+                Err(format!(
+                    "Restack of '{branch}' onto '{onto}' failed and was rolled back ({end_state}): {}",
+                    summarize_git_failure(&rebase_err)
+                ))
+            }
+        }
+    }
+
+    /// Convenience wrapper used outside the gated command path (tests): takes
+    /// the mutation lock, resolves the upstream, executes with preflight and
+    /// rollback. The production command plans/judges/executes under ONE lock
+    /// span via [`Self::prepare_restack`] + [`Self::execute_restack`] instead.
+    pub fn restack(repo_path: &str, branch: &str, onto: &str) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = guard;
+        let upstream = Self::prepare_restack(&repo, branch, onto)?;
+        Self::execute_restack(&repo, branch, onto, &upstream)
     }
 
     pub fn create_tag(
@@ -644,6 +820,42 @@ impl GitWriter {
     }
 }
 
+/// Composes the user-facing error for a failed rebase step together with any
+/// recovery failures that occurred while rolling back.
+///
+/// The step error always leads verbatim. When `abort_result` is
+/// `Some(Err(..))` (a cherry-pick was mid-flight and could not be aborted) or
+/// `restore_result` is `Err(..)` (the checkout back to the original branch /
+/// HEAD failed), an explicit clause names the failure and the true end-state,
+/// so a locked index or full disk can never hide behind the primary error.
+/// Pure: no git, fully unit-testable.
+fn combine_step_failure_with_recovery(
+    step_error: &str,
+    abort_result: Option<&Result<(), String>>, // None when no cherry-pick was in progress
+    restore_result: &Result<(), String>,
+    original_branch: Option<&str>,
+    original_head: &str,
+) -> String {
+    let mut message = step_error.to_string();
+    if let Some(Err(abort_err)) = abort_result {
+        message.push_str(&format!(
+            "; additionally, `cherry-pick --abort` failed ({abort_err}) — \
+             the repository may still be mid-cherry-pick"
+        ));
+    }
+    if let Err(restore_err) = restore_result {
+        let target = match original_branch {
+            Some(branch) => branch.to_string(),
+            None => format!("HEAD {original_head}"),
+        };
+        message.push_str(&format!(
+            "; additionally, restoring {target} failed ({restore_err}) — \
+             HEAD may remain detached at the rebase base"
+        ));
+    }
+    message
+}
+
 /// Resolves a clone destination the way [`crate::engine::git_cli::sandbox_join_canonical`]
 /// resolves in-repo paths: the parent is canonicalized (resolving every
 /// existing symlinked prefix, including macOS `/var` → `/private/var`), an
@@ -770,6 +982,28 @@ pub fn validate_clone_url(url: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Condenses raw git stderr for user-facing mutation errors: drops the
+/// advisory `hint:` lines (they prescribe terminal commands this client does
+/// not expose, e.g. `git rebase --continue`), collapses whitespace runs, and
+/// caps the length so a pathological failure cannot flood the UI banner.
+pub(crate) fn summarize_git_failure(raw: &str) -> String {
+    let meaningful: String = raw
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("hint:"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    const CAP: usize = 400;
+    if meaningful.chars().count() <= CAP {
+        meaningful
+    } else {
+        let truncated: String = meaningful.chars().take(CAP).collect();
+        format!("{truncated}…")
+    }
 }
 
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
@@ -1519,5 +1753,107 @@ mod tests {
             "error must name fixup, got: {fixup_err}"
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
+    }
+
+    /// Pure-message tests for rebase recovery reporting: the step error always
+    /// leads verbatim, and every recovery failure (abort and/or restore) must
+    /// be named with its true end-state instead of being swallowed behind the
+    /// primary failure.
+    #[test]
+    fn combine_step_failure_clean_recovery_returns_step_error_verbatim() {
+        let msg = combine_step_failure_with_recovery(
+            "Rebase step failed (pick abc123): conflict",
+            None,
+            &Ok(()),
+            Some("main"),
+            "0000000000000000000000000000000000000000",
+        );
+        assert_eq!(
+            msg, "Rebase step failed (pick abc123): conflict",
+            "clean recovery must not add any clauses"
+        );
+    }
+
+    #[test]
+    fn combine_step_failure_names_failed_cherry_pick_abort() {
+        let msg = combine_step_failure_with_recovery(
+            "step boom",
+            Some(&Err("index.lock exists".to_string())),
+            &Ok(()),
+            Some("main"),
+            "abc",
+        );
+        assert!(msg.starts_with("step boom"), "step error leads: {msg}");
+        assert!(
+            msg.contains("`cherry-pick --abort` failed (index.lock exists)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("may still be mid-cherry-pick"),
+            "end-state must warn about mid-cherry-pick: {msg}"
+        );
+        assert!(!msg.contains("restoring"), "restore succeeded: {msg}");
+    }
+
+    #[test]
+    fn combine_step_failure_names_failed_branch_restore() {
+        let msg = combine_step_failure_with_recovery(
+            "step boom",
+            None,
+            &Err("disk full".to_string()),
+            Some("feature/x"),
+            "abc",
+        );
+        assert!(msg.starts_with("step boom"), "step error leads: {msg}");
+        assert!(
+            msg.contains("restoring feature/x failed (disk full)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("HEAD may remain detached"),
+            "end-state must warn about detached HEAD: {msg}"
+        );
+        assert!(
+            !msg.contains("abort"),
+            "no cherry-pick was in flight: {msg}"
+        );
+    }
+
+    #[test]
+    fn combine_step_failure_reports_both_recovery_failures_in_order() {
+        let msg = combine_step_failure_with_recovery(
+            "step boom",
+            Some(&Err("abort err".to_string())),
+            &Err("restore err".to_string()),
+            Some("main"),
+            "def456",
+        );
+        assert!(msg.starts_with("step boom"), "{msg}");
+        let abort_at = msg
+            .find("`cherry-pick --abort` failed")
+            .expect("abort clause present");
+        let restore_at = msg.find("restoring main failed").expect("restore clause");
+        assert!(
+            abort_at < restore_at,
+            "abort clause precedes restore clause: {msg}"
+        );
+    }
+
+    #[test]
+    fn combine_step_failure_detached_head_restore_names_head_oid() {
+        let msg = combine_step_failure_with_recovery(
+            "step boom",
+            None,
+            &Err("locked index".to_string()),
+            None,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert!(
+            msg.contains(
+                "restoring HEAD deadbeefdeadbeefdeadbeefdeadbeefdeadbeef failed \
+                          (locked index)"
+            ),
+            "detached HEAD wording must name the oid: {msg}"
+        );
     }
 }

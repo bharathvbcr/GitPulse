@@ -20,7 +20,7 @@ function frameRecorder() {
     beginPath: vi.fn(),
     moveTo: vi.fn(),
     lineTo: vi.fn(),
-    bezierCurveTo: vi.fn(),
+    bezierCurveTo: vi.fn(() => ops.push({ op: "bezierCurveTo", alpha: ctx.globalAlpha as number })),
     arc: vi.fn(() => ops.push({ op: "arc", alpha: ctx.globalAlpha as number })),
     fill: vi.fn(() => ops.push({ op: "fill", alpha: ctx.globalAlpha as number })),
     stroke: vi.fn(() => ops.push({ op: "stroke", alpha: ctx.globalAlpha as number })),
@@ -49,6 +49,7 @@ function fakeSurfaceFactory(): SurfaceFactory {
       canvas,
       ctx: {
         setTransform: vi.fn(),
+        fillRect: vi.fn(),
         save: vi.fn(),
         restore: vi.fn(),
         beginPath: vi.fn(),
@@ -192,5 +193,38 @@ describe("paintGraphFrame layering", () => {
       (o, i) => o.op === "fill" && i > lastStubIndex,
     );
     expect(bodyFillAfterStub).toBe(true);
+  });
+
+  it("overlay draws long connectors whole when strips covered the frame", () => {
+    // A merge edge spanning row 0 -> row 90 (offset 90 > LOOKBACK_ROWS=60):
+    // baked into tiles it would lose its middle at every seam, so the frame
+    // contract hands it to the live overlay instead.
+    const rows: VisualCommitRow[] = Array.from({ length: 100 }, (_, i) =>
+      row(`c${i}`),
+    );
+    rows[0].parent_ids = ["c90"];
+    rows[0].connections.push({
+      from_lane: 0,
+      to_lane: 1,
+      to_row_offset: 90,
+      is_merge: true,
+      color_index: 3,
+    });
+    const { recorder, blitted } = paintWithRealStrips(
+      frameRequest(rows, { startIndex: 85, endIndex: 95, scrollTop: 85 * 36 }),
+    );
+
+    expect(blitted).toBe(true);
+    const lastBlit = recorder.ops.map((o) => o.op).lastIndexOf("drawImage");
+    const firstBezier = recorder.ops.map((o) => o.op).indexOf("bezierCurveTo");
+    // The long edge's lower segment arrives AFTER the strip blits — drawn
+    // whole by the overlay rather than clipped mid-edge at a seam.
+    expect(firstBezier).toBeGreaterThan(lastBlit);
+    // And its endpoint node was re-stamped over the stroke (repair pass).
+    const firstBezierIndex = firstBezier;
+    const repairFill = recorder.ops.some(
+      (o, i) => o.op === "fill" && i > firstBezierIndex,
+    );
+    expect(repairFill).toBe(true);
   });
 });

@@ -28,6 +28,15 @@ const CHURN_CACHE_CAPACITY: usize = 8192;
 /// `git`'s output cap; this guards the direct `fs::read` path.
 const MAX_WORKING_TREE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Hard ceiling on [`GitReader::list_repo_files`]'s payload.
+///
+/// The file explorer ships every visible path over IPC in one `Vec<String>`;
+/// without a bound, a monorepo with millions of entries would serialize an
+/// unbounded allocation into the frontend on every open. Past the cap the
+/// call fails loudly instead of truncating silently — a partial tree rendered
+/// as complete would read as fact.
+const MAX_REPO_FILES: usize = 200_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     pub name: String,
@@ -452,9 +461,11 @@ impl GitReader {
 
     /// Reads one page of history, oldest-first paging via `--skip`.
     ///
-    /// A single walk is capped at [`MAX_HISTORY_COMMITS`]; callers that need
-    /// deeper history paginate rather than raise the cap, so a request can
-    /// never ask git for an unbounded log on a monorepo-scale repository.
+    /// A single walk is capped at [`MAX_HISTORY_COMMITS`] (plus one probe row
+    /// for the caller's has_more check — see [`Self::page_count_limit`]);
+    /// callers that need deeper history paginate rather than raise the cap, so
+    /// a request can never ask git for an unbounded log on a monorepo-scale
+    /// repository.
     pub fn read_commit_history_paged(
         repo_path: &str,
         skip: usize,
@@ -462,7 +473,7 @@ impl GitReader {
         revision: Option<&str>,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_count.clamp(1, Self::MAX_HISTORY_COMMITS).to_string();
+        let count = Self::page_count_limit(max_count).to_string();
         let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
         let count_arg = format!("-n{}", count);
         let skip_arg = format!("--skip={}", skipped);
@@ -473,10 +484,13 @@ impl GitReader {
             "--topo-order",
             // Subjects may legally contain any byte except NUL, so the RECORD
             // terminator is %x00 — a hostile subject can no longer split the
-            // stream into bogus records. Fields use %x01; a stray \x01 inside
-            // one subject only truncates that summary, never misparses later
-            // commits.
-            "--format=format:%H%x01%P%x01%ct%x01%an%x01%ae%x01%s%x00",
+            // stream into bogus records. Fields use %x01, which a subject,
+            // author name or email may legally contain too: the risky
+            // variable-length fields therefore sit at the END of the record
+            // and parsing works from the RIGHT (see [`parse_history_record`]),
+            // so such a byte can only truncate the one field it landed in —
+            // never shift id, parents or timestamp.
+            "--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00",
         ];
         if let Some(rev) = revision {
             validate_ref_name(rev)?;
@@ -494,36 +508,85 @@ impl GitReader {
             if record.is_empty() {
                 continue;
             }
-            let mut parts = record.splitn(6, '\x01');
-            let Some(id) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            let parent_str = parts.next().unwrap_or("");
-            let parent_ids = if parent_str.is_empty() {
-                Vec::new()
-            } else {
-                parent_str.split_whitespace().map(String::from).collect()
-            };
-            let timestamp = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let author_name = parts.next().unwrap_or("").to_string();
-            let author_email = parts.next().unwrap_or("").to_string();
-            let summary = parts.next().unwrap_or("").to_string();
-            commits.push(RawCommitNode {
-                id: id.to_string(),
-                parent_ids,
-                timestamp,
-                author_name,
-                author_email,
-                summary,
-            });
+            if let Some(node) = parse_history_record(record) {
+                commits.push(node);
+            }
         }
         Ok(commits)
     }
 
+    /// `-n` bound handed to git for one history page: the caller's cap plus
+    /// one overshoot slot.
+    ///
+    /// The extra slot exists only for the caller's has_more probe:
+    /// cmd_get_commit_graph fetches cap+1 rows and drops the overflow before
+    /// lanes are solved. Clamping back down to the ceiling here swallowed that
+    /// probe at exactly MAX_HISTORY_COMMITS, so a repository at the ceiling
+    /// reported has_more=false forever while silently truncating its history —
+    /// truncation presented as fact. Only the count widens; `skip` keeps its
+    /// own clamp because paging past the window is a separate concern from
+    /// probing one row past it.
+    pub(crate) fn page_count_limit(max_count: usize) -> usize {
+        max_count.clamp(1, Self::MAX_HISTORY_COMMITS.saturating_add(1))
+    }
+
+    /// Walks the first-parent chain from `tip_oid` NEWEST-first, stopping at
+    /// (and including) the first commit whose id is in `stop_at`, and returns
+    /// the visited ids OLDEST-first so consecutive pairs are first-parent
+    /// edges. `None` when the walk exhausted `max_commits` without reaching a
+    /// stop id — the caller must treat that as "no discoverable base", never
+    /// as "rooted at the default branch".
+    ///
+    /// This repairs the stack hierarchy on long-lived repositories where the
+    /// global `--all` history window ends before a branch's fork point: one
+    /// bounded subprocess per unresolved branch instead of lifting the global
+    /// cap for every request.
+    pub fn first_parent_chain(
+        repo_path: &str,
+        tip_oid: &str,
+        stop_at: &HashSet<String>,
+        max_commits: usize,
+    ) -> Result<Option<Vec<String>>, String> {
+        if stop_at.contains(tip_oid) {
+            // The tip itself is another branch's tip; there is nothing to walk.
+            return Ok(Some(vec![tip_oid.to_string()]));
+        }
+        let repo = validate_repo(repo_path)?;
+        let count = max_commits.clamp(1, Self::MAX_HISTORY_COMMITS).to_string();
+        let count_arg = format!("--max-count={}", count);
+        let stdout = git_text(
+            &repo,
+            &["rev-list", "--first-parent", count_arg.as_str(), tip_oid],
+        )?;
+        let mut walked: Vec<String> = Vec::new();
+        for line in stdout.lines() {
+            let oid = line.trim();
+            if oid.is_empty() {
+                continue;
+            }
+            walked.push(oid.to_string());
+            if stop_at.contains(oid) {
+                walked.reverse();
+                return Ok(Some(walked));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Lists commits (newest-first oids) that touched `file_path`, walking
+    /// the same revisions the graph walk does: all refs when `revision` is
+    /// None, otherwise the user-selected revision.
+    ///
+    /// Revision parity is not optional polish: the graph retains only rows in
+    /// this allow-set, so a HEAD-only walk here silently dropped every
+    /// other-branch commit touching the path while `--all` kept their lanes
+    /// alive — whole branches vanished from the graph the moment a path
+    /// filter was applied.
     pub fn commits_touching_path(
         repo_path: &str,
         file_path: &str,
         max_count: usize,
+        revision: Option<&str>,
     ) -> Result<Vec<String>, String> {
         let repo = validate_repo(repo_path)?;
         // Canonical join resolves existing prefixes through symlinks and keeps
@@ -532,18 +595,23 @@ impl GitReader {
         sandbox_join_canonical(&repo, file_path)?;
         let count = max_count.clamp(1, 100_000).to_string();
         let spec = literal_pathspec(file_path);
-        let stdout = git_text(
-            &repo,
-            &[
-                "-c",
-                "core.quotepath=off",
-                "log",
-                &format!("-n{}", count),
-                "--format=%H",
-                "--",
-                spec.as_str(),
-            ],
-        )?;
+        let count_arg = format!("-n{}", count);
+        let mut args = vec![
+            "-c",
+            "core.quotepath=off",
+            "log",
+            count_arg.as_str(),
+            "--format=%H",
+        ];
+        if let Some(rev) = revision {
+            validate_ref_name(rev)?;
+            args.push(rev);
+        } else {
+            args.push("--all");
+        }
+        args.push("--");
+        args.push(spec.as_str());
+        let stdout = git_text(&repo, &args)?;
         Ok(stdout
             .lines()
             .map(|l| l.trim().to_string())
@@ -625,6 +693,41 @@ impl GitReader {
         Ok(parse_blame_porcelain(&stdout))
     }
 
+    /// Lists every path the file explorer may show: tracked files plus
+    /// untracked-but-not-ignored working-tree files.
+    ///
+    /// `--cached --others --exclude-standard` is deliberately the same
+    /// enumeration [`GitReader::get_repo_language_stats`] uses: `--cached`
+    /// covers the index; `--others --exclude-standard` adds untracked files
+    /// while excluding exactly what standard ignore rules (.gitignore,
+    /// .git/info/exclude, core.excludesFile) ignore — so build output never
+    /// appears and a freshly saved source file does. `-z` with
+    /// `core.quotepath=off` delivers raw UTF-8 paths NUL-separated, the same
+    /// belt-and-braces pairing as [`GitReader::get_status`], so spaces,
+    /// quotes, glob characters, and non-ASCII names survive verbatim.
+    pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        let stdout = git_text(
+            &repo,
+            &[
+                "-c",
+                "core.quotepath=off",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+        )?;
+        let files = parse_ls_files_entries(&stdout);
+        if files.len() > MAX_REPO_FILES {
+            return Err(format!(
+                "File explorer unavailable: this repository contains more than {MAX_REPO_FILES} files"
+            ));
+        }
+        Ok(files)
+    }
+
     pub fn get_file_diff(
         repo_path: &str,
         file_path: &str,
@@ -635,9 +738,17 @@ impl GitReader {
         // Canonical join resolves existing prefixes through symlinks and keeps
         // not-yet-tracked leaves lexical (see get_file_blame).
         sandbox_join_canonical(&repo, file_path)?;
+        if !is_staged {
+            // `git diff` emits nothing for untracked paths, which rendered a
+            // blank diff pane for brand-new files. Synthesize git-shaped
+            // new-file output from the worktree bytes instead.
+            if let Some(synthesized) = untracked_new_file_diff(&repo, file_path)? {
+                return Ok(synthesized);
+            }
+        }
         // :(literal) stops `*?[` in a filename from widening the pathspec.
         let spec = literal_pathspec(file_path);
-        let mut args = vec!["diff"];
+        let mut args = vec!["-c", "core.quotepath=off", "diff"];
         if is_staged {
             args.push("--cached");
         }
@@ -652,7 +763,21 @@ impl GitReader {
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        git_text(&repo, &["show", "--unified=3", "--format=", commit_id])
+        // --diff-merges=first-parent renders merge commits as ordinary hunks
+        // against the first parent instead of the combined --cc format whose
+        // @@@ headers the frontend cannot number (git >= 2.31).
+        git_text(
+            &repo,
+            &[
+                "-c",
+                "core.quotepath=off",
+                "show",
+                "--unified=3",
+                "--diff-merges=first-parent",
+                "--format=",
+                commit_id,
+            ],
+        )
     }
 
     pub fn get_commit_file_diff(
@@ -666,7 +791,16 @@ impl GitReader {
         let spec = literal_pathspec(file_path);
         git_text(
             &repo,
-            &["show", "--unified=3", "--format=", commit_id, "--", &spec],
+            &[
+                "-c",
+                "core.quotepath=off",
+                "show",
+                "--unified=3",
+                "--format=",
+                commit_id,
+                "--",
+                &spec,
+            ],
         )
     }
 
@@ -675,7 +809,10 @@ impl GitReader {
         validate_ref_name(from)?;
         validate_ref_name(to)?;
         let spec = format!("{}...{}", from, to);
-        git_text(&repo, &["diff", "--unified=3", &spec])
+        git_text(
+            &repo,
+            &["-c", "core.quotepath=off", "diff", "--unified=3", &spec],
+        )
     }
 
     pub fn get_commit_files(
@@ -1399,6 +1536,134 @@ fn literal_pathspec(path: &str) -> String {
     format!(":(literal){path}")
 }
 
+/// Decodes one `\x01`-separated history record laid out by
+/// [`GitReader::read_commit_history_paged`] (`id, parents, timestamp,
+/// subject, author name, author email`) into a commit node.
+///
+/// Parsing works from BOTH ends inward: `splitn(3)` pins the structurally
+/// rigid prefix (hex id, whitespace parents, integer timestamp) and
+/// `rsplitn(3)` peels the trailing author email and name, because \x01 is a
+/// legal byte inside every variable-length field. Positional left-to-right
+/// splitting let such a byte shift every later field — an email becoming a
+/// fragment of a name, a timestamp collapsing to zero. Here a stray \x01 can
+/// only degrade the field it landed in: one inside the subject rides in the
+/// summary verbatim, and one inside the author name garbles at most that
+/// name plus the summary text — never id, parents, timestamp or email.
+///
+/// Records whose id field is missing or blank are skipped (None) rather than
+/// fabricated: an unidentifiable row would render as an unclickable ghost.
+fn parse_history_record(record: &str) -> Option<RawCommitNode> {
+    let mut head = record.splitn(3, '\x01');
+    let id = head.next().map(str::trim).filter(|s| !s.is_empty())?;
+    let parent_str = head.next().unwrap_or("");
+    let parent_ids = if parent_str.is_empty() {
+        Vec::new()
+    } else {
+        parent_str.split_whitespace().map(String::from).collect()
+    };
+    let core = head.next().unwrap_or("");
+    // core = timestamp, then the subject, then author name, then email.
+    let mut tail = core.rsplitn(3, '\x01');
+    let author_email = tail.next().unwrap_or("").to_string();
+    let author_name = tail.next().unwrap_or("").to_string();
+    let mut stamp_and_summary = tail.next().unwrap_or("").splitn(2, '\x01');
+    let timestamp = stamp_and_summary
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let summary = stamp_and_summary.next().unwrap_or("").to_string();
+    Some(RawCommitNode {
+        id: id.to_string(),
+        parent_ids,
+        timestamp,
+        author_name,
+        author_email,
+        summary,
+    })
+}
+
+/// Returns a synthesized git-shaped new-file diff when `file_path` is
+/// untracked (`??` in porcelain status), or `None` when git should answer via
+/// its own machinery.
+///
+/// `git diff -- :(literal)<path>` outputs NOTHING for untracked paths, so
+/// clicking a brand-new file used to render a blank pane. The worktree bytes
+/// go through the same capped, sandbox-validated read as every other entry
+/// point (`sandbox_join_canonical` + [`check_working_tree_size`] at
+/// [`MAX_WORKING_TREE_BYTES`]), and text content is rendered exactly like
+/// `git diff` would: header lines, `@@ -0,0 +1,N @@`, one `+{line}` per line,
+/// and `\ No newline at end of file` when the last byte is not a newline.
+fn untracked_new_file_diff(repo: &Path, file_path: &str) -> Result<Option<String>, String> {
+    let spec = literal_pathspec(file_path);
+    let stdout = git_text(
+        repo,
+        &[
+            "-c",
+            "core.quotepath=off",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--",
+            spec.as_str(),
+        ],
+    )?;
+    let untracked = parse_status_records(stdout.as_bytes())
+        .iter()
+        .any(|record| {
+            record.index_status == '?' && record.work_status == '?' && record.path == file_path
+        });
+    if !untracked {
+        return Ok(None);
+    }
+
+    // Same read discipline as get_file_blob's working-tree branch: validate
+    // containment (resolving symlinks), cap on metadata BEFORE reading, then
+    // read whole.
+    let dest = sandbox_join_canonical(repo, file_path)?;
+    check_working_tree_size(&dest, MAX_WORKING_TREE_BYTES)?;
+    let bytes = std::fs::read(&dest).map_err(|e| format!("Failed to read from disk: {}", e))?;
+    Ok(Some(render_new_file_diff(file_path, &bytes)))
+}
+
+/// Renders an untracked file as a unified new-file diff in git's output shape.
+///
+/// Binary payloads reuse the repository-wide heuristic
+/// ([`LanguageDetector::looks_binary`]) and collapse to git's single-line
+/// binary notice. An empty file keeps a zero-count hunk header and no body.
+fn render_new_file_diff(path: &str, bytes: &[u8]) -> String {
+    let mut out = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n");
+    if LanguageDetector::looks_binary(bytes) {
+        out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
+        return out;
+    }
+    out.push_str("--- /dev/null\n");
+    out.push_str(&format!("+++ b/{path}\n"));
+    if bytes.is_empty() {
+        out.push_str("@@ -0,0 +0,0 @@\n");
+        return out;
+    }
+    // Split on '\n': a trailing terminator yields a final empty chunk that is
+    // NOT a line; absence of a trailing terminator means the last chunk IS a
+    // line but needs git's no-newline marker.
+    let mut body = Vec::new();
+    let mut chunks = bytes.split(|&b| b == b'\n').peekable();
+    while let Some(chunk) = chunks.next() {
+        if chunks.peek().is_none() && chunk.is_empty() {
+            break;
+        }
+        body.push(format!("+{}", String::from_utf8_lossy(chunk)));
+    }
+    out.push_str(&format!("@@ -0,0 +1,{} @@\n", body.len()));
+    for line in &body {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !bytes.ends_with(b"\n") {
+        out.push_str("\\ No newline at end of file\n");
+    }
+    out
+}
+
 fn validate_oid(oid: &str) -> Result<(), String> {
     if oid.is_empty() || oid.len() > 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid commit id".into());
@@ -1420,6 +1685,36 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Pure parser for NUL-separated `ls-files -z` output.
+///
+/// Trims the trailing slash a submodule entry carries, drops empty records,
+/// and fails closed per entry: anything equal to "." or "..", escaping via
+/// "../" (leading or mid-path), or absolute-looking is skipped alone rather
+/// than failing the whole listing — one suspicious record must not blank the
+/// file explorer. Duplicates collapse through a set and the result is
+/// byte-sorted so callers get deterministic order. No other normalization:
+/// git always emits forward slashes, and entries cannot contain `\0` once
+/// split on `\0`.
+fn parse_ls_files_entries(raw: &str) -> Vec<String> {
+    let mut unique: HashSet<&str> = HashSet::new();
+    for entry in raw.split('\0') {
+        let entry = entry.strip_suffix('/').unwrap_or(entry);
+        if entry.is_empty()
+            || entry == "."
+            || entry == ".."
+            || entry.starts_with("../")
+            || entry.contains("/../")
+            || entry.starts_with('/')
+        {
+            continue;
+        }
+        unique.insert(entry);
+    }
+    let mut files: Vec<String> = unique.into_iter().map(String::from).collect();
+    files.sort();
+    files
 }
 
 /// One `git status --porcelain=v1 -z` record decoded into typed fields.
@@ -1797,6 +2092,90 @@ mod tests {
             parse_co_authors(body),
             vec!["Bob <bob@example.com>".to_string()]
         );
+    }
+
+    /// A clean record round-trips every field positionally.
+    #[test]
+    fn parse_history_record_parses_a_clean_record() {
+        // Field order per the format string: id, parents, timestamp,
+        // subject, author name, author email.
+        let node = parse_history_record(
+            "abc123\x01p1 p2\x011700000000\x01feat: thing\x01Ada\x01ada@example.com",
+        )
+        .expect("clean record");
+        assert_eq!(node.id, "abc123");
+        assert_eq!(node.parent_ids, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(node.timestamp, 1700000000);
+        assert_eq!(node.author_name, "Ada");
+        assert_eq!(node.author_email, "ada@example.com");
+        assert_eq!(node.summary, "feat: thing");
+
+        let root = parse_history_record("def456\x01\x01\x01\x01\x01").expect("empty-fields record");
+        assert_eq!(root.parent_ids, Vec::<String>::new());
+        assert_eq!(root.timestamp, 0);
+        assert!(root.author_name.is_empty() && root.author_email.is_empty());
+    }
+
+    /// Records without an identifiable id are skipped whole, never fabricated.
+    #[test]
+    fn parse_history_record_rejects_records_without_an_id() {
+        assert!(parse_history_record("").is_none());
+        assert!(parse_history_record("   \x01p1\x011\x01a\x01b\x01c").is_none());
+    }
+
+    /// Regression (\x01-safe field framing): \x01 is legal inside an author
+    /// name, so the risky variable-length fields sit at the END of the record
+    /// and are parsed from the RIGHT. Id, parents and timestamp are then
+    /// structurally immune, and the email — the final field — always wins;
+    /// a stray \x01 can only truncate the single field it landed in.
+    #[test]
+    fn parse_history_record_survives_0x01_inside_author_name() {
+        let record = "abc123\x01p1 p2\x011700000000\x01feat: thing\x01Ev\x01il\x01n@e.com";
+        let node = parse_history_record(record).expect("hostile-author record");
+        assert_eq!(node.id, "abc123");
+        assert_eq!(node.parent_ids, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(
+            node.timestamp, 1700000000,
+            "timestamp must be structurally immune to later-field corruption"
+        );
+        assert_eq!(
+            node.author_email, "n@e.com",
+            "the email is the record's last field and must not shift"
+        );
+    }
+
+    /// A \x01 inside the subject rides INSIDE the summary verbatim (an
+    /// improvement over the old positional parse, which truncated it);
+    /// the name and email parsed from the right must stay intact.
+    #[test]
+    fn parse_history_record_keeps_hostile_summary_intact() {
+        let record = "abc124\x01\x011700000001\x01feat: half\x01 embedded\x01Full Name\x01n@e.com";
+        let node = parse_history_record(record).expect("hostile-subject record");
+        assert_eq!(node.timestamp, 1700000001);
+        assert_eq!(node.author_name, "Full Name");
+        assert_eq!(node.author_email, "n@e.com");
+        assert_eq!(node.summary, "feat: half\x01 embedded");
+    }
+
+    /// Regression (probe at the ceiling): the `-n` bound must admit MAX+1 so
+    /// cmd_get_commit_graph's has_more probe row survives the clamp — the
+    /// probe arrives as exactly MAX_HISTORY_COMMITS+1 when the user's cap is
+    /// the ceiling, and a clamp back down to MAX swallowed it, making such
+    /// repositories report has_more=false forever while silently truncating.
+    #[test]
+    fn page_count_limit_admits_the_has_more_probe_row_at_the_ceiling() {
+        let max = GitReader::MAX_HISTORY_COMMITS;
+        // An ordinary ceiling-sized request is unchanged...
+        assert_eq!(GitReader::page_count_limit(max), max);
+        // ...but the probe row arrives as MAX+1 and must survive the clamp,
+        // while larger overshoots still collapse onto that bound.
+        assert_eq!(
+            GitReader::page_count_limit(max + 1),
+            max + 1,
+            "the probe row must survive the clamp at exactly the ceiling"
+        );
+        assert_eq!(GitReader::page_count_limit(max + 50), max + 1);
+        assert_eq!(GitReader::page_count_limit(0), 1);
     }
 
     /// Audit C2: every extension the frontend's image path list accepts must
@@ -2475,6 +2854,277 @@ mod tests {
         assert_eq!(literal_pathspec(":3:lockfile"), ":(literal):3:lockfile");
         assert_eq!(literal_pathspec("plain.txt"), ":(literal)plain.txt");
     }
+
+    // -------------------------------------------------------------------------
+    // Untracked-file diff synthesis (audit B)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn render_new_file_diff_matches_git_shape_for_text() {
+        let rendered = render_new_file_diff("src/new.rs", b"fn a() {}\nfn b() {}\n");
+        assert_eq!(
+            rendered,
+            concat!(
+                "diff --git a/src/new.rs b/src/new.rs\n",
+                "new file mode 100644\n",
+                "--- /dev/null\n",
+                "+++ b/src/new.rs\n",
+                "@@ -0,0 +1,2 @@\n",
+                "+fn a() {}\n",
+                "+fn b() {}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_new_file_diff_marks_missing_trailing_newline() {
+        let rendered = render_new_file_diff("note.txt", b"alpha\nbeta");
+        assert!(rendered.contains("+beta\n\\ No newline at end of file\n"));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines.last().copied(),
+            Some("\\ No newline at end of file"),
+            "marker must be the final line"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                .count(),
+            2,
+            "one + line per content line"
+        );
+    }
+
+    #[test]
+    fn render_new_file_diff_empty_file_keeps_zero_count_hunk() {
+        assert_eq!(
+            render_new_file_diff("empty.txt", b""),
+            concat!(
+                "diff --git a/empty.txt b/empty.txt\n",
+                "new file mode 100644\n",
+                "--- /dev/null\n",
+                "+++ b/empty.txt\n",
+                "@@ -0,0 +0,0 @@\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_new_file_diff_binary_uses_single_line_notice() {
+        let rendered = render_new_file_diff("img.bin", &[0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF]);
+        assert_eq!(
+            rendered,
+            concat!(
+                "diff --git a/img.bin b/img.bin\n",
+                "new file mode 100644\n",
+                "Binary files /dev/null and b/img.bin differ\n",
+            )
+        );
+        assert!(!rendered.contains("@@"), "binary notice carries no hunks");
+    }
+
+    /// Regression (audit B): clicking an untracked file used to return empty
+    /// output because `git diff` ignores untracked paths. Text, no-trailing-
+    /// newline, binary and empty variants must each synthesize; tracked
+    /// files must keep going through real git.
+    #[test]
+    fn get_file_diff_synthesizes_untracked_new_file() {
+        use std::fs;
+        let dir = init_repo_with_remotes(&[], "main");
+        fs::write(dir.path().join("tracked.txt"), "old\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+
+        // Untracked text WITH trailing newline.
+        fs::write(dir.path().join("fresh.txt"), "line one\nline two\n").unwrap();
+        let diff =
+            GitReader::get_file_diff(dir.path().to_str().unwrap(), "fresh.txt", false, false)
+                .expect("untracked text diff");
+        assert!(
+            diff.starts_with("diff --git a/fresh.txt b/fresh.txt\n"),
+            "{diff}"
+        );
+        assert!(diff.contains("new file mode 100644"));
+        assert!(diff.contains("--- /dev/null"));
+        assert!(diff.contains("+++ b/fresh.txt"));
+        assert!(diff.contains("@@ -0,0 +1,2 @@"));
+        assert!(diff.contains("+line one\n+line two\n"));
+        assert!(!diff.contains("No newline"), "{diff}");
+
+        // Untracked text WITHOUT trailing newline gains git's marker.
+        fs::write(dir.path().join("partial.txt"), "no trailing").unwrap();
+        let diff =
+            GitReader::get_file_diff(dir.path().to_str().unwrap(), "partial.txt", false, false)
+                .expect("untracked partial diff");
+        assert!(diff.contains("+no trailing\n\\ No newline at end of file"));
+
+        // Untracked BINARY collapses to git's notice shape.
+        fs::write(dir.path().join("blob.bin"), [0x00, 0x01, 0x02]).unwrap();
+        let diff = GitReader::get_file_diff(dir.path().to_str().unwrap(), "blob.bin", false, false)
+            .expect("untracked binary diff");
+        assert!(
+            diff.contains("Binary files /dev/null and b/blob.bin differ"),
+            "{diff}"
+        );
+
+        // Untracked EMPTY file keeps a zero-count hunk and no body.
+        fs::write(dir.path().join("hollow.txt"), "").unwrap();
+        let diff =
+            GitReader::get_file_diff(dir.path().to_str().unwrap(), "hollow.txt", false, false)
+                .expect("untracked empty diff");
+        assert!(diff.contains("@@ -0,0 +0,0 @@"), "{diff}");
+        assert!(
+            !diff
+                .lines()
+                .any(|l| l.starts_with('+') && !l.starts_with("+++")),
+            "{diff}"
+        );
+
+        // Tracked-but-modified files keep REAL git output (deletions present,
+        // which synthesis never emits).
+        fs::write(dir.path().join("tracked.txt"), "new\n").unwrap();
+        let diff =
+            GitReader::get_file_diff(dir.path().to_str().unwrap(), "tracked.txt", false, false)
+                .expect("tracked diff");
+        assert!(diff.contains("-old\n+new"), "{diff}");
+
+        // A nonexistent never-tracked path keeps today's behavior: empty Ok.
+        let diff =
+            GitReader::get_file_diff(dir.path().to_str().unwrap(), "ghost.txt", false, false)
+                .expect("missing path stays non-fatal");
+        assert!(diff.is_empty());
+    }
+
+    /// Audit D: merges previously rendered as combined `--cc` diffs whose @@@
+    /// headers cannot be numbered by the frontend. Both a clean merge (which
+    /// plain `git show` renders as NOTHING) and a conflicted one must come
+    /// back as standard hunks against the first parent.
+    #[test]
+    fn merge_commit_renders_standard_hunks_against_first_parent() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+
+        // Clean merge: side adds a file while main moves on.
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "from side\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "side work"]);
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "on main\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "main work"]);
+        git_in(
+            dir.path(),
+            &["merge", "--no-ff", "-q", "side", "-m", "merge"],
+        );
+
+        let merge_oid = rev_parse_at(dir.path(), "HEAD");
+        let diff = GitReader::get_commit_diff(path, &merge_oid).expect("clean merge diff");
+        assert!(
+            diff.contains("diff --git a/side.txt b/side.txt"),
+            "first-parent diff must include the merged file: {diff}"
+        );
+        assert!(diff.contains("@@ -0,0 +1"), "{diff}");
+        assert!(diff.contains("+from side"), "{diff}");
+
+        // Conflicted merge resolved by hand: raw `show` renders this as
+        // `diff --cc` with @@@ hunk headers; first-parent mode must not.
+        git_in(dir.path(), &["checkout", "-q", "-b", "clash", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "clash version\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "clash base"]);
+        git_in(dir.path(), &["checkout", "-q", "side"]);
+        std::fs::write(dir.path().join("main.txt"), "side clash\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "side clash"]);
+        git_in(dir.path(), &["checkout", "-q", "clash"]);
+        let merged = std::process::Command::new("git")
+            .args(["merge", "--no-ff", "side", "-m", "clash merge"])
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("spawn merge");
+        assert!(!merged.status.success(), "fixture needs a real conflict");
+        std::fs::write(dir.path().join("main.txt"), "resolved\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "resolve clash"]);
+
+        let merge_oid = rev_parse_at(dir.path(), "HEAD");
+        let parents = merge_parents(dir.path(), &merge_oid);
+        assert_eq!(parents.len(), 2, "fixture must be a merge");
+        let diff = GitReader::get_commit_diff(path, &merge_oid).expect("conflicted merge diff");
+        assert!(!diff.contains("diff --cc"), "{diff}");
+        assert!(!diff.contains("@@@"), "{diff}");
+        assert!(diff.contains("diff --git a/main.txt b/main.txt"), "{diff}");
+        assert!(diff.contains("@@"), "{diff}");
+    }
+
+    /// Helper for merge_commit_renders_standard_hunks_against_first_parent:
+    /// lists the parent oids of `oid` so the fixture can assert it really
+    /// produced a two-parent merge commit.
+    fn merge_parents(dir: &Path, oid: &str) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &format!("{oid}^@")])
+            .current_dir(dir)
+            .output()
+            .expect("rev-parse parents");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Regression (audit C): without `-c core.quotepath=off`, git C-quotes
+    /// non-ASCII paths in diff headers (`"a/caf\303\251.txt"`), garbling them
+    /// on the wire. File, commit and range diffs must all carry raw UTF-8,
+    /// matching what status/numstat already do.
+    #[test]
+    fn non_ascii_paths_render_unquoted_in_diff_headers() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let unicode_name = "caf\u{e9}.txt";
+
+        // Untracked file diff (synthesized) is raw UTF-8 by construction but
+        // must still round-trip through status plumbing keyed by raw path.
+        std::fs::write(dir.path().join(unicode_name), "unicode\n").unwrap();
+        let diff = GitReader::get_file_diff(path, unicode_name, false, false).expect("untracked");
+        assert!(
+            diff.starts_with(&format!("diff --git a/{unicode_name} b/{unicode_name}\n")),
+            "{diff}"
+        );
+
+        // Commit diff header.
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "unicode name"]);
+        let oid = rev_parse_at(dir.path(), "HEAD");
+        let diff = GitReader::get_commit_diff(path, &oid).expect("commit diff");
+        assert!(
+            diff.contains(&format!("diff --git a/{unicode_name} b/{unicode_name}")),
+            "{diff}"
+        );
+        let per_file =
+            GitReader::get_commit_file_diff(path, &oid, unicode_name).expect("commit file diff");
+        assert!(
+            per_file.contains(&format!("diff --git a/{unicode_name}")),
+            "{per_file}"
+        );
+
+        // Range diff header between two branches touching the same file.
+        git_in(dir.path(), &["checkout", "-q", "-b", "feat-uni"]);
+        std::fs::write(dir.path().join(unicode_name), "unicode v2\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "unicode edit"]);
+        let range = GitReader::get_range_diff(path, "main", "feat-uni").expect("range diff");
+        assert!(range.contains(unicode_name), "{range}");
+        assert!(!range.contains("\\303\\251"), "{range}");
+    }
     #[test]
     fn branch_stats_counts_failed_walks_instead_of_hiding_them() {
         // A repo with one healthy branch off the default and one "ghost" branch
@@ -2524,5 +3174,166 @@ mod tests {
         let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
         assert!(names.contains(&"healthy"), "healthy branch got churn");
         assert_eq!(report.compute_failures, 1, "ghost walk counted as failure");
+    }
+
+    #[test]
+    fn list_repo_files_empty_repo_returns_empty_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let files = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("empty repo");
+        assert!(files.is_empty());
+    }
+
+    /// Exact-result assertion covers everything at once: tracked files, the
+    /// untracked-but-not-ignored file, exclusion of the ignored file, and
+    /// exclusion of .git internals (any leak breaks the equality).
+    #[test]
+    fn list_repo_files_mixes_tracked_untracked_and_hides_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        std::fs::write(dir.path().join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# t\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        std::fs::write(dir.path().join("src/deep/nested.rs"), "fn main() {}\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+        std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+        std::fs::write(dir.path().join("ignored.log"), "noise\n").unwrap();
+
+        let files = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("listing");
+        assert_eq!(
+            files,
+            [".gitignore", "README.md", "fresh.txt", "src/deep/nested.rs"]
+        );
+    }
+
+    /// Names a C-quoted renderer would escape (or a shell reinterpret) must
+    /// survive verbatim: `-z` + core.quotepath=off deliver raw UTF-8, and
+    /// ls-files takes no path arguments here, so a leading dash cannot be
+    /// parsed as one.
+    #[test]
+    fn list_repo_files_preserves_hostile_filenames_verbatim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let names = [
+            "*.md",
+            "-dash.txt",
+            "[bracket].txt",
+            "a/b/c/d/e/f/g.txt",
+            "café.txt",
+            "emoji-🚀.txt",
+            "quo\"te.txt",
+            "weird?.txt",
+            "with space.txt",
+        ];
+        for name in names {
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, "x\n").unwrap();
+        }
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "hostile names"]);
+
+        let mut expected: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        let files = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("listing");
+        assert_eq!(files, expected);
+    }
+
+    #[test]
+    fn list_repo_files_is_deterministic_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        for name in ["zeta.txt", "alpha/beta.txt", "mid.txt"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x\n").unwrap();
+        }
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+
+        let first = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("first");
+        assert!(
+            first.windows(2).all(|pair| pair[0] < pair[1]),
+            "must be strictly ascending: {first:?}"
+        );
+        let second = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("second");
+        assert_eq!(first, second);
+    }
+
+    /// validate_repo's wording ("Not a Git repository: …") is pinned here so
+    /// the explorer can surface a real diagnosis rather than a generic error.
+    #[test]
+    fn list_repo_files_rejects_non_repository_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = GitReader::list_repo_files(&dir.path().to_string_lossy())
+            .expect_err("plain directory is not a repository");
+        assert!(
+            err.to_lowercase().contains("not a git repository"),
+            "got: {err}"
+        );
+    }
+
+    /// The cap must fail loud, never truncate. Registered purely in the index
+    /// via update-index --index-info — no blob objects are written and
+    /// ls-files reads the index, not the worktree — same ghost-object trick
+    /// as the ghost branch in branch_stats_counts_failed_walks_instead_of_hiding_them.
+    #[test]
+    fn list_repo_files_fails_loudly_past_max_repo_files_cap() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let mut child = std::process::Command::new("git")
+            .args(["update-index", "--index-info"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn update-index");
+        {
+            let stdin = child.stdin.as_mut().expect("stdin pipe");
+            for i in 0..=MAX_REPO_FILES {
+                writeln!(stdin, "100644 {oid} 0\tbulk-{i:06}.txt").unwrap();
+            }
+        }
+        assert!(child.wait().unwrap().success());
+
+        let err = GitReader::list_repo_files(&dir.path().to_string_lossy())
+            .expect_err("over-cap listing must fail loudly");
+        assert!(
+            err.to_lowercase().contains("file explorer unavailable"),
+            "got: {err}"
+        );
+        assert!(err.contains(&MAX_REPO_FILES.to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ls_files_entries_empty_input_yields_empty_vec() {
+        assert!(parse_ls_files_entries("").is_empty());
+        // A trailing NUL is ordinary ls-files shape; the empty tail record
+        // must vanish.
+        assert!(parse_ls_files_entries("\0").is_empty());
+    }
+
+    /// Submodule entries arrive as "name/": the slash goes, the entry stays.
+    #[test]
+    fn parse_ls_files_entries_trims_submodule_trailing_slash() {
+        let parsed = parse_ls_files_entries("lib/\0src/main.rs\0");
+        assert_eq!(parsed, ["lib", "src/main.rs"]);
+    }
+
+    #[test]
+    fn parse_ls_files_entries_skips_suspicious_entries_dedups_and_sorts_bytewise() {
+        let parsed = parse_ls_files_entries(
+            ".\0..\0../escape.txt\0deep/../../out.txt\0/etc/passwd\0dup.txt\0dup.txt\0keep.txt\0",
+        );
+        assert_eq!(parsed, ["dup.txt", "keep.txt"]);
+        // Byte-wise order, not collator order: uppercase sorts first.
+        let parsed = parse_ls_files_entries("b.txt\0A.txt\0a.txt\0");
+        assert_eq!(parsed, ["A.txt", "a.txt", "b.txt"]);
     }
 }

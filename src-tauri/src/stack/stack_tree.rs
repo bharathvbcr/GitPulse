@@ -17,6 +17,17 @@ pub struct BranchAncestryChain {
     pub breadcrumb_chain: Vec<String>, // e.g. ["main", "feat-auth", "feat-oauth-google"]
 }
 
+/// Everything the Stack page renders in one IPC round trip. The backend owns
+/// ground truth here: `default_branch` is resolved from the primary remote's
+/// HEAD inside `list_branches`, never from a frontend guess, and `breadcrumb`
+/// is the ancestry trail of the checked-out branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackHierarchyPayload {
+    pub nodes: Vec<StackedBranchNode>,
+    pub default_branch: String,
+    pub breadcrumb: BranchAncestryChain,
+}
+
 pub struct StackTreeEngine;
 
 /// First-parent walk ceiling: far beyond any real stacked-branch depth, and
@@ -65,6 +76,24 @@ impl StackTreeEngine {
                     commit_count_ahead_of_parent: 0,
                 });
                 continue;
+            }
+
+            // Twin branches share a tip: when another branch owns THIS tip,
+            // the relationship is "based on that owner, zero ahead". The
+            // check must happen before any walk — stepping to first_parent
+            // first would skip past the sibling entirely and report a
+            // grandparent base with an inflated count.
+            if let Some(owner) = tip_owner.get(tip_id.as_str()) {
+                if *owner != branch_name.as_str() {
+                    nodes.push(StackedBranchNode {
+                        branch_name: branch_name.clone(),
+                        tip_commit_id: tip_id.clone(),
+                        parent_branch_name: Some((*owner).to_string()),
+                        child_branch_names: Vec::new(),
+                        commit_count_ahead_of_parent: 0,
+                    });
+                    continue;
+                }
             }
 
             // Walk first-parent history until landing on another branch's
@@ -152,7 +181,12 @@ impl StackTreeEngine {
         }
 
         chain.reverse();
-        let root = chain.first().cloned().unwrap_or_else(|| "main".to_string());
+        // The chain is never empty (it always starts with current_branch), so
+        // an unknown branch roots at ITSELF — never at a phantom "main".
+        let root = chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| current_branch.to_string());
 
         BranchAncestryChain {
             current_branch: current_branch.to_string(),
@@ -270,6 +304,108 @@ mod tests {
         let o = nodes.iter().find(|n| n.branch_name == "orphan").unwrap();
         assert_eq!(o.parent_branch_name, None);
         assert_eq!(o.commit_count_ahead_of_parent, 0);
+    }
+
+    /// Regression (audit twin-tip): two branches sitting on the SAME commit
+    /// must discover each other. The walk only consulted tip_owner on
+    // first-parent steps, never at the starting tip, so the twin walked PAST
+    // its sibling and reported a grandparent base with an inflated count.
+    #[test]
+    fn twin_branches_on_one_commit_report_each_other_at_zero_ahead() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "c0".to_string());
+        tips.insert("feat-a".to_string(), "c1".to_string());
+        tips.insert("feat-b".to_string(), "c1".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert("c1".to_string(), vec!["c0".to_string()]);
+        parents.insert("c0".to_string(), vec![]);
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let b = nodes.iter().find(|n| n.branch_name == "feat-b").unwrap();
+        assert_eq!(
+            b.parent_branch_name.as_deref(),
+            Some("feat-a"),
+            "the lexicographically-larger twin must stack on its sibling"
+        );
+        assert_eq!(b.commit_count_ahead_of_parent, 0);
+    }
+
+    /// The default branch wins a shared-tip tie even against a smaller name.
+    #[test]
+    fn default_branch_wins_a_shared_tip_tie() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "c0".to_string());
+        tips.insert("aaa".to_string(), "c0".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert("c0".to_string(), vec![]);
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let aaa = nodes.iter().find(|n| n.branch_name == "aaa").unwrap();
+        assert_eq!(
+            aaa.parent_branch_name.as_deref(),
+            Some("main"),
+            "shared tip must resolve to the default branch as owner"
+        );
+        assert_eq!(aaa.commit_count_ahead_of_parent, 0);
+    }
+
+    /// A merge commit on the first-parent chain counts ONE step: ahead-count
+    /// is first-parent edges walked, not total ancestry.
+    #[test]
+    fn merge_commit_on_chain_counts_a_single_first_parent_step() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "m0".to_string());
+        tips.insert("feat".to_string(), "mg".to_string());
+
+        let mut parents = HashMap::new();
+        // feat tip is itself a merge of side-work; first parent is main's tip.
+        parents.insert("mg".to_string(), vec!["m0".to_string(), "side".to_string()]);
+        parents.insert("side".to_string(), vec!["m0".to_string()]);
+        parents.insert("m0".to_string(), vec![]);
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let f = nodes.iter().find(|n| n.branch_name == "feat").unwrap();
+        assert_eq!(f.parent_branch_name.as_deref(), Some("main"));
+        assert_eq!(
+            f.commit_count_ahead_of_parent, 1,
+            "one first-parent edge from mg to m0"
+        );
+    }
+
+    /// Octopus merges keep only the first parent for stacking purposes.
+    #[test]
+    fn octopus_merge_walks_only_the_first_parent() {
+        let mut tips = HashMap::new();
+        tips.insert("main".to_string(), "r0".to_string());
+        tips.insert("feat".to_string(), "oct".to_string());
+
+        let mut parents = HashMap::new();
+        parents.insert(
+            "oct".to_string(),
+            vec!["mid".to_string(), "s1".to_string(), "s2".to_string()],
+        );
+        parents.insert("mid".to_string(), vec!["r0".to_string()]);
+        parents.insert("s1".to_string(), vec![]);
+        parents.insert("s2".to_string(), vec![]);
+        parents.insert("r0".to_string(), vec![]);
+
+        let nodes = StackTreeEngine::build_stack_hierarchy(&tips, &parents, "main");
+        let f = nodes.iter().find(|n| n.branch_name == "feat").unwrap();
+        assert_eq!(f.parent_branch_name.as_deref(), Some("main"));
+        assert_eq!(f.commit_count_ahead_of_parent, 2);
+    }
+
+    /// An unknown current branch roots the breadcrumb at ITSELF, not at the
+    /// literal string "main": master/trunk repos must never see a phantom
+    /// main injected by the fallback.
+    #[test]
+    fn breadcrumb_for_unknown_branch_roots_at_itself() {
+        let nodes = Vec::new();
+        let chain = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, "ghost");
+        assert_eq!(chain.breadcrumb_chain, vec!["ghost"]);
+        assert_eq!(chain.root_branch, "ghost");
     }
 
     /// Branch iteration order comes from a HashMap, so identical inputs used

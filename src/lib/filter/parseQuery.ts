@@ -34,12 +34,13 @@ export function parseFilterQuery(query: string): ParsedFilterQuery {
       const value = token.slice("sha:".length).toLowerCase();
       if (value) parsed.sha = value;
     } else if (token.startsWith("type:")) {
+      // Parity with CommitFilter::parse (analyzer/filter.rs): any non-empty
+      // value is taken verbatim. Gating on the conventional set here made the
+      // client and the backend disagree about which commits survive a query,
+      // and every disagreement shifts row indices under the solved lanes.
       const value = token.slice("type:".length).toLowerCase();
-      if (CONVENTIONAL_TYPES.has(value)) {
-        parsed.commitType = value;
-      } else {
-        free.push(token);
-      }
+      if (value) parsed.commitType = value;
+      else free.push(token);
     } else if (token.endsWith(":")) {
       const kind = token.slice(0, -1).toLowerCase();
       if (CONVENTIONAL_TYPES.has(kind)) {
@@ -79,14 +80,29 @@ export function matchesCommit(
   }
   if (query.sha && !row.id.toLowerCase().startsWith(query.sha)) return false;
   if (query.commitType) {
+    // All four conventional-commit shapes the backend accepts — plain,
+    // scoped, and both breaking variants. Missing `!` here made the client
+    // drop breaking-change commits the server had kept (and solved around).
     const header = (row.summary || "").toLowerCase();
-    if (!header.startsWith(`${query.commitType}:`) && !header.startsWith(`${query.commitType}(`)) {
+    const kind = query.commitType;
+    if (
+      !header.startsWith(`${kind}:`) &&
+      !header.startsWith(`${kind}(`) &&
+      !header.startsWith(`${kind}!:`) &&
+      !header.startsWith(`${kind}!(`)
+    ) {
       return false;
     }
   }
   if (query.text) {
-    const hay = `${row.summary} ${row.author_name} ${row.id}`.toLowerCase();
-    if (!hay.includes(query.text)) return false;
+    // Backend parity (filter.rs matches_commit): the haystack includes the
+    // author email, and multi-word text is a conjunction over words, not one
+    // contiguous phrase — "oauth flow" must match "fix: flow for oauth".
+    const hay = `${row.summary} ${row.author_name} ${row.author_email} ${row.id}`.toLowerCase();
+    for (const word of query.text.split(/\s+/)) {
+      if (!word) continue;
+      if (!hay.includes(word)) return false;
+    }
   }
   return true;
 }
