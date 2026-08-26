@@ -4,10 +4,11 @@
   "description": "GitPulse default capabilities",
   "windows": ["main"],
   "permissions": [
-    "core:default",
     "core:event:default",
     "core:window:allow-set-title",
     "core:window:allow-set-badge-count",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "opener:allow-default-urls"
   ]
 }

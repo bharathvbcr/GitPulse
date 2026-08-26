@@ -33,19 +33,24 @@
     ],
     "security": {
       "csp": {
-        "devSrc": [
-          "'self'",
-          "http://localhost:5173",
-          "http://127.0.0.1:5173",
-          "ws://localhost:5173",
-          "ws://127.0.0.1:5173"
-        ],
         "default-src": "'self'",
         "script-src": "'self'",
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data: blob:",
         "font-src": "'self' data:",
-        "connect-src": "'self' ipc: http://ipc.localhost"
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "base-uri": "'none'",
+        "object-src": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self' http://localhost:5173 http://127.0.0.1:5173",
+        "script-src": "'self' http://localhost:5173 http://127.0.0.1:5173",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob:",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:5173 ws://127.0.0.1:5173",
+        "base-uri": "'none'",
+        "object-src": "'none'"
       }
     }
   },

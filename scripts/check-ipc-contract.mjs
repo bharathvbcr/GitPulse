@@ -71,7 +71,14 @@ const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".svelte-kit", "targe
 const NON_PRODUCTION_FILE = /(^|[\\/])__tests__([\\/])|\.(test|spec)\.[cm]?[jt]s$|\.d\.ts$/i;
 const FRONTEND_EXT = new Set([".ts", ".svelte"]);
 const HANDLER_ENTRY = /^(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*$/;
-const INVOKE_CALLEE = /invoke/i;
+/**
+ * Callee names that count as IPC invocation. Anchored and exact: an unanchored
+ * substring match would let helpers like `safeInvoke` or `reinvoke` fabricate
+ * contract entries, masking real orphans (false pass) or inventing phantom
+ * missing commands (false fail). A new wrapper name must be added here
+ * explicitly — fail-closed, like every other list in this checker.
+ */
+const INVOKE_CALLEE = /^(?:invoke|invokeFn)$/;
 
 /**
  * Extract the token list inside `generate_handler![ ... ]`.
@@ -378,9 +385,17 @@ function parseArgs(argv) {
   });
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--lib") opts.libPath = path.resolve(argv[++i]);
-    else if (arg === "--src") opts.srcDirs = [path.resolve(argv[++i])];
-    else if (arg === "--extra-dir") opts.extraDirs.push(path.resolve(argv[++i]));
+    // Same contract as check-release-version.mjs: a value-taking flag without
+    // one is a clean usage error, not a raw Node TypeError.
+    /** @param {string} flag */
+    const next = (flag) => {
+      const value = argv[++i];
+      if (value === undefined) throw new Error(`${flag} requires a value`);
+      return value;
+    };
+    if (arg === "--lib") opts.libPath = path.resolve(next(arg));
+    else if (arg === "--src") opts.srcDirs = [path.resolve(next(arg))];
+    else if (arg === "--extra-dir") opts.extraDirs.push(path.resolve(next(arg)));
     else throw new Error(`unknown argument: ${arg}`);
   }
   return { ...opts, srcDirs: [...opts.srcDirs, ...opts.extraDirs] };

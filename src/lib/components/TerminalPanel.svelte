@@ -24,6 +24,7 @@
     ListChecks,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
+  import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import type { PolicyVerdict } from "../stores/harnessStore";
@@ -82,6 +83,11 @@
   let fitAddon: FitAddon | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let unlisteners: UnlistenFn[] = [];
+  // Set when teardown runs; listen() promises that resolve afterwards must
+  // unwind immediately instead of registering on a dead component.
+  let listenersDisposed = false;
+  /** Handle of the pending copy-reset timer, cleared on teardown. */
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Output that arrives between spawn request and id assignment. */
   let earlyOutput: { id: string; bytes: Uint8Array }[] = [];
 
@@ -228,10 +234,20 @@
         },
       ),
     ]).then((unlistenFns) => {
+      if (listenersDisposed) {
+        // The component died before registration landed; undo it now.
+        for (const fn of unlistenFns) fn();
+        return;
+      }
       unlisteners.push(...unlistenFns);
     });
     return () => {
+      listenersDisposed = true;
       for (const fn of unlisteners.splice(0)) fn();
+      if (copyResetTimer !== null) {
+        clearTimeout(copyResetTimer);
+        copyResetTimer = null;
+      }
       resizeObserver?.disconnect();
       resizeObserver = null;
       void killPty(ptySessionId);
@@ -347,6 +363,9 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    // Enter/Arrow keys during an IME conversion belong to the composition,
+    // not to command execution or history navigation.
+    if (isImeComposition(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void execute();
@@ -388,7 +407,9 @@
     }
     if (await copyText(text.trim())) {
       copiedId = entry.id;
-      setTimeout(() => {
+      if (copyResetTimer !== null) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => {
+        copyResetTimer = null;
         if (copiedId === entry.id) copiedId = null;
       }, 1500);
     }

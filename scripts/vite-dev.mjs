@@ -8,7 +8,15 @@ import {
 } from "./dev-port.mjs";
 
 const repoRoot = defaultRepoRoot();
-const envLocked = parseOptionalPort(process.env.GITPULSE_DEV_PORT) != null;
+let envLocked;
+try {
+  envLocked = parseOptionalPort(process.env.GITPULSE_DEV_PORT) != null;
+} catch (err) {
+  // A garbage GITPULSE_DEV_PORT must fail with a readable message and a
+  // nonzero exit, not a raw unhandled rejection.
+  console.error(`vite-dev: ${err.message}`);
+  process.exit(2);
+}
 const result = await resolveDevPort({
   repoRoot,
   allowAutoport: !envLocked && !isTauriHookEnv(),

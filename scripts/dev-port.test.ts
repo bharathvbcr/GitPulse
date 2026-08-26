@@ -16,6 +16,7 @@ import {
   isInsideRepo,
   isPortFree,
   isTauriDevArgs,
+  killPid,
   parseEtimeToMs,
   parseLsofPids,
   parseNetstatPids,
@@ -54,6 +55,7 @@ function mockIo(overrides: Record<string, unknown> = {}) {
     processElapsedMs: async () => null,
     selfPids: () => new Set([process.pid]),
     kill: async () => {},
+    killVerified: async () => {},
     isFree: async () => true,
     waitUntilFree: async () => true,
     findFreePort: async (from: number) => from,
@@ -309,8 +311,9 @@ describe("resolveDevPort", () => {
         processCwd: async () => "/tmp/gitpulse",
         processElapsedMs: async () => RECLAIM_GRACE_MS * 10,
         isFree: async () => false,
-        kill: async (pid: number) => {
+        killVerified: async (pid: number, needle: string | null) => {
           killed.push(pid);
+          if (needle != null) expect(needle).toContain("vite");
         },
         waitUntilFree: async () => true,
       }),
@@ -339,8 +342,9 @@ describe("resolveDevPort", () => {
           return 1_000; // one second old: someone else's live dev server
         },
         isFree: async () => false,
-        kill: async (pid: number) => {
+        killVerified: async (pid: number, needle: string | null) => {
           killed.push(pid);
+          if (needle != null) expect(needle).toContain("vite");
         },
         findFreePort: async () => 5174,
       }),
@@ -368,8 +372,9 @@ describe("resolveDevPort", () => {
           return 0;
         },
         isFree: async () => false,
-        kill: async (pid: number) => {
+        killVerified: async (pid: number, needle: string | null) => {
           killed.push(pid);
+          if (needle != null) expect(needle).toContain("vite");
         },
         waitUntilFree: async () => true,
       }),
@@ -637,3 +642,41 @@ function waitForExit(child: ChildProcess): Promise<void> {
     setTimeout(resolve, 2000);
   });
 }
+
+describe("killPid identity check", () => {
+  /** Liveness via the same mechanism production killPid trusts. */
+  async function aliveViaPs(pid: number): Promise<boolean> {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    try {
+      await promisify(execFile)("ps", ["-p", String(pid), "-o", "command="]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("kills a process whose command still matches the vetted needle", async () => {
+    if (process.platform === "win32") return; // ps-based needle is POSIX-only
+    const child = spawn("sleep", ["5"]);
+    await killPid(child.pid!, "sleep 5");
+    // Poll instead of trusting the 'exit' event, which can lag in test hosts.
+    let dead = false;
+    for (let i = 0; i < 60 && !dead; i += 1) {
+      if (child.exitCode !== null || !(await aliveViaPs(child.pid!))) dead = true;
+      else await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(dead).toBe(true);
+  }, 10_000);
+
+  it("refuses to signal when the command no longer matches (pid-reuse guard)", async () => {
+    if (process.platform === "win32") return;
+    const child = spawn("sleep", ["5"]);
+    // A needle that cannot match `sleep` simulates the pid having been
+    // recycled by an unrelated process between listing and kill.
+    await killPid(child.pid!, "totally-unrelated-process");
+    expect(child.exitCode).toBeNull(); // untouched
+    expect(await aliveViaPs(child.pid!)).toBe(true);
+    child.kill("SIGKILL");
+  }, 10_000);
+});

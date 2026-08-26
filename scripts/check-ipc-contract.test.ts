@@ -115,4 +115,51 @@ describe("check:ipc contract", () => {
     expect(DEFAULT_LIB_RS).toMatch(/[\\/]src-tauri[\\/]src[\\/]lib\.rs$/);
     expect(DEFAULT_SRC_DIR).toMatch(/[\\/]src$/);
   });
+
+  it("fails with a clean usage error when a value flag has no value", async () => {
+    let stderr = "";
+    try {
+      await execFileAsync(process.execPath, [scriptPath, "--lib"], {
+        cwd: path.dirname(scriptPath),
+      });
+      throw new Error("expected nonzero exit");
+    } catch (err) {
+      const failure = err as { code?: number | null; stderr?: string; message: string };
+      if (failure.code === undefined) throw err; // our own sentinel
+      expect(failure.code).toBe(2);
+      stderr = failure.stderr ?? "";
+    }
+    expect(stderr).toMatch(/--lib requires a value/);
+    // Not a raw Node internals dump.
+    expect(stderr).not.toMatch(/paths\[0\]|TypeError/);
+  });
+
+  it("does not count lookalike invoke callees as invocation sites", async () => {
+    const srcDir = await makeTempDir("anchor-src");
+    await writeFile(
+      path.join(srcDir, "caller.ts"),
+      [
+        'import { invoke } from "@tauri-apps/api/core";',
+        'function safeInvoke(cmd: string) { return cmd; }',
+        'safeInvoke("cmd_phantom");',
+        "",
+      ].join("\n"),
+    );
+    // Run against the real tree plus one extra dir whose only "call site"
+    // goes through a non-invoke alias. Unanchored matching would record
+    // `cmd_phantom` as invoked-but-unregistered and blow up the
+    // missing-commands ledger.
+    const ok = await runScript(["--extra-dir", srcDir]);
+    expect(ok.code).toBe(0);
+    expect(ok.stdout).not.toMatch(/missing commands\s*:\s*[1-9]/);
+
+    // Control: the same command through the real invoke DOES trip the check.
+    await writeFile(
+      path.join(srcDir, "caller.ts"),
+      'import { invoke } from "@tauri-apps/api/core";\nawait invoke("cmd_phantom");\n',
+    );
+    const bad = await runScript(["--extra-dir", srcDir]);
+    expect(bad.code).toBe(1);
+    expect(bad.stdout).toMatch(/missing commands\s*:\s*1/);
+  });
 });
