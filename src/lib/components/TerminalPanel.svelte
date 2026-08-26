@@ -136,7 +136,7 @@
   // instead of landing in a drained array and leaking for the webview life.
   const unlisteners = createListenerTracker();
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
-  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Output that arrives between spawn request and id assignment. */
   let earlyOutput: { id: string; bytes: Uint8Array }[] = [];
 
@@ -298,10 +298,9 @@
     });
     return () => {
       unlisteners.dispose();
-      if (copyResetTimer !== null) {
-        clearTimeout(copyResetTimer);
-        copyResetTimer = null;
-      }
+      if (copiedResetTimer !== null) {
+        clearTimeout(copiedResetTimer);
+        copiedResetTimer = null;
       }
       resizeObserver?.disconnect();
       resizeObserver = null;
@@ -520,9 +519,9 @@
     }
     if (await copyText(text.trim())) {
       copiedId = entry.id;
-      if (copyResetTimer !== null) clearTimeout(copyResetTimer);
-      copyResetTimer = setTimeout(() => {
-        copyResetTimer = null;
+      if (copiedResetTimer !== null) clearTimeout(copiedResetTimer);
+      copiedResetTimer = setTimeout(() => {
+        copiedResetTimer = null;
         if (copiedId === entry.id) copiedId = null;
       }, 1500);
     }

@@ -10,29 +10,19 @@ const source = readFileSync(
 
 describe("TerminalPanel PTY lifecycle hygiene", () => {
   it("unwinds listeners that resolve after teardown (no leak on early unmount)", () => {
-    // The registration callback must check the disposed flag...
-    const disposedDecl = source.indexOf("let listenersDisposed = false;");
-    expect(disposedDecl).toBeGreaterThan(-1);
-    const thenIdx = source.indexOf(".then((unlistenFns) => {");
-    expect(thenIdx).toBeGreaterThan(disposedDecl);
-    const guardIdx = source.indexOf("if (listenersDisposed)", thenIdx);
-    expect(guardIdx).toBeGreaterThan(-1);
-    // ...and the guard must sit BEFORE the push that would orphan the fns.
-    const pushIdx = source.indexOf("unlisteners.push(...unlistenFns)");
-    expect(pushIdx).toBeGreaterThan(guardIdx);
+    expect(source).toContain("createListenerTracker()");
+    expect(source).toContain("unlisteners.track(fn)");
   });
 
-  it("sets the disposed flag in the teardown path", () => {
-    const cleanupIdx = source.indexOf("listenersDisposed = true;");
+  it("disposes unlisteners on cleanup", () => {
+    const cleanupIdx = source.indexOf("unlisteners.dispose();");
     expect(cleanupIdx).toBeGreaterThan(-1);
-    const spliceIdx = source.indexOf("unlisteners.splice(0)");
-    expect(spliceIdx).toBeGreaterThan(cleanupIdx);
   });
 
   it("clears a pending copy-reset timer on teardown and before re-arming", () => {
-    expect(source).toContain("if (copyResetTimer !== null) clearTimeout(copyResetTimer);");
+    expect(source).toContain("if (copiedResetTimer !== null) clearTimeout(copiedResetTimer);");
     // Teardown clears too: both occurrences live inside the component.
-    expect(source.match(/clearTimeout\(copyResetTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(source.match(/clearTimeout\(copiedResetTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
   it("guards command-input keys against IME composition", () => {
