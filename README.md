@@ -100,6 +100,7 @@ npm run tauri build  # bundles installers for the current platform
 | `npm run build` | Frontend production bundle (`vite build`) |
 | `npm run check` | Type-check the frontend (`svelte-check`) and node-side config/scripts (`tsc`) |
 | `npm run check:ipc` | Verify the Rust `cmd_*` registry and every frontend `invoke()` call site stay in lockstep |
+| `npm run check:release` | Verify the five version manifests agree; add `-- --tag vX.Y.Z` to also check a release tag |
 | `npm test` | Frontend unit tests (Vitest) |
 | `npm run coverage` | Vitest with v8 coverage |
 | `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | Rust format check |
@@ -108,6 +109,50 @@ npm run tauri build  # bundles installers for the current platform
 
 CI (`.github/workflows/ci.yml`) runs the frontend checks and Rust checks above on Linux, macOS,
 and Windows. Clippy treats warnings as errors; `svelte-check` reports warnings without failing.
+
+GitPulse also runs its own CI on your machine: **ci:local** (`cmd_ci_local`, wired to the GitHub
+panel) plans the same steps from the manifests it finds and runs them sequentially, stopping at
+the first failure and reporting everything after it as *skipped* rather than as a pass.
+
+## Releasing
+
+Releases are cut by pushing a tag; `.github/workflows/release.yml` does the rest.
+
+```sh
+npm run check:release -- --tag v0.1.2   # must pass before you tag
+git tag v0.1.2 && git push origin v0.1.2
+```
+
+The pipeline is deliberately hard to misuse:
+
+- **Every job checks out the tag**, not the branch, and asserts `HEAD` is the tagged commit — a
+  `workflow_dispatch` for a tag that does not exist fails at checkout instead of building the
+  branch head and publishing it under that tag's name.
+- **The version gate runs first.** The Git tag, `src-tauri/tauri.conf.json`, `Cargo.toml`,
+  `Cargo.lock`, `package.json` and `package-lock.json` must all name one version. `tauri.conf.json`
+  supplies both `__VERSION__` in the release name and the bundle version, so a stale manifest would
+  otherwise publish a release tagged `vX` whose installers are all `vY`.
+- **Pre-flight mirrors CI step-for-step**, so a tag whose commit CI never covered cannot ship.
+- **A verify job gates completeness.** The build matrix is `fail-fast: false`, so a `verify` job
+  fails the run when any platform did not succeed *and* independently inventories the draft
+  release's assets for a per-platform installer. A green matrix that uploaded nothing is still a
+  failed release.
+- Concurrency is keyed on the tag with cancellation **off**: a cancel between two asset uploads
+  would leave a draft holding a partial, plausible-looking asset set.
+
+Releases are created as **drafts** and are published by hand after the assets are checked.
+
+### macOS builds are unsigned
+
+There is no Apple signing identity in CI, so the `.dmg` is unsigned and un-notarized. macOS
+quarantines it on download and Gatekeeper refuses to open it. To run a release build locally:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/GitPulse.app
+```
+
+Configuring `APPLE_SIGNING_IDENTITY` / `APPLE_CERTIFICATE` / `APPLE_ID` as repository secrets is
+what removes this step for everyone else.
 
 ## Architecture
 
