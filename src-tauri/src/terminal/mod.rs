@@ -434,8 +434,21 @@ mod tests {
         assert!(!res.stderr_tail.is_empty());
     }
 
+    /// A mutating git command must reach the harness gate, whether or not a
+    /// harness is installed to answer.
+    ///
+    /// This deliberately does *not* assert that `git push --force` is refused.
+    /// `harness::gated` documents a missing harness as the one unchecked
+    /// verdict allowed to proceed, so the refusal only happens on a machine
+    /// that actually has MANVI installed. Asserting it made the suite pass on
+    /// a developer laptop with `manvi` on PATH and fail on every CI runner
+    /// without it — the test was describing the machine, not the code.
+    ///
+    /// The invariant this module really owns is routing: a git command is
+    /// never spawned ungated. Either the gate refuses it, or it comes back
+    /// marked `gated` with the verdict attached.
     #[test]
-    fn blocks_force_push_through_harness() {
+    fn force_push_is_never_spawned_ungated() {
         let dir = TempDir::new().unwrap();
         init_test_repo(dir.path());
         let res = run_terminal(
@@ -450,15 +463,28 @@ mod tests {
             Some(5),
         );
 
-        // Force push must be rejected by MANVI harness command gate before spawning.
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(
-            err.contains("policy")
-                || err.contains("force")
-                || err.contains("blocked")
-                || err.contains("refused")
-                || err.contains("MANVI")
-        );
+        match res {
+            // A harness answered and blocked it: the refusal must name a reason
+            // rather than being an opaque failure.
+            Err(err) => assert!(
+                err.contains("policy")
+                    || err.contains("force")
+                    || err.contains("blocked")
+                    || err.contains("refused")
+                    || err.contains("MANVI"),
+                "refusal should name why it was refused, got: {err}"
+            ),
+            // No harness to answer: it may proceed, but it must still be
+            // recorded as having gone through the gate, with the verdict kept.
+            // `gated == false` here would mean a force push took the non-git
+            // bypass path.
+            Ok(run) => {
+                assert!(run.gated, "a git command must never report itself ungated");
+                assert!(
+                    run.policy.is_some(),
+                    "a gated command must carry the verdict it was judged by"
+                );
+            }
+        }
     }
 }

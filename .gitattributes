@@ -1,0 +1,30 @@
+# Pin line endings in the working tree on every platform.
+#
+# Without this, Git for Windows' default `core.autocrlf=true` — which the
+# GitHub Windows runners ship with — rewrites every checked-out text file to
+# CRLF. Vite cannot parse a CRLF `.mjs` that a `.ts` test imports, so the
+# three `scripts/*.test.ts` suites died with "SyntaxError: Invalid or
+# unexpected token" on Windows only, while passing on macOS and Linux. The
+# defect is the checkout, not the tests, so it is fixed once here for every
+# text file rather than defensively per-file.
+* text=auto eol=lf
+
+# Scripts that Windows itself executes must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.dmg binary
+*.msi binary
+*.deb binary
+*.AppImage binary

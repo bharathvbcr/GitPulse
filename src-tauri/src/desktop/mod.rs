@@ -65,6 +65,12 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
 }
 
 pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
+    // Only the macOS arms below read `app`; the exit arms reap the sidecar and
+    // take nothing. Consumed explicitly rather than renamed to `_app` so the
+    // parameter keeps its name on the platform that uses it, matching
+    // `handle_window_event` above.
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
     match event {
         #[cfg(target_os = "macos")]
         RunEvent::Reopen {
