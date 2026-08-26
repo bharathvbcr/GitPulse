@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "license": "MIT",
   "description": "High-performance native Git desktop client built with Rust (Tauri 2) and Svelte 5",
@@ -17,6 +17,7 @@
     "check:ipc": "node scripts/check-ipc-contract.mjs",
     "check:types": "node scripts/check-coverage-types.mjs",
     "check:release": "node scripts/check-release-version.mjs",
+    "ci:local": "npm run check && npm test && npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "tauri": "node scripts/tauri.mjs"

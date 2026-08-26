@@ -40,26 +40,23 @@ Prefer to build it yourself? See [Getting started](#getting-started).
 
 ## Features
 
-- **Multi-repo workspace** — tabbed repositories with pinning, recents, drag-and-drop opening,
-  and native OS menu integration. Workspace state persists across launches.
-- **Commit history graph** — canvas-rendered graph; lanes, branch folding, and ref decoration
-  are solved on the Rust side.
+- **Multi-language stack & LOC analysis** — detects 60+ programming, markup, and data languages
+  (TypeScript, TSX, Rust, Go, C, C++, Java, Swift, Kotlin, JavaScript, Python, C#, F#, Scala, Ruby,
+  PHP, Dart, Zig, Julia, Groovy, Shell, and more) using official GitHub Linguist colors, manifest
+  recognition (`Cargo.toml`, `go.mod`, `package.json`, `pom.xml`, `Package.swift`, etc.), shebang
+  sniffing, and language-aware comment parsing for accurate LOC breakdowns.
+- **Commit history graph** — GPU-accelerated canvas-rendered graph with avatar rendering, lane
+  smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust.
 - **Diff viewer** — file, commit, and range diffs with word-level intra-line highlighting
   and image diffs. Patches can be staged or unstaged selectively straight from the diff view
   (`cmd_stage_selective_patch`).
 - **Staging & commits** — stage/unstage files, commit with amend, AI-assisted commit messages.
 - **Conflict resolution** — parse and resolve merge conflicts in a dedicated editor.
 - **Blame** — per-line authorship viewer.
-- **Coverage** — discovers coverage artifacts in the repository and shows per-file line coverage,
-  split per language (e.g. Rust vs TypeScript) with per-language totals
-  (LCOV, Cobertura, Go cover, Istanbul JSON, JaCoCo, and Clover reports are matched per language tree,
-  including artifacts under nested cargo workspaces like `src-tauri/target/llvm-cov/`).
-  MANVI is one click away: the local model turns the rendered report into a prioritized analysis
-  whose commands are individually runnable through a coverage-only allowlist, and when a language family has no artifact at all,
-  curated coverage-generating commands (e.g. `cargo llvm-cov --lcov`) are offered and run through
-  the same policy-gated, bounded, journal-recorded action runner before an automatic rescan. Alternative
-  non-Rust generators stop after the first success, while distinct Rust workspaces all run. A report can
-  also be filed as a guarded GitHub issue after confirmation; the draft omits local paths and command output.
+- **Coverage & diagnostics** — discovers coverage artifacts across ecosystems (LCOV, Cobertura,
+  Go cover, Istanbul JSON, JaCoCo, Clover) and displays per-file line coverage. One-click copy
+  for failed coverage diagnostics, script errors, and rescans. MANVI local AI provides prioritized
+  remediation plans and executable coverage scripts via a purpose-limited allowlist runner.
 - **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
   objects, reflogs, LFS, submodule stores), build-output and cache directories across
   ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
@@ -140,7 +137,9 @@ npm run tauri build  # bundles installers for the current platform
 | `npm run build` | Frontend production bundle (`vite build`) |
 | `npm run check` | Type-check the frontend (`svelte-check`) and node-side config/scripts (`tsc`) |
 | `npm run check:ipc` | Verify the Rust `cmd_*` registry and every frontend `invoke()` call site stay in lockstep |
+| `npm run check:types` | Verify coverage serde structs match TypeScript interfaces field-for-field |
 | `npm run check:release` | Verify the five version manifests agree; add `-- --tag vX.Y.Z` to also check a release tag |
+| `npm run ci:local` | Run full local CI pipeline (type-check, tests, build, clippy, cargo test) |
 | `npm test` | Frontend unit tests (Vitest) |
 | `npm run coverage` | Vitest with v8 coverage |
 | `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | Rust format check |

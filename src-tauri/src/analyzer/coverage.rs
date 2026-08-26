@@ -823,7 +823,10 @@ fn specs_for(family: &str) -> &'static [(&'static str, CoverageFormat)] {
         "dotnet" => &[
             ("coverage.cobertura.xml", CoverageFormat::Cobertura),
             ("coverage.xml", CoverageFormat::Cobertura),
-            ("TestResults/coverage.cobertura.xml", CoverageFormat::Cobertura),
+            (
+                "TestResults/coverage.cobertura.xml",
+                CoverageFormat::Cobertura,
+            ),
         ],
         "php" => &[
             ("clover.xml", CoverageFormat::Clover),

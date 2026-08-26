@@ -142,11 +142,20 @@ fn coverage_family_from_untracked_rust_and_cargo_toml() {
 fn multi_language_repo_detects_common_languages() {
     let repo = TestRepo::init();
     repo.write("src/index.ts", "export const msg: string = 'hello';\n");
-    repo.write("src/App.tsx", "export const App = () => <div>hello</div>;\n");
+    repo.write(
+        "src/App.tsx",
+        "export const App = () => <div>hello</div>;\n",
+    );
     repo.write("src/main.rs", "fn main() {}\n");
     repo.write("cmd/app/main.go", "package main\nfunc main() {}\n");
-    repo.write("src/native.c", "#include <stdio.h>\nint main() { return 0; }\n");
-    repo.write("src/Main.java", "public class Main { public static void main(String[] args) {} }\n");
+    repo.write(
+        "src/native.c",
+        "#include <stdio.h>\nint main() { return 0; }\n",
+    );
+    repo.write(
+        "src/Main.java",
+        "public class Main { public static void main(String[] args) {} }\n",
+    );
     repo.write("Sources/App/main.swift", "print(\"hello\")\n");
     repo.write("src/App.kt", "fun main() {}\n");
     repo.write("src/bundle.js", "console.log('js');\n");
@@ -157,7 +166,10 @@ fn multi_language_repo_detects_common_languages() {
         .stats;
 
     let names: Vec<&str> = stats.iter().map(|s| s.language.as_str()).collect();
-    assert!(names.contains(&"TypeScript"), "missing TypeScript: {names:?}");
+    assert!(
+        names.contains(&"TypeScript"),
+        "missing TypeScript: {names:?}"
+    );
     assert!(names.contains(&"TSX"), "missing TSX: {names:?}");
     assert!(names.contains(&"Rust"), "missing Rust: {names:?}");
     assert!(names.contains(&"Go"), "missing Go: {names:?}");
@@ -165,13 +177,25 @@ fn multi_language_repo_detects_common_languages() {
     assert!(names.contains(&"Java"), "missing Java: {names:?}");
     assert!(names.contains(&"Swift"), "missing Swift: {names:?}");
     assert!(names.contains(&"Kotlin"), "missing Kotlin: {names:?}");
-    assert!(names.contains(&"JavaScript"), "missing JavaScript: {names:?}");
+    assert!(
+        names.contains(&"JavaScript"),
+        "missing JavaScript: {names:?}"
+    );
 
-    for lang in &["TypeScript", "TSX", "Rust", "Go", "C", "Java", "Swift", "Kotlin", "JavaScript"] {
+    for lang in &[
+        "TypeScript",
+        "TSX",
+        "Rust",
+        "Go",
+        "C",
+        "Java",
+        "Swift",
+        "Kotlin",
+        "JavaScript",
+    ] {
         let stat = stats.iter().find(|s| s.language == *lang).unwrap();
         assert_eq!(stat.category, "programming", "{lang} category mismatch");
         assert!(stat.code_lines >= 1, "{lang} lines must be >= 1");
         assert_eq!(stat.file_count, 1, "{lang} file count mismatch");
     }
 }
-

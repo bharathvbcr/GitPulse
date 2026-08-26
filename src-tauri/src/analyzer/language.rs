@@ -293,13 +293,8 @@ impl LanguageDetector {
             | "npm-shrinkwrap.json" => Some("npm"),
             "cargo.toml" | "cargo.lock" => Some("cargo"),
             "go.mod" | "go.sum" | "go.work" => Some("go"),
-            "pyproject.toml"
-            | "requirements.txt"
-            | "pipfile"
-            | "pipfile.lock"
-            | "poetry.lock"
-            | "setup.py"
-            | "setup.cfg" => Some("python"),
+            "pyproject.toml" | "requirements.txt" | "pipfile" | "pipfile.lock" | "poetry.lock"
+            | "setup.py" | "setup.cfg" => Some("python"),
             "gemfile" | "gemfile.lock" => Some("ruby"),
             "composer.json" | "composer.lock" => Some("php"),
             "pom.xml"
@@ -452,13 +447,11 @@ fn filename_language(file_lower: &str) -> Option<LanguageInfo> {
             color_hex: "#da3434",
             category: "programming",
         },
-        "cargo.toml" | "clippy.toml" | "rust-toolchain" | "rust-toolchain.toml" => {
-            LanguageInfo {
-                name: "TOML",
-                color_hex: "#9c4221",
-                category: "data",
-            }
-        }
+        "cargo.toml" | "clippy.toml" | "rust-toolchain" | "rust-toolchain.toml" => LanguageInfo {
+            name: "TOML",
+            color_hex: "#9c4221",
+            category: "data",
+        },
         "go.mod" | "go.sum" | "go.work" | "go.work.sum" => LanguageInfo {
             name: "Go",
             color_hex: "#00add8",
@@ -1259,35 +1252,98 @@ mod tests {
 
     #[test]
     fn test_commonly_used_languages_detection() {
-        assert_eq!(LanguageDetector::detect_from_path("src/index.ts").name, "TypeScript");
-        assert_eq!(LanguageDetector::detect_from_path("src/App.tsx").name, "TSX");
-        assert_eq!(LanguageDetector::detect_from_path("src/lib.rs").name, "Rust");
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/index.ts").name,
+            "TypeScript"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/App.tsx").name,
+            "TSX"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/lib.rs").name,
+            "Rust"
+        );
         assert_eq!(LanguageDetector::detect_from_path("cmd/main.go").name, "Go");
         assert_eq!(LanguageDetector::detect_from_path("src/main.c").name, "C");
-        assert_eq!(LanguageDetector::detect_from_path("include/header.h").name, "C");
-        assert_eq!(LanguageDetector::detect_from_path("src/engine.cpp").name, "C++");
-        assert_eq!(LanguageDetector::detect_from_path("src/Main.java").name, "Java");
-        assert_eq!(LanguageDetector::detect_from_path("Sources/App.swift").name, "Swift");
-        assert_eq!(LanguageDetector::detect_from_path("src/Main.kt").name, "Kotlin");
-        assert_eq!(LanguageDetector::detect_from_path("src/index.js").name, "JavaScript");
-        assert_eq!(LanguageDetector::detect_from_path("src/Component.jsx").name, "JSX");
-        assert_eq!(LanguageDetector::detect_from_path("scripts/script.py").name, "Python");
-        assert_eq!(LanguageDetector::detect_from_path("lib/module.rb").name, "Ruby");
-        assert_eq!(LanguageDetector::detect_from_path("src/index.php").name, "PHP");
-        assert_eq!(LanguageDetector::detect_from_path("src/Program.cs").name, "C#");
+        assert_eq!(
+            LanguageDetector::detect_from_path("include/header.h").name,
+            "C"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/engine.cpp").name,
+            "C++"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/Main.java").name,
+            "Java"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("Sources/App.swift").name,
+            "Swift"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/Main.kt").name,
+            "Kotlin"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/index.js").name,
+            "JavaScript"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/Component.jsx").name,
+            "JSX"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("scripts/script.py").name,
+            "Python"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("lib/module.rb").name,
+            "Ruby"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/index.php").name,
+            "PHP"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/Program.cs").name,
+            "C#"
+        );
         assert_eq!(LanguageDetector::detect_from_path("src/App.fs").name, "F#");
-        assert_eq!(LanguageDetector::detect_from_path("src/Main.scala").name, "Scala");
-        assert_eq!(LanguageDetector::detect_from_path("lib/main.dart").name, "Dart");
-        assert_eq!(LanguageDetector::detect_from_path("src/main.zig").name, "Zig");
-        assert_eq!(LanguageDetector::detect_from_path("build.gradle").name, "Groovy");
-        assert_eq!(LanguageDetector::detect_from_path("build.gradle.kts").name, "Kotlin");
-        assert_eq!(LanguageDetector::detect_from_path("Package.swift").name, "Swift");
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/Main.scala").name,
+            "Scala"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("lib/main.dart").name,
+            "Dart"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("src/main.zig").name,
+            "Zig"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("build.gradle").name,
+            "Groovy"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("build.gradle.kts").name,
+            "Kotlin"
+        );
+        assert_eq!(
+            LanguageDetector::detect_from_path("Package.swift").name,
+            "Swift"
+        );
         assert_eq!(LanguageDetector::detect_from_path("go.mod").name, "Go");
     }
 
     #[test]
     fn test_expanded_shebang_interpreters() {
-        let ts = LanguageDetector::detect_from_bytes("cli", b"#!/usr/bin/env ts-node\nconsole.log(1);\n");
+        let ts = LanguageDetector::detect_from_bytes(
+            "cli",
+            b"#!/usr/bin/env ts-node\nconsole.log(1);\n",
+        );
         assert_eq!(ts.name, "TypeScript");
         let py = LanguageDetector::detect_from_bytes("cli", b"#!/usr/bin/env python3\nprint(1)\n");
         assert_eq!(py.name, "Python");
@@ -1299,9 +1355,15 @@ mod tests {
 
     #[test]
     fn test_expanded_coverage_families() {
-        assert_eq!(LanguageDetector::coverage_family("TypeScript"), Some("javascript"));
+        assert_eq!(
+            LanguageDetector::coverage_family("TypeScript"),
+            Some("javascript")
+        );
         assert_eq!(LanguageDetector::coverage_family("TSX"), Some("javascript"));
-        assert_eq!(LanguageDetector::coverage_family("JavaScript"), Some("javascript"));
+        assert_eq!(
+            LanguageDetector::coverage_family("JavaScript"),
+            Some("javascript")
+        );
         assert_eq!(LanguageDetector::coverage_family("Rust"), Some("rust"));
         assert_eq!(LanguageDetector::coverage_family("Go"), Some("go"));
         assert_eq!(LanguageDetector::coverage_family("Java"), Some("jvm"));
@@ -1315,4 +1377,3 @@ mod tests {
         assert_eq!(LanguageDetector::coverage_family("Dart"), Some("dart"));
     }
 }
-
