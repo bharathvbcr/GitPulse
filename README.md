@@ -1,10 +1,42 @@
 # GitPulse
 
+[![CI](https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml)
+[![Coverage](https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg)](https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml)
+[![Release](https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver)](https://github.com/bharathvbcr/GitPulse/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+
 High-performance, native Git desktop client built with Rust & Svelte.
 
 GitPulse is a Tauri 2 app: a Rust backend does the heavy lifting (graph lane solving, diffs,
 coverage scanning, dependency analysis) while a Svelte 5 + TypeScript frontend renders it.
 It runs entirely on your machine; GitHub features go through your locally installed `gh` CLI.
+
+## Contents
+
+- [Install](#install) · [Requirements](#requirements) · [Getting started](#getting-started)
+- [Features](#features) · [Architecture](#architecture) · [Project layout](#project-layout)
+- [Development](#development) · [Releasing](#releasing)
+- [Contributing](#contributing) · [Security](#security) · [License](#license)
+
+## Install
+
+Download the installer for your platform from the
+[latest release](https://github.com/bharathvbcr/GitPulse/releases/latest).
+
+| Platform | Asset | Notes |
+| --- | --- | --- |
+| macOS (Apple Silicon & Intel) | `.dmg` | Universal binary. **Unsigned** — see [below](#macos-builds-are-unsigned). |
+| Linux | `.AppImage`, `.deb` | Built on Ubuntu 22.04, so glibc 2.35+ |
+| Windows | `.msi`, `.exe` | |
+
+macOS quarantines unsigned downloads, so after dragging the app to `/Applications`:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/GitPulse.app
+```
+
+Prefer to build it yourself? See [Getting started](#getting-started).
 
 ## Features
 
@@ -253,3 +285,45 @@ src-tauri/
   tests/                  Rust integration suites
 .github/workflows/        CI, coverage, release
 ```
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+Before opening a PR, run the same checks CI runs — GitPulse can do this for you via the
+**CI:local** button in the GitHub view, or from a shell:
+
+```sh
+npm ci
+npm run check && npm test && npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+Two contract checks run inside `npm test` and will fail the build on drift, so it is worth
+knowing what they mean:
+
+- `check:ipc` — a `cmd_*` handler and its `invoke()` call sites disagree.
+- `check:types` — a Rust serde payload struct and its TypeScript twin disagree field-for-field.
+- `check:release` — the version manifests disagree with each other or with a release tag.
+
+Clippy runs with `-D warnings`; `svelte-check` warnings do not fail the build.
+
+## Security
+
+GitPulse runs entirely on your machine. It does not phone home, and it has no server component.
+GitHub features shell out to your own authenticated [`gh`](https://cli.github.com) CLI, so
+GitPulse never sees or stores a GitHub token. Mutating git actions can additionally be gated
+behind the optional [MANVI harness](#the-manvi-harness).
+
+The webview runs under a restrictive CSP (`src-tauri/tauri.conf.json`): `default-src 'self'`,
+no remote scripts, and `connect-src` limited to the Tauri IPC channel.
+
+Found a vulnerability? Please open a
+[security advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new) rather than
+a public issue.
+
+## License
+
+[MIT](LICENSE) © 2026 Bharath Chandra Vaddaram

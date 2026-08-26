@@ -4,6 +4,8 @@ version = "0.0.1"
 description = "High-Performance Native Git Desktop Client"
 authors = ["GitPulse Team"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/bharathvbcr/GitPulse"
 
 [lib]
 name = "gitpulse_lib"

@@ -2,6 +2,12 @@
   "name": "gitpulse",
   "version": "0.0.1",
   "private": true,
+  "license": "MIT",
+  "description": "High-performance native Git desktop client built with Rust (Tauri 2) and Svelte 5",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bharathvbcr/GitPulse.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "node scripts/vite-dev.mjs",
