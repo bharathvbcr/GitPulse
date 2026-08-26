@@ -198,7 +198,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # `contents: write` is the *minimum* that works here, not a convenience:
+      # the REST releases API only lists draft releases for callers with push
+      # access, so a `contents: read` token 404s on the very release this job
+      # exists to inspect and the check fails for the wrong reason. This job
+      # only reads; it never mutates the release.
+      contents: write
     steps:
       - name: Report Build Matrix Outcome
         run: |
