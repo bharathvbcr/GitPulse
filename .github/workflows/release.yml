@@ -5,26 +5,56 @@ on:
     tags:
       - 'v*'
   # Manual dispatch (GitHub UI or GitPulse's workflow trigger) requires an
-  # explicit tag, since a branch ref has no tag name to release.
+  # explicit tag, since a branch ref has no tag name to release. The tag must
+  # already exist: every job checks out the tag itself, so a dispatch for a
+  # tag that was never pushed fails at checkout rather than quietly building
+  # the branch head and publishing it under that tag's name.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build (e.g. v0.1.2)'
+        description: 'Existing release tag to build (e.g. v0.1.2)'
         required: true
         type: string
 
+# Keyed on the tag being released, not on github.ref: two dispatches for
+# different tags share a branch ref and would otherwise cancel each other.
+# `inputs` and `github` are the contexts available to this key.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  # Never cancel a release in flight. A cancellation between two asset uploads
+  # leaves a draft release holding a partial, plausible-looking asset set.
+  cancel-in-progress: false
+
+# Least privilege by default; only the job that publishes assets is elevated.
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   preflight:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
-      - name: Checkout Repository
+      - name: Checkout Release Tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Confirm Checkout Is The Tagged Commit
+        run: |
+          set -euo pipefail
+          tagged=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          head=$(git rev-parse HEAD)
+          echo "Releasing tag : $RELEASE_TAG"
+          echo "Tagged commit : $tagged"
+          echo "Checked out   : $head"
+          if [ "$tagged" != "$head" ]; then
+            echo "::error::Checkout is not the tagged commit — refusing to build."
+            exit 1
+          fi
 
       - name: Install System Dependencies (Linux)
         run: |
@@ -50,13 +80,36 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      # The gate that nothing else covers: the tag, tauri.conf.json (which
+      # supplies __VERSION__ in the release name and the bundle version),
+      # Cargo.toml/lock, and package.json/lock must all name one version.
+      # Runs before any build minutes are spent.
+      - name: Release Version Gate
+        run: node scripts/check-release-version.mjs --tag "$RELEASE_TAG"
+
+      # Preflight mirrors ci.yml step-for-step. Previously it ran only the
+      # type check and clippy, so a tag whose commit CI never covered — or
+      # covered red — could still ship binaries.
       - name: Frontend Svelte Check
         run: npm run check
+
+      - name: Frontend Unit Tests (Vitest)
+        run: npm test
+
+      - name: Frontend Vite Build
+        run: npm run build
+
+      - name: Rust Cargo Format Check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Rust Cargo Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      - name: Rust Unit & Integration Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
   release:
+    name: Build & Upload (${{ matrix.platform }})
     permissions:
       contents: write
     needs: [preflight]
@@ -66,16 +119,24 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--target universal-apple-darwin'
+          # Pinned to 22.04 deliberately, NOT ubuntu-latest: the glibc and
+          # webkit2gtk of the build host become the floor for the .deb and
+          # AppImage. Building on 24.04 would silently drop older distros.
           - platform: 'ubuntu-22.04'
             args: ''
           - platform: 'windows-latest'
             args: ''
 
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 40
+    # A universal macOS build compiles the whole dependency tree twice
+    # (x86_64 + aarch64). On a cold Rust cache 40 minutes was not enough
+    # headroom for a release build.
+    timeout-minutes: 90
     steps:
-      - name: Checkout Repository
+      - name: Checkout Release Tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install System Dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
@@ -107,9 +168,83 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ inputs.tag || github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
+          # releaseCommitish is deliberately unset: the action only uses it to
+          # create a tag that does not exist yet, and the tag checkout above
+          # has already failed the job in that case. Setting it here would be
+          # dead on a tag push and actively wrong on a dispatch, where
+          # github.sha is the branch head rather than the tagged commit.
           releaseName: 'GitPulse v__VERSION__'
           releaseBody: 'High-performance native Git desktop client release built with Rust & Svelte 5.'
           releaseDraft: true
           prerelease: false
+          # No updater plugin is configured in tauri.conf.json, so there is no
+          # latest.json to publish. Left at its default (true) this would be a
+          # no-op today and would start publishing an update manifest the
+          # moment the updater is switched on, without anyone deciding to.
+          uploadUpdaterJson: false
+          # A 20-to-90-minute build should not be thrown away by one flaky
+          # asset upload.
+          retryAttempts: 3
           args: ${{ matrix.args }}
+
+  verify:
+    name: Verify Release Completeness
+    needs: [release]
+    # Runs even when a platform leg failed — that is precisely the case this
+    # job exists to report. Without it, `fail-fast: false` produces a draft
+    # release that looks finished while silently missing a platform.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Report Build Matrix Outcome
+        run: |
+          set -euo pipefail
+          echo "release job aggregate result: ${{ needs.release.result }}"
+          if [ "${{ needs.release.result }}" != "success" ]; then
+            echo "::error::At least one platform failed to build or upload. The draft release for $RELEASE_TAG is INCOMPLETE — do not publish it."
+            exit 1
+          fi
+
+      - name: Inventory Draft Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job intentionally has no checkout, so gh cannot infer the
+          # repository from a git remote.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Independent of job status: assert the assets themselves exist, one
+          # per platform. A green matrix that uploaded nothing is still a
+          # failed release.
+          if ! gh release view "$RELEASE_TAG" --json assets > assets.json 2>view-err.txt; then
+            echo "::error::Could not read release $RELEASE_TAG to verify its assets. This check did NOT run — treat the release as unverified."
+            cat view-err.txt
+            exit 1
+          fi
+
+          names=$(jq -r '.assets[].name' assets.json)
+          echo "Assets on draft release $RELEASE_TAG:"
+          echo "$names" | awk '{ print "  " $0 }'
+
+          missing=0
+          for pattern in '\.dmg$' '\.AppImage$|\.deb$' '\.msi$|\.exe$'; do
+            if ! echo "$names" | grep -qE "$pattern"; then
+              echo "::error::No asset matching /$pattern/ — a platform produced no installer."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          {
+            echo "### Release $RELEASE_TAG — draft assets verified"
+            echo
+            echo '```'
+            echo "$names"
+            echo '```'
+            echo
+            echo "All three platforms produced an installer. The release is a **draft**; publish it manually."
+          } >> "$GITHUB_STEP_SUMMARY"
