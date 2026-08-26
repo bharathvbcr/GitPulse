@@ -3,6 +3,8 @@ import { writable } from "svelte/store";
 export interface InterfacePrefs {
   showLanguageBar: boolean;
   showHarnessBadges: boolean;
+  /** Author-avatar column in the commit graph gutter. */
+  showGraphAvatars: boolean;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -10,6 +12,7 @@ const STORAGE_KEY = "gitpulse_interface_prefs";
 const DEFAULTS: InterfacePrefs = {
   showLanguageBar: true,
   showHarnessBadges: true,
+  showGraphAvatars: true,
 };
 
 function readPrefs(): InterfacePrefs {
@@ -27,6 +30,10 @@ function readPrefs(): InterfacePrefs {
         typeof parsed.showHarnessBadges === "boolean"
           ? parsed.showHarnessBadges
           : DEFAULTS.showHarnessBadges,
+      showGraphAvatars:
+        typeof parsed.showGraphAvatars === "boolean"
+          ? parsed.showGraphAvatars
+          : DEFAULTS.showGraphAvatars,
     };
   } catch {
     /* corrupt or unavailable storage falls back to defaults */
@@ -63,6 +70,18 @@ function createInterfaceStore() {
     setShowHarnessBadges: (show: boolean) =>
       update((prefs) => {
         const next = { ...prefs, showHarnessBadges: show };
+        persist(next);
+        return next;
+      }),
+    setShowGraphAvatars: (show: boolean) =>
+      update((prefs) => {
+        const next = { ...prefs, showGraphAvatars: show };
+        persist(next);
+        return next;
+      }),
+    toggleGraphAvatars: () =>
+      update((prefs) => {
+        const next = { ...prefs, showGraphAvatars: !prefs.showGraphAvatars };
         persist(next);
         return next;
       }),

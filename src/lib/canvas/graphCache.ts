@@ -33,6 +33,13 @@ export interface GraphCacheInputs {
    * glaring on light themes, banding/strobing as strips evict on dark ones.
    */
   backgroundCssColor?: string;
+  /**
+   * Whether the author-avatar column is baked into the strips. Toggling it
+   * must drop every tile or half the graph carries avatars and half does not
+   * until eviction catches up; width alone is NOT a reliable proxy (a gutter
+   * already wider than the avatar slot would not change size).
+   */
+  showAvatars?: boolean;
 }
 
 /** Structural equality; a changed field means "drop every strip". */
@@ -44,7 +51,10 @@ export function sameCacheInputs(a: GraphCacheInputs | null, b: GraphCacheInputs)
     a.densitySignature === b.densitySignature &&
     a.themeSignature === b.themeSignature &&
     a.dpr === b.dpr &&
-    a.backgroundCssColor === b.backgroundCssColor
+    a.backgroundCssColor === b.backgroundCssColor &&
+    // Normalized so optional-boolean call sites (absent = off) compare equal
+    // to explicit `false`; only an actual toggle may drop strips.
+    (a.showAvatars ?? false) === (b.showAvatars ?? false)
   );
 }
 
@@ -52,7 +62,8 @@ export function sameCacheInputs(a: GraphCacheInputs | null, b: GraphCacheInputs)
 export function computeCacheKey(inputs: GraphCacheInputs): string {
   const dpr = Number(inputs.dpr.toFixed(4));
   const bg = inputs.backgroundCssColor ?? "none";
-  return `${inputs.dataVersion}:${inputs.cssWidth}:${inputs.densitySignature}:${inputs.themeSignature}:${dpr}:${bg}`;
+  const av = inputs.showAvatars ? "avatars" : "noav";
+  return `${inputs.dataVersion}:${inputs.cssWidth}:${inputs.densitySignature}:${inputs.themeSignature}:${dpr}:${bg}:${av}`;
 }
 
 /** One stable signature string for a resolved theme. */
@@ -70,13 +81,6 @@ export interface StripPaintRequest {
   stripTopCss: number;
   /** CSS height of the strip surface, for culling. */
   viewportCssHeight: number;
-  /**
-   * CSS width of the strip surface. Surfaces are allocated with
-   * `alpha: false`, so every pixel starts BLACK until painted — painters must
-   * fill the full rect with the theme background before drawing content or
-   * light themes show opaque black bands behind the graph.
-   */
-  cssWidth: number;
 }
 
 /**
@@ -274,7 +278,6 @@ export function createGraphStaticCache(
       rowCount,
       stripTopCss: firstRow * rowHeight,
       viewportCssHeight: cssHeight,
-      cssWidth: inputs.cssWidth,
     });
     stripRenders += 1;
 
@@ -319,6 +322,12 @@ export function createGraphStaticCache(
     const firstStrip = Math.floor(viewTop / stripSpan);
     const lastStrip = Math.floor((clippedBottom - 1) / stripSpan);
 
+    // Device pixels actually blitted this call. The loop's clamps can skip
+    // every strip (degenerate viewports, subpixel slivers); returning "true"
+    // then would tell the caller emphasis-only mode is safe over an EMPTY
+    // static layer — a coverage lie that leaves rings floating on background.
+    let blittedDevicePixels = 0;
+
     for (let s = firstStrip; s <= lastStrip; s++) {
       const surface = ensureStrip(s);
       if (!surface) return false;
@@ -352,8 +361,9 @@ export function createGraphStaticCache(
         surface.canvas.width / dpr,
         sh / dpr,
       );
+      blittedDevicePixels += sh * surface.canvas.width;
     }
-    return true;
+    return blittedDevicePixels > 0;
   }
 
   function invalidate(): void {

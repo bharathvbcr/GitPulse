@@ -34,4 +34,30 @@ describe("interfaceStore", () => {
     expect(prefs.showLanguageBar).toBe(true);
     expect(prefs.showHarnessBadges).toBe(true);
   });
+
+  it("defaults to showing graph avatars", () => {
+    expect(get(interfaceStore).showGraphAvatars).toBe(true);
+  });
+
+  it("toggles graph avatars via setter and toggle, preserving other prefs", () => {
+    interfaceStore.setShowLanguageBar(false);
+    interfaceStore.setShowGraphAvatars(false);
+    let prefs = get(interfaceStore);
+    expect(prefs.showGraphAvatars).toBe(false);
+    expect(prefs.showLanguageBar).toBe(false);
+
+    interfaceStore.toggleGraphAvatars();
+    prefs = get(interfaceStore);
+    expect(prefs.showGraphAvatars).toBe(true);
+    expect(prefs.showLanguageBar).toBe(false);
+
+    interfaceStore.toggleGraphAvatars();
+    expect(get(interfaceStore).showGraphAvatars).toBe(false);
+  });
+
+  it("reset restores the avatar default too", () => {
+    interfaceStore.setShowGraphAvatars(false);
+    interfaceStore.reset();
+    expect(get(interfaceStore).showGraphAvatars).toBe(true);
+  });
 });

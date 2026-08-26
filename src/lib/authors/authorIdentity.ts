@@ -46,12 +46,13 @@ function fnv1a(input: string): number {
 }
 
 /**
- * Golden-angle hue spread: consecutive integer hashes land ~137.5° apart, so
- * neighbouring authors (hashes differing by small deltas) get visually distinct
- * colours instead of the banded clustering a plain `hash % 360` produces.
+ * Full 32-bit hash through the golden angle: consecutive hashes land ~137.5°
+ * apart, so sequentially-numbered authors (user1@, user2@, … — the norm in
+ * generated/synced repos) get maximally distinct colours. The multiply stays
+ * exact in float64 (2^32 × 137.508 < 2^53).
  */
 function hueFromHash(hash: number): number {
-  return ((hash % 1000) * 137.508) % 360;
+  return (((hash >>> 0) * 137.508) % 360 + 360) % 360;
 }
 
 /** Grapheme splitter with a code-point fallback for runtimes without Segmenter. */
@@ -128,22 +129,29 @@ const identityCache = new Map<string, AuthorIdentity>();
 export function authorIdentity(name: string | null | undefined, email: string | null | undefined): AuthorIdentity {
   const safeName = typeof name === "string" ? name : "";
   const safeEmail = typeof email === "string" ? email : "";
-  const key = (safeEmail.trim() || safeName.trim()).slice(0, 512);
-  const cached = identityCache.get(key);
+  const trimmedName = safeName.trim().slice(0, 512);
+  const trimmedEmail = safeEmail.trim().slice(0, 512);
+  // Hue must be stable across display-name changes (key on email first), but
+  // INITIALS follow the CURRENT name — caching by identity key alone served
+  // renamed authors their old initials. The cache therefore spans both
+  // inputs; renames simply miss once and re-derive.
+  const cacheKey = `${trimmedEmail}\u0000${trimmedName}`;
+  const cached = identityCache.get(cacheKey);
   if (cached) {
     // Refresh recency (Map iteration order = LRU order).
-    identityCache.delete(key);
-    identityCache.set(key, cached);
+    identityCache.delete(cacheKey);
+    identityCache.set(cacheKey, cached);
     return cached;
   }
 
+  const key = trimmedEmail || trimmedName;
   const hash = fnv1a(key);
   const identity: AuthorIdentity = {
     key,
     hue: hueFromHash(hash),
     initials: initialsFrom(safeName, safeEmail),
   };
-  identityCache.set(key, identity);
+  identityCache.set(cacheKey, identity);
   if (identityCache.size > IDENTITY_CACHE_CAP) {
     const oldest = identityCache.keys().next();
     if (!oldest.done) identityCache.delete(oldest.value);

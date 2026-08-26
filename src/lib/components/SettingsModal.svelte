@@ -11,7 +11,7 @@
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck } from "lucide-svelte";
+  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck, CircleUserRound } from "lucide-svelte";
 
   let {
     isOpen = false,
@@ -113,6 +113,33 @@
             >
               <Rows3 size={12} />
               <span>Compact</span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between gap-3 py-1 mt-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <CircleUserRound size={13} class="text-textMuted shrink-0" />
+              <div class="min-w-0">
+                <div class="text-textPrimary">Author avatars</div>
+                <div class="text-textMuted text-[10px]">Initial badges beside the branch lanes</div>
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={$interfaceStore.showGraphAvatars}
+              aria-label="Show author avatars in the commit graph"
+              onclick={() => interfaceStore.setShowGraphAvatars(!$interfaceStore.showGraphAvatars)}
+              class="relative w-8 h-[18px] rounded-full transition-colors shrink-0 {$interfaceStore
+                .showGraphAvatars
+                ? 'bg-accent'
+                : 'bg-border'}"
+            >
+              <span
+                class="absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform {$interfaceStore
+                  .showGraphAvatars
+                  ? 'translate-x-[14px]'
+                  : ''}"
+              ></span>
             </button>
           </div>
         </section>

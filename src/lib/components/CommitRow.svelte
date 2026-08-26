@@ -2,12 +2,12 @@
   import type { VisualCommitRow } from "../canvas/GraphRenderer";
   import { getBranchColor } from "../canvas/Palette";
   import { formatRelativeTime } from "../format";
+  import { authorColor, authorIdentity } from "../authors/authorIdentity";
   import { GitMerge, GitBranch, Cloud, Tag, Compass } from "lucide-svelte";
 
   export interface RefItem {
     name: string;
     kind: "head" | "current-branch" | "local-branch" | "remote-branch" | "tag";
-    colorIndex?: number;
   }
 
   let {
@@ -26,14 +26,10 @@
 
   const isCompact = $derived(density === "compact");
 
-  function getAvatarColor(name: string): string {
-    let hash = 0;
-    for (let i = 0; i < name.length; i++) {
-      hash = name.charCodeAt(i) + ((hash << 5) - hash);
-    }
-    const hue = Math.abs(hash % 360);
-    return `hsl(${hue}, 70%, 48%)`;
-  }
+  // Shared identity module — same hue/initials as the canvas gutter column and
+  // tooltips. The old inline hash covered name only: two authors sharing a
+  // display name collapsed to one colour; email now disambiguates.
+  const avatar = $derived(authorIdentity(row.author_name, row.author_email));
 
   function getConventionalType(msg: string): { type: string; color: string } | null {
     const match = msg.match(/^([a-zA-Z]+)(\([^\)]+\))?(!)?:\s/);
@@ -47,8 +43,20 @@
       case "chore": return { type: "chore", color: "bg-slate-500/15 text-slate-400 border-slate-500/30" };
       case "perf": return { type: "perf", color: "bg-amber-500/15 text-amber-400 border-amber-500/30" };
       case "test": return { type: "test", color: "bg-orange-500/15 text-orange-400 border-orange-500/30" };
+      // parseQuery's server-fetchable type filter also accepts these two;
+      // rendering them generic gray made filtered rows look unclassified.
+      case "build": return { type: "build", color: "bg-teal-500/15 text-teal-400 border-teal-500/30" };
+      case "ci": return { type: "ci", color: "bg-indigo-500/15 text-indigo-400 border-indigo-500/30" };
       default: return { type, color: "bg-zinc-500/15 text-zinc-400 border-zinc-500/30" };
     }
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    // Space on a role=button div scrolls the virtualized list by default;
+    // without preventDefault selecting also page-jumps.
+    e.preventDefault();
+    onSelect?.();
   }
 
   let conventional = $derived(getConventionalType(row.summary || ""));
@@ -58,7 +66,8 @@
   role="button"
   tabindex="0"
   onclick={onSelect}
-  onkeydown={(e) => (e.key === "Enter" || e.key === " ") && onSelect?.()}
+  onkeydown={handleKeydown}
+  aria-pressed={isSelected}
   class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-sm' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
 >
   <!-- Short SHA -->
@@ -91,7 +100,7 @@
       {:else if r.kind === "current-branch"}
         <span
           class="inline-flex items-center gap-1 text-[9px] font-mono font-semibold px-2 py-0.5 rounded-full border shadow-sm"
-          style="border-color: {getBranchColor(r.colorIndex ?? row.color_index)}; color: {getBranchColor(r.colorIndex ?? row.color_index)};"
+          style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
         >
           <GitBranch size={10} />
           {r.name}
@@ -116,7 +125,7 @@
       {/if}
     {/each}
 
-    <span class="truncate">{row.summary || "No commit message"}</span>
+    <span class="truncate" title={row.summary || undefined}>{row.summary || "No commit message"}</span>
   </div>
 
   <!-- Author Name & Relative Date -->
@@ -130,10 +139,9 @@
   <!-- Author Initials Avatar -->
   <div
     class="{isCompact ? 'w-3.5 h-3.5 text-[8px]' : 'w-4.5 h-4.5 text-[10px]'} rounded-full flex items-center justify-center text-white font-bold shrink-0 shadow-sm ring-1 ring-background"
-    style="background-color: {getAvatarColor(row.author_name || 'User')}"
-    title="{row.author_name} <{row.author_email}>"
+    style="background-color: {authorColor(avatar.hue)}"
+    title="{row.author_name || 'Unknown'}{row.author_email ? ` <${row.author_email}>` : ''}"
   >
-    {(row.author_name || "U").charAt(0).toUpperCase()}
+    {avatar.initials}
   </div>
 </div>
-

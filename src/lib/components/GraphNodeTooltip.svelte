@@ -7,11 +7,12 @@
     GitCommit,
     GitMerge,
     Tag,
-    User,
   } from "lucide-svelte";
   import type { VisualCommitRow } from "../canvas/GraphRenderer";
   import type { TooltipPlacement } from "../canvas/graphInteraction";
   import type { RefItem } from "./CommitRow.svelte";
+  import { authorColor, authorIdentity } from "../authors/authorIdentity";
+  import { formatRelativeTime } from "../format";
 
   let {
     row,
@@ -32,6 +33,8 @@
 
   const visibleRefs = $derived(refs.slice(0, 4));
   const hiddenRefCount = $derived(Math.max(0, refs.length - visibleRefs.length));
+
+  const identity = $derived(authorIdentity(row.author_name, row.author_email));
 
   function formatTimestamp(timestamp: number): string {
     const date = new Date(timestamp * 1000);
@@ -99,13 +102,29 @@
   {/if}
 
   <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1.5 px-3 py-2.5 text-[10px]">
-    <dt class="flex items-center gap-1 text-textMuted"><User size={11} /> Author</dt>
-    <dd class="truncate text-right">
+    <dt class="flex items-center gap-1.5 text-textMuted">
+      <!-- Same identity module as the canvas avatars: hue and initials always
+           agree between gutter column, rows and this card. -->
+      <span
+        class="inline-flex h-4 w-4 items-center justify-center rounded-full text-[7px] font-bold text-white ring-1 ring-background"
+        style="background-color: {authorColor(identity.hue)}"
+        aria-hidden="true"
+      >{identity.initials}</span>
+      Author
+    </dt>
+    <dd
+      class="truncate text-right"
+      title={(row.author_name || "Unknown") + (row.author_email ? ` <${row.author_email}>` : "")}
+    >
       {row.author_name || "Unknown"}{#if row.author_email}<span class="text-textMuted"> · {row.author_email}</span>{/if}
     </dd>
 
     <dt class="flex items-center gap-1 text-textMuted"><CalendarClock size={11} /> Created</dt>
-    <dd class="text-right">{formatTimestamp(row.timestamp)}</dd>
+    <dd class="text-right">
+      <!-- At-a-glance age first; the exact stamp stays one hover away via title. -->
+      <span title={formatTimestamp(row.timestamp)}>{formatRelativeTime(row.timestamp) || formatTimestamp(row.timestamp)}</span>
+      <span class="text-textMuted"> · {formatTimestamp(row.timestamp)}</span>
+    </dd>
 
     <dt class="flex items-center gap-1 text-textMuted"><GitCommit size={11} /> Parents</dt>
     <dd class="text-right">{row.parent_ids.length} {row.parent_ids.length === 1 ? "parent" : "parents"}</dd>
