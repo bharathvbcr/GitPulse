@@ -32,8 +32,10 @@ export function makeRecordingCtx(height = 800) {
     lineTo(x: number, y: number) {
       calls.push({ op: "lineTo", x, y });
     },
-    bezierCurveTo(a: number, b: number, c: number, d: number) {
-      calls.push({ op: "bezier", a, b, c, d });
+    bezierCurveTo(a: number, b: number, c: number, d: number, e: number, f: number) {
+      // All six args recorded: geometry tests sample the cubic, and a curve
+      // without its endpoint cannot be sampled.
+      calls.push({ op: "bezier", a, b, c, d, e, f });
     },
     fillText(text: string, x: number, y: number) {
       calls.push({ op: "fillText", text, x, y, font: ctx.font, style: ctx.fillStyle });

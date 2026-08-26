@@ -181,6 +181,12 @@ export const AVATAR_HIT_SLOP = 3;
 /** How far a dangling edge protrudes below its commit, as a fraction of a row. */
 const DANGLING_STUB_RATIO = 0.62;
 /**
+ * Cubic-Bézier control offset approximating a circular quarter arc
+ * (4/3·(√2−1)): connector corners are true tight quarter-turns, so the
+ * straight rails on either side stay straight to the edge of the turn.
+ */
+const QUARTER_ARC_K = 0.5522847498;
+/**
  * Rows of lookback for edges that start above the viewport and cross into it.
  * Doubles as the OWNERSHIP BOUNDARY of the static strip cache: connectors
  * with a span at or under this many rows are baked into tiles (the primed
@@ -1185,14 +1191,16 @@ export class GraphRenderer {
 
   /**
    * Child→parent stroke between two stable columns: a straight vertical
-   * when the columns agree, otherwise exactly one rounded bend. The bend
-   * sits at the end that owns the lane change — a merged-in branch peels
-   * away just under its merge commit and then runs straight down its own
-   * column; a closing lane stays straight until it arrives at its parent —
-   * which is what makes a dense graph readable rather than a bundle of
-   * diagonals. Column exclusivity is the solver's contract: nothing else
-   * ever occupies the span this stroke descends through, so there is no
-   * per-row occupancy to track.
+   * when the columns agree, otherwise a RAIL — straight horizontal run,
+   * one tight quarter-turn, straight vertical run. The horizontal run sits
+   * on the row that owns the lane change: a merged-in branch peels along
+   * its merge commit's row and then descends its own column; a closing
+   * lane descends straight and approaches along its parent's row. Because
+   * the horizontal legs live exactly on row centrelines, every edge landing
+   * on one commit shares a single approach line — dense confluences read
+   * as rails, never as a braid of crossing diagonals. Column exclusivity
+   * is the solver's contract: nothing else ever occupies the span this
+   * stroke descends through, so there is no per-row occupancy to track.
    *
    * A non-forward edge (hostile offset placing the parent at or above the
    * child) degrades to a plain line so corrupt input cannot bend geometry
@@ -1218,7 +1226,13 @@ export class GraphRenderer {
     }
   }
 
-  /** Corner just below the child: the edge peels out, then runs straight down. */
+  /**
+   * Corner on the child's row: the peel runs HORIZONTALLY along the child's
+   * own row to the target column, takes one tight quarter-turn, then runs
+   * straight down. The old shape — a cubic from endpoint to endpoint —
+   * smeared the entire horizontal traversal diagonally across the span;
+   * with several wide peels per screen that read as spaghetti, not rails.
+   */
   private cornerAtStart(
     ctx: CanvasRenderingContext2D,
     xFrom: number,
@@ -1227,13 +1241,35 @@ export class GraphRenderer {
     yTo: number
   ) {
     const radius = this.cornerRadius(yTo - yFrom, xTo - xFrom);
-    const yCorner = yFrom + radius;
+    if (radius < 0.75) {
+      // Sub-pixel corner: the whole edge fits in a band thinner than the
+      // turn could render. A plain line is identical on screen.
+      ctx.moveTo(xFrom, yFrom);
+      ctx.lineTo(xTo, yTo);
+      return;
+    }
+    const sgn = xTo > xFrom ? 1 : -1;
     ctx.moveTo(xFrom, yFrom);
-    ctx.bezierCurveTo(xFrom, yFrom + radius * 0.7, xTo, yCorner - radius * 0.7, xTo, yCorner);
-    if (yTo > yCorner) ctx.lineTo(xTo, yTo);
+    const turnStartX = xTo - sgn * radius;
+    if (Math.abs(turnStartX - xFrom) > 0.1) ctx.lineTo(turnStartX, yFrom);
+    ctx.bezierCurveTo(
+      xTo - sgn * radius * (1 - QUARTER_ARC_K),
+      yFrom,
+      xTo,
+      yFrom + radius * (1 - QUARTER_ARC_K),
+      xTo,
+      yFrom + radius,
+    );
+    if (yTo > yFrom + radius + 0.1) ctx.lineTo(xTo, yTo);
   }
 
-  /** Corner just above the parent: the edge runs straight down, then arrives. */
+  /**
+   * Corner on the parent's row: the close runs straight down its own column,
+   * takes one tight quarter-turn, then approaches HORIZONTALLY along the
+   * parent's row. Every edge landing on one row therefore shares the same
+   * approach line and simultaneous landings coincide instead of braiding —
+   * the scholarlm confluence artifact.
+   */
   private cornerAtEnd(
     ctx: CanvasRenderingContext2D,
     xFrom: number,
@@ -1242,21 +1278,36 @@ export class GraphRenderer {
     yTo: number
   ) {
     const radius = this.cornerRadius(yTo - yFrom, xTo - xFrom);
-    const yCorner = yTo - radius;
+    if (radius < 0.75) {
+      ctx.moveTo(xFrom, yFrom);
+      ctx.lineTo(xTo, yTo);
+      return;
+    }
+    const sgn = xTo > xFrom ? 1 : -1;
     ctx.moveTo(xFrom, yFrom);
-    if (yCorner > yFrom) ctx.lineTo(xFrom, yCorner);
-    ctx.bezierCurveTo(xFrom, yCorner + radius * 0.7, xTo, yTo - radius * 0.7, xTo, yTo);
+    const turnStartY = yTo - radius;
+    if (turnStartY > yFrom + 0.1) ctx.lineTo(xFrom, turnStartY);
+    ctx.bezierCurveTo(
+      xFrom,
+      yTo - radius * (1 - QUARTER_ARC_K),
+      xFrom + sgn * radius * (1 - QUARTER_ARC_K),
+      yTo,
+      xFrom + sgn * radius,
+      yTo,
+    );
+    if (Math.abs(xTo - (xFrom + sgn * radius)) > 0.1) ctx.lineTo(xTo, yTo);
   }
 
   /**
-   * How wide the turn is: never more than half the vertical span (or the
-   * corner would overshoot the parent) and never wider than the lane gap it is
-   * crossing (or a one-lane hop would bulge).
+   * The quarter-turn's radius: at most half a row (so the straight vertical
+   * dominates and hovering the descent matches the closing-span hit model),
+   * half the horizontal gap and half the vertical span (so neither the
+   * horizontal run nor the vertical run can be consumed by the turn, and the
+   * corner can never overshoot the parent).
    */
   private cornerRadius(deltaY: number, deltaX: number): number {
-    const { rowHeight, laneWidth } = this.config;
-    const span = Math.max(1, Math.abs(deltaY));
-    return Math.max(2, Math.min(rowHeight * 0.85, span / 2, Math.abs(deltaX) || laneWidth));
+    const { rowHeight } = this.config;
+    return Math.min(rowHeight * 0.5, Math.abs(deltaX) / 2, Math.abs(deltaY) / 2);
   }
 
   private canvasHeight(ctx: CanvasRenderingContext2D): number {

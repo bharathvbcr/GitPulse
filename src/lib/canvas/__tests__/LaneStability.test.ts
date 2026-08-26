@@ -448,15 +448,30 @@ describe("stable columns: a lane's x never depends on its neighbours", () => {
       (p) => p.points.length >= 2 && p.points.some((pt) => Math.abs(pt.x - lane3X) < 0.5),
     );
     expect(mergePaths.length, "merge edge to lane 3 was not drawn").toBeGreaterThan(0);
+    // One bend means: every recorded point either sits in the peel band on
+    // the merge commit's own row (the horizontal run plus its quarter-turn)
+    // or exactly on lane 3's column (the straight descent). A point in
+    // neither region is a per-row jog — the edge tracking occupancy through
+    // the hole at lane 1, which stable columns exist to forbid.
+    const { rowHeight } = renderer.getConfig();
+    const mergeRowY = renderer.getRowY(0, 0);
+    const targetY = renderer.getRowY(3, 0);
     for (const p of mergePaths) {
-      const xs: number[] = [];
       for (const pt of p.points) {
-        if (xs.length === 0 || Math.abs(xs[xs.length - 1] - pt.x) >= 0.5) xs.push(pt.x);
+        const onPeelBand = Math.abs(pt.y - mergeRowY) <= rowHeight / 2 + 0.75;
+        const onOwnColumn = Math.abs(pt.x - lane3X) < 0.75;
+        expect(
+          onPeelBand || onOwnColumn,
+          `point (${pt.x}, ${pt.y}) is neither on the merge row's peel nor on lane 3's descent`,
+        ).toBe(true);
       }
-      expect(
-        xs.length,
-        `merge edge visited x positions ${xs.join(", ")} — must bend exactly once`,
-      ).toBeLessThanOrEqual(2);
     }
+    // And the descent genuinely arrives: the target row is reached on lane 3.
+    expect(
+      mergePaths.some((p) =>
+        p.points.some((pt) => Math.abs(pt.x - lane3X) < 0.5 && Math.abs(pt.y - targetY) < 0.5),
+      ),
+      "merge edge must descend to its target row on lane 3",
+    ).toBe(true);
   });
 });

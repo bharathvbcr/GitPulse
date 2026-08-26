@@ -1,0 +1,3449 @@
+[
+ {
+  "id": "7ce2efa-330",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 2,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   7
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "106603f-331",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 2,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   7
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 4,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 7,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "c2eb506-332",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 4,
+  "color_index": 7,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   4
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   7
+  ],
+  "connections": [
+   {
+    "from_lane": 4,
+    "to_lane": 2,
+    "to_row_offset": 83,
+    "is_merge": false,
+    "color_index": 7,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "29ccf76-333",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 2,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 4,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 5,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "d43157d-334",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 5,
+  "color_index": 9,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 5,
+    "to_lane": 5,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 5,
+    "to_lane": 6,
+    "to_row_offset": 39,
+    "is_merge": true,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "e770a9b-335",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 5,
+  "color_index": 9,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 5,
+    "to_lane": 5,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "35a8719-336",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 5,
+  "color_index": 9,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 5,
+    "to_lane": 5,
+    "to_row_offset": 29,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "d1e848c-337",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 2,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   2,
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 1,
+    "to_row_offset": 3,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 7,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "c517176-338",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 7,
+  "color_index": 11,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   7
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 7,
+    "to_lane": 7,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "e82baeb-339",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 7,
+  "color_index": 11,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   7
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 7,
+    "to_lane": 2,
+    "to_row_offset": 76,
+    "is_merge": false,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "8bc221a-340",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "42efc7a-341",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "c591931-342",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "b93709e-343",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 12,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "0cf7617-344",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 10,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "b2c3c15-345",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 8,
+    "to_row_offset": 30,
+    "is_merge": true,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "b058f4f-346",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 9,
+    "to_row_offset": 30,
+    "is_merge": true,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "c3e8bd2-347",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 0,
+    "to_lane": 10,
+    "to_row_offset": 36,
+    "is_merge": true,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "114d192-348",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "7ae4446-349",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "b7f4730-350",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "c143f9b-351",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "f0ef562-352",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 0,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "7b6fa0f-353",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 0,
+  "color_index": 0,
+  "active_lanes": [
+   0,
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   0,
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 0,
+    "to_lane": 2,
+    "to_row_offset": 62,
+    "is_merge": false,
+    "color_index": 0,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "76914f0-354",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 6,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "452ef30-355",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 4,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 11,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "6b7cb5b-356",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 8,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 11,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "a3d25ab-357",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 8,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 11,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "23d1f36-358",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 8,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 11,
+    "to_row_offset": 23,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "0e5248e-359",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 11,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 6,
+    "to_row_offset": 14,
+    "is_merge": true,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "9242bc9-360",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 12,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "99723e2-361",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 12,
+  "color_index": 9,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 12,
+    "to_lane": 12,
+    "to_row_offset": 26,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "bdae62e-362",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 13,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "8fbd6fe-363",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 13,
+  "color_index": 10,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   10
+  ],
+  "connections": [
+   {
+    "from_lane": 13,
+    "to_lane": 2,
+    "to_row_offset": 52,
+    "is_merge": false,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "78f5276-364",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 3,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 5,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "fd31e09-365",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 5,
+  "color_index": 9,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 5,
+    "to_lane": 5,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "01fe16c-366",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 5,
+  "color_index": 9,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   9,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 5,
+    "to_lane": 2,
+    "to_row_offset": 49,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "0b504f6-367",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 14,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "1486357-368",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 14,
+  "color_index": 11,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 14,
+    "to_lane": 14,
+    "to_row_offset": 12,
+    "is_merge": false,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "0b67267-369",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 3,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "8723641-370",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "89dc58a-371",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   3,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   6,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 11,
+    "to_row_offset": 10,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "e16a689-372",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 6,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "3ad9c11-373",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 10,
+  "active_lanes": [
+   1,
+   2,
+   6,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   10,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 11,
+    "to_row_offset": 8,
+    "is_merge": false,
+    "color_index": 10,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "1522a5f-374",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   4,
+   5,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 8,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "6b774e1-375",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 8,
+  "color_index": 1,
+  "active_lanes": [
+   2,
+   8,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   5,
+   1,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 8,
+    "to_lane": 9,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "41c699c-376",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 9,
+  "color_index": 2,
+  "active_lanes": [
+   2,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   5,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 9,
+    "to_lane": 9,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "72ba646-377",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 9,
+  "color_index": 2,
+  "active_lanes": [
+   2,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   5,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 9,
+    "to_lane": 9,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "47c76a7-378",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 9,
+  "color_index": 2,
+  "active_lanes": [
+   2,
+   9,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   5,
+   2,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 9,
+    "to_lane": 14,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 9,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "511ec8d-379",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 1,
+  "active_lanes": [
+   1,
+   2,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   1,
+   5,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 11,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "7834b75-380",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 14,
+  "color_index": 11,
+  "active_lanes": [
+   2,
+   10,
+   11,
+   12,
+   14
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   8,
+   9,
+   11
+  ],
+  "connections": [
+   {
+    "from_lane": 14,
+    "to_lane": 11,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 11,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "14c114b-381",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 8,
+  "active_lanes": [
+   2,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 11,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "f408b16-382",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 8,
+  "active_lanes": [
+   2,
+   10,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   8,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 10,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "4f20474-383",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 10,
+  "color_index": 3,
+  "active_lanes": [
+   2,
+   10,
+   12
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 10,
+    "to_lane": 10,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "db83468-384",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 10,
+  "color_index": 3,
+  "active_lanes": [
+   2,
+   10,
+   12
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 10,
+    "to_lane": 10,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "fd2f62c-385",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 10,
+  "color_index": 3,
+  "active_lanes": [
+   2,
+   10,
+   12
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 10,
+    "to_lane": 12,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 10,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "580fc0c-386",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2,
+   12
+  ],
+  "active_lane_colors": [
+   2,
+   5,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "85ed0d0-387",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 12,
+  "color_index": 9,
+  "active_lanes": [
+   1,
+   2,
+   12
+  ],
+  "active_lane_colors": [
+   2,
+   5,
+   9
+  ],
+  "connections": [
+   {
+    "from_lane": 12,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 9,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "a22448c-388",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   2,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "550304e-389",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   2,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "f926591-390",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   2,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 1,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "62d1908-391",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 3,
+  "active_lanes": [
+   1,
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   2,
+   5,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "3c672af-392",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   2,
+   5,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 3,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "d54bedd-393",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 3,
+  "active_lanes": [
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   5,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 3,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 6,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "48e0ac5-394",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 4,
+  "active_lanes": [
+   2,
+   3,
+   6
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 6,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "865f0a2-395",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 3,
+  "active_lanes": [
+   2,
+   3,
+   6
+  ],
+  "active_lane_colors": [
+   5,
+   3,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 6,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "1111dc2-396",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 4,
+  "active_lanes": [
+   2,
+   6
+  ],
+  "active_lane_colors": [
+   5,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 6,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 6,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "1eb47eb-397",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2,
+   6
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "479c3e4-398",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   6
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "412b934-399",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   6,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 10,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "c528021-400",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 8,
+  "active_lanes": [
+   1,
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 1,
+    "to_row_offset": 9,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 6,
+    "to_row_offset": 2,
+    "is_merge": true,
+    "color_index": 1,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 8,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "fa60bf7-401",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 8,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2,
+   6,
+   8
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   1,
+   2
+  ],
+  "connections": [],
+  "is_merge": false,
+  "is_root": true
+ },
+ {
+  "id": "cb9561c-402",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 1,
+  "active_lanes": [
+   1,
+   2,
+   6
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   1
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 1,
+    "to_row_offset": 7,
+    "is_merge": false,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "e595fca-403",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 8,
+  "color_index": 3,
+  "active_lanes": [
+   1,
+   2,
+   8
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 8,
+    "to_lane": 1,
+    "to_row_offset": 6,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 8,
+    "to_lane": 9,
+    "to_row_offset": 2,
+    "is_merge": true,
+    "color_index": 4,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 8,
+    "to_lane": 10,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 2,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "ffc14dd-404",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 10,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2,
+   9,
+   10
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   4,
+   2
+  ],
+  "connections": [],
+  "is_merge": false,
+  "is_root": true
+ },
+ {
+  "id": "a5f0c05-405",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 9,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   9
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   4
+  ],
+  "connections": [
+   {
+    "from_lane": 9,
+    "to_lane": 1,
+    "to_row_offset": 4,
+    "is_merge": false,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "6a05a9c-406",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 10,
+  "color_index": 2,
+  "active_lanes": [
+   1,
+   2,
+   10
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   2
+  ],
+  "connections": [
+   {
+    "from_lane": 10,
+    "to_lane": 1,
+    "to_row_offset": 3,
+    "is_merge": false,
+    "color_index": 2,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 10,
+    "to_lane": 11,
+    "to_row_offset": 2,
+    "is_merge": true,
+    "color_index": 3,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 10,
+    "to_lane": 12,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 4,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "c9c61e8-407",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 12,
+  "color_index": 4,
+  "active_lanes": [
+   1,
+   2,
+   11,
+   12
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   3,
+   4
+  ],
+  "connections": [],
+  "is_merge": false,
+  "is_root": true
+ },
+ {
+  "id": "442031e-408",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 11,
+  "color_index": 3,
+  "active_lanes": [
+   1,
+   2,
+   11
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   3
+  ],
+  "connections": [
+   {
+    "from_lane": 11,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 3,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "590cb23-409",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   6,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "bb12b36-410",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   6,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "13e111b-411",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   6,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 1,
+    "to_row_offset": 3,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "aa0e2fe-412",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 3,
+  "color_index": 8,
+  "active_lanes": [
+   1,
+   2,
+   3
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   8
+  ],
+  "connections": [
+   {
+    "from_lane": 3,
+    "to_lane": 1,
+    "to_row_offset": 2,
+    "is_merge": false,
+    "color_index": 8,
+    "is_dangling": false
+   },
+   {
+    "from_lane": 3,
+    "to_lane": 6,
+    "to_row_offset": 1,
+    "is_merge": true,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": true,
+  "is_root": false
+ },
+ {
+  "id": "9af43bf-413",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 6,
+  "color_index": 1,
+  "active_lanes": [
+   1,
+   2,
+   6
+  ],
+  "active_lane_colors": [
+   6,
+   5,
+   1
+  ],
+  "connections": [
+   {
+    "from_lane": 6,
+    "to_lane": 1,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 1,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "ad05bd1-414",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 1,
+  "color_index": 6,
+  "active_lanes": [
+   1,
+   2
+  ],
+  "active_lane_colors": [
+   6,
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 1,
+    "to_lane": 2,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 6,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "db91450-415",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 2,
+  "color_index": 5,
+  "active_lanes": [
+   2
+  ],
+  "active_lane_colors": [
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 2,
+    "to_lane": 2,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 5,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ },
+ {
+  "id": "1ef0a94-416",
+  "parent_ids": [],
+  "summary": "",
+  "author_name": "Fixture Author",
+  "author_email": "fixture@example.com",
+  "timestamp": 0,
+  "lane": 2,
+  "color_index": 5,
+  "active_lanes": [
+   2
+  ],
+  "active_lane_colors": [
+   5
+  ],
+  "connections": [
+   {
+    "from_lane": 2,
+    "to_lane": 2,
+    "to_row_offset": 1,
+    "is_merge": false,
+    "color_index": 5,
+    "is_dangling": false
+   }
+  ],
+  "is_merge": false,
+  "is_root": false
+ }
+]

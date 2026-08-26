@@ -448,22 +448,32 @@ describe("graph smoothing", () => {
     ];
     renderer.render(ctx, rows, 0, 2, 0);
 
-    // The edge starts on the child's own column and arrives exactly at the
-    // parent's column — never at an invented intermediate position.
+    // The edge starts on the child's own column, turns exactly once just
+    // off that column, and finishes with a flat approach that arrives at
+    // the parent's real column on the parent's row — never at an invented
+    // intermediate position, never smearing the approach across rows.
     const xFrom = renderer.getLaneX(0);
     const xTo = renderer.getLaneX(8);
     const parentY = renderer.getRowY(1, 0);
     const started = calls.some(
       (c) => c.op === "moveTo" && Math.abs(c.args[0] - xFrom) < 0.5,
     );
-    const arrived = calls.some(
+    const turned = calls.some(
       (c) =>
         c.op === "bezierCurveTo" &&
-        Math.abs(c.args[4] - xTo) < 0.5 &&
-        Math.abs(c.args[5] - parentY) < 0.5,
+        Math.abs(c.args[5] - parentY) < 0.5 &&
+        c.args[4] > Math.min(xFrom, xTo) &&
+        c.args[4] < Math.max(xFrom, xTo),
+    );
+    const arrived = calls.some(
+      (c) =>
+        c.op === "lineTo" &&
+        Math.abs(c.args[0] - xTo) < 0.5 &&
+        Math.abs(c.args[1] - parentY) < 0.5,
     );
     expect(started, "edge must leave from the child's column").toBe(true);
-    expect(arrived, "edge must arrive at the parent's real column").toBe(true);
+    expect(turned, "edge must turn onto the parent's row with a single corner").toBe(true);
+    expect(arrived, "edge must arrive flat at the parent's real column").toBe(true);
   });
 
   it("reserves a live destination hop's column in the gutter", () => {
