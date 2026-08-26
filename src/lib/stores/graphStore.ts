@@ -485,9 +485,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
         await fetchDetails(path, token, commit.id, seq);
       }
     },
-    applyClientFilter: (_query: string) => {
-      // Filtering is applied by CommitTable against the latest backend payload.
-    },
   };
 
   return api;

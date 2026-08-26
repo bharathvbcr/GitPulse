@@ -20,6 +20,8 @@ interface GraphRow extends FilterableRow {
   lane: number;
   active_lanes: number[];
   parent_ids: string[];
+  is_merge?: boolean;
+  is_root?: boolean;
   connections: Array<{
     from_lane: number;
     to_lane: number;

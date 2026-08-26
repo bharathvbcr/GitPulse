@@ -16,10 +16,12 @@
   <span
     class="inline-flex items-center gap-1 font-mono text-[10px] shrink-0"
     title="+{additions} / -{deletions} lines"
+    role="img"
+    aria-label="{additions} additions, {deletions} deletions"
   >
     <span class="text-emerald-400">+{additions}</span>
     <span class="text-rose-400">-{deletions}</span>
-    <span class="w-8 h-1 rounded-full overflow-hidden bg-border/70 flex">
+    <span class="w-8 h-1 rounded-full overflow-hidden bg-border/70 flex" aria-hidden="true">
       <span class="h-full bg-emerald-500" style="width: {addPct}%"></span>
       <span class="h-full bg-rose-500" style="width: {delPct}%"></span>
     </span>

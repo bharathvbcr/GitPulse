@@ -31,6 +31,14 @@ export interface GraphFrameRequest {
   hoveredCommitId: string | null;
   hoverStrength: number;
   selectionStrength: number;
+  /**
+   * Author-avatar column. When enabled, avatars are baked into the static
+   * strips (and drawn on the bypass path); the live overlay never stamps
+   * them. `avatarX` is the column centre in CSS pixels — the caller owns
+   * gutter sizing, the composite only forwards.
+   */
+  showAvatars?: boolean;
+  avatarX?: number | null;
 }
 
 /**
@@ -57,6 +65,7 @@ export function paintGraphFrame(
       themeSignature: themeSignatureOf(req.theme),
       dpr: req.dpr,
       backgroundCssColor: req.theme.background,
+      showAvatars: req.showAvatars === true,
     },
     { rowHeight, totalRows: req.rows.length },
   );
@@ -110,6 +119,8 @@ export function paintGraphFrame(
       selectionStrength: req.selectionStrength,
       viewportHeight: req.heightCss,
       emphasisOnly: staticBlitted,
+      showAvatars: req.showAvatars === true,
+      avatarX: req.showAvatars ? (req.avatarX ?? null) : null,
     },
   );
 

@@ -7,6 +7,7 @@
   import type { ViewTab } from "../repos/persist";
   import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
   import { themeStore } from "../stores/themeStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { askText, promptState } from "../stores/modalStore";
   import {
     backdropFade,
@@ -17,7 +18,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug, Terminal } from "lucide-svelte";
+  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug, Terminal, CircleUserRound } from "lucide-svelte";
 
   let isOpen = $state(false);
   let query = $state("");
@@ -57,6 +58,12 @@
   const commands = [
     { id: "refresh", label: "Refresh Repository Status", icon: RefreshCw, action: () => repoStore.refresh() },
     { id: "theme", label: "Toggle Dark / Light Theme", icon: Moon, action: () => themeStore.toggle() },
+    {
+      id: "toggle_author_avatars",
+      label: "Toggle Author Avatars",
+      icon: CircleUserRound,
+      action: () => interfaceStore.toggleGraphAvatars(),
+    },
     { id: "theme_system", label: "Use System Appearance", icon: Moon, action: () => themeStore.setPreference("system") },
     {
       id: "new_branch",

@@ -23,6 +23,7 @@
   } from "../branches/flattenRows";
   import type { BranchFilterTab, BranchSection } from "../branches/types";
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
+  import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
   import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
   import { clampMenuPosition } from "../branches/menuPosition";
   import { parsePinned, pinnedKey, serializePinned } from "../branches/pins";
@@ -627,7 +628,7 @@
       onclick={() => selectRef(branch.name)}
       ondblclick={() => checkoutName(localNameFor(branch))}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
-      title="{branch.name}{branch.last_summary ? `\n${branch.last_summary}` : ''}"
+      title={branchTooltip(branch)}
       class="flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"
     >
       <GitBranch size={13} class={branch.is_current ? "text-accent shrink-0" : "text-textMuted shrink-0"} />
@@ -691,6 +692,7 @@
     type="button"
     onclick={() => selectRef(row.tag.name)}
     oncontextmenu={(e) => openTagMenu(e, row.tag)}
+    title={tagTooltip(row.tag)}
     class="gp-cv-row w-full px-2 rounded-full flex items-center gap-1.5 text-left transition-colors select-none {$filterStore.selectedBranch === row.tag.name
       ? 'bg-accent/10 text-accent ring-1 ring-accent/20'
       : isRowSelected
@@ -818,6 +820,8 @@
         <button
           type="button"
           onclick={() => { query = ""; debouncedQuery = ""; }}
+          title="Clear filter"
+          aria-label="Clear branch filter"
           class="text-textMuted hover:text-textPrimary p-0.5"
         >
           <X size={10} />

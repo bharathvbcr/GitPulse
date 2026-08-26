@@ -6,11 +6,14 @@
   import { filterStore } from "../stores/filterStore";
   import { themeStore } from "../stores/themeStore";
   import { densityStore } from "../stores/densityStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import {
+    AVATAR_STYLES,
     DENSITY_CONFIGS,
     GraphRenderer,
     primedRowRange,
     themeFromCss,
+    type DensityMode,
     type GraphTheme,
     type VisualCommitRow,
   } from "../canvas/GraphRenderer";
@@ -111,10 +114,35 @@
   );
   let filteredRows = $derived(filtered.rows);
 
+  /**
+   * Author-avatar column (Settings → Commit Graph → "Author avatars").
+   *
+   * The column sits right of the lanes: rows align by node Y, so authorship
+   * stays attributable at a glance without ever colliding with dense lane
+   * traffic. The caller owns its geometry — the renderer only receives the
+   * column centre X.
+   */
+  let showAvatars = $derived($interfaceStore.showGraphAvatars);
+  let densityMode = $derived<DensityMode>($densityStore);
+  let avatarSlot = $derived.by(() => {
+    if (!showAvatars) return { gap: 0, radius: 0, width: 0 };
+    const style = AVATAR_STYLES[densityMode];
+    const gap = densityMode === "spacious" ? 12 : 9;
+    return { gap, radius: style.radius, width: gap + style.radius * 2 };
+  });
+
   // Single owner of gutter math (GraphRenderer.measureWidth): it counts node
   // lanes, active lanes AND connection target lanes, so a dangling merged-in
-  // branch's fan-out column can never clip under a hand-rolled formula.
-  let graphColumnWidth = $derived(Math.max(220, renderer.measureWidth(filteredRows)));
+  // branch's fan-out column can never clip under a hand-rolled formula. The
+  // avatar slot rides on top so toggling avatars resizes the gutter once.
+  let laneAreaWidth = $derived(Math.max(220, renderer.measureWidth(filteredRows)));
+  let graphColumnWidth = $derived(laneAreaWidth + avatarSlot.width);
+  /** Centre X of the avatar column; null when the option is off. */
+  let avatarCenterX = $derived(
+    showAvatars && avatarSlot.width > 0
+      ? laneAreaWidth - renderer.getConfig().originX + avatarSlot.gap + avatarSlot.radius
+      : null,
+  );
 
   /**
    * Ref chips, taken from the graph payload rather than derived from the
@@ -174,7 +202,13 @@
         range.to,
         req.stripTopCss,
         undefined,
-        { theme: currentTheme(), viewportHeight: req.viewportCssHeight, skipLongConnectors: true },
+        {
+          theme: currentTheme(),
+          viewportHeight: req.viewportCssHeight,
+          skipLongConnectors: true,
+          showAvatars,
+          avatarX: avatarCenterX,
+        },
         null,
       );
     },
@@ -235,6 +269,8 @@
       hoveredCommitId: paintState.displayHoverId,
       hoverStrength: paintState.hoverStrength,
       selectionStrength: paintState.selectionStrength,
+      showAvatars,
+      avatarX: avatarCenterX,
     });
   }
 
@@ -281,7 +317,15 @@
   }
 
   function handleGraphWheel(e: WheelEvent) {
-    if (!container || e.ctrlKey) return;
+    if (!container) return;
+    // Trackpad pinch arrives as wheel+ctrlKey. There is no graph zoom to
+    // forward it to, so it must be consumed here: letting it through makes
+    // the webview zoom the whole app while the pointer is over the gutter —
+    // the primary place users pinch by accident.
+    if (e.ctrlKey) {
+      e.preventDefault();
+      return;
+    }
     const moved = forwardGraphWheel(
       container,
       e.deltaY,
@@ -301,6 +345,7 @@
       startIndex,
       endIndex,
       scrollTop,
+      showAvatars ? avatarCenterX : null,
     );
   }
 
@@ -383,15 +428,29 @@
     containerHeight;
     graphColumnWidth;
     $repoStore.selectedCommitId;
+    // The canvas ring must not wait on the async diff round-trip: selecting
+    // updates graphStore synchronously, repoStore.selectedCommitId only after
+    // the diff resolves (or never, when it fails). Both are dependencies.
+    $graphStore.selectedCommit;
     $graphStore.headId;
     $densityStore;
+    $interfaceStore.showGraphAvatars;
     renderer.setDensity($densityStore);
     // Density flips change the gutter width and can shift layout around it;
     // the cached pointer rects must not survive the shift or hit-testing
     // lands offset by exactly whatever moved. Same contract as the theme
-    // effect below.
+    // effect below. The avatar toggle rides along: it resizes the gutter too.
     gutterRect = null;
     rootRect = null;
+    // A filter edit or payload refresh can swap `filteredRows` while the
+    // pointer rests over the gutter: mouseleave will never fire, so a tooltip
+    // rendered from the PREVIOUS array would keep floating (possibly showing
+    // a commit the new filter excludes). Re-validate instead of blindly
+    // clearing, so a genuine re-hit under a stationary cursor stays put.
+    if (tooltipRow && !filteredRows.includes(tooltipRow)) {
+      tooltipRow = null;
+      hoveredCommitId = null;
+    }
     schedulePaint();
   });
 
@@ -410,7 +469,12 @@
 
   onMount(() => {
     const observer = new ResizeObserver((entries) => {
-      containerHeight = entries[0]?.contentRect.height || 600;
+      const entry = entries[0];
+      // Distinguish "no measurement" (keep the previous height) from a real
+      // 0px measurement (collapsed pane): `|| 600` used to turn a genuine
+      // zero into a phantom viewport and over-render invisible rows.
+      if (!entry) return;
+      containerHeight = entry.contentRect.height || 0;
       gutterRect = null;
       rootRect = null;
     });
@@ -559,9 +623,13 @@
          frequency; a composited translate3d does not. clientWidth/Height bind
          the REAL box back into placement, so a tall tooltip never gets pinned
          by stale assumed metrics. -->
+    <!-- aria-hidden: the canvas is role=presentation and the pointer-only
+         hover card has no focusable content; announcing it would reference a
+         node AT cannot reach. Commit details remain the accessible path. -->
     <div
       bind:clientWidth={tooltipBoxWidth}
       bind:clientHeight={tooltipBoxHeight}
+      aria-hidden="true"
       class="pointer-events-none absolute left-0 top-0 z-30 w-80 max-w-[calc(100%_-_1rem)]"
       style="transform: translate3d({tooltipLeft}px, {tooltipTop}px, 0);"
     >
