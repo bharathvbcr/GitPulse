@@ -20,6 +20,30 @@ export interface VerticalScroller {
   clientHeight: number;
 }
 
+export interface GraphGutterScroller {
+  scrollLeft: number;
+  scrollWidth: number;
+  clientWidth: number;
+}
+
+export interface GraphWheelGesture {
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  deltaX: number;
+  deltaY: number;
+  deltaMode: number;
+}
+
+/** Visible graph gutter box plus its overflow pan, in CSS pixels. */
+export interface GraphPointerViewport {
+  left: number;
+  top: number;
+  scrollLeft: number;
+}
+
+/** Distance before a gutter press becomes a pan instead of a node click. */
+export const GRAPH_PAN_THRESHOLD_PX = 5;
+
 const TOOLTIP_EDGE_GAP = 8;
 const TOOLTIP_POINTER_GAP = 12;
 
@@ -63,6 +87,101 @@ export function forwardGraphWheel(
   if (nextScrollTop === scroller.scrollTop) return false;
   scroller.scrollTop = nextScrollTop;
   return true;
+}
+
+function scrollerMaxX(scroller: GraphGutterScroller): number {
+  const width = Number.isFinite(scroller.scrollWidth) ? scroller.scrollWidth : 0;
+  const view = Number.isFinite(scroller.clientWidth) ? scroller.clientWidth : 0;
+  return Math.max(0, width - view);
+}
+
+/** Pans extra branch lanes inside the capped graph gutter. */
+export function panGraphHorizontally(
+  scroller: GraphGutterScroller,
+  deltaX: number,
+): boolean {
+  if (!Number.isFinite(deltaX) || deltaX === 0) return false;
+  const max = scrollerMaxX(scroller);
+  if (max <= 0) return false;
+  const current = Number.isFinite(scroller.scrollLeft) ? scroller.scrollLeft : 0;
+  const next = clamp(current + deltaX, 0, max);
+  if (next === current) return false;
+  scroller.scrollLeft = next;
+  return true;
+}
+
+/**
+ * Consumes a wheel gesture over the graph gutter.
+ *
+ * Shift+wheel and dominant deltaX pan extra lanes; otherwise the delta is
+ * forwarded to the commit list so history stays linked to the canvas.
+ * Pinch-zoom (ctrl+wheel) is consumed so the webview cannot scale the app.
+ * Returns whether the caller should preventDefault.
+ */
+export function applyGraphGutterWheel(
+  event: GraphWheelGesture,
+  gutter: GraphGutterScroller,
+  list: VerticalScroller,
+  rowHeight: number,
+): boolean {
+  if (event.ctrlKey) return true;
+  const canScrollX = scrollerMaxX(gutter) > 0.5;
+  const dx = Number.isFinite(event.deltaX) ? event.deltaX : 0;
+  const dy = Number.isFinite(event.deltaY) ? event.deltaY : 0;
+  if (canScrollX && event.shiftKey) {
+    panGraphHorizontally(gutter, dy);
+    return true;
+  }
+  if (canScrollX && Math.abs(dx) > Math.abs(dy)) {
+    panGraphHorizontally(gutter, dx);
+    return true;
+  }
+  return forwardGraphWheel(list, dy, event.deltaMode, rowHeight);
+}
+
+export function graphDragScrollLeft(
+  startScrollLeft: number,
+  pointerStartX: number,
+  pointerX: number,
+): number {
+  const start = Number.isFinite(startScrollLeft) ? startScrollLeft : 0;
+  const from = Number.isFinite(pointerStartX) ? pointerStartX : 0;
+  const to = Number.isFinite(pointerX) ? pointerX : 0;
+  return start - (to - from);
+}
+
+export function isGraphPanGesture(
+  startX: number,
+  startY: number,
+  x: number,
+  y: number,
+): boolean {
+  const dx = (Number.isFinite(x) ? x : 0) - (Number.isFinite(startX) ? startX : 0);
+  const dy = (Number.isFinite(y) ? y : 0) - (Number.isFinite(startY) ? startY : 0);
+  return dx * dx + dy * dy >= GRAPH_PAN_THRESHOLD_PX * GRAPH_PAN_THRESHOLD_PX;
+}
+
+/**
+ * Maps a pointer from client space onto the graph canvas.
+ *
+ * The gutter viewport can pan horizontally (extra branch lanes). Content X is
+ * `clientX - viewport.left + scrollLeft`; using a cached canvas rect instead
+ * misses every node that only became visible after the pan.
+ */
+export function canvasPointFromClient(
+  clientX: number,
+  clientY: number,
+  viewport: GraphPointerViewport,
+): { x: number; y: number } {
+  const left = Number.isFinite(viewport.left) ? viewport.left : 0;
+  const top = Number.isFinite(viewport.top) ? viewport.top : 0;
+  const scrollLeft = Number.isFinite(viewport.scrollLeft) ? viewport.scrollLeft : 0;
+  const x = (Number.isFinite(clientX) ? clientX : 0) - left + scrollLeft;
+  const y = (Number.isFinite(clientY) ? clientY : 0) - top;
+  return {
+    x: Number.isFinite(x) ? x : 0,
+    y: Number.isFinite(y) ? y : 0,
+  };
 }
 
 /** Positions a graph-node tooltip without letting it escape the visible pane. */

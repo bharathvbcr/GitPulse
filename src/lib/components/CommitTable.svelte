@@ -14,9 +14,12 @@
     primedRowRange,
     themeFromCss,
     type DensityMode,
+    type GraphHitKind,
     type GraphTheme,
     type VisualCommitRow,
   } from "../canvas/GraphRenderer";
+  import { authorIdentity } from "../authors/authorIdentity";
+  import { formatRelativeTime } from "../format";
   import { acquireGpu2dContext } from "../canvas/gpuContext";
   import { diagnostics } from "../diagnostics/diagnostics";
   import {
@@ -30,10 +33,23 @@
   import { createRowFilterMemo, parseFilterQueryCached } from "../filter/queryMemo";
   import { nextLoadLimit } from "../stores/graphLimits";
   import {
-    forwardGraphWheel,
+    clampGraphScrollLeft,
+    graphContentBoxStyle,
+    graphViewportBoxStyle,
+    resolveGraphLayout,
+    resolveGraphOverflow,
+  } from "../graph/graphLayout";
+  import {
+    applyGraphGutterWheel,
+    canvasPointFromClient,
+    graphDragScrollLeft,
+    isGraphPanGesture,
+    panGraphHorizontally,
     positionGraphTooltip,
     type TooltipPlacement,
   } from "../canvas/graphInteraction";
+  import { portal } from "../dom/portal";
+  import { LAYERS } from "../ui/layers";
   import CommitRow, { type RefItem } from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
 
@@ -58,9 +74,11 @@
 
   let root: HTMLDivElement | null = $state(null);
   let container: HTMLDivElement | null = $state(null);
+  let graphViewport: HTMLDivElement | null = $state(null);
   let canvas: HTMLCanvasElement | null = $state(null);
   let scrollTop = $state(0);
   let containerHeight = $state(600);
+  let rootWidth = $state(1_200);
 
   const renderer = new GraphRenderer(DENSITY_CONFIGS[get(densityStore)]);
   const scheduler = createFrameScheduler();
@@ -71,6 +89,19 @@
   let attachedCanvas: HTMLCanvasElement | null = null;
   let hoveredCommitId: string | null = null;
   let tooltipRow: (typeof filteredRows)[number] | null = $state(null);
+  /** What the pointer landed on; shapes the tooltip's context strip. */
+  let tooltipHitKind: GraphHitKind = $state("node");
+  /** Connector hits: the merge point the hovered descent lands on. */
+  let tooltipMergeTarget: VisualCommitRow | null = $state(null);
+  /**
+   * Who owns the open tooltip. Pointer cards are decorative duplicates of
+   * on-screen content and stay aria-hidden; a keyboard-focus card IS the
+   * user's UI, is exposed to assistive tech, and survives pointer misses
+   * until the row blurs or Escape dismisses it.
+   */
+  let tooltipSource: "pointer" | "focus" = $state("pointer");
+  /** Live-region text announcing the focused commit's graph context. */
+  let focusAnnouncement = $state("");
   let tooltipLeft = $state(0);
   let tooltipTop = $state(0);
   let tooltipAnchorX = $state(16);
@@ -131,16 +162,38 @@
     return { gap, radius: style.radius, width: gap + style.radius * 2 };
   });
 
-  // Single owner of gutter math (GraphRenderer.measureWidth): it counts node
-  // lanes, active lanes AND connection target lanes, so a dangling merged-in
-  // branch's fan-out column can never clip under a hand-rolled formula. The
-  // avatar slot rides on top so toggling avatars resizes the gutter once.
-  let laneAreaWidth = $derived(Math.max(220, renderer.measureWidth(filteredRows)));
-  let graphColumnWidth = $derived(laneAreaWidth + avatarSlot.width);
+  // Single owner of gutter math (GraphRenderer.measureWidth): the highest
+  // column occupied by a node, pass-through, or live connector. Lanes are
+  // stable columns (the solver's interval allocation keeps width equal to
+  // peak concurrent occupancy), so the gutter genuinely reaches every
+  // branch — transient holes included — and never shifts under a hover.
+  let laneAreaWidth = $derived(renderer.measureWidth(filteredRows));
+  let graphLayout = $derived(
+    resolveGraphLayout({
+      measuredLaneWidth: laneAreaWidth,
+      avatarSlotWidth: avatarSlot.width,
+      availableWidth: rootWidth,
+      widthMode: $interfaceStore.graphWidthMode,
+    }),
+  );
+  let graphContentWidth = $derived(graphLayout.contentWidth);
+  let graphViewportWidth = $derived(graphLayout.viewportWidth);
+  let graphScrollLeft = $state(0);
+  let graphOverflow = $derived(
+    resolveGraphOverflow(graphScrollLeft, graphViewportWidth, graphContentWidth),
+  );
+  let gutterPan: {
+    x: number;
+    y: number;
+    scrollLeft: number;
+    moved: boolean;
+  } | null = null;
+  let suppressGraphClick = false;
+  let graphPanning = $state(false);
   /** Centre X of the avatar column; null when the option is off. */
   let avatarCenterX = $derived(
     showAvatars && avatarSlot.width > 0
-      ? laneAreaWidth - renderer.getConfig().originX + avatarSlot.gap + avatarSlot.radius
+      ? graphContentWidth - renderer.getConfig().originX - avatarSlot.radius
       : null,
   );
 
@@ -154,6 +207,100 @@
    * HEAD belongs to no branch tip at all. A derivation from `branches` shows
    * the first on no row and the second nowhere.
    */
+  /**
+   * Commits per author identity across the loaded (filtered) history, for
+   * the avatar-hover tooltip. Keyed by the canonical identity key (email
+   * first, then name) so display-name changes do not split one person's
+   * count. Memoized on `filteredRows` identity by `$derived`.
+   */
+  let authorCommitCounts = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const row of filteredRows) {
+      const key = authorIdentity(row.author_name, row.author_email).key;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  });
+
+  /**
+   * Merge destination per closing commit: the parent a commit's
+   * first-parent edge lands on when it leaves its own column. This is the
+   * relationship the graph draws as a descending connector; rows carry it
+   * as screen-reader text and both tooltip modes name it, so the
+   * information is never pointer-only.
+   */
+  let closeTargetById = $derived.by(() => {
+    const map = new Map<string, VisualCommitRow>();
+    for (let i = 0; i < filteredRows.length; i++) {
+      const first = filteredRows[i].connections?.[0];
+      if (!first || first.is_dangling || first.is_merge) continue;
+      if (!Number.isFinite(first.to_lane) || first.to_lane === first.from_lane) continue;
+      const target = i + first.to_row_offset;
+      if (!Number.isFinite(target) || target <= i || target >= filteredRows.length) continue;
+      map.set(filteredRows[i].id, filteredRows[target]);
+    }
+    return map;
+  });
+
+  function authorCountFor(row: VisualCommitRow): number | null {
+    return (
+      authorCommitCounts.get(authorIdentity(row.author_name, row.author_email).key) ?? null
+    );
+  }
+
+  /** One spoken sentence carrying what the tooltip card shows. */
+  function composeFocusAnnouncement(row: VisualCommitRow): string {
+    const kind = row.is_merge ? "Merge commit" : row.is_root ? "Root commit" : "Commit";
+    const parts = [
+      `${kind} ${row.id.slice(0, 7)}: ${row.summary || "no commit message"}.`,
+      `By ${row.author_name || "unknown"}, ${formatRelativeTime(row.timestamp) || "unknown time"}.`,
+    ];
+    const target = closeTargetById.get(row.id);
+    if (target) {
+      parts.push(`Merges into ${target.id.slice(0, 7)}: ${target.summary || "no commit message"}.`);
+    }
+    const count = authorCountFor(row);
+    if (count !== null && count > 0) {
+      parts.push(`${count} ${count === 1 ? "commit" : "commits"} by this author in the loaded history.`);
+    }
+    return parts.join(" ");
+  }
+
+  /**
+   * Keyboard focus on a commit row shows the same tooltip card the pointer
+   * gets — anchored beside the row — and announces its content. Click
+   * focus (`keyboardVisible` false) only announces; the pointer already
+   * has its own affordance and a second card would double the UI.
+   */
+  function handleRowFocus(
+    row: VisualCommitRow,
+    element: HTMLElement,
+    keyboardVisible: boolean,
+  ) {
+    focusAnnouncement = composeFocusAnnouncement(row);
+    if (!keyboardVisible || !root) return;
+    tooltipSource = "focus";
+    tooltipRow = row;
+    tooltipHitKind = "node";
+    tooltipMergeTarget = closeTargetById.get(row.id) ?? null;
+    hoveredCommitId = row.id;
+    schedulePaint();
+    const rect = element.getBoundingClientRect();
+    tooltipPointer = { x: rect.left + 24, y: rect.top + rect.height / 2 };
+    placeTooltip(tooltipPointer.x, tooltipPointer.y);
+  }
+
+  function handleRowBlur() {
+    focusAnnouncement = "";
+    if (tooltipSource !== "focus") return;
+    tooltipSource = "pointer";
+    tooltipRow = null;
+    tooltipMergeTarget = null;
+    tooltipPointer = null;
+    hoveredCommitId = null;
+    schedulePaint();
+  }
+
   let refsByCommit = $derived.by(() => {
     const map = new Map<string, RefItem[]>();
     for (const ref of $graphStore.refs) {
@@ -229,8 +376,12 @@
   }
 
   function canvasRect(): DOMRect | null {
-    if (!canvas) return null;
-    if (!gutterRect) gutterRect = canvas.getBoundingClientRect();
+    // Viewport box, not the canvas: the canvas is the full content width and
+    // its left edge moves with overflow pan. Caching that desynced hit-testing
+    // from painted branch nodes after a horizontal scroll. The viewport box is
+    // stable; scrollLeft is added at hit time.
+    if (!graphViewport) return null;
+    if (!gutterRect) gutterRect = graphViewport.getBoundingClientRect();
     return gutterRect;
   }
 
@@ -256,7 +407,7 @@
     paintGraphFrame(ctx, canvas, renderer, graphCache, {
       rows: filteredRows,
       dataVersion: currentRowsVersion(),
-      widthCss: graphColumnWidth,
+      widthCss: graphContentWidth,
       heightCss: containerHeight,
       dpr: window.devicePixelRatio || 1,
       densitySignature: $densityStore,
@@ -311,36 +462,30 @@
       pendingPointer = lastPointer;
     } else {
       tooltipRow = null;
+      tooltipMergeTarget = null;
       hoveredCommitId = null;
     }
     schedulePaint();
   }
 
   function handleGraphWheel(e: WheelEvent) {
-    if (!container) return;
-    // Trackpad pinch arrives as wheel+ctrlKey. There is no graph zoom to
-    // forward it to, so it must be consumed here: letting it through makes
-    // the webview zoom the whole app while the pointer is over the gutter —
-    // the primary place users pinch by accident.
-    if (e.ctrlKey) {
+    if (!container || !graphViewport) return;
+    if (applyGraphGutterWheel(e, graphViewport, container, rowHeight)) {
       e.preventDefault();
-      return;
     }
-    const moved = forwardGraphWheel(
-      container,
-      e.deltaY,
-      e.deltaMode,
-      rowHeight,
-    );
-    if (moved) e.preventDefault();
   }
 
   function hitAt(clientX: number, clientY: number) {
     const rect = canvasRect();
-    if (!rect) return null;
-    return renderer.getCommitAtPoint(
-      clientX - rect.left,
-      clientY - rect.top,
+    if (!rect || !graphViewport) return null;
+    const { x, y } = canvasPointFromClient(clientX, clientY, {
+      left: rect.left,
+      top: rect.top,
+      scrollLeft: graphViewport.scrollLeft,
+    });
+    return renderer.getGraphHitAtPoint(
+      x,
+      y,
       filteredRows,
       startIndex,
       endIndex,
@@ -349,36 +494,106 @@
     );
   }
 
+  function handleGraphScroll() {
+    // Re-hit under the parked pointer so a newly revealed branch node gets
+    // its tooltip instead of keeping a miss from the previous content offset.
+    gutterRect = null;
+    if (graphViewport) graphScrollLeft = graphViewport.scrollLeft;
+    if (lastPointer && !gutterPan?.moved) {
+      pendingPointer = lastPointer;
+      schedulePaint();
+    } else if (!gutterPan?.moved) {
+      tooltipRow = null;
+      tooltipMergeTarget = null;
+      hoveredCommitId = null;
+    }
+  }
+
+  function handleGraphPointerDown(e: PointerEvent) {
+    if (e.button !== 0 || !graphViewport) return;
+    if (graphViewport.scrollWidth <= graphViewport.clientWidth + 0.5) return;
+    suppressGraphClick = false;
+    gutterPan = {
+      x: e.clientX,
+      y: e.clientY,
+      scrollLeft: graphViewport.scrollLeft,
+      moved: false,
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+  }
+
+  function handleGraphPointerUp() {
+    if (gutterPan?.moved) suppressGraphClick = true;
+    gutterPan = null;
+    graphPanning = false;
+  }
+
   function handleCanvasClick(e: MouseEvent) {
+    if (suppressGraphClick) {
+      suppressGraphClick = false;
+      return;
+    }
+    // Connector hits attribute to the commit that owns the descent, so
+    // clicking anywhere along a branch's closing line selects that commit.
     const hit = hitAt(e.clientX, e.clientY);
     if (hit) {
-      graphStore.selectCommit(hit);
-      repoStore.selectCommitDiff(hit.id);
+      graphStore.selectCommit(hit.row);
+      repoStore.selectCommitDiff(hit.row.id);
     }
   }
 
   /**
    * Pointer moves only record the latest position; the frame callback below
-   * performs at most one hit test per vsync (latest-wins).
+   * performs at most one hit test per vsync (latest-wins). A drag that
+   * exceeds the pan threshold pans extra lanes instead of selecting.
    */
-  function handleCanvasMouseMove(e: MouseEvent) {
+  function handleCanvasMouseMove(e: PointerEvent) {
     lastPointer = { x: e.clientX, y: e.clientY };
+    if (gutterPan && graphViewport && (e.buttons & 1) !== 0) {
+      if (
+        !gutterPan.moved &&
+        isGraphPanGesture(gutterPan.x, gutterPan.y, e.clientX, e.clientY)
+      ) {
+        gutterPan.moved = true;
+        graphPanning = true;
+        tooltipRow = null;
+        tooltipMergeTarget = null;
+        hoveredCommitId = null;
+      }
+      if (gutterPan.moved) {
+        const next = graphDragScrollLeft(
+          gutterPan.scrollLeft,
+          gutterPan.x,
+          e.clientX,
+        );
+        panGraphHorizontally(graphViewport, next - graphViewport.scrollLeft);
+        return;
+      }
+    }
     pendingPointer = lastPointer;
     schedulePaint();
   }
 
   function processPointer(x: number, y: number) {
     const hit = hitAt(x, y);
-    const nextId = hit ? hit.id : null;
-    if (canvas) canvas.style.cursor = nextId ? "pointer" : "default";
-    hoveredCommitId = nextId;
     if (!hit || !root) {
+      if (canvas) canvas.style.cursor = "default";
+      // A keyboard-focus card outlives pointer misses: an idle mouse over
+      // empty gutter must not dismiss the UI a keyboard user is reading.
+      if (tooltipSource === "focus") return;
+      hoveredCommitId = null;
       tooltipRow = null;
+      tooltipMergeTarget = null;
       tooltipPointer = null;
       return;
     }
+    if (canvas) canvas.style.cursor = "pointer";
+    tooltipSource = "pointer";
+    hoveredCommitId = hit.row.id;
     tooltipPointer = { x, y };
-    tooltipRow = hit;
+    tooltipRow = hit.row;
+    tooltipHitKind = hit.kind;
+    tooltipMergeTarget = hit.connectorTarget;
     placeTooltip(x, y);
   }
 
@@ -394,8 +609,8 @@
       Math.max(32, tooltipBoxWidth),
       Math.max(32, tooltipBoxHeight),
     );
-    tooltipLeft = position.left;
-    tooltipTop = position.top;
+    tooltipLeft = position.left + rootRect.left;
+    tooltipTop = position.top + rootRect.top;
     tooltipAnchorX = position.anchorX;
     tooltipPlacement = position.placement;
   }
@@ -411,22 +626,41 @@
   });
 
   function handleCanvasMouseLeave() {
+    if (gutterPan?.moved) return;
     if (canvas) canvas.style.cursor = "default";
     pendingPointer = null;
     lastPointer = null;
+    // Leaving the canvas ends pointer hovers only; a keyboard-focus card
+    // belongs to the focused row and dismisses on blur or Escape instead.
+    if (tooltipSource === "focus") return;
     if (hoveredCommitId !== null) {
       hoveredCommitId = null;
       schedulePaint();
     }
     tooltipRow = null;
+    tooltipMergeTarget = null;
   }
+
+  $effect(() => {
+    graphViewportWidth;
+    graphContentWidth;
+    if (!graphViewport) return;
+    const next = clampGraphScrollLeft(
+      graphViewport.scrollLeft,
+      graphViewportWidth,
+      graphContentWidth,
+    );
+    if (graphViewport.scrollLeft !== next) graphViewport.scrollLeft = next;
+    if (graphScrollLeft !== next) graphScrollLeft = next;
+  });
 
   $effect(() => {
     filteredRows;
     startIndex;
     endIndex;
     containerHeight;
-    graphColumnWidth;
+    graphContentWidth;
+    graphViewportWidth;
     $repoStore.selectedCommitId;
     // The canvas ring must not wait on the async diff round-trip: selecting
     // updates graphStore synchronously, repoStore.selectedCommitId only after
@@ -435,6 +669,7 @@
     $graphStore.headId;
     $densityStore;
     $interfaceStore.showGraphAvatars;
+    $interfaceStore.graphWidthMode;
     renderer.setDensity($densityStore);
     // Density flips change the gutter width and can shift layout around it;
     // the cached pointer rects must not survive the shift or hit-testing
@@ -447,8 +682,18 @@
     // rendered from the PREVIOUS array would keep floating (possibly showing
     // a commit the new filter excludes). Re-validate instead of blindly
     // clearing, so a genuine re-hit under a stationary cursor stays put.
-    if (tooltipRow && !filteredRows.includes(tooltipRow)) {
+    //
+    // Validity is judged BY COMMIT ID, never by object identity: `tooltipRow`
+    // is $state, and Svelte 5 deep-proxies assigned objects, so the value
+    // read back is never `===` the raw row inside `filteredRows`. The old
+    // identity check silently destroyed every tooltip one frame after it
+    // mounted — caught only by driving the real UI, because jsdom component
+    // tests never run this effect loop.
+    const tooltipStale = (row: VisualCommitRow | null) =>
+      row !== null && !filteredRows.some((r) => r.id === row.id);
+    if (tooltipStale(tooltipRow) || tooltipStale(tooltipMergeTarget)) {
       tooltipRow = null;
+      tooltipMergeTarget = null;
       hoveredCommitId = null;
     }
     schedulePaint();
@@ -469,16 +714,20 @@
 
   onMount(() => {
     const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      // Distinguish "no measurement" (keep the previous height) from a real
-      // 0px measurement (collapsed pane): `|| 600` used to turn a genuine
-      // zero into a phantom viewport and over-render invisible rows.
-      if (!entry) return;
-      containerHeight = entry.contentRect.height || 0;
+      for (const entry of entries) {
+        // Distinguish "no measurement" from a real 0px measurement: a
+        // collapsed pane must not become a phantom viewport.
+        if (entry.target === container) containerHeight = entry.contentRect.height || 0;
+        if (entry.target === root) rootWidth = entry.contentRect.width || 0;
+      }
       gutterRect = null;
       rootRect = null;
     });
     if (container) observer.observe(container);
+    if (root) {
+      rootWidth = root.clientWidth || 0;
+      observer.observe(root);
+    }
 
     // Display moves change devicePixelRatio without any resize event; watch the
     // current resolution and re-arm on each transition.
@@ -559,15 +808,32 @@
   {/if}
 
   <div
-    class="shrink-0 border-r border-border/40 relative z-10 bg-background gp-gpu cursor-pointer"
-    style="width: {graphColumnWidth}px;"
-    onclick={handleCanvasClick}
-    onmousemove={handleCanvasMouseMove}
-    onmouseleave={handleCanvasMouseLeave}
-    onwheel={handleGraphWheel}
-    role="presentation"
+    class="relative z-10 flex min-w-0 shrink-0 flex-col self-stretch border-r border-border/40 bg-background"
+    style={graphViewportBoxStyle(graphViewportWidth)}
   >
-    <canvas bind:this={canvas} class="gp-gpu w-full h-full block"></canvas>
+    <div
+      bind:this={graphViewport}
+      class="min-h-0 min-w-0 flex-1 overflow-x-auto overflow-y-hidden gp-graph-hscroll cursor-pointer {graphPanning ? 'cursor-grabbing' : ''}"
+      onclick={handleCanvasClick}
+      onpointerdown={handleGraphPointerDown}
+      onpointermove={handleCanvasMouseMove}
+      onpointerup={handleGraphPointerUp}
+      onpointercancel={handleGraphPointerUp}
+      onpointerleave={handleCanvasMouseLeave}
+      onwheel={handleGraphWheel}
+      onscroll={handleGraphScroll}
+      role="presentation"
+    >
+      <div style={graphContentBoxStyle(graphContentWidth)}>
+        <canvas bind:this={canvas} class="gp-gpu w-full h-full block"></canvas>
+      </div>
+    </div>
+    {#if graphOverflow.showStartFade}
+      <div class="pointer-events-none absolute inset-y-0 left-0 z-20 w-8 bg-gradient-to-r from-background to-transparent"></div>
+    {/if}
+    {#if graphOverflow.showEndFade}
+      <div class="pointer-events-none absolute inset-y-0 right-0 z-20 w-8 bg-gradient-to-l from-background to-transparent"></div>
+    {/if}
   </div>
 
   <div
@@ -586,6 +852,10 @@
             density={$densityStore}
             refs={refsByCommit.get(row.id) ?? []}
             isSelected={$repoStore.selectedCommitId === row.id}
+            mergeTarget={closeTargetById.get(row.id) ?? null}
+            onFocusRow={(element, keyboardVisible) =>
+              handleRowFocus(row, element, keyboardVisible)}
+            onBlurRow={handleRowBlur}
             onSelect={() => {
               graphStore.selectCommit(row);
               repoStore.selectCommitDiff(row.id);
@@ -619,26 +889,37 @@
   </div>
 
   {#if tooltipRow}
-    <!-- Positioned via transform: left/top writes invalidate layout at pointer
-         frequency; a composited translate3d does not. clientWidth/Height bind
-         the REAL box back into placement, so a tall tooltip never gets pinned
-         by stale assumed metrics. -->
-    <!-- aria-hidden: the canvas is role=presentation and the pointer-only
-         hover card has no focusable content; announcing it would reference a
-         node AT cannot reach. Commit details remain the accessible path. -->
+    <!-- Portaled to body: main.gp-pane uses contain:paint, which clips
+         position:absolute descendants and traps them under the composited
+         graph scroller. Fixed + body matches BranchList / ViewTabBar menus.
+         Translate3d avoids layout invalidation at pointer frequency. -->
+    <!-- Pointer cards are aria-hidden: the canvas is role=presentation and
+         a mouse hover duplicates content sighted users see; announcing it
+         would reference a node AT cannot reach. A KEYBOARD-focus card is
+         different — it is that user's UI, so it stays exposed and its
+         content is additionally spoken through the live region below. -->
     <div
+      use:portal={"body"}
       bind:clientWidth={tooltipBoxWidth}
       bind:clientHeight={tooltipBoxHeight}
-      aria-hidden="true"
-      class="pointer-events-none absolute left-0 top-0 z-30 w-80 max-w-[calc(100%_-_1rem)]"
-      style="transform: translate3d({tooltipLeft}px, {tooltipTop}px, 0);"
+      aria-hidden={tooltipSource === "focus" ? undefined : true}
+      class="pointer-events-none fixed left-0 top-0 w-80 max-w-[calc(100vw_-_1rem)]"
+      style="transform: translate3d({tooltipLeft}px, {tooltipTop}px, 0); z-index: {LAYERS.TOOLTIP};"
     >
       <GraphNodeTooltip
         row={tooltipRow}
         refs={refsByCommit.get(tooltipRow.id) ?? []}
         placement={tooltipPlacement}
         caretX={tooltipAnchorX}
+        hitKind={tooltipHitKind}
+        mergeTarget={tooltipMergeTarget ?? closeTargetById.get(tooltipRow.id) ?? null}
+        authorCommitCount={authorCountFor(tooltipRow)}
       />
     </div>
   {/if}
+
+  <!-- Spoken mirror of the focus card: focusing a commit row announces the
+       same graph context the pointer tooltip shows, merge destination and
+       author stats included, so none of it is pointer-only. -->
+  <div class="sr-only" role="status" aria-live="polite">{focusAnnouncement}</div>
 </div>

@@ -9,16 +9,28 @@
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "lucide-svelte";
   import { formatError } from "../ui/formatError";
+  import { isImeComposition } from "../keyboard/imeGuard";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
+  let dirtyCount = $derived($repoStore.statuses.length);
+  let conflictedCount = $derived($repoStore.statuses.filter((s) => s.is_conflicted).length);
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let commitMessage = $derived($repoStore.commitDraft);
   let isAmending = $derived($repoStore.isAmending);
+  let includeUnstaged = $state(false);
   let isGenerating = $state(false);
   let generation = $state<AiGeneration | null>(null);
   let aiError = $state<string | null>(null);
   let commitError = $state<string | null>(null);
   let lastVerdict = $state<PolicyVerdict | null>(null);
+
+  let quickCommit = $derived(includeUnstaged && !isAmending);
+  let commitCount = $derived(quickCommit ? dirtyCount : stagedFiles.length);
+  let commitDisabled = $derived(
+    !commitMessage.trim() ||
+      conflictedCount > 0 ||
+      (quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending),
+  );
 
   async function generateMessage() {
     const path = $repoStore.currentPath;
@@ -40,11 +52,7 @@
     }
   }
 
-  async function handleCommit() {
-    const message = commitMessage.trim();
-    if (!message) return;
-    commitError = null;
-    const outcome = await repoStore.commit(message, isAmending);
+  async function finishCommit(outcome: { ok: boolean; error?: string; policy?: PolicyVerdict | null }) {
     lastVerdict = outcome.policy ?? null;
     if (!outcome.ok) {
       // A refused commit keeps its message: the user has to change the action,
@@ -55,6 +63,32 @@
     repoStore.setCommitDraft("");
     repoStore.setAmending(false);
     generation = null;
+  }
+
+  async function handleCommit(forceQuick = false) {
+    const message = commitMessage.trim();
+    const useQuick = (forceQuick || includeUnstaged) && !isAmending;
+    if (!message) return;
+    if (conflictedCount > 0) return;
+    if (useQuick ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending) return;
+    commitError = null;
+    if (useQuick) {
+      await finishCommit(await repoStore.quickCommit(message));
+      return;
+    }
+    await finishCommit(await repoStore.commit(message, isAmending));
+  }
+
+  function onMessageKeydown(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return;
+    event.preventDefault();
+    if (event.shiftKey && !isAmending) {
+      includeUnstaged = true;
+      void handleCommit(true);
+      return;
+    }
+    void handleCommit();
   }
 
   /** "1.4s", "820ms" — a local model's latency is worth showing plainly. */
@@ -87,6 +121,7 @@
   <textarea
     value={commitMessage}
     oninput={(e) => repoStore.setCommitDraft((e.currentTarget as HTMLTextAreaElement).value)}
+    onkeydown={onMessageKeydown}
     placeholder="Commit message (e.g. feat: add auth)..."
     rows="3"
     class="w-full bg-background border border-border/80 rounded-xl p-2.5 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none focus:border-accent/60 resize-none font-mono transition-colors"
@@ -139,23 +174,44 @@
     </div>
   {/if}
 
-  <div class="flex items-center justify-between">
-    <label class="flex items-center gap-1.5 text-[11px] text-textMuted cursor-pointer">
-      <input
-        type="checkbox"
-        checked={isAmending}
-        onchange={(e) => repoStore.setAmending((e.currentTarget as HTMLInputElement).checked)}
-        class="rounded accent-accent"
-      />
-      <span>Amend</span>
-    </label>
+  <div class="flex items-center justify-between gap-2">
+    <div class="flex items-center gap-3 min-w-0">
+      <label class="flex items-center gap-1.5 text-[11px] text-textMuted cursor-pointer">
+        <input
+          type="checkbox"
+          checked={isAmending}
+          onchange={(e) => repoStore.setAmending((e.currentTarget as HTMLInputElement).checked)}
+          class="rounded accent-accent"
+        />
+        <span>Amend</span>
+      </label>
+      <label
+        class="flex items-center gap-1.5 text-[11px] text-textMuted cursor-pointer {isAmending
+          ? 'opacity-40 cursor-not-allowed'
+          : ''}"
+        title="Stage remaining files and commit them together (quick commit)"
+      >
+        <input
+          type="checkbox"
+          checked={includeUnstaged}
+          disabled={isAmending}
+          aria-label="Include unstaged files in this commit"
+          onchange={(e) => (includeUnstaged = (e.currentTarget as HTMLInputElement).checked)}
+          class="rounded accent-accent"
+        />
+        <span>Include unstaged</span>
+      </label>
+    </div>
     <button
-      onclick={handleCommit}
-      disabled={!commitMessage.trim() || (stagedFiles.length === 0 && !isAmending)}
+      onclick={() => void handleCommit()}
+      disabled={commitDisabled}
+      title={quickCommit
+        ? "Stage all changes and commit (Cmd/Ctrl+Shift+Enter)"
+        : "Commit staged files (Cmd/Ctrl+Enter)"}
       class="gp-btn-primary"
     >
       <Send size={12} />
-      <span>Commit ({stagedFiles.length})</span>
+      <span>{quickCommit ? "Commit all" : "Commit"} ({commitCount})</span>
     </button>
   </div>
 </div>

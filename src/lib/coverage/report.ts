@@ -9,6 +9,14 @@ import type {
 
 const MAX_FILES_LISTED = 30;
 const MAX_ARTIFACTS_LISTED = 40;
+const MAX_ISSUE_BODY_BYTES = 60 * 1024;
+const ISSUE_CLIP_NOTE = "\n\n[GitPulse clipped this draft to stay below GitHub's body limit.]";
+
+export interface CoverageIssueDraft {
+  title: string;
+  body: string;
+  clipped: boolean;
+}
 
 /**
  * Coverage numbers cross the IPC boundary as plain JSON, so a buggy or
@@ -18,16 +26,30 @@ const MAX_ARTIFACTS_LISTED = 40;
  */
 function safePercent(value: unknown): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "0.0%";
-  return formatCoveragePercent(value);
+  return formatCoveragePercent(Math.min(100, value));
 }
 
 function safeCount(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0;
-  return Math.max(0, Math.trunc(value));
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.trunc(value)));
 }
 
 function safeText(value: unknown): string {
-  return typeof value === "string" ? value : "";
+  if (typeof value !== "string") return "";
+  // Paths and producer-owned labels are rendered as one report line. Keep
+  // embedded controls visible instead of letting a crafted filename inject a
+  // new heading, runnable command, or terminal control into the model prompt.
+  return Array.from(value, (char) => {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === "\n") return "\\n";
+    if (char === "\r") return "\\r";
+    if (char === "\t") return "\\t";
+    if ([0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].includes(code)) {
+      return `\\u{${code.toString(16)}}`;
+    }
+    if (code < 0x20 || code === 0x7f) return `\\u{${code.toString(16).padStart(4, "0")}}`;
+    return char;
+  }).join("");
 }
 
 function safeList<T>(value: T[] | undefined): T[] {
@@ -113,9 +135,172 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
       const formats = Array.isArray(family.expected_formats)
         ? family.expected_formats.map(safeText).filter(Boolean).join(", ")
         : "";
-      out.push(`- ${safeText(family.family)}${formats ? ` (expected: ${formats})` : ""}`);
+      const commands = Array.isArray(family.suggested_commands)
+        ? family.suggested_commands.map(safeText).filter(Boolean)
+        : [];
+      const setup = Array.isArray(family.setup_commands)
+        ? family.setup_commands.map(safeText).filter(Boolean)
+        : [];
+      const toolReady = family.tool_ready !== false;
+      const toolDetail = safeText(family.tool_detail);
+      const duration = safeText(family.duration_hint);
+      const parts: string[] = [];
+      if (!toolReady && toolDetail) parts.push(toolDetail);
+      if (!toolReady && setup.length > 0) {
+        parts.push(`setup ${setup.map((cmd) => `\`${cmd}\``).join(" then ")}`);
+      }
+      if (commands.length > 0) {
+        const separator = family.family === "rust" ? " then " : " or ";
+        parts.push(`run ${commands.map((cmd) => `\`${cmd}\``).join(separator)}`);
+      }
+      if (duration) parts.push(duration);
+      const extra = parts.length > 0 ? ` — ${parts.join(" — ")}` : "";
+      out.push(`- ${safeText(family.family)}${formats ? ` (expected: ${formats})` : ""}${extra}`);
     }
   }
 
   return out.join("\n");
 }
+
+function sanitizeBodyText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return Array.from(value, (char) => {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === "\n" || char === "\r" || char === "\t") return char;
+    if (code < 0x20 || code === 0x7f) return `\\u{${code.toString(16).padStart(4, "0")}}`;
+    return char;
+  }).join("");
+}
+
+function indentBlock(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => `    ${line}`)
+    .join("\n");
+}
+
+function clipUtf8(value: string, maxBytes: number): { text: string; clipped: boolean } {
+  const encoder = new TextEncoder();
+  if (encoder.encode(value).byteLength <= maxBytes) return { text: value, clipped: false };
+  const noteBytes = encoder.encode(ISSUE_CLIP_NOTE).byteLength;
+  const contentLimit = Math.max(0, maxBytes - noteBytes);
+  let bytes = 0;
+  let text = "";
+  for (const char of value) {
+    const width = encoder.encode(char).byteLength;
+    if (bytes + width > contentLimit) break;
+    text += char;
+    bytes += width;
+  }
+  return { text: text + ISSUE_CLIP_NOTE, clipped: true };
+}
+
+/**
+ * Builds the external GitHub issue payload for a coverage snapshot.
+ *
+ * The local absolute repository path is deliberately excluded (and redacted
+ * from optional MANVI prose), command output is never copied, producer-owned
+ * text is indented as literal data, and the UTF-8 body stays below the backend's
+ * 64 KiB hard limit. Filing still goes through the existing guarded issue owner.
+ */
+export function buildCoverageIssueDraft(
+  report: CoverageReport,
+  repoPath: string,
+  manviAnalysis?: string | null,
+): CoverageIssueDraft {
+  const data = (report ?? {}) as Partial<CoverageReport>;
+  const percentage = safePercent(data.overall?.percentage);
+  const partial = data.truncated === true ? " (partial scan)" : "";
+  const title = `test(coverage): address ${percentage} line coverage${partial}`;
+
+  // The first rendered line contains the local path and is useful only for the
+  // local model/clipboard. Drop it before this content crosses to GitHub.
+  const snapshot = formatCoverageReport(report, "")
+    .split("\n")
+    .slice(1)
+    .join("\n")
+    .trimStart();
+  let analysis = sanitizeBodyText(manviAnalysis).trim();
+  if (repoPath) analysis = analysis.split(repoPath).join("<repository>");
+
+  const sections = [
+    "<!-- gitpulse:coverage-report:v1 -->",
+    "## Coverage snapshot",
+    "",
+    "Generated by GitPulse from bounded coverage artifacts. No local absolute path or command output is included.",
+    "",
+    indentBlock(snapshot || "No coverage data was available."),
+  ];
+  if (analysis) {
+    sections.push("", "## MANVI analysis", "", indentBlock(analysis));
+  }
+  sections.push(
+    "",
+    "## Resolution checklist",
+    "",
+    "- [ ] Confirm the report is current and complete.",
+    "- [ ] Add tests for the lowest-covered behavior, including failure paths.",
+    "- [ ] Regenerate coverage and attach the verified before/after totals.",
+  );
+
+  const clipped = clipUtf8(sections.join("\n"), MAX_ISSUE_BODY_BYTES);
+  return { title, body: clipped.text, clipped: clipped.clipped };
+}
+
+export interface FailedCoverageScript {
+  label: string;
+  detail?: string | null;
+}
+
+export interface FailedCoverageDiagnosticsOptions {
+  repoPath?: string | null;
+  scanError?: string | null;
+}
+
+/**
+ * Formats failed coverage commands, generator scripts, and scan errors into a
+ * clean plain-text diagnostic report suitable for copying to clipboard.
+ */
+export function formatFailedCoverageDiagnostics(
+  failures: readonly FailedCoverageScript[],
+  options?: FailedCoverageDiagnosticsOptions,
+): string {
+  const repo = options?.repoPath ? safeText(options.repoPath) : "";
+  const scanErr = options?.scanError ? options.scanError.trim() : "";
+  const validFailures = (failures ?? []).filter(
+    (f): f is FailedCoverageScript => Boolean(f && typeof f === "object" && typeof f.label === "string"),
+  );
+
+  if (validFailures.length === 0 && !scanErr) {
+    return "No coverage failures recorded.";
+  }
+
+  const out: string[] = [];
+  out.push(repo ? `Coverage failure diagnostics — ${repo}` : "Coverage failure diagnostics");
+
+  if (scanErr) {
+    out.push(`Scan error: ${scanErr}`);
+  }
+
+  if (validFailures.length === 1) {
+    const f = validFailures[0];
+    if (scanErr) out.push("");
+    out.push(`Command: ${f.label}`);
+    out.push("Status: failed");
+    out.push("Output:");
+    out.push(f.detail ? f.detail.trim() : "(no output recorded)");
+  } else if (validFailures.length > 1) {
+    if (scanErr) out.push("");
+    out.push(`Failed coverage commands (${validFailures.length}):`);
+    validFailures.forEach((f, idx) => {
+      out.push("");
+      out.push(`[${idx + 1}] Command: ${f.label}`);
+      out.push("Status: failed");
+      out.push("Output:");
+      out.push(f.detail ? f.detail.trim() : "(no output recorded)");
+    });
+  }
+
+  return out.join("\n");
+}
+

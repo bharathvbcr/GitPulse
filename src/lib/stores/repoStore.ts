@@ -204,7 +204,11 @@ export interface RepoStoreDeps {
   caseInsensitive?: boolean;
   graph?: {
     showRepo(path: string | null): void;
-    loadGraph(path: string, query?: string, revision?: string | null): Promise<void>;
+    loadGraph(
+      path: string,
+      query?: string,
+      revision?: string | null,
+    ): Promise<void>;
     evict(path: string): void;
   };
   filter?: {
@@ -295,7 +299,10 @@ function emptyProjected(): RepoState {
   };
 }
 
-function createSession(tab: { id: string; path: string; pinned: boolean }, extras: Partial<RepoSession> = {}): RepoSession {
+function createSession(
+  tab: { id: string; path: string; pinned: boolean },
+  extras: Partial<RepoSession> = {},
+): RepoSession {
   return {
     id: tab.id,
     path: tab.path,
@@ -328,7 +335,9 @@ function createSession(tab: { id: string; path: string; pinned: boolean }, extra
 }
 
 function project(internal: InternalState): RepoState {
-  const labels = disambiguateLabels(internal.workspace.tabs.map((tab) => tab.path));
+  const labels = disambiguateLabels(
+    internal.workspace.tabs.map((tab) => tab.path),
+  );
   const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
     const session = internal.sessions[tab.id];
     const statuses = session?.statuses ?? [];
@@ -418,7 +427,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   function ensureStatusPoll() {
     if (pollTimer !== null || typeof setInterval === "undefined") return;
-    pollTimer = setInterval(() => void runStatusPoll(), STATUS_POLL_INTERVAL_MS);
+    pollTimer = setInterval(
+      () => void runStatusPoll(),
+      STATUS_POLL_INTERVAL_MS,
+    );
     // Quitting inside the persist debounce window would drop the newest
     // search query / view tab; `pagehide` fires on close and navigation.
     // Added and removed symmetrically with the poll so repeated
@@ -466,7 +478,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     pollRuns.set(sessionId, run);
     pollInflight = true;
     try {
-      const statuses = await invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path });
+      const statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
+        repoPath: path,
+      });
       if (pollRuns.get(sessionId) !== run) return;
       if (snapshotRuns.get(sessionId) !== snapshotRunAtStart) return;
       // A quiet repo returns byte-identical statuses every 6s; republishing
@@ -493,7 +507,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let lastPersistedPayload: string | null = null;
   /** Recents payload last handed to the native menu; IPC fires only on change. */
   let lastSentRecentsJson: string | null = null;
-  let pendingPersist: { data: PersistedWorkspace; recents: string[] } | null = null;
+  let pendingPersist: { data: PersistedWorkspace; recents: string[] } | null =
+    null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   function beginShortcut(): boolean {
@@ -548,7 +563,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const recentsJson = JSON.stringify(pending.recents);
     if (recentsJson !== lastSentRecentsJson) {
       lastSentRecentsJson = recentsJson;
-      void invokeFn("cmd_set_recent_menu", { paths: pending.recents }).catch(() => {});
+      void invokeFn("cmd_set_recent_menu", { paths: pending.recents }).catch(
+        () => {},
+      );
     }
   }
 
@@ -577,7 +594,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * snapshot is recognized and dropped while any new backend field still
    * forces a (safe-direction) publish.
    */
-  function patchIsNoop(session: RepoSession, patch: Partial<RepoSession>): boolean {
+  function patchIsNoop(
+    session: RepoSession,
+    patch: Partial<RepoSession>,
+  ): boolean {
     for (const key of Object.keys(patch) as (keyof RepoSession)[]) {
       const incoming = patch[key];
       if (incoming === session[key]) continue;
@@ -596,7 +616,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return true;
   }
 
-  function applyToSession(id: string, generation: number, patch: Partial<RepoSession>) {
+  function applyToSession(
+    id: string,
+    generation: number,
+    patch: Partial<RepoSession>,
+  ) {
     const session = internal.sessions[id];
     if (!session || session.generation !== generation) return false;
     // A no-op patch must not publish: subscribers treat every store emission
@@ -613,7 +637,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * will never clear this flag — so pending must reset here.
    */
   function bumped(session: RepoSession): RepoSession {
-    return { ...session, generation: session.generation + 1, statsPending: false };
+    return {
+      ...session,
+      generation: session.generation + 1,
+      statsPending: false,
+    };
   }
 
   function syncFilterFromSession(session: RepoSession | undefined) {
@@ -649,7 +677,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (syncingFilter) return;
     const session = activeSession();
     if (!session) return;
-    if (session.searchQuery === value.searchQuery && session.selectedBranch === value.selectedBranch) {
+    if (
+      session.searchQuery === value.searchQuery &&
+      session.selectedBranch === value.selectedBranch
+    ) {
       return;
     }
     putSession({
@@ -670,10 +701,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const [branches, statuses, tags] = await Promise.all([
       invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path }),
       invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path }),
-      invokeFn<TagInfo[]>("cmd_list_tags", { repoPath: path }).catch(() => [] as TagInfo[]),
+      invokeFn<TagInfo[]>("cmd_list_tags", { repoPath: path }).catch(
+        () => [] as TagInfo[],
+      ),
     ]);
     const currentBranch = branches.find((b) => b.is_current)?.name || null;
-    const defaultBranch = branches.find((b) => b.is_default)?.name || currentBranch || "main";
+    const defaultBranch =
+      branches.find((b) => b.is_default)?.name || currentBranch || "main";
     return { branches, statuses, tags, currentBranch, defaultBranch };
   }
 
@@ -715,13 +749,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * the same identity the stats drain merges under — and otherwise takes the
    * snapshot's (tip moved ⇒ stale churn must not survive).
    */
-  function withCarriedChurn(live: RepoSession, snapshot: {
-    branches: BranchInfo[];
-    statuses: FileStatus[];
-    tags: TagInfo[];
-    currentBranch: string | null;
-    defaultBranch: string | null;
-  }) {
+  function withCarriedChurn(
+    live: RepoSession,
+    snapshot: {
+      branches: BranchInfo[];
+      statuses: FileStatus[];
+      tags: TagInfo[];
+      currentBranch: string | null;
+      defaultBranch: string | null;
+    },
+  ) {
     if (live.branches.length === 0) return snapshot;
     const key = (b: Pick<BranchInfo, "name" | "is_remote" | "remote_name">) =>
       `${b.is_remote ? "remote" : "local"}:${b.remote_name ?? ""}:${b.name}`;
@@ -755,7 +792,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
-      applyToSession(id, generation, { isLoading: false, error: formatError(err) });
+      applyToSession(id, generation, {
+        isLoading: false,
+        error: formatError(err),
+      });
     }
   }
 
@@ -766,11 +806,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // the tip guard keeps stale merges out, and the next refresh fetches again.
   const statsInflight = new Set<string>();
 
-  function branchStatsKey(name: string, isRemote: boolean, remoteName?: string | null): string {
+  function branchStatsKey(
+    name: string,
+    isRemote: boolean,
+    remoteName?: string | null,
+  ): string {
     return `${isRemote ? "remote" : "local"}:${remoteName ?? ""}:${name}`;
   }
 
-  async function fetchBranchStats(id: string, path: string, generation: number) {
+  async function fetchBranchStats(
+    id: string,
+    path: string,
+    generation: number,
+  ) {
     if (statsInflight.has(id)) return;
     statsInflight.add(id);
     // Raise the churn marker only when some branch actually misses stats
@@ -781,7 +829,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (
       liveNow &&
       liveNow.generation === generation &&
-      (liveNow.statsFailed || liveNow.branches.some((b) => b.compared_to === undefined))
+      (liveNow.statsFailed ||
+        liveNow.branches.some((b) => b.compared_to === undefined))
     ) {
       applyToSession(id, generation, { statsPending: true });
     }
@@ -809,11 +858,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return;
       }
       if (dirty) {
-        applyToSession(id, generation, { branches, statsPending: pending, statsFailed: failed });
+        applyToSession(id, generation, {
+          branches,
+          statsPending: pending,
+          statsFailed: failed,
+        });
         dirty = false;
         return;
       }
-      applyToSession(id, generation, { statsPending: pending, statsFailed: failed });
+      applyToSession(id, generation, {
+        statsPending: pending,
+        statsFailed: failed,
+      });
     };
     try {
       // Only the LAST batch's failure count matters: uncached failures are
@@ -822,7 +878,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       let lastBatchHadFailures = false;
       let drainedCleanly = false;
       for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
-        const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", { repoPath: path });
+        const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", {
+          repoPath: path,
+        });
         const session = internal.sessions[id];
         if (!session || session.generation !== generation) return;
 
@@ -836,8 +894,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         );
         let batchTouched = false;
         branches = branches.map((branch) => {
-          const update = updates.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
-          if (!update || update.tip_commit_id !== branch.tip_commit_id) return branch;
+          const update = updates.get(
+            branchStatsKey(branch.name, branch.is_remote, branch.remote_name),
+          );
+          if (!update || update.tip_commit_id !== branch.tip_commit_id)
+            return branch;
           batchTouched = true;
           return {
             ...branch,
@@ -913,7 +974,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         allowBroken?: boolean;
         activate?: boolean;
         pinned?: boolean;
-        restore?: { viewTab?: ViewTab; searchQuery?: string; selectedBranch?: string | null };
+        restore?: {
+          viewTab?: ViewTab;
+          searchQuery?: string;
+          selectedBranch?: string | null;
+        };
       } = {},
     ) => {
       const requestId = ++openEpoch;
@@ -945,7 +1010,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const canonicalKey = identityKey(path, options);
       if (resolved && rawKey && canonicalKey && rawKey !== canonicalKey) {
         const aliases = workspace.tabs.filter(
-          (tab) => tab.id !== canonicalKey && identityKey(tab.path, options) === rawKey,
+          (tab) =>
+            tab.id !== canonicalKey &&
+            identityKey(tab.path, options) === rawKey,
         );
         if (aliases.length > 0) {
           const aliasIds = new Set(aliases.map((tab) => tab.id));
@@ -964,7 +1031,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               workspace.activeId !== null && aliasIds.has(workspace.activeId)
                 ? canonicalKey
                 : workspace.activeId,
-            recents: workspace.recents.filter((item) => identityKey(item, options) !== rawKey),
+            recents: workspace.recents.filter(
+              (item) => identityKey(item, options) !== rawKey,
+            ),
             lastClosed: workspace.lastClosed.filter(
               (item) => identityKey(item, options) !== rawKey,
             ),
@@ -974,7 +1043,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           internal = { ...internal, sessions };
         }
       }
-      const hadCanonical = workspace.tabs.some((tab) => tab.id === canonicalKey);
+      const hadCanonical = workspace.tabs.some(
+        (tab) => tab.id === canonicalKey,
+      );
       const carriedPinned = hadCanonical ? undefined : carriedSession?.pinned;
       const opened = openTab(workspace, path, options, {
         pinned: extras.pinned ?? carriedPinned,
@@ -993,7 +1064,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       replaceWorkspace({
         ...opened.workspace,
-        lastClosed: opened.workspace.lastClosed.filter((item) => !sameRepo(item, path, options)),
+        lastClosed: opened.workspace.lastClosed.filter(
+          (item) => !sameRepo(item, path, options),
+        ),
       });
       const existing = internal.sessions[opened.id];
       const session = existing
@@ -1002,20 +1075,31 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             path,
             name: resolved?.name ?? existing.name,
             isBare: resolved?.is_bare ?? existing.isBare,
-            pinned: opened.workspace.tabs.find((tab) => tab.id === opened.id)?.pinned ?? existing.pinned,
+            pinned:
+              opened.workspace.tabs.find((tab) => tab.id === opened.id)
+                ?.pinned ?? existing.pinned,
             isLoading: !existing.hasHydrated,
-            error: resolved ? null : String(internal.workspaceError ?? "Repository is unavailable"),
+            error: resolved
+              ? null
+              : String(internal.workspaceError ?? "Repository is unavailable"),
           }
         : createSession(
-            { id: opened.id, path, pinned: (extras.pinned ?? carriedPinned) === true },
+            {
+              id: opened.id,
+              path,
+              pinned: (extras.pinned ?? carriedPinned) === true,
+            },
             {
               name: resolved?.name,
               isBare: resolved?.is_bare,
               // An adopted alias tab hands over its state; an explicit
               // restore payload always wins over what the alias carried.
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
-              searchQuery: extras.restore?.searchQuery ?? carriedSession?.searchQuery,
-              selectedBranch: extras.restore?.selectedBranch ?? carriedSession?.selectedBranch,
+              searchQuery:
+                extras.restore?.searchQuery ?? carriedSession?.searchQuery,
+              selectedBranch:
+                extras.restore?.selectedBranch ??
+                carriedSession?.selectedBranch,
               commitDraft: carriedSession?.commitDraft ?? "",
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
@@ -1023,7 +1107,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             },
           );
       putSession(session);
-      const shouldPresent = activate && internal.workspace.activeId === opened.id;
+      const shouldPresent =
+        activate && internal.workspace.activeId === opened.id;
       if (shouldPresent) {
         syncFilterFromSession(session);
         graph.showRepo(session.path);
@@ -1033,7 +1118,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       await watch(path);
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
-      if (shouldPresent && latest && internal.workspace.activeId === opened.id) {
+      if (
+        shouldPresent &&
+        latest &&
+        internal.workspace.activeId === opened.id
+      ) {
         revealGraph(latest);
       }
       ensureStatusPoll();
@@ -1186,18 +1275,24 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       await store.openRepo(path, { activate: true });
     },
     removeRecent: (path: string) => {
-      replaceWorkspace(removeWorkspaceRecent(internal.workspace, path, options));
+      replaceWorkspace(
+        removeWorkspaceRecent(internal.workspace, path, options),
+      );
       publish();
     },
     refresh: async (repoPath?: string) => {
       const session = repoPath
-        ? Object.values(internal.sessions).find((item) => sameRepo(item.path, repoPath, options))
+        ? Object.values(internal.sessions).find((item) =>
+            sameRepo(item.path, repoPath, options),
+          )
         : activeSession();
       if (!session) return;
       const generation = session.generation;
       // Spinner only while nothing is rendered; a rendered error stays until
       // this refresh's own outcome replaces or retires it (hydrate settle).
-      applyToSession(session.id, generation, { isLoading: !session.hasHydrated });
+      applyToSession(session.id, generation, {
+        isLoading: !session.hasHydrated,
+      });
       await hydrate(session.id, session.path, generation);
       const latest = internal.sessions[session.id];
       if (latest && internal.workspace.activeId === session.id) {
@@ -1231,7 +1326,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // change inside the window is picked up by the next poll or event.
       const echoUntil = mutationEchoUntil.get(session.path);
       if (echoUntil !== undefined && Date.now() < echoUntil) return;
-      scheduleWatcherRefresh(session.path, () => void store.refresh(session.path));
+      scheduleWatcherRefresh(
+        session.path,
+        () => void store.refresh(session.path),
+      );
     },
     restoreWorkspace: async () => {
       stopStatusPoll();
@@ -1277,7 +1375,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       if (activated) return;
       const desired = persisted.activePath
-        ? internal.workspace.tabs.find((tab) => sameRepo(tab.path, persisted.activePath ?? "", options))
+        ? internal.workspace.tabs.find((tab) =>
+            sameRepo(tab.path, persisted.activePath ?? "", options),
+          )
         : internal.workspace.tabs[0];
       if (desired) {
         await store.activateTab(desired.id, { force: true });
@@ -1338,8 +1438,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (previous === next) return;
       // Read the old session's fields BEFORE applyToSession: putSession
       // replaces the stored object with a fresh immutable copy.
-      const { selectedFilePath: filePath, selectedIsStaged: isStaged, selectionKind } = session;
-      applyToSession(session.id, session.generation, { selectedIgnoreWhitespace: next });
+      const {
+        selectedFilePath: filePath,
+        selectedIsStaged: isStaged,
+        selectionKind,
+      } = session;
+      applyToSession(session.id, session.generation, {
+        selectedIgnoreWhitespace: next,
+      });
       // Only worktree-file selections can be refetched with -w; commit/range
       // selections just record the preference for the next file click.
       if (selectionKind !== "file" || !filePath) return;
@@ -1422,17 +1528,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     },
     stageFile: async (filePath: string) =>
-      runMutating("stage", filePath, (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath })),
+      runMutating("stage", filePath, (path) =>
+        invokeFn("cmd_stage_file", { repoPath: path, filePath }),
+      ),
     unstageFile: async (filePath: string) =>
-      runMutating("unstage", filePath, (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath })),
-    stageSelectivePatch: async (filePatch: FilePatch, isStaging: boolean = true) => {
+      runMutating("unstage", filePath, (path) =>
+        invokeFn("cmd_unstage_file", { repoPath: path, filePath }),
+      ),
+    stageSelectivePatch: async (
+      filePatch: FilePatch,
+      isStaging: boolean = true,
+    ) => {
       if (isStaging) {
         return runMutating("stage-patch", filePatch.new_path, (path) =>
-          invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch })
+          invokeFn("cmd_stage_selective_patch", { repoPath: path, filePatch }),
         );
       } else {
         return runMutating("unstage-patch", filePatch.new_path, (path) =>
-          invokeFn("cmd_unstage_selective_patch", { repoPath: path, filePatch })
+          invokeFn("cmd_unstage_selective_patch", {
+            repoPath: path,
+            filePatch,
+          }),
         );
       }
     },
@@ -1448,7 +1564,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await runMutating(
             "stage",
             f.path,
-            (path) => invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }),
+            (path) =>
+              invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }),
             { skipRefresh: true },
           ),
         );
@@ -1466,7 +1583,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await runMutating(
             "unstage",
             f.path,
-            (path) => invokeFn("cmd_unstage_file", { repoPath: path, filePath: f.path }),
+            (path) =>
+              invokeFn("cmd_unstage_file", {
+                repoPath: path,
+                filePath: f.path,
+              }),
             { skipRefresh: true },
           ),
         );
@@ -1475,52 +1596,87 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       return summarizeBulkOutcome(outcomes, "unstaged");
     },
     discardChanges: async (filePath: string) =>
-      runMutating("discard", filePath, (path) => invokeFn("cmd_discard_changes", { repoPath: path, filePath })),
+      runMutating("discard", filePath, (path) =>
+        invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
+      ),
     commit: async (message: string, amend: boolean = false) =>
       runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
-        invokeFn("cmd_commit", { repoPath: path, message, amend })
+        invokeFn("cmd_commit", { repoPath: path, message, amend }),
+      ),
+    /**
+     * Stage remaining worktree changes and commit the index as one mutation.
+     * Conflicts and empty messages are refused by the backend; the frontend
+     * surfaces those as the same MutationOutcome as a gated `commit`.
+     */
+    quickCommit: async (message: string) =>
+      runMutating("commit", message.split("\n")[0].slice(0, 80), (path) =>
+        invokeFn("cmd_quick_commit", { repoPath: path, message }),
       ),
     checkoutBranch: async (branchName: string) =>
       runMutating("checkout", branchName, (path) =>
-        invokeFn("cmd_checkout_branch", { repoPath: path, branchName })
+        invokeFn("cmd_checkout_branch", { repoPath: path, branchName }),
       ),
     createBranch: async (branchName: string, startPoint?: string) =>
       runMutating("branch", branchName, (path) =>
-        invokeFn("cmd_create_branch", { repoPath: path, branchName, startPoint })
+        invokeFn("cmd_create_branch", {
+          repoPath: path,
+          branchName,
+          startPoint,
+        }),
       ),
     renameBranch: async (oldName: string, newName: string) =>
       runMutating("branch-rename", `${oldName} → ${newName}`, (path) =>
-        invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName })
+        invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName }),
       ),
     deleteBranch: async (branchName: string, force: boolean = false) =>
-      runMutating(force ? "branch-delete-force" : "branch-delete", branchName, (path) =>
-        invokeFn("cmd_delete_branch", { repoPath: path, branchName, force })
+      runMutating(
+        force ? "branch-delete-force" : "branch-delete",
+        branchName,
+        (path) =>
+          invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
       ),
     mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
       runMutating("merge", branchName, (path) =>
-        invokeFn("cmd_merge_branch", { repoPath: path, branchName, ffOnly })
+        invokeFn("cmd_merge_branch", { repoPath: path, branchName, ffOnly }),
       ),
     fetch: async (remote?: string) =>
-      runMutating("fetch", remote ?? "origin", (path) => invokeFn("cmd_fetch", { repoPath: path, remote })),
+      runMutating("fetch", remote ?? "origin", (path) =>
+        invokeFn("cmd_fetch", { repoPath: path, remote }),
+      ),
     pull: async (remote?: string, branch?: string) =>
-      runMutating("pull", [remote, branch].filter(Boolean).join(" ") || "upstream", (path) =>
-        invokeFn("cmd_pull", { repoPath: path, remote, branch })
+      runMutating(
+        "pull",
+        [remote, branch].filter(Boolean).join(" ") || "upstream",
+        (path) => invokeFn("cmd_pull", { repoPath: path, remote, branch }),
       ),
     push: async (remote?: string, branch?: string, force: boolean = false) =>
-      runMutating(force ? "push-force" : "push", [remote, branch].filter(Boolean).join(" ") || "upstream", (path) =>
-        invokeFn("cmd_push", { repoPath: path, remote, branch, force })
+      runMutating(
+        force ? "push-force" : "push",
+        [remote, branch].filter(Boolean).join(" ") || "upstream",
+        (path) =>
+          invokeFn("cmd_push", { repoPath: path, remote, branch, force }),
       ),
     reportIssue: async (title: string, body: string, labels: string[] = []) =>
       runMutating<string>("issue-report", title.slice(0, 80), (path) =>
-        invokeFn("cmd_github_create_issue", { repoPath: path, title, body, labels })
+        invokeFn("cmd_github_create_issue", {
+          repoPath: path,
+          title,
+          body,
+          labels,
+        }),
       ),
     publishRelease: async (tag: string, message: string) =>
       runMutating<ReleasePublishResult>("release-publish", tag, (path) =>
-        invokeFn("cmd_publish_release", { repoPath: path, tag, message })
+        invokeFn("cmd_publish_release", { repoPath: path, tag, message }),
       ),
     stashSave: async (message?: string) =>
-      runMutating("stash", message ?? "", (path) => invokeFn("cmd_stash_save", { repoPath: path, message })),
-    stashPop: async () => runMutating("unstash", "", (path) => invokeFn("cmd_stash_pop", { repoPath: path })),
+      runMutating("stash", message ?? "", (path) =>
+        invokeFn("cmd_stash_save", { repoPath: path, message }),
+      ),
+    stashPop: async () =>
+      runMutating("unstash", "", (path) =>
+        invokeFn("cmd_stash_pop", { repoPath: path }),
+      ),
     setActiveTab: (tab: ViewTab) => {
       const session = activeSession();
       if (!session) return;
@@ -1569,7 +1725,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     kind: string,
     label: string,
     action: (path: string) => Promise<unknown>,
-    opts: { skipRefresh?: boolean } = {}
+    opts: { skipRefresh?: boolean } = {},
   ): Promise<MutationOutcome<T>> {
     const session = activeSession();
     if (!session) return { ok: false, error: "No repository is open." };
@@ -1582,7 +1738,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // events (see WATCHER_ECHO_SUPPRESS_MS).
       mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
       const policy = recordPolicyVerdict(result);
-      harnessStore.recordAction({ kind, label, ok: true, verdict: policy ?? null });
+      harnessStore.recordAction({
+        kind,
+        label,
+        ok: true,
+        verdict: policy ?? null,
+      });
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
         await store.refresh(path);
@@ -1599,11 +1760,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           !still.selectedCommitId &&
           still.activeTab === "diff"
         ) {
-          void store.selectFileDiff(still.selectedFilePath, still.selectedIsStaged);
+          void store.selectFileDiff(
+            still.selectedFilePath,
+            still.selectedIsStaged,
+          );
         }
       }
       const output = mutationOutput<T>(result);
-      return output === undefined ? { ok: true, policy } : { ok: true, policy, output };
+      return output === undefined
+        ? { ok: true, policy }
+        : { ok: true, policy, output };
     } catch (err: unknown) {
       // The error is filed on the session, as it always was, and also returned:
       // a caller that must react to a refusal — the commit box keeping the

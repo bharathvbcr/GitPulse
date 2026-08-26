@@ -96,6 +96,39 @@ impl GitWriter {
         git_text(repo, &args)
     }
 
+    /// The add argv [`GitWriter::quick_commit`] runs. The command layer must
+    /// judge `git` plus these args, never a paraphrased `-A` / pathspec form.
+    pub(crate) const QUICK_COMMIT_ADD_ARGV: &'static [&'static str] = &["add", "--all"];
+
+    /// Stage every tracked change and untracked non-ignored file, then commit,
+    /// under one mutation-lock acquisition.
+    ///
+    /// Interactive "quick commit" uses this rather than `stageAll` + `commit()`,
+    /// which spans two lock acquisitions and can absorb a concurrent writer's
+    /// index. Unmerged paths refuse before `add` so a conflicted tree is never
+    /// silently marked resolved. Ignored untracked files stay untracked —
+    /// `git add --all` does not force them.
+    pub fn quick_commit(repo_path: &str, message: &str) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        if message.trim().is_empty() {
+            return Err("Commit message must not be empty".into());
+        }
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::quick_commit_inner(&repo, message)
+    }
+
+    fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
+        let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
+        if !unmerged.trim().is_empty() {
+            return Err("Resolve merge conflicts before committing.".into());
+        }
+        git_text(repo, Self::QUICK_COMMIT_ADD_ARGV)?;
+        Self::commit_inner(repo, message, false)
+    }
+
     /// Stage exactly `files` and commit them under a single mutation-lock
     /// acquisition.
     ///
@@ -1672,6 +1705,89 @@ mod tests {
         assert!(GitWriter::commit_files(&path, "   ", &["a.txt".into()]).is_err());
         assert!(GitWriter::commit_files(&path, "msg", &["../escape.txt".into()]).is_err());
         assert_eq!(head_message(&dir), "init", "no commit may be created");
+    }
+
+    fn configure_identity(dir: &std::path::Path) {
+        for (key, value) in [
+            ("user.name", "t"),
+            ("user.email", "t@t"),
+            ("commit.gpgsign", "false"),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir)
+                .output()
+                .expect("git config");
+            assert!(
+                output.status.success(),
+                "git config {key} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn quick_commit_add_argv_is_add_all() {
+        assert_eq!(GitWriter::QUICK_COMMIT_ADD_ARGV, &["add", "--all"]);
+    }
+
+    #[test]
+    fn quick_commit_refuses_empty_message_and_clean_tree() {
+        let dir = init_repo_with_commit();
+        configure_identity(dir.path());
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(GitWriter::quick_commit(&path, "   ").is_err());
+        assert!(
+            GitWriter::quick_commit(&path, "feat: nothing").is_err(),
+            "a clean tree must not produce a commit"
+        );
+        assert_eq!(head_message(&dir), "init");
+    }
+
+    #[test]
+    fn quick_commit_stages_unstaged_untracked_and_deletions_but_not_ignored() {
+        let dir = init_repo_with_commit();
+        configure_identity(dir.path());
+        let path = dir.path().to_str().unwrap().to_string();
+        std::fs::write(dir.path().join(".gitignore"), "secret.txt\n").unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "do not commit\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "untracked\n").unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "edited\n").unwrap();
+        std::fs::write(dir.path().join("doomed.txt"), "gone soon\n").unwrap();
+        GitWriter::commit_files(
+            &path,
+            "chore: seed extra",
+            &["doomed.txt".into(), ".gitignore".into()],
+        )
+        .expect("seed");
+        std::fs::remove_file(dir.path().join("doomed.txt")).unwrap();
+
+        GitWriter::quick_commit(&path, "feat: everything").expect("quick commit");
+        assert_eq!(head_message(&dir), "feat: everything");
+
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git show");
+        let names = String::from_utf8(show.stdout).unwrap();
+        assert!(
+            names.contains("new.txt"),
+            "untracked file must be committed: {names}"
+        );
+        assert!(
+            names.contains("tracked.txt"),
+            "unstaged edit must be committed: {names}"
+        );
+        assert!(
+            names.contains("doomed.txt"),
+            "deletion must be committed: {names}"
+        );
+        assert!(
+            !names.contains("secret.txt"),
+            "ignored untracked file must stay untracked: {names}"
+        );
+        assert!(dir.path().join("secret.txt").exists());
     }
 
     /// Linked worktrees must share the mutation lock keyed by the common git

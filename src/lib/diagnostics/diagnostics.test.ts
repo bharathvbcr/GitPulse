@@ -7,6 +7,7 @@ import {
   formatDiagnosticReport,
   formatDiagnosticTime,
   installGlobalDiagnostics,
+  isHostRuntimeNoise,
   type DiagnosticEntry,
   type DiagnosticSeverity,
 } from "./diagnostics";
@@ -126,6 +127,83 @@ describe("createDiagnostics", () => {
     const store = createDiagnostics({ storage: null });
     store.error("test", "memory only");
     expect(get(store)).toHaveLength(1);
+  });
+
+  it("does not record host-runtime noise that is not a GitPulse failure", () => {
+    const { store } = makeStore();
+    store.warn(
+      "console",
+      "[TAURI] Couldn't find callback id 2063278846. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
+    );
+    store.warn(
+      "console",
+      "IPC custom protocol failed, Tauri will now use the postMessage interface instead Load failed",
+    );
+    store.error(
+      "console",
+      "[hmr] Failed to reload /src/app.css. This could be due to syntax errors or importing non-existent modules. (see errors above)",
+    );
+    store.error("console", "Importing a module script failed.");
+    store.error("unhandled-rejection", "undefined is not an object (evaluating 'module.default')");
+    store.error("repo", "clone failed");
+    expect(get(store).map((entry) => entry.message)).toEqual(["clone failed"]);
+  });
+
+  it("drops host-runtime noise when restoring a persisted blob", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        {
+          id: 2,
+          at: 2,
+          severity: "warning",
+          source: "console",
+          message:
+            "[TAURI] Couldn't find callback id 1. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
+          count: 12,
+        },
+        {
+          id: 1,
+          at: 1,
+          severity: "error",
+          source: "pane-crash",
+          message: "graph blew up",
+          count: 1,
+        },
+      ]),
+    });
+    const store = createDiagnostics({ storage });
+    expect(get(store).map((entry) => entry.message)).toEqual(["graph blew up"]);
+    expect(JSON.parse(storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "[]")).toEqual([
+      { id: 1, at: 1, severity: "error", source: "pane-crash", message: "graph blew up", count: 1 },
+    ]);
+  });
+});
+
+describe("isHostRuntimeNoise", () => {
+  it("matches the Tauri reload, IPC fallback, and Vite HMR messages from a WKWebView session", () => {
+    const fromDump = [
+      "[TAURI] Couldn't find callback id 3802601472. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
+      "IPC custom protocol failed, Tauri will now use the postMessage interface instead Load failed",
+      "[hmr] Failed to reload /src/lib/components/SettingsModal.svelte. This could be due to syntax errors or importing non-existent modules. (see errors above)",
+      "Importing a module script failed.",
+      "undefined is not an object (evaluating 'module.default')",
+    ];
+    for (const message of fromDump) {
+      expect(isHostRuntimeNoise(message), message).toBe(true);
+    }
+  });
+
+  it("does not swallow product failures that merely mention reload or modules", () => {
+    const keep = [
+      "clone failed",
+      "Couldn't find callback in the rebase plan",
+      "Failed to reload the repository graph",
+      "Importing a patch failed.",
+      "undefined is not an object (evaluating 'commit.defaultBranch')",
+    ];
+    for (const message of keep) {
+      expect(isHostRuntimeNoise(message), message).toBe(false);
+    }
   });
 });
 
@@ -248,6 +326,21 @@ describe("installGlobalDiagnostics", () => {
     expect(recorded[0].message).toContain("promise died");
     expect(recorded[1].message).toBe("syntax goop");
     expect(recorded[2].message).toContain("typed badly");
+    uninstall();
+  });
+
+  it("forwards host-runtime noise to the original console without recording it", () => {
+    const { recorded, originalWarn, originalError, con, target, uninstall } = setup();
+    con.warn(
+      "[TAURI] Couldn't find callback id 1. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
+    );
+    con.error("Importing a module script failed.");
+    target.emit("unhandledrejection", {
+      reason: "undefined is not an object (evaluating 'module.default')",
+    });
+    expect(recorded).toEqual([]);
+    expect(originalWarn).toHaveBeenCalledTimes(1);
+    expect(originalError).toHaveBeenCalled();
     uninstall();
   });
 

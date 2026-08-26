@@ -11,15 +11,15 @@ const source = readFileSync(
 );
 
 describe("HealthPanel source contracts & interactive remediation", () => {
-  it("invokes cmd_terminal_run with step argv and timeoutSecs for remediation steps", () => {
+  it("invokes the scoped Manvi runner for remediation steps", () => {
     expect(source).toContain('invoke<{');
-    expect(source).toContain('"cmd_terminal_run"');
+    expect(source).toContain('"cmd_manvi_run_action"');
+    expect(source).toContain('actionKind: "health"');
     expect(source).toContain("args: step.argv,");
   });
 
   it("extracts plan steps and tokenizes commands safely", () => {
-    expect(source).toContain("extractPlanSteps(plan.text)");
-    expect(source).toContain("tokenizeCommand(firstCmd)");
+    expect(source).toContain("buildRunnablePlanSteps(plan.text)");
   });
 
   it("journals step execution into harnessStore", () => {
@@ -30,6 +30,22 @@ describe("HealthPanel source contracts & interactive remediation", () => {
   it("provides single-step and sequential run-all execution", () => {
     expect(source).toContain("async function runStep");
     expect(source).toContain("async function runAllSteps");
+  });
+
+  it("uses one cancellation guard for a batch and ignores stale step results", () => {
+    const stepBody = source.slice(
+      source.indexOf("async function runStep"),
+      source.indexOf("async function runAllSteps"),
+    );
+    const batchBody = source.slice(
+      source.indexOf("async function runAllSteps"),
+      source.indexOf("async function copyPlan"),
+    );
+    expect(source).toContain("function beginSteps(): AsyncGuard");
+    expect(stepBody).toContain("guard: AsyncGuard");
+    expect(stepBody).toContain("if (!guard.isLive()) return false;");
+    expect(batchBody).toContain("const guard = beginSteps()");
+    expect(batchBody).toContain("runStep(step, guard)");
   });
 
   it("provides navigation to Terminal view and rescan affordances", () => {

@@ -42,9 +42,13 @@ const FALLBACK_CONTEXT_WINDOW: i64 = 32_768;
 /// Tokens held back from the window for the system prompt, the instructions
 /// and the reply itself.
 const RESERVED_TOKENS: i64 = 2_048;
-/// Cap on one reply. Commit messages are short; this is generous for an
-/// explanation and still bounds a model that will not stop.
+/// Cap on concise replies such as commit messages and branch names.
 const MAX_OUTPUT_TOKENS: i64 = 1_024;
+/// Coverage and dependency reports can make thinking-capable models consume
+/// the concise cap before reaching their visible answer. Keep those advisory
+/// replies bounded too, but leave enough room for reasoning plus the requested
+/// plan. The visible answer is still required and reasoning is never promoted.
+const MAX_ADVISORY_OUTPUT_TOKENS: i64 = 4_096;
 /// A local model on a laptop can take a while on first token: the model may
 /// have to be loaded into memory before it generates anything.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(180);
@@ -133,6 +137,15 @@ impl Feature {
             Feature::BranchName => "branch-name",
             Feature::HealthFix => "health-fix",
             Feature::CoverageReport => "coverage-report",
+        }
+    }
+
+    fn max_output_tokens(self) -> i64 {
+        match self {
+            Feature::HealthFix | Feature::CoverageReport => MAX_ADVISORY_OUTPUT_TOKENS,
+            Feature::CommitMessage | Feature::ExplainCommit | Feature::BranchName => {
+                MAX_OUTPUT_TOKENS
+            }
         }
     }
 }
@@ -267,7 +280,7 @@ fn fetch_probe(base_url: &str, model: &str) -> Result<ProbeResult, String> {
         "base_url": base_url,
         "model": model,
         "declared_context_window": FALLBACK_CONTEXT_WINDOW,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "max_output_tokens": MAX_ADVISORY_OUTPUT_TOKENS,
         "timeout_ms": PROBE_TIMEOUT_MS,
     });
     sidecar::call_typed::<ProbeResult>(
@@ -361,6 +374,7 @@ fn run(
 ) -> Result<AiGeneration, String> {
     let started = Instant::now();
     let mut warnings: Vec<String> = Vec::new();
+    let feature_output_cap = feature.max_output_tokens();
 
     // 1. Where to send it.
     let selection = match selection.filter(|s| !s.base_url.is_empty() && !s.model.is_empty()) {
@@ -396,9 +410,9 @@ fn run(
                     ));
                 }
                 let max_output = if info.max_output_tokens > 0 {
-                    info.max_output_tokens.min(MAX_OUTPUT_TOKENS)
+                    info.max_output_tokens.min(feature_output_cap)
                 } else {
-                    MAX_OUTPUT_TOKENS
+                    feature_output_cap
                 };
                 (info.context_window.max(1_024), info.describe, max_output)
             }
@@ -413,7 +427,7 @@ fn run(
                         "{} tokens (declared default, not probed)",
                         FALLBACK_CONTEXT_WINDOW
                     ),
-                    MAX_OUTPUT_TOKENS,
+                    feature_output_cap,
                 )
             }
         };
@@ -802,21 +816,18 @@ pub fn fix_health(
     if report_text.trim().is_empty() {
         return Err("The health report is empty, so there is nothing to plan a fix for.".into());
     }
-    let mut generation = run(Feature::HealthFix, repo_path, selection, |budget| {
-        let budgeted = prompt::budget_text(report_text, budget.min(48_000));
-        Ok(Turn {
-            system: prompt::health_fix_system(),
-            user: prompt::health_fix_user(&budgeted.text),
-            diff: budgeted,
+    run_advisory_with_empty_retry("remediation plan", |retry| {
+        run(Feature::HealthFix, repo_path, selection.clone(), |budget| {
+            let budgeted = prompt::budget_text(report_text, budget.min(48_000));
+            let mut system = prompt::health_fix_system();
+            append_visible_answer_retry(&mut system, retry);
+            Ok(Turn {
+                system,
+                user: prompt::health_fix_user(&budgeted.text),
+                diff: budgeted,
+            })
         })
-    })?;
-    generation.text = prompt::strip_think_tags(&generation.text)
-        .trim()
-        .to_string();
-    if generation.text.is_empty() {
-        return Err("The model returned an empty remediation plan.".into());
-    }
-    Ok(generation)
+    })
 }
 
 /// Asks the local model for an analysis of a rendered test-coverage report.
@@ -832,21 +843,64 @@ pub fn coverage_report(
     if report_text.trim().is_empty() {
         return Err("The coverage report is empty, so there is nothing to analyze.".into());
     }
-    let mut generation = run(Feature::CoverageReport, repo_path, selection, |budget| {
-        let budgeted = prompt::budget_text(report_text, budget.min(48_000));
-        Ok(Turn {
-            system: prompt::coverage_report_system(),
-            user: prompt::coverage_report_user(&budgeted.text),
-            diff: budgeted,
-        })
-    })?;
-    generation.text = prompt::strip_think_tags(&generation.text)
-        .trim()
-        .to_string();
-    if generation.text.is_empty() {
-        return Err("The model returned an empty coverage analysis.".into());
+    run_advisory_with_empty_retry("coverage analysis", |retry| {
+        run(
+            Feature::CoverageReport,
+            repo_path,
+            selection.clone(),
+            |budget| {
+                let budgeted = prompt::budget_text(report_text, budget.min(48_000));
+                let mut system = prompt::coverage_report_system();
+                append_visible_answer_retry(&mut system, retry);
+                Ok(Turn {
+                    system,
+                    user: prompt::coverage_report_user(&budgeted.text),
+                    diff: budgeted,
+                })
+            },
+        )
+    })
+}
+
+/// Some thinking-capable local models occasionally spend a complete turn in
+/// reasoning and return no visible answer. Never promote chain-of-thought into
+/// user-facing text; retry exactly once with an explicit visible-answer
+/// instruction, preserve the first attempt's warnings, and fail loudly if the
+/// second completion is also empty.
+fn run_advisory_with_empty_retry(
+    answer_name: &str,
+    mut generate: impl FnMut(bool) -> Result<AiGeneration, String>,
+) -> Result<AiGeneration, String> {
+    let mut prior_warnings = Vec::new();
+    for retry in [false, true] {
+        let mut generation = generate(retry)?;
+        generation.text = prompt::strip_think_tags(&generation.text)
+            .trim()
+            .to_string();
+        if !generation.text.is_empty() {
+            if retry {
+                prior_warnings.push(format!(
+                    "The first model completion contained no visible {answer_name}; GitPulse retried once."
+                ));
+            }
+            prior_warnings.append(&mut generation.warnings);
+            generation.warnings = prior_warnings;
+            return Ok(generation);
+        }
+        prior_warnings.append(&mut generation.warnings);
     }
-    Ok(generation)
+    Err(format!(
+        "The model returned an empty {answer_name} twice; GitPulse stopped after one bounded retry."
+    ))
+}
+
+fn append_visible_answer_retry(system: &mut String, retry: bool) {
+    if retry {
+        system.push_str(
+            "\nIMPORTANT: The previous completion contained reasoning but no visible answer. \
+             Return the requested visible final answer now; do not return reasoning alone.",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1040,6 +1094,63 @@ mod tests {
         assert_eq!(
             err,
             "The coverage report is empty, so there is nothing to analyze."
+        );
+    }
+
+    #[test]
+    fn advisory_features_have_a_larger_but_bounded_output_budget() {
+        assert_eq!(Feature::CommitMessage.max_output_tokens(), 1_024);
+        assert_eq!(Feature::ExplainCommit.max_output_tokens(), 1_024);
+        assert_eq!(Feature::BranchName.max_output_tokens(), 1_024);
+        assert_eq!(Feature::HealthFix.max_output_tokens(), 4_096);
+        assert_eq!(Feature::CoverageReport.max_output_tokens(), 4_096);
+    }
+
+    #[test]
+    fn advisory_retry_recovers_an_empty_first_visible_reply_without_exposing_reasoning() {
+        let mut attempts = 0;
+        let generation = run_advisory_with_empty_retry("coverage analysis", |retry| {
+            attempts += 1;
+            assert_eq!(retry, attempts == 2);
+            Ok(AiGeneration {
+                text: if retry {
+                    "Visible plan"
+                } else {
+                    "<think>private"
+                }
+                .into(),
+                reasoning: "private reasoning".into(),
+                model: "test-model".into(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+                context_window: 8_192,
+                context_source: "test".into(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                truncated: false,
+                diff_truncated: false,
+                diff_used_bytes: 0,
+                diff_total_bytes: 0,
+                budget: BudgetReport::default(),
+                warnings: vec![format!("attempt {attempts}")],
+                elapsed_ms: 1,
+            })
+        })
+        .expect("second visible answer");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(generation.text, "Visible plan");
+        assert_eq!(generation.reasoning, "private reasoning");
+        assert!(generation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("retried once")));
+        assert_eq!(
+            generation
+                .warnings
+                .iter()
+                .filter(|warning| warning.starts_with("attempt "))
+                .count(),
+            2
         );
     }
 }

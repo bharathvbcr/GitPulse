@@ -14,6 +14,7 @@ describe("SettingsModal", () => {
     expect(body).toContain('role="dialog"');
     expect(body).toContain('aria-label="Theme appearance"');
     expect(body).toContain('aria-label="Branch spacing"');
+    expect(body).toContain('aria-label="Graph width"');
     // Every option is a pressed/unpressed toggle.
     expect(body).toContain('aria-pressed="true"');
     expect(body).toContain('aria-pressed="false"');
@@ -24,6 +25,9 @@ describe("SettingsModal", () => {
     // Density options (sole owner since the FilterBar control moved here).
     expect(body).toContain("Spacious");
     expect(body).toContain("Compact");
+    expect(body).toContain("Balanced");
+    expect(body).toContain("Wide");
+    expect(body).toContain("Full");
   });
 
   it("owns the interface visibility switches", () => {

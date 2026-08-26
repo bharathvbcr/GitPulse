@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { tipTextOf } from "../dom/tipText";
+  import { tipTextOf, tooltipAnchorFromTarget } from "../dom/tipText";
   import { LAYERS } from "../ui/layers";
 
   /**
@@ -16,6 +16,8 @@
    *
    * Shows after a short delay, follows neither mouse nor scroll (scroll hides),
    * flips above the anchor near the viewport bottom, and clamps horizontally.
+   * Canvas targets do not inherit a titled ancestor — the commit graph owns
+   * GraphNodeTooltip, and a gutter layout hint must not replace it.
    * The entrance reuses the shared gp-pop keyframe (disabled under
    * prefers-reduced-motion).
    */
@@ -35,10 +37,8 @@
 
   /** The tooltip text for an element, migrating a native `title` if present. */
   function anchorOf(target: EventTarget | null): HTMLElement | null {
-    if (!(target instanceof Element)) return null;
-    const el = target.closest<HTMLElement>("[title], [data-tip-text]");
-    if (!el) return null;
-    return tipTextOf(el).trim().length > 0 ? el : null;
+    const el = tooltipAnchorFromTarget(target);
+    return el instanceof HTMLElement ? el : null;
   }
 
   function cancelPending() {

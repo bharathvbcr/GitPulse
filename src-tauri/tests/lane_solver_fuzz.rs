@@ -5,38 +5,44 @@
 //! wrapping u64 arithmetic), so any failure prints the seed that reproduces
 //! it. No external property-testing crates are used.
 //!
-//! # Merge fan-out semantics (verified against lane_solver.rs)
+//! # Merge parent placement (verified against lane_solver.rs)
 //!
-//! For a second-or-later parent edge (`is_merge == true`) of row `i` with
-//! parent id `pk`, the solver does exactly one of:
+//! The solver decomposes history into branch segments (maximal first-parent
+//! chains) and gives each segment one column for its entire lifetime by
+//! interval allocation. For a second-or-later parent edge (`is_merge ==
+//! true`) of row `i` with parent id `pk`:
 //!
-//! 1. **Reuse an existing column** — `find_column(pk)` succeeds because some
-//!    earlier row already reserved `pk`. The reused column can sit anywhere
-//!    relative to the merge commit: left of it, on it, or right of it. Only
-//!    one relation is impossible: `to_lane == from_lane`. While iteration
-//!    `k > 0` runs, the merge commit's own lane is either empty (its first
-//!    parent lived elsewhere) or holds `parent_ids[0]`; a *distinct* `pk`
-//!    therefore can never be found there.
-//! 2. **Allocate a fresh column** — `find_column(pk)` fails, so
-//!    `find_or_create_free_column_strictly_after(current_lane + 1)` places
-//!    `pk` at a column `>= current_lane + 1`: strictly right of the merge.
+//! 1. **Owned parent** — some earlier row already reserved `pk`, so the edge
+//!    lands on that segment's column. That segment overlaps the merge row
+//!    (born above it, ending at or below `pk`'s row) while the merge's own
+//!    segment also covers row `i`; two overlapping segments can never share
+//!    a column, so `to_lane != from_lane` — UNLESS `pk` duplicates
+//!    `parent_ids[0]`, whose continuation legitimately holds the merge's own
+//!    column.
+//! 2. **Fresh parent** — no reservation exists. Normally a new segment is
+//!    born at the merge row and interval allocation may place it left of,
+//!    or right of, the merge (never on it — the two segments overlap).
+//!    The exception: when the merge's FIRST parent is dead (empty id, out
+//!    of window, or malformed), the first fresh live merged-in parent
+//!    continues the merge's own segment straight down, so `to_lane ==
+//!    from_lane` is then the correct, compact outcome.
 //!
-//! From the output alone the two cases are indistinguishable, but the input
-//! tells them apart: `pk` has a reserved column at row `i` iff some earlier
-//! row mentioned `pk` as a parent (a reservation for a still-pending commit
-//! cannot be freed while later references remain). Hence the encoded
-//! invariant:
+//! Hence the encoded invariant keeps only what holds in every case:
 //!
-//! - `pk != parent_ids[0]` and no earlier row mentions `pk` → `to_lane > from_lane`
-//!   (fresh allocation must be strictly-after);
-//! - `pk != parent_ids[0]` and some earlier row mentions `pk` → `to_lane != from_lane`
-//!   (pre-existing column, left or right but never the merge's own lane);
-//! - `pk == parent_ids[0]` (duplicated first parent) → unconstrained; landing
-//!   on the merge's own lane is the legitimate outcome, because iteration 0
-//!   just placed `pk` there.
+//! - `pk != parent_ids[0]`, some earlier row mentions `pk`, → `to_lane !=
+//!   from_lane` (owned by an overlapping segment);
+//! - anything else → unconstrained relative to `from_lane`.
 //!
-//! Asserting plain `to_lane >= from_lane` (or `>`) on all merge edges would be
-//! wrong: pre-existing columns left of the merge are legal by design.
+//! # Width (verified independently from the output)
+//!
+//! Columns are reserved for a segment's whole visual lifetime — including
+//! rows where only its closing connector is still descending, and the stub
+//! row under a window-cut tail. Greedy interval allocation in birth order
+//! is optimal for interval graphs, so the graph's width must EQUAL the peak
+//! number of concurrently occupied columns, where "occupied" is
+//! reconstructed from the output alone: a node, a pass-through lane, an
+//! in-flight connector, or a dangling stub. Wider means columns leak;
+//! narrower is impossible (pigeonhole).
 
 use gitpulse_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
 
@@ -82,8 +88,12 @@ fn make_node(id: String, parent_ids: Vec<String>, tick: i64) -> RawCommitNode {
 /// 3..=6 @5%. Multi-parent nodes duplicate their first parent ~2% of the time
 /// (the same id twice in one list), which exercises the duplicate-parent path.
 fn generate_history(seed: u64) -> GeneratedHistory {
+    generate_history_sized(seed, 120)
+}
+
+fn generate_history_sized(seed: u64, max_nodes: u64) -> GeneratedHistory {
     let mut rng = Lcg(seed ^ 0x9E37_79B9_7F4A_7C15);
-    let node_count = (1 + rng.below(120)) as usize;
+    let node_count = (1 + rng.below(max_nodes)) as usize;
     let mut commits = Vec::with_capacity(node_count);
 
     for i in 0..node_count {
@@ -154,7 +164,7 @@ fn generate_history_with_ghost_parents(seed: u64) -> GeneratedHistory {
         }
 
         let ghosted = parent_count > 0 && rng.below(100) < 25;
-        let parent_ids: Vec<String> = if ghosted {
+        let mut parent_ids: Vec<String> = if ghosted {
             (0..parent_count)
                 .map(|_| {
                     ghost_counter += 1;
@@ -164,6 +174,11 @@ fn generate_history_with_ghost_parents(seed: u64) -> GeneratedHistory {
         } else {
             picks.into_iter().map(|p| format!("n{p}")).collect()
         };
+        // Corrupt/truncated parent ids must dangle without allocating a column.
+        if !parent_ids.is_empty() && rng.below(100) < 8 {
+            let slot = rng.below(parent_ids.len() as u64) as usize;
+            parent_ids[slot] = String::new();
+        }
 
         commits.push(make_node(format!("n{i}"), parent_ids, 1_000 - i as i64));
     }
@@ -292,6 +307,12 @@ fn check_all_invariants(
                         conn.to_row_offset
                     ));
                 }
+                if pk.is_empty() && conn.to_lane != conn.from_lane {
+                    fail(
+                        "empty parent id allocated a column instead of stubbing on the child lane"
+                            .into(),
+                    );
+                }
                 continue;
             }
 
@@ -329,22 +350,78 @@ fn check_all_invariants(
                 // Unconstrained by design: iteration 0 just placed pk on (or
                 // found pk already occupying) some column, and iteration k
                 // finds that same column again.
-            } else if mentioned_earlier {
-                if conn.to_lane == conn.from_lane {
-                    fail(
-                        "pre-existing merged-in parent landed on the merge commit's own lane"
-                            .into(),
-                    );
-                }
-            } else if conn.to_lane <= conn.from_lane {
-                fail(format!(
-                    "freshly allocated merged-in branch landed at/left of the merge lane \
-                     (strictly-after placement violated): to={}",
-                    conn.to_lane
-                ));
+            } else if mentioned_earlier && conn.to_lane == conn.from_lane {
+                fail("pre-existing merged-in parent landed on the merge commit's own lane".into());
+            }
+            // Fresh second parents are first-fit: they may reuse a hole
+            // left of the merge. Compactness is checked separately.
+        }
+    }
+}
+
+/// Width == peak concurrent occupancy, reconstructed from the output alone.
+///
+/// A column is occupied at a row when a node sits on it, a pass-through
+/// lane crosses it, a connector is in flight through it (a merge peel
+/// descending on `to_lane`, or a closing/continuing edge descending on
+/// `from_lane`), or a dangling stub protrudes into it from the row above.
+/// The union of these per column is exactly the interval the solver
+/// reserves, so greedy interval allocation makes the graph EXACTLY
+/// `max_occupancy` columns wide: wider means a reservation leaked; narrower
+/// is impossible by pigeonhole.
+fn assert_width_is_peak_occupancy(rows: &[VisualCommitRow], seed: u64, label: &str) {
+    let n = rows.len();
+    if n == 0 {
+        return;
+    }
+    let high_water = rows
+        .iter()
+        .flat_map(|r| {
+            std::iter::once(r.lane)
+                .chain(r.active_lanes.iter().copied())
+                .chain(r.connections.iter().map(|c| c.to_lane))
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut occupied: Vec<std::collections::HashSet<u32>> = rows
+        .iter()
+        .map(|r| {
+            let mut set: std::collections::HashSet<u32> = r.active_lanes.iter().copied().collect();
+            set.insert(r.lane);
+            set
+        })
+        .collect();
+    for (i, row) in rows.iter().enumerate() {
+        for conn in &row.connections {
+            if conn.is_dangling {
+                // The fading stub protrudes into the row below the commit.
+                let below = (i + 1).min(n - 1);
+                occupied[below].insert(conn.from_lane);
+                continue;
+            }
+            let target = i + conn.to_row_offset as usize;
+            if target >= n {
+                continue;
+            }
+            let lane = if conn.is_merge {
+                conn.to_lane
+            } else {
+                conn.from_lane
+            };
+            for slot in occupied.iter_mut().take(target + 1).skip(i) {
+                slot.insert(lane);
             }
         }
     }
+    let peak = occupied.iter().map(|s| s.len()).max().unwrap_or(0) as u32;
+    assert_eq!(
+        high_water + 1,
+        peak,
+        "{label} seed={seed}: width {} != peak concurrent occupancy {}",
+        high_water + 1,
+        peak
+    );
 }
 
 /// Solves with a fresh solver, checks every invariant, and returns the rows
@@ -369,6 +446,7 @@ fn randomized_dag_invariants_hold_across_seeds() {
         let palette = 1 + (seed % 24) as u32;
 
         let rows = assert_all_invariants(&history, palette, false, seed, "randomized_dag");
+        assert_width_is_peak_occupancy(&rows, seed, "randomized_dag");
 
         // DETERMINISM: same input, fresh solver, identical output.
         let again = LaneSolver::new(palette).solve(&history.commits);
@@ -381,10 +459,11 @@ fn randomized_dag_invariants_hold_across_seeds() {
 
 #[test]
 fn dangling_parent_edges_stay_stubs_across_seeds() {
-    const SEEDS: u64 = 128;
+    const SEEDS: u64 = 256;
     for seed in 10_000..10_000 + SEEDS {
         let history = generate_history_with_ghost_parents(seed);
-        assert_all_invariants(&history, 12, true, seed, "dangling_fuzz");
+        let rows = assert_all_invariants(&history, 12, true, seed, "dangling_fuzz");
+        assert_width_is_peak_occupancy(&rows, seed, "dangling_fuzz");
     }
 }
 
@@ -424,7 +503,7 @@ fn solver_state_does_not_leak_between_solves() {
 /// the duplicated edge is labelled a merge, resolves endpoint-correctly, and
 /// both occurrences converge on the same column — the merge commit's own
 /// lane here, which is why the general invariant forbids `to_lane ==
-/// from_lane` only for distinct non-pre-existing parents.
+/// from_lane` only for distinct *pre-existing* parents.
 #[test]
 fn duplicate_first_parent_merge_edge_converges_on_one_column() {
     let m = make_node("m".into(), vec!["p".into(), "p".into()], 100);
@@ -449,4 +528,122 @@ fn duplicate_first_parent_merge_edge_converges_on_one_column() {
         dup.to_lane, merge_row.lane,
         "duplicate first parent reuses the merge commit's own lane"
     );
+}
+
+/// Truncating the window is how every real page load works (`max_commits`,
+/// filters). It must only turn edges into dangling stubs — never move an
+/// edge to a different row, and never dangle an edge whose parent is still
+/// inside the window. Prefix rows keep their indices, so the two solves are
+/// directly comparable connection by connection.
+#[test]
+fn windowed_prefix_solves_agree_on_edge_structure() {
+    const SEEDS: u64 = 96;
+    for seed in 30_000..30_000 + SEEDS {
+        let history = generate_history(seed);
+        let n = history.commits.len();
+        let full = LaneSolver::new(12).solve(&history.commits);
+        for w in [1, n / 3, n / 2, n.saturating_sub(1), n] {
+            if w == 0 || w > n {
+                continue;
+            }
+            let prefix: Vec<RawCommitNode> = history.commits[..w].to_vec();
+            let rows = LaneSolver::new(12).solve(&prefix);
+            assert_eq!(rows.len(), w, "seed={seed} w={w}: prefix row count");
+            for (i, row) in rows.iter().enumerate() {
+                for (k, conn) in row.connections.iter().enumerate() {
+                    let f = &full[i].connections[k];
+                    let live_in_window = !f.is_dangling && (i + f.to_row_offset as usize) < w;
+                    if live_in_window {
+                        assert!(
+                            !conn.is_dangling,
+                            "seed={seed} w={w} row={i} k={k}: in-window edge became a stub"
+                        );
+                        assert_eq!(
+                            conn.to_row_offset, f.to_row_offset,
+                            "seed={seed} w={w} row={i} k={k}: truncation moved an edge"
+                        );
+                    } else {
+                        assert!(
+                            conn.is_dangling,
+                            "seed={seed} w={w} row={i} k={k}: edge outlived its window"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Opt-in deep fuzz: an order of magnitude more seeds plus larger DAGs
+/// than the always-on suites. Run explicitly with:
+/// `cargo test --test lane_solver_fuzz --release -- --ignored`
+/// Set `DEEP_FUZZ_SCALE=<k>` to multiply every seed count by `k`.
+#[test]
+#[ignore = "deep fuzz; heavy CPU — run explicitly"]
+fn deep_fuzz_many_seeds_and_large_dags() {
+    let scale: u64 = std::env::var("DEEP_FUZZ_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(1);
+    for seed in 0..4_000 * scale {
+        let history = generate_history(seed);
+        let palette = 1 + (seed % 24) as u32;
+        let rows = assert_all_invariants(&history, palette, false, seed, "deep_small");
+        assert_width_is_peak_occupancy(&rows, seed, "deep_small");
+    }
+    for seed in 40_000_000..40_000_000 + 800 * scale {
+        let history = generate_history_sized(seed, 600);
+        let rows = assert_all_invariants(&history, 12, false, seed, "deep_large");
+        assert_width_is_peak_occupancy(&rows, seed, "deep_large");
+    }
+    for seed in 60_000_000..60_000_000 + 2_000 * scale {
+        let history = generate_history_with_ghost_parents(seed);
+        let rows = assert_all_invariants(&history, 12, true, seed, "deep_ghost");
+        assert_width_is_peak_occupancy(&rows, seed, "deep_ghost");
+    }
+}
+
+#[test]
+fn reversed_history_does_not_panic_and_marks_back_edges_dangling() {
+    const SEEDS: u64 = 40;
+    for seed in 0..SEEDS {
+        let history = generate_history(seed);
+        let mut reversed = history.commits.clone();
+        reversed.reverse();
+        let rows = LaneSolver::new(12).solve(&reversed);
+        assert_eq!(
+            rows.len(),
+            reversed.len(),
+            "reversed seed={seed} changed row count"
+        );
+        let index: std::collections::HashMap<&str, usize> = reversed
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.as_str(), i))
+            .collect();
+        for (i, commit) in reversed.iter().enumerate() {
+            assert_eq!(rows[i].connections.len(), commit.parent_ids.len());
+            for (k, parent) in commit.parent_ids.iter().enumerate() {
+                if parent.is_empty() {
+                    assert!(rows[i].connections[k].is_dangling);
+                    continue;
+                }
+                match index.get(parent.as_str()) {
+                    Some(&pidx) if pidx > i => {
+                        assert!(
+                            !rows[i].connections[k].is_dangling,
+                            "reversed seed={seed} row {i} dangled a later parent"
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            rows[i].connections[k].is_dangling,
+                            "reversed seed={seed} row {i} drew a back-edge as live"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -900,10 +900,7 @@ pub(crate) fn run_bounded(
                 if start.elapsed() > timeout {
                     kill_process_tree(&mut child);
                     let _ = child.wait();
-                    break Err(format!(
-                        "{label}{TIMEOUT_MARKER}{}s",
-                        timeout.as_secs()
-                    ));
+                    break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs()));
                 }
                 thread::sleep(Duration::from_millis(15));
             }
@@ -1317,7 +1314,10 @@ mod tests {
         let path_formatted = format!("/usr/bin/sleep{TIMEOUT_MARKER}3s");
         assert!(is_timeout_error("/usr/bin/sleep", &path_formatted));
         // A spawn failure with unrelated text must not classify as a timeout…
-        assert!(!is_timeout_error("sleep", "Failed to spawn sleep: No such file"));
+        assert!(!is_timeout_error(
+            "sleep",
+            "Failed to spawn sleep: No such file"
+        ));
         // …and another program's timeout must not match either.
         assert!(!is_timeout_error("git", &formatted));
     }

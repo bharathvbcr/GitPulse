@@ -10,12 +10,14 @@ import {
   RECLAIM_GRACE_MS,
   attachChildLifetime,
   defaultRepoRoot,
+  devCspForPort,
   findFreePort,
   formatResolveMessage,
   isDevServerCommand,
   isInsideRepo,
   isPortFree,
   isTauriDevArgs,
+  isTauriHookEnv,
   killPid,
   parseEtimeToMs,
   parseLsofPids,
@@ -242,7 +244,34 @@ describe("tauri config helpers", () => {
     ]);
     expect(tauriConfigForPort(5181)).toEqual({
       build: { devUrl: "http://localhost:5181" },
+      app: { security: { devCsp: devCspForPort(5181) } },
     });
+    expect(devCspForPort(5181)["connect-src"]).toContain("ws://localhost:5181");
+    expect(devCspForPort(5181)["script-src"]).toContain("http://127.0.0.1:5181");
+  });
+
+  it("keeps generated dev CSP in lockstep with tauri.conf.json at the preferred port", () => {
+    const conf = JSON.parse(
+      readFileSync(path.join(repoRoot, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { app: { security: { devCsp: Record<string, string> } } };
+    expect(devCspForPort(PREFERRED_DEV_PORT)).toEqual(conf.app.security.devCsp);
+  });
+
+  it("detects the Tauri beforeDevCommand hook env that disables WKWebView HMR", () => {
+    expect(isTauriHookEnv({})).toBe(false);
+    expect(isTauriHookEnv({ TAURI_ENV_PLATFORM: "darwin" })).toBe(true);
+    expect(isTauriHookEnv({ TAURI_ENV_DEBUG: "true" })).toBe(true);
+    expect(isTauriHookEnv({ TAURI_ENV_ARCH: "aarch64" })).toBe(true);
+  });
+
+  it("forces a full reload in the Tauri webview instead of ESM HMR", () => {
+    const source = readFileSync(path.join(repoRoot, "vite.config.ts"), "utf8");
+    expect(source).toContain("gitpulse-tauri-full-reload");
+    expect(source).toContain("isTauriHookEnv");
+    expect(source).toContain('type: "full-reload"');
+    expect(source).toContain('order: "pre"');
+    expect(source).toContain("hotUpdate:");
+    expect(source).toContain("hmr: !isTauriHookEnv()");
   });
 
   it("detects tauri dev vs help", () => {

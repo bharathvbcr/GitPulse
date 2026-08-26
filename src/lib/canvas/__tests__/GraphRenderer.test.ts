@@ -8,6 +8,7 @@ import {
   type VisualCommitRow,
 } from "../GraphRenderer";
 import { getBranchColor, BRANCH_PALETTE } from "../Palette";
+import { canvasPointFromClient } from "../graphInteraction";
 
 function createMockContext(): CanvasRenderingContext2D {
   return {
@@ -98,6 +99,66 @@ describe("GraphRenderer and Palette", () => {
     expect(renderer.getLaneX(3)).toBe(20 + 3 * 26);
   });
 
+  it("hit-tests a later-lane branch node using the gutter pan conversion", () => {
+    const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
+    const rows: VisualCommitRow[] = [
+      {
+        id: "branch-tip",
+        parent_ids: [],
+        summary: "Tip of a side branch",
+        author_name: "Dev",
+        author_email: "dev@example.com",
+        timestamp: 1000,
+        lane: 8,
+        color_index: 8,
+        active_lanes: [0, 1, 2, 3, 4, 5, 6, 7, 8],
+        active_lane_colors: [0, 8],
+        connections: [],
+        is_merge: false,
+        is_root: false,
+      },
+    ];
+    // Lane 8 is at content x = 20 + 8*26 = 228. After a 200px pan the node
+    // sits at client x=128 in a viewport whose left is 100.
+    const { x, y } = canvasPointFromClient(128, 18, {
+      left: 100,
+      top: 0,
+      scrollLeft: 200,
+    });
+    expect(x).toBe(228);
+    expect(renderer.getCommitAtPoint(x, y, rows, 0, 1, 0)?.id).toBe("branch-tip");
+    // The pre-fix conversion (client - viewport.left, no scrollLeft) misses.
+    expect(renderer.getCommitAtPoint(128 - 100, 18, rows, 0, 1, 0)).toBeNull();
+  });
+
+  it("hit-tests a gapped logical lane at its stable column, holes preserved", () => {
+    const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
+    const rows: VisualCommitRow[] = [
+      {
+        id: "gapped",
+        parent_ids: [],
+        summary: "Side branch beyond a hole",
+        author_name: "Dev",
+        author_email: "dev@example.com",
+        timestamp: 1000,
+        lane: 8,
+        color_index: 8,
+        active_lanes: [0, 8],
+        active_lane_colors: [0, 8],
+        connections: [],
+        is_merge: false,
+        is_root: false,
+      },
+    ];
+    // Lanes are stable columns: the branch draws and hit-tests at its own
+    // solver index even when the columns between it and the mainline are
+    // empty. Hovering the hole itself must hit nothing.
+    const logicalX = renderer.getLaneX(8);
+    expect(renderer.laneXForRow(rows[0], 8)).toBe(logicalX);
+    expect(renderer.getCommitAtPoint(logicalX, 18, rows, 0, 1, 0)?.id).toBe("gapped");
+    expect(renderer.getCommitAtPoint(renderer.getLaneX(4), 18, rows, 0, 1, 0)).toBeNull();
+  });
+
   it("identifies commit node at point correctly", () => {
     const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
     const rows: VisualCommitRow[] = [
@@ -156,6 +217,71 @@ describe("GraphRenderer and Palette", () => {
     expect(miss).toBeNull();
   });
 
+  it("hit-tests the branch lane along the whole row, not only the node disc", () => {
+    const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
+    const rows: VisualCommitRow[] = [
+      {
+        id: "c1",
+        parent_ids: [],
+        summary: "Commit 1",
+        author_name: "Dev",
+        author_email: "dev@example.com",
+        timestamp: 1000,
+        lane: 0,
+        color_index: 0,
+        active_lanes: [0],
+        active_lane_colors: [0],
+        connections: [],
+        is_merge: false,
+        is_root: true,
+      },
+    ];
+    // 16px above the 5px disc used to miss; it is still on this row's lane.
+    expect(renderer.getCommitAtPoint(20, 2, rows, 0, 1, 0)?.id).toBe("c1");
+  });
+
+  it("hit-tests a pass-through branch at the occupant commit, not the row it crosses", () => {
+    const renderer = new GraphRenderer({ rowHeight: 36, laneWidth: 26, originX: 20 });
+    const rows: VisualCommitRow[] = [
+      {
+        id: "feature",
+        parent_ids: [],
+        summary: "Feature tip",
+        author_name: "Dev",
+        author_email: "dev@example.com",
+        timestamp: 1000,
+        lane: 8,
+        color_index: 8,
+        active_lanes: [0, 8],
+        active_lane_colors: [0, 8],
+        connections: [],
+        is_merge: false,
+        is_root: false,
+      },
+      {
+        id: "main",
+        parent_ids: [],
+        summary: "Mainline",
+        author_name: "Dev",
+        author_email: "dev@example.com",
+        timestamp: 999,
+        lane: 0,
+        color_index: 0,
+        active_lanes: [0, 8],
+        active_lane_colors: [0, 8],
+        connections: [],
+        is_merge: false,
+        is_root: true,
+      },
+    ];
+    const branchX = renderer.laneXForRow(rows[1], 8);
+    const mainX = renderer.laneXForRow(rows[1], 0);
+    expect(branchX).not.toBe(mainX);
+    expect(renderer.getCommitAtPoint(branchX, renderer.getRowY(1, 0), rows, 0, 2, 0)?.id).toBe(
+      "feature",
+    );
+    expect(renderer.getCommitAtPoint(mainX, renderer.getRowY(1, 0), rows, 0, 2, 0)?.id).toBe("main");
+  });
 
   it("renders linear commit history with straight vertical lines and nodes", () => {
     const renderer = new GraphRenderer();
@@ -768,5 +894,43 @@ describe("long connectors: strip/overlay ownership split", () => {
     // edge spans rows 5-300, viewport shows y of rows 350+ only.
     renderer.drawLongConnectors(ctx, rows, 350, 370, 350 * 36, 36, {});
     expect(ctx.stroke).not.toHaveBeenCalled();
+  });
+
+  it("binds long-connector corner ownership to each connection, not a sibling merge flag", () => {
+    // Two long edges to the same parent row: a closing first-parent hop
+    // (corner at the parent) and a merge hop (peel under the child). Using
+    // `.some(is_merge)` on the sibling list made both peel at the start.
+    const renderer = new GraphRenderer();
+    const n = 100;
+    const rows: VisualCommitRow[] = Array.from({ length: n }, (_, i) => ({
+      id: `c${i}`,
+      parent_ids: [],
+      summary: `Commit ${i}`,
+      author_name: "Dev",
+      author_email: "dev@example.com",
+      timestamp: 1000 - i,
+      lane: i === 0 ? 2 : 0,
+      color_index: 0,
+      active_lanes: [0],
+      active_lane_colors: [0],
+      connections: [],
+      is_merge: i === 0,
+      is_root: i === n - 1,
+    }));
+    rows[0].connections = [
+      { from_lane: 2, to_lane: 0, to_row_offset: 90, is_merge: false, color_index: 0 },
+      { from_lane: 2, to_lane: 5, to_row_offset: 90, is_merge: true, color_index: 1 },
+    ];
+    const bezierEndYs: number[] = [];
+    const ctx = createMockContext();
+    (ctx.bezierCurveTo as ReturnType<typeof vi.fn>).mockImplementation(
+      (...args: number[]) => {
+        bezierEndYs.push(args[5]);
+      },
+    );
+    const scroll = 85 * 36;
+    renderer.drawLongConnectors(ctx, rows, 85, 95, scroll, 800, {});
+    const parentY = renderer.getRowY(90, scroll);
+    expect(bezierEndYs.some((y) => Math.abs(y - parentY) < 0.5)).toBe(true);
   });
 });

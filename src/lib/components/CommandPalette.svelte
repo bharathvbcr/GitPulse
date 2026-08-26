@@ -9,6 +9,7 @@
   import { themeStore } from "../stores/themeStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { askText, promptState } from "../stores/modalStore";
+  import { promptQuickCommit } from "../commit/quickCommit";
   import {
     backdropFade,
     backdropFadeOut,
@@ -18,7 +19,7 @@
   import { isImeComposition } from "../keyboard/imeGuard";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { GitBranch, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug, Terminal, CircleUserRound } from "lucide-svelte";
+  import { GitBranch, GitCommit, Moon, RefreshCw, Plus, Search, Download, Upload, Layers, Percent, ShieldAlert, FolderOpen, FolderGit2, X, Bug, Terminal, CircleUserRound } from "lucide-svelte";
 
   let isOpen = $state(false);
   let query = $state("");
@@ -101,6 +102,12 @@
     ...viewCommands,
     { id: "stash", label: "Stash Working Tree", icon: Layers, action: () => repoStore.stashSave() },
     { id: "stash_pop", label: "Pop Stash", icon: Layers, action: () => repoStore.stashPop() },
+    {
+      id: "quick_commit",
+      label: "Quick Commit…",
+      icon: GitCommit,
+      action: () => void promptQuickCommit(),
+    },
     {
       id: "diagnostics",
       label: "Open Diagnostics",

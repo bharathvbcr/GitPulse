@@ -11,6 +11,11 @@ export interface CoverageFamilyStatus {
   expected_formats: string[];
   expected_paths: string[];
   found: boolean;
+  suggested_commands: string[];
+  setup_commands: string[];
+  tool_ready: boolean;
+  tool_detail: string;
+  duration_hint: string;
 }
 
 export interface CoverageArtifact {

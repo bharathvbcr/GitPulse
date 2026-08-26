@@ -1,6 +1,6 @@
 //! Terminal execution module: PTY session management and bounded command execution.
 
-use crate::engine::git_cli::{run_captured, validate_repo, RunOutcome};
+use crate::engine::git_cli::{run_captured, sandbox_join_canonical, validate_repo, RunOutcome};
 use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -8,7 +8,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +21,41 @@ const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-stream output tail cap (64 KB).
 const TERMINAL_TAIL_CAP_BYTES: usize = 64 * 1024;
+/// Command payload bounds. These protect both the process launcher and the
+/// policy sidecar from an IPC caller sending an effectively unbounded argv.
+const TERMINAL_ARG_COUNT_CAP: usize = 256;
+const TERMINAL_ARG_BYTES_CAP: usize = 16 * 1024;
+const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
+/// Interactive terminal resource bounds. The PTY is user-owned, but its IPC
+/// surface must not permit unbounded processes, allocations, or resize work.
+const MAX_PTY_SESSIONS: usize = 16;
+const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+const MAX_PTY_ROWS: u16 = 1_000;
+const MAX_PTY_COLS: u16 = 1_000;
+
+/// Why a model-authored command is being requested. The value is not merely
+/// telemetry: it selects a purpose-specific allowlist before any process is
+/// spawned, so a coverage *analysis* plan cannot become a package install and
+/// a remediation plan cannot become an arbitrary shell. Coverage *generation*
+/// may install one locked crate (`cargo-llvm-cov`) and add `llvm-tools-preview`
+/// when the scanner planned that setup; it still cannot install arbitrary crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManviActionKind {
+    Health,
+    Coverage,
+    CoverageGenerator,
+}
+
+impl ManviActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Health => "health remediation",
+            Self::Coverage => "coverage analysis",
+            Self::CoverageGenerator => "coverage generation",
+        }
+    }
+}
 
 /// Result of one-shot command execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +105,48 @@ struct SessionEntry {
 #[derive(Default, Clone)]
 pub struct TerminalSessions {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    active_sessions: Arc<AtomicUsize>,
+}
+
+struct SessionReservation {
+    active_sessions: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl SessionReservation {
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.active_sessions.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, String> {
+    state
+        .active_sessions
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MAX_PTY_SESSIONS).then_some(current + 1)
+        })
+        .map_err(|_| format!("Terminal session limit reached ({MAX_PTY_SESSIONS})"))?;
+    Ok(SessionReservation {
+        active_sessions: state.active_sessions.clone(),
+        armed: true,
+    })
+}
+
+fn bounded_pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows: rows.clamp(1, MAX_PTY_ROWS),
+        cols: cols.clamp(1, MAX_PTY_COLS),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
 }
 
 /// Determines the default shell for interactive sessions.
@@ -146,13 +223,9 @@ pub fn spawn_session(
     cols: u16,
 ) -> Result<TerminalSpawned, String> {
     let repo = validate_repo(repo_path)?;
+    let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
-    let size = PtySize {
-        rows: rows.max(1),
-        cols: cols.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
-    };
+    let size = bounded_pty_size(rows, cols);
     let pair = pty_system
         .openpty(size)
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
@@ -206,8 +279,9 @@ pub fn spawn_session(
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
     let sessions_map = state.sessions.clone();
+    let active_sessions = state.active_sessions.clone();
 
-    thread::Builder::new()
+    let reader_thread = thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
         .spawn(move || {
             let mut buf = [0u8; 4096];
@@ -239,7 +313,11 @@ pub fn spawn_session(
             let mut guard = sessions_map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.remove(&sid_for_exit);
+            let removed = guard.remove(&sid_for_exit).is_some();
+            drop(guard);
+            if removed {
+                active_sessions.fetch_sub(1, Ordering::AcqRel);
+            }
 
             // Reap the shell and report its real exit status.
             finalize_pty_session(
@@ -251,8 +329,16 @@ pub fn spawn_session(
                     }
                 },
             );
-        })
-        .map_err(|e| format!("Failed to spawn PTY reader thread: {e}"))?;
+        });
+    if let Err(e) = reader_thread {
+        let mut guard = state
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&session_id);
+        return Err(format!("Failed to spawn PTY reader thread: {e}"));
+    }
+    reservation.commit();
 
     Ok(TerminalSpawned {
         id: session_id,
@@ -267,6 +353,12 @@ pub fn write_to_session(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
+    if data.len() > MAX_PTY_INPUT_BYTES {
+        return Err(format!(
+            "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}",
+            data.len()
+        ));
+    }
     let mut guard = state
         .sessions
         .lock()
@@ -298,12 +390,7 @@ pub fn resize_session(
         .lock()
         .map_err(|e| format!("Lock error: {e}"))?;
     if let Some(session) = guard.get(session_id) {
-        let size = PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        };
+        let size = bounded_pty_size(rows, cols);
         session
             .master
             .resize(size)
@@ -326,6 +413,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
         .lock()
         .map_err(|e| format!("Lock error: {e}"))?;
     if let Some(mut session) = guard.remove(session_id) {
+        state.active_sessions.fetch_sub(1, Ordering::AcqRel);
         session.dead.store(true, Ordering::SeqCst);
         // Best-effort signal; a failure here is logged but must not fail the
         // kill — dropping the PTY master still hangs up the slave side.
@@ -345,9 +433,38 @@ pub fn run_terminal(
     args: &[String],
     timeout_secs: Option<u64>,
 ) -> Result<TerminalRunResult, String> {
+    run_terminal_inner(repo_path, args, timeout_secs, None)
+}
+
+/// Executes one command proposed by MANVI's local-model plane.
+///
+/// This is deliberately separate from [`run_terminal`], the user-owned
+/// console. The app chooses the purpose, the backend validates the command
+/// against that purpose, and every accepted command reaches the MANVI command
+/// gate (not only Git). The allowlist remains authoritative because host
+/// posture can demote a sidecar allowlist miss to an allow.
+pub fn run_manvi_action(
+    repo_path: &str,
+    args: &[String],
+    action_kind: ManviActionKind,
+    timeout_secs: Option<u64>,
+) -> Result<TerminalRunResult, String> {
+    validate_manvi_action(args, action_kind)?;
+    let repo = validate_repo(repo_path)?;
+    validate_manvi_paths(&repo, args, action_kind)?;
+    run_terminal_inner(repo_path, args, timeout_secs, Some(action_kind))
+}
+
+fn run_terminal_inner(
+    repo_path: &str,
+    args: &[String],
+    timeout_secs: Option<u64>,
+    manvi_action: Option<ManviActionKind>,
+) -> Result<TerminalRunResult, String> {
     if args.is_empty() {
         return Err("No command provided".into());
     }
+    validate_argv_bounds(args)?;
     let repo = validate_repo(repo_path)?;
     let program = &args[0];
     if program.trim().is_empty() {
@@ -366,7 +483,8 @@ pub fn run_terminal(
         || program.ends_with("\\git")
         || program.ends_with("\\git.exe")
         || program.ends_with("/git.exe");
-    let (policy_verdict, gated) = if is_git {
+    let should_gate = is_git || manvi_action.is_some();
+    let (policy_verdict, gated) = if should_gate {
         match guard_command(repo_path, &arg_refs) {
             Ok(verdict) => (Some(verdict), true),
             Err(refusal) => {
@@ -418,6 +536,453 @@ pub fn run_terminal(
         }),
         Err(e) => Err(e),
     }
+}
+
+fn validate_argv_bounds(args: &[String]) -> Result<(), String> {
+    if args.len() > TERMINAL_ARG_COUNT_CAP {
+        return Err(format!(
+            "Command has {} arguments; the limit is {TERMINAL_ARG_COUNT_CAP}",
+            args.len()
+        ));
+    }
+    let mut total = 0usize;
+    for arg in args {
+        if arg.len() > TERMINAL_ARG_BYTES_CAP {
+            return Err(format!(
+                "Command argument is {} bytes; the per-argument limit is {TERMINAL_ARG_BYTES_CAP}",
+                arg.len()
+            ));
+        }
+        if arg.chars().any(char::is_control) {
+            return Err("Command arguments cannot contain control characters".into());
+        }
+        total = total.saturating_add(arg.len());
+        if total > TERMINAL_ARGV_BYTES_CAP {
+            return Err(format!(
+                "Command argv exceeds the {TERMINAL_ARGV_BYTES_CAP}-byte limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_program(program: &str) -> String {
+    let lower = program.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".cmd"))
+        .or_else(|| lower.strip_suffix(".bat"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+fn has_parent_or_absolute_path(value: &str) -> bool {
+    let candidate = value.split_once('=').map_or(value, |(_, rhs)| rhs);
+    if candidate.is_empty() || candidate.starts_with('-') {
+        return false;
+    }
+    let path = std::path::Path::new(candidate);
+    path.is_absolute()
+        || candidate.starts_with("\\\\")
+        || candidate.as_bytes().get(1) == Some(&b':')
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
+fn command_is_one_of(args: &[String], allowed: &[&str]) -> bool {
+    args.get(1)
+        .map(|arg| allowed.contains(&arg.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Coverage generation may mutate the host toolchain in exactly one way:
+/// `cargo install cargo-llvm-cov --locked` (flag order may swap). Extra
+/// crates, `--git`, `--path`, or a missing `--locked` are refused. Analysis
+/// (`Coverage`) never calls this.
+fn cargo_llvm_cov_install_allowed(args: &[String]) -> bool {
+    if args.get(1).map(String::as_str) != Some("install") {
+        return false;
+    }
+    let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+    rest.len() == 2 && rest.contains(&"--locked") && rest.contains(&"cargo-llvm-cov")
+}
+
+fn rustup_llvm_tools_allowed(args: &[String]) -> bool {
+    args.len() == 4
+        && args.get(1).map(String::as_str) == Some("component")
+        && args.get(2).map(String::as_str) == Some("add")
+        && args.get(3).map(String::as_str) == Some("llvm-tools-preview")
+}
+
+fn npm_run_is_verification(args: &[String]) -> bool {
+    let Some(script) = args.get(2).map(|s| s.to_ascii_lowercase()) else {
+        return false;
+    };
+    [
+        "test", "check", "lint", "cover", "coverage", "audit", "verify", "ci",
+    ]
+    .iter()
+    .any(|needle| {
+        script == *needle
+            || script
+                .strip_prefix(needle)
+                .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with('-'))
+    })
+}
+
+fn local_js_runner(args: &[String], flag_index: usize) -> bool {
+    matches!(
+        (
+            args.get(flag_index).map(String::as_str),
+            args.get(flag_index + 1).map(String::as_str)
+        ),
+        (
+            Some("--no" | "--no-install"),
+            Some("vitest" | "jest" | "c8" | "nyc")
+        )
+    )
+}
+
+fn build_tool_tasks_allowed(args: &[String], kind: ManviActionKind) -> bool {
+    let mut saw_task = false;
+    for raw in args.iter().skip(1) {
+        let arg = raw.to_ascii_lowercase();
+        if matches!(
+            arg.as_str(),
+            "--no-daemon" | "--stacktrace" | "--info" | "--quiet" | "--offline" | "-q"
+        ) {
+            continue;
+        }
+        saw_task = true;
+        let allowed = match kind {
+            ManviActionKind::Health => matches!(
+                arg.as_str(),
+                "clean"
+                    | "test"
+                    | "check"
+                    | "verify"
+                    | "build"
+                    | "dependencyupdates"
+                    | "dependency:tree"
+                    | "versions:display-dependency-updates"
+                    | "versions:use-latest-releases"
+            ),
+            ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => matches!(
+                arg.as_str(),
+                "clean"
+                    | "test"
+                    | "check"
+                    | "verify"
+                    | "jacocotestreport"
+                    | "jacoco:test"
+                    | "jacoco:report"
+                    | "koverxmlreport"
+                    | "koverhtmlreport"
+            ),
+        };
+        if !allowed {
+            return false;
+        }
+    }
+    saw_task
+}
+
+fn node_package_command_allowed(args: &[String], kind: ManviActionKind) -> bool {
+    let Some(subcommand) = args.get(1).map(|s| s.to_ascii_lowercase()) else {
+        return false;
+    };
+    match kind {
+        ManviActionKind::Health => match subcommand.as_str() {
+            "audit" | "outdated" | "update" | "upgrade" | "install" | "ci" | "test" => true,
+            "run" => npm_run_is_verification(args),
+            _ => false,
+        },
+        ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => match subcommand.as_str()
+        {
+            "test" => true,
+            "run" => npm_run_is_verification(args),
+            // npm exec may otherwise download a missing package. `--no` makes
+            // this a local-dependency-only execution on supported npm builds.
+            "exec" => local_js_runner(args, 2),
+            _ => false,
+        },
+    }
+}
+
+fn python_module_allowed(args: &[String], kind: ManviActionKind) -> bool {
+    if args.get(1).map(String::as_str) != Some("-m") {
+        return false;
+    }
+    let module = args.get(2).map(|s| s.to_ascii_lowercase());
+    match kind {
+        ManviActionKind::Health => match module.as_deref() {
+            Some("pip") => command_is_one_of(&args[2..], &["check", "list", "audit"]),
+            Some("pip_audit" | "pytest") => true,
+            _ => false,
+        },
+        ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => match module.as_deref() {
+            Some("pytest") => true,
+            Some("coverage") => command_is_one_of(
+                &args[2..],
+                &["run", "report", "html", "xml", "json", "lcov"],
+            ),
+            _ => false,
+        },
+    }
+}
+
+/// Backend authority boundary for commands originating in model text.
+///
+/// This intentionally validates shapes, not exact package names: reports can
+/// cover any ecosystem and package. Program families and verbs are bounded,
+/// shells/network/file utilities are absent, paths cannot be absolute or walk
+/// upward, and the separate MANVI policy gate still judges every accepted
+/// command immediately before execution.
+fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("MANVI action has no command".into());
+    }
+    validate_argv_bounds(args).map_err(|e| format!("MANVI action refused: {e}"))?;
+
+    let program_raw = args[0].trim();
+    let repo_wrapper = matches!(
+        program_raw,
+        "./gradlew" | ".\\gradlew.bat" | "./mvnw" | ".\\mvnw.cmd"
+    );
+    if !repo_wrapper
+        && (program_raw.contains('/')
+            || program_raw.contains('\\')
+            || has_parent_or_absolute_path(program_raw))
+    {
+        return Err(format!(
+            "MANVI {} action refused: executable paths are not allowed",
+            kind.label()
+        ));
+    }
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| has_parent_or_absolute_path(arg))
+    {
+        return Err(format!(
+            "MANVI {} action refused: arguments must stay inside the open repository",
+            kind.label()
+        ));
+    }
+    if args.iter().skip(1).any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        ["http:", "https:", "file:", "git:", "git+", "ssh:"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+    }) {
+        return Err(format!(
+            "MANVI {} action refused: external URLs and transports are not allowed",
+            kind.label()
+        ));
+    }
+    if args.iter().skip(1).any(|arg| {
+        matches!(
+            arg.to_ascii_lowercase().as_str(),
+            "-g" | "--global" | "--user" | "--system" | "--location=global"
+        )
+    }) {
+        return Err(format!(
+            "MANVI {} action refused: global package-environment mutation is not allowed",
+            kind.label()
+        ));
+    }
+
+    let program = normalized_program(program_raw);
+    let allowed = match program.as_str() {
+        "npm" | "pnpm" | "yarn" | "bun" => node_package_command_allowed(args, kind),
+        "npx" => {
+            matches!(
+                kind,
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+            ) && local_js_runner(args, 1)
+        }
+        "cargo" => match kind {
+            ManviActionKind::Health => command_is_one_of(
+                args,
+                &["audit", "update", "test", "check", "clippy", "tree"],
+            ),
+            ManviActionKind::Coverage => {
+                command_is_one_of(args, &["llvm-cov", "tarpaulin", "test", "nextest"])
+            }
+            ManviActionKind::CoverageGenerator => {
+                command_is_one_of(args, &["llvm-cov", "tarpaulin", "test", "nextest"])
+                    || cargo_llvm_cov_install_allowed(args)
+            }
+        },
+        "rustup" => kind == ManviActionKind::CoverageGenerator && rustup_llvm_tools_allowed(args),
+        "python" | "python3" | "py" => python_module_allowed(args, kind),
+        "pip" | "pip3" => {
+            kind == ManviActionKind::Health && command_is_one_of(args, &["check", "list", "audit"])
+        }
+        "pip-audit" => kind == ManviActionKind::Health,
+        "pytest" => {
+            matches!(
+                kind,
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+            ) || kind == ManviActionKind::Health
+        }
+        "coverage" => {
+            matches!(
+                kind,
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+            ) && command_is_one_of(args, &["run", "report", "html", "xml", "json", "lcov"])
+        }
+        "go" => match kind {
+            ManviActionKind::Health => command_is_one_of(args, &["get", "mod", "test", "list"]),
+            ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => {
+                command_is_one_of(args, &["test"])
+            }
+        },
+        "govulncheck" => kind == ManviActionKind::Health,
+        "composer" => {
+            kind == ManviActionKind::Health
+                && command_is_one_of(
+                    args,
+                    &["audit", "update", "require", "install", "show", "test"],
+                )
+        }
+        "bundle" | "bundler" => match args.get(1).map(String::as_str) {
+            Some("audit" | "update" | "install" | "check") => kind == ManviActionKind::Health,
+            Some("exec") => {
+                kind == ManviActionKind::Health
+                    && args.get(2).is_some_and(|tool| {
+                        matches!(tool.as_str(), "rake" | "rspec" | "bundler-audit")
+                    })
+            }
+            _ => false,
+        },
+        "dotnet" => match kind {
+            ManviActionKind::Health => {
+                command_is_one_of(args, &["add", "remove", "list", "restore", "test"])
+            }
+            ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => {
+                command_is_one_of(args, &["test"])
+            }
+        },
+        "mvn" | "mvnw" | "./mvnw" | ".\\mvnw" | "gradle" | "gradlew" | "./gradlew"
+        | ".\\gradlew" => build_tool_tasks_allowed(args, kind),
+        "phpunit" => matches!(
+            kind,
+            ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+        ),
+        _ => false,
+    };
+
+    if !allowed {
+        return Err(format!(
+            "MANVI {} action refused: '{}' is outside the purpose-specific command allowlist",
+            kind.label(),
+            crate::harness::render_command(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves every path-bearing option the supported tools can write or read.
+/// Lexical checks above reject obvious `/` and `..` escapes; canonical
+/// resolution here also refuses a repository symlink that points outside.
+fn validate_manvi_paths(
+    repo: &std::path::Path,
+    args: &[String],
+    kind: ManviActionKind,
+) -> Result<(), String> {
+    const NEXT_PATH_FLAGS: &[&str] = &[
+        "--manifest-path",
+        "--output-path",
+        "--junitxml",
+        "--cov-config",
+        "--rcfile",
+        "--requirement",
+        "--constraint",
+        "-r",
+        "-c",
+    ];
+    const PREFIX_PATH_FLAGS: &[&str] = &[
+        "--manifest-path=",
+        "--output-path=",
+        "--junitxml=",
+        "--cov-config=",
+        "--rcfile=",
+        "--requirement=",
+        "--constraint=",
+        "-coverprofile=",
+    ];
+
+    let program_raw = args.first().map(String::as_str).unwrap_or_default();
+    if matches!(
+        program_raw,
+        "./gradlew" | ".\\gradlew.bat" | "./mvnw" | ".\\mvnw.cmd"
+    ) {
+        let normalized = program_raw.replace('\\', "/");
+        let relative = normalized.strip_prefix("./").unwrap_or(&normalized);
+        let wrapper = sandbox_join_canonical(repo, relative).map_err(|e| {
+            format!(
+                "MANVI {} action refused: wrapper '{}' escapes the open repository: {e}",
+                kind.label(),
+                program_raw
+            )
+        })?;
+        if !wrapper.is_file() {
+            return Err(format!(
+                "MANVI {} action refused: wrapper '{}' is not a repository file",
+                kind.label(),
+                program_raw
+            ));
+        }
+    }
+
+    let mut path_values: Vec<&str> = Vec::new();
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if NEXT_PATH_FLAGS.contains(&arg.as_str()) {
+            let value = args.get(index + 1).ok_or_else(|| {
+                format!(
+                    "MANVI {} action refused: {arg} requires a repository-relative path",
+                    kind.label()
+                )
+            })?;
+            path_values.push(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = PREFIX_PATH_FLAGS
+            .iter()
+            .find_map(|prefix| arg.strip_prefix(prefix))
+        {
+            path_values.push(value);
+        }
+        // pytest's `--cov-report=xml:path` carries a path after the format.
+        if let Some(value) = arg.strip_prefix("--cov-report=") {
+            if let Some((_, path)) = value.split_once(':') {
+                path_values.push(path);
+            }
+        }
+        index += 1;
+    }
+
+    for value in path_values {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "MANVI {} action refused: output/input path cannot be empty",
+                kind.label()
+            ));
+        }
+        sandbox_join_canonical(repo, value).map_err(|e| {
+            format!(
+                "MANVI {} action refused: path '{}' escapes the open repository: {e}",
+                kind.label(),
+                value
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +1051,367 @@ mod tests {
         assert!(res.stdout_tail.contains("hello gitpulse"));
         assert!(res.policy.is_none());
         assert!(!res.gated);
+    }
+
+    #[test]
+    fn manvi_health_actions_refuse_arbitrary_processes_and_repo_escape() {
+        for argv in [
+            vec!["rm".into(), "-rf".into(), ".".into()],
+            vec!["sh".into(), "-c".into(), "npm audit fix".into()],
+            vec!["curl".into(), "https://example.com".into()],
+            vec![
+                "npm".into(),
+                "install".into(),
+                "https://example.com/pkg.tgz".into(),
+            ],
+            vec![
+                "npm".into(),
+                "--prefix".into(),
+                "/tmp/outside".into(),
+                "install".into(),
+            ],
+            vec!["../tool".into(), "audit".into()],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::Health).unwrap_err();
+            assert!(
+                err.contains("MANVI"),
+                "refusal must name the authority boundary: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_actions_cannot_mutate_global_package_environments() {
+        for argv in [
+            vec![
+                "npm".into(),
+                "install".into(),
+                "--global".into(),
+                "eslint".into(),
+            ],
+            vec!["npm".into(), "install".into(), "-g".into(), "eslint".into()],
+            vec![
+                "python3".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "requests".into(),
+            ],
+            vec!["pip".into(), "install".into(), "requests".into()],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::Health)
+                .expect_err("global/environment package mutation must be refused");
+            assert!(err.contains("MANVI"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn python_module_actions_are_verb_scoped() {
+        validate_manvi_action(
+            &[
+                "python3".into(),
+                "-m".into(),
+                "coverage".into(),
+                "run".into(),
+                "-m".into(),
+                "pytest".into(),
+            ],
+            ManviActionKind::Coverage,
+        )
+        .unwrap();
+        let err = validate_manvi_action(
+            &[
+                "python3".into(),
+                "-m".into(),
+                "coverage".into(),
+                "erase".into(),
+            ],
+            ManviActionKind::Coverage,
+        )
+        .expect_err("coverage cleanup is not coverage generation");
+        assert!(err.contains("allowlist"), "{err}");
+    }
+
+    #[test]
+    fn manvi_health_actions_allow_remediation_and_verification_shapes() {
+        for argv in [
+            vec!["npm".into(), "audit".into(), "fix".into()],
+            vec!["cargo".into(), "update".into(), "-p".into(), "serde".into()],
+            vec!["python3".into(), "-m".into(), "pip".into(), "check".into()],
+            vec!["go".into(), "test".into(), "./...".into()],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::Health).unwrap();
+        }
+    }
+
+    #[test]
+    fn manvi_coverage_actions_are_purpose_limited() {
+        validate_manvi_action(
+            &["cargo".into(), "llvm-cov".into(), "--workspace".into()],
+            ManviActionKind::Coverage,
+        )
+        .unwrap();
+        validate_manvi_action(
+            &["pytest".into(), "--cov".into(), "--cov-report=xml".into()],
+            ManviActionKind::CoverageGenerator,
+        )
+        .unwrap();
+        let err = validate_manvi_action(
+            &["npm".into(), "install".into(), "left-pad".into()],
+            ManviActionKind::Coverage,
+        )
+        .unwrap_err();
+        assert!(err.contains("coverage"));
+    }
+
+    #[test]
+    fn allowlist_keywords_cannot_be_smuggled_behind_a_different_action() {
+        for argv in [
+            vec![
+                "npx".into(),
+                "--no-install".into(),
+                "hostile-runner".into(),
+                "vitest".into(),
+            ],
+            vec!["npm".into(), "run".into(), "contest-deploy".into()],
+            vec!["./gradlew".into(), "publish".into(), "test".into()],
+            vec!["mvn".into(), "deploy".into(), "verify".into()],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err("an allowed keyword must not bless a different executable/task");
+            assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn coverage_generator_allowlist_accepts_scanner_planned_commands() {
+        for argv in [
+            vec!["npm".into(), "run".into(), "coverage".into()],
+            vec![
+                "npx".into(),
+                "--no-install".into(),
+                "vitest".into(),
+                "run".into(),
+                "--coverage".into(),
+            ],
+            vec![
+                "npx".into(),
+                "--no-install".into(),
+                "jest".into(),
+                "--coverage".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "llvm-cov".into(),
+                "--manifest-path".into(),
+                "src-tauri/Cargo.toml".into(),
+                "--workspace".into(),
+                "--lcov".into(),
+                "--output-path".into(),
+                "src-tauri/lcov.info".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "llvm-cov".into(),
+                "--workspace".into(),
+                "--lcov".into(),
+                "--output-path".into(),
+                "lcov.info".into(),
+            ],
+            vec!["pytest".into(), "--cov".into(), "--cov-report=xml".into()],
+            vec![
+                "go".into(),
+                "test".into(),
+                "./...".into(),
+                "-coverprofile=coverage.out".into(),
+            ],
+            vec!["./gradlew".into(), "test".into(), "jacocoTestReport".into()],
+            vec!["mvn".into(), "verify".into()],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
+        }
+        let npx_without_no_install = validate_manvi_action(
+            &[
+                "npx".into(),
+                "vitest".into(),
+                "run".into(),
+                "--coverage".into(),
+            ],
+            ManviActionKind::CoverageGenerator,
+        )
+        .unwrap_err();
+        assert!(
+            npx_without_no_install.contains("allowlist"),
+            "npx must require --no-install: {npx_without_no_install}"
+        );
+    }
+
+    // REGRESSION GUARD: repo-local wrapper spellings are the only executable
+    // paths the allowlist accepts. Path validation must still canonicalize the
+    // wrapper itself, or ./gradlew can be a symlink to an executable outside
+    // the open repository.
+    #[cfg(unix)]
+    #[test]
+    fn coverage_wrapper_symlink_escape_is_refused() {
+        let repo = TempDir::new().unwrap();
+        init_test_repo(repo.path());
+        let outside = TempDir::new().unwrap();
+        let executable = outside.path().join("gradlew");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::os::unix::fs::symlink(&executable, repo.path().join("gradlew")).unwrap();
+        let argv = vec!["./gradlew".into(), "test".into(), "jacocoTestReport".into()];
+
+        validate_manvi_action(&argv, ManviActionKind::CoverageGenerator).unwrap();
+        let err = validate_manvi_paths(repo.path(), &argv, ManviActionKind::CoverageGenerator)
+            .expect_err("outside wrapper symlink must be refused");
+        assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[test]
+    fn coverage_generator_allowlist_accepts_locked_llvm_cov_setup() {
+        for argv in [
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "cargo-llvm-cov".into(),
+                "--locked".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "--locked".into(),
+                "cargo-llvm-cov".into(),
+            ],
+            vec![
+                "rustup".into(),
+                "component".into(),
+                "add".into(),
+                "llvm-tools-preview".into(),
+            ],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
+            let analysis = validate_manvi_action(&argv, ManviActionKind::Coverage)
+                .expect_err("analysis must not install tools");
+            assert!(analysis.contains("allowlist"), "{argv:?}: {analysis}");
+            let health = validate_manvi_action(&argv, ManviActionKind::Health)
+                .expect_err("health must not install llvm-cov");
+            assert!(health.contains("allowlist"), "{argv:?}: {health}");
+        }
+    }
+
+    #[test]
+    fn coverage_generator_allowlist_refuses_arbitrary_cargo_install() {
+        for argv in [
+            vec!["cargo".into(), "install".into(), "cargo-llvm-cov".into()],
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "cargo-tarpaulin".into(),
+                "--locked".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "cargo-llvm-cov".into(),
+                "--locked".into(),
+                "left-pad".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "cargo-llvm-cov".into(),
+                "--locked".into(),
+                "--git".into(),
+                "https://example.invalid/llvm-cov.git".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "install".into(),
+                "--path".into(),
+                ".".into(),
+                "cargo-llvm-cov".into(),
+            ],
+            vec![
+                "rustup".into(),
+                "component".into(),
+                "add".into(),
+                "rust-src".into(),
+            ],
+            vec![
+                "rustup".into(),
+                "toolchain".into(),
+                "install".into(),
+                "nightly".into(),
+            ],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err("arbitrary toolchain mutation must stay refused");
+            assert!(
+                err.contains("allowlist") || err.contains("URL") || err.contains("transports"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn manvi_action_argv_is_bounded_and_control_character_free() {
+        let oversized = vec![
+            "npm".into(),
+            "test".into(),
+            "x".repeat(TERMINAL_ARG_BYTES_CAP + 1),
+        ];
+        assert!(validate_manvi_action(&oversized, ManviActionKind::Coverage).is_err());
+        assert!(validate_manvi_action(
+            &["npm".into(), "test\nforged-log".into()],
+            ManviActionKind::Coverage,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn allowed_non_git_manvi_action_is_always_gated() {
+        let dir = TempDir::new().unwrap();
+        init_test_repo(dir.path());
+        let result = run_manvi_action(
+            dir.path().to_str().unwrap(),
+            &["npm".into(), "test".into()],
+            ManviActionKind::Health,
+            Some(5),
+        )
+        .expect("an allowed shape should run to an ordinary process result");
+        assert!(
+            result.gated,
+            "model-authored non-git commands must reach MANVI"
+        );
+        assert!(
+            result.policy.is_some(),
+            "a gated action must retain its verdict"
+        );
+        assert_ne!(
+            result.exit_code,
+            Some(0),
+            "the fixture has no package.json test script"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manvi_path_options_refuse_symlink_escape() {
+        let dir = TempDir::new().unwrap();
+        init_test_repo(dir.path());
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("coverage-link")).unwrap();
+        let repo = validate_repo(dir.path().to_str().unwrap()).unwrap();
+        let args = vec![
+            "cargo".into(),
+            "llvm-cov".into(),
+            "--output-path".into(),
+            "coverage-link/lcov.info".into(),
+        ];
+        let err = validate_manvi_paths(&repo, &args, ManviActionKind::Coverage).unwrap_err();
+        assert!(err.contains("escapes the open repository"), "{err}");
     }
 
     #[test]
@@ -669,5 +1595,38 @@ mod tests {
     fn kill_session_of_unknown_id_is_ok_noop() {
         let state = TerminalSessions::default();
         assert!(kill_session(&state, "term-missing").is_ok());
+    }
+
+    #[test]
+    fn pty_dimensions_are_clamped_at_both_boundaries() {
+        let minimum = bounded_pty_size(0, 0);
+        assert_eq!((minimum.rows, minimum.cols), (1, 1));
+
+        let maximum = bounded_pty_size(u16::MAX, u16::MAX);
+        assert_eq!((maximum.rows, maximum.cols), (MAX_PTY_ROWS, MAX_PTY_COLS));
+    }
+
+    #[test]
+    fn oversized_pty_input_is_refused_before_session_lookup() {
+        let state = TerminalSessions::default();
+        let input = "x".repeat(MAX_PTY_INPUT_BYTES + 1);
+        let err = write_to_session(&state, "term-missing", &input).unwrap_err();
+        assert!(err.contains("input"), "{err}");
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn pty_session_reservations_are_globally_bounded() {
+        let state = TerminalSessions::default();
+        let reservations: Vec<_> = (0..MAX_PTY_SESSIONS)
+            .map(|_| reserve_session(&state).expect("within cap"))
+            .collect();
+        let err = reserve_session(&state).err().expect("cap must refuse");
+        assert!(err.contains("limit"), "{err}");
+        drop(reservations);
+        assert!(
+            reserve_session(&state).is_ok(),
+            "released slots must be reusable"
+        );
     }
 }

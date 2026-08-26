@@ -56,6 +56,7 @@ interface Row {
   author_email: string;
   lane: number;
   active_lanes: number[];
+  active_lane_colors?: number[];
 }
 
 function row(overrides: Partial<Row> & { id: string }): Row {
@@ -109,7 +110,12 @@ describe("filterRowsWithLanes", () => {
     ];
     const result = filterRowsWithLanes(rows, parseFilterQuery("type:fix"));
     expect(result.rows.map((r) => r.id)).toEqual(["b2"]);
-    expect(result.maxActiveLane).toBe(5);
+    // Lane 5 only appeared as a through-column on this row; its occupant
+    // was filtered out, so it is dropped rather than renamed. The survivor
+    // packs onto column 0.
+    expect(result.maxActiveLane).toBe(0);
+    expect(result.rows[0].lane).toBe(0);
+    expect(result.rows[0].active_lanes).toEqual([0]);
   });
 
   it("reports zero lanes for an empty or fully-filtered set", () => {
@@ -184,9 +190,110 @@ describe("filterRowsWithLanes", () => {
     expect(edge.to_row_offset).toBe(1);
   });
 
-  it("remaps merge edges by parent identity, preserving lane geometry", () => {
-    // Connection k ↔ parent_ids[k] is the solver's contract; lanes and
-    // colors are per-row state that must NOT change under filtering.
+  it("densifies surviving lanes so a filter cannot leave a wide empty gutter", () => {
+    // Solver lanes are baked against the FULL history. Dropping the rows that
+    // occupied 1..7 used to leave a survivor on lane 8, so measureWidth
+    // still reserved nine columns and connectors ran horizontally across
+    // empty space. The visible set only uses two columns — pack them.
+    const rows = [
+      graphRow({
+        id: "tip",
+        summary: "keep tip",
+        lane: 0,
+        active_lanes: [0, 8],
+        parent_ids: ["base"],
+        connections: [conn({ from_lane: 0, to_lane: 8, to_row_offset: 2 })],
+      }),
+      graphRow({
+        id: "noise",
+        summary: "drop me",
+        lane: 3,
+        active_lanes: [3],
+      }),
+      graphRow({
+        id: "base",
+        summary: "keep base",
+        lane: 8,
+        active_lanes: [8],
+      }),
+    ];
+    const result = filterRowsWithLanes(rows, parseFilterQuery("keep"));
+    expect(result.rows.map((r) => r.id)).toEqual(["tip", "base"]);
+    expect(result.maxActiveLane).toBe(1);
+    expect(result.rows[0].lane).toBe(0);
+    expect(result.rows[0].connections[0].to_lane).toBe(1);
+    expect(result.rows[1].lane).toBe(1);
+    expect(result.rows[0].active_lanes).toEqual([0, 1]);
+  });
+
+  it("drops through-lanes whose occupant was filtered out, then densifies", () => {
+    // active_lanes records every column that passed through the row in the
+    // FULL history. After the occupant of lane 3 is gone, leaving it in the
+    // array paints a ghost vertical and, after densify-by-rename, a spare
+    // column that no surviving commit occupies.
+    const rows = [
+      graphRow({
+        id: "tip",
+        summary: "keep tip",
+        lane: 0,
+        active_lanes: [0, 3, 8],
+        active_lane_colors: [10, 11, 12],
+        parent_ids: ["base"],
+        connections: [conn({ from_lane: 0, to_lane: 8, to_row_offset: 2 })],
+      }),
+      graphRow({
+        id: "ghost-branch",
+        summary: "drop me",
+        lane: 3,
+        active_lanes: [3],
+        active_lane_colors: [11],
+      }),
+      graphRow({
+        id: "base",
+        summary: "keep base",
+        lane: 8,
+        active_lanes: [8],
+        active_lane_colors: [12],
+      }),
+    ];
+    const result = filterRowsWithLanes(rows, parseFilterQuery("keep"));
+    expect(result.rows.map((r) => r.id)).toEqual(["tip", "base"]);
+    expect(result.maxActiveLane).toBe(1);
+    expect(result.rows[0].active_lanes).toEqual([0, 1]);
+    expect(result.rows[0].active_lane_colors).toEqual([10, 12]);
+    expect(result.rows[0].connections[0].to_lane).toBe(1);
+  });
+
+  it("does not keep a dangling parent's column in the gutter", () => {
+    // Stubs are drawn on from_lane. A to_lane that only existed for the
+    // dropped parent must not survive densify and widen measureWidth.
+    const rows = [
+      graphRow({
+        id: "tip",
+        summary: "keep tip",
+        lane: 0,
+        active_lanes: [0],
+        parent_ids: ["gone"],
+        connections: [conn({ from_lane: 0, to_lane: 9, to_row_offset: 1 })],
+      }),
+      graphRow({
+        id: "gone",
+        summary: "drop me",
+        lane: 9,
+        active_lanes: [9],
+      }),
+    ];
+    const result = filterRowsWithLanes(rows, parseFilterQuery("keep"));
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].connections[0].is_dangling).toBe(true);
+    expect(result.rows[0].connections[0].to_lane).toBe(0);
+    expect(result.maxActiveLane).toBe(0);
+  });
+
+  it("remaps merge edges by parent identity, then densifies leftover columns", () => {
+    // Connection k ↔ parent_ids[k] is the solver's contract; colors stay
+    // per-row. Lane *indices* are renamed onto 0..k-1 so dropped columns
+    // cannot keep the gutter wide.
     const rows = [
       graphRow({
         id: "m",
@@ -210,8 +317,10 @@ describe("filterRowsWithLanes", () => {
     expect(firstParent.from_lane).toBe(0);
     // side sat at original index 4, two rows were removed before it: 4-0=2.
     expect(secondParent.to_row_offset).toBe(2);
-    // Lane geometry survives untouched — only index arithmetic shifts.
-    expect(secondParent.to_lane).toBe(4);
+    // Distinct columns stay distinct; unused indices (1..3) are squeezed so
+    // the original to_lane 4 becomes 1.
+    expect(secondParent.to_lane).toBe(1);
+    expect(secondParent.to_lane).not.toBe(firstParent.to_lane);
     expect(secondParent.is_merge).toBe(true);
     expect(secondParent.color_index).toBe(7);
   });

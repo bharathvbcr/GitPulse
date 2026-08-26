@@ -56,9 +56,10 @@ describe("lane-run pool integrity across renders", () => {
     renderer.render(ctx, targetRows, 0, targetRows.length, 0);
 
     const tracks = collectVerticalTracks(calls);
-    // Pass-through lanes 1 and 3 → x=20 and x=40, each spanning all 3 rows.
-    // Under the bug, one of these runs recycled the OTHER's object and both
-    // stroked identical geometry (one lane's track disappeared or duplicated).
+    // Pass-through lanes 1 and 3 draw at their own stable columns → x=20
+    // and x=40, each spanning all 3 rows. Under the bug, one of these runs
+    // recycled the OTHER's object and both stroked identical geometry (one
+    // lane's track disappeared or duplicated).
     const laneOne = tracks.filter((t) => t.x === 20);
     const laneThree = tracks.filter((t) => t.x === 40);
     expect(laneOne.length).toBeGreaterThanOrEqual(1);

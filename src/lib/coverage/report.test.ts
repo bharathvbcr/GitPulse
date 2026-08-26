@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatCoverageReport } from "./report";
+import {
+  buildCoverageIssueDraft,
+  formatCoverageReport,
+  formatFailedCoverageDiagnostics,
+  type FailedCoverageScript,
+} from "./report";
 import type {
   CoverageArtifact,
   CoverageFamilyStatus,
@@ -56,6 +61,11 @@ function family(overrides: Partial<CoverageFamilyStatus> = {}): CoverageFamilySt
     expected_formats: ["lcov.info", "cobertura.xml"],
     expected_paths: ["target/lcov.info"],
     found: true,
+    suggested_commands: [],
+    setup_commands: [],
+    tool_ready: true,
+    tool_detail: "",
+    duration_hint: "",
     ...overrides,
   };
 }
@@ -135,12 +145,43 @@ describe("formatCoverageReport", () => {
     expect(text).toContain("82.0% (410/500 lines) [SCAN TRUNCATED — results partial]");
   });
 
+  it("labels cumulative Rust workspace runs separately from fallback generators", () => {
+    const report = representativeReport();
+    report.families = [
+      family({
+        found: false,
+        suggested_commands: ["cargo llvm-cov --manifest-path one/Cargo.toml", "cargo llvm-cov --manifest-path two/Cargo.toml"],
+      }),
+      family({
+        family: "javascript",
+        found: false,
+        suggested_commands: ["npm run coverage", "npx --no-install vitest run --coverage"],
+      }),
+    ];
+
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain("`cargo llvm-cov --manifest-path one/Cargo.toml` then `cargo llvm-cov --manifest-path two/Cargo.toml`");
+    expect(text).toContain("`npm run coverage` or `npx --no-install vitest run --coverage`");
+  });
+
   it("renders hostile percentages as 0.0%", () => {
     for (const bad of [Number.NaN, -1, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]) {
       const report = representativeReport();
       report.overall = { ...report.overall, percentage: bad };
       expect(formatCoverageReport(report, "/repo")).toContain("0.0% (410/500 lines)");
     }
+  });
+
+  it("clamps impossible finite percentages and counts", () => {
+    const report = representativeReport();
+    report.overall = {
+      lines_hit: Number.MAX_VALUE,
+      lines_found: Number.MAX_VALUE,
+      percentage: 1234,
+    };
+    expect(formatCoverageReport(report, "/repo")).toContain(
+      `100.0% (${Number.MAX_SAFE_INTEGER}/${Number.MAX_SAFE_INTEGER} lines)`,
+    );
   });
 
   it("renders hostile counts as 0 without throwing", () => {
@@ -211,6 +252,59 @@ describe("formatCoverageReport", () => {
     expect(text.indexOf("FAMILIES WITHOUT REPORT")).toBeLessThan(text.indexOf("- javascript"));
   });
 
+  it("names the scanner-planned generate commands for families without a report", () => {
+    const report = representativeReport();
+    report.families = [
+      family({
+        family: "rust",
+        found: false,
+        suggested_commands: [
+          "cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info",
+        ],
+      }),
+      family({
+        family: "javascript",
+        found: false,
+        suggested_commands: ["npm run coverage", "npx --no-install jest --coverage"],
+      }),
+    ];
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain(
+      "- rust (expected: lcov.info, cobertura.xml) — run `cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info`",
+    );
+    expect(text).toContain(
+      "- javascript (expected: lcov.info, cobertura.xml) — run `npm run coverage` or `npx --no-install jest --coverage`",
+    );
+  });
+
+  it("names a missing generator toolchain and its setup commands", () => {
+    const report = representativeReport();
+    report.families = [
+      family({
+        family: "rust",
+        found: false,
+        tool_ready: false,
+        tool_detail: "cargo-llvm-cov is not installed.",
+        duration_hint:
+          "Installing cargo-llvm-cov and generating Rust coverage can take several minutes.",
+        setup_commands: [
+          "rustup component add llvm-tools-preview",
+          "cargo install cargo-llvm-cov --locked",
+        ],
+        suggested_commands: [
+          "cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info",
+        ],
+      }),
+    ];
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain("cargo-llvm-cov is not installed.");
+    expect(text).toContain("setup `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked`");
+    expect(text).toContain(
+      "run `cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info`",
+    );
+    expect(text).toContain("several minutes");
+  });
+
   it("renders a fully empty report as a zeroed header block without throwing", () => {
     const empty = {} as CoverageReport;
     const emptyText = formatCoverageReport(empty, "/repo");
@@ -244,5 +338,119 @@ describe("formatCoverageReport", () => {
     report.families = [null as unknown as CoverageFamilyStatus];
     const text = formatCoverageReport(report, "/repo");
     expect(text.split("\n")[0]).toBe("Coverage report — /repo");
+  });
+});
+
+describe("buildCoverageIssueDraft", () => {
+  it("creates a bounded issue without leaking the local checkout path", () => {
+    const repo = "/Users/example/Secret Checkout";
+    const draft = buildCoverageIssueDraft(
+      representativeReport(),
+      repo,
+      `Inspect ${repo}/src/main.py and add edge-case tests.`,
+    );
+
+    expect(draft.title).toBe("test(coverage): address 82.0% line coverage");
+    expect(draft.body).toContain("<!-- gitpulse:coverage-report:v1 -->");
+    expect(draft.body).toContain("## Coverage snapshot");
+    expect(draft.body).toContain("## MANVI analysis");
+    expect(draft.body).toContain("<repository>/src/main.py");
+    expect(draft.body).not.toContain(repo);
+    expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
+    expect(draft.clipped).toBe(false);
+  });
+
+  it("marks partial scans in the title and keeps producer controls literal", () => {
+    const report = representativeReport();
+    report.truncated = true;
+    report.files[0]!.path = "src/injected.ts\n## forged heading\u0007";
+    const draft = buildCoverageIssueDraft(report, "/repo");
+
+    expect(draft.title).toContain("(partial scan)");
+    expect(draft.body).toContain("src/injected.ts\\n## forged heading\\u{0007}");
+    expect(draft.body).not.toContain("src/injected.ts\n## forged heading");
+  });
+
+  it("clips hostile multi-byte MANVI prose by UTF-8 bytes with an explicit note", () => {
+    const draft = buildCoverageIssueDraft(representativeReport(), "/repo", "🧪".repeat(40_000));
+    expect(draft.clipped).toBe(true);
+    expect(draft.body).toContain("GitPulse clipped this draft");
+    expect(new TextEncoder().encode(draft.body).byteLength).toBeLessThanOrEqual(60 * 1024);
+    expect(draft.body).not.toContain("\uFFFD");
+  });
+});
+
+describe("formatFailedCoverageDiagnostics", () => {
+  it("renders single failure with command label and detail", () => {
+    const failures: FailedCoverageScript[] = [
+      {
+        label: "npm run test:coverage",
+        detail: "Error: Vitest exited with code 1\nAssertion failed in App.test.ts",
+      },
+    ];
+    const text = formatFailedCoverageDiagnostics(failures, { repoPath: "/repo/gitpulse" });
+    expect(text).toContain("Coverage failure diagnostics — /repo/gitpulse");
+    expect(text).toContain("Command: npm run test:coverage");
+    expect(text).toContain("Status: failed");
+    expect(text).toContain("Output:");
+    expect(text).toContain("Assertion failed in App.test.ts");
+  });
+
+  it("renders multiple failed commands with indexing and counts", () => {
+    const failures: FailedCoverageScript[] = [
+      {
+        label: "cargo llvm-cov",
+        detail: "error: failed to compile test harness",
+      },
+      {
+        label: "pytest --cov",
+        detail: "FAILED test_api.py::test_login",
+      },
+    ];
+    const text = formatFailedCoverageDiagnostics(failures, { repoPath: "/repo/gitpulse" });
+    expect(text).toContain("Failed coverage commands (2):");
+    expect(text).toContain("[1] Command: cargo llvm-cov");
+    expect(text).toContain("failed to compile test harness");
+    expect(text).toContain("[2] Command: pytest --cov");
+    expect(text).toContain("FAILED test_api.py::test_login");
+  });
+
+  it("includes scan error when present", () => {
+    const failures: FailedCoverageScript[] = [
+      {
+        label: "npm test",
+        detail: "Exit 1",
+      },
+    ];
+    const text = formatFailedCoverageDiagnostics(failures, {
+      repoPath: "/repo/gitpulse",
+      scanError: "Corrupted lcov.info artifact",
+    });
+    expect(text).toContain("Scan error: Corrupted lcov.info artifact");
+    expect(text).toContain("Command: npm test");
+  });
+
+  it("renders scan error even when there are no script failures", () => {
+    const text = formatFailedCoverageDiagnostics([], {
+      repoPath: "/repo/gitpulse",
+      scanError: "Permission denied reading coverage directory",
+    });
+    expect(text).toContain("Coverage failure diagnostics — /repo/gitpulse");
+    expect(text).toContain("Scan error: Permission denied reading coverage directory");
+  });
+
+  it("returns fallback message when nothing failed", () => {
+    expect(formatFailedCoverageDiagnostics([])).toBe("No coverage failures recorded.");
+  });
+
+  it("handles missing or empty details cleanly without crashing", () => {
+    const failures: FailedCoverageScript[] = [
+      {
+        label: "npm test",
+      },
+    ];
+    const text = formatFailedCoverageDiagnostics(failures);
+    expect(text).toContain("Command: npm test");
+    expect(text).toContain("(no output recorded)");
   });
 });

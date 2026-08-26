@@ -258,6 +258,7 @@ pub fn build_native_menu<R: Runtime>(
             &item(app, actions::STASH, "Stash Working Tree", None)?,
             &item(app, actions::STASH_POP, "Pop Stash", None)?,
             &PredefinedMenuItem::separator(app)?,
+            &item(app, actions::QUICK_COMMIT, "Quick Commit…", None)?,
             &item(app, actions::REBASE, "Interactive Rebase…", None)?,
         ],
     )?;

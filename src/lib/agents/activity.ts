@@ -47,6 +47,7 @@ export function actionKindForCommand(cmd: string): string {
   const stripped = cmd.startsWith("cmd_") ? cmd.slice(4) : cmd;
   switch (stripped) {
     case "commit":
+    case "quick_commit":
       return "commit";
     case "push":
       return "push";

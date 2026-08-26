@@ -5,7 +5,9 @@ import {
   buildIncomingEdgeIndex,
   deepestChildTargetingRange,
   isLongConnection,
+  connectionTargetIndex,
 } from "./graphEdges";
+import { collectLiveLanes, liveLanesByRow, maxOccupiedLane } from "./laneDisplay";
 
 export interface LaneConnection {
   from_lane: number;
@@ -206,12 +208,17 @@ export function primedRowRange(
   };
 }
 
-/** A vertical pass-through segment: one lane, one colour, one y-span. */
+/**
+ * A pass-through vertical: one colour, one x. Lanes are stable columns, so
+ * a run can only ever be a straight line; it breaks when the lane's colour
+ * changes (a recycled column's next occupant) or its rows stop being
+ * contiguous.
+ */
 interface LaneRun {
-  lane: number;
   colorIndex: number;
-  top: number;
-  bottom: number;
+  x: number;
+  yTop: number;
+  yBottom: number;
 }
 
 const RUN_POOL_MAX = 256;
@@ -232,16 +239,16 @@ function resetLaneScratch(): void {
   scratchSeenLanes.length = 0;
 }
 
-function acquireRun(lane: number, colorIndex: number, top: number, bottom: number): LaneRun {
+function acquireRun(colorIndex: number, x: number, top: number, bottom: number): LaneRun {
   const recycled = runPool.pop();
   if (recycled) {
-    recycled.lane = lane;
     recycled.colorIndex = colorIndex;
-    recycled.top = top;
-    recycled.bottom = bottom;
+    recycled.x = x;
+    recycled.yTop = top;
+    recycled.yBottom = bottom;
     return recycled;
   }
-  return { lane, colorIndex, top, bottom };
+  return { colorIndex, x, yTop: top, yBottom: bottom };
 }
 
 function releaseLaneScratch(): void {
@@ -257,6 +264,163 @@ function releaseLaneScratch(): void {
     if (runPool.length < RUN_POOL_MAX) runPool.push(run);
   }
   scratchRuns.length = 0;
+}
+
+/** What a graph pointer probe landed on. */
+export type GraphHitKind = "node" | "lane" | "connector" | "avatar";
+
+/**
+ * A typed pointer hit on the graph gutter.
+ *
+ * `row` is always the commit the hit ATTRIBUTES to: the row's own commit
+ * for nodes and avatars, the nearest occupant for a pass-through lane, and
+ * — for connector hits — the CHILD commit that owns the descent (the
+ * branch's last commit), with the merge point it lands on in
+ * `connectorTarget`.
+ */
+export interface GraphHit {
+  kind: GraphHitKind;
+  row: VisualCommitRow;
+  connectorTarget: VisualCommitRow | null;
+}
+
+/**
+ * Row indices per lane (rows whose own `lane` is that lane), ascending.
+ * Memoized on payload array identity — payloads are immutable snapshots,
+ * so identity is a sound cache key and dropping the array drops the index.
+ */
+const laneOccupancyCache = new WeakMap<object, Map<number, number[]>>();
+
+function laneOccupancy(rows: readonly VisualCommitRow[]): Map<number, number[]> {
+  const hit = laneOccupancyCache.get(rows as object);
+  if (hit) return hit;
+  const map = new Map<number, number[]>();
+  for (let i = 0; i < rows.length; i++) {
+    const lane = rows[i].lane;
+    if (!Number.isFinite(lane)) continue;
+    let list = map.get(lane);
+    if (!list) {
+      list = [];
+      map.set(lane, list);
+    }
+    list.push(i);
+  }
+  laneOccupancyCache.set(rows as object, map);
+  return map;
+}
+
+/**
+ * In-flight closing connectors per lane: for each closing edge (a live,
+ * non-merge connection whose child leaves its own column to arrive on the
+ * parent's), the rows its descent crosses EXCLUSIVE of both endpoints —
+ * `[child+1, parent-1]` — during which the child's column shows nothing but
+ * the drawn line.
+ *
+ * This index exists because those rows have no occupancy entry at all:
+ * `active_lanes` lists nodes and pending reservations, and the solver
+ * deliberately does not reserve visual occupancy for a descent (the column
+ * is allocation-reserved, not drawn-through by a pass-through). Before it,
+ * hovering the middle of a closing connector reported "nothing here" for a
+ * line plainly on screen — the documented tooltip gap. Spans on one lane
+ * are disjoint for solver output (column exclusivity), so lookup is a
+ * binary search; hostile overlapping payloads degrade to a bounded
+ * backward scan, never a wrong answer.
+ *
+ * Memoized on payload array identity like every other per-payload index.
+ */
+interface ClosingSpans {
+  starts: number[];
+  ends: number[];
+  child: number[];
+}
+
+const closingSpanCache = new WeakMap<object, Map<number, ClosingSpans>>();
+
+function closingSpansByLane(rows: readonly VisualCommitRow[]): Map<number, ClosingSpans> {
+  const hit = closingSpanCache.get(rows as object);
+  if (hit) return hit;
+  const map = new Map<number, ClosingSpans>();
+  for (let i = 0; i < rows.length; i++) {
+    const conns = rows[i].connections;
+    if (!conns) continue;
+    for (const conn of conns) {
+      if (conn.is_dangling || conn.is_merge) continue;
+      if (!Number.isFinite(conn.from_lane) || conn.from_lane < 0) continue;
+      if (conn.from_lane === conn.to_lane) continue;
+      const target = connectionTargetIndex(i, conn.to_row_offset, rows.length);
+      if (target === null || target <= i + 1) continue;
+      let spans = map.get(conn.from_lane);
+      if (!spans) {
+        spans = { starts: [], ends: [], child: [] };
+        map.set(conn.from_lane, spans);
+      }
+      // Build order ascends in child row, so starts are non-decreasing and
+      // binary search needs no sort.
+      spans.starts.push(i + 1);
+      spans.ends.push(target - 1);
+      spans.child.push(i);
+    }
+  }
+  closingSpanCache.set(rows as object, map);
+  return map;
+}
+
+/** The closing connector crossing `rowIdx` on `lane`, or null. */
+function findClosingConnector(
+  spansByLane: Map<number, ClosingSpans>,
+  rowIdx: number,
+  lane: number,
+): { child: number; target: number } | null {
+  const spans = spansByLane.get(lane);
+  if (!spans || spans.starts.length === 0) return null;
+  // Greatest start <= rowIdx.
+  let lo = 0;
+  let hi = spans.starts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (spans.starts[mid] <= rowIdx) lo = mid + 1;
+    else hi = mid;
+  }
+  // Solver spans on one lane are disjoint, so only the last-starting
+  // candidate can cover rowIdx; the backward scan exists for hostile
+  // overlapping payloads and is bounded by the lane's own list.
+  for (let k = lo - 1; k >= 0; k--) {
+    if (spans.ends[k] >= rowIdx) {
+      return { child: spans.child[k], target: spans.ends[k] + 1 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Nearest commit whose `lane` is `logical` (ties prefer the row below —
+ * a pass-through's line leads down to its pending commit).
+ *
+ * Resolved through the memoized occupancy index in O(log n): a stable
+ * column's reservation can legitimately span thousands of rows between two
+ * commits of one branch, and the old distance-capped walk reported "no
+ * occupant" past its cap — indistinguishable from an honest miss, so long
+ * pass-throughs silently stopped being hoverable.
+ */
+function findLaneOccupant(
+  rows: readonly VisualCommitRow[],
+  fromIdx: number,
+  logical: number,
+): VisualCommitRow | null {
+  const list = laneOccupancy(rows).get(logical);
+  if (!list || list.length === 0) return null;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid] < fromIdx) lo = mid + 1;
+    else hi = mid;
+  }
+  const below = lo < list.length ? list[lo] : -1;
+  const above = lo > 0 ? list[lo - 1] : -1;
+  if (below < 0) return above < 0 ? null : rows[above];
+  if (above < 0) return rows[below];
+  return below - fromIdx <= fromIdx - above ? rows[below] : rows[above];
 }
 
 export class GraphRenderer {
@@ -302,11 +466,22 @@ export class GraphRenderer {
   }
 
   /**
-   * The canvas X of a lane's centre line.
+   * Canvas X of a solver lane. Lanes are stable columns for a branch's
+   * whole lifetime, so this mapping holds on every row — there is no
+   * per-row repacking that could make a lane's x depend on its neighbours.
    */
   public getLaneX(lane: number): number {
     const { originX, laneWidth } = this.config;
     return originX + lane * laneWidth;
+  }
+
+  /**
+   * Canvas X of a lane on a given row. Identical to {@link getLaneX} —
+   * kept so callers written against the row-dependent era keep working,
+   * and as the single place to say why the row no longer matters.
+   */
+  public laneXForRow(_row: VisualCommitRow, logicalLane: number): number {
+    return this.getLaneX(logicalLane);
   }
 
   /**
@@ -319,13 +494,10 @@ export class GraphRenderer {
   }
 
   /**
-   * The commit whose node — or author avatar — covers a canvas point, or null.
-   *
-   * The hit area is the node plus a few pixels: a 5px disc is a hard target
-   * with a mouse and an impossible one on a trackpad, and a click that lands
-   * one pixel out should still select the commit the user aimed at. When
-   * `avatarX` is supplied the avatar column is hit-tested with the same
-   * slop, so hovering an avatar yields the same tooltip as its node.
+   * The commit whose node, branch lane, connector, or author avatar covers
+   * a canvas point, or null. Compatibility wrapper over
+   * {@link getGraphHitAtPoint}: callers that only need the attributed
+   * commit keep their one-value contract.
    */
   public getCommitAtPoint(
     x: number,
@@ -336,32 +508,92 @@ export class GraphRenderer {
     scrollOffset: number = 0,
     avatarX: number | null = null,
   ): VisualCommitRow | null {
-    const { nodeRadius, mergeNodeRadius } = this.config;
-    if (!rows || rows.length === 0) return null;
-    // Normalize once: the loop below reads the center X on every hit check,
-    // and a bare truthiness guard on `avatar` does not narrow `avatarX`.
+    return (
+      this.getGraphHitAtPoint(x, y, rows, startIndex, endIndex, scrollOffset, avatarX)?.row ??
+      null
+    );
+  }
+
+  /**
+   * Typed pointer hit on the graph gutter, or null.
+   *
+   * Nodes are tiny; the coloured lane through the row is what people
+   * actually hover. In priority order a probe resolves to: the row's own
+   * node column; a pass-through lane's nearest occupant; an in-flight
+   * closing connector (attributed to the CHILD commit whose branch the
+   * descent belongs to, with the merge point in `connectorTarget`); the
+   * author avatar column when `avatarX` is supplied. Occupancy always
+   * outranks a connector claim — on solver output the two can never
+   * coincide (column exclusivity), so the ordering only disciplines
+   * hostile payloads.
+   */
+  public getGraphHitAtPoint(
+    x: number,
+    y: number,
+    rows: VisualCommitRow[],
+    startIndex: number,
+    endIndex: number,
+    scrollOffset: number = 0,
+    avatarX: number | null = null,
+  ): GraphHit | null {
+    const { nodeRadius, mergeNodeRadius, rowHeight, lineWidth, originX, laneWidth } =
+      this.config;
+    if (!rows || rows.length === 0 || rowHeight <= 0) return null;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
     const avatarCenterX =
       avatarX !== null && Number.isFinite(avatarX) ? avatarX : null;
     const avatar = avatarCenterX === null ? null : this.avatarStyle;
+    const lo = Math.max(0, startIndex);
     const limit = Math.min(rows.length, Math.max(endIndex, startIndex));
+    const idx = Math.floor((y + scrollOffset) / rowHeight);
+    if (!Number.isFinite(idx) || idx < lo || idx >= limit) return null;
 
-    for (let i = startIndex; i < limit; i++) {
-      const row = rows[i];
-      const nodeY = this.getRowY(i, scrollOffset);
-      // Node first: it is the primary target when both discs overlap a point.
-      const nodeX = this.getLaneX(row.lane);
-      const radius = (row.is_merge ? mergeNodeRadius : nodeRadius) + 4;
-      const dx = x - nodeX;
-      const dy = y - nodeY;
-      if (dx * dx + dy * dy <= radius * radius) {
-        return row;
-      }
-      if (avatarCenterX !== null && avatar) {
-        const adx = x - avatarCenterX;
-        const ar = avatar.radius + AVATAR_HIT_SLOP;
-        if (adx * adx + dy * dy <= ar * ar) {
-          return row;
+    const row = rows[idx];
+    const live = liveLanesByRow(rows)[idx] ?? collectLiveLanes(row);
+    const slop = Math.max(
+      (row.is_merge ? mergeNodeRadius : nodeRadius) + 4,
+      lineWidth / 2 + 4,
+    );
+    const nodeX = this.getLaneX(row.lane);
+    if (Math.abs(x - nodeX) <= slop) {
+      return { kind: "node", row, connectorTarget: null };
+    }
+
+    for (const logical of live) {
+      if (logical === row.lane) continue;
+      const laneX = this.getLaneX(logical);
+      if (Math.abs(x - laneX) > slop) continue;
+      const occupant = findLaneOccupant(rows, idx, logical);
+      if (occupant) return { kind: "lane", row: occupant, connectorTarget: null };
+    }
+
+    // Closing connectors in flight: the pointer lane is derived from x
+    // (those columns have no occupancy entry to iterate).
+    if (laneWidth > 0) {
+      const probeLane = Math.round((x - originX) / laneWidth);
+      if (
+        Number.isFinite(probeLane) &&
+        probeLane >= 0 &&
+        Math.abs(x - this.getLaneX(probeLane)) <= slop
+      ) {
+        const inFlight = findClosingConnector(closingSpansByLane(rows), idx, probeLane);
+        if (inFlight && inFlight.child >= 0 && inFlight.child < rows.length) {
+          return {
+            kind: "connector",
+            row: rows[inFlight.child],
+            connectorTarget:
+              inFlight.target >= 0 && inFlight.target < rows.length
+                ? rows[inFlight.target]
+                : null,
+          };
         }
+      }
+    }
+
+    if (avatarCenterX !== null && avatar) {
+      const ar = avatar.radius + AVATAR_HIT_SLOP;
+      if (Math.abs(x - avatarCenterX) <= ar) {
+        return { kind: "avatar", row, connectorTarget: null };
       }
     }
     return null;
@@ -369,20 +601,14 @@ export class GraphRenderer {
 
   /**
    * The canvas width this graph needs, so the gutter can be sized to the
-   * history instead of clipping deep branches at a fixed width.
+   * history instead of clipping deep branches at a fixed width. Width is the
+   * highest occupied column ({@link maxOccupiedLane}); the solver's interval
+   * allocation keeps that equal to peak concurrent occupancy, so transient
+   * holes never cost extra width beyond what the history genuinely needs.
    */
   public measureWidth(rows: VisualCommitRow[]): number {
     const { originX, laneWidth, nodeRadius } = this.config;
-    let maxLane = 0;
-    for (const row of rows) {
-      if (row.lane > maxLane) maxLane = row.lane;
-      for (const lane of row.active_lanes) {
-        if (lane > maxLane) maxLane = lane;
-      }
-      for (const conn of row.connections) {
-        if (conn.to_lane > maxLane) maxLane = conn.to_lane;
-      }
-    }
+    const maxLane = maxOccupiedLane(rows);
     return originX + maxLane * laneWidth + nodeRadius + originX;
   }
 
@@ -397,7 +623,7 @@ export class GraphRenderer {
     optionsOrHeadId?: RenderOptions | string | null,
     hoveredCommitId?: string | null
   ) {
-    const { rowHeight, laneWidth, originX, nodeRadius, mergeNodeRadius, lineWidth } = this.config;
+    const { rowHeight, nodeRadius, mergeNodeRadius, lineWidth } = this.config;
     let options: RenderOptions = {};
     if (typeof optionsOrHeadId === "string" || optionsOrHeadId === null) {
       options = {
@@ -423,7 +649,6 @@ export class GraphRenderer {
     // Row arithmetic resolves through the shared yForRow closure; every
     // painter and the hit test see identical coordinates by construction.
     const calcY = this.yForRow(scrollOffset);
-    const laneX = (lane: number) => originX + lane * laneWidth;
 
     const viewportHeight = options.viewportHeight ?? this.canvasHeight(ctx);
     // The connector loop runs five rows past endIndex so partially-scrolled
@@ -449,11 +674,13 @@ export class GraphRenderer {
           deepestChildTargetingRange(buildIncomingEdgeIndex(rows), startIndex, renderEnd),
         );
 
-    // 1. Pass-through lanes, drawn as one path per unbroken run.
+    // 1. Pass-through lanes, drawn as one straight vertical per unbroken run.
     //
     // Stroking a separate segment per row leaves a visible seam at every row
-    // boundary once the line has any transparency or antialiasing, and costs a
-    // path per row per lane. A run is one moveTo/lineTo pair however long it is.
+    // boundary once the line has any transparency or antialiasing, and costs
+    // a path per row per lane. Lanes are stable columns, so a run only ever
+    // extends downward at one x; it breaks when the lane's colour changes (a
+    // recycled column's next occupant) or its rows stop being contiguous.
     if (!options.emphasisOnly) {
       for (let i = startIndex; i < renderEnd && i < rows.length; i++) {
         const row = rows[i];
@@ -468,11 +695,15 @@ export class GraphRenderer {
           if (!scratchSeenLanes.includes(lane)) scratchSeenLanes.push(lane);
           const colorIndex = row.active_lane_colors[l] ?? lane;
           const open = scratchOpenRuns.get(lane);
-          if (open && open.colorIndex === colorIndex && Math.abs(open.bottom - yTop) < 0.5) {
-            open.bottom = yBottom;
+          if (
+            open &&
+            open.colorIndex === colorIndex &&
+            Math.abs(open.yBottom - yTop) < 0.5
+          ) {
+            open.yBottom = yBottom;
           } else {
             if (open) scratchRuns.push(open);
-            scratchOpenRuns.set(lane, acquireRun(lane, colorIndex, yTop, yBottom));
+            scratchOpenRuns.set(lane, acquireRun(colorIndex, this.getLaneX(lane), yTop, yBottom));
           }
         }
         for (const [lane, run] of scratchOpenRuns) {
@@ -491,11 +722,10 @@ export class GraphRenderer {
       }
 
       for (const run of scratchRuns) {
-        const x = laneX(run.lane);
         ctx.strokeStyle = getBranchColor(run.colorIndex);
         ctx.beginPath();
-        ctx.moveTo(x, run.top);
-        ctx.lineTo(x, run.bottom);
+        ctx.moveTo(run.x, run.yTop);
+        ctx.lineTo(run.x, run.yBottom);
         ctx.stroke();
       }
     }
@@ -509,7 +739,6 @@ export class GraphRenderer {
       for (let i = renderStart; i < renderEnd && i < rows.length; i++) {
         const row = rows[i];
         const yFrom = calcY(i);
-        const xFrom = laneX(row.lane);
 
         for (const conn of row.connections) {
           if (conn.is_dangling) {
@@ -525,11 +754,12 @@ export class GraphRenderer {
             continue;
           }
 
-          const targetRowIdx = i + conn.to_row_offset;
-          if (targetRowIdx >= rows.length) continue;
+          const targetRowIdx = connectionTargetIndex(i, conn.to_row_offset, rows.length);
+          if (targetRowIdx === null) continue;
 
           const yTo = calcY(targetRowIdx);
-          const xTo = laneX(conn.to_lane);
+          const fromLane = Number.isFinite(conn.from_lane) ? conn.from_lane : row.lane;
+          if (!Number.isFinite(fromLane) || !Number.isFinite(conn.to_lane)) continue;
 
           if (Math.max(yFrom, yTo) < -rowHeight || Math.min(yFrom, yTo) > viewportHeight + rowHeight) {
             continue;
@@ -537,14 +767,14 @@ export class GraphRenderer {
 
           ctx.strokeStyle = getBranchColor(conn.color_index);
           ctx.beginPath();
-          if (conn.from_lane === conn.to_lane) {
-            ctx.moveTo(xFrom, yFrom);
-            ctx.lineTo(xTo, yTo);
-          } else if (conn.is_merge) {
-            this.cornerAtStart(ctx, xFrom, yFrom, xTo, yTo);
-          } else {
-            this.cornerAtEnd(ctx, xFrom, yFrom, xTo, yTo);
-          }
+          this.strokeConnector(
+            ctx,
+            this.getLaneX(fromLane),
+            yFrom,
+            this.getLaneX(conn.to_lane),
+            yTo,
+            conn.is_merge,
+          );
           ctx.stroke();
         }
       }
@@ -558,7 +788,7 @@ export class GraphRenderer {
       const isHead = options.headCommitId === row.id;
       const isHovered = options.hoveredCommitId === row.id;
       if (options.emphasisOnly && !isSelected && !isHead && !isHovered) continue;
-      const x = laneX(row.lane);
+      const x = this.getLaneX(row.lane);
       const color = getBranchColor(row.color_index);
       const r = row.is_merge ? mergeNodeRadius : nodeRadius;
       const hoverStrength = clamp01(options.hoverStrength ?? 1);
@@ -657,11 +887,28 @@ export class GraphRenderer {
         const yFrom = calcY(i);
         // Same cull band as every other row-anchored mark.
         if (yFrom < -rowHeight || yFrom > viewHeight + rowHeight) continue;
-        const xFrom = this.getLaneX(row.lane);
         for (const conn of row.connections) {
-          if (conn.is_dangling) {
-            this.strokeDanglingStub(ctx, xFrom, yFrom, rowHeight, conn.color_index);
-          }
+          if (!conn.is_dangling) continue;
+          const fromLane = Number.isFinite(conn.from_lane) ? conn.from_lane : row.lane;
+          // A live straight-down edge on the same lane (a promoted
+          // continuation after a window-cut first parent) fully covers the
+          // stub: translucent geometry over a solid line conveys nothing
+          // and muddies the lane. Covered stubs are skipped; a stub beside
+          // a departing close still draws — it marks the missing parent.
+          const covered = row.connections.some(
+            (other) =>
+              !other.is_dangling &&
+              other.from_lane === fromLane &&
+              other.to_lane === fromLane,
+          );
+          if (covered) continue;
+          this.strokeDanglingStub(
+            ctx,
+            this.laneXForRow(row, fromLane),
+            yFrom,
+            rowHeight,
+            conn.color_index,
+          );
         }
       }
     } finally {
@@ -822,11 +1069,10 @@ export class GraphRenderer {
     options?: RenderOptions,
   ): void {
     if (!rows || rows.length === 0) return;
-    const { rowHeight, laneWidth, originX, lineWidth } = this.config;
+    const { rowHeight, lineWidth } = this.config;
     const theme = options?.theme ?? DEFAULT_THEME;
     const viewHeight = viewportHeight ?? this.canvasHeight(ctx);
     const calcY = this.yForRow(scrollOffset);
-    const laneX = (lane: number) => originX + lane * laneWidth;
 
     const index = buildIncomingEdgeIndex(rows);
     const lo = Math.max(0, startIndex);
@@ -834,7 +1080,16 @@ export class GraphRenderer {
 
     // Visible target -> child rows reaching it, straight off the index; each
     // child's matching connection is found by scanning its own (tiny) list.
-    type LongEdge = { j: number; t: number; xFrom: number; yFrom: number; xTo: number; yTo: number; colorIndex: number };
+    type LongEdge = {
+      j: number;
+      t: number;
+      fromLane: number;
+      toLane: number;
+      yFrom: number;
+      yTo: number;
+      colorIndex: number;
+      isMerge: boolean;
+    };
     const edges: LongEdge[] = [];
     for (let t = lo; t < hi; t++) {
       for (let p = index.starts[t]; p < index.starts[t + 1]; p++) {
@@ -845,7 +1100,8 @@ export class GraphRenderer {
         for (const conn of child.connections) {
           if (conn.is_dangling) continue;
           if (!isLongConnection(conn, LOOKBACK_ROWS)) continue;
-          if (j + conn.to_row_offset !== t) continue;
+          if (connectionTargetIndex(j, conn.to_row_offset, rows.length) !== t) continue;
+          if (!Number.isFinite(conn.to_lane)) continue;
           const yTo = calcY(t);
           const yFrom = calcY(j);
           if (
@@ -854,14 +1110,17 @@ export class GraphRenderer {
           ) {
             continue;
           }
+          const fromLane = Number.isFinite(conn.from_lane) ? conn.from_lane : child.lane;
+          if (!Number.isFinite(fromLane)) continue;
           edges.push({
             j,
             t,
-            xFrom: laneX(child.lane),
+            fromLane,
+            toLane: conn.to_lane,
             yFrom,
-            xTo: laneX(conn.to_lane),
             yTo,
             colorIndex: conn.color_index,
+            isMerge: conn.is_merge,
           });
         }
       }
@@ -877,23 +1136,14 @@ export class GraphRenderer {
       for (const e of edges) {
         ctx.strokeStyle = getBranchColor(e.colorIndex);
         ctx.beginPath();
-        if (e.xFrom === e.xTo) {
-          ctx.moveTo(e.xFrom, e.yFrom);
-          ctx.lineTo(e.xTo, e.yTo);
-        } else {
-          // Corner ownership mirrors render(): a merged-in branch peels out
-          // just under its child; a closing lane stays straight until arrival.
-          const childRow = rows[e.j];
-          const isMergeConn = childRow.connections.some(
-            (c) =>
-              !c.is_dangling &&
-              isLongConnection(c, LOOKBACK_ROWS) &&
-              e.j + c.to_row_offset === e.t &&
-              c.is_merge,
-          );
-          if (isMergeConn) this.cornerAtStart(ctx, e.xFrom, e.yFrom, e.xTo, e.yTo);
-          else this.cornerAtEnd(ctx, e.xFrom, e.yFrom, e.xTo, e.yTo);
-        }
+        this.strokeConnector(
+          ctx,
+          this.getLaneX(e.fromLane),
+          e.yFrom,
+          this.getLaneX(e.toLane),
+          e.yTo,
+          e.isMerge,
+        );
         ctx.stroke();
       }
 
@@ -904,22 +1154,22 @@ export class GraphRenderer {
       const pad = Math.max(nodeRadius, mergeNodeRadius) + 2.5 + lineWidth;
       const affected = new Set<number>();
       for (const e of edges) {
-        const xMin = Math.min(e.xFrom, e.xTo) - pad;
-        const xMax = Math.max(e.xFrom, e.xTo) + pad;
         const yMin = Math.min(e.yFrom, e.yTo) - pad;
         const yMax = Math.max(e.yFrom, e.yTo) + pad;
+        // The edge's corner sweeps horizontally near one endpoint, so the
+        // restamp band conservatively covers every visible row the edge
+        // crosses, whatever column their nodes sit on.
         for (let t = lo; t < hi; t++) {
           if (t < e.j || t > e.t) continue;
-          const x = laneX(rows[t].lane);
           const y = calcY(t);
-          if (x < xMin || x > xMax || y < yMin || y > yMax) continue;
+          if (y < yMin || y > yMax) continue;
           affected.add(t);
         }
       }
       const ordered = [...affected].sort((a, b) => a - b);
       for (const t of ordered) {
         const row = rows[t];
-        const x = laneX(row.lane);
+        const x = this.getLaneX(row.lane);
         const y = calcY(t);
         if (y < -rowHeight || y > viewHeight + rowHeight) continue;
         const r = row.is_merge ? mergeNodeRadius : nodeRadius;
@@ -928,6 +1178,41 @@ export class GraphRenderer {
       }
     } finally {
       ctx.restore();
+    }
+  }
+
+  /**
+   * Child→parent stroke between two stable columns: a straight vertical
+   * when the columns agree, otherwise exactly one rounded bend. The bend
+   * sits at the end that owns the lane change — a merged-in branch peels
+   * away just under its merge commit and then runs straight down its own
+   * column; a closing lane stays straight until it arrives at its parent —
+   * which is what makes a dense graph readable rather than a bundle of
+   * diagonals. Column exclusivity is the solver's contract: nothing else
+   * ever occupies the span this stroke descends through, so there is no
+   * per-row occupancy to track.
+   *
+   * A non-forward edge (hostile offset placing the parent at or above the
+   * child) degrades to a plain line so corrupt input cannot bend geometry
+   * into neighbouring rows.
+   */
+  private strokeConnector(
+    ctx: CanvasRenderingContext2D,
+    xFrom: number,
+    yFrom: number,
+    xTo: number,
+    yTo: number,
+    isMerge: boolean,
+  ): void {
+    if (Math.abs(xFrom - xTo) < 0.5 || yTo <= yFrom) {
+      ctx.moveTo(xFrom, yFrom);
+      ctx.lineTo(xTo, yTo);
+      return;
+    }
+    if (isMerge) {
+      this.cornerAtStart(ctx, xFrom, yFrom, xTo, yTo);
+    } else {
+      this.cornerAtEnd(ctx, xFrom, yFrom, xTo, yTo);
     }
   }
 

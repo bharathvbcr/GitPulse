@@ -43,6 +43,7 @@
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
+  import { promptQuickCommit } from "./lib/commit/quickCommit";
   import {
     RefreshCw,
     FolderOpen,
@@ -162,6 +163,7 @@
       rebase: () => {
         isRebaseModalOpen = true;
       },
+      quickCommit: () => void promptQuickCommit(),
       palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
       focusFilter: () =>
         window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
@@ -474,17 +476,20 @@
     </div>
   {/if}
 
-  <!-- Modals -->
-  <!-- One boundary around the whole overlay cluster: a render crash inside a
-       modal must not take down the repo views beneath it — the pane
-       boundaries above stay alive and offer Reset. -->
+  <!-- Overlay widgets: repo views stay in the pane boundaries above. Prompt
+       and Diagnostics are isolated so a PromptModal render crash cannot take
+       down the log that records it. -->
   <svelte:boundary failed={paneFailed}>
     <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
     <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
     <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
-    <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
-    <PromptModal />
     <CommandPalette />
     <Tooltip />
+  </svelte:boundary>
+  <svelte:boundary failed={paneFailed}>
+    <PromptModal />
+  </svelte:boundary>
+  <svelte:boundary failed={paneFailed}>
+    <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
   </svelte:boundary>
 </div>

@@ -55,9 +55,11 @@ Prefer to build it yourself? See [Getting started](#getting-started).
   (LCOV, Cobertura, Go cover, Istanbul JSON, JaCoCo, and Clover reports are matched per language tree,
   including artifacts under nested cargo workspaces like `src-tauri/target/llvm-cov/`).
   MANVI is one click away: the local model turns the rendered report into a prioritized analysis
-  whose commands are individually runnable, and when a language family has no artifact at all,
+  whose commands are individually runnable through a coverage-only allowlist, and when a language family has no artifact at all,
   curated coverage-generating commands (e.g. `cargo llvm-cov --lcov`) are offered and run through
-  the same bounded, journal-recorded terminal runner before an automatic rescan.
+  the same policy-gated, bounded, journal-recorded action runner before an automatic rescan. Alternative
+  non-Rust generators stop after the first success, while distinct Rust workspaces all run. A report can
+  also be filed as a guarded GitHub issue after confirmation; the draft omits local paths and command output.
 - **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
   objects, reflogs, LFS, submodule stores), build-output and cache directories across
   ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
@@ -70,7 +72,9 @@ Prefer to build it yourself? See [Getting started](#getting-started).
   `cargo-audit`, `pip-audit` (pinned requirements files), `govulncheck`, `composer audit`, and
   `bundler-audit`, each used when its CLI is present, plus open GitHub Dependabot alerts (via `gh`)
   unified in the Health view. Copy the whole report as text, or send it through the configured
-  local model for a remediation plan (advisory only — nothing is applied automatically).
+  local model for a remediation plan. Nothing runs merely because the model suggested it: each
+  visible step or the explicit run-all control is a user confirmation, and the backend enforces a
+  health-only command allowlist before execution.
 - **Stacked branches** — visualize and manage stacked branches (`stack` view).
 - **Worktrees** — linked-worktree panel in the sidebar: list with HEAD, branch, dirty-file
   counts, and prunable state; add (with branch and start point), remove, and lock/unlock.
@@ -231,7 +235,8 @@ lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
 ### The MANVI harness
 
 `src-tauri/src/harness/` embeds the MANVI coding-agent harness as a `manvi serve` sidecar
-speaking NDJSON over stdio. It provides two things:
+speaking NDJSON over stdio. The live protocol exposes the policy and local-model planes, not
+MANVI's native agent-tool catalogue or a PTY. It provides two things:
 
 1. **Policy verdicts** — mutating git commands pass through a command gate (low-risk index,
    stash, and clone operations excepted). Verdicts land on a five-step ladder — allowed, demoted,
@@ -247,6 +252,14 @@ harness installed but wedged or unreachable, mutations are refused rather than p
 unchecked. Local AI does not require the harness: it answers against whatever local model server
 is configured; the harness only plans token budgets when available. Set `GITPULSE_MANVI_BIN` to
 point at a specific binary.
+
+The interactive Terminal shell is user-owned and intentionally outside the harness: MANVI never
+receives its PTY handle or keystrokes. Model-authored Health and Coverage commands use a separate
+`cmd_manvi_run_action` IPC seam instead. That seam accepts only direct argv (never a shell), rejects
+arbitrary executables, URLs, outside-repository paths and symlink escapes, applies a purpose-specific
+health/coverage allowlist, sends every accepted command through the MANVI command gate, and bounds
+argv size, timeout and captured output. This is scoped, user-confirmed command execution—not an
+autonomous terminal or general app-control API.
 
 The **MANVI view** groups the highest-frequency repository operations without bypassing their
 canonical owners, and hosts the harness and local-AI controls in a second pane. Branch cleanup is

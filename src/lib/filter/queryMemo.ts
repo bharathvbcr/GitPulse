@@ -63,6 +63,7 @@ export interface FilterableRow {
   author_email: string;
   lane?: number;
   active_lanes?: readonly number[] | null;
+  active_lane_colors?: readonly number[] | null;
   /** Present on solved graph rows; required for connection remapping below. */
   parent_ids?: readonly string[];
   connections?: unknown[];
@@ -88,9 +89,21 @@ export interface FilteredRows<R> {
  * map lookup, and the new offset is the new-index gap, which shrinks by
  * exactly the number of removed rows between child and parent. A parent that
  * was filtered out flips the edge to `is_dangling` so it renders as an
- * honest stub instead of a line into a stranger. Lane geometry (lanes,
- * colors, active-lane snapshots) is per-row solver state and never shifts.
+ * honest stub instead of a line into a stranger.
+ *
+ * After offsets are honest, surviving lane *indices* are densified: the
+ * solver baked columns against the full history, so dropping the rows that
+ * occupied lanes 1..7 would otherwise leave a survivor on lane 8 and a
+ * gutter nine columns wide. Through-columns whose occupant was filtered
+ * out are dropped (not renamed), and a dangling stub's to_lane is parked
+ * on from_lane so a ghost parent column cannot keep the gutter wide.
+ * Densify does not re-solve topology. Connection colors are unchanged;
+ * pass-through colors stay aligned with the pruned active_lanes.
  */
+function isFiniteLane(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 function remapConnections<R extends FilterableRow>(
   row: R,
   newRowIdx: number,
@@ -103,6 +116,8 @@ function remapConnections<R extends FilterableRow>(
   const next = conns.map((conn, k) => {
     const typed = conn as {
       to_row_offset: number;
+      from_lane?: unknown;
+      to_lane?: unknown;
       is_dangling?: boolean;
       [key: string]: unknown;
     };
@@ -113,7 +128,10 @@ function remapConnections<R extends FilterableRow>(
     const parentNew = parentId !== undefined ? newIndexById.get(parentId) : undefined;
     if (parentNew === undefined || parentNew <= newRowIdx) {
       changed = true;
-      return { ...typed, to_row_offset: 1, is_dangling: true };
+      // Stubs are drawn on from_lane. Parking to_lane on the dropped
+      // parent's column would keep that column in the gutter.
+      const fromLane = isFiniteLane(typed.from_lane) ? typed.from_lane : row.lane;
+      return { ...typed, to_row_offset: 1, is_dangling: true, to_lane: fromLane };
     }
     const updated = parentNew - newRowIdx;
     if (updated === typed.to_row_offset) return conn;
@@ -166,9 +184,116 @@ export function filterRowsWithLanes<R extends FilterableRow>(
     remapped[i] = rebuilt ?? kept[i];
     if (rebuilt !== null) mutated = true;
   }
-  // No connection pointed past a removed row: keep original objects so the
-  // strip cache's identity checks see "unchanged geometry".
-  return { rows: mutated ? remapped : kept, maxActiveLane };
+  const afterOffsets = mutated ? remapped : kept;
+  const densified = densifyLanes(afterOffsets);
+  return {
+    rows: densified.rows,
+    maxActiveLane: densified.maxActiveLane,
+  };
+}
+
+/**
+ * Lanes that still have a surviving occupant or a live (non-dangling)
+ * connector. Through-columns whose only occupant was filtered out, and
+ * dangling to_lanes (stubs draw on from_lane), are not live.
+ */
+function collectLiveLanes<R extends FilterableRow>(rows: R[]): Set<number> {
+  const live = new Set<number>();
+  const add = (value: unknown) => {
+    if (isFiniteLane(value)) live.add(value);
+  };
+  for (const row of rows) {
+    add(row.lane);
+    if (!row.connections) continue;
+    for (const conn of row.connections) {
+      const typed = conn as {
+        from_lane?: unknown;
+        to_lane?: unknown;
+        is_dangling?: boolean;
+      };
+      add(typed.from_lane);
+      if (!typed.is_dangling) add(typed.to_lane);
+    }
+  }
+  return live;
+}
+
+function connectionNeedsDanglingRewrite(conn: unknown): boolean {
+  const typed = conn as {
+    from_lane?: unknown;
+    to_lane?: unknown;
+    is_dangling?: boolean;
+  };
+  return Boolean(typed.is_dangling) && typed.to_lane !== typed.from_lane;
+}
+
+/**
+ * Renames surviving lane indices onto 0..k-1. Same array identity when the
+ * visible set is already dense from zero and has no ghost through-lanes, so
+ * a filter that only dropped rows below every edge does not invalidate the
+ * strip cache for geometry.
+ */
+function densifyLanes<R extends FilterableRow>(rows: R[]): {
+  rows: R[];
+  maxActiveLane: number;
+} {
+  const live = collectLiveLanes(rows);
+  const sorted = [...live].sort((a, b) => a - b);
+  if (sorted.length === 0) return { rows, maxActiveLane: 0 };
+  const dense = sorted[0] === 0 && sorted[sorted.length - 1] === sorted.length - 1;
+  const needsPruneOrRewrite = rows.some((row) => {
+    if (row.active_lanes?.some((lane) => isFiniteLane(lane) && !live.has(lane))) {
+      return true;
+    }
+    return Boolean(row.connections?.some(connectionNeedsDanglingRewrite));
+  });
+  if (dense && !needsPruneOrRewrite) {
+    return { rows, maxActiveLane: sorted[sorted.length - 1] };
+  }
+  const map = new Map(sorted.map((old, i) => [old, i]));
+  const mapped = (value: unknown): unknown =>
+    isFiniteLane(value) ? (map.get(value) ?? value) : value;
+  const next: R[] = rows.map((row) => {
+    const lane = mapped(row.lane);
+    let activeLanes = row.active_lanes;
+    let activeLaneColors = row.active_lane_colors;
+    if (activeLanes) {
+      const nextActive: number[] = [];
+      const nextColors: number[] | undefined = activeLaneColors ? [] : undefined;
+      for (let i = 0; i < activeLanes.length; i++) {
+        const sourceLane = activeLanes[i];
+        if (!isFiniteLane(sourceLane) || !live.has(sourceLane)) continue;
+        nextActive.push(mapped(sourceLane) as number);
+        if (nextColors && activeLaneColors) {
+          nextColors.push(activeLaneColors[i] ?? sourceLane);
+        }
+      }
+      activeLanes = nextActive;
+      if (nextColors) activeLaneColors = nextColors;
+    }
+    let connections = row.connections;
+    if (connections) {
+      connections = connections.map((conn) => {
+        const typed = conn as {
+          from_lane?: unknown;
+          to_lane?: unknown;
+          is_dangling?: boolean;
+        };
+        const fromLane = mapped(typed.from_lane);
+        const toLane = typed.is_dangling ? fromLane : mapped(typed.to_lane);
+        if (fromLane === typed.from_lane && toLane === typed.to_lane) return conn;
+        return { ...typed, from_lane: fromLane, to_lane: toLane };
+      });
+    }
+    return {
+      ...row,
+      lane,
+      active_lanes: activeLanes,
+      connections,
+      ...(activeLaneColors !== undefined ? { active_lane_colors: activeLaneColors } : {}),
+    } as R;
+  });
+  return { rows: next, maxActiveLane: sorted.length - 1 };
 }
 
 /**

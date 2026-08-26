@@ -95,6 +95,10 @@ fn regression_go_cover_expansion_is_bounded() {
         "per-file entries {} exceeded sane budget",
         recorded
     );
+    assert!(
+        report.truncated,
+        "a per-range expansion clamp drops real coverage and must be disclosed"
+    );
 }
 
 // REGRESSION GUARD: the same artifact path was once read and parsed once per
@@ -305,6 +309,86 @@ fn artifact_cap_sets_truncated_flag() {
     let (report, _) =
         CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits).expect("scan");
     assert!(report.truncated);
+}
+
+// REGRESSION GUARD: parser-local staging and the merged report used to debit
+// the same global entry budget independently. A two-line artifact under a
+// two-line cap was therefore parsed, then dropped entirely during merge and
+// mislabeled as truncated. The cap counts unique lines in the final map once.
+#[test]
+fn entry_budget_counts_unique_merged_lines_once() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\nfn b() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:src/lib.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
+    );
+    let limits = ScanLimits {
+        max_total_entries: 2,
+        ..ScanLimits::default()
+    };
+    let (report, merged) =
+        CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits).expect("scan");
+
+    assert!(!report.truncated, "an exact-fit entry budget is complete");
+    assert_eq!(report.overall.lines_found, 2);
+    assert_eq!(report.overall.lines_hit, 1);
+    assert_eq!(merged.get("src/lib.rs").map(|lines| lines.len()), Some(2));
+}
+
+// REGRESSION GUARD: cache invalidation sampled only the first 4 KiB. On a
+// coarse-mtime filesystem, an equal-size rewrite after that prefix served the
+// old hit map indefinitely. Fingerprinting must cover the whole bounded file.
+#[test]
+fn equal_size_rewrite_after_first_4k_invalidates_cache() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    let artifact = repo.path().join("lcov.info");
+    let filler = format!("TN:{}\n", "x".repeat(5_000));
+    let before = format!("{filler}SF:src/lib.rs\nDA:1,0\nend_of_record\n");
+    let after = format!("{filler}SF:src/lib.rs\nDA:1,1\nend_of_record\n");
+    assert_eq!(before.len(), after.len());
+    write(repo.path(), "lcov.info", &before);
+
+    let first = scan(repo.path());
+    assert_eq!(first.overall.lines_hit, 0);
+    let original_mtime = fs::metadata(&artifact).unwrap().modified().unwrap();
+
+    fs::write(&artifact, after).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&artifact)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+        .unwrap();
+
+    let second = scan(repo.path());
+    assert_eq!(
+        second.overall.lines_hit, 1,
+        "same-size tail rewrite stayed stale"
+    );
+}
+
+// REGRESSION GUARD: suffix resolution claimed to try the eight most-specific
+// candidates but actually tried the first eight prefixes. Deep absolute paths
+// therefore never reached an ordinary repo-relative tail such as src/lib.rs.
+#[test]
+fn deep_external_paths_resolve_through_bounded_specific_suffixes() {
+    let repo = git_repo();
+    write(repo.path(), "src/lib.rs", "fn a() {}\n");
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:/build/agent/work/one/two/three/four/five/six/seven/src/lib.rs\nDA:1,1\nend_of_record\n",
+    );
+
+    let report = scan(repo.path());
+    assert_eq!(report.overall.lines_found, 1);
+    assert_eq!(
+        report.files.first().map(|file| file.path.as_str()),
+        Some("src/lib.rs")
+    );
 }
 
 #[test]

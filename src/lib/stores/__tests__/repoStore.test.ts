@@ -1330,6 +1330,43 @@ describe("repoStore diff selection", () => {
     await store.unstageAll();
     expect(unstaged).toEqual(["b.ts"]);
   });
+
+  it("quickCommit invokes cmd_quick_commit rather than stage-then-commit", async () => {
+    const calls: Array<{ cmd: string; message?: string }> = [];
+    const invoke = makeInvoke({
+      cmd_quick_commit: async (_cmd, args) => {
+        calls.push({ cmd: "cmd_quick_commit", message: String(args?.message) });
+        return undefined as never;
+      },
+      cmd_commit: async (_cmd, args) => {
+        calls.push({ cmd: "cmd_commit", message: String(args?.message) });
+        return undefined as never;
+      },
+      cmd_stage_file: async () => {
+        calls.push({ cmd: "cmd_stage_file" });
+        return undefined as never;
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/quick");
+    const outcome = await store.quickCommit("feat: all\n\nbody");
+    expect(outcome.ok).toBe(true);
+    expect(calls).toEqual([{ cmd: "cmd_quick_commit", message: "feat: all\n\nbody" }]);
+  });
+
+  it("quickCommit surfaces a backend refusal without calling cmd_commit", async () => {
+    const invoke = makeInvoke({
+      cmd_quick_commit: async () => {
+        throw new Error("Resolve merge conflicts before committing.");
+      },
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/conflicted");
+    const outcome = await store.quickCommit("feat: nope");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("conflict");
+    expect(get(store).error).toContain("conflict");
+  });
 });
 
 describe("repoStore snapshot hydration ordering", () => {

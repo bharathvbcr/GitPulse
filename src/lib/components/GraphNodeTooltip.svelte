@@ -8,7 +8,7 @@
     GitMerge,
     Tag,
   } from "lucide-svelte";
-  import type { VisualCommitRow } from "../canvas/GraphRenderer";
+  import type { GraphHitKind, VisualCommitRow } from "../canvas/GraphRenderer";
   import type { TooltipPlacement } from "../canvas/graphInteraction";
   import type { RefItem } from "./CommitRow.svelte";
   import { authorColor, authorIdentity } from "../authors/authorIdentity";
@@ -19,12 +19,21 @@
     refs = [],
     placement = "below",
     caretX = 16,
+    hitKind = "node",
+    mergeTarget = null,
+    authorCommitCount = null,
   }: {
     row: VisualCommitRow;
     refs?: RefItem[];
     placement?: TooltipPlacement;
     /** Pointer X inside the box; the caret tracks it after clamping. */
     caretX?: number;
+    /** What the probe landed on; drives kind-specific chips and fallbacks. */
+    hitKind?: GraphHitKind;
+    /** The merge point this commit's closing line lands on, when known. */
+    mergeTarget?: VisualCommitRow | null;
+    /** This author's commit count in the loaded history, when known. */
+    authorCommitCount?: number | null;
   } = $props();
 
   // The caller clamps the anchor inside its measured box; here it only needs
@@ -73,9 +82,47 @@
         <span class="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-textPrimary/80">
           {row.is_merge ? "Merge commit" : row.is_root ? "Root commit" : "Commit"}
         </span>
+        {#if hitKind === "lane"}
+          <span class="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-textMuted">
+            Branch line
+          </span>
+        {/if}
       </div>
     </div>
   </div>
+
+  {#if mergeTarget || hitKind === "connector"}
+    <!-- Where this branch's closing line is going. Shown whenever the
+         target is known — pointer hover on the descent or the node, and
+         keyboard focus alike: context must not be gated behind a pointer. -->
+    <div class="flex items-center gap-2 border-b border-border/40 px-3 py-2 text-[10px]">
+      <GitMerge size={11} class="shrink-0 text-accent" />
+      {#if mergeTarget}
+        <span class="min-w-0 truncate text-textPrimary">
+          Merges into
+          <span class="font-mono text-textMuted">{mergeTarget.id.slice(0, 7)}</span>
+          · {mergeTarget.summary || "No commit message"}
+        </span>
+      {:else}
+        <span class="text-textPrimary">Merges into another branch below</span>
+      {/if}
+    </div>
+  {/if}
+
+  {#if authorCommitCount !== null && Number.isFinite(authorCommitCount) && authorCommitCount > 0}
+    <div class="flex items-center gap-2 border-b border-border/40 px-3 py-2 text-[10px]">
+      <span
+        class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[7px] font-bold text-white ring-1 ring-background"
+        style="background-color: {authorColor(identity.hue)}"
+        aria-hidden="true"
+      >{identity.initials}</span>
+      <span class="min-w-0 truncate text-textPrimary">
+        {authorCommitCount}
+        {authorCommitCount === 1 ? "commit" : "commits"} by {row.author_name || "Unknown"} in the
+        loaded history
+      </span>
+    </div>
+  {/if}
 
   {#if refs.length > 0}
     <div class="flex flex-wrap gap-1 border-b border-border/40 px-3 py-2">

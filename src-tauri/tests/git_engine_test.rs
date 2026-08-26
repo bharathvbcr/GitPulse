@@ -95,8 +95,7 @@ fn test_git_workflow_lifecycle() {
     assert_eq!(details.summary, "feat: initial commit for testing");
 
     // 9. Language stats
-    let lang_stats =
-        GitReader::get_repo_language_stats(path)
+    let lang_stats = GitReader::get_repo_language_stats(path)
         .expect("get_repo_language_stats failed")
         .stats;
     assert!(!lang_stats.is_empty());

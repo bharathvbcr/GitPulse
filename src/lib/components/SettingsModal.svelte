@@ -115,6 +115,39 @@
               <span>Compact</span>
             </button>
           </div>
+          <div class="text-textMuted text-[10px] mt-2 mb-1">Graph width</div>
+          <div class="gp-segmented" role="group" aria-label="Graph width">
+            <button
+              type="button"
+              onclick={() => interfaceStore.setGraphWidthMode("balanced")}
+              aria-pressed={$interfaceStore.graphWidthMode === "balanced"}
+              data-active={$interfaceStore.graphWidthMode === "balanced" ? "true" : "false"}
+              class="gp-seg-btn"
+              title="Balanced width keeps commit messages prominent"
+            >
+              Balanced
+            </button>
+            <button
+              type="button"
+              onclick={() => interfaceStore.setGraphWidthMode("wide")}
+              aria-pressed={$interfaceStore.graphWidthMode === "wide"}
+              data-active={$interfaceStore.graphWidthMode === "wide" ? "true" : "false"}
+              class="gp-seg-btn"
+              title="Wide graph viewport with more visible branch lanes"
+            >
+              Wide
+            </button>
+            <button
+              type="button"
+              onclick={() => interfaceStore.setGraphWidthMode("full")}
+              aria-pressed={$interfaceStore.graphWidthMode === "full"}
+              data-active={$interfaceStore.graphWidthMode === "full" ? "true" : "false"}
+              class="gp-seg-btn"
+              title="Use all safe graph space while preserving commit details"
+            >
+              Full
+            </button>
+          </div>
           <div class="flex items-center justify-between gap-3 py-1 mt-2">
             <div class="flex items-center gap-2 min-w-0">
               <CircleUserRound size={13} class="text-textMuted shrink-0" />

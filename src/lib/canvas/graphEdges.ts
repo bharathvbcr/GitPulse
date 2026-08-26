@@ -32,6 +32,18 @@ export interface IncomingEdgeIndex {
 
 const indexCache = new WeakMap<VisualCommitRow[], IncomingEdgeIndex>();
 
+/** Parent row for a child-owned connector, or null when the offset is not a live forward edge. */
+export function connectionTargetIndex(
+  fromIndex: number,
+  offset: number,
+  rowCount: number,
+): number | null {
+  if (!Number.isFinite(offset)) return null;
+  const target = fromIndex + offset;
+  if (!(target > fromIndex && target < rowCount)) return null;
+  return target;
+}
+
 export function buildIncomingEdgeIndex(rows: VisualCommitRow[]): IncomingEdgeIndex {
   const cached = indexCache.get(rows);
   if (cached) return cached;
@@ -43,10 +55,8 @@ export function buildIncomingEdgeIndex(rows: VisualCommitRow[]): IncomingEdgeInd
     const conns = rows[i].connections;
     if (!conns) continue;
     for (let k = 0; k < conns.length; k++) {
-      const offset = conns[k].to_row_offset;
-      if (!Number.isFinite(offset)) continue;
-      const target = i + offset;
-      if (target > i && target < n) counts[target] += 1;
+      const target = connectionTargetIndex(i, conns[k].to_row_offset, n);
+      if (target !== null) counts[target] += 1;
     }
   }
 
@@ -60,10 +70,8 @@ export function buildIncomingEdgeIndex(rows: VisualCommitRow[]): IncomingEdgeInd
     const conns = rows[i].connections;
     if (!conns) continue;
     for (let k = 0; k < conns.length; k++) {
-      const offset = conns[k].to_row_offset;
-      if (!Number.isFinite(offset)) continue;
-      const target = i + offset;
-      if (target > i && target < n) children[cursor[target]++] = i;
+      const target = connectionTargetIndex(i, conns[k].to_row_offset, n);
+      if (target !== null) children[cursor[target]++] = i;
     }
   }
 

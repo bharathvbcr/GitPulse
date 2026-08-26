@@ -426,6 +426,28 @@ describe("serverFetchableQuery", () => {
   });
 });
 
+describe("graphStore loadGraph query sanitization", () => {
+  it("does not forward client-only queries to cmd_get_commit_graph", async () => {
+    const forwarded: unknown[] = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") {
+        forwarded.push(args?.query);
+        return payload("a") as never;
+      }
+      if (cmd === "cmd_get_commit_details") {
+        return { id: "a", summary: "d", changed_files: [], total_additions: 0, total_deletions: 0 } as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a", "author:ada");
+    expect(forwarded).toEqual([null]);
+    await store.loadGraph("/r/a", "path:src");
+    expect(forwarded[1]).toBe("path:src");
+  });
+});
+
 describe("graphStore payload signature", () => {
   const full = () => ({
     rows: [

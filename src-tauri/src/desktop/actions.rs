@@ -24,6 +24,7 @@ pub const PULL: &str = "pull";
 pub const PUSH: &str = "push";
 pub const STASH: &str = "stash";
 pub const STASH_POP: &str = "stash-pop";
+pub const QUICK_COMMIT: &str = "quick-commit";
 pub const REBASE: &str = "rebase";
 pub const PALETTE: &str = "palette";
 pub const FOCUS_FILTER: &str = "focus-filter";
@@ -61,6 +62,7 @@ pub enum NativeAction {
     Push,
     Stash,
     StashPop,
+    QuickCommit,
     Rebase,
     Palette,
     FocusFilter,
@@ -104,6 +106,7 @@ impl NativeAction {
             PUSH => Self::Push,
             STASH => Self::Stash,
             STASH_POP => Self::StashPop,
+            QUICK_COMMIT => Self::QuickCommit,
             REBASE => Self::Rebase,
             PALETTE => Self::Palette,
             FOCUS_FILTER => Self::FocusFilter,
@@ -142,6 +145,7 @@ impl NativeAction {
             Self::Push => PUSH,
             Self::Stash => STASH,
             Self::StashPop => STASH_POP,
+            Self::QuickCommit => QUICK_COMMIT,
             Self::Rebase => REBASE,
             Self::Palette => PALETTE,
             Self::FocusFilter => FOCUS_FILTER,
@@ -175,6 +179,10 @@ mod tests {
         assert_eq!(NativeAction::parse(CLONE), Some(NativeAction::Clone));
         assert_eq!(NativeAction::parse(SETTINGS), Some(NativeAction::Settings));
         assert_eq!(NativeAction::parse(PALETTE), Some(NativeAction::Palette));
+        assert_eq!(
+            NativeAction::parse(QUICK_COMMIT),
+            Some(NativeAction::QuickCommit)
+        );
         assert_eq!(NativeAction::parse(CLOSE_TAB), Some(NativeAction::CloseTab));
         assert_eq!(
             NativeAction::parse(NEXT_REPO_TAB),
@@ -226,6 +234,7 @@ mod tests {
         assert_eq!(recent.event_id(), OPEN_RECENT);
         assert_eq!(recent.path(), Some("/tmp/repo"));
         assert_eq!(NativeAction::Fetch.event_id(), FETCH);
+        assert_eq!(NativeAction::QuickCommit.event_id(), QUICK_COMMIT);
         assert_eq!(NativeAction::Fetch.path(), None);
         assert_eq!(NativeAction::Settings.event_id(), SETTINGS);
         assert_eq!(NativeAction::Settings.path(), None);

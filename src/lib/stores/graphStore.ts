@@ -462,6 +462,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       opts: { forceLimit?: number } = {}
     ) => {
       if (!repoPath) return;
+      query = serverFetchableQuery(query);
       const token = bump(repoPath);
       const max = opts.forceLimit ?? limitFor(repoPath);
       // Stale-while-revalidate: when cached rows are already presented, a
@@ -582,7 +583,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       const current = limitFor(repoPath);
       const next = nextLoadLimit(current);
       if (next === null || !repoPath) return false;
-      await api.loadGraph(repoPath, query, revision, { forceLimit: next });
+      await api.loadGraph(repoPath, serverFetchableQuery(query), revision, { forceLimit: next });
       return true;
     },
     selectCommit: async (commit: VisualCommitRow, repoPath?: string) => {

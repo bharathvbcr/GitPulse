@@ -179,10 +179,34 @@ export function parseNetstatPids(stdout, port) {
 }
 
 /**
+ * Dev-only CSP for a Vite origin. Keep in lockstep with
+ * `src-tauri/tauri.conf.json` `app.security.devCsp` at {@link PREFERRED_DEV_PORT}.
+ *
+ * @param {number} port
+ */
+export function devCspForPort(port) {
+  const http = `http://localhost:${port} http://127.0.0.1:${port}`;
+  const ws = `ws://localhost:${port} ws://127.0.0.1:${port}`;
+  return {
+    "default-src": `'self' ${http}`,
+    "script-src": `'self' ${http}`,
+    "style-src": "'self' 'unsafe-inline'",
+    "img-src": "'self' data: blob:",
+    "font-src": "'self' data:",
+    "connect-src": `'self' ipc: http://ipc.localhost ${ws}`,
+    "base-uri": "'none'",
+    "object-src": "'none'",
+  };
+}
+
+/**
  * @param {number} port
  */
 export function tauriConfigForPort(port) {
-  return { build: { devUrl: `http://localhost:${port}` } };
+  return {
+    build: { devUrl: `http://localhost:${port}` },
+    app: { security: { devCsp: devCspForPort(port) } },
+  };
 }
 
 /**

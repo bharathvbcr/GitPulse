@@ -25,6 +25,10 @@ export interface TokenizeError {
 
 export type TokenizeResult = TokenizeOk | TokenizeError;
 
+const MAX_PLAN_LINES = 4_096;
+const MAX_PLAN_STEPS = 255;
+const MAX_COMMANDS_PER_STEP = 32;
+
 /**
  * Splits one command line into argv, honoring single quotes, double quotes,
  * and backslash escapes. Returns a refusal when the line uses shell syntax
@@ -155,6 +159,16 @@ export interface PlanStep {
   commands: string[];
 }
 
+/** One visible plan row after every command has been tokenized independently. */
+export interface RunnablePlanStep {
+  id: string;
+  number: number | null;
+  text: string;
+  command: string | null;
+  argv: string[] | null;
+  error?: string;
+}
+
 /**
  * Extracts runnable steps from MANVI's rendered remediation plan.
  *
@@ -168,12 +182,32 @@ export interface PlanStep {
 export function extractPlanSteps(planText: string): PlanStep[] {
   const steps: PlanStep[] = [];
   let inFence = false;
+  let fencedOwner: PlanStep | null = null;
+  let capped = false;
+  const lines = planText.split("\n");
 
-  for (const rawLine of planText.split("\n")) {
+  for (const rawLine of lines.slice(0, MAX_PLAN_LINES)) {
     const line = rawLine.trimEnd();
     const fence = line.match(/^\s*```/);
     if (fence) {
       inFence = !inFence;
+      fencedOwner = inFence ? (steps.at(-1) ?? null) : null;
+      continue;
+    }
+
+    if (inFence) {
+      const command = line.trim();
+      // A model often emits a language-labelled fenced block after a numbered
+      // step. Keep each physical command as an independent argv candidate;
+      // comments and blank lines are inert, and tokenization below still
+      // rejects chaining, redirects and substitutions.
+      if (fencedOwner && command && !command.startsWith("#")) {
+        if (fencedOwner.commands.length < MAX_COMMANDS_PER_STEP) {
+          fencedOwner.commands.push(command);
+        } else {
+          capped = true;
+        }
+      }
       continue;
     }
 
@@ -181,15 +215,68 @@ export function extractPlanSteps(planText: string): PlanStep[] {
     const bulleted = line.match(/^\s*[-*]\s+(.*)$/);
     if (!numbered && !bulleted) continue;
 
+    if (steps.length >= MAX_PLAN_STEPS) {
+      capped = true;
+      break;
+    }
+
     const body = numbered ? numbered[2] : bulleted![1];
+    const inlineCommands = extractCodeSpans(body);
+    if (inlineCommands.length > MAX_COMMANDS_PER_STEP) capped = true;
     steps.push({
       number: numbered ? Number.parseInt(numbered[1], 10) : null,
       text: body.trim(),
-      commands: extractCodeSpans(body),
+      commands: inlineCommands.slice(0, MAX_COMMANDS_PER_STEP),
+    });
+  }
+
+  if (lines.length > MAX_PLAN_LINES) capped = true;
+  if (capped) {
+    steps.push({
+      number: null,
+      text: "Plan parsing was capped; additional steps were not treated as complete coverage.",
+      commands: [],
     });
   }
 
   return steps;
+}
+
+/**
+ * Converts model prose into visible, independently runnable rows.
+ *
+ * A step containing two commands becomes two rows so no command disappears.
+ * A prose-only or rejected command stays visible with `argv: null`; callers
+ * can explain why it did not run instead of silently dropping it.
+ */
+export function buildRunnablePlanSteps(planText: string): RunnablePlanStep[] {
+  const runnable: RunnablePlanStep[] = [];
+  for (const [stepIndex, step] of extractPlanSteps(planText).entries()) {
+    const number = step.number ?? stepIndex + 1;
+    if (step.commands.length === 0) {
+      runnable.push({
+        id: `step-${stepIndex + 1}-${number}-prose`,
+        number,
+        text: step.text,
+        command: null,
+        argv: null,
+      });
+      continue;
+    }
+
+    for (const [commandIndex, command] of step.commands.entries()) {
+      const tokenized = tokenizeCommand(command);
+      runnable.push({
+        id: `step-${stepIndex + 1}-${number}-command-${commandIndex + 1}`,
+        number,
+        text: step.text,
+        command,
+        argv: tokenized.ok ? tokenized.argv : null,
+        ...(tokenized.ok ? {} : { error: tokenized.error }),
+      });
+    }
+  }
+  return runnable;
 }
 
 /** Pulls the contents of `` `…` `` spans, skipping fenced-block markers. */
@@ -203,6 +290,7 @@ function extractCodeSpans(text: string): string[] {
     // anything else the model put in backticks on a step line is intended
     // to be runnable.
     if (candidate) commands.push(candidate);
+    if (commands.length > MAX_COMMANDS_PER_STEP) break;
   }
   return commands;
 }

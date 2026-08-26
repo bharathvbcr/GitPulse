@@ -271,6 +271,9 @@ pub fn health_fix_system() -> String {
          Rules:\n\
          - Reply with a numbered plan of concrete steps. Where a step is a command, show the\n\
            exact command in an inline code span.\n\
+         - Every command must be one direct package-manager, audit, or test command. Never use\n\
+           a shell, chaining, pipes, redirects, substitutions, curl/wget, or an executable path.\n\
+           Put multiple commands in separate inline code spans so each is reviewed separately.\n\
          - Order steps by severity: critical and high vulnerabilities first, then warnings,\n\
            then routine updates.\n\
          - Use only what the report shows. Never invent package versions, advisories or\n\
@@ -299,6 +302,9 @@ pub fn coverage_report_system() -> String {
          - Reply with a short prose summary of overall coverage health first.\n\
          - Then give a numbered plan of concrete steps. Where a step is a command, show the\n\
            exact command in an inline code span.\n\
+         - Every command must be one direct test or coverage-tool invocation. Never use a shell,\n\
+           chaining, pipes, redirects, substitutions, network download tools, or executable paths.\n\
+           Put multiple commands in separate inline code spans so each is reviewed separately.\n\
          - Use only what the report shows. Never invent percentages, file names or counts; when\n\
            the report says artifacts are missing or skipped, address generating them instead of\n\
            pretending the data exists.\n\
@@ -591,6 +597,8 @@ mod tests {
         let system = health_fix_system();
         assert!(system.contains("Never invent package versions"));
         assert!(system.contains("verification step"));
+        assert!(system.contains("Never use"));
+        assert!(system.contains("reviewed separately"));
 
         let user = health_fix_user("REPORT BODY");
         assert!(user.contains("```\nREPORT BODY\n```"));
@@ -607,6 +615,7 @@ mod tests {
         assert!(system.contains("inline code span"));
         assert!(system.contains("Never invent percentages"));
         assert!(system.contains("verification step"));
+        assert!(system.contains("Never use a shell"));
 
         let user = coverage_report_user("REPORT BODY");
         assert!(user.contains("```\nREPORT BODY\n```"));

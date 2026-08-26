@@ -133,7 +133,7 @@ describe("avatar hit-testing", () => {
   it("prefers the node when both discs overlap the pointer", () => {
     const renderer = new GraphRenderer({ originX: 20, laneWidth: 18 });
     const rows = [row({ id: "a", lane: 9 })];
-    const nodeX = renderer.getLaneX(9);
+    const nodeX = renderer.laneXForRow(rows[0], 9);
     const y = renderer.getRowY(0, 0);
     expect(renderer.getCommitAtPoint(nodeX, y, rows, 0, 1, 0, nodeX + 4)?.id).toBe("a");
   });

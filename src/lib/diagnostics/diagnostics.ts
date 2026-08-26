@@ -46,6 +46,33 @@ function clampMessage(message: string): string {
     : message;
 }
 
+/**
+ * Webview-host and Vite-HMR chatter that is not a GitPulse failure.
+ *
+ * WKWebView cannot apply Vite's ESM/CSS hot swap (`module.default`); the
+ * page then reloads while Rust still holds IPC callbacks, and Tauri falls
+ * back from the custom protocol to postMessage. Those messages would
+ * otherwise drown the diagnostics ring (and survive relaunch via the
+ * persisted blob).
+ */
+export function isHostRuntimeNoise(message: string): boolean {
+  const text = message.trim();
+  if (text.startsWith("[TAURI] Couldn't find callback id ")) return true;
+  if (
+    text.includes(
+      "IPC custom protocol failed, Tauri will now use the postMessage interface instead",
+    )
+  ) {
+    return true;
+  }
+  if (text.startsWith("[hmr] Failed to reload ")) return true;
+  if (text === "Importing a module script failed." || text === "Importing a module script failed") {
+    return true;
+  }
+  if (text.includes("(evaluating 'module.default')")) return true;
+  return false;
+}
+
 function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
@@ -79,8 +106,9 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
 function loadPersisted(storage: StorageLike | null): {
   entries: DiagnosticEntry[];
   nextId: number;
+  rewritten: boolean;
 } {
-  if (!storage) return { entries: [], nextId: 0 };
+  if (!storage) return { entries: [], nextId: 0, rewritten: false };
   let parsed: unknown = null;
   try {
     const raw = storage.getItem(DIAGNOSTIC_STORAGE_KEY);
@@ -88,15 +116,18 @@ function loadPersisted(storage: StorageLike | null): {
   } catch {
     /* corrupt blob behaves like an empty log */
   }
-  if (!Array.isArray(parsed)) return { entries: [], nextId: 0 };
-  const entries = parsed
+  if (!Array.isArray(parsed)) return { entries: [], nextId: 0, rewritten: false };
+  const sanitized = parsed
     .map(sanitizeEntry)
-    .filter((entry): entry is DiagnosticEntry => entry !== null)
+    .filter((entry): entry is DiagnosticEntry => entry !== null);
+  const entries = sanitized
+    .filter((entry) => !isHostRuntimeNoise(entry.message))
     // Newest first regardless of how the blob was written.
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_DIAGNOSTIC_ENTRIES);
   const nextId = entries.length > 0 ? entries[0].id : 0;
-  return { entries, nextId };
+  const rewritten = sanitized.length !== parsed.length || entries.length !== sanitized.length;
+  return { entries, nextId, rewritten };
 }
 
 export function createDiagnostics(deps: { storage?: StorageLike | null; now?: () => number } = {}): DiagnosticsStore {
@@ -118,8 +149,11 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
     }
   }
 
+  if (restored.rewritten) persist();
+
   function record(severity: DiagnosticSeverity, source: string, detail: unknown) {
     const message = clampMessage(formatError(detail));
+    if (isHostRuntimeNoise(message)) return;
     const newest = entries[0];
     if (
       newest &&
@@ -240,8 +274,9 @@ export function installGlobalDiagnostics(
 
   function note(severity: DiagnosticSeverity, source: string, parts: unknown[]) {
     if (forwarding) return;
-    forwarding = true;
     const message = parts.map((part) => formatError(part)).join(" ");
+    if (isHostRuntimeNoise(message)) return;
+    forwarding = true;
     try {
       // Severity names ("warning") differ from sink method names ("warn").
       if (severity === "error") sink.error(source, message);
@@ -262,11 +297,13 @@ export function installGlobalDiagnostics(
 
   const onUnhandledRejection = (event: DiagnosticEventLike) => {
     const detail = formatError(event.reason);
+    if (isHostRuntimeNoise(detail)) return;
     note("error", "unhandled-rejection", [detail]);
     originalError(`[gitpulse] unhandled promise rejection: ${detail}`);
   };
   const onUncaughtError = (event: DiagnosticEventLike) => {
     const detail = formatError(event.error ?? event.message);
+    if (isHostRuntimeNoise(detail)) return;
     note("error", "uncaught-error", [detail]);
     originalError(`[gitpulse] uncaught error: ${detail}`);
   };

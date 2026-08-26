@@ -252,7 +252,8 @@ fn run_watch_loop<F>(
     sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
     session_stop: Arc<AtomicBool>,
     on_change: F,
-) -> WatchLoopExit where
+) -> WatchLoopExit
+where
     F: Fn(String),
 {
     let WatchLoopContext {
@@ -1247,11 +1248,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();
-        let _key = start_watch_inner(
-            &state,
-            dir.path().to_string_lossy().into_owned(),
-            |_| panic!("emit explosion probe"),
-        )
+        let _key = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {
+            panic!("emit explosion probe")
+        })
         .expect("watch live repo");
         assert_eq!(state.watch_count().unwrap(), 1);
 

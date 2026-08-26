@@ -60,4 +60,23 @@ describe("interfaceStore", () => {
     interfaceStore.reset();
     expect(get(interfaceStore).showGraphAvatars).toBe(true);
   });
+
+  it("customizes graph width without changing the other interface prefs", () => {
+    interfaceStore.setShowLanguageBar(false);
+    interfaceStore.setGraphWidthMode("wide");
+    expect(get(interfaceStore)).toMatchObject({
+      showLanguageBar: false,
+      showGraphAvatars: true,
+      graphWidthMode: "wide",
+    });
+
+    interfaceStore.setGraphWidthMode("full");
+    expect(get(interfaceStore).graphWidthMode).toBe("full");
+  });
+
+  it("reset restores the balanced graph width", () => {
+    interfaceStore.setGraphWidthMode("full");
+    interfaceStore.reset();
+    expect(get(interfaceStore).graphWidthMode).toBe("balanced");
+  });
 });

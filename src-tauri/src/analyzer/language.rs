@@ -190,13 +190,17 @@ impl LanguageDetector {
     pub fn comment_prefix(lang: &str) -> Option<&'static str> {
         match lang {
             "Python" | "YAML" | "TOML" | "Shell" | "Ruby" | "Perl" | "R" | "Makefile"
-            | "Dockerfile" | "Elixir" | "Nim" | "Terraform" => Some("#"),
-            "CSS" | "Less" | "Sass" => Some("/*"),
-            "HTML" | "XML" | "Markdown" | "Vue" | "Svelte" => Some("<!--"),
-            "Lua" | "SQL" | "Haskell" | "Elm" => Some("--"),
-            "Lisp" | "Clojure" | "Scheme" | "Racket" => Some(";"),
-            "Erlang" | "Matlab" => Some("%"),
+            | "Dockerfile" | "Elixir" | "Nim" | "Terraform" | "Julia" | "Prisma" | "Nix"
+            | "Crystal" | "GraphQL" => Some("#"),
+            "CSS" | "Less" | "Sass" | "SCSS" | "Stylus" | "PostCSS" => Some("/*"),
+            "HTML" | "XML" | "Markdown" | "Vue" | "Svelte" | "Astro" => Some("<!--"),
+            "Lua" | "SQL" | "Haskell" | "Elm" | "Ada" | "VHDL" => Some("--"),
+            "Lisp" | "Common Lisp" | "Clojure" | "Scheme" | "Racket" | "Assembly" | "INI" => {
+                Some(";")
+            }
+            "Erlang" | "Matlab" | "PostScript" | "Prolog" => Some("%"),
             "Fortran" => Some("!"),
+            "Batchfile" => Some("REM"),
             _ => Some("//"),
         }
     }
@@ -209,9 +213,14 @@ impl LanguageDetector {
             }
             "Python" => Some("python"),
             "Go" => Some("go"),
-            "Java" | "Kotlin" | "Scala" => Some("jvm"),
-            "C" | "C++" | "Objective-C" | "Zig" => Some("native"),
+            "Java" | "Kotlin" | "Scala" | "Groovy" => Some("jvm"),
+            "C" | "C++" | "Objective-C" | "Objective-C++" | "Zig" | "CUDA" => Some("native"),
             "Swift" => Some("swift"),
+            "C#" | "F#" => Some("dotnet"),
+            "PHP" => Some("php"),
+            "Ruby" => Some("ruby"),
+            "Dart" => Some("dart"),
+            "Elixir" | "Erlang" => Some("beam"),
             _ => None,
         }
     }
@@ -221,6 +230,15 @@ impl LanguageDetector {
     pub fn coverage_family_hint(path: &str, info: &LanguageInfo) -> Option<&'static str> {
         if Self::is_rust_source_or_manifest(path) {
             return Some("rust");
+        }
+        if Self::is_go_source_or_manifest(path) {
+            return Some("go");
+        }
+        if Self::is_swift_source_or_manifest(path) {
+            return Some("swift");
+        }
+        if Self::is_jvm_source_or_manifest(path) {
+            return Some("jvm");
         }
         Self::coverage_family(info.name)
     }
@@ -235,27 +253,72 @@ impl LanguageDetector {
             || name.ends_with(".rs.in")
     }
 
+    pub fn is_go_source_or_manifest(path: &str) -> bool {
+        let p = Self::normalize_rel_path(path);
+        let name = file_name_of(&p).to_ascii_lowercase();
+        matches!(name.as_str(), "go.mod" | "go.sum" | "go.work") || name.ends_with(".go")
+    }
+
+    pub fn is_swift_source_or_manifest(path: &str) -> bool {
+        let p = Self::normalize_rel_path(path);
+        let name = file_name_of(&p).to_ascii_lowercase();
+        matches!(name.as_str(), "package.swift" | "package.resolved") || name.ends_with(".swift")
+    }
+
+    pub fn is_jvm_source_or_manifest(path: &str) -> bool {
+        let p = Self::normalize_rel_path(path);
+        let name = file_name_of(&p).to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
+                | "settings.gradle.kts"
+        )
+    }
+
     pub fn ecosystem_hint(path: &str) -> Option<&'static str> {
         let p = Self::normalize_rel_path(path);
         let name = file_name_of(&p);
-        match name {
+        let name_lower = name.to_ascii_lowercase();
+        match name_lower.as_str() {
             "package.json"
             | "package-lock.json"
             | "yarn.lock"
             | "pnpm-lock.yaml"
+            | "pnpm-lock.yml"
             | "bun.lock"
             | "bun.lockb"
             | "npm-shrinkwrap.json" => Some("npm"),
-            "Cargo.toml" | "Cargo.lock" => Some("cargo"),
-            "go.mod" | "go.sum" => Some("go"),
-            "pyproject.toml" | "requirements.txt" | "Pipfile" | "Pipfile.lock" | "poetry.lock" => {
-                Some("python")
-            }
-            "Gemfile" | "Gemfile.lock" => Some("ruby"),
+            "cargo.toml" | "cargo.lock" => Some("cargo"),
+            "go.mod" | "go.sum" | "go.work" => Some("go"),
+            "pyproject.toml"
+            | "requirements.txt"
+            | "pipfile"
+            | "pipfile.lock"
+            | "poetry.lock"
+            | "setup.py"
+            | "setup.cfg" => Some("python"),
+            "gemfile" | "gemfile.lock" => Some("ruby"),
             "composer.json" | "composer.lock" => Some("php"),
+            "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts" => Some("jvm"),
+            "package.swift" | "package.resolved" => Some("swift"),
+            "pubspec.yaml" | "pubspec.lock" => Some("dart"),
+            "mix.exs" | "mix.lock" => Some("elixir"),
+            "cmakelists.txt" | "makefile" | "gnumakefile" => Some("native"),
             _ => {
                 if Self::is_rust_source_or_manifest(&p) {
                     Some("cargo")
+                } else if name_lower.ends_with(".csproj")
+                    || name_lower.ends_with(".fsproj")
+                    || name_lower.ends_with(".sln")
+                {
+                    Some("dotnet")
                 } else {
                     None
                 }
@@ -374,44 +437,97 @@ fn looks_like_webp(bytes: &[u8]) -> bool {
 
 fn filename_language(file_lower: &str) -> Option<LanguageInfo> {
     Some(match file_lower {
-        "dockerfile" => LanguageInfo {
+        "dockerfile" | "containerfile" => LanguageInfo {
             name: "Dockerfile",
             color_hex: "#384d54",
             category: "programming",
         },
-        "makefile" | "gnumakefile" => LanguageInfo {
+        "makefile" | "gnumakefile" | "kbuild" => LanguageInfo {
             name: "Makefile",
             color_hex: "#427819",
             category: "programming",
         },
-        "cmakelists.txt" => LanguageInfo {
+        "cmakelists.txt" | "cmakecache.txt" => LanguageInfo {
             name: "CMake",
             color_hex: "#da3434",
             category: "programming",
         },
-        "cargo.toml" | "clippy.toml" => LanguageInfo {
-            name: "TOML",
-            color_hex: "#9c4221",
-            category: "data",
-        },
-        "rust-toolchain" | "rust-toolchain.toml" => LanguageInfo {
-            name: "TOML",
-            color_hex: "#9c4221",
-            category: "data",
-        },
-        "go.mod" | "go.sum" => LanguageInfo {
+        "cargo.toml" | "clippy.toml" | "rust-toolchain" | "rust-toolchain.toml" => {
+            LanguageInfo {
+                name: "TOML",
+                color_hex: "#9c4221",
+                category: "data",
+            }
+        }
+        "go.mod" | "go.sum" | "go.work" | "go.work.sum" => LanguageInfo {
             name: "Go",
             color_hex: "#00add8",
             category: "data",
         },
-        "gemfile" => LanguageInfo {
+        "gemfile" | "rakefile" | "guardfile" | "podfile" | "brewfile" | "fastfile"
+        | "vagrantfile" | "thorfile" => LanguageInfo {
             name: "Ruby",
             color_hex: "#701516",
             category: "programming",
         },
-        ".gitignore" | ".gitattributes" | ".gitmodules" => LanguageInfo {
+        "package.json" | "tsconfig.json" | "jsconfig.json" => LanguageInfo {
+            name: "JSON",
+            color_hex: "#292929",
+            category: "data",
+        },
+        "composer.json" | "composer.lock" => LanguageInfo {
+            name: "JSON",
+            color_hex: "#292929",
+            category: "data",
+        },
+        "pom.xml" => LanguageInfo {
+            name: "XML",
+            color_hex: "#0060ac",
+            category: "data",
+        },
+        "build.gradle" | "settings.gradle" | "jenkinsfile" => LanguageInfo {
+            name: "Groovy",
+            color_hex: "#4298b8",
+            category: "programming",
+        },
+        "build.gradle.kts" | "settings.gradle.kts" => LanguageInfo {
+            name: "Kotlin",
+            color_hex: "#a97bff",
+            category: "programming",
+        },
+        "package.swift" => LanguageInfo {
+            name: "Swift",
+            color_hex: "#f05138",
+            category: "programming",
+        },
+        "pubspec.yaml" | "pubspec.lock" => LanguageInfo {
+            name: "YAML",
+            color_hex: "#cb171e",
+            category: "data",
+        },
+        "mix.exs" | "mix.lock" => LanguageInfo {
+            name: "Elixir",
+            color_hex: "#6e4a7e",
+            category: "programming",
+        },
+        "pipfile" | "pipfile.lock" => LanguageInfo {
+            name: "TOML",
+            color_hex: "#9c4221",
+            category: "data",
+        },
+        "procfile" => LanguageInfo {
+            name: "Procfile",
+            color_hex: "#3b2f63",
+            category: "programming",
+        },
+        ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitconfig" => LanguageInfo {
             name: "Git Config",
             color_hex: "#f14e32",
+            category: "data",
+        },
+        ".editorconfig" => LanguageInfo {
+            name: "INI",
+            color_hex: "#d1dbe0",
             category: "data",
         },
         _ => return None,
@@ -432,6 +548,20 @@ fn compound_extension_language(file_lower: &str) -> Option<LanguageInfo> {
             category: "programming",
         });
     }
+    if file_lower.ends_with(".blade.php") {
+        return Some(LanguageInfo {
+            name: "Blade",
+            color_hex: "#f7523f",
+            category: "markup",
+        });
+    }
+    if file_lower.ends_with(".html.erb") || file_lower.ends_with(".erb") {
+        return Some(LanguageInfo {
+            name: "HTML+ERB",
+            color_hex: "#701516",
+            category: "markup",
+        });
+    }
     None
 }
 
@@ -448,7 +578,7 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#3178c6",
             category: "programming",
         },
-        "js" | "mjs" | "cjs" => LanguageInfo {
+        "js" | "mjs" | "cjs" | "es" | "es6" => LanguageInfo {
             name: "JavaScript",
             color_hex: "#f1e05a",
             category: "programming",
@@ -478,17 +608,18 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#00add8",
             category: "programming",
         },
-        "py" | "pyi" | "pyw" => LanguageInfo {
+        "py" | "pyi" | "pyw" | "pyx" | "pxd" | "bzl" => LanguageInfo {
             name: "Python",
             color_hex: "#3572a5",
             category: "programming",
         },
-        "c" | "h" => LanguageInfo {
+        "c" | "h" | "cats" | "idc" => LanguageInfo {
             name: "C",
             color_hex: "#555555",
             category: "programming",
         },
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => LanguageInfo {
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "c++" | "h++" | "tcc" | "inl" | "ipp"
+        | "ixx" | "cppm" | "cxxm" => LanguageInfo {
             name: "C++",
             color_hex: "#f34b7d",
             category: "programming",
@@ -503,12 +634,12 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#6866fb",
             category: "programming",
         },
-        "java" => LanguageInfo {
+        "java" | "jav" | "jsh" => LanguageInfo {
             name: "Java",
             color_hex: "#b07219",
             category: "programming",
         },
-        "kt" | "kts" => LanguageInfo {
+        "kt" | "kts" | "ktm" => LanguageInfo {
             name: "Kotlin",
             color_hex: "#a97bff",
             category: "programming",
@@ -523,17 +654,24 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#c22d40",
             category: "programming",
         },
-        "rb" => LanguageInfo {
+        "groovy" | "gvy" | "gy" | "gsh" | "gradle" => LanguageInfo {
+            name: "Groovy",
+            color_hex: "#4298b8",
+            category: "programming",
+        },
+        "rb" | "rbw" | "rake" | "gemspec" | "ru" => LanguageInfo {
             name: "Ruby",
             color_hex: "#701516",
             category: "programming",
         },
-        "php" => LanguageInfo {
-            name: "PHP",
-            color_hex: "#4f5d95",
-            category: "programming",
-        },
-        "cs" => LanguageInfo {
+        "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "php8" | "phps" | "ctp" => {
+            LanguageInfo {
+                name: "PHP",
+                color_hex: "#4f5d95",
+                category: "programming",
+            }
+        }
+        "cs" | "csx" | "cake" => LanguageInfo {
             name: "C#",
             color_hex: "#178600",
             category: "programming",
@@ -548,24 +686,34 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#6e4a7e",
             category: "programming",
         },
-        "erl" | "hrl" => LanguageInfo {
+        "erl" | "hrl" | "escript" => LanguageInfo {
             name: "Erlang",
             color_hex: "#b83998",
             category: "programming",
         },
-        "hs" => LanguageInfo {
+        "hs" | "lhs" => LanguageInfo {
             name: "Haskell",
             color_hex: "#5e5086",
             category: "programming",
         },
-        "lua" => LanguageInfo {
+        "lua" | "wlua" => LanguageInfo {
             name: "Lua",
             color_hex: "#000080",
             category: "programming",
         },
-        "r" => LanguageInfo {
+        "r" | "rd" | "rsx" => LanguageInfo {
             name: "R",
             color_hex: "#198ce7",
+            category: "programming",
+        },
+        "jl" => LanguageInfo {
+            name: "Julia",
+            color_hex: "#a270ba",
+            category: "programming",
+        },
+        "pl" | "pm" | "t" | "pod" | "al" | "cgi" | "psgi" => LanguageInfo {
+            name: "Perl",
+            color_hex: "#0298c3",
             category: "programming",
         },
         "dart" => LanguageInfo {
@@ -578,12 +726,12 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#ec915c",
             category: "programming",
         },
-        "nim" => LanguageInfo {
+        "nim" | "nimble" | "nims" => LanguageInfo {
             name: "Nim",
             color_hex: "#ffc200",
             category: "programming",
         },
-        "clj" | "cljs" | "cljc" => LanguageInfo {
+        "clj" | "cljs" | "cljc" | "edn" => LanguageInfo {
             name: "Clojure",
             color_hex: "#db5855",
             category: "programming",
@@ -603,7 +751,102 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#aa6746",
             category: "programming",
         },
-        "html" | "htm" => LanguageInfo {
+        "f" | "for" | "f90" | "f95" | "f03" | "f08" | "f77" => LanguageInfo {
+            name: "Fortran",
+            color_hex: "#4d41b1",
+            category: "programming",
+        },
+        "asm" | "s" | "nasm" => LanguageInfo {
+            name: "Assembly",
+            color_hex: "#6e4c13",
+            category: "programming",
+        },
+        "cu" | "cuh" => LanguageInfo {
+            name: "CUDA",
+            color_hex: "#3a4e58",
+            category: "programming",
+        },
+        "wat" | "wast" => LanguageInfo {
+            name: "WebAssembly",
+            color_hex: "#04133b",
+            category: "programming",
+        },
+        "nix" => LanguageInfo {
+            name: "Nix",
+            color_hex: "#7e7eff",
+            category: "programming",
+        },
+        "d" | "di" => LanguageInfo {
+            name: "D",
+            color_hex: "#ba595e",
+            category: "programming",
+        },
+        "cr" => LanguageInfo {
+            name: "Crystal",
+            color_hex: "#000100",
+            category: "programming",
+        },
+        "pas" | "pp" | "lpr" => LanguageInfo {
+            name: "Pascal",
+            color_hex: "#e3f171",
+            category: "programming",
+        },
+        "rkt" | "rktl" => LanguageInfo {
+            name: "Racket",
+            color_hex: "#3c5caa",
+            category: "programming",
+        },
+        "scm" | "ss" | "sld" => LanguageInfo {
+            name: "Scheme",
+            color_hex: "#1e4aec",
+            category: "programming",
+        },
+        "lisp" | "lsp" | "cl" | "ny" => LanguageInfo {
+            name: "Common Lisp",
+            color_hex: "#3fb68b",
+            category: "programming",
+        },
+        "purs" => LanguageInfo {
+            name: "PureScript",
+            color_hex: "#1d222d",
+            category: "programming",
+        },
+        "re" | "rei" => LanguageInfo {
+            name: "ReasonML",
+            color_hex: "#ff5847",
+            category: "programming",
+        },
+        "res" | "resi" => LanguageInfo {
+            name: "ReScript",
+            color_hex: "#ed5051",
+            category: "programming",
+        },
+        "gd" => LanguageInfo {
+            name: "GDScript",
+            color_hex: "#355570",
+            category: "programming",
+        },
+        "v" | "vh" => LanguageInfo {
+            name: "Verilog",
+            color_hex: "#b2b7f8",
+            category: "programming",
+        },
+        "sv" | "svh" => LanguageInfo {
+            name: "SystemVerilog",
+            color_hex: "#dae1c0",
+            category: "programming",
+        },
+        "vhd" | "vhdl" => LanguageInfo {
+            name: "VHDL",
+            color_hex: "#49809f",
+            category: "programming",
+        },
+        "prisma" => LanguageInfo {
+            name: "Prisma",
+            color_hex: "#0c344b",
+            category: "programming",
+        },
+        "html" | "htm" | "xhtml" | "shtml" => LanguageInfo {
             name: "HTML",
             color_hex: "#e34c26",
             category: "markup",
@@ -623,16 +866,28 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#1d365d",
             category: "markup",
         },
-        "xml" => LanguageInfo {
+        "styl" | "stylus" => LanguageInfo {
+            name: "Stylus",
+            color_hex: "#ff6347",
+            category: "markup",
+        },
+        "pcss" | "postcss" => LanguageInfo {
+            name: "PostCSS",
+            color_hex: "#dc3a0c",
+            category: "markup",
+        },
+        "xml" | "xsd" | "xsl" | "xslt" | "plist" | "wsdl" => LanguageInfo {
             name: "XML",
             color_hex: "#0060ac",
             category: "data",
         },
-        "json" | "jsonc" | "json5" => LanguageInfo {
-            name: "JSON",
-            color_hex: "#292929",
-            category: "data",
-        },
+        "json" | "jsonc" | "json5" | "geojson" | "topojson" | "jsonld" | "webmanifest" => {
+            LanguageInfo {
+                name: "JSON",
+                color_hex: "#292929",
+                category: "data",
+            }
+        }
         "toml" => LanguageInfo {
             name: "TOML",
             color_hex: "#9c4221",
@@ -643,22 +898,32 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#cb171e",
             category: "data",
         },
-        "md" | "markdown" | "mdx" => LanguageInfo {
+        "md" | "markdown" | "mdx" | "mdown" | "mkdn" => LanguageInfo {
             name: "Markdown",
             color_hex: "#083fa1",
             category: "prose",
         },
-        "sql" => LanguageInfo {
+        "rst" => LanguageInfo {
+            name: "reStructuredText",
+            color_hex: "#141414",
+            category: "prose",
+        },
+        "adoc" | "asciidoc" | "asc" => LanguageInfo {
+            name: "AsciiDoc",
+            color_hex: "#73a0c5",
+            category: "prose",
+        },
+        "sql" | "mysql" | "pgsql" | "plsql" | "psql" | "cql" => LanguageInfo {
             name: "SQL",
             color_hex: "#e38c00",
             category: "data",
         },
-        "sh" | "bash" | "zsh" | "ksh" | "fish" => LanguageInfo {
+        "sh" | "bash" | "zsh" | "ksh" | "fish" | "csh" | "tcsh" | "ash" => LanguageInfo {
             name: "Shell",
             color_hex: "#89e051",
             category: "programming",
         },
-        "ps1" | "psm1" => LanguageInfo {
+        "ps1" | "psm1" | "psd1" => LanguageInfo {
             name: "PowerShell",
             color_hex: "#012456",
             category: "programming",
@@ -668,12 +933,12 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#c1d18a",
             category: "programming",
         },
-        "tf" | "tfvars" => LanguageInfo {
+        "tf" | "tfvars" | "hcl" => LanguageInfo {
             name: "Terraform",
             color_hex: "#7b42bb",
             category: "programming",
         },
-        "proto" => LanguageInfo {
+        "proto" | "protobuf" => LanguageInfo {
             name: "Protocol Buffer",
             color_hex: "#e8353c",
             category: "data",
@@ -683,7 +948,28 @@ fn extension_language(ext: &str) -> LanguageInfo {
             color_hex: "#e10098",
             category: "data",
         },
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => IMAGE,
+        "ini" | "cfg" | "conf" | "properties" => LanguageInfo {
+            name: "INI",
+            color_hex: "#d1dbe0",
+            category: "data",
+        },
+        "diff" | "patch" => LanguageInfo {
+            name: "Diff",
+            color_hex: "#888888",
+            category: "data",
+        },
+        "csv" => LanguageInfo {
+            name: "CSV",
+            color_hex: "#237346",
+            category: "data",
+        },
+        "tsv" => LanguageInfo {
+            name: "TSV",
+            color_hex: "#237346",
+            category: "data",
+        },
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tiff" => IMAGE,
+        "wasm" => BINARY,
         _ => TEXT,
     }
 }
@@ -729,9 +1015,19 @@ fn interpreter_language(token: &str) -> Option<LanguageInfo> {
             color_hex: "#f1e05a",
             category: "programming",
         },
-        "bash" | "sh" | "zsh" | "ksh" | "dash" | "fish" => LanguageInfo {
+        "ts-node" => LanguageInfo {
+            name: "TypeScript",
+            color_hex: "#3178c6",
+            category: "programming",
+        },
+        "bash" | "sh" | "zsh" | "ksh" | "dash" | "fish" | "csh" | "tcsh" => LanguageInfo {
             name: "Shell",
             color_hex: "#89e051",
+            category: "programming",
+        },
+        "pwsh" | "powershell" => LanguageInfo {
+            name: "PowerShell",
+            color_hex: "#012456",
             category: "programming",
         },
         "ruby" | "jruby" => LanguageInfo {
@@ -754,9 +1050,34 @@ fn interpreter_language(token: &str) -> Option<LanguageInfo> {
             color_hex: "#4f5d95",
             category: "programming",
         },
-        "ts-node" => LanguageInfo {
-            name: "TypeScript",
-            color_hex: "#3178c6",
+        "rscript" => LanguageInfo {
+            name: "R",
+            color_hex: "#198ce7",
+            category: "programming",
+        },
+        "julia" => LanguageInfo {
+            name: "Julia",
+            color_hex: "#a270ba",
+            category: "programming",
+        },
+        "swift" => LanguageInfo {
+            name: "Swift",
+            color_hex: "#f05138",
+            category: "programming",
+        },
+        "groovy" => LanguageInfo {
+            name: "Groovy",
+            color_hex: "#4298b8",
+            category: "programming",
+        },
+        "elixir" => LanguageInfo {
+            name: "Elixir",
+            color_hex: "#6e4a7e",
+            category: "programming",
+        },
+        "escript" => LanguageInfo {
+            name: "Erlang",
+            color_hex: "#b83998",
             category: "programming",
         },
         _ => return None,
@@ -937,14 +1258,61 @@ mod tests {
     }
 
     #[test]
-    fn ecosystem_hint_from_rust_source_file() {
-        assert_eq!(
-            LanguageDetector::ecosystem_hint("src/main.rs"),
-            Some("cargo")
-        );
-        assert_eq!(
-            LanguageDetector::ecosystem_hint("src-tauri/src/engine/git_reader.rs"),
-            Some("cargo")
-        );
+    fn test_commonly_used_languages_detection() {
+        assert_eq!(LanguageDetector::detect_from_path("src/index.ts").name, "TypeScript");
+        assert_eq!(LanguageDetector::detect_from_path("src/App.tsx").name, "TSX");
+        assert_eq!(LanguageDetector::detect_from_path("src/lib.rs").name, "Rust");
+        assert_eq!(LanguageDetector::detect_from_path("cmd/main.go").name, "Go");
+        assert_eq!(LanguageDetector::detect_from_path("src/main.c").name, "C");
+        assert_eq!(LanguageDetector::detect_from_path("include/header.h").name, "C");
+        assert_eq!(LanguageDetector::detect_from_path("src/engine.cpp").name, "C++");
+        assert_eq!(LanguageDetector::detect_from_path("src/Main.java").name, "Java");
+        assert_eq!(LanguageDetector::detect_from_path("Sources/App.swift").name, "Swift");
+        assert_eq!(LanguageDetector::detect_from_path("src/Main.kt").name, "Kotlin");
+        assert_eq!(LanguageDetector::detect_from_path("src/index.js").name, "JavaScript");
+        assert_eq!(LanguageDetector::detect_from_path("src/Component.jsx").name, "JSX");
+        assert_eq!(LanguageDetector::detect_from_path("scripts/script.py").name, "Python");
+        assert_eq!(LanguageDetector::detect_from_path("lib/module.rb").name, "Ruby");
+        assert_eq!(LanguageDetector::detect_from_path("src/index.php").name, "PHP");
+        assert_eq!(LanguageDetector::detect_from_path("src/Program.cs").name, "C#");
+        assert_eq!(LanguageDetector::detect_from_path("src/App.fs").name, "F#");
+        assert_eq!(LanguageDetector::detect_from_path("src/Main.scala").name, "Scala");
+        assert_eq!(LanguageDetector::detect_from_path("lib/main.dart").name, "Dart");
+        assert_eq!(LanguageDetector::detect_from_path("src/main.zig").name, "Zig");
+        assert_eq!(LanguageDetector::detect_from_path("build.gradle").name, "Groovy");
+        assert_eq!(LanguageDetector::detect_from_path("build.gradle.kts").name, "Kotlin");
+        assert_eq!(LanguageDetector::detect_from_path("Package.swift").name, "Swift");
+        assert_eq!(LanguageDetector::detect_from_path("go.mod").name, "Go");
+    }
+
+    #[test]
+    fn test_expanded_shebang_interpreters() {
+        let ts = LanguageDetector::detect_from_bytes("cli", b"#!/usr/bin/env ts-node\nconsole.log(1);\n");
+        assert_eq!(ts.name, "TypeScript");
+        let py = LanguageDetector::detect_from_bytes("cli", b"#!/usr/bin/env python3\nprint(1)\n");
+        assert_eq!(py.name, "Python");
+        let swift = LanguageDetector::detect_from_bytes("cli", b"#!/usr/bin/swift\nprint(1)\n");
+        assert_eq!(swift.name, "Swift");
+        let sh = LanguageDetector::detect_from_bytes("cli", b"#!/bin/bash\necho 1\n");
+        assert_eq!(sh.name, "Shell");
+    }
+
+    #[test]
+    fn test_expanded_coverage_families() {
+        assert_eq!(LanguageDetector::coverage_family("TypeScript"), Some("javascript"));
+        assert_eq!(LanguageDetector::coverage_family("TSX"), Some("javascript"));
+        assert_eq!(LanguageDetector::coverage_family("JavaScript"), Some("javascript"));
+        assert_eq!(LanguageDetector::coverage_family("Rust"), Some("rust"));
+        assert_eq!(LanguageDetector::coverage_family("Go"), Some("go"));
+        assert_eq!(LanguageDetector::coverage_family("Java"), Some("jvm"));
+        assert_eq!(LanguageDetector::coverage_family("Kotlin"), Some("jvm"));
+        assert_eq!(LanguageDetector::coverage_family("Swift"), Some("swift"));
+        assert_eq!(LanguageDetector::coverage_family("C"), Some("native"));
+        assert_eq!(LanguageDetector::coverage_family("C++"), Some("native"));
+        assert_eq!(LanguageDetector::coverage_family("C#"), Some("dotnet"));
+        assert_eq!(LanguageDetector::coverage_family("PHP"), Some("php"));
+        assert_eq!(LanguageDetector::coverage_family("Ruby"), Some("ruby"));
+        assert_eq!(LanguageDetector::coverage_family("Dart"), Some("dart"));
     }
 }
+

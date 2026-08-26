@@ -6,10 +6,13 @@
 //! not searched for `coverage.out`.
 
 use crate::analyzer::language::LanguageDetector;
-use crate::engine::git_cli::{git_text_partial, sandbox_join, validate_repo};
+use crate::engine::git_cli::{
+    capture_command, git_text_partial, sandbox_join, sandbox_join_canonical, validate_repo,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 
 type HitMap = BTreeMap<usize, u64>;
 type FileHitMaps = HashMap<String, HitMap>;
@@ -32,6 +35,10 @@ const MAX_DETAIL_LINES: usize = 100_000;
 /// Repos held in the process-wide scan cache. Bounded so hopping across many
 /// repos in one session cannot accumulate unbounded hit maps in memory.
 const CACHE_MAX_REPOS: usize = 8;
+/// Large scans are returned but not retained. A 4M-entry BTreeMap can consume
+/// hundreds of MiB; caching eight such maps would turn ordinary repo switching
+/// into process-wide memory exhaustion.
+const CACHE_MAX_ENTRIES_PER_REPO: usize = 250_000;
 
 /// Hard ceiling on hit-map entries recorded across one scan.
 ///
@@ -61,21 +68,35 @@ impl Default for ScanLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryBudget {
     remaining: usize,
+    /// True only when a new line was actually refused. Reaching zero exactly
+    /// is complete; treating an exact fit as truncation makes capped reports
+    /// lie about work they did finish.
+    dropped: bool,
 }
 
 impl EntryBudget {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             remaining: capacity,
+            dropped: false,
         }
     }
 
     fn spend(&mut self) -> bool {
         if self.remaining == 0 {
+            self.dropped = true;
             return false;
         }
         self.remaining -= 1;
         true
+    }
+
+    fn mark_dropped(&mut self) {
+        self.dropped = true;
+    }
+
+    fn dropped(&self) -> bool {
+        self.dropped
     }
 }
 
@@ -141,6 +162,20 @@ pub struct CoverageFamilyStatus {
     pub expected_formats: Vec<String>,
     pub expected_paths: Vec<String>,
     pub found: bool,
+    /// Repo-aware commands that produce artifacts this family can parse.
+    /// Empty when GitPulse cannot plan a no-shell command for the layout.
+    /// Planned even when `found` is true so a stale report can be regenerated.
+    pub suggested_commands: Vec<String>,
+    /// Tool-install steps MANVI must run before `suggested_commands` when
+    /// `tool_ready` is false (e.g. `cargo install cargo-llvm-cov --locked`).
+    pub setup_commands: Vec<String>,
+    /// True when a version probe confirmed the generator toolchain. False
+    /// means setup is required; it is never reported as a successful generate.
+    pub tool_ready: bool,
+    /// Why `tool_ready` is false, or empty when the toolchain answered.
+    pub tool_detail: String,
+    /// Honest bound for the UI so a multi-minute generate is not a hang.
+    pub duration_hint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,30 +319,45 @@ fn limits_tag(limits: &ScanLimits) -> u64 {
     hash
 }
 
-/// Cheap content probe mixed into the fingerprint. mtime granularity is
-/// filesystem-dependent (1s on HFS+/ext3/network mounts), so delete-recreate
-/// with equal size inside one tick would otherwise serve stale parses. The
-/// first bytes of a coverage artifact change on every regeneration.
+/// Complete bounded-file digest mixed into the fingerprint. mtime granularity
+/// is filesystem-dependent (1s on HFS+/ext3/network mounts), so an equal-size
+/// rewrite inside one tick can otherwise serve stale parses. Sampling a prefix
+/// is insufficient: coverage generators commonly rewrite counters near the end
+/// while headers and file lists remain identical.
 ///
-/// Regular files ONLY: `File::open` on a FIFO with no writer blocks forever,
-/// so callers must not probe special files (and this double-checks).
-fn content_probe(path: &Path) -> u64 {
+/// Only regular files at or below the parser's byte limit are read, and the
+/// canonical target must stay inside the repository. That prevents a FIFO from
+/// blocking and prevents a symlink candidate from fingerprinting outside data.
+fn content_probe(repo: &Path, path: &Path, max_bytes: u64) -> u64 {
     use std::io::Read;
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(canon) = path.canonicalize() else {
         return 0;
     };
-    if !meta.is_file() {
+    if !canon.starts_with(repo) {
         return 0;
     }
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(meta) = std::fs::metadata(&canon) else {
         return 0;
     };
-    let mut buf = [0u8; 4096];
-    let read = file.read(&mut buf).unwrap_or(0);
+    if !meta.is_file() || meta.len() > max_bytes {
+        return 0;
+    }
+    let Ok(mut file) = std::fs::File::open(canon) else {
+        return 0;
+    };
+    let mut buf = [0u8; 64 * 1024];
     let mut hash: u64 = 0x8422_2325_cbf2_9ce4;
-    for byte in &buf[..read] {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
+    loop {
+        let Ok(read) = file.read(&mut buf) else {
+            return 0;
+        };
+        if read == 0 {
+            break;
+        }
+        for byte in &buf[..read] {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
     }
     hash
 }
@@ -328,7 +378,7 @@ impl CoverageScanner {
 
     pub fn file_coverage(repo_path: &str, file_path: &str) -> Result<FileCoverage, String> {
         let repo = validate_repo(repo_path)?;
-        let joined = sandbox_join(&repo, file_path)?;
+        let joined = sandbox_join_canonical(&repo, file_path)?;
         let rel = joined
             .strip_prefix(&repo)
             .map_err(|_| "File path escapes the repository".to_string())?
@@ -435,7 +485,7 @@ impl CoverageScanner {
                     .unwrap_or(0);
                 // Probe regular files only — opening a FIFO would block.
                 let probe = if meta.is_file() {
-                    content_probe(&repo.join(&cand.rel))
+                    content_probe(&repo, &repo.join(&cand.rel), limits.max_artifact_bytes)
                 } else {
                     0
                 };
@@ -467,8 +517,11 @@ impl CoverageScanner {
                 _ => None,
             }
         };
-        if let Some(hit) = cache_hit {
-            return Ok(hit);
+        if let Some((mut report, maps)) = cache_hit {
+            // Suggestions read live manifests (package.json, Cargo.toml), not
+            // the artifact fingerprint, so a cache hit must still refresh them.
+            fill_suggested_commands(&repo, &mut report.families, &detected.cargo_dirs);
+            return Ok((report, maps));
         }
 
         let mut artifacts = Vec::new();
@@ -513,14 +566,22 @@ impl CoverageScanner {
                     }
                     #[cfg(test)]
                     SCAN_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+                    // Parsing builds an artifact-local staging map; merging it
+                    // into the report is where the scan-wide budget is spent.
+                    // Reusing the global budget for both phases charged every
+                    // unique line twice and could drop an exact-fit artifact.
+                    let mut artifact_budget = EntryBudget::new(limits.max_total_entries);
                     match parse_artifact(
                         cand.format,
                         &text,
                         &repo,
-                        &mut budget,
+                        &mut artifact_budget,
                         &mut go_expansion_capped,
                     ) {
                         Ok(map) => {
+                            if artifact_budget.dropped() {
+                                truncated = true;
+                            }
                             // A parse that yields no records is not "0%
                             // covered" data — it's an artifact we understood
                             // but found nothing usable in (empty file,
@@ -641,6 +702,7 @@ impl CoverageScanner {
 
         let mut family_list: Vec<CoverageFamilyStatus> = families.into_values().collect();
         family_list.sort_by(|a, b| a.family.cmp(&b.family));
+        fill_suggested_commands(&repo, &mut family_list, &detected.cargo_dirs);
 
         let report = CoverageReport {
             families: family_list,
@@ -650,6 +712,11 @@ impl CoverageScanner {
             overall,
             truncated,
         };
+
+        let merged_entries: usize = merged.values().map(BTreeMap::len).sum();
+        if merged_entries > CACHE_MAX_ENTRIES_PER_REPO {
+            return Ok((report, merged));
+        }
 
         let mut guard = cache
             .lock()
@@ -744,10 +811,33 @@ fn specs_for(family: &str) -> &'static [(&'static str, CoverageFormat)] {
             ("lcov.info", CoverageFormat::Lcov),
             ("coverage.info", CoverageFormat::Lcov),
             ("coverage/lcov.info", CoverageFormat::Lcov),
+            ("build/coverage.info", CoverageFormat::Lcov),
+            ("build/lcov.info", CoverageFormat::Lcov),
         ],
         "swift" => &[
             ("cobertura.xml", CoverageFormat::Cobertura),
             ("coverage/cobertura.xml", CoverageFormat::Cobertura),
+            ("coverage/lcov.info", CoverageFormat::Lcov),
+            ("lcov.info", CoverageFormat::Lcov),
+        ],
+        "dotnet" => &[
+            ("coverage.cobertura.xml", CoverageFormat::Cobertura),
+            ("coverage.xml", CoverageFormat::Cobertura),
+            ("TestResults/coverage.cobertura.xml", CoverageFormat::Cobertura),
+        ],
+        "php" => &[
+            ("clover.xml", CoverageFormat::Clover),
+            ("coverage.xml", CoverageFormat::Cobertura),
+            ("build/logs/clover.xml", CoverageFormat::Clover),
+        ],
+        "ruby" => &[
+            ("coverage/coverage.json", CoverageFormat::Istanbul),
+            ("coverage/lcov.info", CoverageFormat::Lcov),
+            ("coverage.xml", CoverageFormat::Cobertura),
+        ],
+        "dart" => &[
+            ("coverage/lcov.info", CoverageFormat::Lcov),
+            ("lcov.info", CoverageFormat::Lcov),
         ],
         _ => &[],
     }
@@ -764,7 +854,409 @@ fn extra_dirs_for(family: &str) -> &'static [&'static str] {
             "target/tarpaulin",
             "target/coverage",
         ],
+        "jvm" => &[
+            "target/site/jacoco",
+            "build/reports/jacoco",
+            "build/reports/jacoco/test",
+        ],
+        "native" => &["coverage", "build", "build/coverage"],
+        "swift" => &["coverage", ".build"],
+        "dotnet" => &["TestResults", "coverage"],
+        "php" => &["coverage", "build/logs"],
+        "ruby" => &["coverage"],
+        "dart" => &["coverage"],
         _ => &[],
+    }
+}
+
+/// Cap on cargo workspaces we emit a coverage command for. A monorepo with
+/// dozens of `Cargo.toml` files must not drown the UI in buttons.
+const MAX_RUST_COVERAGE_COMMANDS: usize = 4;
+/// Bound on `package.json` we will parse for a coverage script. A hostile
+/// multi-megabyte manifest is skipped and we fall back to generic runners.
+const MAX_PACKAGE_JSON_BYTES: u64 = 256 * 1024;
+
+/// Characters the frontend tokenizer refuses (no-shell argv runner). A
+/// planned command that contains one would silently no-op in the UI.
+fn command_line_is_argv_safe(line: &str) -> bool {
+    !line.bytes().any(|b| {
+        matches!(
+            b,
+            b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'`' | b'$' | 0
+        )
+    })
+}
+
+fn rel_is_command_unsafe(rel: &str) -> bool {
+    rel.bytes().any(|b| {
+        matches!(
+            b,
+            b'|' | b'&'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'('
+                | b')'
+                | b'`'
+                | b'$'
+                | b'\n'
+                | b'\r'
+                | b'"'
+                | b'\''
+                | 0
+        )
+    })
+}
+
+fn quote_rel(rel: &str) -> String {
+    if rel.chars().any(char::is_whitespace) {
+        format!("\"{rel}\"")
+    } else {
+        rel.to_string()
+    }
+}
+
+fn manifest_is_file(repo: &Path, rel: &str) -> bool {
+    sandbox_join_canonical(repo, rel)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+fn read_root_package_json(repo: &Path) -> Option<serde_json::Value> {
+    let path = sandbox_join_canonical(repo, "package.json").ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PACKAGE_JSON_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn package_has_dep(pkg: &serde_json::Value, name: &str) -> bool {
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .any(|key| pkg.get(*key).and_then(|deps| deps.get(name)).is_some())
+}
+
+fn javascript_coverage_commands(repo: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Some(pkg) = read_root_package_json(repo) {
+        let has_script = pkg
+            .get("scripts")
+            .and_then(|s| s.get("coverage"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_script {
+            commands.push("npm run coverage".into());
+        } else {
+            if package_has_dep(&pkg, "vitest") || package_has_dep(&pkg, "@vitest/coverage-v8") {
+                commands.push("npx --no-install vitest run --coverage".into());
+            }
+            if package_has_dep(&pkg, "jest") || package_has_dep(&pkg, "@jest/core") {
+                commands.push("npx --no-install jest --coverage".into());
+            }
+        }
+    }
+    if commands.is_empty() {
+        commands.push("npx --no-install vitest run --coverage".into());
+        commands.push("npx --no-install jest --coverage".into());
+    }
+    commands
+}
+
+fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = cargo_dirs
+        .iter()
+        .filter(|d| !rel_is_command_unsafe(d))
+        .cloned()
+        .collect();
+    if dirs.is_empty() {
+        // Listing missed every Cargo.toml (ignored, or only `.rs` files).
+        // Same two-path fallback CI:local uses for Tauri checkouts.
+        if manifest_is_file(repo, "Cargo.toml") {
+            dirs.push(String::new());
+        } else if manifest_is_file(repo, "src-tauri/Cargo.toml") {
+            dirs.push("src-tauri".into());
+        }
+    }
+    let mut commands = Vec::new();
+    for dir in dirs.into_iter().take(MAX_RUST_COVERAGE_COMMANDS) {
+        let command = if dir.is_empty() {
+            "cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string()
+        } else {
+            let manifest = quote_rel(&format!("{dir}/Cargo.toml"));
+            let output = quote_rel(&format!("{dir}/lcov.info"));
+            format!(
+                "cargo llvm-cov --manifest-path {manifest} --workspace --lcov --output-path {output}"
+            )
+        };
+        if command_line_is_argv_safe(&command) {
+            commands.push(command);
+        }
+    }
+    if commands.is_empty() {
+        commands.push("cargo llvm-cov --workspace --lcov --output-path lcov.info".into());
+    }
+    commands
+}
+
+fn python_coverage_commands() -> Vec<String> {
+    vec!["pytest --cov --cov-report=xml".into()]
+}
+
+fn go_coverage_commands() -> Vec<String> {
+    vec!["go test ./... -coverprofile=coverage.out".into()]
+}
+
+fn jvm_coverage_commands(repo: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if manifest_is_file(repo, "gradlew") || manifest_is_file(repo, "gradlew.bat") {
+        commands.push("./gradlew test jacocoTestReport".into());
+    }
+    if manifest_is_file(repo, "pom.xml") {
+        commands.push("mvn verify".into());
+    }
+    if commands.is_empty() {
+        commands.push("./gradlew test jacocoTestReport".into());
+        commands.push("mvn verify".into());
+    }
+    commands
+}
+
+const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Version probe for the cargo-llvm-cov subcommand. A missing binary, a
+/// non-zero exit, or a timeout all mean "not ready" — never "generate
+/// succeeded". The scan itself still succeeds; setup is planned instead.
+fn cargo_llvm_cov_available() -> bool {
+    match capture_command(
+        "cargo",
+        &["llvm-cov", "--version"],
+        None,
+        TOOL_PROBE_TIMEOUT,
+        &[],
+    ) {
+        Ok(out) => out.success,
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone)]
+struct LanguageCoveragePlan {
+    generate: Vec<String>,
+    setup: Vec<String>,
+    tool_ready: bool,
+    tool_detail: String,
+    duration_hint: String,
+}
+
+impl LanguageCoveragePlan {
+    fn ready(generate: Vec<String>, duration_hint: &str) -> Self {
+        let duration_hint = if generate.is_empty() {
+            String::new()
+        } else {
+            duration_hint.to_string()
+        };
+        Self {
+            generate,
+            setup: Vec::new(),
+            tool_ready: true,
+            tool_detail: String::new(),
+            duration_hint,
+        }
+    }
+}
+
+fn rust_coverage_plan(
+    repo: &Path,
+    cargo_dirs: &[String],
+    llvm_cov_ready: bool,
+) -> LanguageCoveragePlan {
+    let generate = rust_coverage_commands(repo, cargo_dirs);
+    if llvm_cov_ready {
+        return LanguageCoveragePlan::ready(
+            generate,
+            "Generating Rust coverage can take several minutes.",
+        );
+    }
+    LanguageCoveragePlan {
+        generate,
+        setup: vec![
+            "rustup component add llvm-tools-preview".into(),
+            "cargo install cargo-llvm-cov --locked".into(),
+        ],
+        tool_ready: false,
+        tool_detail: "cargo-llvm-cov is not installed.".into(),
+        duration_hint:
+            "Installing cargo-llvm-cov and generating Rust coverage can take several minutes."
+                .into(),
+    }
+}
+
+fn javascript_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        javascript_coverage_commands(repo),
+        "Frontend coverage usually finishes in about a minute.",
+    )
+}
+
+fn python_coverage_plan() -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        python_coverage_commands(),
+        "Python coverage can take a few minutes.",
+    )
+}
+
+fn go_coverage_plan() -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        go_coverage_commands(),
+        "Go coverage can take a few minutes.",
+    )
+}
+
+fn jvm_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        jvm_coverage_commands(repo),
+        "JVM coverage can take a few minutes.",
+    )
+}
+
+fn native_coverage_commands(repo: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if manifest_is_file(repo, "CMakeLists.txt") {
+        commands.push("ctest --output-on-failure".into());
+    }
+    if manifest_is_file(repo, "Makefile") || manifest_is_file(repo, "GNUmakefile") {
+        commands.push("make test".into());
+    }
+    commands
+}
+
+fn native_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        native_coverage_commands(repo),
+        "Native C/C++ coverage usually finishes in a few minutes.",
+    )
+}
+
+fn swift_coverage_commands() -> Vec<String> {
+    vec!["swift test --enable-code-coverage".into()]
+}
+
+fn swift_coverage_plan() -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        swift_coverage_commands(),
+        "Swift test coverage usually finishes in a few minutes.",
+    )
+}
+
+fn dotnet_coverage_commands() -> Vec<String> {
+    vec!["dotnet test --collect:\"XPlat Code Coverage\"".into()]
+}
+
+fn dotnet_coverage_plan() -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        dotnet_coverage_commands(),
+        ".NET test coverage usually finishes in a few minutes.",
+    )
+}
+
+fn php_coverage_commands(repo: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if manifest_is_file(repo, "vendor/bin/phpunit") {
+        commands.push("vendor/bin/phpunit --coverage-clover coverage.xml".into());
+    }
+    if manifest_is_file(repo, "composer.json") {
+        commands.push("composer test".into());
+    }
+    commands
+}
+
+fn php_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        php_coverage_commands(repo),
+        "PHP test coverage usually finishes in about a minute.",
+    )
+}
+
+fn ruby_coverage_commands(repo: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if manifest_is_file(repo, "Gemfile") {
+        commands.push("bundle exec rspec".into());
+    }
+    commands
+}
+
+fn ruby_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        ruby_coverage_commands(repo),
+        "Ruby test coverage usually finishes in about a minute.",
+    )
+}
+
+fn dart_coverage_commands() -> Vec<String> {
+    vec!["dart test --coverage=coverage".into()]
+}
+
+fn dart_coverage_plan() -> LanguageCoveragePlan {
+    LanguageCoveragePlan::ready(
+        dart_coverage_commands(),
+        "Dart test coverage usually finishes in about a minute.",
+    )
+}
+
+fn apply_language_plan(status: &mut CoverageFamilyStatus, plan: LanguageCoveragePlan) {
+    status.suggested_commands = plan.generate;
+    status.setup_commands = plan.setup;
+    status.tool_ready = plan.tool_ready;
+    status.tool_detail = plan.tool_detail;
+    status.duration_hint = plan.duration_hint;
+}
+
+/// Fills generate/setup commands from the checkout's actual manifests and a
+/// live toolchain probe so the UI never offers `cargo llvm-cov` at a repo
+/// root that has no Cargo.toml, or pretends Rust generation is ready when
+/// cargo-llvm-cov is missing.
+fn fill_suggested_commands(
+    repo: &Path,
+    families: &mut [CoverageFamilyStatus],
+    cargo_dirs: &[String],
+) {
+    let rust_present = families.iter().any(|status| status.family == "rust");
+    let llvm_cov_ready = if rust_present {
+        cargo_llvm_cov_available()
+    } else {
+        true
+    };
+    let javascript = javascript_coverage_plan(repo);
+    let rust = rust_coverage_plan(repo, cargo_dirs, llvm_cov_ready);
+    let python = python_coverage_plan();
+    let go = go_coverage_plan();
+    let jvm = jvm_coverage_plan(repo);
+    let native = native_coverage_plan(repo);
+    let swift = swift_coverage_plan();
+    let dotnet = dotnet_coverage_plan();
+    let php = php_coverage_plan(repo);
+    let ruby = ruby_coverage_plan(repo);
+    let dart = dart_coverage_plan();
+    for status in families.iter_mut() {
+        let plan = match status.family.as_str() {
+            "javascript" => javascript.clone(),
+            "rust" => rust.clone(),
+            "python" => python.clone(),
+            "go" => go.clone(),
+            "jvm" => jvm.clone(),
+            "native" => native.clone(),
+            "swift" => swift.clone(),
+            "dotnet" => dotnet.clone(),
+            "php" => php.clone(),
+            "ruby" => ruby.clone(),
+            "dart" => dart.clone(),
+            _ => LanguageCoveragePlan::ready(Vec::new(), ""),
+        };
+        apply_language_plan(status, plan);
     }
 }
 
@@ -848,6 +1340,11 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
                 expected_formats: formats.into_iter().collect(),
                 expected_paths: paths,
                 found: false,
+                suggested_commands: Vec::new(),
+                setup_commands: Vec::new(),
+                tool_ready: true,
+                tool_detail: String::new(),
+                duration_hint: String::new(),
             }
         });
         let label = if family == "rust" { "Rust" } else { info.name };
@@ -1098,10 +1595,6 @@ fn read_artifact(repo: &Path, rel: &str, max_bytes: u64) -> ArtifactRead {
     }
 }
 
-fn budget_remaining(budget: &EntryBudget) -> usize {
-    budget.remaining
-}
-
 fn parse_artifact(
     format: CoverageFormat,
     text: &str,
@@ -1159,7 +1652,7 @@ fn parse_lcov(
             if let (Some(ln), Some(hits)) = (parts.next(), parts.next()) {
                 if let (Ok(ln), Ok(hits)) = (ln.trim().parse::<usize>(), hits.trim().parse::<u64>())
                 {
-                    record_hit(&mut lines, ln, hits, budget);
+                    record_hit_unbudgeted(&mut lines, ln, hits);
                 }
             }
         }
@@ -1203,7 +1696,7 @@ fn parse_cobertura(
                 let hits = xml_attr(rest, "hits").or_else(|| xml_attr(rest, "count"));
                 if let (Some(ln), Some(hits)) = (ln, hits) {
                     if let (Ok(ln), Ok(hits)) = (ln.parse::<usize>(), hits.parse::<u64>()) {
-                        record_hit(&mut lines, ln, hits, budget);
+                        record_hit_unbudgeted(&mut lines, ln, hits);
                     }
                 }
             }
@@ -1269,6 +1762,7 @@ fn parse_go_cover(
             continue;
         };
         if budget.remaining == 0 {
+            budget.mark_dropped();
             break;
         }
         let allowance = expansion
@@ -1281,21 +1775,24 @@ fn parse_go_cover(
             continue;
         }
         let file = out.entry(path.clone()).or_default();
-        let end = end_line
+        let bounded_end = end_line
             .max(start_line)
             .min(start_line.saturating_add(10_000))
             .min(MAX_LINE_NO);
+        if bounded_end < end_line.max(start_line) {
+            *expansion_capped = true;
+        }
         // Clamp the span to whatever budget remains; a range that straddles
         // the boundary still records its reachable head.
         let span_end = start_line
             .saturating_add((*allowance).saturating_sub(1))
-            .min(end);
+            .min(bounded_end);
         if span_end < start_line {
             *allowance = 0;
             *expansion_capped = true;
             continue;
         }
-        if span_end < end {
+        if span_end < bounded_end {
             // The allowance, not the parser's own per-range policy, cut this
             // range: the tail is real coverage data the map will not hold.
             *expansion_capped = true;
@@ -1412,7 +1909,7 @@ fn parse_jacoco(
                 continue;
             }
             if let Some(ln) = ln.and_then(|v| v.parse::<usize>().ok()) {
-                record_hit(&mut lines, ln, ci, budget);
+                record_hit_unbudgeted(&mut lines, ln, ci);
             }
         }
     }
@@ -1447,7 +1944,7 @@ fn parse_clover(
             let hits = xml_attr(trimmed, "count");
             if let (Some(ln), Some(hits)) = (ln, hits) {
                 if let (Ok(ln), Ok(hits)) = (ln.parse::<usize>(), hits.parse::<u64>()) {
-                    record_hit(&mut lines, ln, hits, budget);
+                    record_hit_unbudgeted(&mut lines, ln, hits);
                 }
             }
         }
@@ -1595,21 +2092,38 @@ fn record_hit(lines: &mut BTreeMap<usize, u64>, ln: usize, hits: u64, budget: &m
     }
 }
 
+/// Records into a short-lived parser record without spending a budget yet.
+/// The record is charged when it merges into the artifact map, where duplicate
+/// SF/class/file blocks can be recognized and counted only once.
+fn record_hit_unbudgeted(lines: &mut BTreeMap<usize, u64>, ln: usize, hits: u64) {
+    if ln == 0 || ln > MAX_LINE_NO {
+        return;
+    }
+    let hits = hits.min(u32::MAX as u64);
+    lines
+        .entry(ln)
+        .and_modify(|value| *value = (*value).max(hits))
+        .or_insert(hits);
+}
+
+/// Merges one record into a budgeted map. This owns the unique-key debit for
+/// both artifact-local maps and the final scan map.
 fn merge_file(
     out: &mut HashMap<String, BTreeMap<usize, u64>>,
     path: String,
     lines: BTreeMap<usize, u64>,
     budget: &mut EntryBudget,
 ) {
-    if skip_source(&path) || lines.is_empty() || budget_remaining(budget) == 0 {
+    if skip_source(&path) || lines.is_empty() {
+        return;
+    }
+    if !out.contains_key(&path) && budget.remaining == 0 {
+        budget.mark_dropped();
         return;
     }
     let dest = out.entry(path).or_default();
     for (ln, hits) in lines {
         record_hit(dest, ln, hits, budget);
-        if budget_remaining(budget) == 0 {
-            break;
-        }
     }
 }
 
@@ -1626,10 +2140,7 @@ fn merge_into(
     let mut exhausted = false;
     for (path, lines) in ordered {
         merge_file(dest, path, lines, budget);
-        if budget_remaining(budget) == 0 {
-            exhausted = true;
-            break;
-        }
+        exhausted |= budget.dropped();
     }
     exhausted
 }
@@ -1765,10 +2276,11 @@ thread_local! {
 fn path_exists_cached(repo: &Path, rel: &str) -> bool {
     let key = format!("{}\0{}", repo.display(), rel);
     EXISTENCE_MEMO.with(|memo| {
-        *memo
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| repo.join(rel).is_file())
+        *memo.borrow_mut().entry(key).or_insert_with(|| {
+            sandbox_join_canonical(repo, rel)
+                .map(|path| path.is_file())
+                .unwrap_or(false)
+        })
     })
 }
 
@@ -1791,7 +2303,7 @@ fn relativize_or_suffix(repo: &Path, reported: &str) -> Option<String> {
     // Longest-suffix-first (most specific match wins), bounded to the eight
     // most specific attempts: deeper tails cost a stat each and ambiguity,
     // not precision, dominates beyond that.
-    for i in 0..parts.len().min(8) {
+    for i in parts.len().saturating_sub(8)..parts.len() {
         let candidate = parts[i..].join("/");
         if is_safe_rel(&candidate)
             && !skip_source(&candidate)
@@ -1910,6 +2422,11 @@ mod tests {
                 expected_formats: vec!["lcov".into()],
                 expected_paths: vec!["lcov.info".into()],
                 found: false,
+                suggested_commands: Vec::new(),
+                setup_commands: Vec::new(),
+                tool_ready: true,
+                tool_detail: String::new(),
+                duration_hint: String::new(),
             },
         );
         let cands = collect_candidates(&families, &[]);
@@ -1930,6 +2447,11 @@ mod tests {
                 expected_formats: vec!["cobertura".into()],
                 expected_paths: vec!["coverage.xml".into()],
                 found: false,
+                suggested_commands: Vec::new(),
+                setup_commands: Vec::new(),
+                tool_ready: true,
+                tool_detail: String::new(),
+                duration_hint: String::new(),
             },
         );
         let cands = collect_candidates(&families, &[]);
@@ -2265,6 +2787,13 @@ src/main.go:4.1,4.8 1 0
             .expect("rust family from Cargo.toml");
         assert!(rust.languages.iter().any(|l| l == "Rust"));
         assert!(!rust.found);
+        assert_eq!(
+            rust.suggested_commands,
+            vec!["cargo llvm-cov --workspace --lcov --output-path lcov.info".to_string()],
+            "root Cargo.toml must not be planned as a nested workspace: {:?}",
+            rust.suggested_commands
+        );
+        assert_rust_llvm_cov_plan(rust);
     }
 
     #[test]
@@ -2430,6 +2959,257 @@ src/main.go:4.1,4.8 1 0
             !rust.found,
             "rust must stay 'no report' when only JS files are covered: {:?}",
             report.families
+        );
+    }
+
+    fn assert_argv_safe(commands: &[String]) {
+        for command in commands {
+            assert!(
+                command_line_is_argv_safe(command),
+                "planned command must be no-shell argv: {command}"
+            );
+        }
+    }
+
+    fn assert_rust_llvm_cov_plan(rust: &CoverageFamilyStatus) {
+        assert!(
+            rust.duration_hint.contains("several minutes"),
+            "rust duration must be honest: {:?}",
+            rust.duration_hint
+        );
+        if rust.tool_ready {
+            assert!(
+                rust.setup_commands.is_empty(),
+                "a ready toolchain must not plan setup: {:?}",
+                rust.setup_commands
+            );
+            assert!(
+                rust.tool_detail.is_empty(),
+                "ready toolchain detail must be empty: {:?}",
+                rust.tool_detail
+            );
+        } else {
+            assert_eq!(
+                rust.setup_commands,
+                vec![
+                    "rustup component add llvm-tools-preview".to_string(),
+                    "cargo install cargo-llvm-cov --locked".to_string(),
+                ]
+            );
+            assert!(
+                rust.tool_detail.contains("cargo-llvm-cov"),
+                "missing tool must be named: {:?}",
+                rust.tool_detail
+            );
+        }
+        assert_argv_safe(&rust.suggested_commands);
+        assert_argv_safe(&rust.setup_commands);
+    }
+
+    #[test]
+    fn rust_plan_injects_setup_when_llvm_cov_is_missing() {
+        let plan = rust_coverage_plan(Path::new("."), &[], false);
+        assert!(!plan.tool_ready);
+        assert_eq!(
+            plan.setup,
+            vec![
+                "rustup component add llvm-tools-preview".to_string(),
+                "cargo install cargo-llvm-cov --locked".to_string(),
+            ]
+        );
+        assert!(plan.tool_detail.contains("cargo-llvm-cov"));
+        assert!(plan.duration_hint.contains("several minutes"));
+        assert!(!plan.generate.is_empty());
+        assert_argv_safe(&plan.generate);
+        assert_argv_safe(&plan.setup);
+    }
+
+    #[test]
+    fn rust_plan_skips_setup_when_llvm_cov_is_ready() {
+        let plan = rust_coverage_plan(Path::new("."), &[], true);
+        assert!(plan.tool_ready);
+        assert!(plan.setup.is_empty());
+        assert!(plan.tool_detail.is_empty());
+        assert!(plan.duration_hint.contains("several minutes"));
+        assert!(!plan.generate.is_empty());
+    }
+
+    /// GitPulse itself is a Tauri tree: cargo lives under `src-tauri/`, and
+    /// `package.json` has a `coverage` script. The chips next to "no report"
+    /// must offer those commands, not a root `cargo llvm-cov` (no Cargo.toml)
+    /// or a stray `npx jest`.
+    #[test]
+    fn tauri_layout_plans_manifest_path_llvm_cov_and_npm_coverage() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "src-tauri/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(repo.path(), "src-tauri/src/lib.rs", "pub fn x() {}\n");
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"app","scripts":{"coverage":"vitest run --coverage"},"devDependencies":{"vitest":"2.0.0","@vitest/coverage-v8":"2.0.0"}}"#,
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+
+        let rust = report
+            .families
+            .iter()
+            .find(|f| f.family == "rust")
+            .expect("rust family");
+        assert!(!rust.found, "no rust artifact was written");
+        assert_eq!(
+            rust.suggested_commands,
+            vec![
+                "cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path src-tauri/lcov.info"
+                    .to_string()
+            ]
+        );
+        assert_rust_llvm_cov_plan(rust);
+
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert_eq!(js.suggested_commands, vec!["npm run coverage".to_string()]);
+        assert!(js.tool_ready);
+        assert!(js.setup_commands.is_empty());
+        assert!(
+            js.duration_hint.contains("minute"),
+            "js duration must be honest: {:?}",
+            js.duration_hint
+        );
+        assert!(
+            !js.suggested_commands.iter().any(|c| c.contains("jest")),
+            "a coverage script must win over jest: {:?}",
+            js.suggested_commands
+        );
+        assert_argv_safe(&js.suggested_commands);
+    }
+
+    #[test]
+    fn javascript_without_coverage_script_prefers_declared_runner() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"app","devDependencies":{"vitest":"2.0.0"}}"#,
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert_eq!(
+            js.suggested_commands,
+            vec!["npx --no-install vitest run --coverage".to_string()]
+        );
+        assert!(
+            !js.suggested_commands.iter().any(|c| c.contains("jest")),
+            "jest must not be offered when the manifest has only vitest: {:?}",
+            js.suggested_commands
+        );
+    }
+
+    #[test]
+    fn javascript_without_package_json_falls_back_to_both_runners() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert_eq!(
+            js.suggested_commands,
+            vec![
+                "npx --no-install vitest run --coverage".to_string(),
+                "npx --no-install jest --coverage".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn python_go_and_jvm_keep_curated_commands_native_has_none() {
+        let repo = git_repo();
+        write(repo.path(), "pkg/mod.py", "def f():\n    return 1\n");
+        write(repo.path(), "main.go", "package main\nfunc main() {}\n");
+        write(repo.path(), "src/Main.java", "class Main {}\n");
+        write(repo.path(), "src/lib.c", "int x;\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+
+        let python = report
+            .families
+            .iter()
+            .find(|f| f.family == "python")
+            .expect("python");
+        assert_eq!(
+            python.suggested_commands,
+            vec!["pytest --cov --cov-report=xml".to_string()]
+        );
+        assert!(python.tool_ready);
+        assert!(python.setup_commands.is_empty());
+        assert!(python.duration_hint.contains("few minutes"));
+        let go = report
+            .families
+            .iter()
+            .find(|f| f.family == "go")
+            .expect("go");
+        assert_eq!(
+            go.suggested_commands,
+            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        );
+        assert!(go.tool_ready);
+        assert!(go.duration_hint.contains("few minutes"));
+        let jvm = report
+            .families
+            .iter()
+            .find(|f| f.family == "jvm")
+            .expect("jvm");
+        assert_eq!(
+            jvm.suggested_commands,
+            vec![
+                "./gradlew test jacocoTestReport".to_string(),
+                "mvn verify".to_string()
+            ]
+        );
+        assert!(jvm.tool_ready);
+        assert!(jvm.duration_hint.contains("few minutes"));
+        let native = report
+            .families
+            .iter()
+            .find(|f| f.family == "native")
+            .expect("native");
+        assert_eq!(native.suggested_commands, Vec::<String>::new());
+        assert!(native.setup_commands.is_empty());
+        assert!(native.duration_hint.is_empty());
+        for family in &report.families {
+            assert_argv_safe(&family.suggested_commands);
+            assert_argv_safe(&family.setup_commands);
+        }
+    }
+
+    #[test]
+    fn jvm_with_gradlew_does_not_offer_maven() {
+        let repo = git_repo();
+        write(repo.path(), "src/Main.java", "class Main {}\n");
+        write(repo.path(), "gradlew", "#!/bin/sh\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let jvm = report
+            .families
+            .iter()
+            .find(|f| f.family == "jvm")
+            .expect("jvm");
+        assert_eq!(
+            jvm.suggested_commands,
+            vec!["./gradlew test jacocoTestReport".to_string()]
         );
     }
 

@@ -311,6 +311,17 @@ html.macos ::-webkit-scrollbar {
   backface-visibility: hidden;
 }
 
+/* Graph gutter: extra branch lanes pan inside a capped column. Overlay /
+   thin scrollbars only — a classic track would shrink the canvas and
+   un-align nodes from commit rows. */
+.gp-graph-hscroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
 .gp-pane {
   contain: layout paint;
 }

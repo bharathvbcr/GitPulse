@@ -232,7 +232,9 @@ fn test_open_repo_history_status_and_details() {
     assert_eq!(details.summary, history[0].summary);
     assert_eq!(details.gpg_status, "N");
 
-    let stats = GitReader::get_repo_language_stats(&path).expect("stats").stats;
+    let stats = GitReader::get_repo_language_stats(&path)
+        .expect("stats")
+        .stats;
     let rust = stats
         .iter()
         .find(|s| s.language == "Rust")
@@ -512,6 +514,44 @@ fn test_merge_conflict_parse_and_resolve() {
     }
     let text = gitpulse_lib::diff::ConflictResolver::render_resolved(&resolved).unwrap();
     assert!(text.contains("ours change"));
+}
+
+#[test]
+fn quick_commit_refuses_unmerged_paths_and_leaves_the_tree() {
+    let repo = TestRepo::init();
+    repo.write("app.txt", "base\n");
+    repo.commit_all("chore: base");
+    let path = repo.path_str();
+
+    GitWriter::create_branch(&path, "theirs", None).unwrap();
+    GitWriter::checkout_branch(&path, "theirs").unwrap();
+    repo.write("app.txt", "theirs change\n");
+    repo.commit_all("feat: theirs");
+
+    GitWriter::checkout_branch(&path, "main").unwrap();
+    repo.write("app.txt", "ours change\n");
+    repo.commit_all("feat: ours");
+
+    let _ = GitWriter::merge_branch(&path, "theirs", false);
+    let conflicted = GitReader::get_status(&path)
+        .unwrap()
+        .iter()
+        .any(|s| s.is_conflicted);
+    assert!(conflicted, "expected unmerged paths after the merge");
+
+    let err = GitWriter::quick_commit(&path, "feat: should not land")
+        .expect_err("conflicted tree must refuse");
+    assert!(
+        err.to_lowercase().contains("conflict"),
+        "refusal must name the conflict, got {err}"
+    );
+    let history = GitReader::read_commit_history(&path, 5, None).expect("history");
+    assert!(
+        !history
+            .iter()
+            .any(|c| c.summary.contains("should not land")),
+        "quick commit must not create a commit on a conflicted tree"
+    );
 }
 
 #[test]

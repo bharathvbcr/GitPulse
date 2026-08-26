@@ -1,10 +1,16 @@
 import { writable } from "svelte/store";
+import {
+  isGraphWidthMode,
+  type GraphWidthMode,
+} from "../graph/graphLayout";
 
 export interface InterfacePrefs {
   showLanguageBar: boolean;
   showHarnessBadges: boolean;
   /** Author-avatar column in the commit graph gutter. */
   showGraphAvatars: boolean;
+  /** Maximum share of the graph view used by the lane viewport. */
+  graphWidthMode: GraphWidthMode;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -13,6 +19,7 @@ const DEFAULTS: InterfacePrefs = {
   showLanguageBar: true,
   showHarnessBadges: true,
   showGraphAvatars: true,
+  graphWidthMode: "balanced",
 };
 
 function readPrefs(): InterfacePrefs {
@@ -34,6 +41,9 @@ function readPrefs(): InterfacePrefs {
         typeof parsed.showGraphAvatars === "boolean"
           ? parsed.showGraphAvatars
           : DEFAULTS.showGraphAvatars,
+      graphWidthMode: isGraphWidthMode(parsed.graphWidthMode)
+        ? parsed.graphWidthMode
+        : DEFAULTS.graphWidthMode,
     };
   } catch {
     /* corrupt or unavailable storage falls back to defaults */
@@ -76,6 +86,12 @@ function createInterfaceStore() {
     setShowGraphAvatars: (show: boolean) =>
       update((prefs) => {
         const next = { ...prefs, showGraphAvatars: show };
+        persist(next);
+        return next;
+      }),
+    setGraphWidthMode: (mode: GraphWidthMode) =>
+      update((prefs) => {
+        const next = { ...prefs, graphWidthMode: mode };
         persist(next);
         return next;
       }),

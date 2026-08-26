@@ -96,6 +96,58 @@ fn symlink_at_spec_path_is_reported_as_escape() {
     assert_eq!(report.overall.lines_found, 0);
 }
 
+// REGRESSION GUARD: suffix resolution used Path::is_file, which follows a
+// repository symlink outside the checkout. An artifact could therefore make an
+// external source path appear in the report even though source loading later
+// refused it. Discovery and detail lookup must share canonical containment.
+#[cfg(unix)]
+#[test]
+fn source_symlink_escape_never_enters_report_or_detail() {
+    let outside = TempDir::new().unwrap();
+    let secret = outside.path().join("secret.rs");
+    fs::write(&secret, "pub const SECRET: &str = \"outside\";\n").unwrap();
+
+    let repo = git_repo();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::os::unix::fs::symlink(&secret, repo.path().join("src/leak.rs")).unwrap();
+    write(
+        repo.path(),
+        "lcov.info",
+        "SF:/build/agent/work/src/leak.rs\nDA:1,1\nend_of_record\n",
+    );
+
+    let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+    assert!(report.files.iter().all(|file| file.path != "src/leak.rs"));
+    assert!(CoverageScanner::file_coverage(repo.path().to_str().unwrap(), "src/leak.rs").is_err());
+}
+
+// REGRESSION GUARD: command planning read a root package.json through an
+// outside symlink and could offer that external project's coverage script.
+// Manifest discovery must use the same canonical containment as artifact and
+// source discovery.
+#[cfg(unix)]
+#[test]
+fn outside_package_manifest_cannot_shape_coverage_commands() {
+    let outside = TempDir::new().unwrap();
+    let package = outside.path().join("package.json");
+    fs::write(&package, r#"{"scripts":{"coverage":"outside-command"}}"#).unwrap();
+
+    let repo = git_repo();
+    write(repo.path(), "src/app.ts", "export const app = true;\n");
+    std::os::unix::fs::symlink(&package, repo.path().join("package.json")).unwrap();
+
+    let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+    let javascript = report
+        .families
+        .iter()
+        .find(|family| family.family == "javascript")
+        .expect("javascript family");
+    assert!(!javascript
+        .suggested_commands
+        .iter()
+        .any(|command| command == "npm run coverage"));
+}
+
 /// An unreadable artifact must degrade to an explicit skip reason instead of
 /// silently vanishing from the report.
 #[test]

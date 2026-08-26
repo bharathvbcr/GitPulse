@@ -3,6 +3,7 @@
   import { getBranchColor } from "../canvas/Palette";
   import { formatRelativeTime } from "../format";
   import { authorColor, authorIdentity } from "../authors/authorIdentity";
+  import { isKeyboardFocus } from "../dom/focusVisibility";
   import { GitMerge, GitBranch, Cloud, Tag, Compass } from "lucide-svelte";
 
   export interface RefItem {
@@ -16,12 +17,29 @@
     density = "spacious",
     refs = [],
     onSelect,
+    mergeTarget = null,
+    onFocusRow,
+    onBlurRow,
   }: {
     row: VisualCommitRow;
     isSelected?: boolean;
     density?: "spacious" | "compact";
     refs?: RefItem[];
     onSelect?: () => void;
+    /**
+     * The merge point this commit's closing line lands on, when it closes
+     * into another branch. Rendered as screen-reader-only text so the
+     * relationship the graph draws is part of the row's accessible content
+     * — the accessible path must carry what the pointer tooltip shows.
+     */
+    mergeTarget?: Pick<VisualCommitRow, "id" | "summary"> | null;
+    /**
+     * Row focus, with whether it is keyboard-driven (`:focus-visible`).
+     * The table shows the graph tooltip card for keyboard focus so the
+     * hover affordance is not pointer-only.
+     */
+    onFocusRow?: (element: HTMLElement, keyboardVisible: boolean) => void;
+    onBlurRow?: () => void;
   } = $props();
 
   const isCompact = $derived(density === "compact");
@@ -52,11 +70,25 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      // Dismiss the focus-driven tooltip card without moving focus.
+      onBlurRow?.();
+      return;
+    }
     if (e.key !== "Enter" && e.key !== " ") return;
     // Space on a role=button div scrolls the virtualized list by default;
     // without preventDefault selecting also page-jumps.
     e.preventDefault();
     onSelect?.();
+  }
+
+  function handleFocus(e: FocusEvent) {
+    const el = e.currentTarget;
+    if (!(el instanceof HTMLElement)) return;
+    // Keyboard vs click modality — owned and tested by focusVisibility.ts,
+    // which fails open so the accessible card can never be lost to an
+    // environment that cannot answer the question.
+    onFocusRow?.(el, isKeyboardFocus(el));
   }
 
   let conventional = $derived(getConventionalType(row.summary || ""));
@@ -67,6 +99,8 @@
   tabindex="0"
   onclick={onSelect}
   onkeydown={handleKeydown}
+  onfocus={handleFocus}
+  onblur={() => onBlurRow?.()}
   aria-pressed={isSelected}
   class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-sm' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
 >
@@ -126,6 +160,14 @@
     {/each}
 
     <span class="truncate" title={row.summary || undefined}>{row.summary || "No commit message"}</span>
+
+    {#if mergeTarget}
+      <!-- The graph draws this commit's closing line into its merge point;
+           the same relationship must exist in the accessible content. -->
+      <span class="sr-only">
+        Merges into {mergeTarget.id.slice(0, 7)} — {mergeTarget.summary || "no commit message"}
+      </span>
+    {/if}
   </div>
 
   <!-- Author Name & Relative Date -->

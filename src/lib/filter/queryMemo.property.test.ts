@@ -129,6 +129,12 @@ describe("filterRowsWithLanes randomized endpoint truth", () => {
               parentNewIdx,
               `seed ${seed} row ${row.id} conn ${k}: dangled but parent visible`,
             ).toBeUndefined();
+            if (result.rows.length !== commits.length) {
+              expect(
+                conn.to_lane,
+                `seed ${seed} row ${row.id} conn ${k}: dangling to_lane must not keep a ghost column`,
+              ).toBe(conn.from_lane);
+            }
           } else {
             expect(
               parentNewIdx,
@@ -174,6 +180,71 @@ describe("filterRowsWithLanes randomized endpoint truth", () => {
       const rank = new Map(ids.map((id, i) => [id, i]));
       for (let i = 1; i < result.rows.length; i++) {
         expect(rank.get(result.rows[i].id)!).toBeGreaterThan(rank.get(result.rows[i - 1].id)!);
+      }
+    }
+  });
+
+  it("densifies surviving lane indices onto 0..k-1 after a real filter", () => {
+    for (let seed = 1; seed <= 240; seed++) {
+      const { commits } = makeHistory(seed);
+      for (let i = 0; i < commits.length; i++) {
+        commits[i].lane = i % 2 === 0 ? 0 : 12;
+        commits[i].active_lanes = [commits[i].lane];
+        commits[i].connections = commits[i].connections.map((c, k) => ({
+          ...c,
+          from_lane: commits[i].lane,
+          to_lane: k === 0 ? 0 : 12,
+        }));
+      }
+      const needle = NEEDLES[seed % NEEDLES.length];
+      if (needle === "") continue;
+      const result = filterRowsWithLanes(commits, parseFilterQuery(needle));
+      if (result.rows.length === commits.length || result.rows.length === 0) continue;
+      const used = new Set<number>();
+      const add = (n: unknown) => {
+        if (typeof n === "number" && Number.isFinite(n) && n >= 0) used.add(n);
+      };
+      for (const row of result.rows) {
+        add(row.lane);
+        for (const lane of row.active_lanes ?? []) add(lane);
+        for (const conn of row.connections) {
+          const typed = conn as { from_lane?: unknown; to_lane?: unknown };
+          add(typed.from_lane);
+          add(typed.to_lane);
+        }
+      }
+      const max = Math.max(...used);
+      expect(result.maxActiveLane, `seed ${seed}`).toBe(max);
+      expect(max, `seed ${seed} left a hole`).toBe(used.size - 1);
+      for (let i = 0; i <= max; i++) {
+        expect(used.has(i), `seed ${seed} missing densified lane ${i}`).toBe(true);
+      }
+    }
+  });
+
+  it("keeps endpoint truth after dropping about 90 percent of a history", () => {
+    for (let seed = 1; seed <= 80; seed++) {
+      const { commits } = makeHistory(seed);
+      for (let i = 0; i < commits.length; i++) {
+        if (i % 10 === 0) commits[i].summary = `KEEPME ${commits[i].summary}`;
+      }
+      const result = filterRowsWithLanes(commits, parseFilterQuery("KEEPME"));
+      expect(result.rows.length, `seed ${seed}`).toBeGreaterThan(0);
+      expect(result.rows.length, `seed ${seed}`).toBeLessThan(commits.length);
+      const newIndex = new Map(result.rows.map((r, i) => [r.id, i]));
+      for (let i = 0; i < result.rows.length; i++) {
+        const row = result.rows[i];
+        expect(row.connections.length).toBe(row.parent_ids.length);
+        for (let k = 0; k < row.connections.length; k++) {
+          const conn = row.connections[k] as GraphRow["connections"][number];
+          const parentNewIdx = newIndex.get(row.parent_ids[k]);
+          if (conn.is_dangling) {
+            expect(parentNewIdx).toBeUndefined();
+            expect(conn.to_lane).toBe(conn.from_lane);
+          } else {
+            expect(result.rows[i + conn.to_row_offset].id).toBe(row.parent_ids[k]);
+          }
+        }
       }
     }
   });

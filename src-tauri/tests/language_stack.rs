@@ -59,7 +59,9 @@ fn run_git(cwd: &Path, args: &[&str]) {
 fn untracked_rust_is_detected() {
     let repo = TestRepo::init();
     repo.write("src/lib.rs", "pub fn ready() {}\n");
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
+    let stats = GitReader::get_repo_language_stats(&repo.path_str())
+        .expect("stats")
+        .stats;
     let rust = stats
         .iter()
         .find(|s| s.language == "Rust")
@@ -93,7 +95,9 @@ fn tauri_layout_detects_rust_despite_lockfiles_and_frontend() {
     );
     repo.commit_all("chore: mixed tauri tree");
 
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
+    let stats = GitReader::get_repo_language_stats(&repo.path_str())
+        .expect("stats")
+        .stats;
     assert!(
         stats
             .iter()
@@ -135,21 +139,39 @@ fn coverage_family_from_untracked_rust_and_cargo_toml() {
 }
 
 #[test]
-fn rust_survives_many_earlier_prose_files() {
+fn multi_language_repo_detects_common_languages() {
     let repo = TestRepo::init();
-    for i in 0..80 {
-        repo.write(&format!("docs/{i:03}.md"), "# note\n");
-        repo.write(&format!("data/{i:03}.json"), "{\"k\":1}\n");
+    repo.write("src/index.ts", "export const msg: string = 'hello';\n");
+    repo.write("src/App.tsx", "export const App = () => <div>hello</div>;\n");
+    repo.write("src/main.rs", "fn main() {}\n");
+    repo.write("cmd/app/main.go", "package main\nfunc main() {}\n");
+    repo.write("src/native.c", "#include <stdio.h>\nint main() { return 0; }\n");
+    repo.write("src/Main.java", "public class Main { public static void main(String[] args) {} }\n");
+    repo.write("Sources/App/main.swift", "print(\"hello\")\n");
+    repo.write("src/App.kt", "fun main() {}\n");
+    repo.write("src/bundle.js", "console.log('js');\n");
+    repo.commit_all("chore: add various language files");
+
+    let stats = GitReader::get_repo_language_stats(&repo.path_str())
+        .expect("stats")
+        .stats;
+
+    let names: Vec<&str> = stats.iter().map(|s| s.language.as_str()).collect();
+    assert!(names.contains(&"TypeScript"), "missing TypeScript: {names:?}");
+    assert!(names.contains(&"TSX"), "missing TSX: {names:?}");
+    assert!(names.contains(&"Rust"), "missing Rust: {names:?}");
+    assert!(names.contains(&"Go"), "missing Go: {names:?}");
+    assert!(names.contains(&"C"), "missing C: {names:?}");
+    assert!(names.contains(&"Java"), "missing Java: {names:?}");
+    assert!(names.contains(&"Swift"), "missing Swift: {names:?}");
+    assert!(names.contains(&"Kotlin"), "missing Kotlin: {names:?}");
+    assert!(names.contains(&"JavaScript"), "missing JavaScript: {names:?}");
+
+    for lang in &["TypeScript", "TSX", "Rust", "Go", "C", "Java", "Swift", "Kotlin", "JavaScript"] {
+        let stat = stats.iter().find(|s| s.language == *lang).unwrap();
+        assert_eq!(stat.category, "programming", "{lang} category mismatch");
+        assert!(stat.code_lines >= 1, "{lang} lines must be >= 1");
+        assert_eq!(stat.file_count, 1, "{lang} file count mismatch");
     }
-    repo.write("zzz-backend/src/lib.rs", "pub fn late() { let y = 2; }\n");
-    repo.commit_all("chore: drown then rust");
-    let stats = GitReader::get_repo_language_stats(&repo.path_str()).expect("stats").stats;
-    assert!(
-        stats.iter().any(|s| s.language == "Rust"),
-        "late rust path dropped: {:?}",
-        stats
-            .iter()
-            .map(|s| s.language.as_str())
-            .collect::<Vec<_>>()
-    );
 }
+

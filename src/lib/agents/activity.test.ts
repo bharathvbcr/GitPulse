@@ -61,6 +61,7 @@ describe("makeAgentAction", () => {
 describe("actionKindForCommand", () => {
   it("maps guarded commands to coarse verbs", () => {
     expect(actionKindForCommand("cmd_commit")).toBe("commit");
+    expect(actionKindForCommand("cmd_quick_commit")).toBe("commit");
     expect(actionKindForCommand("cmd_push")).toBe("push");
     expect(actionKindForCommand("cmd_rebase_interactive")).toBe("rebase");
     expect(actionKindForCommand("cmd_stage_selective_patch")).toBe("stage");

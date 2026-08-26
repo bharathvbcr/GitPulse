@@ -1,15 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { tipTextOf, type TipHost } from "./tipText";
+import { tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
 
 class FakeTipHost implements TipHost {
   attributes = new Map<string, string>();
+  nodeName: string;
   constructor(
     attributes: Record<string, string> = {},
     private text = "",
+    options: { nodeName?: string; closest?: () => unknown } = {},
   ) {
     for (const [name, value] of Object.entries(attributes)) {
       this.attributes.set(name, value);
     }
+    this.nodeName = options.nodeName ?? "DIV";
+    this._closest = options.closest ?? (() => (this.hasAttribute("title") || this.hasAttribute("data-tip-text") ? this : null));
+  }
+  private _closest: () => unknown;
+  closest(_selectors: string): unknown {
+    return this._closest();
   }
   getAttribute(name: string): string | null {
     return this.attributes.has(name) ? (this.attributes.get(name) as string) : null;
@@ -83,5 +91,38 @@ describe("tipTextOf", () => {
     expect(el.getAttribute("data-tip-text")).toBe("");
     expect(el.hasAttribute("aria-label")).toBe(false);
     expect(el.hasAttribute("title")).toBe(false);
+  });
+});
+
+describe("tooltipAnchorFromTarget", () => {
+  it("resolves a titled control the way the global tooltip does", () => {
+    const button = new FakeTipHost({ title: "Pin branch" }, "★");
+    expect(tooltipAnchorFromTarget(button)).toBe(button);
+    expect(button.getAttribute("data-tip-text")).toBe("Pin branch");
+  });
+
+  it("does not steal a graph node hover via a titled canvas ancestor", () => {
+    const gutter = new FakeTipHost({
+      title: "Wide graph — scroll horizontally to see more lanes",
+    });
+    const canvas = new FakeTipHost({}, "", {
+      nodeName: "CANVAS",
+      closest: () => gutter,
+    });
+    expect(tooltipAnchorFromTarget(canvas)).toBeNull();
+    // Ancestor must stay untouched: migrating it would still pop the layout
+    // hint on the next non-canvas mouseover.
+    expect(gutter.getAttribute("title")).toBe(
+      "Wide graph — scroll horizontally to see more lanes",
+    );
+    expect(gutter.getAttribute("data-tip-text")).toBeNull();
+  });
+
+  it("still tooltips a canvas that carries its own title", () => {
+    const canvas = new FakeTipHost({ title: "Commit graph" }, "", {
+      nodeName: "CANVAS",
+    });
+    expect(tooltipAnchorFromTarget(canvas)).toBe(canvas);
+    expect(canvas.getAttribute("data-tip-text")).toBe("Commit graph");
   });
 });

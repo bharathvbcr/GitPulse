@@ -151,8 +151,9 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                warnings
-                    .push(format!("HEAD unavailable ({err}); commit graph may lack the HEAD marker"));
+                warnings.push(format!(
+                    "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
+                ));
                 None
             }
             Err(_) => {
@@ -419,6 +420,32 @@ pub async fn cmd_commit(
         };
         let policy = guard(&repo_path, &argv)?;
         let output = GitWriter::commit(&repo_path, &message, amend)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Stages every tracked change and untracked non-ignored file, then commits,
+/// after the harness has judged both command lines this would run.
+///
+/// Interactive "quick commit" (commit-all) is one mutation, not `stageAll`
+/// followed by `cmd_commit`: two lock acquisitions can absorb a concurrent
+/// writer's index.
+#[tauri::command(async)]
+pub async fn cmd_quick_commit(
+    repo_path: String,
+    message: String,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let add_argv: Vec<&str> = std::iter::once("git")
+            .chain(GitWriter::QUICK_COMMIT_ADD_ARGV.iter().copied())
+            .collect();
+        let add_policy = guard(&repo_path, &add_argv)?;
+        let commit_owned = commit_amend_argv(&message, false);
+        let commit_argv: Vec<&str> = commit_owned.iter().map(String::as_str).collect();
+        let commit_policy = guard(&repo_path, &commit_argv)?;
+        let policy = strictest_verdict(add_policy, commit_policy);
+        let output = GitWriter::quick_commit(&repo_path, &message)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -1691,6 +1718,19 @@ mod tests {
     }
 
     #[test]
+    fn quick_commit_gates_add_all_then_commit_minus_m() {
+        assert_eq!(GitWriter::QUICK_COMMIT_ADD_ARGV, &["add", "--all"]);
+        let add_argv: Vec<&str> = std::iter::once("git")
+            .chain(GitWriter::QUICK_COMMIT_ADD_ARGV.iter().copied())
+            .collect();
+        assert_eq!(add_argv, vec!["git", "add", "--all"]);
+        assert_eq!(
+            commit_amend_argv("feat: all", false),
+            vec!["git", "commit", "-m", "feat: all"]
+        );
+    }
+
+    #[test]
     fn reworded_message_keeps_body_rewrites_subject() {
         assert_eq!(reworded_message("old\n\nbody", "new"), "new\n\nbody");
         assert_eq!(reworded_message("subject only", "new"), "new");
@@ -2022,4 +2062,23 @@ pub async fn cmd_terminal_run(
     timeout_secs: Option<u64>,
 ) -> Result<crate::terminal::TerminalRunResult, String> {
     off_thread(move || crate::terminal::run_terminal(&repo_path, &args, timeout_secs)).await
+}
+
+/// Runs one model-authored health or coverage command through the app's
+/// purpose-specific allowlist and the MANVI command gate.
+///
+/// Keeping this separate from `cmd_terminal_run` makes the authority boundary
+/// structural: plan text cannot reach the user-owned arbitrary argv console by
+/// accidentally omitting a flag or spoofing an origin string.
+#[tauri::command(async)]
+pub async fn cmd_manvi_run_action(
+    repo_path: String,
+    args: Vec<String>,
+    action_kind: crate::terminal::ManviActionKind,
+    timeout_secs: Option<u64>,
+) -> Result<crate::terminal::TerminalRunResult, String> {
+    off_thread(move || {
+        crate::terminal::run_manvi_action(&repo_path, &args, action_kind, timeout_secs)
+    })
+    .await
 }

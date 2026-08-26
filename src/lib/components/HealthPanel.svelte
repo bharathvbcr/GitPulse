@@ -38,7 +38,7 @@
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
   import { formatHealthReport, skippedAudits } from "../health/report";
-  import { extractPlanSteps, tokenizeCommand } from "../terminal/tokenize";
+  import { buildRunnablePlanSteps } from "../terminal/tokenize";
   import type {
     Vulnerability,
   } from "../health/types";
@@ -74,30 +74,7 @@
 
   let planSteps = $derived.by<RunnableStep[]>(() => {
     if (!plan?.text) return [];
-    const raw = extractPlanSteps(plan.text);
-    return raw.map((step, idx) => {
-      const firstCmd = step.commands[0] ?? null;
-      let argv: string[] | null = null;
-      let error: string | undefined;
-
-      if (firstCmd) {
-        const tokenized = tokenizeCommand(firstCmd);
-        if (tokenized.ok) {
-          argv = tokenized.argv;
-        } else {
-          error = tokenized.error;
-        }
-      }
-
-      return {
-        id: `step-${step.number ?? idx + 1}`,
-        number: step.number ?? idx + 1,
-        text: step.text,
-        command: firstCmd,
-        argv,
-        error,
-      };
-    });
+    return buildRunnablePlanSteps(plan.text);
   });
 
   let stepResults = $state<
@@ -151,6 +128,13 @@
    * repository became current after a switch.
    */
   let stepsInflight: AsyncGuard | null = null;
+
+  function beginSteps(): AsyncGuard {
+    stepsInflight?.cancel();
+    const guard = createAsyncGuard();
+    stepsInflight = guard;
+    return guard;
+  }
 
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
@@ -248,7 +232,7 @@
     }
   }
 
-  async function runStep(step: RunnableStep): Promise<boolean> {
+  async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
     stepResults[step.id] = { running: true };
@@ -265,12 +249,14 @@
         stderr_tail: string;
         truncated: boolean;
         duration_ms: number;
-      }>("cmd_terminal_run", {
+      }>("cmd_manvi_run_action", {
         repoPath,
         args: step.argv,
+        actionKind: "health",
         // Long enough for a cold install/build; the backend clamps to [1s, 30min].
         timeoutSecs: 600,
       });
+      if (!guard.isLive()) return false;
 
       const passed = !res.timed_out && res.exit_code === 0;
       stepResults[step.id] = {
@@ -293,6 +279,7 @@
 
       return passed;
     } catch (err) {
+      if (!guard.isLive()) return false;
       const msg = formatError(err);
       stepResults[step.id] = {
         running: false,
@@ -313,14 +300,12 @@
   async function runAllSteps() {
     if (runningAll) return;
     runningAll = true;
-    const guard = createAsyncGuard();
-    stepsInflight?.cancel();
-    stepsInflight = guard;
+    const guard = beginSteps();
     try {
       for (const step of planSteps) {
         if (!guard.isLive()) break;
         if (step.argv && step.argv.length > 0) {
-          const ok = await runStep(step);
+          const ok = await runStep(step, guard);
           if (!ok) {
             // Stop sequential execution on failure
             break;
@@ -636,7 +621,7 @@
                       {#if step.argv}
                         <button
                           type="button"
-                          onclick={() => void runStep(step)}
+                          onclick={() => void runStep(step, beginSteps())}
                           disabled={res?.running || runningAll}
                           class="gp-btn !py-1 !px-2.5 text-xs shrink-0 disabled:opacity-50"
                           title="Execute this command step directly"

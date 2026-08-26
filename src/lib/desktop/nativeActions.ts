@@ -22,6 +22,7 @@ export interface NativeMenuHandlers {
   stash: () => void;
   stashPop: () => void;
   rebase: () => void;
+  quickCommit: () => void;
   palette: () => void;
   focusFilter: () => void;
   openRecent: (path: string) => void;
@@ -80,6 +81,9 @@ export function dispatchNativeMenu(
       return true;
     case "rebase":
       handlers.rebase();
+      return true;
+    case "quick-commit":
+      handlers.quickCommit();
       return true;
     case "palette":
       handlers.palette();

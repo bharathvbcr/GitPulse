@@ -69,8 +69,8 @@ const ROW_HEIGHT = DENSITY_CONFIGS.spacious.rowHeight;
 /** Strip size used by the fake tiling below (matches ~14 spacious rows). */
 const ROWS_PER_STRIP = Math.floor(512 / ROW_HEIGHT);
 
-function laneX(lane: number): number {
-  return DENSITY_CONFIGS.spacious.originX + lane * DENSITY_CONFIGS.spacious.laneWidth;
+function packedX(renderer: GraphRenderer, row: VisualCommitRow, logical: number): number {
+  return renderer.laneXForRow(row, logical);
 }
 
 function yOf(rowIdx: number, scrollTop: number): number {
@@ -261,9 +261,9 @@ describe("no-gap oracle: production frame composition", () => {
 
           const whole = edgeDrawnWhole(
             passes,
-            laneX(rows[c].lane),
+            packedX(renderer, rows[c], conn.from_lane),
             yOf(c, 0), // content-space y (offset applied per pass)
-            laneX(conn.to_lane),
+            packedX(renderer, rows[t], conn.to_lane),
             yOf(t, 0),
           );
           expect(
@@ -309,8 +309,8 @@ describe("no-gap oracle: production frame composition", () => {
           if (conn.is_dangling) continue;
           const t = c + conn.to_row_offset;
           if (t < winStart || t >= winStart + 20) continue;
-          const xFrom = laneX(rows[c].lane);
-          const xTo = laneX(conn.to_lane);
+          const xFrom = packedX(renderer, rows[c], conn.from_lane);
+          const xTo = packedX(renderer, rows[t], conn.to_lane);
           const yFrom = yOf(c, winStart * ROW_HEIGHT);
           const yTo = yOf(t, winStart * ROW_HEIGHT);
           const whole = usable.some(

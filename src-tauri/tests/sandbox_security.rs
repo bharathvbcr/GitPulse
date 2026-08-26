@@ -155,7 +155,9 @@ fn working_tree_reads_refuse_symlink_escape() {
     let outside_py = tempfile::TempDir::new().unwrap();
     std::fs::write(outside_py.path().join("payload.py"), "print('pwned')\n").unwrap();
     std::os::unix::fs::symlink(outside_py.path().join("payload.py"), repo.join("evil.py")).unwrap();
-    let stats = GitReader::get_repo_language_stats(&repo_str).expect("language stats").stats;
+    let stats = GitReader::get_repo_language_stats(&repo_str)
+        .expect("language stats")
+        .stats;
     assert!(
         stats
             .iter()

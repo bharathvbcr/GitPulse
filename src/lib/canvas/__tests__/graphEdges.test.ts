@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { VisualCommitRow } from "../GraphRenderer";
 import {
   buildIncomingEdgeIndex,
+  connectionTargetIndex,
   deepestChildTargetingRange,
   isLongConnection,
 } from "../graphEdges";
@@ -119,5 +120,15 @@ describe("isLongConnection", () => {
   it("owns the strip/overlay boundary at exactly the lookback bound", () => {
     expect(isLongConnection({ to_row_offset: 60 }, 60)).toBe(false);
     expect(isLongConnection({ to_row_offset: 61 }, 60)).toBe(true);
+  });
+});
+
+describe("connectionTargetIndex", () => {
+  it("accepts only finite forward offsets that land inside the array", () => {
+    expect(connectionTargetIndex(2, 1, 6)).toBe(3);
+    expect(connectionTargetIndex(2, 0, 6)).toBeNull();
+    expect(connectionTargetIndex(2, -3, 6)).toBeNull();
+    expect(connectionTargetIndex(2, Number.NaN, 6)).toBeNull();
+    expect(connectionTargetIndex(2, 99, 6)).toBeNull();
   });
 });

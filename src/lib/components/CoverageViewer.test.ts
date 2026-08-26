@@ -31,15 +31,19 @@ describe("CoverageViewer MANVI integration contracts", () => {
     expect(source).toContain("formatCoverageReport(current, repo)");
   });
 
-  it("runs plan steps and script suggestions through the gated terminal runner", () => {
-    expect(source).toContain('"cmd_terminal_run"');
+  it("runs model-authored steps through the scoped Manvi runner", () => {
+    expect(source).toContain('"cmd_manvi_run_action"');
+    expect(source).toContain('actionKind: "coverage"');
     expect(source).toContain("args: step.argv,");
     expect(source).toContain("timeoutSecs: 900");
   });
 
+  it("runs curated generator commands through their own scoped Manvi origin", () => {
+    expect(source).toContain('actionKind: "coverage_generator"');
+  });
+
   it("derives runnable steps from the generation text like HealthPanel does", () => {
-    expect(source).toContain("extractPlanSteps(aiGeneration.text)");
-    expect(source).toContain("tokenizeCommand(firstCmd)");
+    expect(source).toContain("buildRunnablePlanSteps(aiGeneration.text)");
   });
 
   it("journals report generation, step execution and script runs into harnessStore", () => {
@@ -48,14 +52,40 @@ describe("CoverageViewer MANVI integration contracts", () => {
     expect(source).toContain('kind: "coverage-script"');
   });
 
+  it("files a redacted snapshot through the canonical guarded issue owner", () => {
+    const body = source.slice(
+      source.indexOf("async function reportCoverageIssue"),
+      source.indexOf("async function openCoverageIssue"),
+    );
+    expect(body).toContain("buildCoverageIssueDraft(current, repo, aiGeneration?.text)");
+    expect(body).toContain("await askConfirm(");
+    expect(body).toContain("repoStore.reportIssue(draft.title, draft.body, [])");
+    expect(body).toContain("$repoStore.currentPath !== repo");
+    expect(body).toContain("anyScriptRunning");
+    expect(body).toContain("runningMissing");
+    expect(body).toContain("isScanning");
+    expect(body).not.toContain('invoke("cmd_github_create_issue"');
+    expect(source).toContain("The draft excludes the local checkout path and command output.");
+    expect(source).toContain("Create a guarded GitHub issue from this coverage snapshot");
+  });
+
   it("rescans after commands settle so fresh artifacts appear", () => {
     const runStepBody = source.slice(source.indexOf("async function runStep"), source.indexOf("async function runAllSteps"));
     expect(runStepBody).toContain("rescan()");
     const scriptBody = source.slice(
       source.indexOf("async function runCoverageScript"),
-      source.indexOf("$effect"),
+      source.indexOf("async function runCoveragePipeline"),
     );
     expect(scriptBody).toContain("rescan()");
+  });
+
+  it("starts run-all with a fresh live guard instead of requiring a prior action", () => {
+    const runAllBody = source.slice(
+      source.indexOf("async function runAllSteps"),
+      source.indexOf("function briefDetail"),
+    );
+    expect(runAllBody).toContain("const guard = beginOps()");
+    expect(runAllBody).not.toContain("if (!opsInflight?.isLive()) break");
   });
 
   it("guards every async path and resets MANVI state on repo switch", () => {
@@ -72,6 +102,43 @@ describe("CoverageViewer MANVI integration contracts", () => {
   it("keeps the generate button usable without a discovered model server", () => {
     expect(source).toContain("No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.");
     expect(source).not.toMatch(/onclick=\{generateAiReport\}[^>]*disabled=\{(?![^{]*generating)[^}]*aiReady/);
+  });
+
+  it("offers Run coverage with MANVI from scanner-planned commands when a family has no report", () => {
+    expect(source).toContain("runMissingCoverage");
+    expect(source).toContain("runCoverageFamily");
+    expect(source).toContain("runCoveragePipeline");
+    expect(source).toContain("Generate missing coverage artifacts with MANVI");
+    expect(source).toContain("suggestedCoverageCommands(family)");
+    expect(source).toMatch(/missingCoveragePipelines\([\s\S]*report[\s\S]*\?\.families\)/);
+    expect(source).toContain('actionKind: "coverage_generator"');
+    expect(source).toContain("tokenized.error");
+    expect(source).toContain("coverageFamilyRunLabel");
+    expect(source).toContain("durationHint");
+    expect(source).toContain("cargo-llvm-cov");
+    expect(source).toContain("several minutes");
+  });
+
+  it("runs each missing language independently and continues after a language fails", () => {
+    const scriptBody = source.slice(
+      source.indexOf("async function runCoverageScript"),
+      source.indexOf("async function runCoveragePipeline"),
+    );
+    const pipelineBody = source.slice(
+      source.indexOf("async function runCoveragePipeline"),
+      source.indexOf("async function runCoverageFamily"),
+    );
+    const batchBody = source.slice(
+      source.indexOf("async function runMissingCoverage"),
+      source.indexOf("$effect"),
+    );
+    expect(scriptBody).toContain("Promise<boolean>");
+    expect(pipelineBody).toContain("kind: step.kind");
+    expect(pipelineBody).toContain('pipeline.mode === "first_success"');
+    expect(pipelineBody).toContain('pipeline.mode === "all"');
+    expect(batchBody).toContain("guard: batchGuard");
+    expect(batchBody).toContain("await runCoveragePipeline(pipeline");
+    expect(batchBody).not.toContain("if (!passed) break");
   });
 });
 
@@ -114,3 +181,37 @@ describe("CoverageViewer flicker contracts", () => {
     expect(source).toContain("untrack(() => $repoStore.selectedFilePath)");
   });
 });
+
+describe("CoverageViewer failure diagnostics and copy contracts", () => {
+  it("provides single and batch copy options for failed coverage scripts", () => {
+    expect(source).toContain("formatFailedCoverageDiagnostics");
+    expect(source).toContain("copyFailedScript");
+    expect(source).toContain("copyAllFailedScripts");
+    expect(source).toContain("failedScriptList");
+    expect(source).toContain("Copy all failed coverage command diagnostics");
+    expect(source).toContain("Copy failure diagnostics for");
+  });
+
+  it("provides copy error affordances for rescan and scan failures", () => {
+    expect(source).toContain("copyScanError");
+    expect(source).toContain("Copy scan error");
+  });
+
+  it("provides copy diagnostics affordance for failed MANVI steps", () => {
+    expect(source).toContain("copyStepOutput");
+    expect(source).toContain("Copy step diagnostics");
+  });
+
+  it("records failed coverage runs and step failures to the diagnostics store", () => {
+    expect(source).toContain('diagnostics.error(\n          "coverage"');
+    expect(source).toContain('reportPanelError("coverage"');
+  });
+
+  it("cleans up all copy feedback timers on reset and unmount", () => {
+    expect(source).toContain("window.clearTimeout(copiedScriptTimer);");
+    expect(source).toContain("window.clearTimeout(copiedAllTimer);");
+    expect(source).toContain("window.clearTimeout(scanErrorCopyTimer);");
+    expect(source).toContain("window.clearTimeout(copiedStepTimer);");
+  });
+});
+

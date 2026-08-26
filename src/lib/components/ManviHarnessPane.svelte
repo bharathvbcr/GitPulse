@@ -12,6 +12,10 @@
     Check,
     History,
     Clipboard,
+    SquareTerminal,
+    Wrench,
+    Percent,
+    Gauge,
   } from "lucide-svelte";
 
   let branchSuggestion = $state<string>("");
@@ -25,6 +29,13 @@
   let preferred = $derived($harnessStore.preferred);
   // Newest first: the question the journal answers is "what just happened".
   let recentActions = $derived($harnessStore.actions.slice().reverse());
+
+  type CapabilityTab = "health" | "coverage" | "terminal" | "github";
+
+  function openCapability(tab: CapabilityTab) {
+    if (!$repoStore.currentPath) return;
+    repoStore.setActiveTab(tab);
+  }
 
   function actionTime(ts: number): string {
     return new Date(ts).toLocaleTimeString();
@@ -154,6 +165,78 @@
         </p>
       </div>
     {/if}
+  </section>
+
+  <!-- The live `hello` response is intentionally narrow: GitPulse embeds
+       MANVI's policy and local-model planes only. This card keeps that wire
+       truth separate from app-owned, user-confirmed command execution. -->
+  <section class="gp-card p-4 space-y-3">
+    <div class="space-y-1">
+      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Capability boundary</h3>
+      <p class="text-textMuted leading-relaxed">
+        No autonomous PTY or app-control API is exposed by <span class="font-mono">manvi serve</span>.
+        GitPulse adds narrow, explicit controls around the planes the sidecar actually provides.
+      </p>
+    </div>
+
+    <div class="grid gap-2 sm:grid-cols-2">
+      <div class="rounded-xl border border-border/70 bg-background p-3 space-y-1">
+        <div class="flex items-center gap-2 text-textPrimary font-medium">
+          <SquareTerminal size={13} class="text-textMuted" />
+          <span>Interactive shell</span>
+          <span class="ml-auto text-[10px] uppercase text-amber-300">User only</span>
+        </div>
+        <p class="text-textMuted leading-relaxed">
+          MANVI never receives the PTY handle or keystrokes. Shell commands are typed and owned by you.
+        </p>
+      </div>
+      <div class="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3 space-y-1">
+        <div class="flex items-center gap-2 text-textPrimary font-medium">
+          <ShieldCheck size={13} class="text-emerald-400" />
+          <span>Scoped action runner</span>
+          <span class="ml-auto text-[10px] uppercase text-emerald-300">Available</span>
+        </div>
+        <p class="text-textMuted leading-relaxed">
+          Health and coverage commands require a click, a purpose allowlist, direct argv execution,
+          the MANVI policy gate, hard timeouts, bounded output, and stop-on-failure accounting.
+        </p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+      <button
+        class="gp-btn justify-start"
+        disabled={!$repoStore.currentPath}
+        onclick={() => openCapability("health")}
+        title="Scan dependencies, ask MANVI for a remediation plan, and run approved steps"
+      >
+        <Wrench size={12} /> Health fixes
+      </button>
+      <button
+        class="gp-btn justify-start"
+        disabled={!$repoStore.currentPath}
+        onclick={() => openCapability("coverage")}
+        title="Generate, scan, and analyze coverage reports. Rust needs cargo-llvm-cov; a full run can take several minutes."
+      >
+        <Percent size={12} /> Coverage
+      </button>
+      <button
+        class="gp-btn justify-start"
+        disabled={!$repoStore.currentPath}
+        onclick={() => openCapability("terminal")}
+        title="Open the user-owned shell and bounded console"
+      >
+        <SquareTerminal size={12} /> Terminal
+      </button>
+      <button
+        class="gp-btn justify-start"
+        disabled={!$repoStore.currentPath}
+        onclick={() => openCapability("github")}
+        title="Run this repository's bounded local CI pipeline"
+      >
+        <Gauge size={12} /> CI:local
+      </button>
+    </div>
   </section>
 
   <!-- Model servers -->

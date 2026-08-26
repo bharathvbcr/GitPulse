@@ -22,6 +22,7 @@ function handlers(): NativeMenuHandlers & { calls: string[] } {
     stash: () => calls.push("stash"),
     stashPop: () => calls.push("stashPop"),
     rebase: () => calls.push("rebase"),
+    quickCommit: () => calls.push("quickCommit"),
     palette: () => calls.push("palette"),
     focusFilter: () => calls.push("focusFilter"),
     openRecent: (path) => calls.push(`recent:${path}`),
@@ -41,7 +42,8 @@ describe("dispatchNativeMenu", () => {
     expect(dispatchNativeMenu({ id: "open" }, h)).toBe(true);
     expect(dispatchNativeMenu({ id: "clone" }, h)).toBe(true);
     expect(dispatchNativeMenu({ id: "fetch" }, h)).toBe(true);
-    expect(h.calls).toEqual(["open", "clone", "fetch"]);
+    expect(dispatchNativeMenu({ id: "quick-commit" }, h)).toBe(true);
+    expect(h.calls).toEqual(["open", "clone", "fetch", "quickCommit"]);
   });
 
   it("opens settings from the app menu", () => {
@@ -57,7 +59,13 @@ describe("dispatchNativeMenu", () => {
     dispatchNativeMenu({ id: "tab-coverage" }, h);
     dispatchNativeMenu({ id: "tab-health" }, h);
     dispatchNativeMenu({ id: "theme-system" }, h);
-    expect(h.calls).toEqual(["tab:diff", "tab:github", "tab:coverage", "tab:health", "themeSystem"]);
+    expect(h.calls).toEqual([
+      "tab:diff",
+      "tab:github",
+      "tab:coverage",
+      "tab:health",
+      "themeSystem",
+    ]);
   });
 
   it("routes every registered view tab, including manvi (regression)", () => {
@@ -72,7 +80,9 @@ describe("dispatchNativeMenu", () => {
 
   it("opens a recent path and ignores empty recent", () => {
     const h = handlers();
-    expect(dispatchNativeMenu({ id: "open-recent", path: "/tmp/repo" }, h)).toBe(true);
+    expect(
+      dispatchNativeMenu({ id: "open-recent", path: "/tmp/repo" }, h),
+    ).toBe(true);
     expect(dispatchNativeMenu({ id: "open-recent" }, h)).toBe(false);
     expect(h.calls).toEqual(["recent:/tmp/repo"]);
   });
@@ -96,7 +106,9 @@ describe("dispatchNativeMenu", () => {
 describe("repoWindowTitle", () => {
   it("formats repo and branch for Mission Control / the Window menu", () => {
     expect(repoWindowTitle(null, null)).toBe("GitPulse");
-    expect(repoWindowTitle("/Users/acme/gitpulse", "main")).toBe("gitpulse — main");
+    expect(repoWindowTitle("/Users/acme/gitpulse", "main")).toBe(
+      "gitpulse — main",
+    );
     expect(repoWindowTitle("/Users/acme/gitpulse", null)).toBe("gitpulse");
   });
 });
