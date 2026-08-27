@@ -165,9 +165,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let run = |args: &[&str], env: &[(&str, &str)]| {
             let mut cmd = Command::new("git");
-            cmd.args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(dir.path());
+            cmd.args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir.path());
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -179,6 +186,9 @@ mod tests {
             );
         };
         run(&["init", "-q", "-b", "main"], &[]);
+        run(&["config", "user.name", "t"], &[]);
+        run(&["config", "user.email", "t@t"], &[]);
+        run(&["config", "commit.gpgsign", "false"], &[]);
         std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
         run(&["add", "--", "f.txt"], &[]);
         run(&["commit", "-m", "init"], &[]);
@@ -197,7 +207,15 @@ mod tests {
     fn all_tags_are_kept_when_under_the_cap() {
         let dir = init_repo();
         for i in 0..5 {
-            Command::new("git")
+            let out = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(["tag", "-a", "-m", "t", &format!("v0.0.{i}")])
                 .env(
                     "GIT_COMMITTER_DATE",
@@ -206,6 +224,11 @@ mod tests {
                 .current_dir(dir.path())
                 .output()
                 .expect("git tag");
+            assert!(
+                out.status.success(),
+                "tag v0.0.{i} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let decorations = list_ref_decorations(dir.path().to_str().unwrap()).unwrap();
         let names = tag_names(&decorations);
@@ -223,7 +246,15 @@ mod tests {
             // the newest, v0.0.0 the oldest.
             let day = 1 + (i % 28);
             let month = 1 + i / 28;
-            Command::new("git")
+            let out = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(["tag", "-a", "-m", "t", &format!("v0.0.{i}")])
                 .env(
                     "GIT_COMMITTER_DATE",
@@ -232,6 +263,11 @@ mod tests {
                 .current_dir(dir.path())
                 .output()
                 .expect("git tag");
+            assert!(
+                out.status.success(),
+                "tag v0.0.{i} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let decorations = list_ref_decorations(dir.path().to_str().unwrap()).unwrap();
         let mut names = tag_names(&decorations);

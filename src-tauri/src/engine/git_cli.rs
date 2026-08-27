@@ -2175,6 +2175,7 @@ mod tests {
         assert!(sandbox_join_canonical(&repo, "/etc/passwd").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_join_canonical_refuses_symlink_escape() {
         let outside = tempfile::TempDir::new().unwrap();
@@ -2229,6 +2230,7 @@ mod tests {
     /// `fs::write` used to follow a repo-internal symlink and land the file
     /// outside the repository. The canonicalizing join must refuse it while
     /// ordinary writes keep working.
+    #[cfg(unix)]
     #[test]
     fn sandbox_write_refuses_symlinked_directory_escape() {
         let outside = tempfile::TempDir::new().unwrap();

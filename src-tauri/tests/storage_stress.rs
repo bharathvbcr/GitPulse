@@ -195,6 +195,7 @@ fn symlink_loop_does_not_hang_or_explode() {
 
 /// A directory with no read permission is skipped and counted, never fatal,
 /// and never reported as truncation by itself.
+#[cfg(unix)]
 #[test]
 fn permission_denied_subtree_degrades_gracefully() {
     use std::os::unix::fs::PermissionsExt;

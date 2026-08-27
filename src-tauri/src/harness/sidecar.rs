@@ -1358,6 +1358,7 @@ done
     /// every mutation in that window proceeded unchecked. `call_policy` must
     /// retry once on a FRESH connection and surface that attempt's verdict
     /// with no backoff left armed.
+    #[cfg(unix)]
     #[test]
     fn policy_verdict_retries_once_on_a_fresh_connection() {
         let _serial = SLOT_TEST_LOCK

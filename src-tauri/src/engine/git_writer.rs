@@ -1323,6 +1323,25 @@ mod tests {
         }
     }
 
+    fn configure_identity(dir: &std::path::Path) {
+        for (key, value) in [
+            ("user.name", "t"),
+            ("user.email", "t@t"),
+            ("commit.gpgsign", "false"),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir)
+                .output()
+                .expect("git config");
+            assert!(
+                output.status.success(),
+                "git config {key} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn init_repo_with_commit() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
         let output = std::process::Command::new("git")
@@ -1331,6 +1350,7 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+        configure_identity(dir.path());
         std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
         let output = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -1705,25 +1725,6 @@ mod tests {
         assert!(GitWriter::commit_files(&path, "   ", &["a.txt".into()]).is_err());
         assert!(GitWriter::commit_files(&path, "msg", &["../escape.txt".into()]).is_err());
         assert_eq!(head_message(&dir), "init", "no commit may be created");
-    }
-
-    fn configure_identity(dir: &std::path::Path) {
-        for (key, value) in [
-            ("user.name", "t"),
-            ("user.email", "t@t"),
-            ("commit.gpgsign", "false"),
-        ] {
-            let output = std::process::Command::new("git")
-                .args(["config", key, value])
-                .current_dir(dir)
-                .output()
-                .expect("git config");
-            assert!(
-                output.status.success(),
-                "git config {key} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
     }
 
     #[test]

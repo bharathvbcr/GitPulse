@@ -832,6 +832,7 @@ fn test_glob_shaped_paths_match_literally() {
 /// Regression (item 6): reader commands resolve paths through symlinks only
 /// while staying inside the repository; a symlinked directory pointing out is
 /// refused before git ever runs.
+#[cfg(unix)]
 #[test]
 fn test_reader_read_paths_refuse_symlink_escape() {
     let outside = TempDir::new().expect("outside tempdir");

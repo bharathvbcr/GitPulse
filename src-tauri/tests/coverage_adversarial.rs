@@ -6,6 +6,7 @@
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
 use std::fs::Permissions;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -74,6 +75,7 @@ fn fifo_artifact_is_skipped_not_blocking() {
 
 /// A symlink planted exactly at a spec path pointing outside the repository
 /// must surface as a skipped row carrying the escape reason.
+#[cfg(unix)]
 #[test]
 fn symlink_at_spec_path_is_reported_as_escape() {
     let repo = git_repo();
@@ -150,6 +152,7 @@ fn outside_package_manifest_cannot_shape_coverage_commands() {
 
 /// An unreadable artifact must degrade to an explicit skip reason instead of
 /// silently vanishing from the report.
+#[cfg(unix)]
 #[test]
 fn permission_denied_artifact_reports_reason() {
     if unsafe { libc_geteuid() } == 0 {
@@ -174,6 +177,7 @@ fn permission_denied_artifact_reports_reason() {
     assert_eq!(row.skip_reason.as_deref(), Some("permission denied"));
 }
 
+#[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
     // Avoid a libc dependency: read euid from a fresh process.
     let output = Command::new("id").args(["-u"]).output().expect("id -u");

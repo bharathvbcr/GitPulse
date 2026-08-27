@@ -9,7 +9,9 @@
 //! intuition it is called out in a comment.
 
 use gitpulse_lib::analyzer::loc_counter::DiffChurn;
-use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join_canonical};
+use gitpulse_lib::engine::git_cli::resolve_git_dir;
+#[cfg(unix)]
+use gitpulse_lib::engine::git_cli::sandbox_join_canonical;
 use gitpulse_lib::engine::git_writer::validate_ref_name;
 use gitpulse_lib::engine::{GitReader, GitWriter};
 use std::fs::File;
