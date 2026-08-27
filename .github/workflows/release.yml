@@ -175,7 +175,37 @@ jobs:
           # dead on a tag push and actively wrong on a dispatch, where
           # github.sha is the branch head rather than the tagged commit.
           releaseName: 'GitPulse v__VERSION__'
-          releaseBody: 'High-performance native Git desktop client release built with Rust & Svelte 5.'
+          releaseBody: |
+            ### 🚀 GitPulse v__VERSION__
+
+            GitPulse v__VERSION__ introduces major graph visualization upgrades, multi-language detection expansions, robust MANVI coverage runner integrations, and comprehensive cross-platform stability hardening across macOS, Linux, and Windows.
+
+            #### 🌟 Highlights & Features
+            - **High-Performance Canvas / GPU Graph Rendering**:
+              - Optimized curved rail rendering and strict bounding envelope invariants for complex branching topologies and octopus merges.
+              - Author avatars in commit graph nodes with persistent caching and high-DPI scaling.
+              - Interactive tooltip cards with richer commit metadata and branch context.
+              - Virtualized graph lanes and smooth lookback windowing.
+
+            - **Expanded Multi-Language & Stack Detection**:
+              - Support for 60+ programming languages and frameworks with fast heuristic scanning.
+              - Deep repository inspection for JVM (Maven/Gradle), Swift (SPM), Dart/Flutter, .NET, Go, Python, and JavaScript/TypeScript ecosystems.
+              - Bounded language LOC analysis preventing hangs on massive directories.
+
+            - **MANVI Policy & Coverage Engine**:
+              - Native coverage runner integrations for `cargo llvm-cov`, `pytest-cov`, `vitest`, `jest`, `jacoco`, `dotnet test`, `swift test`, and `dart test`.
+              - Strict security allowlisting and purpose-specific validation for developer test generators.
+              - Granular error diagnostics with copyable action hints and resolution guides for missing toolchains or manifests.
+
+            - **Storage & Worktree Management**:
+              - Multi-worktree inspection with safe atomic concurrent operations.
+              - Fast storage analyzer with symlink-loop detection and permission degradation handling.
+
+            #### 🛡️ Hardening & Bug Fixes
+            - Gated platform-specific symlink tests and filesystem permissions for clean Windows/Linux CI builds.
+            - Isolated Git author/committer identities in test fixtures preventing CI failures in pristine environments.
+            - Hardened micro-benchmark timing thresholds and vitest timeouts for CI VM runners.
+            - Automated release version gate asserting synchronous parity across all 5 workspace manifests.
           releaseDraft: true
           prerelease: false
           # No updater plugin is configured in tauri.conf.json, so there is no

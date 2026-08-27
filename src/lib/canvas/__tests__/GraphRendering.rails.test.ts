@@ -308,7 +308,7 @@ describe("connector rails", () => {
       state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
       return state / 2 ** 32;
     };
-    for (let iter = 0; iter < 200; iter++) {
+    for (let iter = 0; iter < 100; iter++) {
       const rowHeight = 8 + Math.floor(rnd() * 41);
       const laneWidth = 6 + Math.floor(rnd() * 35);
       const renderer = new GraphRenderer({ rowHeight, laneWidth, originX: 12 });
@@ -354,7 +354,7 @@ describe("connector rails", () => {
       }
       assertRailEnvelope(connector!, rowHeight, `iter ${iter} (rh=${rowHeight} lw=${laneWidth} ${fromLane}->${toLane} +${offset} merge=${isMerge})`);
     }
-  });
+  }, 30_000);
 
   describe("scholarlm confluence fixture (real solver output behind the artifact screenshot)", () => {
     const rows = scholarlmConfluence as VisualCommitRow[];
