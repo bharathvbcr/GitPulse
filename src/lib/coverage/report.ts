@@ -286,6 +286,30 @@ export function coverageFailureHint(
   if (GO_MISSING_MODULE.test(output)) {
     return "Go was run from a directory without go.mod. Generate coverage from the module root with `go -C <module-dir> test ./... -coverprofile=coverage.out`.";
   }
+  if (
+    /No such file or directory \(os error 2\)/i.test(output) ||
+    /Failed to spawn \S+/i.test(output)
+  ) {
+    return "That generator is not installed. GitPulse will not plan it unless the binary is on PATH.";
+  }
+  if (/outside the purpose-specific command allowlist/i.test(output)) {
+    return "That command is not on the coverage allowlist. The scanner should not offer it.";
+  }
+  if (
+    /npx canceled due to missing packages/i.test(output) ||
+    /no YES option/i.test(output)
+  ) {
+    return "npx --no-install will not download a missing runner. Declare a coverage script or install the package locally.";
+  }
+  if (
+    /Cannot find dependency '@vitest\/coverage-v8'/i.test(output) ||
+    /MISSING DEPENDENCY/i.test(output)
+  ) {
+    return "Vitest ran without a coverage provider. Add @vitest/coverage-v8 or use the package.json coverage script.";
+  }
+  if (/wrapper ['`].*['`] is not a repository file/i.test(output)) {
+    return "No Gradle wrapper in this repository. GitPulse will not invent ./gradlew.";
+  }
   if (TEST_SUITE_RAN_FAILURE.some((pattern) => pattern.test(output))) {
     const cmd = typeof command === "string" ? command : "";
     const runner = /\bvitest\b|\bjest\b|npm run/.test(cmd)

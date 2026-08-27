@@ -52,6 +52,8 @@ describe("suggestedCoverageCommands", () => {
       "npm run test:coverage",
       "./gradlew test jacocoTestReport",
       "mvn verify",
+      "swift test --enable-code-coverage",
+      "dart test --coverage=coverage",
     ];
     for (const command of commands) {
       const tokenized = tokenizeCommand(command);

@@ -879,6 +879,18 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
                 command_is_one_of(args, &["test"])
             }
         },
+        "swift" => {
+            matches!(
+                kind,
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+            ) && command_is_one_of(args, &["test"])
+        }
+        "dart" => {
+            matches!(
+                kind,
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
+            ) && command_is_one_of(args, &["test"])
+        }
         "mvn" | "mvnw" | "./mvnw" | ".\\mvnw" | "gradle" | "gradlew" | "./gradlew"
         | ".\\gradlew" => build_tool_tasks_allowed(args, kind),
         "phpunit" => matches!(
@@ -927,6 +939,7 @@ fn validate_manvi_paths(
         "--requirement=",
         "--constraint=",
         "-coverprofile=",
+        "--coverage=",
     ];
 
     let program_raw = args.first().map(String::as_str).unwrap_or_default();
@@ -1251,6 +1264,12 @@ mod tests {
             vec!["npm".into(), "run".into(), "test:coverage".into()],
             vec!["./gradlew".into(), "test".into(), "jacocoTestReport".into()],
             vec!["mvn".into(), "verify".into()],
+            vec![
+                "swift".into(),
+                "test".into(),
+                "--enable-code-coverage".into(),
+            ],
+            vec!["dart".into(), "test".into(), "--coverage=coverage".into()],
         ] {
             validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
                 .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
@@ -1292,6 +1311,32 @@ mod tests {
         ] {
             let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
                 .expect_err("only go -C <dir> test is allowed");
+            assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn coverage_generator_allowlist_accepts_swift_and_dart_test_only() {
+        validate_manvi_action(
+            &[
+                "swift".into(),
+                "test".into(),
+                "--enable-code-coverage".into(),
+            ],
+            ManviActionKind::CoverageGenerator,
+        )
+        .unwrap();
+        validate_manvi_action(
+            &["dart".into(), "test".into(), "--coverage=coverage".into()],
+            ManviActionKind::CoverageGenerator,
+        )
+        .unwrap();
+        for argv in [
+            vec!["swift".into(), "package".into(), "reset".into()],
+            vec!["dart".into(), "pub".into(), "get".into()],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err("non-test swift/dart must stay refused");
             assert!(err.contains("allowlist"), "{argv:?}: {err}");
         }
     }

@@ -427,8 +427,8 @@ impl CoverageScanner {
         limits: ScanLimits,
     ) -> Result<(CoverageReport, FileHitMaps), String> {
         let repo = validate_repo(repo_path)?;
-        let detected = detect_families(&repo)?;
-        let mut families = detected.families;
+        let mut detected = detect_families(&repo)?;
+        let mut families = std::mem::take(&mut detected.families);
         if families.is_empty() {
             return Ok((
                 CoverageReport {
@@ -523,9 +523,7 @@ impl CoverageScanner {
             fill_suggested_commands(
                 &repo,
                 &mut report.families,
-                &detected.cargo_dirs,
-                &detected.go_mod_dirs,
-                detected.go_work_at_root,
+                CoverageCommandLayout::from_scan(&detected),
             );
             return Ok((report, maps));
         }
@@ -711,9 +709,7 @@ impl CoverageScanner {
         fill_suggested_commands(
             &repo,
             &mut family_list,
-            &detected.cargo_dirs,
-            &detected.go_mod_dirs,
-            detected.go_work_at_root,
+            CoverageCommandLayout::from_scan(&detected),
         );
 
         let report = CoverageReport {
@@ -891,7 +887,7 @@ const MAX_RUST_COVERAGE_COMMANDS: usize = 4;
 /// scanner's `MAX_GO_MODS` bound so a polyglot monorepo cannot drown the UI.
 const MAX_GO_COVERAGE_COMMANDS: usize = 4;
 /// Bound on `package.json` we will parse for a coverage script. A hostile
-/// multi-megabyte manifest is skipped and we fall back to generic runners.
+/// multi-megabyte manifest is skipped; we do not invent npx vitest/jest.
 const MAX_PACKAGE_JSON_BYTES: u64 = 256 * 1024;
 
 /// Characters the frontend tokenizer refuses (no-shell argv runner). A
@@ -965,32 +961,49 @@ fn package_script<'a>(pkg: &'a serde_json::Value, name: &str) -> Option<&'a str>
         .filter(|s| !s.trim().is_empty())
 }
 
+fn javascript_has_vitest_coverage_provider(pkg: &serde_json::Value) -> bool {
+    package_has_dep(pkg, "@vitest/coverage-v8") || package_has_dep(pkg, "@vitest/coverage-istanbul")
+}
+
 fn javascript_coverage_commands(repo: &Path) -> Vec<String> {
     let mut commands = Vec::new();
-    if let Some(pkg) = read_root_package_json(repo) {
-        // Prefer a declared coverage script over a generic vitest/jest argv.
-        // `coverage` is the historical name; `test:coverage` is the npm
-        // convention ScholarLM and others actually ship. Do not pick every
-        // script whose name contains "coverage" (`test:rust:coverage` is not
-        // a JavaScript generator).
-        if package_script(&pkg, "coverage").is_some() {
-            commands.push("npm run coverage".into());
-        } else if package_script(&pkg, "test:coverage").is_some() {
-            commands.push("npm run test:coverage".into());
-        } else {
-            if package_has_dep(&pkg, "vitest") || package_has_dep(&pkg, "@vitest/coverage-v8") {
-                commands.push("npx --no-install vitest run --coverage".into());
-            }
-            if package_has_dep(&pkg, "jest") || package_has_dep(&pkg, "@jest/core") {
-                commands.push("npx --no-install jest --coverage".into());
-            }
+    let Some(pkg) = read_root_package_json(repo) else {
+        return commands;
+    };
+    // Prefer a declared coverage script over a generic vitest/jest argv.
+    // `coverage` is the historical name; `test:coverage` is the npm
+    // convention ScholarLM and others actually ship. Do not pick every
+    // script whose name contains "coverage" (`test:rust:coverage` is not
+    // a JavaScript generator). Never invent `npx --no-install vitest|jest`
+    // when the checkout has no local runner — npx then fails with
+    // "missing packages and no YES option" or a missing coverage provider.
+    if package_script(&pkg, "coverage").is_some() {
+        commands.push("npm run coverage".into());
+    } else if package_script(&pkg, "test:coverage").is_some() {
+        commands.push("npm run test:coverage".into());
+    } else {
+        if package_has_dep(&pkg, "vitest") && javascript_has_vitest_coverage_provider(&pkg) {
+            commands.push("npx --no-install vitest run --coverage".into());
+        }
+        if package_has_dep(&pkg, "jest") || package_has_dep(&pkg, "@jest/core") {
+            commands.push("npx --no-install jest --coverage".into());
         }
     }
-    if commands.is_empty() {
-        commands.push("npx --no-install vitest run --coverage".into());
-        commands.push("npx --no-install jest --coverage".into());
-    }
     commands
+}
+
+fn javascript_unready_detail(repo: &Path) -> String {
+    match read_root_package_json(repo) {
+        None => "No package.json coverage script or local vitest/jest runner.".into(),
+        Some(pkg)
+            if package_has_dep(&pkg, "vitest") && !javascript_has_vitest_coverage_provider(&pkg) =>
+        {
+            "Vitest is present but no coverage provider (@vitest/coverage-v8 or @vitest/coverage-istanbul) is declared.".into()
+        }
+        Some(_) => {
+            "No coverage script or local vitest/jest coverage runner in package.json.".into()
+        }
+    }
 }
 
 fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
@@ -1056,8 +1069,10 @@ fn go_coverage_commands(repo: &Path, go_mod_dirs: &[String], go_work_at_root: bo
         .cloned()
         .collect();
     if dirs.is_empty() {
-        // Listing missed every go.mod (ignored, or only `.go` files). A root
-        // go.work still lets `./...` resolve; otherwise fall back to CWD.
+        // Listing missed every go.mod (ignored). A root go.work or go.mod
+        // still lets `./...` resolve. Do not invent `go test ./...` at a
+        // checkout that has only `.go` files — that is the
+        // "directory prefix . does not contain main module" failure.
         if manifest_is_file(repo, "go.work") || manifest_is_file(repo, "go.mod") {
             dirs.push(String::new());
         }
@@ -1068,22 +1083,15 @@ fn go_coverage_commands(repo: &Path, go_mod_dirs: &[String], go_work_at_root: bo
             commands.push(command);
         }
     }
-    if commands.is_empty() {
-        commands.push("go test ./... -coverprofile=coverage.out".into());
-    }
     commands
 }
 
-fn jvm_coverage_commands(repo: &Path) -> Vec<String> {
+fn jvm_coverage_commands(repo: &Path, mvn_ready: bool) -> Vec<String> {
     let mut commands = Vec::new();
     if manifest_is_file(repo, "gradlew") || manifest_is_file(repo, "gradlew.bat") {
         commands.push("./gradlew test jacocoTestReport".into());
     }
-    if manifest_is_file(repo, "pom.xml") {
-        commands.push("mvn verify".into());
-    }
-    if commands.is_empty() {
-        commands.push("./gradlew test jacocoTestReport".into());
+    if manifest_is_file(repo, "pom.xml") && mvn_ready {
         commands.push("mvn verify".into());
     }
     commands
@@ -1105,6 +1113,17 @@ fn cargo_llvm_cov_available() -> bool {
         Ok(out) => out.success,
         Err(_) => false,
     }
+}
+
+/// True when `program` can be spawned. A non-zero `--version` still counts:
+/// the binary exists. Spawn failure (os error 2) does not.
+fn program_on_path(program: &str) -> bool {
+    capture_command(program, &["--version"], None, TOOL_PROBE_TIMEOUT, &[]).is_ok()
+        || capture_command(program, &["version"], None, TOOL_PROBE_TIMEOUT, &[]).is_ok()
+}
+
+fn family_present(families: &[CoverageFamilyStatus], name: &str) -> bool {
+    families.iter().any(|status| status.family == name)
 }
 
 #[derive(Clone)]
@@ -1129,6 +1148,18 @@ impl LanguageCoveragePlan {
             tool_ready: true,
             tool_detail: String::new(),
             duration_hint,
+        }
+    }
+
+    /// No generate command: the UI shows `tool_detail` and does not offer a
+    /// Run button that would spawn a missing binary or fail the allowlist.
+    fn unavailable(detail: &str) -> Self {
+        Self {
+            generate: Vec::new(),
+            setup: Vec::new(),
+            tool_ready: false,
+            tool_detail: detail.to_string(),
+            duration_hint: String::new(),
         }
     }
 }
@@ -1160,13 +1191,20 @@ fn rust_coverage_plan(
 }
 
 fn javascript_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let generate = javascript_coverage_commands(repo);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable(&javascript_unready_detail(repo));
+    }
     LanguageCoveragePlan::ready(
-        javascript_coverage_commands(repo),
+        generate,
         "Frontend coverage usually finishes in about a minute.",
     )
 }
 
-fn python_coverage_plan() -> LanguageCoveragePlan {
+fn python_coverage_plan(pytest_ready: bool) -> LanguageCoveragePlan {
+    if !pytest_ready {
+        return LanguageCoveragePlan::unavailable("pytest is not installed.");
+    }
     LanguageCoveragePlan::ready(
         python_coverage_commands(),
         "Python coverage can take a few minutes.",
@@ -1178,17 +1216,22 @@ fn go_coverage_plan(
     go_mod_dirs: &[String],
     go_work_at_root: bool,
 ) -> LanguageCoveragePlan {
-    LanguageCoveragePlan::ready(
-        go_coverage_commands(repo, go_mod_dirs, go_work_at_root),
-        "Go coverage can take a few minutes.",
-    )
+    let generate = go_coverage_commands(repo, go_mod_dirs, go_work_at_root);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable("No go.mod or go.work in this repository.");
+    }
+    LanguageCoveragePlan::ready(generate, "Go coverage can take a few minutes.")
 }
 
-fn jvm_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
-    LanguageCoveragePlan::ready(
-        jvm_coverage_commands(repo),
-        "JVM coverage can take a few minutes.",
-    )
+fn jvm_coverage_plan(repo: &Path, mvn_ready: bool) -> LanguageCoveragePlan {
+    let generate = jvm_coverage_commands(repo, mvn_ready);
+    if !generate.is_empty() {
+        return LanguageCoveragePlan::ready(generate, "JVM coverage can take a few minutes.");
+    }
+    if manifest_is_file(repo, "pom.xml") && !mvn_ready {
+        return LanguageCoveragePlan::unavailable("mvn is not installed.");
+    }
+    LanguageCoveragePlan::unavailable("No Gradle wrapper or pom.xml in the repository.")
 }
 
 fn native_coverage_commands(repo: &Path) -> Vec<String> {
@@ -1209,24 +1252,28 @@ fn native_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
     )
 }
 
-fn swift_coverage_commands() -> Vec<String> {
-    vec!["swift test --enable-code-coverage".into()]
-}
-
-fn swift_coverage_plan() -> LanguageCoveragePlan {
+fn swift_coverage_plan(has_package_swift: bool, swift_ready: bool) -> LanguageCoveragePlan {
+    if !has_package_swift {
+        return LanguageCoveragePlan::unavailable("No Package.swift in this repository.");
+    }
+    if !swift_ready {
+        return LanguageCoveragePlan::unavailable("swift is not installed.");
+    }
     LanguageCoveragePlan::ready(
-        swift_coverage_commands(),
+        vec!["swift test --enable-code-coverage".into()],
         "Swift test coverage usually finishes in a few minutes.",
     )
 }
 
-fn dotnet_coverage_commands() -> Vec<String> {
-    vec!["dotnet test --collect:\"XPlat Code Coverage\"".into()]
-}
-
-fn dotnet_coverage_plan() -> LanguageCoveragePlan {
+fn dotnet_coverage_plan(has_dotnet_proj: bool, dotnet_ready: bool) -> LanguageCoveragePlan {
+    if !has_dotnet_proj {
+        return LanguageCoveragePlan::unavailable("No .sln/.csproj/.fsproj in this repository.");
+    }
+    if !dotnet_ready {
+        return LanguageCoveragePlan::unavailable("dotnet is not installed.");
+    }
     LanguageCoveragePlan::ready(
-        dotnet_coverage_commands(),
+        vec!["dotnet test --collect:\"XPlat Code Coverage\"".into()],
         ".NET test coverage usually finishes in a few minutes.",
     )
 }
@@ -1264,13 +1311,15 @@ fn ruby_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
     )
 }
 
-fn dart_coverage_commands() -> Vec<String> {
-    vec!["dart test --coverage=coverage".into()]
-}
-
-fn dart_coverage_plan() -> LanguageCoveragePlan {
+fn dart_coverage_plan(has_pubspec: bool, dart_ready: bool) -> LanguageCoveragePlan {
+    if !has_pubspec {
+        return LanguageCoveragePlan::unavailable("No pubspec.yaml in this repository.");
+    }
+    if !dart_ready {
+        return LanguageCoveragePlan::unavailable("dart is not installed.");
+    }
     LanguageCoveragePlan::ready(
-        dart_coverage_commands(),
+        vec!["dart test --coverage=coverage".into()],
         "Dart test coverage usually finishes in about a minute.",
     )
 }
@@ -1283,34 +1332,85 @@ fn apply_language_plan(status: &mut CoverageFamilyStatus, plan: LanguageCoverage
     status.duration_hint = plan.duration_hint;
 }
 
+/// Manifests and listing flags the command planner needs besides `families`.
+struct CoverageCommandLayout<'a> {
+    cargo_dirs: &'a [String],
+    go_mod_dirs: &'a [String],
+    go_work_at_root: bool,
+    has_package_swift: bool,
+    has_pubspec: bool,
+    has_dotnet_proj: bool,
+}
+
+impl<'a> CoverageCommandLayout<'a> {
+    fn from_scan(detected: &'a FamilyScan) -> Self {
+        CoverageCommandLayout {
+            cargo_dirs: &detected.cargo_dirs,
+            go_mod_dirs: &detected.go_mod_dirs,
+            go_work_at_root: detected.go_work_at_root,
+            has_package_swift: detected.has_package_swift,
+            has_pubspec: detected.has_pubspec,
+            has_dotnet_proj: detected.has_dotnet_proj,
+        }
+    }
+}
+
 /// Fills generate/setup commands from the checkout's actual manifests and a
 /// live toolchain probe so the UI never offers `cargo llvm-cov` at a repo
-/// root that has no Cargo.toml, `go test ./...` at a root with no go.mod, or
-/// pretends Rust generation is ready when cargo-llvm-cov is missing.
+/// root that has no Cargo.toml, `go test ./...` at a root with no go.mod,
+/// `swift test` without Package.swift, or a generator whose binary is missing.
 fn fill_suggested_commands(
     repo: &Path,
     families: &mut [CoverageFamilyStatus],
-    cargo_dirs: &[String],
-    go_mod_dirs: &[String],
-    go_work_at_root: bool,
+    layout: CoverageCommandLayout<'_>,
 ) {
-    let rust_present = families.iter().any(|status| status.family == "rust");
+    let rust_present = family_present(families, "rust");
     let llvm_cov_ready = if rust_present {
         cargo_llvm_cov_available()
     } else {
         true
     };
     let javascript = javascript_coverage_plan(repo);
-    let rust = rust_coverage_plan(repo, cargo_dirs, llvm_cov_ready);
-    let python = python_coverage_plan();
-    let go = go_coverage_plan(repo, go_mod_dirs, go_work_at_root);
-    let jvm = jvm_coverage_plan(repo);
+    let rust = rust_coverage_plan(repo, layout.cargo_dirs, llvm_cov_ready);
+    let python = if family_present(families, "python") {
+        python_coverage_plan(program_on_path("pytest"))
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
+    let go = go_coverage_plan(repo, layout.go_mod_dirs, layout.go_work_at_root);
+    let jvm = if family_present(families, "jvm") {
+        let mvn_needed = manifest_is_file(repo, "pom.xml");
+        jvm_coverage_plan(repo, !mvn_needed || program_on_path("mvn"))
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
     let native = native_coverage_plan(repo);
-    let swift = swift_coverage_plan();
-    let dotnet = dotnet_coverage_plan();
+    let swift = if family_present(families, "swift") {
+        swift_coverage_plan(
+            layout.has_package_swift,
+            layout.has_package_swift && program_on_path("swift"),
+        )
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
+    let dotnet = if family_present(families, "dotnet") {
+        dotnet_coverage_plan(
+            layout.has_dotnet_proj,
+            layout.has_dotnet_proj && program_on_path("dotnet"),
+        )
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
     let php = php_coverage_plan(repo);
     let ruby = ruby_coverage_plan(repo);
-    let dart = dart_coverage_plan();
+    let dart = if family_present(families, "dart") {
+        dart_coverage_plan(
+            layout.has_pubspec,
+            layout.has_pubspec && program_on_path("dart"),
+        )
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
     for status in families.iter_mut() {
         let plan = match status.family.as_str() {
             "javascript" => javascript.clone(),
@@ -1338,6 +1438,9 @@ struct FamilyScan {
     cargo_dirs: Vec<String>,
     go_mod_dirs: Vec<String>,
     go_work_at_root: bool,
+    has_package_swift: bool,
+    has_pubspec: bool,
+    has_dotnet_proj: bool,
     listing_partial: bool,
 }
 
@@ -1365,6 +1468,9 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     let mut cargo_dirs: Vec<String> = Vec::new();
     let mut go_mod_dirs: Vec<String> = Vec::new();
     let mut go_work_at_root = false;
+    let mut has_package_swift = false;
+    let mut has_pubspec = false;
+    let mut has_dotnet_proj = false;
     let mut classified = 0usize;
     for rel in stdout.split('\0') {
         let rel = LanguageDetector::normalize_rel_path(rel);
@@ -1391,6 +1497,19 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
             }
         } else if name == "go.work" && rel_parent_dir(&rel).is_empty() {
             go_work_at_root = true;
+        } else if name.eq_ignore_ascii_case("Package.swift") {
+            has_package_swift = true;
+        } else if name.eq_ignore_ascii_case("pubspec.yaml") {
+            has_pubspec = true;
+        } else {
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".csproj")
+                || lower.ends_with(".fsproj")
+                || lower.ends_with(".vbproj")
+                || lower.ends_with(".sln")
+            {
+                has_dotnet_proj = true;
+            }
         }
         let info = LanguageDetector::detect_from_path(&rel);
         let Some(family) = LanguageDetector::coverage_family_hint(&rel, &info) else {
@@ -1443,6 +1562,9 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
         cargo_dirs,
         go_mod_dirs,
         go_work_at_root,
+        has_package_swift,
+        has_pubspec,
+        has_dotnet_proj,
         listing_partial,
     })
 }
@@ -3148,6 +3270,35 @@ src/main.go:4.1,4.8 1 0
         assert!(!plan.generate.is_empty());
     }
 
+    #[test]
+    fn python_plan_is_unavailable_when_pytest_is_missing() {
+        let plan = python_coverage_plan(false);
+        assert!(!plan.tool_ready);
+        assert!(plan.generate.is_empty());
+        assert!(plan.tool_detail.contains("pytest"));
+    }
+
+    #[test]
+    fn go_plan_is_unavailable_without_a_module() {
+        let plan = go_coverage_plan(Path::new("."), &[], false);
+        assert!(!plan.tool_ready);
+        assert!(plan.generate.is_empty());
+        assert!(plan.tool_detail.contains("go.mod"));
+    }
+
+    #[test]
+    fn swift_plan_requires_package_manifest() {
+        let plan = swift_coverage_plan(false, true);
+        assert!(plan.generate.is_empty());
+        assert!(plan.tool_detail.contains("Package.swift"));
+        let ready = swift_coverage_plan(true, true);
+        assert_eq!(
+            ready.generate,
+            vec!["swift test --enable-code-coverage".to_string()]
+        );
+        assert!(ready.tool_ready);
+    }
+
     /// GitPulse itself is a Tauri tree: cargo lives under `src-tauri/`, and
     /// `package.json` has a `coverage` script. The chips next to "no report"
     /// must offer those commands, not a root `cargo llvm-cov` (no Cargo.toml)
@@ -3212,7 +3363,7 @@ src/main.go:4.1,4.8 1 0
         write(
             repo.path(),
             "package.json",
-            r#"{"name":"app","devDependencies":{"vitest":"2.0.0"}}"#,
+            r#"{"name":"app","devDependencies":{"vitest":"2.0.0","@vitest/coverage-v8":"2.0.0"}}"#,
         );
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
         let js = report
@@ -3232,7 +3383,7 @@ src/main.go:4.1,4.8 1 0
     }
 
     #[test]
-    fn javascript_without_package_json_falls_back_to_both_runners() {
+    fn javascript_without_package_json_does_not_invent_npx_runners() {
         let repo = git_repo();
         write(repo.path(), "src/app.ts", "export const x = 1;\n");
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
@@ -3241,12 +3392,44 @@ src/main.go:4.1,4.8 1 0
             .iter()
             .find(|f| f.family == "javascript")
             .expect("javascript family");
-        assert_eq!(
-            js.suggested_commands,
-            vec![
-                "npx --no-install vitest run --coverage".to_string(),
-                "npx --no-install jest --coverage".to_string()
-            ]
+        assert!(
+            js.suggested_commands.is_empty(),
+            "no package.json must not invent vitest/jest: {:?}",
+            js.suggested_commands
+        );
+        assert!(!js.tool_ready);
+        assert!(
+            js.tool_detail.contains("package.json"),
+            "missing runner must be named: {:?}",
+            js.tool_detail
+        );
+    }
+
+    #[test]
+    fn javascript_vitest_without_coverage_provider_is_not_planned() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"app","devDependencies":{"vitest":"2.0.0"}}"#,
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert!(
+            js.suggested_commands.is_empty(),
+            "vitest without a coverage provider must not plan --coverage: {:?}",
+            js.suggested_commands
+        );
+        assert!(!js.tool_ready);
+        assert!(
+            js.tool_detail.contains("@vitest/coverage-v8"),
+            "missing provider must be named: {:?}",
+            js.tool_detail
         );
     }
 
@@ -3298,12 +3481,15 @@ src/main.go:4.1,4.8 1 0
     }
 
     #[test]
-    fn python_go_and_jvm_keep_curated_commands_native_has_none() {
+    fn source_files_without_manifests_do_not_invent_generators() {
         let repo = git_repo();
         write(repo.path(), "pkg/mod.py", "def f():\n    return 1\n");
         write(repo.path(), "main.go", "package main\nfunc main() {}\n");
         write(repo.path(), "src/Main.java", "class Main {}\n");
         write(repo.path(), "src/lib.c", "int x;\n");
+        write(repo.path(), "App.swift", "import Foundation\n");
+        write(repo.path(), "lib/hi.dart", "void main() {}\n");
+        write(repo.path(), "Program.cs", "class Program {}\n");
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
 
         let python = report
@@ -3311,38 +3497,53 @@ src/main.go:4.1,4.8 1 0
             .iter()
             .find(|f| f.family == "python")
             .expect("python");
-        assert_eq!(
-            python.suggested_commands,
-            vec!["pytest --cov --cov-report=xml".to_string()]
-        );
-        assert!(python.tool_ready);
-        assert!(python.setup_commands.is_empty());
-        assert!(python.duration_hint.contains("few minutes"));
+        if python.suggested_commands.is_empty() {
+            assert!(!python.tool_ready);
+            assert!(
+                python.tool_detail.contains("pytest"),
+                "missing pytest must be named: {:?}",
+                python.tool_detail
+            );
+        } else {
+            assert_eq!(
+                python.suggested_commands,
+                vec!["pytest --cov --cov-report=xml".to_string()]
+            );
+            assert!(python.tool_ready);
+            assert!(python.duration_hint.contains("few minutes"));
+        }
         let go = report
             .families
             .iter()
             .find(|f| f.family == "go")
             .expect("go");
-        assert_eq!(
-            go.suggested_commands,
-            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        assert!(
+            go.suggested_commands.is_empty(),
+            "bare .go files must not plan root ./...: {:?}",
+            go.suggested_commands
         );
-        assert!(go.tool_ready);
-        assert!(go.duration_hint.contains("few minutes"));
+        assert!(!go.tool_ready);
+        assert!(
+            go.tool_detail.contains("go.mod"),
+            "missing module must be named: {:?}",
+            go.tool_detail
+        );
         let jvm = report
             .families
             .iter()
             .find(|f| f.family == "jvm")
             .expect("jvm");
-        assert_eq!(
-            jvm.suggested_commands,
-            vec![
-                "./gradlew test jacocoTestReport".to_string(),
-                "mvn verify".to_string()
-            ]
+        assert!(
+            jvm.suggested_commands.is_empty(),
+            "java without wrapper/pom must not invent gradlew/mvn: {:?}",
+            jvm.suggested_commands
         );
-        assert!(jvm.tool_ready);
-        assert!(jvm.duration_hint.contains("few minutes"));
+        assert!(!jvm.tool_ready);
+        assert!(
+            jvm.tool_detail.contains("pom.xml") || jvm.tool_detail.contains("Gradle"),
+            "missing JVM manifest must be named: {:?}",
+            jvm.tool_detail
+        );
         let native = report
             .families
             .iter()
@@ -3351,6 +3552,38 @@ src/main.go:4.1,4.8 1 0
         assert_eq!(native.suggested_commands, Vec::<String>::new());
         assert!(native.setup_commands.is_empty());
         assert!(native.duration_hint.is_empty());
+        let swift = report
+            .families
+            .iter()
+            .find(|f| f.family == "swift")
+            .expect("swift");
+        assert!(
+            swift.suggested_commands.is_empty(),
+            "swift without Package.swift must not plan swift test: {:?}",
+            swift.suggested_commands
+        );
+        assert!(swift.tool_detail.contains("Package.swift"));
+        let dart = report
+            .families
+            .iter()
+            .find(|f| f.family == "dart")
+            .expect("dart");
+        assert!(
+            dart.suggested_commands.is_empty(),
+            "dart without pubspec.yaml must not plan dart test: {:?}",
+            dart.suggested_commands
+        );
+        assert!(dart.tool_detail.contains("pubspec.yaml"));
+        let dotnet = report
+            .families
+            .iter()
+            .find(|f| f.family == "dotnet")
+            .expect("dotnet");
+        assert!(
+            dotnet.suggested_commands.is_empty(),
+            ".cs without a project file must not plan dotnet test: {:?}",
+            dotnet.suggested_commands
+        );
         for family in &report.families {
             assert_argv_safe(&family.suggested_commands);
             assert_argv_safe(&family.setup_commands);

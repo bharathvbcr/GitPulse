@@ -517,4 +517,55 @@ describe("formatFailedCoverageDiagnostics", () => {
       coverageFailureHint("cargo llvm-cov", "error: failed to compile test harness"),
     ).toBeNull();
   });
+
+  it("hints when a generator binary is missing", () => {
+    expect(
+      coverageFailureHint(
+        "pytest --cov --cov-report=xml",
+        "Failed to spawn pytest: No such file or directory (os error 2)",
+      ),
+    ).toContain("not installed");
+    expect(
+      coverageFailureHint(
+        "dotnet test --collect:\"XPlat Code Coverage\"",
+        "Failed to spawn dotnet: No such file or directory (os error 2)",
+      ),
+    ).toContain("not installed");
+  });
+
+  it("hints when MANVI refused an unallowlisted generator", () => {
+    expect(
+      coverageFailureHint(
+        "swift test --enable-code-coverage",
+        "MANVI coverage generation action refused: 'swift test --enable-code-coverage' is outside the purpose-specific command allowlist",
+      ),
+    ).toContain("allowlist");
+  });
+
+  it("hints when npx --no-install has no local package", () => {
+    expect(
+      coverageFailureHint(
+        "npx --no-install jest --coverage",
+        'npm error npx canceled due to missing packages and no YES option: ["jest@30.4.2"]',
+      ),
+    ).toContain("will not download");
+  });
+
+  it("hints when vitest is missing the coverage provider", () => {
+    expect(
+      coverageFailureHint(
+        "npx --no-install vitest run --coverage",
+        "MISSING DEPENDENCY  Cannot find dependency '@vitest/coverage-v8'",
+      ),
+    ).toContain("@vitest/coverage-v8");
+  });
+
+  it("hints when the Gradle wrapper is not in the repository", () => {
+    expect(
+      coverageFailureHint(
+        "./gradlew test jacocoTestReport",
+        "MANVI coverage generation action refused: wrapper './gradlew' is not a repository file",
+      ),
+    ).toContain("Gradle wrapper");
+  });
 });
