@@ -5,6 +5,7 @@
 
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
 use std::fs;
+#[cfg(unix)]
 use std::fs::Permissions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

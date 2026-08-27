@@ -499,6 +499,7 @@ pub fn resolve_binary() -> Option<String> {
 static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn set_test_binary(path: Option<String>) {
     let mut current = TEST_BINARY.lock().expect("test binary registry");
     *current = path;
@@ -1327,6 +1328,7 @@ mod tests {
     /// enough NDJSON to satisfy the handshake and one policy verdict. Each
     /// spawn appends itself to a count file, so a test can prove which
     /// connection actually served a request.
+    #[cfg(unix)]
     const FAKE_MANVI_SH: &str = r#"#!/bin/sh
 count_file="@COUNT_FILE@"
 n=0
