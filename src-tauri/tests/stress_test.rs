@@ -28,6 +28,9 @@ fn init_repo_with_base_file() -> tempfile::TempDir {
         .current_dir(dir.path())
         .status()
         .expect("git init");
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "commit.gpgsign", "false"]);
     std::fs::write(dir.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
     git(&["add", "--", "lib.rs"]);
     git(&["commit", "-m", "base"]);

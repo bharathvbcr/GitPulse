@@ -32,6 +32,9 @@ fn git_in(dir: &Path, args: &[&str]) {
 fn init_repo() -> TempDir {
     let dir = TempDir::new().unwrap();
     git_in(dir.path(), &["init", "-b", "main"]);
+    git_in(dir.path(), &["config", "user.name", "GitPulse"]);
+    git_in(dir.path(), &["config", "user.email", "gitpulse@test.local"]);
+    git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
     std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
     git_in(dir.path(), &["add", "."]);
     git_in(dir.path(), &["commit", "-m", "init"]);

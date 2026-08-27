@@ -21,6 +21,16 @@ fn init_repo(dir: &std::path::Path) {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    for (k, v) in [
+        ("user.name", "t"),
+        ("user.email", "t@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        let _ = std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(dir)
+            .output();
+    }
 }
 
 /// Writes `file`, stages it, and commits with a fixed identity.

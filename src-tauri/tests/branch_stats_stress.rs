@@ -22,6 +22,7 @@ fn init_repo() -> TempDir {
     run_git(dir.path(), &["init", "-q", "-b", "main"]);
     run_git(dir.path(), &["config", "user.email", "stress@gitpulse.dev"]);
     run_git(dir.path(), &["config", "user.name", "Stress Tester"]);
+    run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
     dir
 }
 
