@@ -1,346 +1,239 @@
 # GitPulse
 
-[![CI](https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml)
-[![Coverage](https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg)](https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml)
-[![Release](https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver)](https://github.com/bharathvbcr/GitPulse/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+<p align="center">
+  <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg" alt="Coverage"></a>
+  <a href="https://github.com/bharathvbcr/GitPulse/releases"><img src="https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms">
+  <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
+</p>
 
-High-performance, native Git desktop client built with Rust & Svelte.
+<p align="center">
+  <strong>High-performance, local-first native Git desktop client.</strong><br>
+  Engineered with a native Rust backend and a reactive Svelte 5 frontend for instant graph rendering, universal code coverage, deep repository auditing, and safe on-device AI.
+</p>
 
-GitPulse is a Tauri 2 app: a Rust backend does the heavy lifting (graph lane solving, diffs,
-coverage scanning, dependency analysis) while a Svelte 5 + TypeScript frontend renders it.
-It runs entirely on your machine; GitHub features go through your locally installed `gh` CLI.
+---
 
-## Contents
+## Architecture at a Glance
 
-- [Install](#install) · [Requirements](#requirements) · [Getting started](#getting-started)
-- [Features](#features) · [Architecture](#architecture) · [Project layout](#project-layout)
-- [Development](#development) · [Releasing](#releasing)
-- [Contributing](#contributing) · [Security](#security) · [License](#license)
+GitPulse operates completely locally on your machine with strict IPC boundaries and zero remote telemetry:
 
-## Install
+```mermaid
+flowchart TB
+    subgraph Frontend["Svelte 5 + TypeScript Frontend"]
+        direction TB
+        Views["12 Specialized Views<br/>(Graph, Diff, Coverage, Health, Storage...)"]
+        Stores["Reactive Svelte 5 Stores & Runes"]
+        CanvasEngine["GPU-Accelerated HTML5 Canvas"]
+        AsyncGuards["Async Cancellation Guards"]
+        
+        Views --> Stores
+        Views --> CanvasEngine
+        Stores --> AsyncGuards
+    end
 
-Download the installer for your platform from the
-[latest release](https://github.com/bharathvbcr/GitPulse/releases/latest).
+    subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
+        direction TB
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(94 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+    end
 
-| Platform | Asset | Notes |
-| --- | --- | --- |
-| macOS (Apple Silicon & Intel) | `.dmg` | Universal binary. **Unsigned** — see [below](#macos-builds-are-unsigned). |
-| Linux | `.AppImage`, `.deb` | Built on Ubuntu 22.04, so glibc 2.35+ |
-| Windows | `.msi`, `.exe` | |
+    subgraph Backend["Rust Backend (Tauri 2 / Rayon / Tokio)"]
+        direction TB
+        GitSandbox["Git Execution Sandbox & Blame"]
+        GraphSolver["Topological Lane Solver & Nogap Bounds"]
+        Analyzers["Analyzers: 60+ Languages, Universal Coverage, Health"]
+        StorageEngine["Storage Auditor & History Snapshots"]
+        TerminalPTY["Native PTY Terminal (portable-pty)"]
+    end
 
-macOS quarantines unsigned downloads, so after dragging the app to `/Applications`:
+    subgraph LocalTools["Local Toolchain & Sidecars"]
+        direction TB
+        GitCLI["<code>git</code> CLI"]
+        GhCLI["<code>gh</code> CLI (GitHub Auth)"]
+        LocalAI["Local LLMs (Ollama / LM Studio)"]
+        ManviSidecar["MANVI Harness (<code>manvi serve</code>)"]
+    end
 
-```sh
-xattr -dr com.apple.quarantine /Applications/GitPulse.app
+    AsyncGuards --> IPCBridge
+    IPCBridge --> Backend
+    GitSandbox --> GitCLI
+    Analyzers --> GhCLI
+    Analyzers --> LocalAI
+    Backend --> ManviSidecar
 ```
 
-Prefer to build it yourself? See [Getting started](#getting-started).
+---
 
-## Features
+## View Catalog & Workflows
 
-- **Multi-language stack & LOC analysis** — detects 60+ programming, markup, and data languages
-  (TypeScript, TSX, Rust, Go, C, C++, Java, Swift, Kotlin, JavaScript, Python, C#, F#, Scala, Ruby,
-  PHP, Dart, Zig, Julia, Groovy, Shell, and more) using official GitHub Linguist colors, manifest
-  recognition (`Cargo.toml`, `go.mod`, `package.json`, `pom.xml`, `Package.swift`, etc.), shebang
-  sniffing, and language-aware comment parsing for accurate LOC breakdowns.
-- **Commit history graph** — GPU-accelerated canvas-rendered graph with avatar rendering, lane
-  smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust.
-- **Diff viewer** — file, commit, and range diffs with word-level intra-line highlighting
-  and image diffs. Patches can be staged or unstaged selectively straight from the diff view
-  (`cmd_stage_selective_patch`).
-- **Staging & commits** — stage/unstage files, commit with amend, AI-assisted commit messages.
-- **Conflict resolution** — parse and resolve merge conflicts in a dedicated editor.
-- **Blame** — per-line authorship viewer.
-- **Coverage & diagnostics** — discovers coverage artifacts across ecosystems (LCOV, Cobertura,
-  Go cover, Istanbul JSON, JaCoCo, Clover) and displays per-file line coverage. One-click copy
-  for failed coverage diagnostics, script errors, and rescans. MANVI local AI provides prioritized
-  remediation plans and executable coverage scripts via a purpose-limited allowlist runner.
-- **Storage** — disk-usage audit of the whole repository: git internals (packfiles vs loose
-  objects, reflogs, LFS, submodule stores), build-output and cache directories across
-  ecosystems, hygiene gaps (artifact directories not covered by `.gitignore`, or ignored ones
-  still holding committed files), oversized working-tree files, linked-worktree sizes, and
-  merged-stale branch weight that links into MANVI's cleanup plan. Every completed scan records
-  a per-repository snapshot locally, so growth is visible over time ("+180 MB this week") via a
-  trend sparkline and deltas. Walks are budgeted and never follow symlinks; a hostile or huge
-  repository degrades into an honest "partial scan" instead of a hang.
-- **Dependency health** — multi-ecosystem vulnerability and staleness scanning: `npm audit`/`outdated`,
-  `cargo-audit`, `pip-audit` (pinned requirements files), `govulncheck`, `composer audit`, and
-  `bundler-audit`, each used when its CLI is present, plus open GitHub Dependabot alerts (via `gh`)
-  unified in the Health view. Copy the whole report as text, or send it through the configured
-  local model for a remediation plan. Nothing runs merely because the model suggested it: each
-  visible step or the explicit run-all control is a user confirmation, and the backend enforces a
-  health-only command allowlist before execution.
-- **Stacked branches** — visualize and manage stacked branches (`stack` view).
-- **Worktrees** — linked-worktree panel in the sidebar: list with HEAD, branch, dirty-file
-  counts, and prunable state; add (with branch and start point), remove, and lock/unlock.
-- **Reflog** — browse the reference log.
-- **Policy-gated mutations & local AI** — an optional [MANVI](#the-manvi-harness) harness sidecar
-  vets mutating git actions and answers AI prompts against a local model. Everything degrades
-  gracefully when it is not installed.
-- **MANVI view** — one surface for everything MANVI: guarded pull/push shortcuts, conservative
-  merged-branch cleanup plans, outgoing commit-message review with explicit coverage counts,
-  bounded GitHub issue & release monitoring and reporting, release-tag publication with clean/synchronized/
-  default-branch preflights, plus the harness connection, local model servers, branch naming, and
-  the agent activity journal (copyable as a log). The header badge is a status indicator that
-  leads here. The OS View menu's numbered tab shortcuts stop at Reflog; reach MANVI through the
-  header tab bar's More menu or the command palette ("Open MANVI View").
-- **GitHub integration** — repo-wide open-PR list with one-click PR checkout, workflow run status,
-  Dependabot alerts, issue creation, and live release monitoring, all through the locally installed
-  `gh` CLI. Remote-URL detection recognizes github.com, `*.github.com`, and `*.ghe.com`;
-  self-hosted GHES on arbitrary domains is intentionally not matched.
-- **GitHub CI/CD actions** — the GitHub view lists the repository's Actions workflows
-  (`gh workflow list`), dispatches any active one against a chosen branch or tag
-  (`workflow_dispatch`), and re-runs or cancels recent runs in place — every action policy-gated
-  like the rest of GitPulse's mutations. The repository's own release workflow is dispatchable:
-  `.github/workflows/release.yml` accepts a manual `tag` input as well as tag pushes.
-- **CI:local** — one button runs this repository's CI pipeline on the current machine before you
-  push: the frontend checks and Rust checks of `.github/workflows/ci.yml`, planned from the
-  manifests actually present (`package.json`, `Cargo.toml`), executed sequentially with hard
-  per-step timeouts, capped output tails, stop-on-first-failure, and honest passed/failed/skipped
-  accounting.
+GitPulse organizes 12 purpose-built views into three intuitive functional groups:
 
-## Requirements
+```mermaid
+flowchart LR
+    subgraph Work["🔨 Work Views"]
+        Graph["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph & lanes"]
+        Diff["<b>Diff</b> (<code>diff</code>)<br/>Word-level diff & selective staging"]
+        Conflict["<b>Resolve</b> (<code>conflict</code>)<br/>3-way merge conflict editor"]
+    end
 
-| Tool | Version | Notes |
-| --- | --- | --- |
-| Node.js | 22+ | Frontend build and test tooling |
-| Rust | stable (edition 2021) | Backend build via Cargo |
-| Git | any recent version | The engine shells out to the `git` CLI at runtime |
-| Tauri system deps | — | Linux needs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, etc. — see `.github/workflows/ci.yml` for the exact package list |
+    subgraph Inspect["🔍 Inspect Views"]
+        Blame["<b>Blame</b> (<code>blame</code>)<br/>Line authorship & heatmap"]
+        Coverage["<b>Coverage</b> (<code>coverage</code>)<br/>Universal scanner & line gutters"]
+        Health["<b>Health</b> (<code>health</code>)<br/>Vulnerabilities & Dependabot"]
+        Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage & history trends"]
+        Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization"]
+    end
 
-## Getting started
-
-```sh
-npm install          # frontend dependencies
-npm run tauri dev    # builds the Rust backend and opens the app window
+    subgraph System["⚙️ System & Ops"]
+        Terminal["<b>Terminal</b> (<code>terminal</code>)<br/>Isolated native PTY shell"]
+        MANVI["<b>MANVI</b> (<code>manvi</code>)<br/>Policy gate & local AI harness"]
+        GitHub["<b>GitHub</b> (<code>github</code>)<br/>PRs, workflow dispatch & CI:local"]
+        Reflog["<b>Reflog</b> (<code>reflog</code>)<br/>Reference history log"]
+    end
 ```
 
-The dev scripts resolve a free Vite port automatically (preferred: 5173, falling back through
-5174–5193). Set `GITPULSE_DEV_PORT=<port>` to pin it — Tauri's `devUrl` is rewritten to match.
-Nuance: under `tauri dev`, a busy pinned port that can't be reclaimed autoports past the pin;
-the bare Vite wrapper (`npm run dev`) fails loudly instead.
+---
 
-### Production build
+## Key Features
 
-```sh
-npm run tauri build  # bundles installers for the current platform
-```
-
-## Development
-
-| Command | What it does |
+### 🚀 Core Git & Visualization
+| Feature | Description |
 | --- | --- |
-| `npm run dev` | Vite dev server only (no app shell) |
-| `npm run tauri dev` | Full desktop app with hot reload |
-| `npm run build` | Frontend production bundle (`vite build`) |
-| `npm run check` | Type-check the frontend (`svelte-check`) and node-side config/scripts (`tsc`) |
-| `npm run check:ipc` | Verify the Rust `cmd_*` registry and every frontend `invoke()` call site stay in lockstep |
-| `npm run check:types` | Verify coverage serde structs match TypeScript interfaces field-for-field |
-| `npm run check:release` | Verify the five version manifests agree; add `-- --tag vX.Y.Z` to also check a release tag |
-| `npm run ci:local` | Run full local CI pipeline (type-check, tests, build, clippy, cargo test) |
-| `npm test` | Frontend unit tests (Vitest) |
-| `npm run coverage` | Vitest with v8 coverage |
-| `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | Rust format check |
-| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust lint |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit & integration tests |
+| **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with avatar rendering, lane smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust. |
+| **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, and one-click selective hunk/line patch staging. |
+| **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
+| **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
 
-CI (`.github/workflows/ci.yml`) runs the frontend checks and Rust checks above on Linux, macOS,
-and Windows. Clippy treats warnings as errors; `svelte-check` reports warnings without failing.
+### 🛡️ Code Intelligence & Auditing
+| Feature | Description |
+| --- | --- |
+| **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation and copyable diagnostics. |
+| **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. |
+| **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
+| **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
 
-GitPulse also runs its own CI on your machine: **ci:local** (`cmd_ci_local`, wired to the GitHub
-panel) plans the same steps from the manifests it finds and runs them sequentially, stopping at
-the first failure and reporting everything after it as *skipped* rather than as a pass.
+### 🤖 Local AI & Policy Safety Gate
+| Feature | Description |
+| --- | --- |
+| **MANVI Policy Gate** | Mutating Git actions are evaluated against a 5-verdict safety ladder (*Allowed*, *Demoted*, *Warned*, *Blocked*, *Unchecked*). Asymmetric degradation ensures wedged sidecars fail closed safely. |
+| **On-Device AI Assistance** | Context-calibrated AI assistance for commit messages, commit explanations, and branch naming against local LLMs (Ollama, LM Studio, llama.cpp, vLLM). |
+| **Scoped Action Allowlist** | AI-suggested coverage generation and dependency fixes execute via a purpose-limited command allowlist (`cmd_manvi_run_action`) requiring explicit user confirmation. |
 
-## Releasing
+```mermaid
+flowchart TD
+    subgraph PolicyGate["🛡️ MANVI 5-Verdict Policy Gate"]
+        ActionReq["User Triggers Mutating Action"] --> Eval["Evaluate Command & Bounds"]
+        Eval -->|Safe| Allowed["Allowed → Execute"]
+        Eval -->|Modified| Demoted["Demoted → Execute Safe Variant"]
+        Eval -->|Caution| Warned["Warned → Execute with Warning"]
+        Eval -->|Hostile / Risky| Blocked["Blocked → Refuse Loudly"]
+        Eval -->|No Harness| Unchecked["Unchecked → Explicit Status"]
+    end
 
-Releases are cut by pushing a tag; `.github/workflows/release.yml` does the rest.
-
-```sh
-npm run check:release -- --tag v0.1.2   # must pass before you tag
-git tag v0.1.2 && git push origin v0.1.2
+    subgraph Remediation["🤖 Local AI & Scoped Execution"]
+        AIReq["Health / Coverage Gap Identified"] --> LocalModel["Local Model Formulates Remediation"]
+        LocalModel --> AllowlistCheck["Strict Allowlist Validation<br/>(No shell, direct argv, ecosystem tools only)"]
+        AllowlistCheck --> UserConfirm["Explicit User Confirmation"]
+        UserConfirm --> BoundedRun["Bounded Execution (Hard timeout & capped output)"]
+    end
 ```
 
-The pipeline is deliberately hard to misuse:
+---
 
-- **Every job checks out the tag**, not the branch, and asserts `HEAD` is the tagged commit — a
-  `workflow_dispatch` for a tag that does not exist fails at checkout instead of building the
-  branch head and publishing it under that tag's name.
-- **The version gate runs first.** The Git tag, `src-tauri/tauri.conf.json`, `Cargo.toml`,
-  `Cargo.lock`, `package.json` and `package-lock.json` must all name one version. `tauri.conf.json`
-  supplies both `__VERSION__` in the release name and the bundle version, so a stale manifest would
-  otherwise publish a release tagged `vX` whose installers are all `vY`.
-- **Pre-flight mirrors CI step-for-step**, so a tag whose commit CI never covered cannot ship.
-- **A verify job gates completeness.** The build matrix is `fail-fast: false`, so a `verify` job
-  fails the run when any platform did not succeed *and* independently inventories the draft
-  release's assets for a per-platform installer. A green matrix that uploaded nothing is still a
-  failed release.
-- Concurrency is keyed on the tag with cancellation **off**: a cancel between two asset uploads
-  would leave a draft holding a partial, plausible-looking asset set.
+## Local CI & Release Pipeline
 
-Releases are created as **drafts** and are published by hand after the assets are checked.
+GitPulse includes **`CI:local`** (`cmd_ci_local`), allowing you to execute the exact pre-flight test matrix locally on your machine before pushing code:
 
-### macOS builds are unsigned
+```mermaid
+flowchart LR
+    subgraph LocalCI["CI:Local (Single Click)"]
+        Detect["Scan Manifests<br/>(package.json, Cargo.toml)"] --> Plan["Plan Step Matrix"]
+        Plan --> Run["Sequential Run<br/>(Svelte Check → Vitest → Cargo Clippy → Cargo Test)"]
+        Run --> Outcome["Honest Accounting<br/>(Passed / Failed / Skipped)"]
+    end
 
-There is no Apple signing identity in CI, so the `.dmg` is unsigned and un-notarized. macOS
-quarantines it on download and Gatekeeper refuses to open it. To run a release build locally:
+    subgraph ReleasePipeline["GitHub Actions Release Pipeline"]
+        TagPush["Push Tag <code>vX.Y.Z</code>"] --> VerGate["Version Gate Validation<br/>(5 manifests must match)"]
+        VerGate --> Matrix["Cross-Platform Matrix<br/>(macOS, Linux, Windows)"]
+        Matrix --> Verify["Draft Release Asset Verification"]
+        Verify --> Publish["Draft Ready for Publishing"]
+    end
+
+    Outcome --> TagPush
+```
+
+---
+
+## Installation
+
+Download pre-built installers from the [latest release](https://github.com/bharathvbcr/GitPulse/releases/latest):
+
+| Platform | Format | Architecture | Notes |
+| --- | --- | --- | --- |
+| **macOS** | `.dmg` | Universal (Apple Silicon & Intel) | Unsigned binary. Run quarantine command below. |
+| **Linux** | `.AppImage`, `.deb` | x86_64 | Built on Ubuntu 22.04 (glibc 2.35+) |
+| **Windows** | `.msi`, `.exe` | x64 | Windows 10/11 installer |
+
+### macOS Unsigned Gatekeeper Note
+macOS quarantines unsigned downloads. After dragging GitPulse to `/Applications`, run:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/GitPulse.app
 ```
 
-Configuring `APPLE_SIGNING_IDENTITY` / `APPLE_CERTIFICATE` / `APPLE_ID` as repository secrets is
-what removes this step for everyone else.
+---
 
-## Architecture
+## Quickstart & Development
 
-Two codebases meet at a single IPC seam — every `cmd_*` handler in the Rust registry
-(`src-tauri/src/lib.rs:34`) is checked against every frontend `invoke()` call site by
-`npm run check:ipc`, which fails on either direction of drift: a UI command the backend never
-registered (guaranteed runtime crash) or a registered handler no view ever calls. Handlers that
-are intentionally Rust-only carry a justification in the checker's allowlist:
+### Prerequisites
+- **Node.js**: `22.x+`
+- **Rust**: `stable` (edition 2021)
+- **Git**: Recent version
 
-```
-Svelte 5 + TS frontend                 Rust backend
-─────────────────────                  ─────────────────────────────────────
-lib/components/  one view per screen   engine/     git CLI + write sandbox
-lib/stores/      workspace state       graph/      lane solving, folding
-lib/repos/       tab model, persist    diff/       diffs + conflicts
-lib/desktop/     menus, drag-drop      analyzer/   language, LOC, coverage,
-                                                 deps health
-         ▲ │                           stack/      stacked branches
-         └─┴── invoke() ──► cmd_* ──►  storage/    disk usage + history
-                                       ops.rs      MANVI cleanup/review planning
-                                       github/ watcher/ harness/ ai/ desktop/
-```
-
-- **No router.** Screens are members of the `ViewTab` union (`src/lib/repos/persist.ts`);
-  `src/App.svelte` maps each to one component. Adding a screen touches three places: the union +
-  `VIEW_TABS` in `persist.ts`, one entry in the view registry (`src/lib/views/viewRegistry.ts`)
-  — from which the header tabs, native menu, and command palette all derive — and the render
-  branch in `App.svelte`. TypeScript's `Record<ViewTab, …>` on the registry rejects anything less.
-- **State** lives in classic Svelte stores built by factory functions with injectable
-  dependencies (`createRepoStore(deps)`, …), which keeps them unit-testable without Tauri.
-  Components use Svelte 5 runes (`$state`, `$derived`, `$effect`) for local UI state.
-- **IPC boundary** is snake_case over the wire (`repo_path`) and camelCase inside TypeScript
-  (`currentPath`). All disk access goes through custom `cmd_*` Rust commands — no Tauri fs plugin;
-  writes are policy-checked and confined to the open repository.
-- **Async hygiene**: views guard in-flight `invoke()` calls with `createAsyncGuard()`
-  (`src/lib/async/guard.ts`) so responses that arrive after a repo switch are discarded.
-- **Styling** is Tailwind utilities over CSS design tokens (`src/app.css`, wired into Tailwind by
-  `tailwind.config.js`); dark/light themes swap variables on `html.dark` / `html.light`.
-
-### The MANVI harness
-
-`src-tauri/src/harness/` embeds the MANVI coding-agent harness as a `manvi serve` sidecar
-speaking NDJSON over stdio. The live protocol exposes the policy and local-model planes, not
-MANVI's native agent-tool catalogue or a PTY. It provides two things:
-
-1. **Policy verdicts** — mutating git commands pass through a command gate (low-risk index,
-   stash, and clone operations excepted). Verdicts land on a five-step ladder — allowed, demoted,
-   warned, blocked, unchecked; unknown actions fail closed to blocked. They are recorded centrally
-   by `runMutating()` in the repo store and surfaced in the header badge.
-2. **Local AI** — commit messages, commit explanations, branch-name suggestions, dependency-health
-   remediation plans, and coverage-report analyses answered by a locally configured model, with
-   token budgets planned by the harness.
-
-Degradation is asymmetric by design. With no `manvi` binary installed, mutating commands proceed
-but their verdicts are recorded as `unchecked` — explicitly distinct from an allow. With the
-harness installed but wedged or unreachable, mutations are refused rather than proceeding
-unchecked. Local AI does not require the harness: it answers against whatever local model server
-is configured; the harness only plans token budgets when available. Set `GITPULSE_MANVI_BIN` to
-point at a specific binary.
-
-The interactive Terminal shell is user-owned and intentionally outside the harness: MANVI never
-receives its PTY handle or keystrokes. Model-authored Health and Coverage commands use a separate
-`cmd_manvi_run_action` IPC seam instead. That seam accepts only direct argv (never a shell), rejects
-arbitrary executables, URLs, outside-repository paths and symlink escapes, applies a purpose-specific
-health/coverage allowlist, sends every accepted command through the MANVI command gate, and bounds
-argv size, timeout and captured output. This is scoped, user-confirmed command execution—not an
-autonomous terminal or general app-control API.
-
-The **MANVI view** groups the highest-frequency repository operations without bypassing their
-canonical owners, and hosts the harness and local-AI controls in a second pane. Branch cleanup is
-review-first and only offers local branches Git reports merged
-into the default branch; current/default/worktree/unmerged branches stay protected. Commit review
-reports both reviewed and total counts. Issue monitoring reports failed or capped checks instead of
-showing them as an empty, complete result. Publishing a release creates or resumes an annotated
-SemVer tag and pushes the fully qualified tag ref, which triggers the repository's existing release
-workflow.
-
-## Project layout
-
-```
-src/
-  App.svelte              Root shell: header tabs, welcome screen, view switching
-  app.css                 Design tokens, scrollbars, animation helpers
-  lib/
-    components/           One component per view plus chrome (Sidebar, CommandPalette, …)
-    stores/               repoStore (workspace + mutations), graph/filter/theme/density/
-                          harness/interface/modal stores
-    views/                Single view catalog (VIEW_REGISTRY): nav, menus, palette derive from it
-    repos/                Tab model, persistence schema, path identity
-    canvas/  motion/      Commit-graph rendering and paint scheduling
-    diff/                 Word-level diffing, patch building, conflict save
-    filter/               Commit query language (parse + memoized filtering)
-    branches/ rebase/     Branch grouping/flattening; interactive-rebase planning
-    ops/  agents/         Types for the Rust ops planner; agent activity journal model
-    coverage/ health/     Formatting and types for the analyzers' output
-    storage/ github/      Storage-scan formatting/history; shared GitHub types
-    async/                Cancellation guards and debouncing for stale IPC responses
-    desktop/              Native menu/event wiring, clipboard, window title sync
-    ui/                   Focus trap, z-index layers, error formatting, webview shortcuts
-    keyboard/ dom/        IME-safe shortcuts; portals, tooltips, virtual windows
-    language/             Language-bar statistics
-scripts/                  Dev-port wrappers around vite/tauri CLIs; IPC contract checker
-src-tauri/
-  src/lib.rs              Command registry, watcher, native menu
-  src/commands/mod.rs     Definitions of the cmd_* IPC handlers
-  src/engine/…            Subsystems (see Architecture)
-  src/ops.rs              Read-only MANVI ops planning: cleanup plans, commit review, releases
-  tests/                  Rust integration suites
-.github/workflows/        CI, coverage, release
-```
-
-## Contributing
-
-Issues and pull requests are welcome.
-
-Before opening a PR, run the same checks CI runs — GitPulse can do this for you via the
-**CI:local** button in the GitHub view, or from a shell:
+### Getting Started
 
 ```sh
-npm ci
-npm run check && npm test && npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+# 1. Install dependencies
+npm install
+
+# 2. Launch full desktop application with hot-reload
+npm run tauri dev
 ```
 
-Two contract checks run inside `npm test` and will fail the build on drift, so it is worth
-knowing what they mean:
+### Essential Developer Commands
 
-- `check:ipc` — a `cmd_*` handler and its `invoke()` call sites disagree.
-- `check:types` — a Rust serde payload struct and its TypeScript twin disagree field-for-field.
-- `check:release` — the version manifests disagree with each other or with a release tag.
+| Command | Description |
+| --- | --- |
+| `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
+| `npm run dev` | Run Vite development server only (browser UI mode) |
+| `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
+| `npm run check:ipc` | Verify 94 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field |
+| `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, etc.) |
+| `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests) |
+| `npm test` | Run Vitest unit and integration test suite |
+| `npm run coverage` | Generate Vitest v8 code coverage report |
+| `npm run build` | Build frontend production bundle |
+| `npm run tauri build` | Bundle native installers for the host platform |
 
-Clippy runs with `-D warnings`; `svelte-check` warnings do not fail the build.
+---
 
-## Security
+## In-Depth Documentation
 
-GitPulse runs entirely on your machine. It does not phone home, and it has no server component.
-GitHub features shell out to your own authenticated [`gh`](https://cli.github.com) CLI, so
-GitPulse never sees or stores a GitHub token. Mutating git actions can additionally be gated
-behind the optional [MANVI harness](#the-manvi-harness).
+For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
-The webview runs under a restrictive CSP (`src-tauri/tauri.conf.json`): `default-src 'self'`,
-no remote scripts, and `connect-src` limited to the Tauri IPC channel.
+- 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
+- 🤖 **[MANVI Harness Guide](docs/MANVI.md)** — Policy gate ladder, local AI completion budgeting, loopback safety, and allowlist runner.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 12 application views.
+- 🤝 **[Contributing Guide](docs/CONTRIBUTING.md)** — Developer workflow, coding standards, and contract check enforcement.
+- 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.
 
-Found a vulnerability? Please open a
-[security advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new) rather than
-a public issue.
+---
 
 ## License
 
-[MIT](LICENSE) © 2026 Bharath Chandra Vaddaram
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.
+
+© 2026 Bharath Chandra Vaddaram
