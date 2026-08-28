@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "license": "MIT",
   "description": "High-performance native Git desktop client built with Rust (Tauri 2) and Svelte 5",
