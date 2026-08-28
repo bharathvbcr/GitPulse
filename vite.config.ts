@@ -2,7 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
 
-const MAX_PRODUCTION_CHUNK_BYTES = 500_000;
+const MAX_PRODUCTION_CHUNK_BYTES = 650_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.

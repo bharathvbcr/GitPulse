@@ -645,9 +645,18 @@ impl GitReader {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
         // belt-and-braces so a future non-z invocation still gets raw UTF-8.
+        // -u ensures all untracked files are individually enumerated rather
+        // than collapsed into directory roots.
         let stdout = git_text(
             &repo,
-            &["-c", "core.quotepath=off", "status", "--porcelain=v1", "-z"],
+            &[
+                "-c",
+                "core.quotepath=off",
+                "status",
+                "--porcelain=v1",
+                "-u",
+                "-z",
+            ],
         )?;
         // numstat failures are surfaced, not laundered into "zero churn": a
         // broken diff must fail the report rather than fabricate numbers, and
@@ -671,20 +680,56 @@ impl GitReader {
                 || (index_status == 'A' && work_status == 'A')
                 || (index_status == 'D' && work_status == 'D');
             let is_staged = index_status != ' ' && index_status != '?';
-            // Only the side this row's numbers actually come from can make
-            // the row lie about them.
-            let active = if is_staged {
-                &numstat_index
+            let is_untracked = index_status == '?' && work_status == '?';
+
+            // Staged churn from numstat_index (for files with changes staged in index)
+            let (staged_add, staged_del) = if is_staged {
+                numstat_index
+                    .churn
+                    .get(&path)
+                    .or_else(|| old_path.as_ref().and_then(|op| numstat_index.churn.get(op)))
+                    .copied()
+                    .unwrap_or((0, 0))
             } else {
-                &numstat_work
+                (0, 0)
             };
-            let (additions, deletions) = active.churn.get(&path).copied().unwrap_or((0, 0));
-            let warnings: Vec<String> = active
-                .issues
-                .iter()
-                .filter(|(warned_path, _)| *warned_path == path)
-                .map(|(_, reason)| reason.clone())
-                .collect();
+
+            // Unstaged churn: untracked files count file lines directly; modified working-tree files read numstat_work
+            let (work_add, work_del) = if is_untracked {
+                if let Ok(safe_path) = sandbox_join_canonical(&repo, &path) {
+                    count_untracked_file_lines(&safe_path)
+                } else {
+                    (0, 0)
+                }
+            } else if work_status != ' ' && work_status != '?' {
+                numstat_work
+                    .churn
+                    .get(&path)
+                    .or_else(|| old_path.as_ref().and_then(|op| numstat_work.churn.get(op)))
+                    .copied()
+                    .unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            };
+
+            let additions = staged_add + work_add;
+            let deletions = staged_del + work_del;
+
+            let mut warnings: Vec<String> = Vec::new();
+            if is_staged {
+                for (warned_path, reason) in &numstat_index.issues {
+                    if warned_path == &path || old_path.as_deref() == Some(warned_path) {
+                        warnings.push(reason.clone());
+                    }
+                }
+            }
+            if work_status != ' ' && work_status != '?' {
+                for (warned_path, reason) in &numstat_work.issues {
+                    if warned_path == &path || old_path.as_deref() == Some(warned_path) {
+                        warnings.push(reason.clone());
+                    }
+                }
+            }
 
             statuses.push(FileStatus {
                 path,
@@ -1723,6 +1768,69 @@ fn validate_oid(oid: &str) -> Result<(), String> {
         return Err("Invalid commit id".into());
     }
     Ok(())
+}
+
+/// Streaming line counter for untracked working-tree text files.
+///
+/// Returns `(line_count, 0)` for valid text files, and `(0, 0)` for binary,
+/// empty, oversized, symlinked, directory, or unreadable files.
+/// Operates with O(1) buffer space (64 KB) to ensure zero memory bloat even
+/// when scanning very large files.
+fn count_untracked_file_lines(full_path: &Path) -> (usize, usize) {
+    let Ok(meta) = std::fs::symlink_metadata(full_path) else {
+        return (0, 0);
+    };
+    if !meta.is_file() {
+        return (0, 0);
+    }
+    if meta.len() == 0 {
+        return (0, 0);
+    }
+    const MAX_UNTRACKED_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+    if meta.len() > MAX_UNTRACKED_SCAN_BYTES {
+        return (0, 0);
+    }
+
+    let Ok(file) = std::fs::File::open(full_path) else {
+        return (0, 0);
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line_count = 0usize;
+    let mut last_byte: Option<u8> = None;
+    let mut is_binary = false;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        match std::io::Read::read(&mut reader, &mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &buffer[..n];
+                if chunk.contains(&0) {
+                    is_binary = true;
+                    break;
+                }
+                for &b in chunk {
+                    if b == b'\n' {
+                        line_count += 1;
+                    }
+                }
+                last_byte = Some(chunk[n - 1]);
+            }
+            Err(_) => return (0, 0),
+        }
+    }
+
+    if is_binary {
+        return (0, 0);
+    }
+
+    if let Some(last) = last_byte {
+        if last != b'\n' {
+            line_count += 1;
+        }
+    }
+
+    (line_count, 0)
 }
 
 /// Rejects files larger than `max_bytes` BEFORE their bytes are read.

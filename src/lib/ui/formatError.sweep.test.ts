@@ -22,6 +22,9 @@ const SWEPT_FILES = [
   "../components/CoverageViewer.svelte",
   "../components/BlameViewer.svelte",
   "../components/FileExplorer.svelte",
+  "../components/FileViewer.svelte",
+  "../components/files/FileTreePanel.svelte",
+  "../components/files/CodeViewer.svelte",
   "../components/CommitDetails.svelte",
   "../components/CommitComposer.svelte",
   "../components/ReflogViewer.svelte",
@@ -40,14 +43,13 @@ const RAW_ERROR_STRINGIFY = /\bString\(\s*(err|reason|error|e)\b/;
 // before feeding the ring. Either spelling satisfies the contract; raw
 // String(err) satisfies neither.
 const FORMATTER_SEAM = [
-  { marker: "formatError(", import: 'from "../ui/formatError"' },
-  { marker: "reportPanelError(", import: 'from "../diagnostics/report"' },
+  { marker: "formatError(", importNeedle: "ui/formatError" },
+  { marker: "reportPanelError(", importNeedle: "diagnostics/report" },
 ] as const;
 
 function routesThroughFormatter(source: string): boolean {
   return FORMATTER_SEAM.some(
-    ({ marker, import: importPath }) =>
-      source.includes(marker) && source.includes(importPath),
+    ({ marker, importNeedle }) => source.includes(marker) && source.includes(importNeedle),
   );
 }
 

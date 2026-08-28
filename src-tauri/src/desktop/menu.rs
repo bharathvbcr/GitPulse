@@ -15,15 +15,15 @@ const SETTINGS_ACCEL: &str = "CmdOrCtrl+,";
 
 /// View-menu digit shortcuts. Repository tab actions must not reuse these.
 const VIEW_TAB_BINDINGS: &[(&str, &str, &str)] = &[
-    (actions::TAB_HISTORY, "Graph", "CmdOrCtrl+1"),
-    (actions::TAB_DIFF, "Diff", "CmdOrCtrl+2"),
-    (actions::TAB_CONFLICT, "Resolve Conflicts", "CmdOrCtrl+3"),
-    (actions::TAB_BLAME, "Blame", "CmdOrCtrl+4"),
-    (actions::TAB_STACK, "Stack", "CmdOrCtrl+5"),
-    (actions::TAB_GITHUB, "GitHub", "CmdOrCtrl+6"),
-    (actions::TAB_COVERAGE, "Coverage", "CmdOrCtrl+7"),
-    (actions::TAB_HEALTH, "Health", "CmdOrCtrl+8"),
-    (actions::TAB_REFLOG, "Reflog", "CmdOrCtrl+9"),
+    (actions::TAB_FILES, "Files", "CmdOrCtrl+1"),
+    (actions::TAB_HISTORY, "Graph", "CmdOrCtrl+2"),
+    (actions::TAB_DIFF, "Diff", "CmdOrCtrl+3"),
+    (actions::TAB_CONFLICT, "Resolve Conflicts", "CmdOrCtrl+4"),
+    (actions::TAB_BLAME, "Blame", "CmdOrCtrl+5"),
+    (actions::TAB_STACK, "Stack", "CmdOrCtrl+6"),
+    (actions::TAB_GITHUB, "GitHub", "CmdOrCtrl+7"),
+    (actions::TAB_COVERAGE, "Coverage", "CmdOrCtrl+8"),
+    (actions::TAB_HEALTH, "Health", "CmdOrCtrl+9"),
 ];
 const _: () = assert!(VIEW_TAB_BINDINGS.len() == 9);
 
@@ -384,10 +384,10 @@ mod tests {
             .collect();
         let expected: Vec<String> = (1..=9).map(|digit| format!("CmdOrCtrl+{digit}")).collect();
         assert_eq!(digits, expected);
-        assert_eq!(VIEW_TAB_BINDINGS[0].0, actions::TAB_HISTORY);
-        assert_eq!(VIEW_TAB_BINDINGS[6].0, actions::TAB_COVERAGE);
-        assert_eq!(VIEW_TAB_BINDINGS[7].0, actions::TAB_HEALTH);
-        assert_eq!(VIEW_TAB_BINDINGS[8].0, actions::TAB_REFLOG);
+        assert_eq!(VIEW_TAB_BINDINGS[0].0, actions::TAB_FILES);
+        assert_eq!(VIEW_TAB_BINDINGS[1].0, actions::TAB_HISTORY);
+        assert_eq!(VIEW_TAB_BINDINGS[7].0, actions::TAB_COVERAGE);
+        assert_eq!(VIEW_TAB_BINDINGS[8].0, actions::TAB_HEALTH);
     }
 
     #[test]

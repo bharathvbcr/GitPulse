@@ -4,6 +4,8 @@ import {
   buildFileTree,
   filterPathsByQuery,
   flattenFileTree,
+  isValidRelativePath,
+  joinWorktreePath,
   type FileRow,
 } from "./fileTree";
 
@@ -141,5 +143,21 @@ describe("ancestorsOf", () => {
     expect(ancestorsOf("root.txt")).toEqual([]);
     // A leading slash is not a repo-relative ancestor boundary.
     expect(ancestorsOf("/etc/passwd")).toEqual([]);
+  });
+});
+
+describe("joinWorktreePath", () => {
+  it("joins a repo root to a validated relative path", () => {
+    expect(joinWorktreePath("/Users/acme/repo", "src/a.ts")).toBe("/Users/acme/repo/src/a.ts");
+    expect(joinWorktreePath("/Users/acme/repo/", "README.md")).toBe("/Users/acme/repo/README.md");
+  });
+
+  it("refuses traversal, absolute, and empty inputs", () => {
+    expect(joinWorktreePath("/repo", "../escape.ts")).toBeNull();
+    expect(joinWorktreePath("/repo", "/etc/passwd")).toBeNull();
+    expect(joinWorktreePath("", "a.ts")).toBeNull();
+    expect(joinWorktreePath("/repo", "")).toBeNull();
+    expect(isValidRelativePath("src/a.ts")).toBe(true);
+    expect(isValidRelativePath("../x")).toBe(false);
   });
 });

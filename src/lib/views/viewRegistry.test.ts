@@ -37,6 +37,7 @@ describe("viewRegistry", () => {
 
   it("keeps declaration order stable so menus render predictably", () => {
     expect(REGISTERED_VIEWS.map((view) => view.id)).toEqual([
+      "files",
       "history",
       "diff",
       "conflict",

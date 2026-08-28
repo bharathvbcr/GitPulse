@@ -40,12 +40,9 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   // CommitDetails renders the file list from cmd_get_commit_details' payload;
   // this dedicated endpoint is unused surplus until a view needs it alone.
   cmd_get_commit_files: "superseded by cmd_get_commit_details payload; kept for API parity",
-  // Frontend computes word-level intra-line highlights itself (lib/diff);
-  // the Rust word-diff engine stays exposed for future parity/perf work.
+  // Word-diff engine exposed for future parity/perf work.
   cmd_compute_word_diff: "frontend computes word diffs client-side; Rust engine reserved",
-  // Language tooling endpoints without a UI surface yet; the LanguageBar uses
-  // the aggregated cmd_get_language_stats instead.
-  cmd_detect_language: "utility endpoint; UI uses aggregated language stats",
+  // Language LOC endpoint without a UI surface yet.
   cmd_count_loc: "utility endpoint; no LOC display wired yet",
   // The commit-type filter parses conventional prefixes locally
   // (lib/filter/parseQuery.ts CONVENTIONAL_TYPES); parser endpoint unused.

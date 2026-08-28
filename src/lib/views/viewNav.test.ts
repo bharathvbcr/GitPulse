@@ -20,22 +20,24 @@ describe("viewNav", () => {
   it("keeps daily work as tabs and folds the rest into menus", () => {
     const work = VIEW_NAV.find((group) => group.id === "work");
     expect(work?.kind).toBe("tabs");
-    expect(work?.items.map((item) => item.id)).toEqual(["history", "diff", "conflict"]);
+    expect(work?.items.map((item) => item.id)).toEqual(["files", "history", "diff", "conflict"]);
 
     const menus = VIEW_NAV.filter((group) => group.kind === "menu");
     expect(menus.length).toBeGreaterThanOrEqual(1);
     const tabCount = VIEW_NAV.filter((group) => group.kind === "tabs").flatMap((group) => group.items)
       .length;
     expect(tabCount).toBeLessThan(VIEW_TABS.length);
-    expect(tabCount).toBeLessThanOrEqual(3);
+    expect(tabCount).toBeLessThanOrEqual(4);
   });
 
   it("resolves group and item metadata for each tab", () => {
     expect(viewNavGroupFor("history")?.id).toBe("work");
+    expect(viewNavGroupFor("files")?.id).toBe("work");
     expect(viewNavGroupFor("coverage")?.id).toBe("inspect");
     expect(viewNavGroupFor("github")?.id).toBe("more");
     expect(viewNavGroupFor("terminal")?.id).toBe("more");
     expect(viewNavItemFor("history")?.label).toBe("Graph");
+    expect(viewNavItemFor("files")?.label).toBe("Files");
     expect(viewNavItemFor("conflict")?.label).toBe("Resolve");
     expect(viewNavItemFor("terminal")?.label).toBe("Terminal");
   });

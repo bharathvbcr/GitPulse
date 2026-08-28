@@ -21,6 +21,7 @@
   import Sidebar from "./lib/components/Sidebar.svelte";
   import CommitTable from "./lib/components/CommitTable.svelte";
   import CommitDetails from "./lib/components/CommitDetails.svelte";
+  import FileViewer from "./lib/components/FileViewer.svelte";
   import DiffViewer from "./lib/components/DiffViewer.svelte";
   import ConflictEditor from "./lib/components/ConflictEditor.svelte";
   import BlameViewer from "./lib/components/BlameViewer.svelte";
@@ -426,6 +427,8 @@
                   <CommitTable />
                   <CommitDetails />
                 </div>
+              {:else if $repoStore.activeTab === "files"}
+                <FileViewer />
               {:else if $repoStore.activeTab === "diff"}
                 <DiffViewer />
               {:else if $repoStore.activeTab === "conflict"}

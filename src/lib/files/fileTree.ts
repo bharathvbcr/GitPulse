@@ -44,7 +44,8 @@ export interface FileRow {
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
-function isValidRelativePath(raw: string): boolean {
+/** True when `raw` is a safe repo-relative path (no absolute, drive, or `..`). */
+export function isValidRelativePath(raw: string): boolean {
   if (typeof raw !== "string") return false;
   const normalized = raw.replaceAll("\\", "/");
   if (normalized.trim().length === 0) return false;
@@ -196,6 +197,18 @@ export function filterPathsByQuery(paths: readonly string[], query: string): str
     const base = lower.slice(lower.lastIndexOf("/") + 1);
     return base.includes(needle);
   });
+}
+
+/**
+ * Joins a repository root and a repo-relative path for desktop openers.
+ * Returns null instead of coercing a traversal escape into a clickable path.
+ */
+export function joinWorktreePath(repoPath: string, relative: string): string | null {
+  if (typeof repoPath !== "string" || repoPath.trim().length === 0) return null;
+  if (!isValidRelativePath(relative)) return null;
+  const root = repoPath.replaceAll("\\", "/").replace(/\/+$/, "");
+  if (!root || root === "/" || root === "//") return null;
+  return `${root}/${relative.replaceAll("\\", "/")}`;
 }
 
 /** Ancestor dir paths of a repo-relative file path, nearest last. */

@@ -201,3 +201,26 @@ fn real_repository_history_solves_clean() {
         check_stable_column_invariants(&cut, &rows);
     }
 }
+
+#[test]
+#[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
+fn real_repository_status_smoke() {
+    let repo =
+        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let statuses = gitpulse_lib::engine::GitReader::get_status(&repo).expect("get_status");
+    println!("Real repository status count: {}", statuses.len());
+    let mut total_add = 0;
+    let mut total_del = 0;
+    for s in &statuses {
+        total_add += s.additions;
+        total_del += s.deletions;
+        if s.additions > 0 || s.deletions > 0 || s.status_code == "??" {
+            println!(
+                "  [{}] {} (+{} -{})",
+                s.status_code, s.path, s.additions, s.deletions
+            );
+        }
+    }
+    println!("Total uncommitted churn: +{} -{}", total_add, total_del);
+    assert!(!statuses.is_empty(), "expected dirty repo with changes");
+}
