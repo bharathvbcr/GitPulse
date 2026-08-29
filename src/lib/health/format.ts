@@ -33,26 +33,59 @@ export function issueClass(severity: string): string {
   return "border-border bg-surface text-textMuted";
 }
 
-export type UpdateKind = "major" | "minor" | "patch" | "same" | "unknown";
+export type UpdateKind = "major" | "minor" | "patch" | "prerelease" | "same" | "unknown";
 
-function parseSemver(raw: string): [number, number, number] | null {
-  const cleaned = raw.trim().replace(/^v/, "").split("-")[0] ?? "";
-  const parts = cleaned.split(".");
-  if (parts.length < 1) return null;
-  const major = Number(parts[0]);
-  const minor = Number(parts[1] ?? "0");
-  const patch = Number(parts[2] ?? "0");
-  if (![major, minor, patch].every((n) => Number.isFinite(n))) return null;
-  return [major, minor, patch];
+interface ParsedSemver {
+  core: [number, number, number];
+  prerelease: string[] | null;
+}
+
+function parseSemver(raw: string): ParsedSemver | null {
+  const match = raw.trim().match(
+    /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/,
+  );
+  if (!match) return null;
+  return {
+    core: [Number(match[1]), Number(match[2] ?? "0"), Number(match[3] ?? "0")],
+    prerelease: match[4] ? match[4].split(".") : null,
+  };
+}
+
+function comparePrerelease(a: string[] | null, b: string[] | null): number {
+  if (a === null && b === null) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  const count = Math.max(a.length, b.length);
+  for (let index = 0; index < count; index += 1) {
+    if (a[index] === undefined) return -1;
+    if (b[index] === undefined) return 1;
+    if (a[index] === b[index]) continue;
+    const aNumeric = /^\d+$/.test(a[index]);
+    const bNumeric = /^\d+$/.test(b[index]);
+    if (aNumeric && bNumeric) return Number(a[index]) - Number(b[index]);
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a[index].localeCompare(b[index]);
+  }
+  return 0;
 }
 
 export function updateKind(current: string, latest: string): UpdateKind {
   const a = parseSemver(current);
   const b = parseSemver(latest);
   if (!a || !b) return "unknown";
-  if (b[0] > a[0]) return "major";
-  if (b[0] === a[0] && b[1] > a[1]) return "minor";
-  if (b[0] === a[0] && b[1] === a[1] && b[2] > a[2]) return "patch";
+  if (b.core[0] > a.core[0]) return "major";
+  if (b.core[0] === a.core[0] && b.core[1] > a.core[1]) return "minor";
+  if (
+    b.core[0] === a.core[0] &&
+    b.core[1] === a.core[1] &&
+    b.core[2] > a.core[2]
+  ) return "patch";
+  if (
+    b.core[0] === a.core[0] &&
+    b.core[1] === a.core[1] &&
+    b.core[2] === a.core[2] &&
+    comparePrerelease(a.prerelease, b.prerelease) < 0
+  ) return "prerelease";
   return "same";
 }
 
@@ -63,6 +96,7 @@ export function updateKindClass(kind: UpdateKind): string {
     case "minor":
       return "text-amber-300";
     case "patch":
+    case "prerelease":
       return "text-sky-300";
     default:
       return "text-textMuted";
@@ -78,10 +112,12 @@ export function formatAuditCounts(
     unknown?: number;
     total: number;
   },
-  options?: { ran?: boolean },
+  options?: { complete?: boolean; ran?: boolean },
 ): string {
   if (summary.total === 0) {
-    return options?.ran ? "No known vulnerabilities" : "Audit did not run";
+    if (options?.complete === true) return "No known vulnerabilities";
+    if (options?.ran === true) return "Audit incomplete";
+    return "Audit did not run";
   }
   const parts: string[] = [];
   if (summary.critical) parts.push(`${summary.critical} critical`);

@@ -28,6 +28,10 @@ describe("health format", () => {
     expect(updateKind("1.2.3", "1.2.3")).toBe("same");
     expect(updateKind("v5.6.0", "5.9.2")).toBe("minor");
     expect(updateKind("not-a-version", "1.0.0")).toBe("unknown");
+    expect(
+      updateKind("7.0.0-dev.20260514.1", "7.0.0-dev.20260707.2"),
+    ).toBe("prerelease");
+    expect(updateKind("1.0.0-rc.1", "1.0.0")).toBe("prerelease");
     expect(updateKindClass("major")).toContain("rose");
     expect(updateKindClass("patch")).toContain("sky");
   });
@@ -48,9 +52,15 @@ describe("health format", () => {
     expect(
       formatAuditCounts(
         { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
-        { ran: true },
+        { complete: true, ran: true },
       ),
     ).toBe("No known vulnerabilities");
+    expect(
+      formatAuditCounts(
+        { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
+        { complete: false, ran: true },
+      ),
+    ).toBe("Audit incomplete");
     expect(
       formatAuditCounts({ critical: 1, high: 2, moderate: 0, low: 4, total: 7 }),
     ).toBe("1 critical · 2 high · 4 low");

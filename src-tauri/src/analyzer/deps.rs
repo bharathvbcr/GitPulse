@@ -28,9 +28,12 @@ const MAX_MANIFESTS: usize = 12;
 const MAX_VULNS: usize = 200;
 const MAX_OUTDATED: usize = 200;
 const MAX_ISSUES: usize = 48;
+const MAX_NPM_ROOTS: usize = 6;
+const MAX_CARGO_LOCKS: usize = 6;
 const MAX_PY_REQUIREMENTS: usize = 6;
 const MAX_GO_MODS: usize = 4;
 const MAX_COMPOSER_LOCKS: usize = 6;
+const MAX_ECOSYSTEM_MANIFESTS: usize = 24;
 /// pip-audit / govulncheck / composer findings carry no CVSS-style severity.
 /// They are counted in their own bucket instead of masquerading as "info".
 pub(crate) const SEVERITY_UNKNOWN: &str = "unknown";
@@ -177,6 +180,13 @@ pub struct OutdatedPackage {
     pub location: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanLimitNotice {
+    pub resource: String,
+    pub kept: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DepsHealthReport {
     pub node_version: Option<String>,
@@ -193,6 +203,10 @@ pub struct DepsHealthReport {
     /// what DID. `serde(default)` keeps older serialized reports loadable.
     #[serde(default)]
     pub scanners_ran: Vec<String>,
+    /// True only when every discovered, supported audit target was scanned
+    /// successfully and no coverage-affecting safety cap was hit.
+    #[serde(default)]
+    pub audit_complete: bool,
     pub manifests: Vec<NpmManifest>,
     pub ecosystems: Vec<EcosystemHint>,
     pub issues: Vec<HealthIssue>,
@@ -200,12 +214,16 @@ pub struct DepsHealthReport {
     pub audit: AuditSummary,
     pub outdated: Vec<OutdatedPackage>,
     pub truncated: bool,
+    /// Exact retained/observed counts for every safety budget that fired.
+    #[serde(default)]
+    pub limit_notices: Vec<ScanLimitNotice>,
 }
 
 /// Ecosystem artifacts collected while listing tracked files; the CLI enrichers
 /// consume these so probes only run when something is actually there to scan.
 #[derive(Debug, Default)]
 struct ScanTargets {
+    cargo_locks: Vec<String>,
     /// requirements*.txt files (pinned lists pip-audit can audit without pip).
     py_requirements: Vec<String>,
     go_mods: Vec<String>,
@@ -293,7 +311,7 @@ impl DepsScanner {
             if enrich_npm(&repo, &mut report, &env) {
                 ran.push("npm".into());
             }
-            if enrich_cargo(&repo, &mut report, &env) {
+            if enrich_cargo(&repo, &targets, &mut report, &env) {
                 ran.push("cargo".into());
             }
             if enrich_python(&repo, &targets, &mut report, &env) {
@@ -314,17 +332,19 @@ impl DepsScanner {
         report.audit = AuditSummary::from_vulns(&report.vulnerabilities);
         sort_report(&mut report);
         cap_report(&mut report);
+        report.audit_complete = audit_is_complete(&report, &targets, options.run_cli);
         Ok(report)
     }
 }
 
 fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTargets), String> {
-    let listed = list_repo_files(repo)?;
-    let mut truncated = false;
+    let (listed, file_limit) = list_repo_files(repo)?;
+    let mut limit_notices = file_limit.into_iter().collect::<Vec<_>>();
     let mut other: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut issues = Vec::new();
     let mut manifests = Vec::new();
     let mut targets = ScanTargets::default();
+    let mut npm_manifest_candidates = 0usize;
 
     for rel in &listed {
         let name = rel.rsplit('/').next().unwrap_or(rel.as_str());
@@ -337,11 +357,11 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             }
         }
         if name != "package.json" {
-            collect_side_target(name, rel, &mut targets, &mut truncated);
+            collect_side_target(name, rel, &mut targets);
             continue;
         }
+        npm_manifest_candidates += 1;
         if manifests.len() >= MAX_MANIFESTS {
-            truncated = true;
             continue;
         }
         match read_npm_manifest(repo, rel) {
@@ -360,12 +380,21 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         }
     }
 
+    if npm_manifest_candidates > MAX_MANIFESTS {
+        limit_notices.push(ScanLimitNotice {
+            resource: "npm manifests".into(),
+            kept: MAX_MANIFESTS,
+            total: npm_manifest_candidates,
+        });
+    }
+    cap_scan_targets(&mut targets, &mut limit_notices);
+
     let node_probe = probe_tool_version(node_program(), &["-v"], env, VERSION_TIMEOUT);
     let npm_probe = probe_tool_version(npm_program(), &["--version"], env, VERSION_TIMEOUT);
     let node_version = node_probe.version().map(str::to_string);
     let npm_version = npm_probe.version().map(str::to_string);
     let npm_cli_present = npm_version.is_some();
-    let cargo_audit_present = other.contains_key("cargo") && cargo_audit_available(env);
+    let cargo_audit_present = !targets.cargo_locks.is_empty() && cargo_audit_available(env);
     // Scanner probes are gated on artifacts: a pure-Node repo never pays for a
     // pip-audit / govulncheck / composer spawn.
     let pip_audit_present = pip_audit_present(&targets)
@@ -401,59 +430,65 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         }
     }
 
-    let mut ecosystems: Vec<EcosystemHint> = other
-        .into_iter()
-        .map(|(family, mut files)| {
-            files.sort();
-            files.dedup();
-            files.truncate(24);
-            let note = match family.as_str() {
-                "cargo" => {
-                    if cargo_audit_present {
-                        "Cargo.lock will be checked with cargo audit".into()
-                    } else {
-                        "Install cargo-audit (`cargo install cargo-audit`) to scan Rust crates"
-                            .into()
-                    }
+    let mut ecosystems: Vec<EcosystemHint> = Vec::new();
+    for (family, mut files) in other {
+        files.sort();
+        files.dedup();
+        if files.len() > MAX_ECOSYSTEM_MANIFESTS {
+            limit_notices.push(ScanLimitNotice {
+                resource: format!("{family} ecosystem artifacts"),
+                kept: MAX_ECOSYSTEM_MANIFESTS,
+                total: files.len(),
+            });
+            files.truncate(MAX_ECOSYSTEM_MANIFESTS);
+        }
+        let note = match family.as_str() {
+            "cargo" => {
+                if cargo_audit_present {
+                    "Cargo.lock files will be checked with cargo audit".into()
+                } else {
+                    "Install cargo-audit (`cargo install cargo-audit`) to scan Rust crates".into()
                 }
-                "go" => {
-                    if govulncheck_present {
-                        "Go modules will be checked with govulncheck".into()
-                    } else {
-                        "Install govulncheck (`go install golang.org/x/vuln/cmd/govulncheck@latest`) to scan Go modules".into()
-                    }
-                }
-                "python" => {
-                    if pip_audit_present {
-                        "Pinned requirements*.txt files will be checked with pip-audit (--no-deps)".into()
-                    } else {
-                        "Install pip-audit (`pipx install pip-audit`) to scan pinned requirements files".into()
-                    }
-                }
-                "php" => {
-                    if composer_present {
-                        "composer.lock will be checked with composer audit --locked".into()
-                    } else {
-                        "Install Composer 2.4+ to run `composer audit` against composer.lock".into()
-                    }
-                }
-                "ruby" => {
-                    if bundler_audit_present {
-                        "Gemfile.lock will be checked with bundler-audit".into()
-                    } else {
-                        "Install bundler-audit (`gem install bundler-audit`) to scan Gemfile.lock"
-                            .into()
-                    }
-                }
-                _ => "Detected; no scanner wired".into(),
-            };
-            EcosystemHint {
-                family,
-                manifests: files,
-                note,
             }
-        })
-        .collect();
+            "go" => {
+                if govulncheck_present {
+                    "Go modules will be checked with govulncheck".into()
+                } else {
+                    "Install govulncheck (`go install golang.org/x/vuln/cmd/govulncheck@latest`) to scan Go modules".into()
+                }
+            }
+            "python" => {
+                if pip_audit_present {
+                    "Pinned requirements*.txt files will be checked with pip-audit (--no-deps)"
+                        .into()
+                } else {
+                    "Install pip-audit (`pipx install pip-audit`) to scan pinned requirements files"
+                        .into()
+                }
+            }
+            "php" => {
+                if composer_present {
+                    "composer.lock will be checked with composer audit --locked".into()
+                } else {
+                    "Install Composer 2.4+ to run `composer audit` against composer.lock".into()
+                }
+            }
+            "ruby" => {
+                if bundler_audit_present {
+                    "Gemfile.lock will be checked with bundler-audit".into()
+                } else {
+                    "Install bundler-audit (`gem install bundler-audit`) to scan Gemfile.lock"
+                        .into()
+                }
+            }
+            _ => "Detected; no scanner wired".into(),
+        };
+        ecosystems.push(EcosystemHint {
+            family,
+            manifests: files,
+            note,
+        });
+    }
     ecosystems.sort_by(|a, b| a.family.cmp(&b.family));
 
     Ok((
@@ -467,53 +502,91 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             composer_present,
             bundler_audit_present,
             scanners_ran: Vec::new(),
+            audit_complete: false,
             manifests,
             ecosystems,
             issues,
             vulnerabilities: Vec::new(),
             audit: AuditSummary::default(),
             outdated: Vec::new(),
-            truncated,
+            truncated: !limit_notices.is_empty(),
+            limit_notices,
         },
         targets,
     ))
 }
 
 /// Records non-npm scan inputs spotted during the tracked-file walk.
-fn collect_side_target(name: &str, rel: &str, targets: &mut ScanTargets, truncated: &mut bool) {
+fn collect_side_target(name: &str, rel: &str, targets: &mut ScanTargets) {
+    if name == "Cargo.lock" {
+        targets.cargo_locks.push(rel.to_string());
+        return;
+    }
     if name == "go.mod" {
-        if targets.go_mods.len() < MAX_GO_MODS {
-            targets.go_mods.push(rel.to_string());
-        } else {
-            *truncated = true;
-        }
+        targets.go_mods.push(rel.to_string());
         return;
     }
     if name == "composer.lock" {
-        if targets.composer_locks.len() < MAX_COMPOSER_LOCKS {
-            targets.composer_locks.push(rel.to_string());
-        } else {
-            *truncated = true;
-        }
+        targets.composer_locks.push(rel.to_string());
         return;
     }
     if name == "Gemfile.lock" {
-        // Same per-family cap as composer locks; a repo rarely has more than
-        // a handful of bundler projects.
-        if targets.gemfile_locks.len() < MAX_COMPOSER_LOCKS {
-            targets.gemfile_locks.push(rel.to_string());
-        } else {
-            *truncated = true;
-        }
+        targets.gemfile_locks.push(rel.to_string());
+        return;
     }
     // requirements.txt, requirements-dev.txt, requirements/production.txt …
     if name.starts_with("requirements") && name.ends_with(".txt") || name == "constraints.txt" {
-        if targets.py_requirements.len() < MAX_PY_REQUIREMENTS {
-            targets.py_requirements.push(rel.to_string());
-        } else {
-            *truncated = true;
-        }
+        targets.py_requirements.push(rel.to_string());
     }
+}
+
+fn cap_target_list(
+    items: &mut Vec<String>,
+    max: usize,
+    resource: &str,
+    notices: &mut Vec<ScanLimitNotice>,
+) {
+    if items.len() > max {
+        notices.push(ScanLimitNotice {
+            resource: resource.into(),
+            kept: max,
+            total: items.len(),
+        });
+        items.truncate(max);
+    }
+}
+
+fn cap_scan_targets(targets: &mut ScanTargets, notices: &mut Vec<ScanLimitNotice>) {
+    cap_target_list(
+        &mut targets.cargo_locks,
+        MAX_CARGO_LOCKS,
+        "Cargo.lock audit targets",
+        notices,
+    );
+    cap_target_list(
+        &mut targets.py_requirements,
+        MAX_PY_REQUIREMENTS,
+        "Python audit targets",
+        notices,
+    );
+    cap_target_list(
+        &mut targets.go_mods,
+        MAX_GO_MODS,
+        "Go audit targets",
+        notices,
+    );
+    cap_target_list(
+        &mut targets.composer_locks,
+        MAX_COMPOSER_LOCKS,
+        "Composer audit targets",
+        notices,
+    );
+    cap_target_list(
+        &mut targets.gemfile_locks,
+        MAX_COMPOSER_LOCKS,
+        "Bundler audit targets",
+        notices,
+    );
 }
 
 fn pip_audit_present(targets: &ScanTargets) -> bool {
@@ -581,7 +654,11 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool
     if !report.npm_cli_present || report.manifests.is_empty() {
         return false;
     }
-    let roots = npm_scan_roots(&report.manifests);
+    let mut roots = npm_scan_roots(&report.manifests);
+    if roots.len() > MAX_NPM_ROOTS {
+        record_limit(report, "npm audit roots", MAX_NPM_ROOTS, roots.len());
+        roots.truncate(MAX_NPM_ROOTS);
+    }
     let mut ran = false;
     for rel_dir in roots {
         let cwd = match npm_cwd(repo, &rel_dir) {
@@ -645,63 +722,94 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool
     ran
 }
 
-/// Runs `cargo audit --json` against the root Cargo.lock. Returns true when
-/// the command was dispatched (whatever its outcome).
-fn enrich_cargo(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool {
+/// Runs `cargo audit --json --file <path>` against every bounded Cargo.lock
+/// target. Returns true when at least one command was dispatched.
+fn enrich_cargo(
+    repo: &Path,
+    targets: &ScanTargets,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+) -> bool {
     if !report.cargo_audit_present {
         return false;
     }
-    let has_lock = sandbox_join(repo, "Cargo.lock")
-        .ok()
-        .map(|p| p.is_file())
-        .unwrap_or(false);
-    if !has_lock {
-        return false;
-    }
-    match capture_scanner_command(
-        env,
-        "cargo",
-        &["audit", "--json"],
-        Some(repo),
-        AUDIT_TIMEOUT,
-        &[("CARGO_TERM_COLOR", "never")],
-    ) {
-        Ok(out) => {
-            let text = out.stdout_text();
-            if text.trim().is_empty() && !out.success {
+    let mut ran = false;
+    for rel in &targets.cargo_locks {
+        let valid_lock = sandbox_join_canonical(repo, rel)
+            .ok()
+            .map(|path| path.is_file())
+            .unwrap_or(false);
+        if !valid_lock {
+            push_issue(
+                &mut report.issues,
+                "error",
+                "audit_cwd",
+                "Cargo.lock could not be validated inside the repository".into(),
+                Some(rel.clone()),
+            );
+            continue;
+        }
+        match capture_scanner_command(
+            env,
+            "cargo",
+            &["audit", "--json", "--file", rel],
+            Some(repo),
+            AUDIT_TIMEOUT,
+            &[("CARGO_TERM_COLOR", "never")],
+        ) {
+            Ok(out) => {
+                ran = true;
+                let text = out.stdout_text();
+                if text.trim().is_empty() && !out.success {
+                    push_issue(
+                        &mut report.issues,
+                        "warning",
+                        "cargo_audit_failed",
+                        if out.stderr_text().is_empty() {
+                            format!("cargo audit exited {}", out.status_code)
+                        } else {
+                            out.stderr_text()
+                        },
+                        Some(rel.clone()),
+                    );
+                    continue;
+                }
+                match parse_cargo_audit_json(&text) {
+                    Ok((mut vulns, warnings)) => {
+                        report.vulnerabilities.append(&mut vulns);
+                        for mut warning in warnings {
+                            warning.path = Some(rel.clone());
+                            push_issue(
+                                &mut report.issues,
+                                &warning.severity,
+                                &warning.code,
+                                warning.message,
+                                warning.path,
+                            );
+                        }
+                    }
+                    Err(e) => push_issue(
+                        &mut report.issues,
+                        "warning",
+                        "cargo_audit_failed",
+                        e,
+                        Some(rel.clone()),
+                    ),
+                }
+            }
+            Err(e) => {
+                ran = true;
                 push_issue(
                     &mut report.issues,
                     "warning",
                     "cargo_audit_failed",
-                    if out.stderr_text().is_empty() {
-                        format!("cargo audit exited {}", out.status_code)
-                    } else {
-                        out.stderr_text()
-                    },
-                    Some("Cargo.lock".into()),
-                );
-                return true;
-            }
-            match parse_cargo_audit_json(&text) {
-                Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
-                Err(e) => push_issue(
-                    &mut report.issues,
-                    "warning",
-                    "cargo_audit_failed",
                     e,
-                    Some("Cargo.lock".into()),
-                ),
+                    Some(rel.clone()),
+                );
             }
         }
-        Err(e) => push_issue(
-            &mut report.issues,
-            "warning",
-            "cargo_audit_failed",
-            e,
-            Some("Cargo.lock".into()),
-        ),
     }
-    true
+    ran
 }
 
 /// Audits pinned requirements files with `pip-audit --no-deps`.
@@ -1008,9 +1116,6 @@ pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>,
     };
     let mut out = Vec::new();
     for result in results {
-        if out.len() >= MAX_VULNS {
-            break;
-        }
         if !result.is_object() {
             continue;
         }
@@ -1147,7 +1252,6 @@ fn npm_scan_roots(manifests: &[NpmManifest]) -> Vec<String> {
         .iter()
         .filter(|m| m.lockfile.is_some())
         .map(|m| dir_of(&m.path))
-        .take(6)
         .collect()
 }
 
@@ -1385,7 +1489,7 @@ fn node_program() -> &'static str {
     }
 }
 
-fn list_repo_files(repo: &Path) -> Result<Vec<String>, String> {
+fn list_repo_files(repo: &Path) -> Result<(Vec<String>, Option<ScanLimitNotice>), String> {
     let stdout = git_text(
         repo,
         &[
@@ -1404,15 +1508,23 @@ fn list_repo_files(repo: &Path) -> Result<Vec<String>, String> {
         }
         out.push(rel);
     }
-    if out.len() > MAX_SOURCE_FILES {
+    let limit = if out.len() > MAX_SOURCE_FILES {
+        let total = out.len();
         out.sort_by(|a, b| {
             let ea = LanguageDetector::ecosystem_hint(a).is_some();
             let eb = LanguageDetector::ecosystem_hint(b).is_some();
             eb.cmp(&ea).then_with(|| a.cmp(b))
         });
         out.truncate(MAX_SOURCE_FILES);
-    }
-    Ok(out)
+        Some(ScanLimitNotice {
+            resource: "repository files".into(),
+            kept: MAX_SOURCE_FILES,
+            total,
+        })
+    } else {
+        None
+    };
+    Ok((out, limit))
 }
 
 fn read_npm_manifest(repo: &Path, rel: &str) -> Result<Option<NpmManifest>, String> {
@@ -1569,9 +1681,6 @@ fn push_issue(
     message: String,
     path: Option<String>,
 ) {
-    if issues.len() >= MAX_ISSUES {
-        return;
-    }
     if issues
         .iter()
         .any(|i| i.code == code && i.path == path && i.message == message)
@@ -1583,6 +1692,18 @@ fn push_issue(
         code: code.to_string(),
         message,
         path,
+    });
+}
+
+fn record_limit(report: &mut DepsHealthReport, resource: &str, kept: usize, total: usize) {
+    if total <= kept {
+        return;
+    }
+    report.truncated = true;
+    report.limit_notices.push(ScanLimitNotice {
+        resource: resource.into(),
+        kept,
+        total,
     });
 }
 
@@ -1599,13 +1720,74 @@ fn sort_report(report: &mut DepsHealthReport) {
 
 fn cap_report(report: &mut DepsHealthReport) {
     if report.vulnerabilities.len() > MAX_VULNS {
-        report.truncated = true;
+        let total = report.vulnerabilities.len();
+        record_limit(report, "vulnerabilities", MAX_VULNS, total);
         report.vulnerabilities.truncate(MAX_VULNS);
     }
     if report.outdated.len() > MAX_OUTDATED {
-        report.truncated = true;
+        let total = report.outdated.len();
+        record_limit(report, "outdated npm packages", MAX_OUTDATED, total);
         report.outdated.truncate(MAX_OUTDATED);
     }
+    if report.issues.len() > MAX_ISSUES {
+        let total = report.issues.len();
+        record_limit(report, "health issues", MAX_ISSUES, total);
+        report.issues.truncate(MAX_ISSUES);
+    }
+}
+
+fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: bool) -> bool {
+    if !run_cli || report.truncated {
+        return false;
+    }
+    let ran = |name: &str| report.scanners_ran.iter().any(|scanner| scanner == name);
+    let requirements = [
+        (
+            !report.manifests.is_empty(),
+            report.npm_cli_present && ran("npm"),
+        ),
+        (
+            !targets.cargo_locks.is_empty(),
+            report.cargo_audit_present && ran("cargo"),
+        ),
+        (
+            !targets.py_requirements.is_empty(),
+            report.pip_audit_present && ran("pip-audit"),
+        ),
+        (
+            !targets.go_mods.is_empty(),
+            report.govulncheck_present && ran("govulncheck"),
+        ),
+        (
+            !targets.composer_locks.is_empty(),
+            report.composer_present && ran("composer"),
+        ),
+        (
+            !targets.gemfile_locks.is_empty(),
+            report.bundler_audit_present && ran("bundler-audit"),
+        ),
+    ];
+    let has_target = requirements.iter().any(|(expected, _)| *expected);
+    if !has_target
+        || requirements
+            .iter()
+            .any(|(expected, completed)| *expected && !*completed)
+    {
+        return false;
+    }
+    let failure_codes = [
+        "audit_cwd",
+        "audit_failed",
+        "cargo_audit_failed",
+        "pip_audit_failed",
+        "govulncheck_failed",
+        "composer_audit_failed",
+        "bundler_audit_failed",
+    ];
+    !report
+        .issues
+        .iter()
+        .any(|issue| failure_codes.contains(&issue.code.as_str()))
 }
 
 pub(crate) fn severity_rank(severity: &str) -> u8 {
@@ -1675,9 +1857,6 @@ fn parse_npm_audit_v2(value: &Value) -> Vec<Vulnerability> {
     };
     let mut out = Vec::new();
     for (name, entry) in map {
-        if out.len() >= MAX_VULNS {
-            break;
-        }
         let severity = entry
             .get("severity")
             .and_then(|v| v.as_str())
@@ -1783,9 +1962,6 @@ fn parse_npm_audit_v1(value: &Value) -> Vec<Vulnerability> {
     };
     let mut out = Vec::new();
     for (_id, entry) in map {
-        if out.len() >= MAX_VULNS {
-            break;
-        }
         let findings = entry.get("findings").and_then(|v| v.as_array());
         let is_direct = findings
             .and_then(|rows| rows.first())
@@ -1851,9 +2027,6 @@ pub(crate) fn parse_npm_outdated_json(text: &str) -> Result<Vec<OutdatedPackage>
     };
     let mut out = Vec::new();
     for (name, entry) in map {
-        if out.len() >= MAX_OUTDATED {
-            break;
-        }
         if !entry.is_object() {
             continue;
         }
@@ -1890,7 +2063,9 @@ fn first_non_empty(value: &Value, keys: &[&str]) -> Option<String> {
         .find_map(|k| opt_json_str(value, k).filter(|s| !s.is_empty()))
 }
 
-pub(crate) fn parse_cargo_audit_json(text: &str) -> Result<Vec<Vulnerability>, String> {
+pub(crate) fn parse_cargo_audit_json(
+    text: &str,
+) -> Result<(Vec<Vulnerability>, Vec<HealthIssue>), String> {
     let value: Value =
         serde_json::from_str(text.trim()).map_err(|e| format!("cargo audit JSON: {e}"))?;
     let list = value
@@ -1900,9 +2075,6 @@ pub(crate) fn parse_cargo_audit_json(text: &str) -> Result<Vec<Vulnerability>, S
         .unwrap_or_default();
     let mut out = Vec::new();
     for item in list {
-        if out.len() >= MAX_VULNS {
-            break;
-        }
         let advisory = item.get("advisory").unwrap_or(&item);
         let pkg = advisory
             .get("package")
@@ -1954,7 +2126,56 @@ pub(crate) fn parse_cargo_audit_json(text: &str) -> Result<Vec<Vulnerability>, S
             ecosystem: "cargo".into(),
         });
     }
-    Ok(out)
+    let mut warnings = Vec::new();
+    if let Some(groups) = value
+        .get("warnings")
+        .and_then(|warnings| warnings.as_object())
+    {
+        for (kind, entries) in groups {
+            let Some(entries) = entries.as_array() else {
+                continue;
+            };
+            for entry in entries {
+                let advisory = entry.get("advisory").unwrap_or(entry);
+                let package = entry
+                    .pointer("/package/name")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| advisory.get("package").and_then(|value| value.as_str()))
+                    .unwrap_or("unknown crate");
+                let version = entry
+                    .pointer("/package/version")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let id = json_str(advisory, "id");
+                let title = json_str(advisory, "title");
+                let url = json_str(advisory, "url");
+                let mut message = format!(
+                    "{package}{version_suffix}",
+                    version_suffix = if version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {version}")
+                    }
+                );
+                if !title.is_empty() {
+                    message.push_str(&format!(": {title}"));
+                }
+                if !id.is_empty() {
+                    message.push_str(&format!(" ({id})"));
+                }
+                if !url.is_empty() {
+                    message.push_str(&format!(" — {url}"));
+                }
+                warnings.push(HealthIssue {
+                    severity: "warning".into(),
+                    code: format!("cargo_audit_{}", kind.replace('-', "_")),
+                    message,
+                    path: None,
+                });
+            }
+        }
+    }
+    Ok((out, warnings))
 }
 
 fn cvss_to_severity(score: &str) -> String {
@@ -2004,9 +2225,6 @@ pub(crate) fn parse_pip_audit_json(text: &str) -> Result<Vec<Vulnerability>, Str
             continue;
         };
         for vuln in vulns {
-            if out.len() >= MAX_VULNS {
-                return Ok(out);
-            }
             let id = json_str(vuln, "id");
             let aliases = vuln
                 .get("aliases")
@@ -2171,9 +2389,6 @@ pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>,
     }
     let mut out = Vec::new();
     for ((id, _module), mf) in seen {
-        if out.len() >= MAX_VULNS {
-            break;
-        }
         let title = osv_titles.get(&id).cloned().unwrap_or_else(|| id.clone());
         let url = osv_urls.get(&id).cloned().unwrap_or_else(|| {
             if id.starts_with("GO-") {
@@ -2232,9 +2447,6 @@ pub(crate) fn parse_composer_audit_json(text: &str) -> Result<Vec<Vulnerability>
             continue;
         };
         for entry in entries {
-            if out.len() >= MAX_VULNS {
-                return Ok(out);
-            }
             if !entry.is_object() {
                 continue;
             }
@@ -2624,12 +2836,36 @@ mod tests {
             ]
           }
         }"#;
-        let vulns = parse_cargo_audit_json(json).unwrap();
+        let (vulns, warnings) = parse_cargo_audit_json(json).unwrap();
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0].name, "time");
         assert_eq!(vulns[0].ecosystem, "cargo");
         assert_eq!(vulns[0].fix_available, ">=0.2.23");
         assert!(vulns[0].url.contains("RUSTSEC-2020-0071"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_cargo_audit_surfaces_informational_warnings() {
+        let json = r#"{
+          "vulnerabilities": {"list": []},
+          "warnings": {
+            "unsound": [{
+              "package": {"name": "glib", "version": "0.18.5"},
+              "advisory": {
+                "id": "RUSTSEC-2024-0429",
+                "title": "Unsound iterator implementation",
+                "url": "https://rustsec.org/advisories/RUSTSEC-2024-0429"
+              }
+            }]
+          }
+        }"#;
+        let (vulns, warnings) = parse_cargo_audit_json(json).unwrap();
+        assert!(vulns.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "cargo_audit_unsound");
+        assert!(warnings[0].message.contains("glib 0.18.5"));
+        assert!(warnings[0].message.contains("RUSTSEC-2024-0429"));
     }
 
     #[test]
@@ -2940,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_pip_audit_caps_findings_without_panic() {
+    fn parse_pip_audit_preserves_total_for_report_level_capping() {
         let mut rows = Vec::new();
         for i in 0..(MAX_VULNS * 4) {
             rows.push(format!(
@@ -2949,7 +3185,7 @@ mod tests {
         }
         let text = format!("[{}]", rows.join(","));
         let vulns = parse_pip_audit_json(&text).unwrap();
-        assert_eq!(vulns.len(), MAX_VULNS);
+        assert_eq!(vulns.len(), MAX_VULNS * 4);
     }
 
     // -- govulncheck ----------------------------------------------------------
@@ -3243,14 +3479,14 @@ not-json-at-all
     }
 
     #[test]
-    fn parse_composer_caps_and_falls_back_to_package_key() {
+    fn parse_composer_preserves_total_and_falls_back_to_package_key() {
         let mut entries = Vec::new();
         for i in 0..(MAX_VULNS + 20) {
             entries.push(format!(r#"{{"advisoryId":"ID-{i}"}}"#));
         }
         let json = format!(r#"{{"advisories":{{"pkg":[{}]}}}}"#, entries.join(","));
         let vulns = parse_composer_audit_json(&json).unwrap();
-        assert_eq!(vulns.len(), MAX_VULNS);
+        assert_eq!(vulns.len(), MAX_VULNS + 20);
         // packageName absent → key used.
         assert_eq!(vulns[0].name, "pkg");
     }
@@ -3299,6 +3535,33 @@ not-json-at-all
         assert_eq!(summary.unknown, 1);
         assert_eq!(summary.info, 1, "truly alien strings stay informational");
         assert_eq!(summary.total, 3);
+    }
+
+    #[test]
+    fn report_level_caps_keep_exact_observed_totals() {
+        let repo = git_repo();
+        let env = ScanEnv::from_options(&ScanOptions {
+            run_cli: false,
+            path_var: None,
+            home: None,
+        });
+        let (mut report, _) = local_scan(repo.path(), &env).unwrap();
+        for index in 0..(MAX_ISSUES + 7) {
+            report.issues.push(HealthIssue {
+                severity: "warning".into(),
+                code: format!("issue_{index}"),
+                message: format!("issue {index}"),
+                path: None,
+            });
+        }
+        cap_report(&mut report);
+        assert_eq!(report.issues.len(), MAX_ISSUES);
+        assert!(report.truncated);
+        assert!(report.limit_notices.iter().any(|notice| {
+            notice.resource == "health issues"
+                && notice.kept == MAX_ISSUES
+                && notice.total == MAX_ISSUES + 7
+        }));
     }
 
     // -- bundler-audit ----------------------------------------------------------
@@ -3392,7 +3655,7 @@ not-json-at-all
     }
 
     #[test]
-    fn parse_bundler_audit_cvss_v2_fallback_and_caps() {
+    fn parse_bundler_audit_cvss_v2_fallback_preserves_total() {
         let mut results = Vec::new();
         for i in 0..(MAX_VULNS + 5) {
             results.push(format!(
@@ -3402,9 +3665,7 @@ not-json-at-all
         }
         let text = format!(r#"{{"results":[{}]}}"#, results.join(","));
         let vulns = parse_bundler_audit_json(&text).unwrap();
-        assert_eq!(vulns.len(), MAX_VULNS);
-        // The capped output keeps lexicographically-first ids; just verify
-        // the v2 fallback mapped where present.
+        assert_eq!(vulns.len(), MAX_VULNS + 5);
         assert!(vulns.iter().any(|v| v.via.contains(&"A-0".to_string())));
     }
 
@@ -3467,29 +3728,33 @@ not-json-at-all
     // -- target collection ------------------------------------------------------
 
     #[test]
-    fn collect_side_targets_caps_each_family() {
+    fn collect_side_targets_report_exact_caps_for_each_family() {
         let mut targets = ScanTargets::default();
-        let mut truncated = false;
         for i in 0..MAX_PY_REQUIREMENTS + 3 {
             collect_side_target(
                 "requirements-test.txt",
                 &format!("requirements{i}.txt"),
                 &mut targets,
-                &mut truncated,
             );
         }
         for i in 0..MAX_GO_MODS + 2 {
-            collect_side_target(
-                "go.mod",
-                &format!("svc{i}/go.mod"),
-                &mut targets,
-                &mut truncated,
-            );
+            collect_side_target("go.mod", &format!("svc{i}/go.mod"), &mut targets);
         }
-        assert!(truncated);
+        let mut notices = Vec::new();
+        cap_scan_targets(&mut targets, &mut notices);
         assert_eq!(targets.py_requirements.len(), MAX_PY_REQUIREMENTS);
         assert_eq!(targets.go_mods.len(), MAX_GO_MODS);
         assert_eq!(targets.composer_locks.len(), 0);
+        assert!(notices.iter().any(|notice| {
+            notice.resource == "Python audit targets"
+                && notice.kept == MAX_PY_REQUIREMENTS
+                && notice.total == MAX_PY_REQUIREMENTS + 3
+        }));
+        assert!(notices.iter().any(|notice| {
+            notice.resource == "Go audit targets"
+                && notice.kept == MAX_GO_MODS
+                && notice.total == MAX_GO_MODS + 2
+        }));
     }
 
     #[test]
@@ -3505,15 +3770,13 @@ not-json-at-all
         ];
         for (name, expected) in cases {
             let mut targets = ScanTargets::default();
-            let mut truncated = false;
-            collect_side_target(name, name, &mut targets, &mut truncated);
+            collect_side_target(name, name, &mut targets);
             assert_eq!(
                 targets.py_requirements.is_empty(),
                 !expected,
                 "{name} should be {}",
                 if expected { "collected" } else { "skipped" }
             );
-            assert!(!truncated);
         }
     }
 
@@ -3603,6 +3866,105 @@ not-json-at-all
             },
         ];
         assert_eq!(npm_scan_roots(&manifests), vec![String::new()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_audits_nested_cargo_lockfiles_with_their_explicit_path() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "src-tauri/Cargo.lock",
+            "# generated\nversion = 3\n",
+        );
+        write(
+            repo.path(),
+            "src-tauri/Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        git_add(repo.path(), "src-tauri/Cargo.lock");
+        git_add(repo.path(), "src-tauri/Cargo.toml");
+
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo",
+            "#!/bin/sh\nif [ \"$1\" = audit ] && [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\nif [ \"$1\" = audit ] && [ \"$2\" = --json ] && [ \"$3\" = --file ] && [ \"$4\" = src-tauri/Cargo.lock ]; then echo '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'; exit 0; fi\necho \"unexpected args: $*\" >&2\nexit 64\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(report.scanners_ran, vec!["cargo".to_string()]);
+        assert!(
+            report.audit_complete,
+            "clean nested audit should be complete"
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "cargo_audit_failed"),
+            "nested lockfile audit failed: {:?}",
+            report.issues
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatched_scanner_failure_never_marks_audit_complete() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        write(
+            repo.path(),
+            "package-lock.json",
+            r#"{"name":"demo","lockfileVersion":3}"#,
+        );
+        git_add(repo.path(), "package.json");
+        git_add(repo.path(), "package-lock.json");
+
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "node",
+            "#!/bin/sh\nif [ \"$1\" = -v ]; then echo v20.0.0; fi\n",
+        );
+        write_exec(
+            stubs.path(),
+            "npm",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 10.9.0 ;;\n  audit) echo 'not json' ;;\n  outdated) echo '{}' ;;\nesac\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan");
+
+        assert_eq!(report.scanners_ran, vec!["npm".to_string()]);
+        assert!(!report.audit_complete);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "audit_failed"));
     }
 
     // -- probe diagnosis & GUI-minimal PATH regressions ------------------------

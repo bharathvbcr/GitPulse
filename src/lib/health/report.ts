@@ -5,6 +5,10 @@ function line(items: (string | undefined | null)[]): string {
   return items.filter((item) => item !== undefined && item !== null && item !== "").join(" · ");
 }
 
+function observedTotal(report: DepsHealthReport, resource: string, retained: number): number {
+  return report.limit_notices?.find((notice) => notice.resource === resource)?.total ?? retained;
+}
+
 /**
  * Audits whose artifacts exist but whose CLI was unavailable — a check that
  * could not run must never read as one that ran clean.
@@ -51,13 +55,17 @@ export function formatHealthReport(
   out.push("# Dependency health report");
   if (repoPath) out.push(`Repository: ${repoPath}`);
 
-  const localScanners = [
-    report.npm_cli_present ? "npm audit" : null,
-    report.cargo_audit_present ? "cargo-audit" : null,
-    report.pip_audit_present ? "pip-audit" : null,
-    report.govulncheck_present ? "govulncheck" : null,
-    report.composer_present ? "composer-audit" : null,
-  ].filter(Boolean);
+  const scannerLabels: Record<string, string> = {
+    npm: "npm audit",
+    cargo: "cargo-audit",
+    "pip-audit": "pip-audit",
+    govulncheck: "govulncheck",
+    composer: "composer-audit",
+    "bundler-audit": "bundler-audit",
+  };
+  const localScanners = (report.scanners_ran ?? []).map(
+    (scanner) => scannerLabels[scanner] ?? scanner,
+  );
   const scanners = [
     ...localScanners,
     dependabot?.available ? "github-dependabot" : null,
@@ -74,31 +82,39 @@ export function formatHealthReport(
   );
   const skipped = skippedAudits(report);
   const auditsRan = (report.scanners_ran ?? []).length > 0;
-  const auditSummary = auditsRan
-    ? formatAuditCounts(report.audit, { ran: true })
+  const auditComplete = report.audit_complete === true;
+  const outdatedTotal = observedTotal(report, "outdated npm packages", report.outdated.length);
+  const auditSummary = auditsRan || auditComplete
+    ? formatAuditCounts(report.audit, { complete: auditComplete, ran: auditsRan })
     : `audit did not run${skipped.length > 0 ? ` (CLI missing: ${skipped.join(", ")})` : ""}`;
-  out.push(`Audit summary: ${auditSummary}; ${report.outdated.length} outdated.`);
+  out.push(`Audit summary: ${auditSummary}; ${outdatedTotal} outdated npm package(s).`);
   if (skipped.length > 0) {
     out.push(
       `NOTE: checks that did NOT run (CLI missing): ${skipped.join(", ")}. The counts above are not complete coverage.`,
     );
   }
   if (dependabot?.available) {
-    out.push(`GitHub Dependabot: ${dependabot.alerts.length} open alert(s).`);
+    out.push(
+      `GitHub Dependabot: ${dependabot.truncated ? "at least " : ""}${dependabot.alerts.length} open alert(s).`,
+    );
   }
   if (report.truncated || dependabot?.truncated) {
     out.push("NOTE: the scan was capped; findings below are not complete coverage.");
   }
+  for (const notice of report.limit_notices ?? []) {
+    out.push(`- ${notice.resource}: retained ${notice.kept} of ${notice.total}`);
+  }
 
   if (report.issues.length > 0) {
-    out.push("", `## Issues (${report.issues.length})`);
+    const issueTotal = observedTotal(report, "health issues", report.issues.length);
+    out.push("", `## Issues (${issueTotal}${issueTotal > report.issues.length ? `; showing ${report.issues.length}` : ""})`);
     for (const issue of report.issues) {
       out.push(`- [${issue.severity}] ${issue.code}${issue.path ? ` (${issue.path})` : ""}: ${issue.message}`);
     }
   }
 
   if (report.vulnerabilities.length > 0) {
-    out.push("", `## Vulnerabilities (${report.vulnerabilities.length})`);
+    out.push("", `## Vulnerabilities (${report.audit.total}${report.audit.total > report.vulnerabilities.length ? `; showing ${report.vulnerabilities.length}` : ""})`);
     for (const vuln of report.vulnerabilities) {
       out.push(
         `- [${vuln.severity}] ${vuln.ecosystem}/${vuln.name}${vuln.range ? ` ${vuln.range}` : ""} — ${vuln.title}`,
@@ -112,7 +128,7 @@ export function formatHealthReport(
   }
 
   if (dependabot?.available && dependabot.alerts.length > 0) {
-    out.push("", `## GitHub Dependabot alerts (${dependabot.alerts.length})`);
+    out.push("", `## GitHub Dependabot alerts (${dependabot.truncated ? "at least " : ""}${dependabot.alerts.length})`);
     for (const alert of dependabot.alerts) {
       const ids = [alert.advisory_id, alert.cve_id].filter(Boolean).join(", ");
       out.push(
@@ -132,7 +148,7 @@ export function formatHealthReport(
   }
 
   if (report.outdated.length > 0) {
-    out.push("", `## Outdated packages (${report.outdated.length})`);
+    out.push("", `## Outdated npm packages (${outdatedTotal}${outdatedTotal > report.outdated.length ? `; showing ${report.outdated.length}` : ""})`);
     for (const pkg of report.outdated) {
       out.push(
         `- ${pkg.name}: ${pkg.current} -> ${pkg.latest} (wanted ${pkg.wanted}, ${pkg.dep_type || "dep"})${
@@ -147,8 +163,10 @@ export function formatHealthReport(
     report.vulnerabilities.length === 0 &&
     report.outdated.length === 0 &&
     (!dependabot?.available || dependabot.alerts.length === 0);
-  if (nothingReported && skipped.length === 0) {
+  if (nothingReported && skipped.length === 0 && auditComplete) {
     out.push("", "No issues, vulnerabilities or outdated packages were reported.");
+  } else if (nothingReported && !auditComplete) {
+    out.push("", "No reportable findings were collected; local audit coverage is incomplete.");
   }
 
   return out.join("\n");

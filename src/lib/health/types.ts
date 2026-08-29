@@ -65,6 +65,12 @@ export interface OutdatedPackage {
   location: string;
 }
 
+export interface ScanLimitNotice {
+  resource: string;
+  kept: number;
+  total: number;
+}
+
 export interface DepsHealthReport {
   node_version?: string | null;
   npm_version?: string | null;
@@ -80,6 +86,8 @@ export interface DepsHealthReport {
    * Empty or absent means nothing ran — zero findings then mean nothing.
    */
   scanners_ran?: string[];
+  /** True only when every discovered supported audit target completed. */
+  audit_complete?: boolean;
   manifests: NpmManifest[];
   ecosystems: EcosystemHint[];
   issues: HealthIssue[];
@@ -87,6 +95,8 @@ export interface DepsHealthReport {
   audit: AuditSummary;
   outdated: OutdatedPackage[];
   truncated: boolean;
+  /** Exact retained/observed counts for each safety budget that fired. */
+  limit_notices?: ScanLimitNotice[];
 }
 
 /** One open Dependabot alert. Mirrors the Rust `DependabotAlertInfo` wire type. */

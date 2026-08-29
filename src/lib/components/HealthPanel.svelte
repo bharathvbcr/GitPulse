@@ -102,7 +102,8 @@
   /** Audits that could not run because their CLI was missing. */
   let skipped = $derived(report ? skippedAudits(report) : []);
 
-  /** True only when the backend recorded at least one scanner dispatch. */
+  /** A clean result is valid only after every discovered supported target ran. */
+  let auditComplete = $derived(report?.audit_complete === true);
   let auditsRan = $derived((report?.scanners_ran ?? []).length > 0);
 
   /** Open Dependabot alerts, for the header badge. */
@@ -112,11 +113,18 @@
   let dependabotBadgeClass = $derived.by(() => {
     const current = dependabot;
     if (!current?.available || current.alerts.length === 0) return "";
-    const worst = current.alerts.some(
+    const severe = current.alerts.some(
       (a) => a.severity === "critical" || a.severity === "high",
     );
-    return worst ? "text-rose-300" : "";
+    if (severe) return "text-rose-300";
+    const moderate = current.alerts.some((a) => a.severity === "medium");
+    return moderate ? "text-amber-300" : "text-sky-300";
   });
+  let outdatedTotal = $derived(
+    report?.limit_notices?.find((notice) => notice.resource === "outdated npm packages")?.total ??
+      report?.outdated.length ??
+      0,
+  );
 
   const scanned = { path: "" };
   let inflight: AsyncGuard | null = null;
@@ -190,7 +198,7 @@
     const current = report;
     const repoPath = $repoStore.currentPath;
     if (!current || !repoPath) return null;
-    return formatHealthReport(current, repoPath);
+    return formatHealthReport(current, repoPath, dependabot);
   }
 
   let copyTimer: number | null = null;
@@ -383,7 +391,7 @@
       <section class="space-y-2">
         <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
           GitHub Dependabot{dependabot.available
-            ? ` (${dependabot.alerts.length})`
+            ? ` (${dependabot.alerts.length}${dependabot.truncated ? "+" : ""})`
             : ""}
         </h3>
         {#if !dependabot.cli_present}
@@ -464,16 +472,18 @@
       <span class="font-semibold text-textPrimary">Health</span>
       {#if report}
         <span class="text-textMuted truncate">
-          {formatAuditCounts(report.audit, { ran: auditsRan })}
-          {#if report.outdated.length > 0}
-            · {report.outdated.length} outdated
+          Local: {formatAuditCounts(report.audit, { complete: auditComplete, ran: auditsRan })}
+          {#if outdatedTotal > 0}
+            · {outdatedTotal} outdated npm
           {/if}
         </span>
       {/if}
-      {#if dependabotBadgeClass}
+      {#if openDependabotCount > 0}
         <span class={`truncate ${dependabotBadgeClass}`}>
-          · Dependabot {openDependabotCount}
+          · Dependabot {openDependabotCount}{dependabot?.truncated ? "+" : ""}
         </span>
+      {:else if dependabot && !dependabot.available}
+        <span class="truncate text-amber-300">· Dependabot unavailable</span>
       {/if}
     </div>
     <div class="flex items-center gap-2">
@@ -690,7 +700,14 @@
       {/if}
 
       {#if report.truncated}
-        <div class="text-amber-300">Scan was capped; some findings may be omitted.</div>
+        <div class="text-amber-300 space-y-0.5">
+          <div>Scan was capped; some findings may be omitted.</div>
+          {#each report.limit_notices ?? [] as notice}
+            <div class="font-mono text-[10px]">
+              {notice.resource}: retained {notice.kept} of {notice.total}
+            </div>
+          {/each}
+        </div>
       {/if}
 
       {#if report.issues.length > 0}
@@ -787,9 +804,11 @@
         {:else if visibleVulns.length === 0}
           <p class="text-textMuted">
             {report.audit.total === 0
-              ? skipped.length > 0
-                ? `No vulnerabilities found by the scanners that ran (not run: ${skipped.join(", ")}).`
-                : "No vulnerabilities reported."
+              ? auditComplete
+                ? "No vulnerabilities found by completed local audits."
+                : auditsRan
+                  ? `Local audit incomplete${skipped.length > 0 ? ` (not run: ${skipped.join(", ")})` : ""}; no all-clear is available.`
+                  : `Local audit did not run${skipped.length > 0 ? ` (not run: ${skipped.join(", ")})` : ""}.`
               : "No direct dependencies are vulnerable."}
           </p>
         {:else}
@@ -843,7 +862,7 @@
 
       <section class="space-y-2 pb-4">
         <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
-          Outdated ({report.outdated.length})
+          Outdated npm packages ({outdatedTotal})
         </h3>
         {#if report.outdated.length === 0}
           <p class="text-textMuted">

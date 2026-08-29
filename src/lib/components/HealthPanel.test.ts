@@ -62,9 +62,19 @@ describe("HealthPanel rendering", () => {
   });
 
   it("feeds scanners_ran into formatAuditCounts so an unrun audit never renders as clean", () => {
-    expect(source).toContain("let auditsRan = $derived");
-    expect(source).toContain("(report?.scanners_ran ?? []).length > 0");
-    expect(source).toContain("formatAuditCounts(report.audit, { ran: auditsRan })");
+    expect(source).toContain("report?.audit_complete === true");
+    expect(source).toContain("formatAuditCounts(report.audit, { complete: auditComplete, ran: auditsRan })");
+  });
+
+  it("includes Dependabot in the copied report and shows every alert severity in the header", () => {
+    expect(source).toContain("formatHealthReport(current, repoPath, dependabot)");
+    expect(source).toContain("{#if openDependabotCount > 0}");
+  });
+
+  it("labels outdated results as npm-only and renders exact cap notices", () => {
+    expect(source).toContain("Outdated npm packages ({outdatedTotal})");
+    expect(source).toContain("report.limit_notices");
+    expect(source).toContain("retained {notice.kept} of {notice.total}");
   });
 });
 
