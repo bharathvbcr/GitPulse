@@ -27,6 +27,15 @@ pub struct NativeEvent {
     pub path: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePolicy {
+    ExitApp,
+}
+
+#[cfg(target_os = "macos")]
+const CLOSE_POLICY: ClosePolicy = ClosePolicy::ExitApp;
+
 pub fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let recents = app
         .state::<DesktopState>()
@@ -56,9 +65,13 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
 
 pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
     #[cfg(target_os = "macos")]
-    if let WindowEvent::CloseRequested { api, .. } = event {
-        api.prevent_close();
-        let _ = window.hide();
+    if let WindowEvent::CloseRequested { .. } = event {
+        match CLOSE_POLICY {
+            // macOS otherwise keeps the process alive after its last window is
+            // closed. GitPulse has no background-only mode, so close should
+            // terminate the app and let the normal exit handler reap sidecars.
+            ClosePolicy::ExitApp => window.app_handle().exit(0),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -206,5 +219,11 @@ mod tests {
             Some("/tmp/repo".into())
         );
         assert_eq!(state.pending_open.lock().unwrap().take(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_the_window_exits_the_app_instead_of_hiding_it() {
+        assert_eq!(CLOSE_POLICY, ClosePolicy::ExitApp);
     }
 }
