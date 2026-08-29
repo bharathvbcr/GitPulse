@@ -48,6 +48,21 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      # The three contract checkers are pure Node and run in well under a
+      # second, so they gate the slow steps rather than trailing them: they
+      # catch Rust<->TS drift that neither svelte-check nor cargo can see.
+      - name: IPC Contract Check
+        run: npm run check:ipc
+
+      - name: Coverage Type Contract Check
+        run: npm run check:types
+
+      # No --tag on a CI build: with the flag absent the gate still requires
+      # all five version manifests to agree and simply skips the tag
+      # comparison. release.yml passes --tag "$RELEASE_TAG" at tag time.
+      - name: Release Version Gate
+        run: npm run check:release
+
       - name: Frontend Svelte Check
         run: npm run check
 
