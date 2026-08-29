@@ -1,0 +1,80 @@
+name: Language / Coverage Adapter Request
+description: Request support for a language, framework, or test-coverage runner GitPulse does not yet detect.
+title: "adapter: "
+labels: ["adapter", "enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GitPulse detects languages and drives coverage runners through pluggable
+        adapters. Adding one is a well-scoped, self-contained change — these requests
+        frequently make good first issues.
+
+        Relevant code:
+
+        - Language detection — `src-tauri/src/analyzer/language.rs`
+        - LOC counting and comment syntax — `src-tauri/src/analyzer/loc_counter.rs`
+        - Coverage runners and report parsing — `src-tauri/src/analyzer/coverage.rs`
+        - MANVI runner allowlist — `src-tauri/src/harness/policy.rs`
+        - Syntax highlighting — `src/lib/files/syntaxHighlight.ts`
+        - File-type icons — `src/lib/files/fileIcons.ts`
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of adapter?
+      options:
+        - Language detection (file extensions, LOC, comment syntax)
+        - Coverage runner (a test command that produces a coverage report)
+        - Dependency / manifest ecosystem (health scanning)
+        - Syntax highlighting only
+    validations:
+      required: true
+
+  - type: input
+    id: name
+    attributes:
+      label: Language, framework, or runner
+      placeholder: "Zig · Elixir · Kotlin Multiplatform · nyc · tarpaulin"
+    validations:
+      required: true
+
+  - type: textarea
+    id: identification
+    attributes:
+      label: How is it identified on disk?
+      description: |
+        File extensions, manifest filenames, lockfiles, and directory conventions —
+        whatever lets a scanner recognise the project without guessing.
+      placeholder: |
+        Extensions: .zig, .zon
+        Manifest:   build.zig, build.zig.zon
+        Comments:   //  (no block comment form)
+    validations:
+      required: true
+
+  - type: textarea
+    id: coverage
+    attributes:
+      label: Coverage command and report format
+      description: |
+        For coverage adapters only. The exact command, and the report file it writes
+        with its format (LCOV, Cobertura XML, JSON summary, …). GitPulse only runs
+        commands on its allowlist, so the invocation needs to be precise.
+      placeholder: |
+        Command: zig build test --summary all
+        Report:  zig-out/coverage/lcov.info (LCOV)
+
+  - type: textarea
+    id: sample
+    attributes:
+      label: Link to a public sample repository
+      description: A real repository the adapter can be verified against.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I checked that this language/runner is not already supported.
+          required: true

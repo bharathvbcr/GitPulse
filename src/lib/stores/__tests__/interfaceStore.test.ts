@@ -103,4 +103,38 @@ describe("interfaceStore", () => {
     interfaceStore.resetCoachMarks();
     expect(get(interfaceStore).seenCoachMarks).toEqual({});
   });
+
+  it("leaves the release check opt-in by default", () => {
+    interfaceStore.reset();
+    const prefs = get(interfaceStore);
+    expect(prefs.checkForUpdates).toBe(false);
+    expect(prefs.lastUpdateCheckAt).toBe(0);
+    expect(prefs.dismissedUpdateVersion).toBe("");
+  });
+
+  it("toggles the release check and records completed checks", () => {
+    interfaceStore.setCheckForUpdates(true);
+    expect(get(interfaceStore).checkForUpdates).toBe(true);
+
+    interfaceStore.markUpdateChecked(1_700_000_000_000);
+    expect(get(interfaceStore).lastUpdateCheckAt).toBe(1_700_000_000_000);
+  });
+
+  it("clears a dismissal when the check is turned off", () => {
+    // Re-enabling later must report honestly rather than stay silent about a
+    // version dismissed under settings the user has since changed.
+    interfaceStore.setCheckForUpdates(true);
+    interfaceStore.dismissUpdateVersion("0.1.0");
+    expect(get(interfaceStore).dismissedUpdateVersion).toBe("0.1.0");
+
+    interfaceStore.setCheckForUpdates(false);
+    expect(get(interfaceStore).dismissedUpdateVersion).toBe("");
+  });
+
+  it("keeps a dismissal across an unrelated toggle-on", () => {
+    interfaceStore.setCheckForUpdates(true);
+    interfaceStore.dismissUpdateVersion("0.1.0");
+    interfaceStore.setCheckForUpdates(true);
+    expect(get(interfaceStore).dismissedUpdateVersion).toBe("0.1.0");
+  });
 });

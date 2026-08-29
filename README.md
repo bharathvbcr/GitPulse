@@ -183,6 +183,26 @@ macOS quarantines unsigned downloads. After dragging GitPulse to `/Applications`
 xattr -dr com.apple.quarantine /Applications/GitPulse.app
 ```
 
+### Staying Up To Date
+
+GitPulse does **not** auto-update, and it does not check for updates unless you ask
+it to. Updating is a manual download from the releases page.
+
+There is an opt-in convenience in **Settings → Updates**:
+
+- **Off by default.** With the toggle off, GitPulse makes no network request about
+  itself, ever — consistent with the zero-telemetry model.
+- **When enabled**, it compares release tags against this repository at most once a
+  day and shows a notification if a newer version exists. It reads the public tag
+  list with `git ls-remote` — no account, no token, and nothing is sent about you or
+  your repositories.
+- **Check now** runs a single check on demand regardless of the toggle.
+- It never downloads or installs anything. The notification links to the release
+  page; the download is yours to make.
+
+A check that cannot complete says so. "Could not check" is never reported as "up to
+date".
+
 ---
 
 ## Quickstart & Development
@@ -227,8 +247,42 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
 - 🤖 **[MANVI Harness Guide](docs/MANVI.md)** — Policy gate ladder, local AI completion budgeting, loopback safety, and allowlist runner.
 - 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 12 application views.
-- 🤝 **[Contributing Guide](docs/CONTRIBUTING.md)** — Developer workflow, coding standards, and contract check enforcement.
+- 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
+- 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.
+
+---
+
+## Contributing
+
+Pull requests, bug reports, and feature proposals are welcome. Start with the
+**[Contributing Guide](CONTRIBUTING.md)** for development setup, how to run the
+tests, and an architecture orientation — then pick something from the
+**[curated backlog](docs/GOOD_FIRST_ISSUES.md)**.
+
+### Contributors
+
+Thanks to everyone who has contributed to GitPulse. This project follows the
+[all-contributors](https://github.com/all-contributors/all-contributors)
+specification: **code is one kind of contribution among many** — documentation,
+design, bug reports, testing, reviews, and ideas are all recognised here.
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+To add someone (including yourself), comment on any issue or pull request:
+
+```
+@all-contributors please add @username for code, doc
+```
+
+The bot opens a pull request updating this section and `.all-contributorsrc`.
+See the [emoji key](https://allcontributors.org/docs/en/emoji-key) for contribution
+types.
 
 ---
 

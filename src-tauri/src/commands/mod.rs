@@ -2082,3 +2082,17 @@ pub async fn cmd_manvi_run_action(
     })
     .await
 }
+
+/// Checks whether a newer GitPulse release has been published.
+///
+/// Opt-in at the call site: the frontend invokes this only when the user has
+/// enabled the preference or pressed "Check now". Nothing here reaches the
+/// network on its own.
+///
+/// Infallible by design — every failure arrives as an [`UpdateCheck`] with
+/// `checked: false` and a reason, so a transport error can never be rendered
+/// as "you are up to date".
+#[tauri::command(async)]
+pub fn cmd_check_app_update() -> crate::updates::UpdateCheck {
+    crate::updates::check_for_update()
+}

@@ -1,0 +1,107 @@
+name: Bug Report
+description: Something in GitPulse behaves incorrectly.
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        **Before filing:** please search [existing issues](https://github.com/bharathvbcr/GitPulse/issues?q=is%3Aissue) first.
+
+        ⚠️ **Do not report security vulnerabilities here.** Follow
+        [docs/SECURITY.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/SECURITY.md) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe, and what did you expect instead?
+      placeholder: |
+        Expected: the commit graph re-lanes after switching branches.
+        Actual: lanes keep the previous branch's colours until I reopen the repo.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Numbered steps, starting from a freshly launched GitPulse. A bug we cannot
+        reproduce is a bug we cannot fix — please be specific about the repository
+        state (branch count, merge shape, uncommitted changes) if it matters.
+      placeholder: |
+        1. Open a repository with 40+ branches
+        2. Switch to the Graph view
+        3. Check out a different branch from the sidebar
+        4. Observe the lane colours
+    validations:
+      required: true
+
+  - type: dropdown
+    id: view
+    attributes:
+      label: Which view or subsystem?
+      options:
+        - Commit Graph
+        - Files / Code Viewer
+        - Diff / Conflict Editor
+        - Blame
+        - Coverage
+        - Health / Dependencies
+        - Storage
+        - Worktrees
+        - Terminal
+        - GitHub panel
+        - MANVI harness
+        - Settings / Preferences
+        - Application startup or window behaviour
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: GitPulse version
+      description: From the application menu, or the release you installed.
+      placeholder: "0.0.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows 11
+        - Windows 10
+        - Linux (Debian/Ubuntu)
+        - Linux (other)
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: |
+        GitPulse can copy a diagnostics report for you — open the Diagnostics modal
+        (command palette → "Diagnostics") and use the copy button. It contains
+        version, platform, and recent log lines. **Review it before pasting:** it may
+        include repository paths.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go through docs/SECURITY.md).
+          required: true

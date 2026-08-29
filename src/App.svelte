@@ -66,6 +66,12 @@
     runBootSequence,
     type NativeShellHandlers,
   } from "./lib/boot/bootSequence";
+  import {
+    checkForAppUpdate,
+    describeUpdateCheck,
+    maybeNotifyUpdate,
+  } from "./lib/updates/updateCheck";
+  import { openExternal } from "./lib/desktop/openExternal";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
@@ -272,6 +278,38 @@
       [...$repoStore.recentRepos],
       shellHandlers,
     );
+
+    // Opt-in release check. `maybeNotifyUpdate` makes no request at all while
+    // the preference is off, so the default build never contacts the network
+    // about itself. Detached from the boot sequence deliberately: a slow or
+    // unreachable remote must not delay the workspace restoring.
+    void maybeNotifyUpdate({
+      prefs: {
+        checkForUpdates: $interfaceStore.checkForUpdates,
+        lastUpdateCheckAt: $interfaceStore.lastUpdateCheckAt,
+        dismissedUpdateVersion: $interfaceStore.dismissedUpdateVersion,
+      },
+      now: Date.now(),
+      check: () => checkForAppUpdate(),
+      markChecked: (at) => interfaceStore.markUpdateChecked(at),
+      notify: (result) => {
+        toastStore.action(
+          describeUpdateCheck(result).message,
+          "View release",
+          () => {
+            // Dismiss this version whether or not the browser hand-off
+            // works; the user has seen and acted on the notice.
+            interfaceStore.dismissUpdateVersion(result.latestVersion);
+            void openExternal(result.releaseUrl).catch((err) =>
+              diagnostics.warn("update:open", err),
+            );
+          },
+          12000,
+        );
+      },
+      onError: (message) => diagnostics.warn("update:check", message),
+    });
+
     return () => {
       disposed = true;
       if (dropHideTimer !== null) {

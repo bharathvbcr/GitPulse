@@ -212,6 +212,13 @@ jobs:
           # latest.json to publish. Left at its default (true) this would be a
           # no-op today and would start publishing an update manifest the
           # moment the updater is switched on, without anyone deciding to.
+          #
+          # Still accurate as of the opt-in release check (src-tauri/src/updates):
+          # that feature only compares published tags via `git ls-remote` and
+          # links the user to the release page. It downloads nothing and installs
+          # nothing, so it needs neither signed update artifacts nor a manifest.
+          # Flipping this to true requires adding tauri-plugin-updater AND a
+          # signing keypair (TAURI_SIGNING_PRIVATE_KEY) first.
           uploadUpdaterJson: false
           # A 20-to-90-minute build should not be thrown away by one flaky
           # asset upload.

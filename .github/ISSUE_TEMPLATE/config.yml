@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/bharathvbcr/GitPulse/blob/main/docs/SECURITY.md
+    about: Do not open a public issue. Follow the disclosure process in SECURITY.md.
+  - name: Question or idea
+    url: https://github.com/bharathvbcr/GitPulse/discussions
+    about: Open-ended questions and proposals belong in Discussions.
+  - name: Contributing guide
+    url: https://github.com/bharathvbcr/GitPulse/blob/main/CONTRIBUTING.md
+    about: Development setup, how to run the tests, and architecture orientation.

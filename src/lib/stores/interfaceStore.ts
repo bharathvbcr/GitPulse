@@ -15,6 +15,15 @@ export interface InterfacePrefs {
   uiFontScale: number;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
+  /**
+   * Opt-in automatic release check. Off by default: GitPulse makes no network
+   * request about itself until the user asks for one.
+   */
+  checkForUpdates: boolean;
+  /** Epoch ms of the last completed automatic check; 0 means never. */
+  lastUpdateCheckAt: number;
+  /** Version whose update notice the user dismissed ("" means none). */
+  dismissedUpdateVersion: string;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -26,6 +35,9 @@ const DEFAULTS: InterfacePrefs = {
   graphWidthMode: "balanced",
   uiFontScale: 1.0,
   seenCoachMarks: {},
+  checkForUpdates: false,
+  lastUpdateCheckAt: 0,
+  dismissedUpdateVersion: "",
 };
 
 function readPrefs(): InterfacePrefs {
@@ -60,6 +72,19 @@ function readPrefs(): InterfacePrefs {
         parsed.seenCoachMarks && typeof parsed.seenCoachMarks === "object"
           ? parsed.seenCoachMarks
           : {},
+      // Anything other than an explicit `true` leaves the check off. A
+      // corrupt or partially-written value must never opt a user in.
+      checkForUpdates: parsed.checkForUpdates === true,
+      lastUpdateCheckAt:
+        typeof parsed.lastUpdateCheckAt === "number" &&
+        Number.isFinite(parsed.lastUpdateCheckAt) &&
+        parsed.lastUpdateCheckAt >= 0
+          ? parsed.lastUpdateCheckAt
+          : DEFAULTS.lastUpdateCheckAt,
+      dismissedUpdateVersion:
+        typeof parsed.dismissedUpdateVersion === "string"
+          ? parsed.dismissedUpdateVersion
+          : DEFAULTS.dismissedUpdateVersion,
     };
   } catch {
     /* corrupt or unavailable storage falls back to defaults */
@@ -141,6 +166,33 @@ function createInterfaceStore() {
     resetZoom: () =>
       update((prefs) => {
         const next = { ...prefs, uiFontScale: 1.0 };
+        persist(next);
+        return next;
+      }),
+    setCheckForUpdates: (enabled: boolean) =>
+      update((prefs) => {
+        // Turning the check off also clears the dismissal, so re-enabling it
+        // later reports honestly instead of staying silent about a version
+        // the user dismissed under different settings.
+        const next = {
+          ...prefs,
+          checkForUpdates: enabled,
+          dismissedUpdateVersion: enabled ? prefs.dismissedUpdateVersion : "",
+        };
+        persist(next);
+        return next;
+      }),
+    /** Records that an automatic check completed, restarting the throttle. */
+    markUpdateChecked: (at: number) =>
+      update((prefs) => {
+        const next = { ...prefs, lastUpdateCheckAt: at };
+        persist(next);
+        return next;
+      }),
+    /** Silences the notice for one specific version only. */
+    dismissUpdateVersion: (version: string) =>
+      update((prefs) => {
+        const next = { ...prefs, dismissedUpdateVersion: version };
         persist(next);
         return next;
       }),

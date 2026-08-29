@@ -1,0 +1,91 @@
+# GitPulse issue and pull-request labels.
+#
+# This file is the intended label set, kept in version control so it is
+# reviewable. It is NOT applied automatically — no workflow reads it today.
+#
+# To apply it by hand with the GitHub CLI:
+#
+#   gh label create "good first issue" --color 7057ff \
+#     --description "Scoped, self-contained, and documented — a good entry point" --force
+#
+# `--force` updates a label that already exists, so the file can be re-applied.
+
+# --- Contributor entry points ---------------------------------------------
+- name: "good first issue"
+  color: "7057ff"
+  description: "Scoped, self-contained, and documented — a good entry point"
+
+- name: "help wanted"
+  color: "008672"
+  description: "Maintainers would welcome outside contribution here"
+
+# --- Type -----------------------------------------------------------------
+- name: "bug"
+  color: "d73a4a"
+  description: "Something behaves incorrectly"
+
+- name: "enhancement"
+  color: "a2eeef"
+  description: "New capability or improvement to an existing one"
+
+- name: "documentation"
+  color: "0075ca"
+  description: "README, docs/, doc comments, or templates"
+
+- name: "test"
+  color: "bfd4f2"
+  description: "Test coverage, fixtures, or harness work"
+
+- name: "performance"
+  color: "fbca04"
+  description: "Latency, throughput, memory, or render cost"
+
+- name: "security"
+  color: "b60205"
+  description: "Handled per docs/SECURITY.md — not for undisclosed vulnerabilities"
+
+- name: "adapter"
+  color: "5319e7"
+  description: "Language, coverage runner, or dependency-ecosystem support"
+
+# --- Area -----------------------------------------------------------------
+- name: "area: graph"
+  color: "c5def5"
+  description: "Commit graph, lane solver, canvas renderer"
+
+- name: "area: rust-core"
+  color: "c5def5"
+  description: "src-tauri — engine, analyzer, commands"
+
+- name: "area: frontend"
+  color: "c5def5"
+  description: "Svelte components, stores, views"
+
+- name: "area: ci"
+  color: "c5def5"
+  description: "GitHub Actions workflows, release pipeline, contract scripts"
+
+- name: "area: github"
+  color: "c5def5"
+  description: "gh CLI integration — PRs, issues, runs, Dependabot"
+
+- name: "area: manvi"
+  color: "c5def5"
+  description: "Policy gate, harness sidecar, local AI"
+
+# --- Workflow -------------------------------------------------------------
+- name: "needs-triage"
+  color: "ededed"
+  description: "Not yet reviewed by a maintainer"
+
+- name: "needs-repro"
+  color: "ededed"
+  description: "Cannot be acted on until reproduced"
+
+- name: "blocked"
+  color: "ededed"
+  description: "Waiting on an upstream fix or another issue"
+
+- name: "wontfix"
+  color: "ffffff"
+  description: "Deliberately out of scope"

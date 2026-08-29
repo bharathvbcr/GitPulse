@@ -1,0 +1,74 @@
+name: Feature Request
+description: Propose a new capability or an improvement to an existing one.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement.
+
+        GitPulse has two standing constraints that shape what can be accepted, so it
+        is worth knowing them up front:
+
+        - **Local-first, zero telemetry.** Nothing phones home. Features that require
+          sending repository data anywhere will not be accepted.
+        - **New dependencies need justification.** The Rust core deliberately runs on
+          a small dependency set (see `src-tauri/Cargo.toml`). Proposals that pull in
+          a large crate or npm package should say why the standard library or an
+          existing dependency cannot do the job.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the situation you are in, not the solution you have in mind. What are
+        you trying to do, and where does GitPulse get in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should GitPulse do instead? Sketch the interaction if it has UI.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      options:
+        - Commit Graph / visualization
+        - Git operations (commit, branch, rebase, stash, worktrees)
+        - Diff / merge conflict resolution
+        - Code intelligence (coverage, health, language stats)
+        - GitHub integration
+        - MANVI harness / local AI
+        - Terminal
+        - Settings, theming, accessibility
+        - Performance
+        - Packaging / distribution / updates
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Including "do nothing" — what happens if GitPulse does not add this? Existing
+        workarounds are useful context.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
+        - label: This feature works entirely locally and sends no repository data off the machine.
+          required: true

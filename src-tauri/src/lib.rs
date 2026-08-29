@@ -13,6 +13,7 @@ pub mod ops;
 pub mod stack;
 pub mod storage;
 pub mod terminal;
+pub mod updates;
 pub mod watcher;
 
 use commands::*;
@@ -137,6 +138,7 @@ pub fn run() {
             cmd_set_recent_menu,
             cmd_resolve_git_root,
             cmd_diagnostic_log_tail,
+            cmd_check_app_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building GitPulse")

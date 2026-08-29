@@ -11,7 +11,14 @@
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck, CircleUserRound } from "lucide-svelte";
+  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck, CircleUserRound, RefreshCw } from "lucide-svelte";
+  import {
+    checkForAppUpdate,
+    describeUpdateCheck,
+    type UpdateStatus,
+  } from "../updates/updateCheck";
+  import { openExternal } from "../desktop/openExternal";
+  import { formatError } from "../ui/formatError";
 
   let {
     isOpen = false,
@@ -26,6 +33,39 @@
   function setTheme(preference: ThemePreference) {
     themePreference = preference;
     themeStore.setPreference(preference);
+  }
+
+  /** Result of the most recent manual check; null until one is pressed. */
+  let updateStatus = $state<UpdateStatus | null>(null);
+  let updateUrl = $state("");
+  let checkingUpdate = $state(false);
+
+  async function runManualUpdateCheck() {
+    if (checkingUpdate) return;
+    checkingUpdate = true;
+    updateStatus = null;
+    try {
+      const result = await checkForAppUpdate();
+      updateStatus = describeUpdateCheck(result);
+      // Only offer the link when the check actually ran; a failed check has
+      // nothing to point at beyond the generic releases page.
+      updateUrl = result.checked ? result.releaseUrl : "";
+      if (result.checked && result.updateAvailable) {
+        // A version the user has now seen here should not also nag on the
+        // next launch.
+        interfaceStore.dismissUpdateVersion(result.latestVersion);
+      }
+    } finally {
+      checkingUpdate = false;
+    }
+  }
+
+  async function openReleasePage() {
+    try {
+      await openExternal(updateUrl);
+    } catch (error) {
+      updateStatus = { kind: "failed", message: formatError(error) };
+    }
   }
 
   const THEME_OPTIONS: Array<{
@@ -288,6 +328,75 @@
                 Reset Tips
               </button>
             </div>
+          </div>
+        </section>
+
+        <section>
+          <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Updates</h2>
+          <div class="space-y-3">
+            <div class="flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <div class="text-textPrimary text-[11px] font-medium">Check for new releases</div>
+                <div class="text-textMuted text-[10px] leading-snug">
+                  Off by default. When on, GitPulse contacts its own public repository
+                  at most once a day to compare release tags. It never downloads or
+                  installs anything.
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={$interfaceStore.checkForUpdates}
+                aria-label="Automatically check for new GitPulse releases"
+                onclick={() => interfaceStore.setCheckForUpdates(!$interfaceStore.checkForUpdates)}
+                class="relative w-8 h-[18px] rounded-full transition-colors shrink-0 {$interfaceStore
+                  .checkForUpdates
+                  ? 'bg-accent'
+                  : 'bg-border'}"
+              >
+                <span
+                  class="absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform {$interfaceStore
+                    .checkForUpdates
+                    ? 'translate-x-[14px]'
+                    : 'translate-x-0'}"
+                ></span>
+              </button>
+            </div>
+
+            <div class="pt-1 flex items-center justify-between gap-3">
+              <span class="text-textMuted text-[11px]">Check now</span>
+              <button
+                type="button"
+                onclick={runManualUpdateCheck}
+                disabled={checkingUpdate}
+                class="gp-btn !py-0.5 !px-2.5 text-[11px] flex items-center gap-1.5"
+              >
+                <RefreshCw size={11} class={checkingUpdate ? "animate-spin" : ""} />
+                {checkingUpdate ? "Checking…" : "Check"}
+              </button>
+            </div>
+
+            {#if updateStatus}
+              <div
+                class="text-[10px] leading-snug {updateStatus.kind === 'available'
+                  ? 'text-accent'
+                  : updateStatus.kind === 'failed'
+                    ? 'text-red-400'
+                    : 'text-textMuted'}"
+                role="status"
+              >
+                {updateStatus.message}
+                {#if updateStatus.kind === "available" && updateUrl}
+                  <button
+                    type="button"
+                    onclick={openReleasePage}
+                    class="underline underline-offset-2 hover:text-textPrimary ml-1"
+                  >
+                    View release
+                  </button>
+                {/if}
+              </div>
+            {/if}
           </div>
         </section>
       </div>
