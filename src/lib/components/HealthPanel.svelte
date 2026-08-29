@@ -51,6 +51,7 @@
   } from "../health/format";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
+  import Skeleton from "./Skeleton.svelte";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
@@ -535,7 +536,14 @@
 
   <div class="flex-1 overflow-auto p-4 space-y-5">
     {#if loading && !report}
-      <div class="text-textMuted">Scanning lockfiles, querying advisories, and fetching Dependabot alerts…</div>
+      <div class="space-y-4 max-w-4xl">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <Skeleton variant="card" count={3} />
+        </div>
+        <div class="space-y-2 pt-2">
+          <Skeleton variant="text" count={4} height="2rem" />
+        </div>
+      </div>
     {:else if errorMsg}
       <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-2xl">
         {errorMsg}

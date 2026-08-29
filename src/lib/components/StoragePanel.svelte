@@ -14,7 +14,6 @@
     HardDrive,
     RefreshCw,
     Clipboard,
-    LoaderCircle,
     AlertTriangle,
     Trash2,
     GitBranch,
@@ -26,6 +25,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { copyText } from "../desktop/clipboard";
   import { reportPanelError } from "../diagnostics/report";
+  import Skeleton from "./Skeleton.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
   import {
@@ -345,9 +345,13 @@
 
   <div class="flex-1 overflow-auto p-4 space-y-5">
     {#if loading && !report}
-      <div class="flex items-center gap-2 text-textMuted">
-        <LoaderCircle size={14} class="animate-spin" />
-        Walking the repository and the git directory…
+      <div class="space-y-4 max-w-4xl">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <Skeleton variant="card" count={4} />
+        </div>
+        <div class="space-y-2 pt-2">
+          <Skeleton variant="text" count={5} height="2rem" />
+        </div>
       </div>
     {:else if errorMsg}
       <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-2xl">

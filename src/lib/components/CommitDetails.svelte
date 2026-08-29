@@ -15,10 +15,14 @@
     Sparkles,
     Loader,
     AlertTriangle,
+    Copy,
+    Check,
   } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
   import { formatDate, shortHash } from "../format";
   import { formatError } from "../ui/formatError";
+  import { copyText } from "../desktop/clipboard";
+  import { toastStore } from "../stores/toastStore";
 
   interface CommitFileChange {
     path: string;
@@ -93,6 +97,23 @@
   let explainGuard: AsyncGuard | null = null;
   const explainTarget = { repo: null as string | null, id: null as string | null };
 
+  let copiedSha = $state(false);
+  let copiedMessage = $state(false);
+
+  async function copySha(id: string) {
+    await copyText(id);
+    copiedSha = true;
+    toastStore.info(`Copied full SHA: ${id.slice(0, 8)}`, undefined, 2000);
+    setTimeout(() => (copiedSha = false), 1500);
+  }
+
+  async function copyMessage(msg: string) {
+    await copyText(msg);
+    copiedMessage = true;
+    toastStore.info("Copied commit message", undefined, 2000);
+    setTimeout(() => (copiedMessage = false), 1500);
+  }
+
   async function explainCommit() {
     const path = $repoStore.currentPath;
     const id = currentCommitId;
@@ -159,12 +180,39 @@
     <div class="px-4 py-2.5 border-b border-border/60 flex items-center justify-between bg-surfaceHover/30">
       <div class="flex items-center gap-3 min-w-0">
         <GitCommit size={16} class="text-accent shrink-0" />
-        <span class="font-mono text-xs font-semibold text-accent">{shortHash(selectedCommit.id, 8)}</span>
-        <span class="text-xs font-medium text-textPrimary truncate">{selectedCommit.summary}</span>
+        <button
+          type="button"
+          onclick={() => copySha(selectedCommit.id)}
+          class="font-mono text-xs font-semibold text-accent hover:underline flex items-center gap-1 group/sha"
+          title="Click to copy full commit SHA ({selectedCommit.id})"
+        >
+          <span>{shortHash(selectedCommit.id, 8)}</span>
+          {#if copiedSha}
+            <Check size={11} class="text-emerald-500" />
+          {:else}
+            <Copy size={10} class="text-textMuted/60 opacity-0 group-hover/sha:opacity-100 transition-opacity" />
+          {/if}
+        </button>
+
+        <div class="flex items-center gap-1.5 min-w-0 group/msg">
+          <span class="text-xs font-medium text-textPrimary truncate select-text">{selectedCommit.summary}</span>
+          <button
+            type="button"
+            onclick={() => copyMessage(selectedCommit.summary)}
+            class="opacity-0 group-hover/msg:opacity-100 text-textMuted hover:text-textPrimary transition-opacity p-0.5"
+            title="Copy commit message"
+          >
+            {#if copiedMessage}
+              <Check size={11} class="text-emerald-500" />
+            {:else}
+              <Copy size={11} />
+            {/if}
+          </button>
+        </div>
       </div>
       <div class="flex items-center gap-4 text-[11px] text-textMuted shrink-0">
-        <span class="flex items-center gap-1.5"><User size={13} /> {selectedCommit.author_name}</span>
-        <span class="flex items-center gap-1.5"><Calendar size={13} /> {details?.author_date || formatDate(selectedCommit.timestamp)}</span>
+        <span class="flex items-center gap-1.5 select-text"><User size={13} /> {selectedCommit.author_name}</span>
+        <span class="flex items-center gap-1.5 select-text"><Calendar size={13} /> {details?.author_date || formatDate(selectedCommit.timestamp)}</span>
         <span class="flex items-center gap-1 {sig.ok ? 'text-green-400' : 'text-textMuted'}">
           {#if sig.ok}
             <ShieldCheck size={13} />
@@ -186,10 +234,10 @@
           {/if}
         </div>
         {#if details?.body}
-          <div class="px-2 py-1 text-[11px] text-textMuted whitespace-pre-wrap">{details.body}</div>
+          <div class="px-2 py-1 text-[11px] text-textMuted whitespace-pre-wrap select-text">{details.body}</div>
         {/if}
         {#if details && details.co_authors.length > 0}
-          <div class="px-2 py-1 text-[11px] text-textMuted">Co-authors: {details.co_authors.join(", ")}</div>
+          <div class="px-2 py-1 text-[11px] text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
         {/if}
 
         <!-- Local explanation of the commit. Nothing leaves the machine: the
@@ -271,7 +319,7 @@
 
       <div class="col-span-2 p-3 font-mono text-xs overflow-auto bg-background/50 flex flex-col">
         {#if previewLines.length > 0}
-          <pre class="whitespace-pre text-textPrimary text-[11px] leading-relaxed">{previewLines.join("\n")}</pre>
+          <pre class="whitespace-pre text-textPrimary text-[11px] leading-relaxed select-text">{previewLines.join("\n")}</pre>
           {#if previewTruncated}
             <button
               class="mt-2 self-start px-2.5 py-1 rounded-full border border-border/80 text-[11px] font-sans text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors"

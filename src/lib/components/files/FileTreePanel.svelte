@@ -43,6 +43,7 @@
   import { copyText } from "../../desktop/clipboard";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { askConfirm, askText } from "../../stores/modalStore";
+  import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
   import { shouldDismissOverlay } from "../../ui/dismiss";
@@ -695,9 +696,8 @@
     onkeydown={handleKeydown}
   >
     {#if isLoading}
-      <div class="h-full flex items-center justify-center text-textMuted text-xs gap-2">
-        <span class="animate-spin">⏳</span>
-        <span>Loading workspace files...</span>
+      <div class="p-3 space-y-1 overflow-hidden h-full">
+        <Skeleton variant="tree-row" count={14} />
       </div>
     {:else if errorMsg}
       <div class="h-full flex items-center justify-center text-rose-400 text-xs p-4 text-center">

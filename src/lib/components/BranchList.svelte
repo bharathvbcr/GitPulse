@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
+  import { toastStore } from "../stores/toastStore";
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
@@ -484,8 +485,20 @@
       confirmLabel: "Delete",
     });
     if (!ok) return;
+    const branchSha = branch.tip_commit_id;
+    const branchName = branch.name;
     const outcome = await repoStore.deleteBranch(branch.name, false);
-    if (outcome.ok) return;
+    if (outcome.ok) {
+      if (branchSha) {
+        toastStore.action(`Deleted branch "${branchName}"`, "Undo", async () => {
+          await repoStore.createBranch(branchName, branchSha);
+          toastStore.success(`Restored branch "${branchName}"`);
+        });
+      } else {
+        toastStore.success(`Deleted branch "${branchName}"`);
+      }
+      return;
+    }
     const decision = escalateDeleteDecision(outcome.error ?? "", branch);
     if (!decision.canRetryForce || !decision.message) return;
     const forceOk = await askConfirm({
@@ -494,7 +507,17 @@
       confirmLabel: "Force delete",
     });
     if (!forceOk) return;
-    await repoStore.deleteBranch(branch.name, true);
+    const forceOutcome = await repoStore.deleteBranch(branch.name, true);
+    if (forceOutcome.ok) {
+      if (branchSha) {
+        toastStore.action(`Force deleted branch "${branchName}"`, "Undo", async () => {
+          await repoStore.createBranch(branchName, branchSha);
+          toastStore.success(`Restored branch "${branchName}"`);
+        });
+      } else {
+        toastStore.success(`Force deleted branch "${branchName}"`);
+      }
+    }
   }
 
   async function runCompare(branch: BranchInfo) {

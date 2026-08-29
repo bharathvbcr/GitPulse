@@ -11,6 +11,10 @@ export interface InterfacePrefs {
   showGraphAvatars: boolean;
   /** Maximum share of the graph view used by the lane viewport. */
   graphWidthMode: GraphWidthMode;
+  /** Global UI font / zoom scale factor (e.g. 1.0 = 100%, 0.9 = 90%, 1.1 = 110%). */
+  uiFontScale: number;
+  /** Map of dismissed coach mark IDs. */
+  seenCoachMarks: Record<string, boolean>;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -20,6 +24,8 @@ const DEFAULTS: InterfacePrefs = {
   showHarnessBadges: true,
   showGraphAvatars: true,
   graphWidthMode: "balanced",
+  uiFontScale: 1.0,
+  seenCoachMarks: {},
 };
 
 function readPrefs(): InterfacePrefs {
@@ -44,6 +50,16 @@ function readPrefs(): InterfacePrefs {
       graphWidthMode: isGraphWidthMode(parsed.graphWidthMode)
         ? parsed.graphWidthMode
         : DEFAULTS.graphWidthMode,
+      uiFontScale:
+        typeof parsed.uiFontScale === "number" &&
+        parsed.uiFontScale >= 0.75 &&
+        parsed.uiFontScale <= 1.5
+          ? parsed.uiFontScale
+          : DEFAULTS.uiFontScale,
+      seenCoachMarks:
+        parsed.seenCoachMarks && typeof parsed.seenCoachMarks === "object"
+          ? parsed.seenCoachMarks
+          : {},
     };
   } catch {
     /* corrupt or unavailable storage falls back to defaults */
@@ -98,6 +114,48 @@ function createInterfaceStore() {
     toggleGraphAvatars: () =>
       update((prefs) => {
         const next = { ...prefs, showGraphAvatars: !prefs.showGraphAvatars };
+        persist(next);
+        return next;
+      }),
+    setFontScale: (scale: number) =>
+      update((prefs) => {
+        const clamped = Math.round(Math.max(0.75, Math.min(1.5, scale)) * 100) / 100;
+        const next = { ...prefs, uiFontScale: clamped };
+        persist(next);
+        return next;
+      }),
+    zoomIn: () =>
+      update((prefs) => {
+        const nextScale = Math.round(Math.min(1.5, prefs.uiFontScale + 0.05) * 100) / 100;
+        const next = { ...prefs, uiFontScale: nextScale };
+        persist(next);
+        return next;
+      }),
+    zoomOut: () =>
+      update((prefs) => {
+        const nextScale = Math.round(Math.max(0.75, prefs.uiFontScale - 0.05) * 100) / 100;
+        const next = { ...prefs, uiFontScale: nextScale };
+        persist(next);
+        return next;
+      }),
+    resetZoom: () =>
+      update((prefs) => {
+        const next = { ...prefs, uiFontScale: 1.0 };
+        persist(next);
+        return next;
+      }),
+    dismissCoachMark: (id: string) =>
+      update((prefs) => {
+        const next = {
+          ...prefs,
+          seenCoachMarks: { ...prefs.seenCoachMarks, [id]: true },
+        };
+        persist(next);
+        return next;
+      }),
+    resetCoachMarks: () =>
+      update((prefs) => {
+        const next = { ...prefs, seenCoachMarks: {} };
         persist(next);
         return next;
       }),

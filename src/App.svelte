@@ -5,6 +5,8 @@
   import { graphStore } from "./lib/stores/graphStore";
   import { themeStore } from "./lib/stores/themeStore";
   import { filterStore } from "./lib/stores/filterStore";
+  import { interfaceStore } from "./lib/stores/interfaceStore";
+  import { toastStore } from "./lib/stores/toastStore";
   import { applyPlatformClass, isMacOS } from "./lib/platform";
   import { displayName } from "./lib/repos/paths";
   import { formatError } from "./lib/ui/formatError";
@@ -37,6 +39,10 @@
   import RebaseModal from "./lib/components/RebaseModal.svelte";
   import CloneModal from "./lib/components/CloneModal.svelte";
   import SettingsModal from "./lib/components/SettingsModal.svelte";
+  import ShortcutsModal from "./lib/components/ShortcutsModal.svelte";
+  import ToastContainer from "./lib/components/ToastContainer.svelte";
+  import StatusBar from "./lib/components/StatusBar.svelte";
+  import CoachMark from "./lib/components/CoachMark.svelte";
   import GitHubPanel from "./lib/components/GitHubPanel.svelte";
   import ManviOpsPanel from "./lib/components/ManviOpsPanel.svelte";
   import ReflogViewer from "./lib/components/ReflogViewer.svelte";
@@ -52,7 +58,6 @@
     Clock,
     Bug,
   } from "lucide-svelte";
-  import { interfaceStore } from "./lib/stores/interfaceStore";
   import {
     GRAPH_FETCH_DEBOUNCE_MS,
     createGraphFetchScheduler,
@@ -65,6 +70,7 @@
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
   let isSettingsModalOpen = $state(false);
+  let isShortcutsOpen = $state(false);
   let isDiagnosticsOpen = $state(false);
   let dropActive = $state(false);
   /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
@@ -85,6 +91,15 @@
       return;
     }
     if (terminalActive) terminalMounted = true;
+  });
+
+  // Forward legacy repoStore.error to centralized toast queue
+  $effect(() => {
+    const err = $repoStore.error;
+    if (err) {
+      toastStore.error(err);
+      repoStore.setError(null);
+    }
   });
 
   // --- drag-drop overlay grace ----------------------------------------------
@@ -142,6 +157,48 @@
     };
     window.addEventListener("gitpulse:diagnostics", openDiagnostics);
     track(() => window.removeEventListener("gitpulse:diagnostics", openDiagnostics));
+
+    const openShortcuts = () => {
+      isShortcutsOpen = true;
+    };
+    window.addEventListener("gitpulse:shortcuts", openShortcuts);
+    track(() => window.removeEventListener("gitpulse:shortcuts", openShortcuts));
+
+    const handleGlobalKeydown = (e: KeyboardEvent) => {
+      const isInput =
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        (e.target as HTMLElement | null)?.isContentEditable;
+
+      if ((e.metaKey || e.ctrlKey) && (e.key === "=" || e.key === "+")) {
+        e.preventDefault();
+        interfaceStore.zoomIn();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "-") {
+        e.preventDefault();
+        interfaceStore.zoomOut();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+        e.preventDefault();
+        interfaceStore.resetZoom();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+        e.preventDefault();
+        isShortcutsOpen = true;
+        return;
+      }
+      if (!isInput && e.key === "?" && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        isShortcutsOpen = true;
+        return;
+      }
+    };
+    window.addEventListener("keydown", handleGlobalKeydown);
+    track(() => window.removeEventListener("keydown", handleGlobalKeydown));
+
     const shellHandlers: NativeShellHandlers = {
       open: () => void repoStore.pickAndOpenRepo(),
       clone: () => {
@@ -156,11 +213,25 @@
       themeLight: () => themeStore.setTheme("light"),
       themeDark: () => themeStore.setTheme("dark"),
       setTab: (tab) => repoStore.setActiveTab(tab),
-      fetch: () => void repoStore.fetch(),
-      pull: () => void repoStore.pull(),
-      push: () => void repoStore.push(),
-      stash: () => void repoStore.stashSave(),
-      stashPop: () => void repoStore.stashPop(),
+      fetch: () => {
+        repoStore.fetch().then(() => toastStore.info("Fetched remote updates"));
+      },
+      pull: () => {
+        repoStore.pull().then(() => toastStore.success("Pulled changes from remote"));
+      },
+      push: () => {
+        repoStore.push().then(() => toastStore.success("Pushed commits to remote"));
+      },
+      stash: () => {
+        repoStore.stashSave().then(() => {
+          toastStore.action("Stashed uncommitted changes", "Pop", () => {
+            void repoStore.stashPop();
+          });
+        });
+      },
+      stashPop: () => {
+        repoStore.stashPop().then(() => toastStore.success("Popped latest stash"));
+      },
       rebase: () => {
         isRebaseModalOpen = true;
       },
@@ -174,7 +245,7 @@
       nextRepoTab: () => void repoStore.nextTab(),
       prevRepoTab: () => void repoStore.prevTab(),
       reopenRepoTab: () => void repoStore.reopenLastClosed(),
-      openError: (message) => repoStore.setError(message),
+      openError: (message) => toastStore.error(message),
       setDropActive: (active) => {
         setDropOverlay(active);
       },
@@ -266,7 +337,10 @@
     </div>
   {/snippet}
 
-<div class="h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative">
+<div
+  class="h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
+  style="--ui-font-scale: {$interfaceStore.uiFontScale};"
+>
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed}>
     <header
@@ -341,17 +415,8 @@
 
   <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />
 
-  {#if $repoStore.error}
-    <!-- Overlay toast, not in-flow: an in-flow banner shoved the entire app
-         up/down on every transient failure and its auto-clear. -->
-    <div
-      class="absolute bottom-3 right-3 max-w-md gp-pop rounded-xl border border-rose-500/30 bg-surface px-3 py-2 text-[11px] text-rose-300 shadow-float flex items-center gap-2"
-      style="z-index: {LAYERS.MODAL}"
-    >
-      <span class="min-w-0 flex-1 break-words">{$repoStore.error}</span>
-      <button type="button" class="shrink-0 px-1.5 hover:text-white" onclick={() => repoStore.setError(null)}>Dismiss</button>
-    </div>
-  {/if}
+  <!-- Global Toast Notification Queue -->
+  <ToastContainer />
 
   {#if !$repoStore.currentPath}
     <!-- Welcome & Open Repository Screen -->
@@ -463,7 +528,19 @@
           </svelte:boundary>
         {/if}
       </div>
+
+      <!-- Bottom Ambient Status Bar -->
+      <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
     {/key}
+
+    <!-- First-run coach mark onboarding tip -->
+    <CoachMark
+      id="coach-palette"
+      title="Command Palette"
+      description="Press ⌘K anytime to search files, switch branches, run git commands, or jump to commits."
+      shortcut="⌘K"
+      class="bottom-10 right-6"
+    />
   {/if}
 
   {#if dropActive}
@@ -486,6 +563,7 @@
     <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
     <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
     <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
+    <ShortcutsModal isOpen={isShortcutsOpen} onClose={() => (isShortcutsOpen = false)} />
     <CommandPalette />
     <Tooltip />
   </svelte:boundary>

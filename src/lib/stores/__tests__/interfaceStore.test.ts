@@ -79,4 +79,28 @@ describe("interfaceStore", () => {
     interfaceStore.reset();
     expect(get(interfaceStore).graphWidthMode).toBe("balanced");
   });
+
+  it("manages font zoom scale and clamps properly", () => {
+    expect(get(interfaceStore).uiFontScale).toBe(1.0);
+    interfaceStore.zoomIn();
+    expect(get(interfaceStore).uiFontScale).toBe(1.05);
+
+    interfaceStore.zoomOut();
+    expect(get(interfaceStore).uiFontScale).toBe(1.0);
+
+    interfaceStore.setFontScale(1.3);
+    expect(get(interfaceStore).uiFontScale).toBe(1.3);
+
+    interfaceStore.resetZoom();
+    expect(get(interfaceStore).uiFontScale).toBe(1.0);
+  });
+
+  it("manages coach mark dismissals", () => {
+    expect(get(interfaceStore).seenCoachMarks).toEqual({});
+    interfaceStore.dismissCoachMark("palette");
+    expect(get(interfaceStore).seenCoachMarks["palette"]).toBe(true);
+
+    interfaceStore.resetCoachMarks();
+    expect(get(interfaceStore).seenCoachMarks).toEqual({});
+  });
 });

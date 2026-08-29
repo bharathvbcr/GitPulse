@@ -237,6 +237,59 @@
             </div>
           </div>
         </section>
+
+        <section>
+          <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Zoom & Guidance</h2>
+          <div class="space-y-3">
+            <div>
+              <div class="flex items-center justify-between text-[11px] mb-1">
+                <span class="text-textPrimary font-medium">UI Font Scale</span>
+                <span class="font-mono text-accent font-semibold">{Math.round($interfaceStore.uiFontScale * 100)}%</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  onclick={() => interfaceStore.zoomOut()}
+                  class="gp-btn !py-0.5 !px-2 text-xs"
+                  title="Zoom Out (⌘-)"
+                >-</button>
+                <input
+                  type="range"
+                  min="0.75"
+                  max="1.4"
+                  step="0.05"
+                  value={$interfaceStore.uiFontScale}
+                  oninput={(e) => interfaceStore.setFontScale(parseFloat(e.currentTarget.value))}
+                  class="flex-1"
+                  aria-label="UI Font Scale Slider"
+                />
+                <button
+                  type="button"
+                  onclick={() => interfaceStore.zoomIn()}
+                  class="gp-btn !py-0.5 !px-2 text-xs"
+                  title="Zoom In (⌘+)"
+                >+</button>
+                <button
+                  type="button"
+                  onclick={() => interfaceStore.resetZoom()}
+                  class="gp-btn !py-0.5 !px-2 text-[10px]"
+                  title="Reset Zoom (⌘0)"
+                >Reset</button>
+              </div>
+            </div>
+
+            <div class="pt-1 flex items-center justify-between">
+              <span class="text-textMuted text-[11px]">First-run coach marks</span>
+              <button
+                type="button"
+                onclick={() => interfaceStore.resetCoachMarks()}
+                class="gp-btn !py-0.5 !px-2.5 text-[11px]"
+              >
+                Reset Tips
+              </button>
+            </div>
+          </div>
+        </section>
       </div>
 
       <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">

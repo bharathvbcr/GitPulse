@@ -68,6 +68,7 @@
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
+  import Skeleton from "./Skeleton.svelte";
 
   let ctx = $state<GitHubContext | null>(null);
   let loading = $state(false);
@@ -476,7 +477,12 @@
   {/if}
 
   {#if (loading && !ctx) || (workflowsLoading && !workflows)}
-    <div class="text-textMuted">Loading GitHub status…</div>
+    <div class="space-y-4 max-w-4xl">
+      <Skeleton variant="card" count={2} />
+      <div class="space-y-2 pt-2">
+        <Skeleton variant="text" count={4} height="2.5rem" />
+      </div>
+    </div>
   {:else if ctx?.error}
     <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs max-w-xl">
       {ctx.error}

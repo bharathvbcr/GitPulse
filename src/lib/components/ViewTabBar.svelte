@@ -121,7 +121,12 @@
             onclick={() => selectTab(item.id)}
             class="gp-seg-btn {tabClass(item, active)}"
           >
-            {formatViewTabLabel(item, conflictedCount)}
+            <span>{formatViewTabLabel(item, conflictedCount)}</span>
+            {#if item.id === "diff" && $repoStore.statuses.length > 0}
+              <span class="ml-1 px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-amber-500/20 text-amber-600 dark:text-amber-300 font-semibold">
+                {$repoStore.statuses.length}
+              </span>
+            {/if}
           </button>
         {/each}
       </div>

@@ -15,4 +15,17 @@ describe("CommandPalette", () => {
     expect(source).toContain("promptQuickCommit");
     expect(source).toContain("GitCommit");
   });
+
+  it("supports mode prefixes for commits and branches", () => {
+    expect(source).toContain('mode = $derived.by');
+    expect(source).toContain('trimmed.startsWith("#")');
+    expect(source).toContain('trimmed.startsWith("@")');
+    expect(source).toContain('trimmed.startsWith("?")');
+  });
+
+  it("supports match highlighting and frecency tracking", () => {
+    expect(source).toContain("highlightMatches");
+    expect(source).toContain("readFrecency");
+    expect(source).toContain("recordFrecency");
+  });
 });

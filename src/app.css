@@ -54,6 +54,7 @@ html.light {
 }
 
 :root {
+  --ui-font-scale: 1;
   /* Derived plain colors — the canvas graph reads these. */
   --bg-main: rgb(var(--c-bg));
   --bg-surface: rgb(var(--c-surface));
@@ -72,6 +73,7 @@ html.dark {
   body {
     background-color: rgb(var(--c-bg));
     color: rgb(var(--c-text));
+    font-size: calc(12px * var(--ui-font-scale, 1));
   }
 
   ::selection {
