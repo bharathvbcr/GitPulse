@@ -60,6 +60,18 @@ export interface CoverageLanguageSplit {
   percentage: number;
 }
 
+/**
+ * Exact retained/observed counts for one scan cap that fired. Mirrors the Rust
+ * `CoverageScanLimit`. `truncated` says only that something was cut; these say
+ * how much, so a bounded section can headline what was seen rather than what
+ * survived.
+ */
+export interface CoverageScanLimit {
+  resource: string;
+  kept: number;
+  total: number;
+}
+
 export interface CoverageReport {
   families: CoverageFamilyStatus[];
   languages: CoverageLanguageSplit[];
@@ -67,4 +79,9 @@ export interface CoverageReport {
   files: FileCoverageSummary[];
   overall: CoverageTotals;
   truncated: boolean;
+  /**
+   * Optional on the wire: `#[serde(default)]` in Rust, and reports cached by
+   * an older build carry no notices at all.
+   */
+  limit_notices?: CoverageScanLimit[];
 }

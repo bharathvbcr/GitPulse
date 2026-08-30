@@ -90,3 +90,62 @@ describe("HealthPanel flicker contracts", () => {
     expect(source).toContain("{#if loading && !report}");
   });
 });
+
+describe("HealthPanel error-state separation (regression)", () => {
+  /**
+   * `openExternal` failures are non-fatal: the advisory link did not open,
+   * but the scan behind it is still valid. Routing them into the same state
+   * that guards the "load failed" branch meant one failed link click
+   * replaced the entire report with a bare banner — and made the in-report
+   * banner (whose own comment promised otherwise) unreachable dead code.
+   */
+  it("does not let a non-fatal action error replace the whole report", () => {
+    const opener = source.slice(
+      source.indexOf("async function openExternal"),
+      source.lastIndexOf("</script>"),
+    );
+    const assigned = opener.match(/(\w+)\s*=\s*reportPanelError\("health"/);
+    expect(assigned, "openExternal must report its failure").not.toBeNull();
+    const actionState = assigned![1];
+
+    const chain = source.slice(source.indexOf("{#if loading && !report}"));
+    const branches = [...chain.matchAll(/\{:else if ([^}]+)\}/g)].map((m) => m[1].trim());
+    const reportBranch = branches.indexOf("report");
+    expect(reportBranch, "the report branch must exist").toBeGreaterThanOrEqual(0);
+    // Nothing that a non-fatal action sets may shadow the report branch.
+    expect(branches.slice(0, reportBranch)).not.toContain(actionState);
+  });
+
+  it("keeps the action banner outside the load-error else-chain so it can render", () => {
+    const chainStart = source.indexOf("{#if loading && !report}");
+    expect(source.indexOf("{#if actionError}")).toBeGreaterThan(-1);
+    // Rendered before the chain, like GitHubPanel's actionError banner, so it
+    // is visible in every state rather than nested in one unreachable branch.
+    expect(source.indexOf("{#if actionError}")).toBeLessThan(chainStart);
+  });
+
+  it("clears a stale action error when a new scan starts", () => {
+    const scanBody = source.slice(
+      source.indexOf("async function scan("),
+      source.indexOf("function renderedReport"),
+    );
+    expect(scanBody).toContain("actionError = null");
+  });
+
+  it("tints the Dependabot header badge through the shared normalizer", () => {
+    expect(source).toContain("dependabotBadgeClass");
+    // Raw string equality on GitHub severities missed "HIGH"/"Critical",
+    // which github/mod.rs passes through verbatim.
+    expect(source).not.toMatch(/severity === "(critical|high|medium)"/);
+  });
+
+  it("discloses capped section counts instead of showing only what survived", () => {
+    expect(source).toContain("observedTotal(");
+    // Both bounded sections must headline the observed total, not just the
+    // rows that survived the cap.
+    const issuesHeading = source.slice(source.indexOf(">\n            Issues ("));
+    expect(issuesHeading.slice(0, 200)).toContain("issuesTotal");
+    const vulnHeading = source.slice(source.indexOf("Vulnerabilities ("));
+    expect(vulnHeading.slice(0, 300)).toContain("vulnerabilitiesTotal");
+  });
+});

@@ -1,12 +1,25 @@
 import { formatAuditCounts } from "./format";
+import { cappedSuffix, observedTotal as observedScanTotal } from "../scan/limits";
 import type { DependabotReport, DepsHealthReport } from "./types";
 
 function line(items: (string | undefined | null)[]): string {
   return items.filter((item) => item !== undefined && item !== null && item !== "").join(" · ");
 }
 
-function observedTotal(report: DepsHealthReport, resource: string, retained: number): number {
-  return report.limit_notices?.find((notice) => notice.resource === resource)?.total ?? retained;
+/**
+ * How many of a bounded collection the scan actually observed, as opposed to
+ * how many survived the cap. Canonical owner for both the text report and the
+ * Health view, which previously each re-derived it and could disagree.
+ *
+ * Thin adapter over the shared reader in `scan/limits`; the coverage report
+ * asks the same question of its own notices.
+ */
+export function observedTotal(
+  report: DepsHealthReport,
+  resource: string,
+  retained: number,
+): number {
+  return observedScanTotal(report, resource, retained);
 }
 
 /**
@@ -107,14 +120,14 @@ export function formatHealthReport(
 
   if (report.issues.length > 0) {
     const issueTotal = observedTotal(report, "health issues", report.issues.length);
-    out.push("", `## Issues (${issueTotal}${issueTotal > report.issues.length ? `; showing ${report.issues.length}` : ""})`);
+    out.push("", `## Issues (${issueTotal}${cappedSuffix(issueTotal, report.issues.length)})`);
     for (const issue of report.issues) {
       out.push(`- [${issue.severity}] ${issue.code}${issue.path ? ` (${issue.path})` : ""}: ${issue.message}`);
     }
   }
 
   if (report.vulnerabilities.length > 0) {
-    out.push("", `## Vulnerabilities (${report.audit.total}${report.audit.total > report.vulnerabilities.length ? `; showing ${report.vulnerabilities.length}` : ""})`);
+    out.push("", `## Vulnerabilities (${report.audit.total}${cappedSuffix(report.audit.total, report.vulnerabilities.length)})`);
     for (const vuln of report.vulnerabilities) {
       out.push(
         `- [${vuln.severity}] ${vuln.ecosystem}/${vuln.name}${vuln.range ? ` ${vuln.range}` : ""} — ${vuln.title}`,
@@ -148,7 +161,7 @@ export function formatHealthReport(
   }
 
   if (report.outdated.length > 0) {
-    out.push("", `## Outdated npm packages (${outdatedTotal}${outdatedTotal > report.outdated.length ? `; showing ${report.outdated.length}` : ""})`);
+    out.push("", `## Outdated npm packages (${outdatedTotal}${cappedSuffix(outdatedTotal, report.outdated.length)})`);
     for (const pkg of report.outdated) {
       out.push(
         `- ${pkg.name}: ${pkg.current} -> ${pkg.latest} (wanted ${pkg.wanted}, ${pkg.dep_type || "dep"})${

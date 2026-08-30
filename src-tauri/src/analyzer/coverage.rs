@@ -220,6 +220,21 @@ pub struct FileCoverage {
     pub lines_truncated: bool,
 }
 
+/// Exact retained/observed counts for one safety budget that fired during a
+/// scan.
+///
+/// `truncated` alone says only "something was cut". A renderer holding just
+/// that has to headline the counts it *kept* — 30 of 141 — which reads as
+/// complete coverage of a 141-file repo even when 12,873 files were seen.
+/// Mirrors `analyzer::deps::ScanLimitNotice`, whose report already carries
+/// these numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageScanLimit {
+    pub resource: String,
+    pub kept: usize,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoverageReport {
     pub families: Vec<CoverageFamilyStatus>,
@@ -229,6 +244,12 @@ pub struct CoverageReport {
     pub files: Vec<FileCoverageSummary>,
     pub overall: CoverageTotals,
     pub truncated: bool,
+    /// Exact retained/observed counts for every cap that fired. A subset of
+    /// what `truncated` covers: budget exhaustion and partial directory
+    /// listings have no honest total to report, so they raise the flag alone.
+    /// `serde(default)` keeps older cached reports loadable.
+    #[serde(default)]
+    pub limit_notices: Vec<CoverageScanLimit>,
 }
 
 /// Aggregated coverage for one detected language across every artifact that
@@ -440,12 +461,14 @@ impl CoverageScanner {
                     // An empty report from a cut listing is "unknown", not a
                     // clean "nothing to scan".
                     truncated: detected.listing_partial,
+                    limit_notices: Vec::new(),
                 },
                 HashMap::new(),
             ));
         }
 
         let mut truncated = detected.listing_partial;
+        let mut limit_notices: Vec<CoverageScanLimit> = Vec::new();
         let candidates = {
             let mut c = collect_candidates(&families, &detected.cargo_dirs, &detected.go_mod_dirs);
             if extend_directory_candidates(&repo, &families, &detected.cargo_dirs, &mut c) {
@@ -536,9 +559,15 @@ impl CoverageScanner {
         // reduced go-cover data don't read as authoritative.
         let mut go_expansion_capped = false;
 
+        let present_artifacts = present.len();
         for (considered, cand) in present.into_iter().enumerate() {
             if considered >= limits.max_artifacts {
                 truncated = true;
+                limit_notices.push(CoverageScanLimit {
+                    resource: "coverage artifacts".into(),
+                    kept: limits.max_artifacts,
+                    total: present_artifacts,
+                });
                 break;
             }
             match read_artifact(&repo, &cand.rel, limits.max_artifact_bytes) {
@@ -645,6 +674,11 @@ impl CoverageScanner {
 
         if merged.len() > limits.max_files {
             truncated = true;
+            limit_notices.push(CoverageScanLimit {
+                resource: "covered files".into(),
+                kept: limits.max_files,
+                total: merged.len(),
+            });
             // Drop lowest-value files first: files with no hit lines carry no
             // information beyond presence, then alphabetical order keeps the
             // survivor set deterministic across runs (HashMap iteration order
@@ -719,6 +753,7 @@ impl CoverageScanner {
             files,
             overall,
             truncated,
+            limit_notices,
         };
 
         let merged_entries: usize = merged.values().map(BTreeMap::len).sum();
@@ -1246,8 +1281,14 @@ fn native_coverage_commands(repo: &Path) -> Vec<String> {
 }
 
 fn native_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let generate = native_coverage_commands(repo);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable(
+            "No CMakeLists.txt or Makefile in this repository, so no C/C++ coverage build can be planned.",
+        );
+    }
     LanguageCoveragePlan::ready(
-        native_coverage_commands(repo),
+        generate,
         "Native C/C++ coverage usually finishes in a few minutes.",
     )
 }
@@ -1290,8 +1331,14 @@ fn php_coverage_commands(repo: &Path) -> Vec<String> {
 }
 
 fn php_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let generate = php_coverage_commands(repo);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable(
+            "No composer.json or vendor/bin/phpunit in this repository.",
+        );
+    }
     LanguageCoveragePlan::ready(
-        php_coverage_commands(repo),
+        generate,
         "PHP test coverage usually finishes in about a minute.",
     )
 }
@@ -1305,8 +1352,12 @@ fn ruby_coverage_commands(repo: &Path) -> Vec<String> {
 }
 
 fn ruby_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let generate = ruby_coverage_commands(repo);
+    if generate.is_empty() {
+        return LanguageCoveragePlan::unavailable("No Gemfile in this repository.");
+    }
     LanguageCoveragePlan::ready(
-        ruby_coverage_commands(repo),
+        generate,
         "Ruby test coverage usually finishes in about a minute.",
     )
 }
@@ -1324,12 +1375,31 @@ fn dart_coverage_plan(has_pubspec: bool, dart_ready: bool) -> LanguageCoveragePl
     )
 }
 
+/// Applies a plan and enforces the family-row invariant.
+///
+/// `tool_ready == true` asserts "a generator for this family is available".
+/// Every `ready(...)` constructor took a command list that could be empty
+/// (`native` with no CMakeLists/Makefile, `php` with no composer.json, `ruby`
+/// with no Gemfile, and the catch-all arm), so that assertion was published
+/// without ever being checked: the row rendered as a bare label with no Run
+/// button, no reason, and no duration — byte-identical to a family GitPulse
+/// simply had no opinion about. Enforcing it here rather than at each call
+/// site covers families added later too.
 fn apply_language_plan(status: &mut CoverageFamilyStatus, plan: LanguageCoveragePlan) {
     status.suggested_commands = plan.generate;
     status.setup_commands = plan.setup;
     status.tool_ready = plan.tool_ready;
     status.tool_detail = plan.tool_detail;
     status.duration_hint = plan.duration_hint;
+    if status.suggested_commands.is_empty() {
+        status.tool_ready = false;
+        if status.tool_detail.is_empty() {
+            status.tool_detail =
+                "GitPulse could not plan a coverage generator for this repository layout.".into();
+        }
+        // A duration for a command that does not exist is noise.
+        status.duration_hint.clear();
+    }
 }
 
 /// Manifests and listing flags the command planner needs besides `families`.
@@ -1424,7 +1494,18 @@ fn fill_suggested_commands(
             "php" => php.clone(),
             "ruby" => ruby.clone(),
             "dart" => dart.clone(),
-            _ => LanguageCoveragePlan::ready(Vec::new(), ""),
+            // `beam` is detected (Elixir/Erlang sources seed it) but GitPulse
+            // parses none of the formats the BEAM tooling emits, so there is
+            // no artifact for a generate command to produce. Say that rather
+            // than leaving a row the user cannot act on or explain.
+            "beam" => LanguageCoveragePlan::unavailable(
+                "GitPulse cannot parse Elixir/Erlang coverage output, so no generator is planned.",
+            ),
+            // Fail closed: an unrecognized family has had no readiness check
+            // at all, and must not claim one.
+            _ => LanguageCoveragePlan::unavailable(
+                "GitPulse has no coverage generator for this ecosystem.",
+            ),
         };
         apply_language_plan(status, plan);
     }
@@ -2627,6 +2708,181 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(dest, content).unwrap();
+    }
+
+    /// Regression: a detected family with no plannable generator published
+    /// `tool_ready = true` with no command, no reason and no duration — the
+    /// exact row shape of a family GitPulse simply had no opinion about. The
+    /// user's own report showed it as a bare `- native (expected: lcov)`.
+    #[test]
+    fn family_without_a_generator_is_never_reported_ready() {
+        let repo = git_repo();
+        // C sources seed `native`; no CMakeLists.txt and no Makefile exist, so
+        // there is nothing to run.
+        write(
+            repo.path(),
+            "src/engine.c",
+            "int main(void) { return 0; }\n",
+        );
+        write(repo.path(), "src/engine.h", "int main(void);\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+
+        let native = report
+            .families
+            .iter()
+            .find(|f| f.family == "native")
+            .expect("C sources must seed the native family");
+        assert!(
+            native.suggested_commands.is_empty(),
+            "no build file, so no generate command may be planned"
+        );
+        assert!(
+            !native.tool_ready,
+            "readiness was never checked; it must not be asserted"
+        );
+        assert!(
+            native.tool_detail.contains("CMakeLists.txt"),
+            "the row must say why it is a dead end, got {:?}",
+            native.tool_detail
+        );
+        assert!(
+            native.duration_hint.is_empty(),
+            "a duration for a command that does not exist is noise"
+        );
+    }
+
+    /// The invariant is enforced at the single application point, so a family
+    /// GitPulse has no plan arm for at all is covered too.
+    #[test]
+    fn unplannable_families_still_explain_themselves() {
+        let repo = git_repo();
+        write(repo.path(), "lib/app.ex", "defmodule App do\nend\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+
+        let beam = report
+            .families
+            .iter()
+            .find(|f| f.family == "beam")
+            .expect("Elixir sources must seed the beam family");
+        assert!(beam.suggested_commands.is_empty());
+        assert!(!beam.tool_ready);
+        assert!(
+            !beam.tool_detail.is_empty(),
+            "every actionless family row must carry a reason"
+        );
+    }
+
+    /// Every family the scanner emits must satisfy the invariant, not just the
+    /// ones a test happens to name.
+    #[test]
+    fn no_family_claims_readiness_without_a_command() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "src/engine.c",
+            "int main(void) { return 0; }\n",
+        );
+        write(repo.path(), "lib/app.ex", "defmodule App do\nend\n");
+        write(repo.path(), "app/index.php", "<?php echo 1;\n");
+        write(repo.path(), "app/main.rb", "puts 1\n");
+        write(repo.path(), "src/main.go", "package main\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert!(
+            report.families.len() >= 4,
+            "fixture must seed several families"
+        );
+        for family in &report.families {
+            if family.suggested_commands.is_empty() {
+                assert!(
+                    !family.tool_ready,
+                    "{} claims a generator it cannot name",
+                    family.family
+                );
+                assert!(
+                    !family.tool_detail.is_empty(),
+                    "{} gives the user nothing to act on and no reason",
+                    family.family
+                );
+            }
+        }
+    }
+
+    /// Regression: the file cap set `truncated` and nothing else, so the
+    /// renderer could only headline the count it kept. That reads as a
+    /// complete inventory of a small repo.
+    #[test]
+    fn file_cap_records_exact_retained_and_observed_counts() {
+        let repo = git_repo();
+        write(repo.path(), "src/a.go", "package main\n");
+        write(repo.path(), "src/b.go", "package main\n");
+        write(
+            repo.path(),
+            "coverage.out",
+            "mode: set\nsrc/a.go:1.1,2.10 2 1\nsrc/b.go:1.1,2.10 2 1\n",
+        );
+        let limits = ScanLimits {
+            max_files: 1,
+            ..ScanLimits::default()
+        };
+        let (report, _) =
+            CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits).expect("scan");
+
+        assert!(report.truncated);
+        assert_eq!(report.files.len(), 1);
+        let notice = report
+            .limit_notices
+            .iter()
+            .find(|n| n.resource == "covered files")
+            .expect("the file cap must publish what it dropped");
+        assert_eq!(notice.kept, 1);
+        assert_eq!(notice.total, 2);
+    }
+
+    #[test]
+    fn artifact_cap_records_exact_retained_and_observed_counts() {
+        let repo = git_repo();
+        write(repo.path(), "src/a.go", "package main\n");
+        write(
+            repo.path(),
+            "coverage.out",
+            "mode: set\nsrc/a.go:1.1,2.10 2 1\n",
+        );
+        write(
+            repo.path(),
+            "cover.out",
+            "mode: set\nsrc/a.go:1.1,2.10 2 1\n",
+        );
+        let limits = ScanLimits {
+            max_artifacts: 1,
+            ..ScanLimits::default()
+        };
+        let (report, _) =
+            CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits).expect("scan");
+
+        assert!(report.truncated);
+        let notice = report
+            .limit_notices
+            .iter()
+            .find(|n| n.resource == "coverage artifacts")
+            .expect("the artifact cap must publish what it dropped");
+        assert_eq!(notice.kept, 1);
+        assert_eq!(notice.total, 2);
+    }
+
+    /// A scan that hit no cap must publish no notices: an empty list is the
+    /// signal the renderer uses to print unqualified counts.
+    #[test]
+    fn complete_scans_publish_no_limit_notices() {
+        let repo = git_repo();
+        write(repo.path(), "src/a.go", "package main\n");
+        write(
+            repo.path(),
+            "coverage.out",
+            "mode: set\nsrc/a.go:1.1,2.10 2 1\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert!(!report.truncated);
+        assert!(report.limit_notices.is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  dependabotBadgeClass,
   formatAuditCounts,
   normalizeSeverity,
   severityClass,
@@ -92,5 +93,54 @@ describe("health format", () => {
   it("styles unrated severities as muted, not alarming", () => {
     expect(severityClass("unknown")).toBe(severityClass("info"));
     expect(normalizeSeverity("unknown")).toBe("info");
+  });
+});
+
+describe("health format — audit coverage honesty (regression)", () => {
+  it("never renders a known-incomplete audit as a bare finding count", () => {
+    // A capped/partial scan that happens to have findings must still say so.
+    // Previously `complete` was consulted only when total === 0, so an
+    // incomplete scan with findings rendered identically to a full one.
+    const summary = { critical: 1, high: 2, moderate: 0, low: 4, total: 7 };
+    const incomplete = formatAuditCounts(summary, { complete: false, ran: true });
+    const complete = formatAuditCounts(summary, { complete: true, ran: true });
+
+    expect(complete).toBe("1 critical · 2 high · 4 low");
+    expect(incomplete).not.toBe(complete);
+    expect(incomplete).toContain("1 critical");
+    expect(incomplete).toMatch(/incomplete/i);
+  });
+
+  it("keeps the bare count when the caller states no coverage opinion", () => {
+    // Callers that pass no options get the unchanged legacy rendering.
+    expect(
+      formatAuditCounts({ critical: 1, high: 2, moderate: 0, low: 4, total: 7 }),
+    ).toBe("1 critical · 2 high · 4 low");
+  });
+});
+
+describe("dependabotBadgeClass — severity casing (regression)", () => {
+  it("ranks GitHub severities case-insensitively, as the Rust parser does", () => {
+    // github/mod.rs passes `security_vulnerability.severity` through verbatim
+    // and only lowercases for ranking, so "HIGH"/"Critical" reach the UI.
+    const lower = dependabotBadgeClass([{ severity: "high" }]);
+    expect(lower).toBe("text-rose-300");
+    expect(dependabotBadgeClass([{ severity: "HIGH" }])).toBe(lower);
+    expect(dependabotBadgeClass([{ severity: "Critical" }])).toBe(lower);
+    expect(dependabotBadgeClass([{ severity: " high " }])).toBe(lower);
+  });
+
+  it("maps GitHub's 'medium' onto the moderate tier and leaves the rest muted", () => {
+    expect(dependabotBadgeClass([{ severity: "medium" }])).toBe("text-amber-300");
+    expect(dependabotBadgeClass([{ severity: "MEDIUM" }])).toBe("text-amber-300");
+    expect(dependabotBadgeClass([{ severity: "low" }])).toBe("text-sky-300");
+    expect(dependabotBadgeClass([{ severity: "" }])).toBe("text-sky-300");
+    expect(dependabotBadgeClass([])).toBe("");
+  });
+
+  it("takes the worst severity in the list, not the first", () => {
+    expect(
+      dependabotBadgeClass([{ severity: "low" }, { severity: "CRITICAL" }]),
+    ).toBe("text-rose-300");
   });
 });

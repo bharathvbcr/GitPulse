@@ -4,6 +4,7 @@ import {
   coverageFailureHint,
   formatCoverageReport,
   formatFailedCoverageDiagnostics,
+  NO_COVERAGE_DATA,
   type FailedCoverageScript,
 } from "./report";
 import type {
@@ -185,10 +186,25 @@ describe("formatCoverageReport", () => {
     );
   });
 
-  it("renders hostile counts as 0 without throwing", () => {
+  it("refuses to render a percentage over counts that sanitized to nothing", () => {
+    // Was asserted as "50.0% (0/0 lines)". That expectation was wrong: a
+    // producer percentage with no lines behind it is not a measurement, and
+    // printing it gave a hostile (or merely broken) payload the authority of a
+    // coverage figure. Zero measurable lines now renders as "not measured".
     const report = representativeReport();
     report.overall = { lines_hit: Number.NaN, lines_found: -7, percentage: 50 };
-    expect(formatCoverageReport(report, "/repo")).toContain("50.0% (0/0 lines)");
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).not.toContain("50.0%");
+    expect(text).toContain(NO_COVERAGE_DATA);
+  });
+
+  it("keeps hit counts from exceeding the lines they were counted out of", () => {
+    // lines_hit > lines_found cannot come from the scanner (both are derived
+    // from one map) but can come from a hand-built or corrupted payload, and
+    // "600/500 lines" is not a number any reader can use.
+    const report = representativeReport();
+    report.overall = { lines_hit: 600, lines_found: 500, percentage: 82 };
+    expect(formatCoverageReport(report, "/repo")).toContain("82.0% (500/500 lines)");
   });
 
   it("survives hostile numbers in every per-language and file field", () => {
@@ -317,12 +333,18 @@ describe("formatCoverageReport", () => {
     expect(text).toContain("several minutes");
   });
 
-  it("renders a fully empty report as a zeroed header block without throwing", () => {
+  it("renders a fully empty report as an explicit no-data header without throwing", () => {
+    // Was asserted as "0.0% (0/0 lines)" — the same line a repo whose code is
+    // real but entirely uncovered would get. One is "we could not measure",
+    // the other is a finding; collapsing them sent "0% coverage" into the
+    // model prompt, the clipboard and the issue title for repos that simply
+    // had no artifact.
     const empty = {} as CoverageReport;
     const emptyText = formatCoverageReport(empty, "/repo");
     expect(emptyText.split("\n")[0]).toBe("Coverage report — /repo");
     expect(emptyText).toContain("OVERALL");
-    expect(emptyText).toContain("0.0% (0/0 lines)");
+    expect(emptyText).toContain(NO_COVERAGE_DATA);
+    expect(emptyText).not.toContain("0.0%");
 
     const bare: CoverageReport = {
       families: [],
@@ -335,7 +357,7 @@ describe("formatCoverageReport", () => {
     const text = formatCoverageReport(bare, "");
     expect(text.split("\n")[0]).toBe("Coverage report — ");
     expect(text).toContain("OVERALL");
-    expect(text).toContain("0.0% (0/0 lines)");
+    expect(text).toContain(NO_COVERAGE_DATA);
     expect(text).not.toContain("PER-LANGUAGE");
     expect(text).not.toContain("LOWEST-COVERED FILES");
     expect(text).not.toContain("ARTIFACTS");
@@ -567,5 +589,99 @@ describe("formatFailedCoverageDiagnostics", () => {
         "MANVI coverage generation action refused: wrapper './gradlew' is not a repository file",
       ),
     ).toContain("Gradle wrapper");
+  });
+});
+
+describe("coverage report — cap disclosure and no-data honesty (regression)", () => {
+  it("headlines the observed file total, not the count that survived the cap", () => {
+    // Pre-fix the heading read "showing 30 of 4000": the scanner's own
+    // max_files cap was invisible, so a 12,873-file repo reported as a
+    // 4,000-file one and the sample read as the inventory.
+    const report = representativeReport();
+    report.files = Array.from({ length: 40 }, (_, i) =>
+      file({ path: `src/f${i}.rs`, percentage: i, lines_hit: i, lines_found: 100 }),
+    );
+    report.truncated = true;
+    report.limit_notices = [{ resource: "covered files", kept: 40, total: 12873 }];
+
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain("showing 30 of 12873; 40 retained by the scan cap");
+    expect(text).toContain("SCAN LIMITS (the sections above are a bounded sample)");
+    expect(text).toContain("- covered files: retained 40 of 12873");
+  });
+
+  it("discloses a capped artifact sweep the same way", () => {
+    const report = representativeReport();
+    report.limit_notices = [{ resource: "coverage artifacts", kept: 2, total: 61 }];
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain("ARTIFACTS (showing 2 of 61; 2 read before the scan cap)");
+  });
+
+  it("leaves complete sections unqualified", () => {
+    const text = formatCoverageReport(representativeReport(), "/repo");
+    expect(text).toContain("LOWEST-COVERED FILES (worst first, showing 3 of 3)");
+    expect(text).toContain("ARTIFACTS (showing 2 of 2)");
+    expect(text).not.toContain("SCAN LIMITS");
+    expect(text).not.toContain("retained by the scan cap");
+  });
+
+  it("never lets a notice shrink a section below the rows it prints", () => {
+    // A notice claiming fewer observed than retained is incoherent; believing
+    // it would print "showing 3 of 1".
+    const report = representativeReport();
+    report.limit_notices = [{ resource: "covered files", kept: 3, total: 1 }];
+    expect(formatCoverageReport(report, "/repo")).toContain(
+      "LOWEST-COVERED FILES (worst first, showing 3 of 3)",
+    );
+  });
+
+  it("does not title an issue with a coverage figure the scan never measured", () => {
+    const empty: CoverageReport = {
+      families: [],
+      languages: [],
+      artifacts: [],
+      files: [],
+      overall: totals(0, 0, 0),
+      truncated: false,
+    };
+    const draft = buildCoverageIssueDraft(empty, "/repos/acme");
+    expect(draft.title).toBe("test(coverage): no coverage data was produced");
+    expect(draft.title).not.toContain("0.0%");
+    expect(draft.body).toContain(NO_COVERAGE_DATA);
+    // The local path still never crosses to GitHub.
+    expect(draft.body).not.toContain("/repos/acme");
+  });
+
+  it("still titles a real measurement with its percentage", () => {
+    const draft = buildCoverageIssueDraft(representativeReport(), "/repos/acme");
+    expect(draft.title).toBe("test(coverage): address 82.0% line coverage");
+  });
+
+  it("says so when a missing family carries neither a command nor a reason", () => {
+    const report = representativeReport();
+    report.families = [
+      family({ family: "native", found: false, expected_formats: [], suggested_commands: [] }),
+    ];
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain(
+      "- native (no artifact locations known) — no generator planned and no reason reported",
+    );
+  });
+
+  it("prefers the backend's reason when it has one", () => {
+    const report = representativeReport();
+    report.families = [
+      family({
+        family: "native",
+        found: false,
+        expected_formats: ["lcov"],
+        suggested_commands: [],
+        tool_ready: false,
+        tool_detail: "No CMakeLists.txt or Makefile in this repository.",
+      }),
+    ];
+    const text = formatCoverageReport(report, "/repo");
+    expect(text).toContain("- native (expected: lcov) — No CMakeLists.txt or Makefile");
+    expect(text).not.toContain("no reason reported");
   });
 });

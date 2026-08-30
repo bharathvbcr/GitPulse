@@ -44,6 +44,7 @@ export const CHECKED_STRUCTS = Object.freeze([
   "CoveredLine",
   "FileCoverage",
   "CoverageLanguageSplit",
+  "CoverageScanLimit",
   "CoverageReport",
 ]);
 

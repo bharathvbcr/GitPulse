@@ -125,5 +125,28 @@ export function formatAuditCounts(
   if (summary.moderate) parts.push(`${summary.moderate} moderate`);
   if (summary.low) parts.push(`${summary.low} low`);
   if (summary.unknown) parts.push(`${summary.unknown} unranked`);
-  return parts.join(" · ") || `${summary.total} findings`;
+  const counts = parts.join(" · ") || `${summary.total} findings`;
+  // A partial scan that happens to have findings is still a partial scan.
+  // Consulting `complete` only in the zero case let a capped or half-run
+  // audit render byte-identical to a full one, which is the "capped sample
+  // presented as complete coverage" failure. Silence stays silence: an
+  // absent opinion (undefined) keeps the bare counts unchanged.
+  return options?.complete === false ? `${counts} (coverage incomplete)` : counts;
+}
+
+/**
+ * Header tint for the Dependabot badge, driven by the worst open alert.
+ *
+ * Severity arrives exactly as GitHub wrote it — `github/mod.rs` stores
+ * `security_vulnerability.severity` verbatim and lowercases only when
+ * ranking — so "HIGH" and "Critical" are both live inputs. Comparing raw
+ * strings here silently demoted them to the muted tier; normalization is
+ * shared with `severityClass` so one field cannot be read two ways.
+ */
+export function dependabotBadgeClass(alerts: { severity: string }[]): string {
+  if (alerts.length === 0) return "";
+  const tiers = new Set(alerts.map((alert) => normalizeSeverity(alert.severity)));
+  if (tiers.has("critical") || tiers.has("high")) return "text-rose-300";
+  if (tiers.has("moderate")) return "text-amber-300";
+  return "text-sky-300";
 }

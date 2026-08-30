@@ -37,12 +37,13 @@
     type PolicyVerdict,
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
-  import { formatHealthReport, skippedAudits } from "../health/report";
+  import { formatHealthReport, observedTotal, skippedAudits } from "../health/report";
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
   import type {
     Vulnerability,
   } from "../health/types";
   import {
+    dependabotBadgeClass as badgeClassFor,
     formatAuditCounts,
     issueClass,
     severityClass,
@@ -57,6 +58,12 @@
   let dependabot = $state<DependabotReport | null>(null);
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
+  /**
+   * Failures of in-panel actions (opening an advisory link). Deliberately NOT
+   * `errorMsg`: that one guards the "load failed" branch, so reusing it made
+   * one failed link click swap the whole report for a bare banner.
+   */
+  let actionError = $state<string | null>(null);
   let filter = $state<"all" | "direct">("all");
   let copied = $state(false);
   let fixing = $state(false);
@@ -111,20 +118,20 @@
   let openDependabotCount = $derived(
     dependabot?.available ? dependabot.alerts.length : 0,
   );
-  let dependabotBadgeClass = $derived.by(() => {
-    const current = dependabot;
-    if (!current?.available || current.alerts.length === 0) return "";
-    const severe = current.alerts.some(
-      (a) => a.severity === "critical" || a.severity === "high",
-    );
-    if (severe) return "text-rose-300";
-    const moderate = current.alerts.some((a) => a.severity === "medium");
-    return moderate ? "text-amber-300" : "text-sky-300";
-  });
+  let dependabotBadgeClass = $derived(
+    dependabot?.available ? badgeClassFor(dependabot.alerts) : "",
+  );
+  // Observed totals, not surviving-row counts: a capped table that prints only
+  // what it kept reads as complete coverage. Shared with the copied report so
+  // the screen and the clipboard cannot disagree.
   let outdatedTotal = $derived(
-    report?.limit_notices?.find((notice) => notice.resource === "outdated npm packages")?.total ??
-      report?.outdated.length ??
-      0,
+    report ? observedTotal(report, "outdated npm packages", report.outdated.length) : 0,
+  );
+  let issuesTotal = $derived(
+    report ? observedTotal(report, "health issues", report.issues.length) : 0,
+  );
+  let vulnerabilitiesTotal = $derived(
+    report ? Math.max(report.audit.total, report.vulnerabilities.length) : 0,
   );
 
   const scanned = { path: "" };
@@ -153,6 +160,7 @@
     inflight = guard;
     loading = true;
     errorMsg = null;
+    actionError = null;
     // Both sources run together so the Health page fills in as one picture,
     // and each settles independently: a failed Dependabot fetch must not
     // erase a finished local scan, or the reverse.
@@ -357,6 +365,7 @@
       report = null;
       dependabot = null;
       errorMsg = null;
+      actionError = null;
       loading = false;
       plan = null;
       planError = null;
@@ -381,7 +390,7 @@
     try {
       await openExternalUrl(url);
     } catch (err) {
-      errorMsg = reportPanelError("health", err);
+      actionError = reportPanelError("health", err);
     }
   }
 </script>
@@ -535,6 +544,14 @@
   </div>
 
   <div class="flex-1 overflow-auto p-4 space-y-5">
+    <!-- Non-fatal action failures render ahead of the state chain so they stay
+         visible in every state instead of shadowing (or being shadowed by) the
+         load-error branch. Same shape as GitHubPanel's actionError banner. -->
+    {#if actionError}
+      <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
+        {actionError}
+      </div>
+    {/if}
     {#if loading && !report}
       <div class="space-y-4 max-w-4xl">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -550,14 +567,6 @@
       </div>
       {@render dependabotSection()}
     {:else if report}
-      <!-- Action failures (e.g. "open on GitHub") must stay visible even
-           while a report is on screen: the else-if chain above would
-           otherwise swallow them behind the healthy-report rendering. -->
-      {#if errorMsg}
-        <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
-          {errorMsg}
-        </div>
-      {/if}
       {#if planError}
         <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-3xl">
           Fix with MANVI failed: {planError}
@@ -720,7 +729,11 @@
 
       {#if report.issues.length > 0}
         <section class="space-y-1.5 max-w-3xl">
-          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Issues</h3>
+          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+            Issues ({issuesTotal}{issuesTotal > report.issues.length
+              ? `; showing ${report.issues.length}`
+              : ""})
+          </h3>
           {#each report.issues as issue}
             <div class="px-3 py-2 rounded-xl border {issueClass(issue.severity)}">
               <div class="flex items-center gap-2">
@@ -790,7 +803,13 @@
       <section class="space-y-2">
         <div class="flex items-center justify-between max-w-5xl">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
-            Vulnerabilities ({visibleVulns.length}{filter === "direct" ? " direct" : ""})
+            Vulnerabilities ({filter === "direct"
+              ? `${visibleVulns.length} direct`
+              : `${vulnerabilitiesTotal}${
+                  vulnerabilitiesTotal > visibleVulns.length
+                    ? `; showing ${visibleVulns.length}`
+                    : ""
+                }`})
           </h3>
           <div class="gp-segmented">
             <button

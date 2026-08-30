@@ -224,6 +224,18 @@
   let missingPipelines = $derived.by(() =>
     missingCoveragePipelines((report as CoverageReport | null)?.families),
   );
+  /**
+   * Exact retained/observed counts for the caps that fired, e.g.
+   * "4000 of 12873 covered files". Empty when the scan published no notices —
+   * budget exhaustion and partial directory listings have no honest total, and
+   * inventing one would be worse than the bare flag.
+   */
+  let cappedDetail = $derived(
+    ((report as CoverageReport | null)?.limit_notices ?? [])
+      .filter((notice) => notice && notice.total > notice.kept)
+      .map((notice) => `${notice.kept} of ${notice.total} ${notice.resource}`)
+      .join(" · "),
+  );
   let anyScriptRunning = $derived(Object.values(scriptStatuses).some((status) => status.running));
   let failedScriptList = $derived.by(() =>
     Object.values(scriptStatuses).filter((status) => status.status === "failed"),
@@ -891,7 +903,7 @@
   <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <Percent size={16} class="text-accent shrink-0" />
-      {#if report}
+      {#if report && report.overall.lines_found > 0}
         <div class="flex items-center gap-2">
           <span
             class="font-semibold tabular-nums"
@@ -901,6 +913,13 @@
             {report.overall.lines_hit}/{report.overall.lines_found} lines
           </span>
         </div>
+      {:else if report}
+        <!-- No artifact contributed a line record. Painting a red 0.0% here
+             states a measurement the scan never made — the same badge a repo
+             with real, fully uncovered code would get. -->
+        <span class="text-textMuted" title="No parsable coverage artifact contributed line records">
+          No coverage data
+        </span>
       {:else}
         <span class="text-textMuted">Test coverage</span>
       {/if}
@@ -1055,7 +1074,14 @@
           </div>
         {/each}
         {#if report.truncated}
-          <span class="text-amber-400 shrink-0 font-medium">scan capped</span>
+          <!-- "scan capped" alone leaves the reader to assume the numbers on
+               screen are the repository. Where the scanner published exact
+               retained/observed counts, name them: the totals above are a
+               sample of that size, not the whole tree. -->
+          <span
+            class="text-amber-400 shrink-0 font-medium"
+            title={cappedDetail || "Some coverage data was dropped to bound the scan"}
+          >scan capped{cappedDetail ? `: ${cappedDetail}` : ""}</span>
         {/if}
       </div>
       {#if Object.keys(scriptStatuses).length > 0}

@@ -1,5 +1,6 @@
 import { formatCoveragePercent } from "./format";
 import { coverageCommandsAreCumulative } from "./scripts";
+import { observedTotal } from "../scan/limits";
 import type {
   CoverageArtifact,
   CoverageFamilyStatus,
@@ -12,6 +13,15 @@ const MAX_FILES_LISTED = 30;
 const MAX_ARTIFACTS_LISTED = 40;
 const MAX_ISSUE_BODY_BYTES = 60 * 1024;
 const ISSUE_CLIP_NOTE = "\n\n[GitPulse clipped this draft to stay below GitHub's body limit.]";
+
+/**
+ * Rendered instead of a percentage when no artifact contributed a single line
+ * record. Distinguishing "not measured" from "measured 0%" is the whole point;
+ * the parenthetical exists so a model or a reader skimming the line cannot
+ * collapse them back together.
+ */
+export const NO_COVERAGE_DATA =
+  "No coverage data — no artifact contributed line records (this is not 0% coverage)";
 
 export interface CoverageIssueDraft {
   title: string;
@@ -73,9 +83,17 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
   const out: string[] = [];
   out.push(`Coverage report — ${safeText(repoPath)}`);
 
+  const linesFound = safeCount(data.overall?.lines_found);
+  const linesHit = Math.min(safeCount(data.overall?.lines_hit), linesFound);
+  // "0.0% (0/0 lines)" is what a repo with no parsable artifact produced and
+  // what a repo whose every line is uncovered produced — the same sentence for
+  // "we could not measure" and "we measured, it is bad". Only the second is a
+  // coverage figure, and only the second should be actioned as one. A real 0%
+  // still has lines_found > 0, so the two are separable here.
   let overall =
-    `${safePercent(data.overall?.percentage)} ` +
-    `(${safeCount(data.overall?.lines_hit)}/${safeCount(data.overall?.lines_found)} lines)`;
+    linesFound === 0
+      ? NO_COVERAGE_DATA
+      : `${safePercent(data.overall?.percentage)} (${linesHit}/${linesFound} lines)`;
   // A capped scan must say so in the same breath as its totals.
   if (data.truncated === true) overall += " [SCAN TRUNCATED — results partial]";
   out.push("", "OVERALL", overall);
@@ -93,9 +111,16 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
 
   // report.files already arrives sorted worst-first; slicing preserves that.
   if (fileRows.length > 0) {
+    // Two independent caps stack here: the scanner's `max_files` (disclosed by
+    // a limit notice) and this renderer's MAX_FILES_LISTED. Naming only the
+    // second turns "4,000 of 12,873 files were kept" into "141 files", which
+    // reads as a complete inventory. Carry both numbers.
+    const observedFiles = observedTotal(data, "covered files", fileRows.length);
+    const scannerDropped =
+      observedFiles > fileRows.length ? `; ${fileRows.length} retained by the scan cap` : "";
     out.push(
       "",
-      `LOWEST-COVERED FILES (worst first, showing ${Math.min(fileRows.length, MAX_FILES_LISTED)} of ${fileRows.length})`,
+      `LOWEST-COVERED FILES (worst first, showing ${Math.min(fileRows.length, MAX_FILES_LISTED)} of ${observedFiles}${scannerDropped})`,
     );
     for (const file of fileRows.slice(0, MAX_FILES_LISTED) as FileCoverageSummary[]) {
       if (!file || typeof file !== "object") continue;
@@ -107,9 +132,14 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
   }
 
   if (artifactRows.length > 0) {
+    const observedArtifacts = observedTotal(data, "coverage artifacts", artifactRows.length);
+    const artifactsDropped =
+      observedArtifacts > artifactRows.length
+        ? `; ${artifactRows.length} read before the scan cap`
+        : "";
     out.push(
       "",
-      `ARTIFACTS (showing ${Math.min(artifactRows.length, MAX_ARTIFACTS_LISTED)} of ${artifactRows.length})`,
+      `ARTIFACTS (showing ${Math.min(artifactRows.length, MAX_ARTIFACTS_LISTED)} of ${observedArtifacts}${artifactsDropped})`,
     );
     for (const artifact of artifactRows.slice(0, MAX_ARTIFACTS_LISTED) as CoverageArtifact[]) {
       if (!artifact || typeof artifact !== "object") continue;
@@ -122,6 +152,16 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
     }
     if (artifactRows.length > MAX_ARTIFACTS_LISTED) {
       out.push(`…and ${artifactRows.length - MAX_ARTIFACTS_LISTED} more`);
+    }
+  }
+
+  const notices = safeList(data.limit_notices).filter(
+    (notice) => !!notice && typeof notice === "object",
+  );
+  if (notices.length > 0) {
+    out.push("", "SCAN LIMITS (the sections above are a bounded sample)");
+    for (const notice of notices) {
+      out.push(`- ${safeText(notice.resource)}: retained ${safeCount(notice.kept)} of ${safeCount(notice.total)}`);
     }
   }
 
@@ -155,8 +195,21 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
         parts.push(`run ${commands.map((cmd) => `\`${cmd}\``).join(separator)}`);
       }
       if (duration) parts.push(duration);
-      const extra = parts.length > 0 ? ` — ${parts.join(" — ")}` : "";
-      out.push(`- ${safeText(family.family)}${formats ? ` (expected: ${formats})` : ""}${extra}`);
+      if (parts.length === 0) {
+        // A family listed with no reason and no command is a dead end: the
+        // reader cannot tell whether GitPulse found no generator, failed to
+        // probe one, or simply had nothing to say. The backend now always
+        // sends a detail, so reaching this means the payload predates that or
+        // was hand-built; state the uncertainty instead of printing a bare
+        // label that reads as "nothing to do here".
+        parts.push("no generator planned and no reason reported");
+      }
+      const extra = ` — ${parts.join(" — ")}`;
+      out.push(
+        `- ${safeText(family.family)}${
+          formats ? ` (expected: ${formats})` : " (no artifact locations known)"
+        }${extra}`,
+      );
     }
   }
 
@@ -210,9 +263,14 @@ export function buildCoverageIssueDraft(
   manviAnalysis?: string | null,
 ): CoverageIssueDraft {
   const data = (report ?? {}) as Partial<CoverageReport>;
-  const percentage = safePercent(data.overall?.percentage);
   const partial = data.truncated === true ? " (partial scan)" : "";
-  const title = `test(coverage): address ${percentage} line coverage${partial}`;
+  // Never file "address 0.0% line coverage" for a repo that produced no
+  // measurement: that states a finding the scan did not make, and it is the
+  // title a maintainer reads first.
+  const title =
+    safeCount(data.overall?.lines_found) === 0
+      ? `test(coverage): no coverage data was produced${partial}`
+      : `test(coverage): address ${safePercent(data.overall?.percentage)} line coverage${partial}`;
 
   // The first rendered line contains the local path and is useful only for the
   // local model/clipboard. Drop it before this content crosses to GitHub.

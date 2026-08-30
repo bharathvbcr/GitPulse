@@ -30,7 +30,6 @@ describe("CoverageViewer", () => {
     expect(body).toContain("disabled");
   });
 });
-
 describe("CoverageViewer report copy contract", () => {
   it("copies the canonical full coverage snapshot for the current repository", () => {
     const body = source.slice(
@@ -246,5 +245,37 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
     expect(source).toContain("window.clearTimeout(copiedAllTimer);");
     expect(source).toContain("window.clearTimeout(scanErrorCopyTimer);");
     expect(source).toContain("window.clearTimeout(copiedStepTimer);");
+  });
+});
+
+describe("CoverageViewer honesty contracts (regression)", () => {
+  it("does not paint a 0.0% badge for a scan that measured nothing", () => {
+    // A report with no parsable artifact has overall 0/0. Rendering that
+    // through the same percentage badge a fully-uncovered repo gets turned
+    // "we could not measure" into a red 0.0% finding.
+    expect(source).toContain("{#if report && report.overall.lines_found > 0}");
+    expect(source).toContain("No coverage data");
+  });
+
+  it("names the exact retained/observed counts on the capped-scan chip", () => {
+    // "scan capped" with no numbers leaves the reader assuming the totals on
+    // screen describe the repository.
+    expect(source).toContain("cappedDetail");
+    expect(source).toContain("limit_notices");
+    expect(source).toMatch(/scan capped\{cappedDetail/);
+  });
+
+  it("only builds the chip detail from notices that actually dropped rows", () => {
+    expect(source).toContain("notice.total > notice.kept");
+  });
+
+  it("shows the reason a family cannot be generated for", () => {
+    // The backend now guarantees a detail whenever it plans no command; the
+    // panel must actually render it rather than leaving a bare family label.
+    expect(source).toContain("family.tool_ready === false && family.tool_detail");
+  });
+
+  it("never offers a Run button for a family with no planned command", () => {
+    expect(source).toContain("suggestedCoverageCommands(family).length > 0");
   });
 });
