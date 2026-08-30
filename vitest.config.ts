@@ -1,8 +1,13 @@
 import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { appVersion } from "./scripts/app-version.mjs";
 
 export default defineConfig({
   plugins: [svelte()],
+  // Same definition as the production build, from the same source.
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion()),
+  },
   test: {
     environment: "node",
     globals: true,

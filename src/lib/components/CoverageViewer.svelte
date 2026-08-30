@@ -46,6 +46,7 @@
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
   import {
     buildCoverageIssueDraft,
+    coverageFailureHint,
     formatCoverageReport,
     formatFailedCoverageDiagnostics,
     type FailedCoverageScript,
@@ -557,7 +558,7 @@
       if (!passed) {
         diagnostics.error(
           "coverage",
-          `Coverage step "${step.command ?? step.text}" failed (exit ${res.exit_code ?? "?"}):\n${detail}`,
+          failureLogEntry(step.command ?? step.text, res.exit_code, detail),
         );
       }
 
@@ -615,6 +616,22 @@
     const firstLine = detail.split("\n")[0]?.trim() ?? "";
     if (firstLine.length <= 200) return firstLine;
     return `${firstLine.slice(0, 200)}…`;
+  }
+
+  /**
+   * The diagnostics-ring entry for a failed command.
+   *
+   * The hint goes immediately after the header, before the output, so the one
+   * line that names the real cause sits in the part of the message the ring's
+   * length clamp always keeps.
+   */
+  function failureLogEntry(label: string, exitCode: number | null, detail: string): string {
+    const hint = coverageFailureHint(label, detail);
+    return [
+      `Coverage command "${label}" failed (exit ${exitCode ?? "?"}):`,
+      ...(hint ? [`Hint: ${hint}`] : []),
+      detail,
+    ].join("\n");
   }
 
   function scriptKey(family: string, command: string): string {
@@ -681,10 +698,7 @@
       };
 
       if (!passed) {
-        diagnostics.error(
-          "coverage",
-          `Coverage command "${command}" failed (exit ${res.exit_code ?? "?"}):\n${detail}`,
-        );
+        diagnostics.error("coverage", failureLogEntry(command, res.exit_code, detail));
       }
 
       harnessStore.recordAction({

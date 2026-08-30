@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import {
+  APP_VERSION,
   DIAGNOSTIC_STORAGE_KEY,
   MAX_DIAGNOSTIC_ENTRIES,
   createDiagnostics,
@@ -69,10 +70,16 @@ describe("createDiagnostics", () => {
 
   it("clamps oversized messages instead of storing them whole", () => {
     const { store } = makeStore();
-    store.error("test", "x".repeat(5000));
+    store.error("test", `START${"x".repeat(5000)}END`);
     const entries = get(store);
-    expect(entries[0].message.length).toBeLessThanOrEqual(2001);
-    expect(entries[0].message.endsWith("…")).toBe(true);
+    expect(entries[0].message.length).toBeLessThanOrEqual(2000);
+    // This used to assert the message ended in "…", which encoded the very
+    // defect being fixed: truncating from the head threw the ending away, and
+    // for command output the ending is where the reason lives. A clamped
+    // message now keeps both ends and says what it dropped in between.
+    expect(entries[0].message).toMatch(/… \d+ characters elided …/);
+    expect(entries[0].message.startsWith("START")).toBe(true);
+    expect(entries[0].message.endsWith("END")).toBe(true);
   });
 
   it("persists entries and restores them into a fresh instance", () => {
@@ -178,7 +185,6 @@ describe("createDiagnostics", () => {
     ]);
   });
 });
-
 describe("isHostRuntimeNoise", () => {
   it("matches the Tauri reload, IPC fallback, and Vite HMR messages from a WKWebView session", () => {
     const fromDump = [
@@ -228,9 +234,10 @@ describe("formatDiagnosticReport", () => {
 
   it("indents multi-line messages so they stay inside one block", () => {
     const entries: DiagnosticEntry[] = [
-      { id: 1, at: 0, severity: "error", source: "t", message: "line one\nline two", count: 1 },
+      { id: 1, at: 0, severity: "error", source: "t", message: "line one\nline two", count: 1, version: "1.2.3" },
     ];
-    const report = formatDiagnosticReport(entries, generatedAt);
+    // Recorded by the running build, so the header carries no build note.
+    const report = formatDiagnosticReport(entries, generatedAt, "1.2.3");
     expect(report).toContain("(t)\n  line one\n  line two");
   });
 
@@ -382,5 +389,179 @@ describe("installGlobalDiagnostics", () => {
     target.emit("unhandledrejection", { reason: "late again" });
     expect(recorded).toEqual([]);
     expect(originalError).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The ring is what a user copies to report a problem, so a clamped entry must
+ * keep the part that explains the failure.
+ *
+ * Head-only truncation kept the wrong half: a real coverage failure produced
+ * an 18,580-character message whose cause sat at character 18,356, and the
+ * 2,000-character head held nothing but the aborting script's own chatter.
+ */
+describe("message clamping keeps both ends", () => {
+  function longMessage(): string {
+    const header = 'Coverage command "pytest --cov" failed (exit 3):';
+    const noise = Array.from({ length: 900 }, (_, i) => `  ok   check number ${i}`).join("\n");
+    const cause = [
+      'INTERNALERROR>   File "/repo/bench/stress_test.py", line 944, in <module>',
+      "INTERNALERROR>     sys.exit(1 if FAIL else 0)",
+      "INTERNALERROR> SystemExit: 0",
+      "============================ no tests ran in 17.74s ============================",
+    ].join("\n");
+    return [header, noise, cause].join("\n");
+  }
+
+  function recordAndRead(message: string) {
+    const store = createDiagnostics({ storage: null, now: () => 0 });
+    store.error("coverage", message);
+    let entries: readonly { message: string }[] = [];
+    store.subscribe((next) => (entries = next))();
+    return entries[0].message;
+  }
+
+  it("keeps the ending, where the reason for a failure lives", () => {
+    const kept = recordAndRead(longMessage());
+    expect(kept).toContain("stress_test.py");
+    expect(kept).toContain("line 944");
+    expect(kept).toContain("SystemExit: 0");
+    expect(kept).toContain("no tests ran");
+  });
+
+  it("keeps the beginning, which names the command", () => {
+    const kept = recordAndRead(longMessage());
+    expect(kept).toContain('Coverage command "pytest --cov" failed (exit 3):');
+  });
+
+  it("announces the elision, and the accounting is exact", () => {
+    const message = longMessage();
+    const kept = recordAndRead(message);
+    const notice = kept.match(/\n… (\d+) characters elided …\n/);
+    expect(notice, "a clamped message must say what it dropped").not.toBeNull();
+    const dropped = Number(notice![1]);
+    const retained = kept.length - notice![0].length;
+    // Nothing unaccounted for: what was kept plus what was dropped is the
+    // whole original message.
+    expect(retained + dropped).toBe(message.length);
+  });
+
+  it("pays for the elision notice out of the budget, not on top of it", () => {
+    const kept = recordAndRead(longMessage());
+    expect(kept.length).toBeLessThanOrEqual(2000);
+  });
+
+  it("leaves a message inside the budget completely untouched", () => {
+    const short = "Coverage command failed (exit 1):\nboom";
+    expect(recordAndRead(short)).toBe(short);
+    const exact = "x".repeat(2000);
+    expect(recordAndRead(exact)).toBe(exact);
+    expect(recordAndRead("x".repeat(2001))).toContain("characters elided");
+  });
+
+  it("never loses both ends of a pathological single-line payload", () => {
+    const kept = recordAndRead(`START${"y".repeat(50_000)}END`);
+    expect(kept.startsWith("START")).toBe(true);
+    expect(kept.endsWith("END")).toBe(true);
+  });
+});
+
+/**
+ * The ring is persisted, so it outlives the build that wrote it. Without a
+ * stamp, a log copied after an upgrade presents entries from an older build
+ * as though they described the running one — which is how an already-fixed
+ * bug reads as a live one.
+ */
+describe("build stamping", () => {
+  const generatedAt = new Date("2026-08-25T12:00:00Z");
+
+  function entry(overrides: Partial<DiagnosticEntry> = {}): DiagnosticEntry {
+    return {
+      id: 1,
+      at: Date.parse("2026-08-25T11:00:00Z"),
+      severity: "error",
+      source: "coverage",
+      message: "boom",
+      count: 1,
+      ...overrides,
+    };
+  }
+
+  it("stamps new entries with the running build", () => {
+    const store = createDiagnostics({ storage: null, now: () => 0 });
+    store.error("coverage", "boom");
+    expect(get(store)[0].version).toBe(APP_VERSION);
+  });
+
+  it("injects a real version rather than falling back to unknown", () => {
+    // If the build-time define is ever dropped, this catches it before the
+    // stamp silently degrades to a constant that says nothing.
+    expect(APP_VERSION).not.toBe("unknown");
+    expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("says nothing when the entry came from the running build", () => {
+    const report = formatDiagnosticReport([entry({ version: "0.0.3" })], generatedAt, "0.0.3");
+    expect(report).toContain("] ERROR (coverage)\n");
+    expect(report).not.toContain("recorded by");
+  });
+
+  it("names the recording build when it differs from the running one", () => {
+    const report = formatDiagnosticReport([entry({ version: "0.0.2" })], generatedAt, "0.0.3");
+    expect(report).toContain("[recorded by 0.0.2, now running 0.0.3]");
+  });
+
+  it("marks an entry written before stamping existed", () => {
+    const report = formatDiagnosticReport([entry()], generatedAt, "0.0.3");
+    expect(report).toContain("[recorded by an earlier build, now running 0.0.3]");
+  });
+
+  it("names the running build in the report header", () => {
+    const report = formatDiagnosticReport([entry({ version: "0.0.3" })], generatedAt, "0.0.3");
+    expect(report).toContain("Generated: 2026-08-25T12:00:00.000Z by GitPulse 0.0.3");
+  });
+
+  it("never folds a repeat into an entry from a different build", () => {
+    // Coalescing rewrites the timestamp, so merging across builds would claim
+    // the older build produced something it never saw.
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        { id: 1, at: 1, severity: "error", source: "coverage", message: "boom", count: 1, version: "0.0.1" },
+      ]),
+    });
+    const store = createDiagnostics({ storage, now: () => 99 });
+    store.error("coverage", "boom");
+    const entries = get(store);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].version).toBe(APP_VERSION);
+    expect(entries[0].count).toBe(1);
+    expect(entries[1].version).toBe("0.0.1");
+    expect(entries[1].at).toBe(1);
+  });
+
+  it("still coalesces repeats from the same build", () => {
+    const store = createDiagnostics({ storage: null, now: () => 7 });
+    store.error("coverage", "boom");
+    store.error("coverage", "boom");
+    const entries = get(store);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].count).toBe(2);
+  });
+
+  it("refuses a malformed version from a hostile persisted blob", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        { id: 4, at: 4, severity: "error", source: "s", message: "object", count: 1, version: { evil: true } },
+        { id: 3, at: 3, severity: "error", source: "s", message: "blank", count: 1, version: "   " },
+        { id: 2, at: 2, severity: "error", source: "s", message: "oversized", count: 1, version: "9".repeat(500) },
+        { id: 1, at: 1, severity: "error", source: "s", message: "fine", count: 1, version: "0.0.2" },
+      ]),
+    });
+    const entries = get(createDiagnostics({ storage }));
+    const byMessage = Object.fromEntries(entries.map((e) => [e.message, e.version]));
+    expect(byMessage.object).toBeUndefined();
+    expect(byMessage.blank).toBeUndefined();
+    expect(byMessage.oversized).toHaveLength(32);
+    expect(byMessage.fine).toBe("0.0.2");
   });
 });

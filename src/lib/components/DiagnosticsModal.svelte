@@ -1,9 +1,11 @@
 <script lang="ts">
   import { fade, scale } from "svelte/transition";
   import {
+    APP_VERSION,
     diagnostics,
     formatDiagnosticReport,
     formatDiagnosticTime,
+    staleBuildNote,
     type DiagnosticEntry,
     type DiagnosticSeverity,
   } from "../diagnostics/diagnostics";
@@ -159,6 +161,16 @@
                   : 'text-amber-400'}"
               >{entry.severity}</span>
               <span class="px-1.5 py-px rounded-md bg-surfaceHover text-[10px] text-textMuted font-mono">{entry.source}</span>
+              <!-- Only entries that did not come from the running build are
+                   marked, so the badge means something when it appears: the
+                   ring is persisted, so a log can outlive the build that
+                   wrote it and describe a bug that is already fixed. -->
+              {#if staleBuildNote(entry.version, APP_VERSION)}
+                <span
+                  class="px-1.5 py-px rounded-md bg-amber-500/15 text-[10px] text-amber-400/90 font-mono shrink-0"
+                  title="Recorded by {entry.version ?? 'an earlier build'}; this app is running {APP_VERSION}."
+                >{entry.version ?? "older build"}</span>
+              {/if}
               <span class="text-[10px] text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticTime(entry.at)}</span>
               {#if entry.count > 1}
                 <span class="px-1.5 py-px rounded-full bg-surfaceHover text-[10px] font-semibold text-textPrimary shrink-0">×{entry.count}</span>

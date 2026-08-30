@@ -1,6 +1,7 @@
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
+import { appVersion } from "./scripts/app-version.mjs";
 
 const MAX_PRODUCTION_CHUNK_BYTES = 650_000;
 
@@ -96,6 +97,11 @@ export default defineConfig({
     gitpulseBundleBudget(),
   ],
   clearScreen: false,
+  // Stamped into diagnostics entries so a log copied after an upgrade says
+  // which build actually recorded each line.
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion()),
+  },
   build: {
     rollupOptions: {
       output: {

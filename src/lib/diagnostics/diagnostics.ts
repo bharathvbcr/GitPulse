@@ -12,6 +12,16 @@ import { browserStorage, type StorageLike } from "../repos/persist";
 
 export type DiagnosticSeverity = "error" | "warning";
 
+/**
+ * The build that is running, injected at build time from package.json.
+ *
+ * Guarded with `typeof` so a runner that does not define it degrades to
+ * "unknown" rather than throwing at module load — the diagnostics ring is the
+ * last thing that should fail when something else already has.
+ */
+export const APP_VERSION: string =
+  typeof __APP_VERSION__ === "string" && __APP_VERSION__ ? __APP_VERSION__ : "unknown";
+
 export interface DiagnosticEntry {
   /** Monotonic sequence id; higher is newer. */
   readonly id: number;
@@ -23,6 +33,16 @@ export interface DiagnosticEntry {
   readonly message: string;
   /** Occurrences after coalescing identical consecutive repeats. */
   readonly count: number;
+  /**
+   * The app version that recorded this entry.
+   *
+   * Optional because the ring is persisted and survives upgrades: an entry
+   * written before stamping existed has none, and that absence is itself the
+   * useful fact. Without this, a log copied after an upgrade presented
+   * entries from an older build as if they described the running one — which
+   * is exactly how a fixed bug reads as a live one.
+   */
+  readonly version?: string;
 }
 
 export const DIAGNOSTIC_STORAGE_KEY = "gitpulse_diagnostics_v1";
@@ -30,6 +50,8 @@ export const DIAGNOSTIC_STORAGE_KEY = "gitpulse_diagnostics_v1";
 export const MAX_DIAGNOSTIC_ENTRIES = 500;
 /** Per-message cap so one huge payload cannot blow the storage quota. */
 const MAX_MESSAGE_CHARS = 2000;
+/** Version strings are short; a persisted blob does not get to say otherwise. */
+const MAX_VERSION_CHARS = 32;
 
 const SEVERITIES: readonly DiagnosticSeverity[] = ["error", "warning"];
 
@@ -40,10 +62,43 @@ export interface DiagnosticsStore {
   clear(): void;
 }
 
+/**
+ * Share of the budget given to the head. The tail gets the rest: a command's
+ * output usually opens with routine chatter and *ends* with the reason it
+ * failed, so the tail is the more valuable half.
+ */
+const CLAMP_HEAD_SHARE = 0.35;
+
+/**
+ * Bounds a message to [`MAX_MESSAGE_CHARS`], keeping both ends and saying how
+ * much was dropped.
+ *
+ * Head-only truncation kept the wrong half. A real coverage failure produced
+ * an 18,580-character message whose cause — `bench/stress_test.py:944`,
+ * `SystemExit: 0`, "no tests ran" — sat at character 18,356; the 2,000
+ * character head held nothing but the aborting script's own `ok …` chatter,
+ * and every marker of the cause was discarded. The entry that survived was
+ * the one a user would copy to report the problem.
+ *
+ * Keeping both ends preserves what the head is actually good for (which
+ * command, which repository) without throwing away the ending, and the
+ * elision is announced so a clipped message is never mistaken for a whole one.
+ */
 function clampMessage(message: string): string {
-  return message.length > MAX_MESSAGE_CHARS
-    ? `${message.slice(0, MAX_MESSAGE_CHARS)}…`
-    : message;
+  if (message.length <= MAX_MESSAGE_CHARS) return message;
+  const marker = (dropped: number) => `\n… ${dropped} characters elided …\n`;
+  // The notice is paid for out of the budget, not added to it, so a clamped
+  // entry still never exceeds MAX_MESSAGE_CHARS. Reserving against the widest
+  // the notice could be is safe: `dropped` cannot have more digits than the
+  // message has characters.
+  const body = MAX_MESSAGE_CHARS - marker(message.length).length;
+  const headChars = Math.floor(body * CLAMP_HEAD_SHARE);
+  const tailChars = body - headChars;
+  return (
+    message.slice(0, headChars) +
+    marker(message.length - body) +
+    message.slice(message.length - tailChars)
+  );
 }
 
 /**
@@ -93,6 +148,12 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
     typeof record.count === "number" && Number.isInteger(record.count) && record.count >= 1
       ? Math.min(record.count, Number.MAX_SAFE_INTEGER)
       : 1;
+  // A missing version is legitimate (an entry from before stamping); a
+  // malformed one is not, and must not be echoed back into the report.
+  const version =
+    typeof record.version === "string" && record.version.trim()
+      ? record.version.trim().slice(0, MAX_VERSION_CHARS)
+      : undefined;
   return {
     id: record.id,
     at: record.at,
@@ -100,6 +161,7 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
     source: clampMessage(record.source),
     message: clampMessage(record.message),
     count,
+    ...(version ? { version } : {}),
   };
 }
 
@@ -159,7 +221,11 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       newest &&
       newest.severity === severity &&
       newest.source === source &&
-      newest.message === message
+      newest.message === message &&
+      // Never fold a new occurrence into an entry recorded by a different
+      // build: coalescing rewrites the timestamp, so the merged entry would
+      // claim the older build produced something it never saw.
+      newest.version === APP_VERSION
     ) {
       // Coalesce repeats (error storms) into one entry with a counter.
       entries = [{ ...newest, count: newest.count + 1, at: now() }, ...entries.slice(1)];
@@ -168,7 +234,10 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       return;
     }
     nextId += 1;
-    entries = [{ id: nextId, at: now(), severity, source, message, count: 1 }, ...entries];
+    entries = [
+      { id: nextId, at: now(), severity, source, message, count: 1, version: APP_VERSION },
+      ...entries,
+    ];
     if (entries.length > MAX_DIAGNOSTIC_ENTRIES) {
       entries = entries.slice(0, MAX_DIAGNOSTIC_ENTRIES);
     }
@@ -202,9 +271,27 @@ export const diagnostics: DiagnosticsStore = createDiagnostics();
  * Render entries as a plain-text report for pasting into an issue or handing
  * to a fixer. Input order is preserved (newest first).
  */
+/**
+ * How an entry's recording build relates to the one running.
+ *
+ * Only entries that did *not* come from the running build are annotated, so
+ * the common case stays uncluttered and the annotation means something when
+ * it appears.
+ */
+export function staleBuildNote(
+  entryVersion: string | undefined,
+  runningVersion: string,
+): string {
+  if (entryVersion === runningVersion) return "";
+  return entryVersion
+    ? ` [recorded by ${entryVersion}, now running ${runningVersion}]`
+    : ` [recorded by an earlier build, now running ${runningVersion}]`;
+}
+
 export function formatDiagnosticReport(
   entries: readonly DiagnosticEntry[],
   generatedAt: Date = new Date(),
+  runningVersion: string = APP_VERSION,
 ): string {
   const occurrences = (severity: DiagnosticSeverity) =>
     entries.reduce((total, entry) => (entry.severity === severity ? total + entry.count : total), 0);
@@ -213,7 +300,7 @@ export function formatDiagnosticReport(
   }
   const blocks = entries.map((entry) => {
     const repeats = entry.count > 1 ? ` x${entry.count}` : "";
-    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${entry.source})`;
+    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${entry.source})${staleBuildNote(entry.version, runningVersion)}`;
     const body = entry.message
       .split("\n")
       .map((line) => `  ${line}`)
@@ -222,7 +309,7 @@ export function formatDiagnosticReport(
   });
   return [
     `GitPulse diagnostics — ${occurrences("error")} error(s), ${occurrences("warning")} warning(s), ${entries.length} distinct`,
-    `Generated: ${generatedAt.toISOString()}`,
+    `Generated: ${generatedAt.toISOString()} by GitPulse ${runningVersion}`,
     "",
     ...blocks,
   ].join("\n");
