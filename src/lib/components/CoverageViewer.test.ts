@@ -23,6 +23,40 @@ describe("CoverageViewer", () => {
     const { body } = render(CoverageViewer);
     expect(body).toContain("MANVI: analyze coverage with the local model");
   });
+
+  it("always renders a copy-report affordance in the header", () => {
+    const { body } = render(CoverageViewer);
+    expect(body).toContain("Copy coverage report");
+    expect(body).toContain("disabled");
+  });
+});
+
+describe("CoverageViewer report copy contract", () => {
+  it("copies the canonical full coverage snapshot for the current repository", () => {
+    const body = source.slice(
+      source.indexOf("async function copyCoverageReport"),
+      source.indexOf("async function generateAiReport"),
+    );
+    expect(body).toContain("const current = report;");
+    expect(body).toContain("const repo = $repoStore.currentPath;");
+    expect(body).toContain("formatCoverageReport(current, repo)");
+    expect(body).toContain("await copyText(");
+  });
+
+  it("only reports success after the clipboard owner confirms the copy", () => {
+    const body = source.slice(
+      source.indexOf("async function copyCoverageReport"),
+      source.indexOf("async function generateAiReport"),
+    );
+    expect(body).toContain("if (await copyText(");
+    expect(body).toContain("reportCopied = true;");
+    expect(source).toContain('{reportCopied ? "Coverage report copied" : "Copy coverage report"}');
+  });
+
+  it("cleans up report-copy feedback on reset and unmount", () => {
+    expect(source).toContain("window.clearTimeout(reportCopyTimer);");
+    expect(source.match(/window\.clearTimeout\(reportCopyTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe("CoverageViewer MANVI integration contracts", () => {
@@ -214,4 +248,3 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
     expect(source).toContain("window.clearTimeout(copiedStepTimer);");
   });
 });
-

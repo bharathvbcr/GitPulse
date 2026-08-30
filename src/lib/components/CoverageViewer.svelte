@@ -82,6 +82,8 @@
   let scanTruncated = $state(false);
   let reportVersion = $state(0);
   let scanInflight: AsyncGuard | null = null;
+  let reportCopied = $state(false);
+  let reportCopyTimer: number | null = null;
 
   function beginScan(): AsyncGuard {
     scanInflight?.cancel();
@@ -137,6 +139,24 @@
     if (!repo) return;
     const guard = beginScan();
     void scan(repo, guard);
+  }
+
+  /** Copies the same complete, bounded snapshot used by MANVI analysis. */
+  async function copyCoverageReport() {
+    const current = report;
+    const repo = $repoStore.currentPath;
+    if (!current || !repo) return;
+    if (await copyText(formatCoverageReport(current, repo))) {
+      // A copy can settle after a repo switch. The clipboard write already
+      // happened, but stale success feedback must not leak into the new repo.
+      if ($repoStore.currentPath !== repo || report !== current) return;
+      reportCopied = true;
+      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
+      reportCopyTimer = window.setTimeout(() => {
+        reportCopyTimer = null;
+        reportCopied = false;
+      }, 1500);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -230,6 +250,11 @@
     generating = false;
     aiGeneration = null;
     aiError = null;
+    reportCopied = false;
+    if (reportCopyTimer !== null) {
+      window.clearTimeout(reportCopyTimer);
+      reportCopyTimer = null;
+    }
     generationCopied = false;
     if (aiCopyTimer !== null) {
       window.clearTimeout(aiCopyTimer);
@@ -714,6 +739,7 @@
       scanInflight?.cancel();
       generationInflight?.cancel();
       opsInflight?.cancel();
+      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
       if (aiCopyTimer !== null) window.clearTimeout(aiCopyTimer);
       if (copiedScriptTimer !== null) window.clearTimeout(copiedScriptTimer);
       if (copiedAllTimer !== null) window.clearTimeout(copiedAllTimer);
@@ -885,6 +911,21 @@
         <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-red-500/50"></span> missed</span>
         <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-gray-500/30"></span> uninstrumented</span>
       </div>
+      <button
+        type="button"
+        class="gp-icon-btn !p-1 hover:text-accent"
+        class:text-emerald-400={reportCopied}
+        title={reportCopied ? "Coverage report copied" : "Copy coverage report"}
+        aria-label={reportCopied ? "Coverage report copied" : "Copy coverage report"}
+        onclick={() => void copyCoverageReport()}
+        disabled={!report || !$repoStore.currentPath}
+      >
+        {#if reportCopied}
+          <Check size={13} />
+        {:else}
+          <Clipboard size={13} />
+        {/if}
+      </button>
       <button
         type="button"
         class="gp-icon-btn !p-1 hover:text-accent"
