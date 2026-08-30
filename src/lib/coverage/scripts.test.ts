@@ -232,3 +232,90 @@ describe("setupCoverageCommands", () => {
     expect(setupCoverageCommands(undefined)).toEqual([]);
   });
 });
+
+describe("install-then-generate pipelines (regression)", () => {
+  it("orders the Python virtualenv build before the install before the run", () => {
+    // Ordering is the whole safety property: pip must not run before the venv
+    // exists, and pytest must not run before pip. The pipeline runner stops at
+    // the first failed setup step, so a broken venv never reaches a test run.
+    const [pipeline] = missingCoveragePipelines([
+      family({
+        family: "python",
+        found: false,
+        tool_ready: false,
+        tool_detail: "pytest is not installed.",
+        setup_commands: [
+          "python3 -m venv .venv",
+          ".venv/bin/python -m pip install pytest pytest-cov",
+        ],
+        suggested_commands: [".venv/bin/python -m pytest --cov --cov-report=xml"],
+      }),
+    ]);
+    expect(pipeline.steps.map((step) => [step.kind, step.command])).toEqual([
+      ["setup", "python3 -m venv .venv"],
+      ["setup", ".venv/bin/python -m pip install pytest pytest-cov"],
+      ["generate", ".venv/bin/python -m pytest --cov --cov-report=xml"],
+    ]);
+    expect(pipeline.label).toBe("Python");
+    expect(pipeline.toolReady).toBe(false);
+  });
+
+  it("installs the JS coverage provider before running vitest --coverage", () => {
+    // Running vitest --coverage without a provider fails with "Cannot find
+    // dependency '@vitest/coverage-v8'"; the install step is what stops that.
+    const [pipeline] = missingCoveragePipelines([
+      family({
+        family: "javascript",
+        found: false,
+        tool_ready: false,
+        tool_detail: "Vitest is present but no coverage provider is declared.",
+        setup_commands: ["npm install --save-dev @vitest/coverage-v8"],
+        suggested_commands: ["npx --no-install vitest run --coverage"],
+      }),
+    ]);
+    expect(pipeline.steps).toEqual([
+      {
+        family: "javascript",
+        command: "npm install --save-dev @vitest/coverage-v8",
+        kind: "setup",
+      },
+      {
+        family: "javascript",
+        command: "npx --no-install vitest run --coverage",
+        kind: "generate",
+      },
+    ]);
+  });
+
+  it("never replays setup once the scanner reports the toolchain ready", () => {
+    // A rescan after a successful install reports ready; re-running the
+    // installer on every subsequent generate would be pure churn.
+    const [pipeline] = missingCoveragePipelines([
+      family({
+        family: "python",
+        found: false,
+        tool_ready: true,
+        setup_commands: [".venv/bin/python -m pip install pytest pytest-cov"],
+        suggested_commands: [".venv/bin/python -m pytest --cov --cov-report=xml"],
+      }),
+    ]);
+    expect(pipeline.steps.every((step) => step.kind === "generate")).toBe(true);
+  });
+
+  it("plans nothing for a family the scanner could not give a generate command", () => {
+    // No amount of setup helps when there is no command to run afterwards.
+    expect(
+      missingCoveragePipelines([
+        family({
+          family: "native",
+          found: false,
+          tool_ready: false,
+          tool_detail: "No CMakeLists.txt or Makefile in this repository.",
+          setup_commands: ["make install-deps"],
+          suggested_commands: [],
+        }),
+      ]),
+    ).toEqual([]);
+  });
+});
+

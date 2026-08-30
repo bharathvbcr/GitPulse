@@ -1,6 +1,8 @@
 //! Terminal execution module: PTY session management and bounded command execution.
 
-use crate::engine::git_cli::{run_captured, sandbox_join_canonical, validate_repo, RunOutcome};
+use crate::engine::git_cli::{
+    run_captured, sandbox_join, sandbox_join_canonical, validate_repo, RunOutcome,
+};
 use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -622,6 +624,187 @@ fn cargo_llvm_cov_install_allowed(args: &[String]) -> bool {
     rest.len() == 2 && rest.contains(&"--locked") && rest.contains(&"cargo-llvm-cov")
 }
 
+/// Executables that live inside the open repository and may be named as the
+/// program, mapped to the tool identity the allowlist reasons about.
+///
+/// Exact-string only — never a prefix, glob, or "anything under vendor/".
+/// A repository must not be able to nominate an arbitrary checked-in file as
+/// an executable by naming it, and `validate_manvi_paths` separately proves
+/// the file really resolves inside the repository before it is spawned.
+fn repo_local_program(normalized: &str) -> Option<&'static str> {
+    match normalized {
+        // Build wrappers a project checks in so nobody needs a system tool.
+        "./gradlew" | ".\\gradlew" => Some("./gradlew"),
+        "./mvnw" | ".\\mvnw" => Some("./mvnw"),
+        ".venv/bin/python" | "venv/bin/python" | ".venv/scripts/python" | "venv/scripts/python" => {
+            Some("python")
+        }
+        "vendor/bin/phpunit" => Some("phpunit"),
+        _ => None,
+    }
+}
+
+/// `python -m venv .venv` — creating the project's own virtualenv.
+///
+/// The target directory is pinned to the two conventional names rather than
+/// "any repository-relative path": coverage generation has exactly one reason
+/// to create a virtualenv, and a free-form path would let plan text scatter
+/// interpreters through the checkout.
+/// Resolves a bare program name against the process PATH to its canonical
+/// path. Host-controlled by construction — the repository has no say in it,
+/// which is what makes it usable as a trust anchor.
+fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .filter(|candidate| candidate.is_file())
+        .find_map(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
+/// True when `interpreter`, after every symlink is resolved, is the very
+/// Python GitPulse would have run from PATH anyway.
+fn resolves_to_host_python(interpreter: &std::path::Path) -> bool {
+    let Ok(target) = std::fs::canonicalize(interpreter) else {
+        return false;
+    };
+    ["python3", "python"]
+        .iter()
+        .any(|name| resolve_on_path(name).is_some_and(|host| host == target))
+}
+
+/// Validates the project virtualenv's interpreter as a program.
+///
+/// Canonical containment — the rule every other repository-local program is
+/// held to — is the wrong test here and would reject every real virtualenv:
+/// `python -m venv` builds `.venv/bin/python` as a symlink *out* to the host
+/// toolchain, by construction. So the property is preserved a different way
+/// rather than dropped. Three things must hold:
+///
+/// 1. the venv directory carries `pyvenv.cfg`, the marker of a real
+///    virtualenv rather than a directory shaped like one;
+/// 2. the interpreter path exists inside the repository, lexically; and
+/// 3. it resolves to the same binary as `python3`/`python` on PATH.
+///
+/// (3) is the load-bearing one. It means the process GitPulse executes is the
+/// interpreter it would have executed regardless — the virtualenv changes
+/// which site-packages get imported, not which binary runs. A repository that
+/// ships `.venv/bin/python` as a symlink to `/bin/sh`, to a checked-in
+/// payload, or to any other interpreter fails it and is refused.
+pub(crate) fn check_venv_interpreter(
+    repo: &std::path::Path,
+    relative: &str,
+) -> Result<(), &'static str> {
+    let Some(venv_dir) = relative.split('/').next().filter(|dir| !dir.is_empty()) else {
+        return Err("has no virtualenv directory");
+    };
+    match sandbox_join_canonical(repo, &format!("{venv_dir}/pyvenv.cfg")) {
+        Ok(cfg) if cfg.is_file() => {}
+        _ => return Err("is not inside a virtualenv (no pyvenv.cfg)"),
+    }
+    let Ok(interpreter) = sandbox_join(repo, relative) else {
+        return Err("is not a repository-relative path");
+    };
+    if !interpreter.is_file() {
+        return Err("is not a repository file");
+    }
+    if !resolves_to_host_python(&interpreter) {
+        return Err("does not resolve to the Python interpreter on PATH");
+    }
+    Ok(())
+}
+
+fn validate_venv_interpreter(
+    repo: &std::path::Path,
+    relative: &str,
+    kind: ManviActionKind,
+) -> Result<(), String> {
+    check_venv_interpreter(repo, relative).map_err(|detail| {
+        format!(
+            "MANVI {} action refused: virtualenv interpreter '{relative}' {detail}; GitPulse will not execute it",
+            kind.label()
+        )
+    })
+}
+
+/// Single owner of "is this program a repository file rather than a PATH
+/// name". Three checks must agree on it — the executable-path refusal, the
+/// allowlist match, and path validation — and they previously each carried
+/// their own literal list, which is how the vendored phpunit and venv
+/// interpreter the scanner plans could be accepted by one and refused by
+/// another.
+fn program_is_repo_local(program_raw: &str) -> bool {
+    repo_local_program(&normalized_program(program_raw)).is_some()
+}
+
+fn python_venv_create_allowed(args: &[String]) -> bool {
+    args.len() == 4
+        && args.get(2).map(String::as_str) == Some("venv")
+        && matches!(args.get(3).map(String::as_str), Some(".venv" | "venv"))
+}
+
+/// The pytest coverage toolchain, and nothing else.
+const PYTEST_COVERAGE_PACKAGES: &[&str] = &["pytest", "pytest-cov"];
+
+/// `<repo venv>/bin/python -m pip install pytest pytest-cov`.
+///
+/// `pip install` is absent from every other allowlist arm on purpose. This is
+/// the single pinned exception and it is refused outright unless the
+/// interpreter is the repository's own virtualenv: installing into whatever
+/// interpreter happens to be on PATH mutates the host Python (and on a
+/// PEP 668 system fails or demands `--break-system-packages`), which is not a
+/// trade a coverage panel may make. The package set is fixed, so this cannot
+/// become a general package installer.
+fn pip_coverage_install_allowed(args: &[String], interpreter_is_repo_local: bool) -> bool {
+    if !interpreter_is_repo_local {
+        return false;
+    }
+    if args.get(3).map(String::as_str) != Some("install") {
+        return false;
+    }
+    let packages: Vec<&str> = args.iter().skip(4).map(String::as_str).collect();
+    !packages.is_empty()
+        && packages
+            .iter()
+            .all(|pkg| PYTEST_COVERAGE_PACKAGES.contains(pkg))
+}
+
+/// Coverage providers the scanner knows how to drive. Adding one here is what
+/// makes it installable; nothing else about the ecosystem is.
+const JS_COVERAGE_PROVIDERS: &[&str] = &["@vitest/coverage-v8", "@vitest/coverage-istanbul"];
+
+/// `npm install --save-dev @vitest/coverage-v8`.
+///
+/// A project devDependency, not a host mutation — but still a write to
+/// package.json and the lockfile, so it is pinned to the provider set and
+/// requires an explicit dev flag. A bare `npm install <anything>` under a
+/// coverage action would let plan text add any package to the project.
+fn node_coverage_provider_install_allowed(args: &[String]) -> bool {
+    if !matches!(
+        args.get(1).map(String::as_str),
+        Some("install" | "i" | "add")
+    ) {
+        return false;
+    }
+    let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+    let dev_flag = |arg: &str| matches!(arg, "--save-dev" | "-D" | "--dev");
+    if !rest.iter().copied().any(dev_flag) {
+        return false;
+    }
+    // Every token is either the dev flag or a pinned provider: no stray flags
+    // (`--registry`, `--force`) and no extra packages ride along.
+    let mut packages = 0usize;
+    for arg in &rest {
+        if dev_flag(arg) {
+            continue;
+        }
+        if !JS_COVERAGE_PROVIDERS.contains(arg) {
+            return false;
+        }
+        packages += 1;
+    }
+    packages > 0
+}
+
 fn rustup_llvm_tools_allowed(args: &[String]) -> bool {
     args.len() == 4
         && args.get(1).map(String::as_str) == Some("component")
@@ -712,8 +895,7 @@ fn node_package_command_allowed(args: &[String], kind: ManviActionKind) -> bool 
             "run" => npm_run_is_verification(args),
             _ => false,
         },
-        ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => match subcommand.as_str()
-        {
+        ManviActionKind::Coverage => match subcommand.as_str() {
             "test" => true,
             "run" => npm_run_is_verification(args),
             // npm exec may otherwise download a missing package. `--no` makes
@@ -721,10 +903,23 @@ fn node_package_command_allowed(args: &[String], kind: ManviActionKind) -> bool 
             "exec" => local_js_runner(args, 2),
             _ => false,
         },
+        // Generation may additionally install the missing coverage provider.
+        // Analysis (`Coverage`) never writes to the project.
+        ManviActionKind::CoverageGenerator => match subcommand.as_str() {
+            "test" => true,
+            "run" => npm_run_is_verification(args),
+            "exec" => local_js_runner(args, 2),
+            "install" | "i" | "add" => node_coverage_provider_install_allowed(args),
+            _ => false,
+        },
     }
 }
 
-fn python_module_allowed(args: &[String], kind: ManviActionKind) -> bool {
+fn python_module_allowed(
+    args: &[String],
+    kind: ManviActionKind,
+    interpreter_is_repo_local: bool,
+) -> bool {
     if args.get(1).map(String::as_str) != Some("-m") {
         return false;
     }
@@ -735,12 +930,25 @@ fn python_module_allowed(args: &[String], kind: ManviActionKind) -> bool {
             Some("pip_audit" | "pytest") => true,
             _ => false,
         },
-        ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => match module.as_deref() {
+        ManviActionKind::Coverage => match module.as_deref() {
             Some("pytest") => true,
             Some("coverage") => command_is_one_of(
                 &args[2..],
                 &["run", "report", "html", "xml", "json", "lcov"],
             ),
+            _ => false,
+        },
+        // Generation may additionally build the project virtualenv and put
+        // the pytest coverage toolchain in it. Both steps are pinned; neither
+        // is reachable from the read-only analysis action.
+        ManviActionKind::CoverageGenerator => match module.as_deref() {
+            Some("pytest") => true,
+            Some("coverage") => command_is_one_of(
+                &args[2..],
+                &["run", "report", "html", "xml", "json", "lcov"],
+            ),
+            Some("venv") => python_venv_create_allowed(args),
+            Some("pip") => pip_coverage_install_allowed(args, interpreter_is_repo_local),
             _ => false,
         },
     }
@@ -760,10 +968,7 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
     validate_argv_bounds(args).map_err(|e| format!("MANVI action refused: {e}"))?;
 
     let program_raw = args[0].trim();
-    let repo_wrapper = matches!(
-        program_raw,
-        "./gradlew" | ".\\gradlew.bat" | "./mvnw" | ".\\mvnw.cmd"
-    );
+    let repo_wrapper = program_is_repo_local(program_raw);
     if !repo_wrapper
         && (program_raw.contains('/')
             || program_raw.contains('\\')
@@ -807,7 +1012,11 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
         ));
     }
 
-    let program = normalized_program(program_raw);
+    let spelled = normalized_program(program_raw);
+    // A repository-local executable is judged as the tool it is, once its
+    // spelling has been pinned to a known-safe exact path.
+    let repo_local = repo_local_program(&spelled);
+    let program = repo_local.unwrap_or(spelled.as_str()).to_string();
     let allowed = match program.as_str() {
         "npm" | "pnpm" | "yarn" | "bun" => node_package_command_allowed(args, kind),
         "npx" => {
@@ -830,7 +1039,9 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
             }
         },
         "rustup" => kind == ManviActionKind::CoverageGenerator && rustup_llvm_tools_allowed(args),
-        "python" | "python3" | "py" => python_module_allowed(args, kind),
+        "python" | "python3" | "py" => {
+            python_module_allowed(args, kind, repo_local == Some("python"))
+        }
         "pip" | "pip3" => {
             kind == ManviActionKind::Health && command_is_one_of(args, &["check", "list", "audit"])
         }
@@ -854,21 +1065,36 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
             }
         },
         "govulncheck" => kind == ManviActionKind::Health,
-        "composer" => {
-            kind == ManviActionKind::Health
-                && command_is_one_of(
-                    args,
-                    &["audit", "update", "require", "install", "show", "test"],
-                )
-        }
+        "composer" => match kind {
+            ManviActionKind::Health => command_is_one_of(
+                args,
+                &["audit", "update", "require", "install", "show", "test"],
+            ),
+            // Materializing dependencies already pinned in composer.lock is
+            // what makes vendor/bin/phpunit exist at all.
+            ManviActionKind::CoverageGenerator => command_is_one_of(args, &["install", "test"]),
+            ManviActionKind::Coverage => command_is_one_of(args, &["test"]),
+        },
         "bundle" | "bundler" => match args.get(1).map(String::as_str) {
-            Some("audit" | "update" | "install" | "check") => kind == ManviActionKind::Health,
-            Some("exec") => {
-                kind == ManviActionKind::Health
-                    && args.get(2).is_some_and(|tool| {
-                        matches!(tool.as_str(), "rake" | "rspec" | "bundler-audit")
-                    })
-            }
+            Some("audit" | "update" | "check") => kind == ManviActionKind::Health,
+            // `bundle install` resolves the Gemfile so `bundle exec` can run
+            // at all; generation needs it, analysis does not.
+            Some("install") => matches!(
+                kind,
+                ManviActionKind::Health | ManviActionKind::CoverageGenerator
+            ),
+            Some("exec") => args.get(2).is_some_and(|tool| match kind {
+                ManviActionKind::Health => {
+                    matches!(tool.as_str(), "rake" | "rspec" | "bundler-audit")
+                }
+                // The Ruby generate command the scanner plans, and only it.
+                // Without this arm the command was planned and then refused at
+                // the gate. `rake` stays health-only: coverage has no reason
+                // to invoke arbitrary project tasks.
+                ManviActionKind::Coverage | ManviActionKind::CoverageGenerator => {
+                    tool.as_str() == "rspec"
+                }
+            }),
             _ => false,
         },
         "dotnet" => match kind {
@@ -943,25 +1169,33 @@ fn validate_manvi_paths(
     ];
 
     let program_raw = args.first().map(String::as_str).unwrap_or_default();
-    if matches!(
-        program_raw,
-        "./gradlew" | ".\\gradlew.bat" | "./mvnw" | ".\\mvnw.cmd"
-    ) {
+    // Programs that are files in the repository rather than names on PATH:
+    // build wrappers, the project virtualenv's interpreter, vendored phpunit.
+    // The allowlist has already pinned the spelling; this proves the path
+    // resolves to a real file that has not been symlinked out of the tree.
+    if program_is_repo_local(program_raw) {
         let normalized = program_raw.replace('\\', "/");
         let relative = normalized.strip_prefix("./").unwrap_or(&normalized);
-        let wrapper = sandbox_join_canonical(repo, relative).map_err(|e| {
-            format!(
-                "MANVI {} action refused: wrapper '{}' escapes the open repository: {e}",
-                kind.label(),
-                program_raw
-            )
-        })?;
-        if !wrapper.is_file() {
-            return Err(format!(
-                "MANVI {} action refused: wrapper '{}' is not a repository file",
-                kind.label(),
-                program_raw
-            ));
+        // The virtualenv interpreter is validated on its own terms; every
+        // other repository-local program must canonically resolve inside the
+        // tree. Both fall through to the argument checks below.
+        if repo_local_program(&normalized_program(program_raw)) == Some("python") {
+            validate_venv_interpreter(repo, relative, kind)?;
+        } else {
+            let wrapper = sandbox_join_canonical(repo, relative).map_err(|e| {
+                format!(
+                    "MANVI {} action refused: wrapper '{}' escapes the open repository: {e}",
+                    kind.label(),
+                    program_raw
+                )
+            })?;
+            if !wrapper.is_file() {
+                return Err(format!(
+                    "MANVI {} action refused: wrapper '{}' is not a repository file",
+                    kind.label(),
+                    program_raw
+                ));
+            }
         }
     }
 
@@ -1208,6 +1442,365 @@ mod tests {
             let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
                 .expect_err("an allowed keyword must not bless a different executable/task");
             assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
+    }
+
+    /// The virtualenv interpreter is the one program GitPulse executes that
+    /// is *expected* to symlink out of the repository, so it is exempted from
+    /// canonical containment. These tests pin what replaced that guarantee.
+    #[cfg(unix)]
+    #[test]
+    fn venv_interpreter_must_resolve_to_the_host_python() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        std::fs::write(repo.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        // A repository that ships its own "interpreter" pointing at a shell.
+        symlink("/bin/sh", repo.join(".venv/bin/python")).unwrap();
+
+        let err = check_venv_interpreter(repo, ".venv/bin/python")
+            .expect_err("a symlink to anything but the host python must be refused");
+        assert!(err.contains("does not resolve"), "{err}");
+
+        // And the refusal is what the command gate reports, not a bypass.
+        let argv = vec![
+            ".venv/bin/python".to_string(),
+            "-m".to_string(),
+            "pytest".to_string(),
+        ];
+        let gate = validate_manvi_paths(repo, &argv, ManviActionKind::CoverageGenerator)
+            .expect_err("the gate must refuse it too");
+        assert!(gate.contains("will not execute it"), "{gate}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn venv_interpreter_requires_a_real_virtualenv_marker() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        // A regular file in a directory merely shaped like a virtualenv.
+        std::fs::write(repo.join(".venv/bin/python"), "#!/bin/sh\necho hi\n").unwrap();
+
+        let err = check_venv_interpreter(repo, ".venv/bin/python")
+            .expect_err("no pyvenv.cfg means this is not a virtualenv");
+        assert!(err.contains("pyvenv.cfg"), "{err}");
+    }
+
+    #[test]
+    fn venv_interpreter_must_exist() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = check_venv_interpreter(dir.path(), ".venv/bin/python")
+            .expect_err("an absent interpreter is not runnable");
+        assert!(
+            err.contains("pyvenv.cfg") || err.contains("repository file"),
+            "{err}"
+        );
+    }
+
+    /// The positive case, against a virtualenv built the way `python -m venv`
+    /// really builds one (interpreter symlinked out to the host toolchain).
+    /// Skipped where no Python is installed; the negative cases above carry
+    /// the security contract on every machine.
+    #[test]
+    fn a_real_virtualenv_interpreter_is_accepted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        let built = std::process::Command::new("python3")
+            .args(["-m", "venv", ".venv"])
+            .current_dir(repo)
+            .status();
+        match built {
+            Ok(status) if status.success() => {}
+            _ => return, // no usable python3 on this host
+        }
+        check_venv_interpreter(repo, ".venv/bin/python")
+            .expect("a virtualenv built by python -m venv must be accepted");
+        let argv = vec![
+            ".venv/bin/python".to_string(),
+            "-m".to_string(),
+            "pytest".to_string(),
+            "--cov".to_string(),
+            "--cov-report=xml".to_string(),
+        ];
+        validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+            .expect("the planned generate command must be allowed");
+        validate_manvi_paths(repo, &argv, ManviActionKind::CoverageGenerator)
+            .expect("and its paths must validate");
+    }
+
+    /// The setup steps coverage generation is now allowed to run.
+    ///
+    /// Each is pinned to one shape. This test is the inventory of what the
+    /// widening actually bought; anything not listed here must be refused by
+    /// the companion test below.
+    #[test]
+    fn coverage_generator_allows_exactly_the_planned_setup_steps() {
+        for argv in [
+            // Python: build the project's own virtualenv, then put the pytest
+            // coverage toolchain in it, then run it.
+            vec!["python3".into(), "-m".into(), "venv".into(), ".venv".into()],
+            vec!["python".into(), "-m".into(), "venv".into(), "venv".into()],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "pytest".into(),
+                "pytest-cov".into(),
+            ],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pytest".into(),
+                "--cov".into(),
+                "--cov-report=xml".into(),
+            ],
+            // JavaScript: the missing coverage provider as a devDependency.
+            vec![
+                "npm".into(),
+                "install".into(),
+                "--save-dev".into(),
+                "@vitest/coverage-v8".into(),
+            ],
+            vec![
+                "npm".into(),
+                "install".into(),
+                "-D".into(),
+                "@vitest/coverage-istanbul".into(),
+            ],
+            // PHP and Ruby: materialize dependencies the manifest already pins.
+            vec!["composer".into(), "install".into()],
+            vec!["bundle".into(), "install".into()],
+            vec!["bundle".into(), "exec".into(), "rspec".into()],
+            vec![
+                "vendor/bin/phpunit".into(),
+                "--coverage-clover".into(),
+                "coverage.xml".into(),
+            ],
+            // JVM: the wrapper a project ships so nobody needs a system Maven.
+            vec!["./mvnw".into(), "verify".into()],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
+        }
+    }
+
+    /// The blast radius of the setup widening, stated as refusals.
+    ///
+    /// The load-bearing case is the first one: installing into whatever
+    /// interpreter is on PATH mutates the host Python. Only the repository's
+    /// own virtualenv may receive packages, and only the pinned ones.
+    #[test]
+    fn coverage_generator_refuses_everything_adjacent_to_the_setup_steps() {
+        for (argv, why) in [
+            (
+                vec![
+                    "python3".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "pytest".into(),
+                ],
+                "host interpreter must never receive an install",
+            ),
+            (
+                vec!["pip".into(), "install".into(), "pytest".into()],
+                "bare pip is not an install channel",
+            ),
+            (
+                vec![
+                    ".venv/bin/python".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "requests".into(),
+                ],
+                "package set is pinned to the pytest coverage toolchain",
+            ),
+            (
+                vec![
+                    ".venv/bin/python".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "pytest".into(),
+                    "evil-package".into(),
+                ],
+                "an extra package must not ride along with a pinned one",
+            ),
+            (
+                vec![
+                    ".venv/bin/python".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "uninstall".into(),
+                    "pytest".into(),
+                ],
+                "only install is allowed",
+            ),
+            (
+                vec![
+                    "python3".into(),
+                    "-m".into(),
+                    "venv".into(),
+                    "tools/env".into(),
+                ],
+                "virtualenv location is pinned to .venv/venv",
+            ),
+            (
+                vec![
+                    "npm".into(),
+                    "install".into(),
+                    "--save-dev".into(),
+                    "left-pad".into(),
+                ],
+                "provider set is pinned",
+            ),
+            (
+                vec!["npm".into(), "install".into(), "@vitest/coverage-v8".into()],
+                "a coverage provider is a devDependency, not a dependency",
+            ),
+            (
+                vec![
+                    "npm".into(),
+                    "install".into(),
+                    "--save-dev".into(),
+                    "@vitest/coverage-v8".into(),
+                    "--force".into(),
+                ],
+                "no stray flags may ride along",
+            ),
+            (
+                vec!["npm".into(), "install".into()],
+                "a bare install resolves the whole tree, which is not a coverage step",
+            ),
+            (
+                vec!["composer".into(), "require".into(), "evil/pkg".into()],
+                "generation may install pinned deps, not add new ones",
+            ),
+            (
+                vec![
+                    "bundle".into(),
+                    "exec".into(),
+                    "rake".into(),
+                    "release".into(),
+                ],
+                "coverage has no reason to run arbitrary project tasks",
+            ),
+            (
+                vec![
+                    "vendor/bin/evil".into(),
+                    "--coverage-clover".into(),
+                    "coverage.xml".into(),
+                ],
+                "a repository file is not an executable just because it is named",
+            ),
+            (
+                vec![".venv/bin/pip".into(), "install".into(), "pytest".into()],
+                "only the pinned interpreter spellings are repo-local programs",
+            ),
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err(&format!("{argv:?} must be refused: {why}"));
+            assert!(
+                err.contains("refused"),
+                "{argv:?} ({why}) must be refused explicitly: {err}"
+            );
+        }
+    }
+
+    /// Analysis never writes. Every setup step the generator may run must be
+    /// refused for the read-only coverage action, so a mislabeled call site
+    /// cannot install anything.
+    #[test]
+    fn coverage_analysis_refuses_every_setup_step() {
+        for argv in [
+            vec!["python3".into(), "-m".into(), "venv".into(), ".venv".into()],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "pytest".into(),
+                "pytest-cov".into(),
+            ],
+            vec![
+                "npm".into(),
+                "install".into(),
+                "--save-dev".into(),
+                "@vitest/coverage-v8".into(),
+            ],
+            vec!["composer".into(), "install".into()],
+            vec!["bundle".into(), "install".into()],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::Coverage)
+                .expect_err("analysis must not be able to install anything");
+            assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
+    }
+
+    /// A health remediation must not become an install channel either: the
+    /// venv/pip pair is coverage-generation-only.
+    #[test]
+    fn health_actions_cannot_use_the_coverage_install_channel() {
+        for argv in [
+            vec!["python3".into(), "-m".into(), "venv".into(), ".venv".into()],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "pytest".into(),
+            ],
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::Health)
+                .expect_err("health remediation is not a coverage setup channel");
+            assert!(err.contains("allowlist"), "{argv:?}: {err}");
+        }
+    }
+
+    /// The global refusals still bind the new shapes: no escaping the repo,
+    /// no host-wide flags, no network sources.
+    #[test]
+    fn setup_steps_remain_subject_to_the_global_refusals() {
+        for argv in [
+            vec![
+                "python3".into(),
+                "-m".into(),
+                "venv".into(),
+                "/tmp/env".into(),
+            ],
+            vec![
+                "python3".into(),
+                "-m".into(),
+                "venv".into(),
+                "../outside".into(),
+            ],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "--user".into(),
+                "pytest".into(),
+            ],
+            vec![
+                "npm".into(),
+                "install".into(),
+                "--save-dev".into(),
+                "https://evil.example/pkg.tgz".into(),
+            ],
+            vec![
+                "npm".into(),
+                "install".into(),
+                "--global".into(),
+                "@vitest/coverage-v8".into(),
+            ],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err("global refusals must still bind");
         }
     }
 

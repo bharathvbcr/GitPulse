@@ -279,3 +279,48 @@ describe("CoverageViewer honesty contracts (regression)", () => {
     expect(source).toContain("suggestedCoverageCommands(family).length > 0");
   });
 });
+
+describe("CoverageViewer install-then-generate contracts (regression)", () => {
+  it("offers the pipeline button whenever the scanner planned a generate command", () => {
+    // Gated on the command, not on tool_ready: a family whose toolchain is
+    // missing is precisely the one that needs the setup-then-generate run.
+    expect(source).toContain("suggestedCoverageCommands(family).length > 0");
+    expect(source).toContain("runCoverageFamily(family.family)");
+  });
+
+  it("hides the bare command chips until the toolchain is ready", () => {
+    // Running `vitest --coverage` or the venv pytest on its own, before setup,
+    // is the failure the pipeline exists to prevent. Only ready families get
+    // one-click access to the raw command.
+    expect(source).toContain("{#if family.tool_ready !== false}");
+  });
+
+  it("runs every setup step before any generate step and stops on failure", () => {
+    const pipelineFn = source.slice(
+      source.indexOf("async function runCoveragePipeline"),
+      source.indexOf("async function runCoverageFamily"),
+    );
+    expect(pipelineFn).toContain('step.kind === "setup"');
+    expect(pipelineFn).toContain('step.kind === "generate"');
+    expect(pipelineFn.indexOf("for (const step of setup)")).toBeLessThan(
+      pipelineFn.indexOf("for (const step of generate)"),
+    );
+    // A failed install must not be followed by a run that cannot work.
+    expect(pipelineFn).toMatch(/for \(const step of setup\)[\s\S]*?if \(!passed\) return false;/);
+  });
+
+  it("routes generation through the coverage_generator action kind", () => {
+    // The read-only "coverage" kind cannot install anything; only this one is
+    // permitted to mutate the project or the virtualenv.
+    expect(source).toContain('actionKind: "coverage_generator"');
+  });
+
+  it("rescans after a pipeline so a newly installed toolchain is picked up", () => {
+    const pipelineFn = source.slice(
+      source.indexOf("async function runCoveragePipeline"),
+      source.indexOf("async function runCoverageFamily"),
+    );
+    expect(pipelineFn).toContain("rescan()");
+  });
+});
+

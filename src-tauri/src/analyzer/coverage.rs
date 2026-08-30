@@ -1077,9 +1077,96 @@ fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
     commands
 }
 
-fn python_coverage_commands() -> Vec<String> {
-    vec!["pytest --cov --cov-report=xml".into()]
+/// Repo-relative interpreter paths a project virtualenv puts its Python at.
+/// Unix and Windows layouts differ; both are probed so a checkout made on one
+/// platform is still recognized on the other.
+const VENV_PYTHON_PATHS: &[&str] = &[
+    ".venv/bin/python",
+    "venv/bin/python",
+    ".venv/Scripts/python.exe",
+    "venv/Scripts/python.exe",
+];
+
+/// Where GitPulse creates a virtualenv when the project has none, and the
+/// interpreter inside it. Kept as one pair so the create step and every later
+/// step cannot drift apart.
+const MANAGED_VENV_DIR: &str = ".venv";
+
+fn managed_venv_python() -> &'static str {
+    if cfg!(windows) {
+        ".venv/Scripts/python.exe"
+    } else {
+        ".venv/bin/python"
+    }
 }
+
+/// The project's existing virtualenv interpreter, if one is checked out.
+///
+/// Presence is not enough: the interpreter must also pass the same trust rule
+/// the command gate applies before executing it, or planning a command around
+/// it would produce a step that is guaranteed to be refused.
+fn existing_venv_python(repo: &Path) -> Result<Option<&'static str>, &'static str> {
+    let mut rejection = None;
+    for rel in VENV_PYTHON_PATHS.iter().copied() {
+        // Lexical existence check: a virtualenv interpreter is a symlink out
+        // to the host toolchain by construction, so canonical containment
+        // (`manifest_is_file`) would report every real virtualenv as absent.
+        if !repo.join(rel).is_file() {
+            continue;
+        }
+        match crate::terminal::check_venv_interpreter(repo, rel) {
+            Ok(()) => return Ok(Some(rel)),
+            Err(reason) => rejection = Some(reason),
+        }
+    }
+    match rejection {
+        Some(reason) => Err(reason),
+        None => Ok(None),
+    }
+}
+
+/// True when `pytest` can actually be imported by this interpreter. A present
+/// virtualenv is not the same as a virtualenv that can generate coverage, and
+/// reporting "ready" for one would send the user into a failing run.
+fn interpreter_has_pytest(repo: &Path, python_rel: &str) -> bool {
+    // Already trust-checked by `existing_venv_python`; join lexically because
+    // the interpreter legitimately symlinks out of the repository.
+    let Ok(python) = sandbox_join(repo, python_rel) else {
+        return false;
+    };
+    match capture_command(
+        &python.to_string_lossy(),
+        &["-m", "pytest", "--version"],
+        Some(repo),
+        TOOL_PROBE_TIMEOUT,
+        &[],
+    ) {
+        Ok(out) => out.success,
+        Err(_) => false,
+    }
+}
+
+/// The interpreter GitPulse creates virtualenvs with. `python3` first: on
+/// macOS and most Linux distributions a bare `python` is either absent or
+/// Python 2.
+fn host_python_program(repo: &Path) -> Option<&'static str> {
+    let _ = repo;
+    ["python3", "python"]
+        .into_iter()
+        .find(|program| program_on_path(program))
+}
+
+fn pytest_generate_command(python_rel: Option<&str>) -> String {
+    match python_rel {
+        Some(python) => format!("{python} -m pytest --cov --cov-report=xml"),
+        None => "pytest --cov --cov-report=xml".to_string(),
+    }
+}
+
+/// Packages a coverage generate step needs from PyPI. Pinned as a set (not a
+/// user-supplied list) because the command gate allows exactly this
+/// installation and nothing else.
+const PYTEST_COVERAGE_PACKAGES: &str = "pytest pytest-cov";
 
 fn go_test_cover_command(dir: &str) -> Option<String> {
     let command = if dir.is_empty() {
@@ -1126,8 +1213,15 @@ fn jvm_coverage_commands(repo: &Path, mvn_ready: bool) -> Vec<String> {
     if manifest_is_file(repo, "gradlew") || manifest_is_file(repo, "gradlew.bat") {
         commands.push("./gradlew test jacocoTestReport".into());
     }
-    if manifest_is_file(repo, "pom.xml") && mvn_ready {
-        commands.push("mvn verify".into());
+    if manifest_is_file(repo, "pom.xml") {
+        // A checked-in Maven wrapper is the project's own Maven. Requiring a
+        // system `mvn` made GitPulse report "mvn is not installed" for repos
+        // that ship `mvnw` precisely so nobody needs one.
+        if manifest_is_file(repo, "mvnw") || manifest_is_file(repo, "mvnw.cmd") {
+            commands.push("./mvnw verify".into());
+        } else if mvn_ready {
+            commands.push("mvn verify".into());
+        }
     }
     commands
 }
@@ -1225,25 +1319,122 @@ fn rust_coverage_plan(
     }
 }
 
-fn javascript_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
-    let generate = javascript_coverage_commands(repo);
-    if generate.is_empty() {
-        return LanguageCoveragePlan::unavailable(&javascript_unready_detail(repo));
+/// The one JavaScript setup step that is both bounded and correct: a checkout
+/// that already depends on vitest but declares no coverage provider. The
+/// provider is a devDependency of this project, so installing it is a
+/// repository change (package.json + lockfile), not a host change.
+///
+/// Deliberately narrow: a checkout with no test runner at all is not a missing
+/// package, it is a missing test suite, and `npm install vitest` would leave
+/// the user with a runner and nothing to run.
+fn javascript_provider_setup(repo: &Path) -> Option<(String, String)> {
+    let pkg = read_root_package_json(repo)?;
+    if !package_has_dep(&pkg, "vitest") || javascript_has_vitest_coverage_provider(&pkg) {
+        return None;
     }
-    LanguageCoveragePlan::ready(
-        generate,
-        "Frontend coverage usually finishes in about a minute.",
-    )
+    Some((
+        "npm install --save-dev @vitest/coverage-v8".to_string(),
+        "Vitest is present but no coverage provider is declared. GitPulse will add @vitest/coverage-v8 to devDependencies.".to_string(),
+    ))
 }
 
-fn python_coverage_plan(pytest_ready: bool) -> LanguageCoveragePlan {
-    if !pytest_ready {
-        return LanguageCoveragePlan::unavailable("pytest is not installed.");
+fn javascript_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let generate = javascript_coverage_commands(repo);
+    if !generate.is_empty() {
+        return LanguageCoveragePlan::ready(
+            generate,
+            "Frontend coverage usually finishes in about a minute.",
+        );
     }
-    LanguageCoveragePlan::ready(
-        python_coverage_commands(),
-        "Python coverage can take a few minutes.",
-    )
+    if let Some((setup, detail)) = javascript_provider_setup(repo) {
+        return LanguageCoveragePlan {
+            generate: vec!["npx --no-install vitest run --coverage".into()],
+            setup: vec![setup],
+            tool_ready: false,
+            tool_detail: detail,
+            duration_hint:
+                "Installing the coverage provider and running the suite usually takes a minute or two."
+                    .into(),
+        };
+    }
+    LanguageCoveragePlan::unavailable(&javascript_unready_detail(repo))
+}
+
+/// Python coverage, including the setup needed to get there.
+///
+/// "pytest is not installed" used to end the story: no generate command, no
+/// setup, nothing to press. But pytest is installable, so the honest answer is
+/// a plan, not a dead end. Installation is deliberately confined to a
+/// project-local virtualenv: the host interpreter may be externally managed
+/// (PEP 668), where a plain `pip install` either fails or requires
+/// `--break-system-packages`, and mutating the system Python to render a
+/// coverage number is not a trade this app gets to make on the user's behalf.
+///
+/// An interpreter that already has pytest is used as-is — GitPulse does not
+/// impose a virtualenv on a project whose toolchain already works.
+fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+    let venv = match existing_venv_python(repo) {
+        Ok(found) => found,
+        Err(reason) => {
+            // A virtualenv exists but GitPulse will not run its interpreter.
+            // Say which rule it failed rather than silently falling back to
+            // the host interpreter or planning a step the gate would refuse.
+            return LanguageCoveragePlan::unavailable(&format!(
+                "The project virtualenv {reason}, so GitPulse will not use it. Recreate it with `python3 -m venv .venv`, then rescan."
+            ));
+        }
+    };
+    if let Some(python) = venv {
+        let generate = vec![pytest_generate_command(Some(python))];
+        if interpreter_has_pytest(repo, python) {
+            return LanguageCoveragePlan::ready(
+                generate,
+                "Python coverage can take a few minutes.",
+            );
+        }
+        return LanguageCoveragePlan {
+            generate,
+            setup: vec![format!(
+                "{python} -m pip install {PYTEST_COVERAGE_PACKAGES}"
+            )],
+            tool_ready: false,
+            tool_detail: format!("pytest is not installed in the project virtualenv ({python})."),
+            duration_hint:
+                "Installing pytest and generating Python coverage can take a few minutes.".into(),
+        };
+    }
+
+    if program_on_path("pytest") {
+        return LanguageCoveragePlan::ready(
+            vec![pytest_generate_command(None)],
+            "Python coverage can take a few minutes.",
+        );
+    }
+
+    let Some(host_python) = host_python_program(repo) else {
+        // Nothing to build a virtualenv with. Installing a Python runtime is a
+        // host-level change with no bounded command; say so instead of
+        // planning a step that cannot succeed.
+        return LanguageCoveragePlan::unavailable(
+            "No Python interpreter on PATH, so pytest cannot be installed. Install Python, then rescan.",
+        );
+    };
+
+    let python = managed_venv_python();
+    LanguageCoveragePlan {
+        generate: vec![pytest_generate_command(Some(python))],
+        setup: vec![
+            format!("{host_python} -m venv {MANAGED_VENV_DIR}"),
+            format!("{python} -m pip install {PYTEST_COVERAGE_PACKAGES}"),
+        ],
+        tool_ready: false,
+        tool_detail: format!(
+            "pytest is not installed. GitPulse will create {MANAGED_VENV_DIR} in this repository and install pytest there; your system Python is not touched."
+        ),
+        duration_hint:
+            "Creating the virtualenv, installing pytest and generating coverage can take a few minutes."
+                .into(),
+    }
 }
 
 fn go_coverage_plan(
@@ -1264,7 +1455,9 @@ fn jvm_coverage_plan(repo: &Path, mvn_ready: bool) -> LanguageCoveragePlan {
         return LanguageCoveragePlan::ready(generate, "JVM coverage can take a few minutes.");
     }
     if manifest_is_file(repo, "pom.xml") && !mvn_ready {
-        return LanguageCoveragePlan::unavailable("mvn is not installed.");
+        return LanguageCoveragePlan::unavailable(
+            "mvn is not installed and this project ships no Maven wrapper (mvnw).",
+        );
     }
     LanguageCoveragePlan::unavailable("No Gradle wrapper or pom.xml in the repository.")
 }
@@ -1337,6 +1530,25 @@ fn php_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
             "No composer.json or vendor/bin/phpunit in this repository.",
         );
     }
+    // A composer project whose vendor/ has never been installed has the
+    // manifest but not the runner. `composer install` is a project-local
+    // materialization of dependencies already pinned in composer.lock.
+    let vendored = manifest_is_file(repo, "vendor/bin/phpunit");
+    if !vendored && manifest_is_file(repo, "composer.json") {
+        if !program_on_path("composer") {
+            return LanguageCoveragePlan::unavailable(
+                "composer is not installed, so PHP dependencies cannot be installed. Install Composer, then rescan.",
+            );
+        }
+        return LanguageCoveragePlan {
+            generate,
+            setup: vec!["composer install".into()],
+            tool_ready: false,
+            tool_detail: "PHP dependencies are not installed (no vendor/bin/phpunit).".into(),
+            duration_hint: "Installing dependencies and running the suite can take a few minutes."
+                .into(),
+        };
+    }
     LanguageCoveragePlan::ready(
         generate,
         "PHP test coverage usually finishes in about a minute.",
@@ -1355,6 +1567,22 @@ fn ruby_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
     let generate = ruby_coverage_commands(repo);
     if generate.is_empty() {
         return LanguageCoveragePlan::unavailable("No Gemfile in this repository.");
+    }
+    if !program_on_path("bundle") {
+        return LanguageCoveragePlan::unavailable(
+            "bundler is not installed, so Ruby dependencies cannot be installed. Install Bundler, then rescan.",
+        );
+    }
+    // No Gemfile.lock means the bundle has never been resolved, so
+    // `bundle exec` would fail before the suite ever starts.
+    if !manifest_is_file(repo, "Gemfile.lock") {
+        return LanguageCoveragePlan {
+            generate,
+            setup: vec!["bundle install".into()],
+            tool_ready: false,
+            tool_detail: "Ruby dependencies are not installed (no Gemfile.lock).".into(),
+            duration_hint: "Installing gems and running the suite can take a few minutes.".into(),
+        };
     }
     LanguageCoveragePlan::ready(
         generate,
@@ -1443,7 +1671,7 @@ fn fill_suggested_commands(
     let javascript = javascript_coverage_plan(repo);
     let rust = rust_coverage_plan(repo, layout.cargo_dirs, llvm_cov_ready);
     let python = if family_present(families, "python") {
-        python_coverage_plan(program_on_path("pytest"))
+        python_coverage_plan(repo)
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
     };
@@ -3526,12 +3754,167 @@ src/main.go:4.1,4.8 1 0
         assert!(!plan.generate.is_empty());
     }
 
+    /// Replaces `python_plan_is_unavailable_when_pytest_is_missing`, which
+    /// asserted the dead end: no generate command, no setup, nothing to press.
+    /// pytest is installable, so a missing pytest is a plan, not a verdict.
+    /// A virtualenv GitPulse will not execute must not silently become a
+    /// fallback to the host interpreter, and must not be planned around
+    /// either — that would emit steps the command gate is certain to refuse.
+    #[cfg(unix)]
     #[test]
-    fn python_plan_is_unavailable_when_pytest_is_missing() {
-        let plan = python_coverage_plan(false);
+    fn untrusted_project_venv_is_refused_with_its_reason() {
+        use std::os::unix::fs::symlink;
+        let repo = git_repo();
+        write(repo.path(), "app/main.py", "print(1)\n");
+        write(repo.path(), ".venv/pyvenv.cfg", "home = /usr/bin\n");
+        std::fs::create_dir_all(repo.path().join(".venv/bin")).unwrap();
+        symlink("/bin/sh", repo.path().join(".venv/bin/python")).unwrap();
+
+        let plan = python_coverage_plan(repo.path());
+        assert!(plan.generate.is_empty(), "no step may be planned around it");
+        assert!(plan.setup.is_empty());
         assert!(!plan.tool_ready);
+        assert!(
+            plan.tool_detail.contains("virtualenv"),
+            "the reason must name the virtualenv: {:?}",
+            plan.tool_detail
+        );
+    }
+
+    /// Regression: a project that ships `mvnw` ships its own Maven precisely
+    /// so nobody needs a system one, but the plan required `mvn` on PATH and
+    /// reported "mvn is not installed" for exactly those repositories.
+    #[test]
+    fn maven_wrapper_is_used_instead_of_requiring_a_system_maven() {
+        let repo = git_repo();
+        write(repo.path(), "src/Main.java", "class Main {}\n");
+        write(repo.path(), "pom.xml", "<project></project>\n");
+        write(repo.path(), "mvnw", "#!/bin/sh\nexit 0\n");
+
+        // `false` = no system maven, the case that used to be a dead end.
+        let plan = jvm_coverage_plan(repo.path(), false);
+        assert_eq!(plan.generate, vec!["./mvnw verify".to_string()]);
+        assert!(plan.tool_ready);
+    }
+
+    #[test]
+    fn maven_without_wrapper_or_system_maven_says_both_are_missing() {
+        let repo = git_repo();
+        write(repo.path(), "src/Main.java", "class Main {}\n");
+        write(repo.path(), "pom.xml", "<project></project>\n");
+
+        let plan = jvm_coverage_plan(repo.path(), false);
         assert!(plan.generate.is_empty());
+        assert!(!plan.tool_ready);
+        assert!(
+            plan.tool_detail.contains("mvnw"),
+            "the wrapper must be named as the alternative: {:?}",
+            plan.tool_detail
+        );
+    }
+
+    #[test]
+    fn python_plan_installs_pytest_into_an_existing_project_venv() {
+        let repo = git_repo();
+        write(repo.path(), "app/main.py", "print(1)\n");
+        // A real virtualenv: it must pass the interpreter trust rule (a stub
+        // file does not), and pytest genuinely is not in it yet.
+        let built = std::process::Command::new("python3")
+            .args(["-m", "venv", ".venv"])
+            .current_dir(repo.path())
+            .status();
+        match built {
+            Ok(status) if status.success() => {}
+            _ => return, // no usable python3 on this host
+        }
+
+        let plan = python_coverage_plan(repo.path());
+        assert!(!plan.tool_ready, "a venv without pytest is not ready");
+        assert_eq!(
+            plan.generate,
+            vec![".venv/bin/python -m pytest --cov --cov-report=xml".to_string()],
+            "the generate step must run the project interpreter, not a host one"
+        );
+        assert_eq!(
+            plan.setup,
+            vec![".venv/bin/python -m pip install pytest pytest-cov".to_string()],
+            "installation must target the project virtualenv only"
+        );
         assert!(plan.tool_detail.contains("pytest"));
+        assert!(!plan.duration_hint.is_empty());
+    }
+
+    /// With no virtualenv, GitPulse creates one rather than touching the host
+    /// interpreter. Asserted as an invariant rather than an exact command list
+    /// because a host that already has pytest legitimately skips the venv.
+    #[test]
+    fn python_plan_is_never_a_dead_end_when_python_exists() {
+        let repo = git_repo();
+        write(repo.path(), "app/main.py", "print(1)\n");
+        let plan = python_coverage_plan(repo.path());
+        if plan.tool_detail.contains("No Python interpreter") {
+            // No interpreter to build a venv with: an honest refusal, not a
+            // silent one.
+            assert!(plan.generate.is_empty());
+            assert!(!plan.tool_ready);
+            return;
+        }
+        assert!(
+            !plan.generate.is_empty(),
+            "a repository with Python sources must always get a generate command"
+        );
+        if !plan.tool_ready {
+            assert!(
+                !plan.setup.is_empty(),
+                "not-ready must mean 'here are the steps', never 'give up'"
+            );
+            assert!(
+                plan.setup.iter().any(|cmd| cmd.contains("pip install")),
+                "the plan must actually install pytest: {:?}",
+                plan.setup
+            );
+            assert!(
+                plan.setup
+                    .iter()
+                    .all(|cmd| !cmd.contains("--user") && !cmd.contains("--break-system-packages")),
+                "the host interpreter must never be mutated: {:?}",
+                plan.setup
+            );
+        }
+    }
+
+    /// The contract every family now owes the user: if it cannot generate
+    /// coverage yet, it either offers the steps that would fix that or states
+    /// why no step exists. Silence is not an option.
+    #[test]
+    fn no_family_is_left_without_steps_or_a_reason() {
+        let repo = git_repo();
+        write(repo.path(), "app/main.py", "print(1)\n");
+        write(repo.path(), "src/lib.rs", "pub fn a() {}\n");
+        write(repo.path(), "src/main.go", "package main\n");
+        write(repo.path(), "src/engine.c", "int main(void){return 0;}\n");
+        write(repo.path(), "app/index.php", "<?php echo 1;\n");
+        write(repo.path(), "app/main.rb", "puts 1\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert!(report.families.len() >= 5);
+        for family in &report.families {
+            if family.found {
+                continue;
+            }
+            let actionable = !family.suggested_commands.is_empty();
+            assert!(
+                actionable || !family.tool_detail.is_empty(),
+                "{} offers neither a command nor a reason",
+                family.family
+            );
+            if !family.tool_ready && actionable {
+                assert!(
+                    !family.setup_commands.is_empty(),
+                    "{} says its toolchain is missing but offers no way to install it",
+                    family.family
+                );
+            }
+        }
     }
 
     #[test]
@@ -3662,7 +4045,14 @@ src/main.go:4.1,4.8 1 0
     }
 
     #[test]
-    fn javascript_vitest_without_coverage_provider_is_not_planned() {
+    /// Was `javascript_vitest_without_coverage_provider_is_not_planned`, which
+    /// asserted that nothing at all was planned. The guardrail it protected —
+    /// never run `vitest --coverage` against a checkout with no provider, which
+    /// fails with "Cannot find dependency '@vitest/coverage-v8'" — is now
+    /// enforced by ordering instead of by silence: the generate command exists
+    /// but sits behind a setup step, and `tool_ready = false` keeps the UI from
+    /// offering it as a standalone command chip.
+    fn javascript_missing_coverage_provider_is_installed_before_running() {
         let repo = git_repo();
         write(repo.path(), "src/app.ts", "export const x = 1;\n");
         write(
@@ -3676,17 +4066,43 @@ src/main.go:4.1,4.8 1 0
             .iter()
             .find(|f| f.family == "javascript")
             .expect("javascript family");
-        assert!(
-            js.suggested_commands.is_empty(),
-            "vitest without a coverage provider must not plan --coverage: {:?}",
-            js.suggested_commands
+        assert_eq!(
+            js.setup_commands,
+            vec!["npm install --save-dev @vitest/coverage-v8".to_string()],
+            "the missing provider must be installable"
         );
-        assert!(!js.tool_ready);
+        assert_eq!(
+            js.suggested_commands,
+            vec!["npx --no-install vitest run --coverage".to_string()],
+        );
+        assert!(
+            !js.tool_ready,
+            "not ready until setup runs — this is what stops the UI offering the bare command"
+        );
         assert!(
             js.tool_detail.contains("@vitest/coverage-v8"),
             "missing provider must be named: {:?}",
             js.tool_detail
         );
+    }
+
+    /// A checkout with no runner at all is still not a missing package: adding
+    /// vitest would leave the user with a runner and no tests.
+    #[test]
+    fn javascript_without_any_runner_is_not_offered_an_install() {
+        let repo = git_repo();
+        write(repo.path(), "src/app.ts", "export const x = 1;\n");
+        write(repo.path(), "package.json", r#"{"name":"app"}"#);
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let js = report
+            .families
+            .iter()
+            .find(|f| f.family == "javascript")
+            .expect("javascript family");
+        assert!(js.suggested_commands.is_empty());
+        assert!(js.setup_commands.is_empty());
+        assert!(!js.tool_ready);
+        assert!(!js.tool_detail.is_empty());
     }
 
     #[test]
@@ -3753,20 +4169,43 @@ src/main.go:4.1,4.8 1 0
             .iter()
             .find(|f| f.family == "python")
             .expect("python");
-        if python.suggested_commands.is_empty() {
-            assert!(!python.tool_ready);
-            assert!(
-                python.tool_detail.contains("pytest"),
-                "missing pytest must be named: {:?}",
-                python.tool_detail
-            );
-        } else {
+        // pytest runs from any directory, so unlike `go test ./...` there is no
+        // manifest that must exist first — a command here is planned, not
+        // invented. What must hold is that it targets a real interpreter and,
+        // when the toolchain is missing, comes with the steps that supply it.
+        if python.tool_ready {
             assert_eq!(
                 python.suggested_commands,
                 vec!["pytest --cov --cov-report=xml".to_string()]
             );
-            assert!(python.tool_ready);
+            assert!(python.setup_commands.is_empty());
             assert!(python.duration_hint.contains("few minutes"));
+        } else if python.suggested_commands.is_empty() {
+            // No interpreter at all: an honest refusal.
+            assert!(python.tool_detail.contains("Python"));
+        } else {
+            assert_eq!(
+                python.suggested_commands,
+                vec![format!(
+                    "{} -m pytest --cov --cov-report=xml",
+                    managed_venv_python()
+                )],
+                "coverage must run the virtualenv interpreter GitPulse creates"
+            );
+            assert!(
+                python.setup_commands.iter().any(|c| c.contains("venv")),
+                "the virtualenv must be created first: {:?}",
+                python.setup_commands
+            );
+            assert!(
+                python
+                    .setup_commands
+                    .iter()
+                    .any(|c| c.contains("pip install pytest")),
+                "pytest must actually be installed: {:?}",
+                python.setup_commands
+            );
+            assert!(python.tool_detail.contains("pytest"));
         }
         let go = report
             .families
