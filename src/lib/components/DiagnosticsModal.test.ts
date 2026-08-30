@@ -47,6 +47,32 @@ describe("DiagnosticsModal", () => {
     expect(body).not.toContain("No diagnostics recorded");
     diagnostics.clear();
   });
+
+  it("qualifies a repeat count whose occurrences were not identical", () => {
+    // Repeats group by fingerprint, so a bare count would present N
+    // occurrences as N verbatim copies of the one message shown.
+    diagnostics.clear();
+    diagnostics.error("coverage", "no tests ran in 17.30s");
+    diagnostics.error("coverage", "no tests ran in 17.00s");
+
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body).toContain("differing");
+    expect(body).toContain("17.00s");
+    expect(body).not.toContain("17.30s");
+    diagnostics.clear();
+  });
+
+  it("leaves an identical repeat count unqualified", () => {
+    diagnostics.clear();
+    diagnostics.error("repo", "clone failed");
+    diagnostics.error("repo", "clone failed");
+
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body).not.toContain("differing");
+    diagnostics.clear();
+  });
 });
 
 describe("withBackendLogSection", () => {

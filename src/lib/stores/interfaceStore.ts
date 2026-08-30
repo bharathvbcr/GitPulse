@@ -24,6 +24,13 @@ export interface InterfacePrefs {
   lastUpdateCheckAt: number;
   /** Version whose update notice the user dismissed ("" means none). */
   dismissedUpdateVersion: string;
+  /**
+   * Opt-in automatic coverage generation. Off by default: generating coverage
+   * runs the repository's own test suites, which costs minutes of CPU and
+   * writes artifacts (coverage.out, .coverage, lcov.info) into the working
+   * tree. GitPulse does not do that to a repository until the user asks.
+   */
+  autoRunCoverage: boolean;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -38,6 +45,7 @@ const DEFAULTS: InterfacePrefs = {
   checkForUpdates: false,
   lastUpdateCheckAt: 0,
   dismissedUpdateVersion: "",
+  autoRunCoverage: false,
 };
 
 function readPrefs(): InterfacePrefs {
@@ -75,6 +83,9 @@ function readPrefs(): InterfacePrefs {
       // Anything other than an explicit `true` leaves the check off. A
       // corrupt or partially-written value must never opt a user in.
       checkForUpdates: parsed.checkForUpdates === true,
+      // Same rule, and it matters more here: this one runs the repository's
+      // test suites and writes files into the working tree.
+      autoRunCoverage: parsed.autoRunCoverage === true,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -166,6 +177,12 @@ function createInterfaceStore() {
     resetZoom: () =>
       update((prefs) => {
         const next = { ...prefs, uiFontScale: 1.0 };
+        persist(next);
+        return next;
+      }),
+    setAutoRunCoverage: (enabled: boolean) =>
+      update((prefs) => {
+        const next = { ...prefs, autoRunCoverage: enabled };
         persist(next);
         return next;
       }),

@@ -52,6 +52,12 @@
     type FailedCoverageScript,
   } from "../coverage/report";
   import {
+    planCoverageRecovery,
+    type CoverageLimitation,
+    type CoverageRecovery,
+    type CoverageRecoveryStep,
+  } from "../coverage/recovery";
+  import {
     coverageFamilyViews,
     type CoverageFamilyView,
     type MissingCoveragePipeline,
@@ -64,6 +70,7 @@
   import { askConfirm } from "../stores/modalStore";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { copyText } from "../desktop/clipboard";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { buildRunnablePlanSteps, tokenizeCommand } from "../terminal/tokenize";
   import {
     formatRunDetail,
@@ -161,7 +168,7 @@
     const current = report;
     const repo = $repoStore.currentPath;
     if (!current || !repo) return;
-    if (await copyText(formatCoverageReport(current, repo))) {
+    if (await copyText(formatCoverageReport(current, repo, coverageExclusions))) {
       // A copy can settle after a repo switch. The clipboard write already
       // happened, but stale success feedback must not leak into the new repo.
       if ($repoStore.currentPath !== repo || report !== current) return;
@@ -203,6 +210,14 @@
     detail?: string;
     /** One line naming what happened, for the status row. */
     summary?: string;
+    /**
+     * Set when this result came from an automatic retry.
+     *
+     * A recovered run measured a smaller codebase than the user asked about,
+     * so every surface that shows the outcome must show this too. A bare
+     * "passed" here would be a percentage over a quietly reduced denominator.
+     */
+    recovery?: { note: string; limitation: CoverageLimitation };
   }
 
   let aiOpen = $state(false);
@@ -224,6 +239,19 @@
   > = $state({});
   let runningAll = $state(false);
   let scriptStatuses: Record<string, ScriptStatus> = $state({});
+
+  /**
+   * Commands whose coverage only exists because GitPulse retried them with
+   * files excluded.
+   *
+   * Derived from the run statuses rather than tracked separately, so the
+   * report and the panel cannot disagree about what was left out.
+   */
+  let coverageExclusions = $derived(
+    Object.values(scriptStatuses)
+      .filter((status) => status.status === "passed" && status.recovery)
+      .map((status) => ({ command: status.label, limitation: status.recovery!.limitation })),
+  );
   let runningMissing = $state(false);
   let aiCopyTimer: number | null = null;
   let copiedScriptKey = $state<string | null>(null);
@@ -426,7 +454,13 @@
     aiGeneration = null;
     stepResults = {};
     try {
-      const next = await harnessStore.coverageReport(repo, formatCoverageReport(current, repo));
+      // The model reasons about these numbers and drafts issues from them.
+      // Handing it a percentage without saying what was excluded would put
+      // the omission into every recommendation it makes.
+      const next = await harnessStore.coverageReport(
+        repo,
+        formatCoverageReport(current, repo, coverageExclusions),
+      );
       if (!guard.isLive()) return;
       aiGeneration = next;
       harnessStore.recordAction({
@@ -638,6 +672,72 @@
     return `${family}:${command}`;
   }
 
+  /**
+   * Runs a recovery plan's steps and reports one outcome for the set.
+   *
+   * `mode: "all"` requires every step to pass. Go coverage is cumulative
+   * across modules, so accepting the first success would present a
+   * whole-repository percentage measured over a single module. `null` means
+   * the run was cancelled and neither answer applies.
+   */
+  async function runRecoverySteps(
+    plan: CoverageRecovery,
+    repoPath: string,
+    guard: AsyncGuard,
+  ): Promise<{
+    passed: boolean;
+    detail: string;
+    summary: string;
+    exitCode: number | null;
+    verdict: NonNullable<TerminalRunResult["policy"]> | null;
+    failedCommand: string;
+  } | null> {
+    const details: string[] = [];
+    const label = (step: CoverageRecoveryStep, body: string) =>
+      plan.steps.length > 1 ? `${step.command}:\n${body}` : body;
+    let last: { res: TerminalRunResult; step: CoverageRecoveryStep } | null = null;
+    for (const step of plan.steps) {
+      const res = await invokeCoverageCommand(step.argv, repoPath);
+      if (!guard.isLive()) return null;
+      details.push(label(step, formatRunDetail(res)));
+      last = { res, step };
+      if (!runPassed(res)) {
+        return {
+          passed: false,
+          detail: details.join("\n\n"),
+          summary: formatRunSummary(res),
+          exitCode: res.exit_code,
+          verdict: res.policy ?? null,
+          failedCommand: step.command,
+        };
+      }
+      if (plan.mode === "first_success") break;
+    }
+    if (!last) return null;
+    return {
+      passed: true,
+      detail: details.join("\n\n"),
+      summary: formatRunSummary(last.res),
+      exitCode: last.res.exit_code,
+      verdict: last.res.policy ?? null,
+      failedCommand: last.step.command,
+    };
+  }
+
+  /**
+   * The single place a coverage command crosses IPC. The first attempt and an
+   * automatic retry go through here identically, so a retry can never reach
+   * the backend under looser terms than the command it replaces.
+   */
+  function invokeCoverageCommand(argv: string[], repoPath: string): Promise<TerminalRunResult> {
+    return invoke<TerminalRunResult>("cmd_manvi_run_action", {
+      repoPath,
+      args: argv,
+      actionKind: "coverage_generator",
+      timeoutSecs: 900,
+    });
+  }
+
   async function runCoverageScript(
     family: string,
     command: string,
@@ -646,6 +746,8 @@
       guard?: AsyncGuard;
       kind?: "setup" | "generate";
       durationHint?: string;
+      /** Off for a run that is itself a retry, so recovery cannot recurse. */
+      recover?: boolean;
     } = {},
   ): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
@@ -678,34 +780,67 @@
 
     let passed = false;
     try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
-        repoPath,
-        args: tokenized.argv,
-        actionKind: "coverage_generator",
-        timeoutSecs: 900,
-      });
+      const res = await invokeCoverageCommand(tokenized.argv, repoPath);
       if (!guard.isLive()) return false;
 
       passed = runPassed(res);
-      const detail = formatRunDetail(res);
-      const summary = formatRunSummary(res);
+      let detail = formatRunDetail(res);
+      let summary = formatRunSummary(res);
+      let exitCode = res.exit_code;
+      let verdict = res.policy ?? null;
+      let recovery: CoverageRecovery | null = null;
+
+      if (!passed && (options.recover ?? true)) {
+        // Exactly one recovery, and only for a cause GitPulse can both name
+        // and act on. It cannot recurse: `planCoverageRecovery` refuses a
+        // command that already carries what it would add.
+        const plan = planCoverageRecovery(tokenized.argv, detail, {
+          repoPath,
+          goModules: report?.go_modules,
+          goModulesPartial: report?.go_modules_partial,
+        });
+        if (plan) {
+          scriptStatuses[key] = { label, running: true, detail: plan.note };
+          const outcome = await runRecoverySteps(plan, repoPath, guard);
+          if (outcome === null) return false;
+          if (outcome.passed) {
+            passed = true;
+            recovery = plan;
+            detail = outcome.detail;
+            summary = outcome.summary;
+            exitCode = outcome.exitCode;
+            verdict = outcome.verdict;
+          } else {
+            // Both attempts are kept. The retry's output is the evidence that
+            // narrowing the run was not the whole story, and dropping it
+            // would leave the user debugging a command they never saw run.
+            detail = `${detail}\n\nAutomatic retry (${outcome.failedCommand}) also failed:\n${outcome.detail}`;
+          }
+        }
+      }
+
       scriptStatuses[key] = {
         label,
         running: false,
         status: passed ? "passed" : "failed",
         detail,
         summary,
+        ...(recovery
+          ? { recovery: { note: recovery.note, limitation: recovery.limitation } }
+          : {}),
       };
 
       if (!passed) {
-        diagnostics.error("coverage", failureLogEntry(command, res.exit_code, detail));
+        diagnostics.error("coverage", failureLogEntry(command, exitCode, detail));
       }
 
       harnessStore.recordAction({
         kind: "coverage-script",
-        label: command,
+        // The plan's own commands, not the one the user asked for: the
+        // journal must record what actually ran.
+        label: recovery ? recovery.steps.map((step) => step.command).join(" && ") : command,
         ok: passed,
-        verdict: res.policy ?? null,
+        verdict,
       });
     } catch (err: unknown) {
       if (!guard.isLive()) return false;
@@ -916,6 +1051,34 @@
     }
   });
 
+  /**
+   * Repositories this session has already auto-started coverage for.
+   *
+   * The trigger fires at most once per repository per session, and is marked
+   * before the run rather than after. Every coverage command rescans when it
+   * finishes, so a trigger keyed on the scan result alone would start the
+   * suites again from inside its own completion — and a trigger marked only
+   * on success would restart them after every failure.
+   */
+  const autoRunAttempted = new Set<string>();
+
+  /**
+   * Starts generation without being asked, when the user has opted in.
+   *
+   * Off by default: this runs the repository's own test suites and writes
+   * coverage artifacts into the working tree.
+   */
+  function maybeAutoRunCoverage(repo: string, guard: AsyncGuard) {
+    if (!$interfaceStore.autoRunCoverage) return;
+    if (autoRunAttempted.has(repo)) return;
+    // A scan that landed after the user moved on must not start suites in a
+    // repository they are no longer looking at.
+    if (!guard.isLive() || $repoStore.currentPath !== repo) return;
+    if (missingPipelines.length === 0) return;
+    autoRunAttempted.add(repo);
+    void runMissingCoverage();
+  }
+
   // Repo-scoped scan lifecycle, memoized on currentPath: poll ticks re-emit
   // the store object, and an unguarded rerun would blank the report and
   // restart the scan IPC on every emission.
@@ -951,7 +1114,9 @@
     report = reportCache.get(repo) ?? null;
     resetManvi();
     const guard = beginScan();
-    void scan(repo, guard);
+    void scan(repo, guard).then((fresh) => {
+      if (fresh) maybeAutoRunCoverage(repo, guard);
+    });
     return () => {
       if (scanInflight === guard) {
         guard.cancel();
@@ -1262,6 +1427,13 @@
               {#if status.running}
                 <LoaderCircle size={10} class="animate-spin text-accent shrink-0" />
                 <span class="text-textMuted shrink-0">running</span>
+              {:else if status.status === "passed" && status.recovery}
+                <!-- Passed only after an automatic retry that dropped files
+                     from measurement. Deliberately not the green checkmark:
+                     the coverage behind it covers fewer files than the
+                     command was asked to measure. -->
+                <Check size={10} class="text-amber-400 shrink-0" />
+                <span class="text-amber-400/90 shrink-0 whitespace-nowrap">passed (recovered)</span>
               {:else if status.status === "passed"}
                 <Check size={10} class="text-emerald-400 shrink-0" />
                 <span class="text-emerald-400/90 shrink-0">passed</span>
@@ -1275,7 +1447,11 @@
                 <span class="text-rose-400/90 shrink-0">failed</span>
               {/if}
               <span class="font-mono text-textPrimary/80 truncate shrink-0">{status.label}</span>
-              {#if status.summary || briefDetail(status.detail)}
+              {#if status.recovery}
+                <span class="text-amber-400/80 truncate" title={status.recovery.note}
+                  >{status.recovery.note}</span
+                >
+              {:else if status.summary || briefDetail(status.detail)}
                 <span class="text-textMuted/70 truncate">{status.summary || briefDetail(status.detail)}</span>
               {/if}
               {#if status.status === "failed" || status.status === "no_data"}

@@ -8,6 +8,7 @@ import {
   formatDiagnosticReport,
   formatDiagnosticTime,
   installGlobalDiagnostics,
+  diagnosticFingerprint,
   isHostRuntimeNoise,
   type DiagnosticEntry,
   type DiagnosticSeverity,
@@ -563,5 +564,277 @@ describe("build stamping", () => {
     expect(byMessage.blank).toBeUndefined();
     expect(byMessage.oversized).toHaveLength(32);
     expect(byMessage.fine).toBe("0.0.2");
+  });
+});
+
+describe("diagnosticFingerprint", () => {
+  const same = (a: string, b: string) =>
+    expect(diagnosticFingerprint(a)).toBe(diagnosticFingerprint(b));
+  const differ = (a: string, b: string) =>
+    expect(diagnosticFingerprint(a)).not.toBe(diagnosticFingerprint(b));
+
+  it("masks ISO-8601 timestamps", () => {
+    same("failed at 2026-08-30T07:23:44.575Z", "failed at 2026-01-02T00:00:00.000Z");
+  });
+
+  it("masks wall-clock times", () => {
+    same("started 10:22:44", "started 23:01:02");
+  });
+
+  it("masks elapsed durations whatever the unit", () => {
+    same("no tests ran in 17.30s", "no tests ran in 17.00s");
+    same("no tests ran in 17.30s", "no tests ran in 2ms");
+  });
+
+  it("masks heap addresses and handles", () => {
+    same("segfault at 0xdeadbeef", "segfault at 0x1");
+  });
+
+  it("masks UUIDs", () => {
+    same(
+      "job 3f2504e0-4f89-11d3-9a0c-0305e82c3301 died",
+      "job 00000000-0000-0000-0000-000000000000 died",
+    );
+  });
+
+  it("masks per-run temporary directories", () => {
+    same("wrote /var/folders/ab/T/tmp123/out.xml", "wrote /tmp/other-99/out.xml");
+  });
+
+  it("masks the character count in its own elision notice", () => {
+    same("head\n… 17064 characters elided …\ntail", "head\n… 3 characters elided …\ntail");
+  });
+
+  it("keeps exit codes distinct", () => {
+    differ('command "x" failed (exit 3)', 'command "x" failed (exit 1)');
+  });
+
+  it("keeps source locations distinct", () => {
+    differ("at stress_test.py:944", "at stress_test.py:945");
+  });
+
+  it("keeps repository paths distinct", () => {
+    differ("scanning /Users/me/Code/Manvi", "scanning /Users/me/Code/GitPulse");
+  });
+
+  it("leaves a message with nothing volatile exactly as it is", () => {
+    expect(diagnosticFingerprint("clone failed")).toBe("clone failed");
+  });
+
+  it("never throws, whatever the input", () => {
+    const hostile = ["", " ".repeat(100), "…".repeat(2000), "0x".repeat(1000), "9".repeat(4000)];
+    for (const input of hostile) {
+      expect(() => diagnosticFingerprint(input)).not.toThrow();
+      expect(typeof diagnosticFingerprint(input)).toBe("string");
+    }
+  });
+});
+
+describe("coalescing across per-run detail (regression)", () => {
+  const generatedAt = new Date("2026-08-25T12:00:00Z");
+  const run = (seconds: string) =>
+    [
+      'Coverage command ".venv/bin/python -m pytest --cov" failed (exit 3):',
+      "INTERNALERROR> SystemExit: 0",
+      `=========== no tests ran in ${seconds} ===========`,
+    ].join("\n");
+
+  it("folds repeats whose only difference is an embedded duration", () => {
+    // Exact-equality coalescing was defeated by pytest stamping its own
+    // runtime into the output: three runs of one unchanged failure became
+    // three "distinct" entries. Anything a tool embeds per run — a duration,
+    // a timestamp, a temp path — defeats it the same way, so a real error
+    // storm could flush all 500 slots instead of collapsing into a counter.
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", run("17.30s"));
+    store.error("coverage", run("17.00s"));
+    const entries = get(store);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].count).toBe(2);
+  });
+
+  it("retains the most recent occurrence's text, not the first", () => {
+    // `at` moves to the newest occurrence, so the message must move with it;
+    // keeping the first would date one occurrence and quote another.
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", run("17.30s"));
+    store.error("coverage", run("17.00s"));
+    const [head] = get(store);
+    expect(head.message).toContain("17.00s");
+    expect(head.message).not.toContain("17.30s");
+    expect(head.at).toBe(2);
+  });
+
+  it("marks a folded group whose occurrences were not identical", () => {
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", run("17.30s"));
+    store.error("coverage", run("17.00s"));
+    expect(get(store)[0].varied).toBe(true);
+  });
+
+  it("leaves byte-identical repeats unmarked", () => {
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", run("17.30s"));
+    store.error("coverage", run("17.30s"));
+    const [head] = get(store);
+    expect(head.count).toBe(2);
+    expect(head.varied ?? false).toBe(false);
+  });
+
+  it("discloses in the report that a folded group is not one verbatim message", () => {
+    // `x2` alone would claim two identical occurrences. A summary must never
+    // read as more exact than the evidence behind it.
+    const varied = formatDiagnosticReport(
+      [{ id: 1, at: 0, severity: "error", source: "coverage", message: "boom", count: 2, varied: true, version: "0.0.3" }],
+      generatedAt,
+      "0.0.3",
+    );
+    expect(varied).toContain("occurrences differed; showing the most recent");
+    const identical = formatDiagnosticReport(
+      [{ id: 1, at: 0, severity: "error", source: "coverage", message: "boom", count: 2, version: "0.0.3" }],
+      generatedAt,
+      "0.0.3",
+    );
+    expect(identical).not.toContain("occurrences differed");
+  });
+
+  it("survives a storm of messages that differ only by timestamp", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        { id: 1, at: 1, severity: "error", source: "repo", message: "the original failure", count: 1, version: APP_VERSION },
+      ]),
+    });
+    const store = createDiagnostics({ storage, now: () => 5 });
+    const storm = MAX_DIAGNOSTIC_ENTRIES + 100;
+    for (let i = 0; i < storm; i += 1) {
+      const stamp = `2026-08-30T07:${String(i % 60).padStart(2, "0")}:00.000Z`;
+      store.error("console", `[${stamp}] socket closed`);
+    }
+    const entries = get(store);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].count).toBe(storm);
+    expect(entries[1].message).toBe("the original failure");
+  });
+
+  it("does not fold failures that differ in exit code", () => {
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", 'command "x" failed (exit 3): boom');
+    store.error("coverage", 'command "x" failed (exit 1): boom');
+    expect(get(store)).toHaveLength(2);
+  });
+
+  it("does not fold failures that differ in source location", () => {
+    const { store } = makeStore([1, 2]);
+    store.error("coverage", "aborted at stress_test.py:944");
+    store.error("coverage", "aborted at stress_test.py:945");
+    expect(get(store)).toHaveLength(2);
+  });
+
+  it("still refuses to fold across builds when only per-run detail differs", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        { id: 1, at: 1, severity: "error", source: "coverage", message: run("17.30s"), count: 1, version: "0.0.1" },
+      ]),
+    });
+    const store = createDiagnostics({ storage, now: () => 9 });
+    store.error("coverage", run("17.00s"));
+    const entries = get(store);
+    expect(entries).toHaveLength(2);
+    expect(entries[1].at).toBe(1);
+  });
+
+  it("refuses a malformed varied flag from a hostile persisted blob", () => {
+    const storage = memoryStorage({
+      [DIAGNOSTIC_STORAGE_KEY]: JSON.stringify([
+        { id: 2, at: 2, severity: "error", source: "s", message: "truthy", count: 2, varied: "yes" },
+        { id: 1, at: 1, severity: "error", source: "s", message: "real", count: 2, varied: true },
+      ]),
+    });
+    const entries = get(createDiagnostics({ storage }));
+    expect(entries.find((e) => e.message === "truthy")?.varied).toBeUndefined();
+    expect(entries.find((e) => e.message === "real")?.varied).toBe(true);
+  });
+});
+
+describe("diagnostics ring under fuzz", () => {
+  /** Deterministic LCG: the same sequence every run, so a failure reproduces. */
+  function seeded(seed: number) {
+    let state = seed >>> 0;
+    return () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state / 0x100000000;
+    };
+  }
+
+  const shapes = [
+    (n: number) => `Coverage command failed (exit ${n % 4}): no tests ran in ${n % 90}.${n % 100}s`,
+    (n: number) => `[2026-08-30T07:${String(n % 60).padStart(2, "0")}:0${n % 10}.000Z] socket closed`,
+    (n: number) => `wrote /var/folders/ab/T/tmp${n}/coverage.xml`,
+    (n: number) => `panic at 0x${(n * 2654435761).toString(16)}`,
+    (n: number) => `clone failed for repo-${n % 7}`,
+    () => "plain unchanging failure",
+  ];
+
+  it("holds its invariants across a random operation stream", () => {
+    const random = seeded(20260830);
+    const storage = memoryStorage();
+    const store = createDiagnostics({ storage, now: () => 1 });
+    let recorded = 0;
+
+    for (let i = 0; i < 4000; i += 1) {
+      const shape = shapes[Math.floor(random() * shapes.length)];
+      const message = shape(Math.floor(random() * 1000));
+      if (random() < 0.5) store.error("fuzz", message);
+      else store.warn("fuzz", message);
+      recorded += 1;
+    }
+
+    const entries = get(store);
+    expect(entries.length).toBeLessThanOrEqual(MAX_DIAGNOSTIC_ENTRIES);
+    for (let i = 1; i < entries.length; i += 1) {
+      expect(entries[i - 1].id).toBeGreaterThan(entries[i].id);
+    }
+    for (const entry of entries) {
+      expect(entry.count).toBeGreaterThanOrEqual(1);
+      expect(entry.message.length).toBeLessThanOrEqual(2000);
+      // A single occurrence cannot have diverged from anything.
+      if (entry.varied) expect(entry.count).toBeGreaterThan(1);
+    }
+    // At this size the ring overflows, so the surviving counts can only be a
+    // subset — never more than what actually happened.
+    const counted = entries.reduce((total, entry) => total + entry.count, 0);
+    expect(entries).toHaveLength(MAX_DIAGNOSTIC_ENTRIES);
+    expect(counted).toBeLessThanOrEqual(recorded);
+
+    // The persisted blob restores an identical ring.
+    expect(get(createDiagnostics({ storage }))).toEqual(entries);
+  });
+
+  it("accounts for every event exactly while the ring has room", () => {
+    const random = seeded(7);
+    const store = createDiagnostics({ storage: memoryStorage(), now: () => 1 });
+    let recorded = 0;
+    for (let i = 0; i < 200; i += 1) {
+      const shape = shapes[Math.floor(random() * shapes.length)];
+      store.error("fuzz", shape(Math.floor(random() * 5)));
+      recorded += 1;
+    }
+    const entries = get(store);
+    expect(entries.length).toBeLessThan(MAX_DIAGNOSTIC_ENTRIES);
+    expect(entries.reduce((total, entry) => total + entry.count, 0)).toBe(recorded);
+  });
+
+  it("normalizes a worst-case message well inside its per-event budget", () => {
+    // The fingerprint runs on every recorded error, so a storm must not be
+    // able to stall the UI thread on regex work. Input is bounded by the
+    // 2000-char clamp, and the patterns have no nested quantifiers, so there
+    // is nothing here that can backtrack catastrophically.
+    const worst = Array.from({ length: 40 }, (_, i) =>
+      `2026-08-30T07:23:${String(i % 60).padStart(2, "0")}.575Z ran in ${i}.${i}s at 0x${i.toString(16)} in /var/folders/ab/T/tmp${i}/x`,
+    ).join("\n");
+    const started = performance.now();
+    for (let i = 0; i < 1000; i += 1) diagnosticFingerprint(worst);
+    const perCall = (performance.now() - started) / 1000;
+    expect(perCall).toBeLessThan(1);
   });
 });

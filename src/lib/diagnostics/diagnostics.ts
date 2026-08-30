@@ -43,6 +43,15 @@ export interface DiagnosticEntry {
    * is exactly how a fixed bug reads as a live one.
    */
   readonly version?: string;
+  /**
+   * Set when the folded occurrences were not textually identical.
+   *
+   * Coalescing groups by {@link diagnosticFingerprint}, which deliberately
+   * ignores per-run detail, so `count` can cover occurrences that differed in
+   * a duration or a timestamp. Without this flag `x3` would claim three
+   * verbatim repeats — a summary reading as more exact than its evidence.
+   */
+  readonly varied?: boolean;
 }
 
 export const DIAGNOSTIC_STORAGE_KEY = "gitpulse_diagnostics_v1";
@@ -99,6 +108,52 @@ function clampMessage(message: string): string {
     marker(message.length - body) +
     message.slice(message.length - tailChars)
   );
+}
+
+/**
+ * Spans that differ between runs of the *same* failure.
+ *
+ * Coalescing used to demand byte equality, which any tool that stamps its own
+ * runtime into its output defeats: three runs of one unchanged pytest failure
+ * landed as three "distinct" entries because the trailer read `17.30s`,
+ * `17.00s`, `17.99s`. That is benign for three manual runs and dangerous for a
+ * storm — 500 near-identical entries flush every older, unrelated failure out
+ * of the ring, which is precisely what coalescing exists to prevent.
+ *
+ * Each pattern here names *when* or *where* something happened. None of them
+ * can distinguish one failure from another, so masking them cannot merge two
+ * genuine problems. Everything that does discriminate — exit codes, file
+ * paths, line numbers, error types, repository names — is left untouched.
+ */
+const VOLATILE_SPANS: readonly (readonly [RegExp, string])[] = [
+  // GitPulse's own elision notice: its count tracks the message length, so
+  // two clamped copies of one failure disagree on it.
+  [/… \d+ characters elided …/g, "… ⟨n⟩ characters elided …"],
+  [/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?/g, "⟨timestamp⟩"],
+  [
+    /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g,
+    "⟨uuid⟩",
+  ],
+  [/\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b/g, "⟨time⟩"],
+  // Elapsed times. The unit is required, so bare numbers — exit codes, line
+  // numbers, counts — are never touched.
+  [/\b\d+(?:\.\d+)?\s?(?:ns|µs|us|ms|s|m|h)\b/g, "⟨duration⟩"],
+  [/\b0x[0-9a-fA-F]+\b/g, "⟨address⟩"],
+  [/(?:\/private)?\/(?:var\/folders|tmp)\/\S+/g, "⟨tmp⟩"],
+];
+
+/**
+ * The identity of a failure, with per-run detail masked out.
+ *
+ * Two messages sharing a fingerprint are the same problem happening again;
+ * the entry keeps the most recent text and counts the occurrences.
+ */
+export function diagnosticFingerprint(message: string): string {
+  let key = message;
+  for (const [pattern, placeholder] of VOLATILE_SPANS) {
+    key = key.replace(pattern, placeholder);
+  }
+  return key;
 }
 
 /**
@@ -162,6 +217,9 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
     message: clampMessage(record.message),
     count,
     ...(version ? { version } : {}),
+    // Strictly `true`; a truthy string from a hostile blob must not become a
+    // disclosure the app never made.
+    ...(record.varied === true ? { varied: true } : {}),
   };
 }
 
@@ -200,6 +258,10 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 
   let entries: DiagnosticEntry[] = restored.entries;
   let nextId = restored.nextId;
+  // Only the newest entry can absorb a repeat, so one cached key is enough —
+  // and it keeps an error storm from re-normalizing the head on every event.
+  let headKey: string | null =
+    entries.length > 0 ? diagnosticFingerprint(entries[0].message) : null;
   const store = writable<readonly DiagnosticEntry[]>(entries);
 
   function persist() {
@@ -216,19 +278,33 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
   function record(severity: DiagnosticSeverity, source: string, detail: unknown) {
     const message = clampMessage(formatError(detail));
     if (isHostRuntimeNoise(message)) return;
+    const key = diagnosticFingerprint(message);
     const newest = entries[0];
     if (
       newest &&
       newest.severity === severity &&
       newest.source === source &&
-      newest.message === message &&
+      headKey === key &&
       // Never fold a new occurrence into an entry recorded by a different
       // build: coalescing rewrites the timestamp, so the merged entry would
       // claim the older build produced something it never saw.
       newest.version === APP_VERSION
     ) {
-      // Coalesce repeats (error storms) into one entry with a counter.
-      entries = [{ ...newest, count: newest.count + 1, at: now() }, ...entries.slice(1)];
+      // Coalesce repeats (error storms) into one entry with a counter. The
+      // retained text is the newest occurrence's, because `at` moves to the
+      // newest too: keeping the first would date one occurrence and quote
+      // another.
+      const varied = newest.varied === true || newest.message !== message;
+      entries = [
+        {
+          ...newest,
+          message,
+          count: newest.count + 1,
+          at: now(),
+          ...(varied ? { varied: true as const } : {}),
+        },
+        ...entries.slice(1),
+      ];
       store.set(entries);
       persist();
       return;
@@ -238,6 +314,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       { id: nextId, at: now(), severity, source, message, count: 1, version: APP_VERSION },
       ...entries,
     ];
+    headKey = key;
     if (entries.length > MAX_DIAGNOSTIC_ENTRIES) {
       entries = entries.slice(0, MAX_DIAGNOSTIC_ENTRIES);
     }
@@ -252,6 +329,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
     clear: () => {
       entries = [];
       nextId = 0;
+      headKey = null;
       store.set(entries);
       if (storage) {
         try {
@@ -300,7 +378,10 @@ export function formatDiagnosticReport(
   }
   const blocks = entries.map((entry) => {
     const repeats = entry.count > 1 ? ` x${entry.count}` : "";
-    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${entry.source})${staleBuildNote(entry.version, runningVersion)}`;
+    // `x3` on its own would read as three verbatim repeats.
+    const spread =
+      entry.count > 1 && entry.varied ? " [occurrences differed; showing the most recent]" : "";
+    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${entry.source})${spread}${staleBuildNote(entry.version, runningVersion)}`;
     const body = entry.message
       .split("\n")
       .map((line) => `  ${line}`)

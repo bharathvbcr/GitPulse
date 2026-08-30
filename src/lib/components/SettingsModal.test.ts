@@ -40,3 +40,30 @@ describe("SettingsModal", () => {
     expect(body).toContain('aria-checked="true"');
   });
 });
+
+describe("SettingsModal automatic coverage toggle", () => {
+  it("offers automatic coverage generation as an explicit opt-in, off by default", () => {
+    const { body } = render(SettingsModal, { props: { isOpen: true } });
+    expect(body).toContain(
+      'aria-label="Automatically generate coverage for repositories that have none"',
+    );
+    // Rendered from the stored preference, which defaults to off.
+    expect(body).toContain('aria-checked="false"');
+  });
+
+  it("states the cost before the user turns it on", () => {
+    // Running a repository's test suites and writing artifacts into its
+    // working tree is not what a settings toggle is normally assumed to do.
+    // Scoped to this section: the Updates section also opens "Off by default",
+    // and an unscoped assertion passed with the coverage copy deleted.
+    const { body } = render(SettingsModal, { props: { isOpen: true } });
+    const section = body.slice(
+      body.indexOf("Generate coverage automatically"),
+      body.indexOf("Check for new releases"),
+    );
+    expect(section).not.toBe("");
+    expect(section).toContain("Off by default");
+    expect(section).toContain("writes coverage artifacts into the working tree");
+    expect(section).toContain("never reported as a clean result");
+  });
+});

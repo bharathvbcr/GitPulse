@@ -1178,6 +1178,8 @@ pub(crate) fn validate_manvi_paths(
         "--rcfile",
         "--requirement",
         "--constraint",
+        // pytest exclusion appended when GitPulse recovers a collection abort.
+        "--ignore",
         "-r",
         "-c",
         "-C",
@@ -1190,6 +1192,7 @@ pub(crate) fn validate_manvi_paths(
         "--rcfile=",
         "--requirement=",
         "--constraint=",
+        "--ignore=",
         "-coverprofile=",
         "--coverage=",
     ];
@@ -2214,6 +2217,46 @@ mod tests {
             chdir_err.contains("escapes the open repository"),
             "{chdir_err}"
         );
+    }
+
+    /// The exclusion GitPulse appends when it recovers a pytest collection
+    /// abort is a path, and must be proven to live inside the open repository
+    /// like every other path argument. Before `--ignore` was listed, its value
+    /// was the one path in a coverage command that reached pytest unchecked.
+    #[test]
+    fn pytest_ignore_paths_are_confined_to_the_repository() {
+        let dir = TempDir::new().unwrap();
+        init_test_repo(dir.path());
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("bench-link")).unwrap();
+        let repo = validate_repo(dir.path().to_str().unwrap()).unwrap();
+
+        let ok: Vec<String> = vec![
+            "pytest".into(),
+            "--cov".into(),
+            "--ignore=bench/stress_test.py".into(),
+        ];
+        validate_manvi_paths(&repo, &ok, ManviActionKind::CoverageGenerator)
+            .expect("a repository-relative exclusion must validate");
+
+        for escaping in [
+            "--ignore=/etc/passwd".to_string(),
+            "--ignore=../outside.py".to_string(),
+            "--ignore=bench-link/stress_test.py".to_string(),
+        ] {
+            let argv: Vec<String> = vec!["pytest".into(), escaping.clone()];
+            let err = validate_manvi_paths(&repo, &argv, ManviActionKind::CoverageGenerator)
+                .expect_err("an escaping exclusion must be refused");
+            assert!(
+                err.contains("escapes the open repository"),
+                "{escaping}: {err}"
+            );
+        }
+
+        let spaced: Vec<String> = vec!["pytest".into(), "--ignore".into(), "/etc/passwd".into()];
+        let err = validate_manvi_paths(&repo, &spaced, ManviActionKind::CoverageGenerator)
+            .expect_err("the separated spelling must be checked too");
+        assert!(err.contains("escapes the open repository"), "{err}");
     }
 
     #[test]

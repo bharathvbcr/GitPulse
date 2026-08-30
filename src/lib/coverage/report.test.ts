@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCoverageIssueDraft,
+  classifyCoverageFailure,
   coverageFailureHint,
+  type CoverageExclusionNotice,
   formatCoverageReport,
   formatFailedCoverageDiagnostics,
   NO_COVERAGE_DATA,
@@ -798,5 +800,148 @@ describe("coverageFailureHint: pytest aborted during collection", () => {
     const second = coverageFailureHint("pytest --cov", realOutput);
     expect(second).toBe(first);
     expect(second).toContain("stress_test.py:944");
+  });
+});
+
+describe("formatCoverageReport: recovered runs", () => {
+  const base = {
+    families: [],
+    languages: [],
+    artifacts: [],
+    files: [],
+    overall: { lines_found: 100, lines_hit: 50, percentage: 50 },
+    truncated: false,
+  } as unknown as CoverageReport;
+
+  it("marks the totals when files were excluded to make the run complete", () => {
+    // The exclusion must appear in the same breath as the number, like the
+    // scan-truncated marker. A percentage over a quietly reduced denominator
+    // is the defect this exists to prevent.
+    const out = formatCoverageReport(base, "/repo", [
+      { command: "pytest --cov", limitation: { kind: "excluded_paths", paths: ["bench/stress_test.py"] } },
+    ]);
+    const overall = out.split("\n").find((line) => line.includes("50.0%")) ?? "";
+    expect(overall).toContain("RECOVERED RUN — 1 file(s) excluded from measurement");
+  });
+
+  it("names every excluded file and the command it was excluded for", () => {
+    const out = formatCoverageReport(base, "/repo", [
+      { command: "pytest --cov", limitation: { kind: "excluded_paths", paths: ["bench/a.py", "bench/b.py"] } },
+    ]);
+    expect(out).toContain("RECOVERED RUNS");
+    expect(out).toContain("- bench/a.py — excluded so `pytest --cov` could run at all");
+    expect(out).toContain("- bench/b.py — excluded so `pytest --cov` could run at all");
+    const overall = out.split("\n").find((line) => line.includes("50.0%")) ?? "";
+    expect(overall).toContain("2 file(s)");
+  });
+
+  it("says nothing when no run was recovered", () => {
+    const out = formatCoverageReport(base, "/repo");
+    expect(out).not.toContain("RECOVERED");
+    expect(formatCoverageReport(base, "/repo", [])).toBe(out);
+  });
+
+  it("ignores hostile or empty exclusion payloads without inventing a notice", () => {
+    const hostile = [
+      null,
+      undefined,
+      "string",
+      42,
+      { command: "x" },
+      { command: "x", limitation: null },
+      { command: "x", limitation: { kind: "excluded_paths", paths: [] } },
+      { command: "x", limitation: { kind: "excluded_paths", paths: [null, "", "   "] } },
+      { command: "x", limitation: { kind: "scoped_to_modules", modules: [] } },
+      { command: "x", limitation: { kind: "invented_kind", paths: ["a"] } },
+    ] as unknown as CoverageExclusionNotice[];
+    const out = formatCoverageReport(base, "/repo", hostile);
+    expect(out).not.toContain("RECOVERED");
+  });
+
+  it("neutralizes control characters in an excluded path", () => {
+    // Paths reach this from a tool's traceback; one must not be able to inject
+    // a new heading or a runnable-looking line into the copied report.
+    const out = formatCoverageReport(base, "/repo", [
+      { command: "pytest", limitation: { kind: "excluded_paths", paths: ["bench/x.py\nOVERALL\n100.0%"] } },
+    ]);
+    expect(out).toContain("\\n");
+    expect(out.split("\n").filter((line) => line === "OVERALL")).toHaveLength(1);
+  });
+});
+
+describe("formatCoverageReport: runs scoped to Go modules", () => {
+  const base = {
+    families: [],
+    languages: [],
+    artifacts: [],
+    files: [],
+    overall: { lines_found: 100, lines_hit: 50, percentage: 50 },
+    truncated: false,
+  } as unknown as CoverageReport;
+
+  const scoped = (modules: string[], partial = false): CoverageExclusionNotice[] => [
+    { command: "go test ./...", limitation: { kind: "scoped_to_modules", modules, partial } },
+  ];
+
+  it("marks the totals as covering only the modules that ran", () => {
+    const out = formatCoverageReport(base, "/repo", scoped(["svc", "tool"]));
+    const overall = out.split("\n").find((line) => line.includes("50.0%")) ?? "";
+    expect(overall).toContain("RECOVERED RUN — measured only 2 module(s)");
+  });
+
+  it("names the modules and says the rest is not covered", () => {
+    const out = formatCoverageReport(base, "/repo", scoped(["svc", "tool"]));
+    expect(out).toContain("measured only these Go modules: svc, tool");
+    expect(out).toContain("code outside them is not covered");
+  });
+
+  it("discloses a capped module search rather than implying completeness", () => {
+    const out = formatCoverageReport(base, "/repo", scoped(["svc"], true));
+    const overall = out.split("\n").find((line) => line.includes("50.0%")) ?? "";
+    expect(overall).toContain("that list was itself capped");
+    expect(out).toContain("the module search hit its bound");
+  });
+
+  it("reports both kinds of narrowing in one run", () => {
+    const out = formatCoverageReport(base, "/repo", [
+      { command: "pytest", limitation: { kind: "excluded_paths", paths: ["a.py"] } },
+      ...scoped(["svc"]),
+    ]);
+    const overall = out.split("\n").find((line) => line.includes("50.0%")) ?? "";
+    expect(overall).toContain("1 file(s) excluded from measurement");
+    expect(overall).toContain("measured only 1 module(s)");
+  });
+});
+
+describe("coverageFailureHint: Go workspace root that is not a module", () => {
+  /**
+   * The exact text go 1.26 prints for the case the Go recovery exists for,
+   * captured from a real workspace whose root is not a module. The pattern
+   * only matched the non-workspace wording ("main module"), so the one
+   * failure GitPulse can act on was classified as unrecognised.
+   */
+  const workspaceMessage = [
+    "# ./...",
+    "pattern ./...: directory prefix . does not contain modules listed in go.work or their selected dependencies",
+    "FAIL\t./... [setup failed]",
+  ].join("\n");
+
+  it("recognizes the go.work wording", () => {
+    expect(classifyCoverageFailure("go test ./...", workspaceMessage)).toEqual({
+      kind: "go_missing_module",
+    });
+  });
+
+  it("still recognizes the non-workspace wording", () => {
+    const single = "go: directory prefix . does not contain main module or its selected dependencies";
+    expect(classifyCoverageFailure("go test ./...", single)).toEqual({
+      kind: "go_missing_module",
+    });
+  });
+
+  it("does not fire on unrelated go output", () => {
+    expect(
+      classifyCoverageFailure("go test ./...", "ok  \tsvc\t0.2s\tcoverage: 50.0% of statements"),
+    ).toBeNull();
   });
 });

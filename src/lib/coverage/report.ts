@@ -73,7 +73,75 @@ function safeList<T>(value: T[] | undefined): T[] {
  * order is stable so prompts and tests stay comparable across runs; capped
  * lists carry their counters so "shorter list" never reads as "everything".
  */
-export function formatCoverageReport(report: CoverageReport, repoPath: string): string {
+/**
+ * What a recovered run does not cover.
+ *
+ * Recovery buys a result by narrowing what was measured, so this is not
+ * optional detail — it is the difference between the number meaning what a
+ * reader assumes and meaning something smaller.
+ */
+export type CoverageLimitation =
+  /** Files dropped from an otherwise whole-repository run. */
+  | { kind: "excluded_paths"; paths: string[] }
+  /**
+   * Only these module directories were measured. `partial` says the module
+   * list itself was capped, so even the named scope may be incomplete.
+   */
+  | { kind: "scoped_to_modules"; modules: string[]; partial: boolean };
+
+/**
+ * A command that produced coverage only after GitPulse retried it on
+ * narrower terms. The numbers that follow such a run describe less than the
+ * user asked about, so this rides alongside them everywhere.
+ */
+export interface CoverageExclusionNotice {
+  /** The command, as displayed. */
+  command: string;
+  limitation: CoverageLimitation;
+}
+
+function safeStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .map(safeText);
+}
+
+function safeExclusions(
+  value: readonly CoverageExclusionNotice[] | undefined,
+): CoverageExclusionNotice[] {
+  if (!Array.isArray(value)) return [];
+  const clean: CoverageExclusionNotice[] = [];
+  for (const notice of value) {
+    if (!notice || typeof notice !== "object") continue;
+    const limitation = notice.limitation;
+    if (!limitation || typeof limitation !== "object") continue;
+    const command = safeText(notice.command);
+    if (limitation.kind === "excluded_paths") {
+      const paths = safeStrings(limitation.paths);
+      if (paths.length > 0) clean.push({ command, limitation: { kind: "excluded_paths", paths } });
+    } else if (limitation.kind === "scoped_to_modules") {
+      const modules = safeStrings(limitation.modules);
+      if (modules.length > 0) {
+        clean.push({
+          command,
+          limitation: {
+            kind: "scoped_to_modules",
+            modules,
+            partial: limitation.partial === true,
+          },
+        });
+      }
+    }
+  }
+  return clean;
+}
+
+export function formatCoverageReport(
+  report: CoverageReport,
+  repoPath: string,
+  exclusions: readonly CoverageExclusionNotice[] = [],
+): string {
   const data = (report ?? {}) as Partial<CoverageReport>;
   const languageRows = safeList(data.languages);
   const fileRows = safeList(data.files);
@@ -96,7 +164,45 @@ export function formatCoverageReport(report: CoverageReport, repoPath: string): 
       : `${safePercent(data.overall?.percentage)} (${linesHit}/${linesFound} lines)`;
   // A capped scan must say so in the same breath as its totals.
   if (data.truncated === true) overall += " [SCAN TRUNCATED — results partial]";
+  // So must a run that only completed on narrower terms than it was asked for.
+  const recovered = safeExclusions(exclusions);
+  const marks: string[] = [];
+  const excludedCount = recovered.reduce(
+    (total, n) => total + (n.limitation.kind === "excluded_paths" ? n.limitation.paths.length : 0),
+    0,
+  );
+  const scoped = recovered.filter((n) => n.limitation.kind === "scoped_to_modules");
+  if (excludedCount > 0) marks.push(`${excludedCount} file(s) excluded from measurement`);
+  if (scoped.length > 0) {
+    const modules = scoped.reduce(
+      (total, n) => total + (n.limitation.kind === "scoped_to_modules" ? n.limitation.modules.length : 0),
+      0,
+    );
+    const capped = scoped.some((n) => n.limitation.kind === "scoped_to_modules" && n.limitation.partial);
+    marks.push(
+      `measured only ${modules} module(s)${capped ? ", and that list was itself capped" : ""}`,
+    );
+  }
+  if (marks.length > 0) overall += ` [RECOVERED RUN — ${marks.join("; ")}]`;
   out.push("", "OVERALL", overall);
+
+  if (recovered.length > 0) {
+    out.push("", "RECOVERED RUNS (the totals above do not cover the following)");
+    for (const notice of recovered) {
+      if (notice.limitation.kind === "excluded_paths") {
+        for (const path of notice.limitation.paths) {
+          out.push(`- ${path} — excluded so \`${notice.command}\` could run at all`);
+        }
+      } else {
+        out.push(
+          `- \`${notice.command}\` measured only these Go modules: ${notice.limitation.modules.join(", ")} — code outside them is not covered`,
+        );
+        if (notice.limitation.partial) {
+          out.push("  (the module search hit its bound, so other modules may exist)");
+        }
+      }
+    }
+  }
 
   if (languageRows.length > 0) {
     out.push("", "PER-LANGUAGE");
@@ -326,8 +432,19 @@ export interface FailedCoverageDiagnosticsOptions {
   scanError?: string | null;
 }
 
+/**
+ * `go` prints two different sentences for "you ran this where there is no
+ * module", and the recovery needs both:
+ *
+ *   directory prefix . does not contain main module or its selected dependencies
+ *   directory prefix . does not contain modules listed in go.work or their selected dependencies
+ *
+ * The second is the workspace form — a `go.work` whose root is not itself a
+ * module — which is precisely the case GitPulse can retry per module. Matching
+ * only the first meant the one Go failure it can act on read as unrecognised.
+ */
 const GO_MISSING_MODULE =
-  /directory prefix\s+\S+\s+does not contain main module/i;
+  /directory prefix\s+\S+\s+does not contain (?:main module|modules listed in go\.work)/i;
 
 /**
  * pytest aborted during *collection*, not during a test.
@@ -376,56 +493,106 @@ const TEST_SUITE_RAN_FAILURE = [
 ];
 
 /**
+ * What went wrong, as a fact rather than as a sentence.
+ *
+ * The hint the user reads and the retry GitPulse plans are two presentations
+ * of one judgement. Deciding twice is how they drift: a hint naming a cause
+ * the recovery does not recognise, or a retry for something the report
+ * describes differently. Both derive from here.
+ */
+export type CoverageFailureCause =
+  | { kind: "go_missing_module" }
+  | { kind: "generator_missing" }
+  | { kind: "not_allowlisted" }
+  | { kind: "npx_refused_install" }
+  | { kind: "vitest_provider_missing" }
+  | { kind: "no_gradle_wrapper" }
+  /** `module` is `<path>:<line>` of the importing frame, or null if unreadable. */
+  | { kind: "pytest_collection_abort"; module: string | null }
+  | { kind: "tests_failed"; generatorRan: boolean };
+
+/**
  * Classifies a failed coverage command so copied diagnostics name the real
  * problem: a missing Go module root, or a generator that ran and whose tests
  * failed — never "try a different ecosystem command" for those cases.
+ *
+ * Order is load-bearing: the first pattern that matches wins, and the narrow
+ * causes are tested before the broad ones.
  */
-export function coverageFailureHint(
+export function classifyCoverageFailure(
   command: unknown,
   detail: unknown,
-): string | null {
+): CoverageFailureCause | null {
   const output = typeof detail === "string" ? detail : "";
   if (!output.trim()) return null;
   if (GO_MISSING_MODULE.test(output)) {
-    return "Go was run from a directory without go.mod. Generate coverage from the module root with `go -C <module-dir> test ./... -coverprofile=coverage.out`.";
+    return { kind: "go_missing_module" };
   }
   if (
     /No such file or directory \(os error 2\)/i.test(output) ||
     /Failed to spawn \S+/i.test(output)
   ) {
-    return "That generator is not installed. GitPulse will not plan it unless the binary is on PATH.";
+    return { kind: "generator_missing" };
   }
   if (/outside the purpose-specific command allowlist/i.test(output)) {
-    return "That command is not on the coverage allowlist. The scanner should not offer it.";
+    return { kind: "not_allowlisted" };
   }
   if (
     /npx canceled due to missing packages/i.test(output) ||
     /no YES option/i.test(output)
   ) {
-    return "npx --no-install will not download a missing runner. Declare a coverage script or install the package locally.";
+    return { kind: "npx_refused_install" };
   }
   if (
     /Cannot find dependency '@vitest\/coverage-v8'/i.test(output) ||
     /MISSING DEPENDENCY/i.test(output)
   ) {
-    return "Vitest ran without a coverage provider. Add @vitest/coverage-v8 or use the package.json coverage script.";
+    return { kind: "vitest_provider_missing" };
   }
   if (/wrapper ['`].*['`] is not a repository file/i.test(output)) {
-    return "No Gradle wrapper in this repository. GitPulse will not invent ./gradlew.";
+    return { kind: "no_gradle_wrapper" };
   }
   if (PYTEST_COLLECTION_ABORTED.test(output)) {
-    const origin = pytestAbortingModule(output);
-    const where = origin ? ` The module was ${origin}.` : "";
-    return `pytest never ran a test: importing a collected module called sys.exit(), which aborts the whole session.${where} That file matches pytest's default collection patterns (test_*.py, *_test.py) but is a runnable script, not a test module. Rename it, guard its body with \`if __name__ == "__main__":\`, or exclude it (\`--ignore=<path>\`, or \`norecursedirs\`/\`python_files\` in pytest.ini).`;
+    return { kind: "pytest_collection_abort", module: pytestAbortingModule(output) };
   }
   if (TEST_SUITE_RAN_FAILURE.some((pattern) => pattern.test(output))) {
     const cmd = typeof command === "string" ? command : "";
-    const runner = /\bvitest\b|\bjest\b|npm run/.test(cmd)
-      ? "The coverage generator ran; tests failed."
-      : "Tests ran and failed.";
-    return `${runner} This is a test failure, not the wrong ecosystem command.`;
+    return { kind: "tests_failed", generatorRan: /\bvitest\b|\bjest\b|npm run/.test(cmd) };
   }
   return null;
+}
+
+/** The sentence form of {@link classifyCoverageFailure}. */
+export function coverageFailureHint(
+  command: unknown,
+  detail: unknown,
+): string | null {
+  const cause = classifyCoverageFailure(command, detail);
+  if (!cause) return null;
+  switch (cause.kind) {
+    case "go_missing_module":
+      return "Go was run from a directory without go.mod. Generate coverage from the module root with `go -C <module-dir> test ./... -coverprofile=coverage.out`.";
+    case "generator_missing":
+      return "That generator is not installed. GitPulse will not plan it unless the binary is on PATH.";
+    case "not_allowlisted":
+      return "That command is not on the coverage allowlist. The scanner should not offer it.";
+    case "npx_refused_install":
+      return "npx --no-install will not download a missing runner. Declare a coverage script or install the package locally.";
+    case "vitest_provider_missing":
+      return "Vitest ran without a coverage provider. Add @vitest/coverage-v8 or use the package.json coverage script.";
+    case "no_gradle_wrapper":
+      return "No Gradle wrapper in this repository. GitPulse will not invent ./gradlew.";
+    case "pytest_collection_abort": {
+      const where = cause.module ? ` The module was ${cause.module}.` : "";
+      return `pytest never ran a test: importing a collected module called sys.exit(), which aborts the whole session.${where} That file matches pytest's default collection patterns (test_*.py, *_test.py) but is a runnable script, not a test module. Rename it, guard its body with \`if __name__ == "__main__":\`, or exclude it (\`--ignore=<path>\`, or \`norecursedirs\`/\`python_files\` in pytest.ini).`;
+    }
+    case "tests_failed": {
+      const runner = cause.generatorRan
+        ? "The coverage generator ran; tests failed."
+        : "Tests ran and failed.";
+      return `${runner} This is a test failure, not the wrong ecosystem command.`;
+    }
+  }
 }
 
 function statusLine(status: FailedCoverageScript["status"]): string {

@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { get } from "svelte/store";
 import { interfaceStore } from "../interfaceStore";
+import { memoryStorage } from "../../repos/persist";
 
 describe("interfaceStore", () => {
   beforeEach(() => {
@@ -110,6 +111,53 @@ describe("interfaceStore", () => {
     expect(prefs.checkForUpdates).toBe(false);
     expect(prefs.lastUpdateCheckAt).toBe(0);
     expect(prefs.dismissedUpdateVersion).toBe("");
+  });
+
+  it("leaves automatic coverage generation opt-in by default", () => {
+    // This one runs the repository's own test suites and writes artifacts
+    // into the working tree; it must never be on unless the user said so.
+    interfaceStore.reset();
+    expect(get(interfaceStore).autoRunCoverage).toBe(false);
+  });
+
+  it("toggles automatic coverage generation", () => {
+    interfaceStore.setAutoRunCoverage(true);
+    expect(get(interfaceStore).autoRunCoverage).toBe(true);
+    interfaceStore.setAutoRunCoverage(false);
+    expect(get(interfaceStore).autoRunCoverage).toBe(false);
+  });
+
+  it("refuses to opt a user in from a corrupt stored value", async () => {
+    // Anything other than an explicit `true` leaves it off: a partially
+    // written blob must not start test suites on the next launch. Prefs are
+    // read once when the store is created, so each case needs a fresh module
+    // reading a fresh blob. The suite runs without a DOM, so `window` is
+    // stubbed with the in-memory storage the app already uses in tests.
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: unknown) => {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ autoRunCoverage: stored }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore).autoRunCoverage;
+    };
+    try {
+      for (const stored of ["true", 1, "yes", {}, [], null]) {
+        expect(await load(stored), `stored: ${JSON.stringify(stored)}`).toBe(false);
+      }
+      // The control: an explicit `true` does opt in, so the cases above are
+      // not passing merely because the reader ignores the field.
+      expect(await load(true)).toBe(true);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
   });
 
   it("toggles the release check and records completed checks", () => {

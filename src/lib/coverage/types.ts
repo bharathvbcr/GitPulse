@@ -84,4 +84,12 @@ export interface CoverageReport {
    * an older build carry no notices at all.
    */
   limit_notices?: CoverageScanLimit[];
+  /**
+   * Go module directories found without the git listing, published only for
+   * repositories whose plan contains a root-level `go test ./...` — the
+   * command that can fail for want of a module. Empty everywhere else.
+   */
+  go_modules?: string[];
+  /** Whether a bound cut the module search short; a partial list means partial coverage. */
+  go_modules_partial?: boolean;
 }

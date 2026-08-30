@@ -38,7 +38,7 @@ describe("CoverageViewer report copy contract", () => {
     );
     expect(body).toContain("const current = report;");
     expect(body).toContain("const repo = $repoStore.currentPath;");
-    expect(body).toContain("formatCoverageReport(current, repo)");
+    expect(body).toContain("formatCoverageReport(current, repo, coverageExclusions)");
     expect(body).toContain("await copyText(");
   });
 
@@ -60,7 +60,10 @@ describe("CoverageViewer report copy contract", () => {
 describe("CoverageViewer MANVI integration contracts", () => {
   it("sends the rendered report through the harness store to cmd_ai_coverage_report", () => {
     expect(source).toContain("harnessStore.coverageReport(");
-    expect(source).toContain("formatCoverageReport(current, repo)");
+    // Every renderer of the totals carries the exclusions, the model's copy
+    // included — an omission here would reach every issue it drafts.
+    expect(source).toContain("formatCoverageReport(current, repo, coverageExclusions)");
+    expect(source).not.toContain("formatCoverageReport(current, repo)");
   });
 
   it("runs model-authored steps through the scoped Manvi runner", () => {
@@ -455,5 +458,136 @@ describe("CoverageViewer run-output contracts (regression)", () => {
       source.indexOf("async function runCoveragePipeline"),
     );
     expect(marker).toContain("summary: note");
+  });
+});
+
+describe("CoverageViewer automatic recovery", () => {
+  const runner = source.slice(
+    source.indexOf("async function runCoverageScript"),
+    source.indexOf("async function familyGainedCoverage"),
+  );
+
+  it("attempts one recovery for a failed command", () => {
+    expect(runner).toContain("planCoverageRecovery(tokenized.argv, detail, {");
+    expect(runner).toContain("options.recover ?? true");
+  });
+
+  it("sends the retry through the same gated invoker as the first attempt", () => {
+    // A retry reaching the backend by a second path could reach it under
+    // looser terms than the command it replaces.
+    expect(source).toContain("function invokeCoverageCommand(");
+    expect(runner).toContain("invokeCoverageCommand(tokenized.argv, repoPath)");
+    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath)");
+    // The coverage runner itself never builds an IPC payload of its own.
+    expect(runner).not.toContain('"cmd_manvi_run_action"');
+  });
+
+  it("runs the retry argv verbatim rather than re-parsing a display string", () => {
+    // Re-tokenizing would split an excluded path that contains a space back
+    // into two arguments.
+    expect(source).not.toContain("tokenizeCommand(step.command)");
+    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath)");
+  });
+
+  it("requires every step of a cumulative recovery to pass", () => {
+    // Go coverage is cumulative across modules; accepting the first success
+    // would report a whole-repository percentage measured over one module.
+    const steps = source.slice(
+      source.indexOf("async function runRecoverySteps"),
+      source.indexOf("The single place a coverage command crosses IPC"),
+    );
+    expect(steps).toContain("if (!runPassed(res)) {");
+    expect(steps).toContain("passed: false,");
+    expect(steps).toContain('if (plan.mode === "first_success") break;');
+  });
+
+  it("gives the Go recovery the modules the scan discovered, not parsed text", () => {
+    // A traceback can name any path on the machine; these were found by
+    // walking this repository.
+    expect(runner).toContain("goModules: report?.go_modules");
+    expect(runner).toContain("goModulesPartial: report?.go_modules_partial");
+  });
+
+  it("keeps every step's output when a cumulative recovery fails midway", () => {
+    const steps = source.slice(
+      source.indexOf("async function runRecoverySteps"),
+      source.indexOf("The single place a coverage command crosses IPC"),
+    );
+    expect(steps).toContain("details.push(");
+    expect(steps).toContain("details.join(");
+  });
+
+  it("keeps both attempts' output when the retry also fails", () => {
+    expect(runner).toContain("Automatic retry (${outcome.failedCommand}) also failed:");
+  });
+
+  it("records what a recovered run excluded", () => {
+    expect(runner).toContain("recovery: { note: recovery.note, limitation: recovery.limitation }");
+    expect(source).toContain("recovery?: { note: string; limitation: CoverageLimitation };");
+  });
+
+  it("never renders a recovered pass as a plain green pass", () => {
+    // The coverage behind it measures fewer files than the command was asked
+    // to cover, so the row must not look like a clean run.
+    expect(source).toContain('{:else if status.status === "passed" && status.recovery}');
+    expect(source).toContain("passed (recovered)");
+    const recoveredBranch = source.slice(
+      source.indexOf('{:else if status.status === "passed" && status.recovery}'),
+      source.indexOf('{:else if status.status === "passed"}'),
+    );
+    expect(recoveredBranch).toContain("text-amber-400");
+    expect(recoveredBranch).not.toContain("text-emerald-400");
+  });
+
+  it("carries the exclusions into the copied report", () => {
+    expect(source).toContain("formatCoverageReport(current, repo, coverageExclusions)");
+    // Derived from the run statuses, so the panel and the report cannot
+    // disagree about what was left out.
+    expect(source).toContain("let coverageExclusions = $derived(");
+    expect(source).toContain("limitation: status.recovery!.limitation");
+    expect(source).toContain('status.status === "passed" && status.recovery');
+  });
+});
+
+describe("CoverageViewer automatic generation (opt-in)", () => {
+  const trigger = source.slice(
+    source.indexOf("function maybeAutoRunCoverage"),
+    source.indexOf("// Repo-scoped scan lifecycle"),
+  );
+
+  it("does nothing unless the user opted in", () => {
+    expect(trigger).toContain("if (!$interfaceStore.autoRunCoverage) return;");
+  });
+
+  it("cannot restart the suites from inside its own completion", () => {
+    // Every coverage command rescans when it finishes. Without a per-repo
+    // latch the fresh report would re-enter this trigger and start the whole
+    // batch again, forever.
+    expect(source).toContain("const autoRunAttempted = new Set<string>();");
+    expect(trigger).toContain("if (autoRunAttempted.has(repo)) return;");
+    // Latched before the run, not after: a failed batch must not re-arm.
+    const latch = trigger.indexOf("autoRunAttempted.add(repo);");
+    const start = trigger.indexOf("void runMissingCoverage();");
+    expect(latch).toBeGreaterThan(-1);
+    expect(latch).toBeLessThan(start);
+  });
+
+  it("does not start suites in a repository the user has left", () => {
+    expect(trigger).toContain("if (!guard.isLive() || $repoStore.currentPath !== repo) return;");
+  });
+
+  it("does nothing when there is nothing missing to generate", () => {
+    expect(trigger).toContain("if (missingPipelines.length === 0) return;");
+  });
+
+  it("runs only after a scan actually produced a report", () => {
+    expect(source).toContain("void scan(repo, guard).then((fresh) => {");
+    expect(source).toContain("if (fresh) maybeAutoRunCoverage(repo, guard);");
+  });
+
+  it("goes through the same batch runner as the button", () => {
+    // Not a second execution path: the batch runner carries the concurrency
+    // guards, the per-family pipeline modes and the recovery.
+    expect(trigger).toContain("void runMissingCoverage();");
   });
 });

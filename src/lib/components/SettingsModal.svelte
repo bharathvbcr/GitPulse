@@ -332,6 +332,40 @@
         </section>
 
         <section>
+          <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Coverage</h2>
+          <div class="flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <div class="text-textPrimary text-[11px] font-medium">Generate coverage automatically</div>
+              <div class="text-textMuted text-[10px] leading-snug">
+                Off by default. When on, opening a repository with missing coverage
+                runs its test suites once per session — minutes of CPU on a large
+                project — and writes coverage artifacts into the working tree.
+                A run that only completes because files were excluded is always
+                labelled, never reported as a clean result.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={$interfaceStore.autoRunCoverage}
+              aria-label="Automatically generate coverage for repositories that have none"
+              onclick={() => interfaceStore.setAutoRunCoverage(!$interfaceStore.autoRunCoverage)}
+              class="relative w-8 h-[18px] rounded-full transition-colors shrink-0 {$interfaceStore
+                .autoRunCoverage
+                ? 'bg-accent'
+                : 'bg-border'}"
+            >
+              <span
+                class="absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform {$interfaceStore
+                  .autoRunCoverage
+                  ? 'translate-x-[14px]'
+                  : 'translate-x-0'}"
+              ></span>
+            </button>
+          </div>
+        </section>
+
+        <section>
           <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Updates</h2>
           <div class="space-y-3">
             <div class="flex items-center justify-between gap-3">

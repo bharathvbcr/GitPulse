@@ -172,8 +172,16 @@
                 >{entry.version ?? "older build"}</span>
               {/if}
               <span class="text-[10px] text-textMuted ml-auto font-mono shrink-0">{formatDiagnosticTime(entry.at)}</span>
+              <!-- Repeats are grouped by fingerprint, so occurrences can
+                   differ in per-run detail. Saying so keeps the counter from
+                   reading as N verbatim copies of the text below it. -->
               {#if entry.count > 1}
-                <span class="px-1.5 py-px rounded-full bg-surfaceHover text-[10px] font-semibold text-textPrimary shrink-0">×{entry.count}</span>
+                <span
+                  class="px-1.5 py-px rounded-full bg-surfaceHover text-[10px] font-semibold text-textPrimary shrink-0"
+                  title={entry.varied
+                    ? `${entry.count} occurrences; they were not identical — the most recent is shown.`
+                    : `${entry.count} identical occurrences.`}
+                >×{entry.count}{entry.varied ? " differing" : ""}</span>
               {/if}
             </div>
             <pre class="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-textPrimary m-0">{entry.message}</pre>

@@ -254,6 +254,19 @@ pub struct CoverageReport {
     /// `serde(default)` keeps older cached reports loadable.
     #[serde(default)]
     pub limit_notices: Vec<CoverageScanLimit>,
+    /// Go module directories found without the git listing.
+    ///
+    /// Populated only when the listing found none, which is exactly when the
+    /// planner falls back to a root-level `go test ./...` that can answer
+    /// "directory prefix . does not contain main module". The frontend uses
+    /// this to retry per module after that failure; it is empty for every
+    /// repository whose modules the listing already found.
+    #[serde(default)]
+    pub go_modules: Vec<String>,
+    /// Whether a bound cut the module search short. A partial module list
+    /// means partial coverage, so it is never left implicit.
+    #[serde(default)]
+    pub go_modules_partial: bool,
 }
 
 /// Aggregated coverage for one detected language across every artifact that
@@ -466,6 +479,8 @@ impl CoverageScanner {
                     // clean "nothing to scan".
                     truncated: detected.listing_partial,
                     limit_notices: Vec::new(),
+                    go_modules: Vec::new(),
+                    go_modules_partial: false,
                 },
                 HashMap::new(),
             ));
@@ -750,6 +765,25 @@ impl CoverageScanner {
             CoverageCommandLayout::from_scan(&detected),
         );
 
+        // Populated for exactly the repositories whose plan contains a
+        // root-level `go test ./...`, which is the command that can answer
+        // "directory prefix . does not contain main module":
+        //
+        //   - a root `go.work`, where that command is planned unconditionally
+        //     because a workspace root normally covers every used module; and
+        //   - no module directory in the listing, where it is the fallback.
+        //
+        // Keying this on an empty listing alone missed the first case
+        // entirely: a workspace plans the root command however many modules
+        // the listing found.
+        let go_root_command_planned = detected.go_work_at_root || detected.go_mod_dirs.is_empty();
+        let (go_modules, go_modules_partial) =
+            if go_root_command_planned && family_list.iter().any(|f| f.family == "go") {
+                discover_go_modules(&repo)
+            } else {
+                (Vec::new(), false)
+            };
+
         let report = CoverageReport {
             families: family_list,
             languages,
@@ -758,6 +792,8 @@ impl CoverageScanner {
             overall,
             truncated,
             limit_notices,
+            go_modules,
+            go_modules_partial,
         };
 
         let merged_entries: usize = merged.values().map(BTreeMap::len).sum();
@@ -967,6 +1003,233 @@ fn quote_rel(rel: &str) -> String {
     } else {
         rel.to_string()
     }
+}
+
+/// Bound on the `go.work` we will parse. A hostile multi-megabyte manifest is
+/// skipped rather than read; no module list is better than a wrong one.
+const MAX_GO_WORK_BYTES: u64 = 64 * 1024;
+/// Bound on discovered Go modules. Hitting it is disclosed, never silently
+/// truncated — a partial module list means partial coverage.
+const MAX_GO_MODULES: usize = 16;
+/// Depth and breadth bounds for the `go.mod` fallback search. A repository
+/// with a deep vendor tree must not turn a scan into a full-disk walk.
+const MAX_GO_WALK_DEPTH: usize = 3;
+const MAX_GO_WALK_DIRS: usize = 512;
+
+/// Directories named by a `go.work` `use` directive.
+///
+/// Handles both spellings the tool accepts: a parenthesised block and one or
+/// more single-line `use` lines. Comments are stripped, and a `use` naming
+/// the workspace root itself comes back as `""` like every other module dir
+/// in this file.
+fn parse_go_work_use(text: &str) -> (Vec<String>, bool) {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut partial = false;
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = match raw.split_once("//") {
+            Some((before, _)) => before,
+            None => raw,
+        }
+        .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+                continue;
+            }
+            partial |= push_go_work_dir(&mut dirs, line);
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("use") else {
+            continue;
+        };
+        // `used` and `usefoo` are not `use`.
+        if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            continue;
+        }
+        let rest = rest.trim();
+        if let Some(inline) = rest.strip_prefix('(') {
+            in_block = true;
+            // `use (./a)` and `use ( ./a` both occur in hand-written files.
+            let inline = inline.trim();
+            if let Some(before) = inline.strip_suffix(')') {
+                in_block = false;
+                partial |= push_go_work_dir(&mut dirs, before.trim());
+            } else {
+                partial |= push_go_work_dir(&mut dirs, inline);
+            }
+            continue;
+        }
+        partial |= push_go_work_dir(&mut dirs, rest);
+    }
+    (dirs, partial)
+}
+
+/// Adds one valid, unique workspace directory and reports whether the module
+/// cap prevented it from being retained.
+fn push_go_work_dir(dirs: &mut Vec<String>, raw: &str) -> bool {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let rel = trimmed
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .replace('\\', "/");
+    // `use .` is the workspace root, which this file spells "".
+    let rel = if rel == "." { String::new() } else { rel };
+    if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    if rel_is_command_unsafe(&rel) {
+        return false;
+    }
+    if dirs.contains(&rel) {
+        return false;
+    }
+    if dirs.len() >= MAX_GO_MODULES {
+        return true;
+    }
+    dirs.push(rel);
+    false
+}
+
+/// The workspace's module directories, or `None` when there is no root
+/// `go.work`. A present file that cannot be read safely is an explicitly
+/// partial result, not permission to substitute a filesystem guess for the
+/// workspace's authoritative `use` set.
+fn read_go_work_modules(repo: &Path) -> Option<(Vec<String>, bool)> {
+    let raw_path = repo.join("go.work");
+    match std::fs::symlink_metadata(&raw_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some((Vec::new(), true)),
+    }
+    let path = match sandbox_join_canonical(repo, "go.work") {
+        Ok(path) => path,
+        Err(_) => return Some((Vec::new(), true)),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return Some((Vec::new(), true)),
+    };
+    if !meta.is_file() || meta.len() > MAX_GO_WORK_BYTES {
+        return Some((Vec::new(), true));
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Some((Vec::new(), true)),
+    };
+    Some(parse_go_work_use(&text))
+}
+
+/// Bounded search for `go.mod` directories.
+///
+/// The scan's own module list comes from `git ls-files --exclude-standard`,
+/// which cannot see a `go.mod` that is git-ignored and stops at
+/// `LISTING_ENTRY_CAP` on a large checkout. This walks the tree instead, so
+/// the two methods fail for different reasons. Returns the directories and
+/// whether a bound cut the search short.
+fn walk_for_go_mod(repo: &Path) -> (Vec<String>, bool) {
+    let mut found: Vec<String> = Vec::new();
+    let mut partial = false;
+    let mut visited = 0usize;
+    // (relative dir, depth). Breadth-first so shallow modules — the ones a
+    // workspace actually uses — are found before deep vendored copies.
+    let mut queue: std::collections::VecDeque<(String, usize)> =
+        std::collections::VecDeque::from([(String::new(), 0usize)]);
+    while let Some((rel, depth)) = queue.pop_front() {
+        if visited >= MAX_GO_WALK_DIRS {
+            partial = true;
+            break;
+        }
+        visited += 1;
+        let Ok(dir) = sandbox_join_canonical(repo, if rel.is_empty() { "." } else { &rel }) else {
+            partial = true;
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            partial = true;
+            continue;
+        };
+        for (seen_entries, entry) in entries.enumerate() {
+            if seen_entries >= MAX_DIR_ENTRIES {
+                partial = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                partial = true;
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            // `file_type` does not follow symlinks, so a link is never
+            // descended into: no cycle, and no module reported twice under
+            // both its real path and an alias. Escaping the repository is
+            // separately impossible — `sandbox_join_canonical` resolves each
+            // directory before it is read.
+            let Ok(kind) = entry.file_type() else {
+                partial = true;
+                continue;
+            };
+            if kind.is_file() && name == "go.mod" {
+                if found.len() >= MAX_GO_MODULES {
+                    partial = true;
+                } else if !rel_is_command_unsafe(&rel) && !found.contains(&rel) {
+                    found.push(rel.clone());
+                }
+                continue;
+            }
+            if !kind.is_dir() {
+                continue;
+            }
+            if name.starts_with('.')
+                || matches!(name.as_str(), "node_modules" | "vendor" | "target")
+            {
+                continue;
+            }
+            if depth + 1 > MAX_GO_WALK_DEPTH {
+                partial = true;
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            queue.push_back((child, depth + 1));
+        }
+    }
+    found.sort();
+    (found, partial)
+}
+
+/// Every directory in this repository that holds a Go module, found without
+/// relying on the git listing.
+///
+/// The `go.work` `use` set is authoritative when there is one: it says which
+/// modules the workspace actually builds, which a filesystem search cannot.
+/// The search is the fallback for repositories with no workspace file.
+fn discover_go_modules(repo: &Path) -> (Vec<String>, bool) {
+    if let Some((workspace, partial)) = read_go_work_modules(repo) {
+        // A `use` entry whose directory has no go.mod is stale; running it
+        // would reproduce the very failure this is here to get past.
+        let live: Vec<String> = workspace
+            .into_iter()
+            .filter(|dir| {
+                let manifest = if dir.is_empty() {
+                    "go.mod".to_string()
+                } else {
+                    format!("{dir}/go.mod")
+                };
+                manifest_is_file(repo, &manifest)
+            })
+            .collect();
+        return (live, partial);
+    }
+    walk_for_go_mod(repo)
 }
 
 fn manifest_is_file(repo: &Path, rel: &str) -> bool {
@@ -2917,6 +3180,190 @@ mod tests {
             "changed artifact must force one fresh parse"
         );
         assert_ne!(third.overall.lines_hit, second.overall.lines_hit);
+    }
+
+    #[test]
+    fn go_work_use_block_is_parsed() {
+        let (dirs, partial) = parse_go_work_use(
+            "go 1.22\n\nuse (\n\t./manvi\n\t./bench/live // the live bench\n\t.\n)\n",
+        );
+        assert_eq!(dirs, vec!["manvi", "bench/live", ""]);
+        assert!(!partial);
+    }
+
+    #[test]
+    fn go_work_single_line_and_inline_block_spellings_are_parsed() {
+        assert_eq!(parse_go_work_use("use ./a\nuse ./b\n").0, vec!["a", "b"]);
+        assert_eq!(parse_go_work_use("use (./a)\n").0, vec!["a"]);
+        assert_eq!(parse_go_work_use("use \"./quoted\"\n").0, vec!["quoted"]);
+    }
+
+    #[test]
+    fn go_work_parser_refuses_paths_that_leave_the_repository() {
+        // These become `go -C <dir>` arguments. The backend gate refuses an
+        // escaping path too, but a planner that offers one is already wrong.
+        let dirs = parse_go_work_use("use (\n\t/etc\n\t../sibling\n\t./ok\n)\n").0;
+        assert_eq!(dirs, vec!["ok"]);
+    }
+
+    #[test]
+    fn go_work_parser_refuses_shell_unsafe_directories() {
+        let dirs = parse_go_work_use("use (\n\t./a;rm -rf\n\t./b$(x)\n\t./fine\n)\n").0;
+        assert_eq!(dirs, vec!["fine"]);
+    }
+
+    #[test]
+    fn go_work_parser_ignores_words_that_merely_start_with_use() {
+        assert!(parse_go_work_use("used ./a\nuseful ./b\ngo 1.22\n")
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn go_work_parser_is_bounded_and_never_hangs_on_hostile_input() {
+        let many = (0..1000)
+            .map(|i| format!("use ./m{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (dirs, partial) = parse_go_work_use(&many);
+        assert_eq!(dirs.len(), MAX_GO_MODULES);
+        assert!(partial, "a capped workspace module list must be disclosed");
+        // Unclosed block, stray parens, empty entries: no panic, no garbage.
+        assert!(parse_go_work_use("use (\n\n\n").0.is_empty());
+        assert!(parse_go_work_use(")\n)\nuse\n").0.is_empty());
+        assert!(parse_go_work_use("").0.is_empty());
+    }
+
+    #[test]
+    fn workspace_modules_win_over_the_filesystem_search() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "go.work",
+            "go 1.22\n\nuse (\n\t./svc\n\t./tool\n)\n",
+        );
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        write(repo.path(), "tool/go.mod", "module tool\n");
+        // Present on disk but not in the workspace: `go.work` says which
+        // modules the workspace actually builds, and a search cannot.
+        write(repo.path(), "extra/go.mod", "module extra\n");
+        let (dirs, partial) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["svc", "tool"]);
+        assert!(!partial);
+    }
+
+    #[test]
+    fn a_stale_workspace_entry_is_dropped_rather_than_retried() {
+        // Running `go -C gone` would reproduce the very failure this exists
+        // to get past.
+        let repo = git_repo();
+        write(repo.path(), "go.work", "use (\n\t./live\n\t./gone\n)\n");
+        write(repo.path(), "live/go.mod", "module live\n");
+        let (dirs, _) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["live"]);
+    }
+
+    #[test]
+    fn the_search_finds_a_git_ignored_module_the_listing_cannot() {
+        // The scan's own module list comes from `git ls-files
+        // --exclude-standard`, which cannot see this one at all.
+        let repo = git_repo();
+        write(repo.path(), ".gitignore", "generated/\n");
+        write(repo.path(), "generated/go.mod", "module generated\n");
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        let (dirs, partial) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["generated", "svc"]);
+        assert!(!partial);
+    }
+
+    #[test]
+    fn the_search_is_bounded_in_depth_and_says_nothing_it_did_not_see() {
+        let repo = git_repo();
+        // Deeper than MAX_GO_WALK_DEPTH: out of range, and its absence must
+        // not be mistaken for "this repository has no such module".
+        write(repo.path(), "a/b/c/d/e/go.mod", "module deep\n");
+        write(repo.path(), "a/b/go.mod", "module shallow\n");
+        let (dirs, partial) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["a/b"]);
+        assert!(
+            partial,
+            "skipping deeper directories must make the result partial"
+        );
+    }
+
+    #[test]
+    fn an_oversized_workspace_is_not_replaced_with_an_unlabelled_filesystem_guess() {
+        let repo = git_repo();
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        write(
+            repo.path(),
+            "go.work",
+            &"x".repeat(MAX_GO_WORK_BYTES as usize + 1),
+        );
+        let (dirs, partial) = discover_go_modules(repo.path());
+        assert!(dirs.is_empty(), "go.work is authoritative when present");
+        assert!(partial, "an unreadable workspace must not look complete");
+    }
+
+    #[test]
+    fn the_search_does_not_descend_into_symlinked_directories() {
+        // A link to a real module inside the repository. Following it would
+        // report one module twice, under its real path and under the alias,
+        // and `go -C alias` measures the same code again.
+        let repo = git_repo();
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        std::os::unix::fs::symlink(repo.path().join("svc"), repo.path().join("alias")).unwrap();
+        let (dirs, _) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["svc"]);
+    }
+
+    #[test]
+    fn the_search_cannot_reach_a_symlinked_tree_outside_the_repository() {
+        // Belt and braces: the link is not descended into because it is a
+        // symlink, and `sandbox_join_canonical` would refuse the resolved
+        // path anyway.
+        let repo = git_repo();
+        let outside = TempDir::new().expect("tempdir");
+        write(outside.path(), "go.mod", "module outside\n");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).unwrap();
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        let (dirs, _) = discover_go_modules(repo.path());
+        assert_eq!(dirs, vec!["svc"], "a symlinked tree is not this repository");
+    }
+
+    #[test]
+    fn the_search_reports_itself_partial_when_it_hits_its_module_bound() {
+        let repo = git_repo();
+        for i in 0..MAX_GO_MODULES + 5 {
+            write(repo.path(), &format!("m{i:02}/go.mod"), "module m\n");
+        }
+        let (dirs, partial) = discover_go_modules(repo.path());
+        assert_eq!(dirs.len(), MAX_GO_MODULES);
+        assert!(partial, "a capped module list must never look complete");
+    }
+
+    #[test]
+    fn a_repository_whose_listing_found_modules_pays_nothing_for_the_search() {
+        // The report carries module directories only for the case that needs
+        // them; every other Go repository gets an empty list.
+        let repo = git_repo();
+        write(repo.path(), "go.mod", "module root\n");
+        write(repo.path(), "main.go", "package main\n\nfunc main() {}\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert!(report.go_modules.is_empty());
+        assert!(!report.go_modules_partial);
+    }
+
+    #[test]
+    fn a_workspace_root_that_is_not_a_module_publishes_its_modules() {
+        let repo = git_repo();
+        write(repo.path(), "go.work", "go 1.22\n\nuse (\n\t./svc\n)\n");
+        write(repo.path(), "svc/go.mod", "module svc\n");
+        // Go source at the root, so the family is detected, but no root
+        // go.mod — the shape whose root-level command fails.
+        write(repo.path(), "doc.go", "package doc\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        assert_eq!(report.go_modules, vec!["svc"]);
     }
 
     fn git_repo() -> TempDir {
@@ -5223,6 +5670,51 @@ src/main.go:4.1,4.8 1 0
         /// skips exactly the commands worth checking. Drive the plan functions
         /// directly with their preconditions forced instead, so this holds on
         /// any host.
+        /// The commands the frontend's automatic recovery builds must clear the
+        /// same gate as a planned one. A recovery the backend refuses is a
+        /// third dead button: an offer that cannot run.
+        ///
+        /// These shapes are pinned in `src/lib/coverage/recovery.ts` and
+        /// asserted verbatim by `recovery.test.ts`. Both halves have to move
+        /// together; either one drifting fails here or there.
+        #[test]
+        fn recovery_commands_are_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "svc/go.mod", "module svc\n");
+            write(repo.path(), "bench/stress_test.py", "import sys\n");
+            let root = validate_repo(repo.path().to_str().expect("utf-8")).expect("repo");
+
+            // Go: one `-C <module>` command per discovered module.
+            let go: Vec<String> = vec![
+                "go".into(),
+                "-C".into(),
+                "svc".into(),
+                "test".into(),
+                "./...".into(),
+                "-coverprofile=coverage.out".into(),
+            ];
+            validate_manvi_action(&go, ManviActionKind::CoverageGenerator)
+                .expect("the Go module recovery must be allowed");
+            crate::terminal::validate_manvi_paths(&root, &go, ManviActionKind::CoverageGenerator)
+                .expect("and its module directory must validate");
+
+            // Python: the original command plus the exclusion.
+            let pytest: Vec<String> = vec![
+                "pytest".into(),
+                "--cov".into(),
+                "--cov-report=xml".into(),
+                "--ignore=bench/stress_test.py".into(),
+            ];
+            validate_manvi_action(&pytest, ManviActionKind::CoverageGenerator)
+                .expect("the pytest collection-abort recovery must be allowed");
+            crate::terminal::validate_manvi_paths(
+                &root,
+                &pytest,
+                ManviActionKind::CoverageGenerator,
+            )
+            .expect("and its exclusion path must validate");
+        }
+
         #[test]
         fn every_toolchain_gated_plan_is_runnable() {
             let repo = git_repo();
