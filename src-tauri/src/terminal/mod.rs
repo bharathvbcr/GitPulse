@@ -1,5 +1,8 @@
 //! Terminal execution module: PTY session management and bounded command execution.
 
+use crate::coverage_toolchain::{
+    repo_local_program, JS_COVERAGE_PROVIDERS, PYTEST_PACKAGES, VENV_DIR_NAMES,
+};
 use crate::engine::git_cli::{
     run_captured, sandbox_join, sandbox_join_canonical, validate_repo, RunOutcome,
 };
@@ -568,7 +571,7 @@ fn validate_argv_bounds(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn normalized_program(program: &str) -> String {
+pub(crate) fn normalized_program(program: &str) -> String {
     let lower = program.to_ascii_lowercase();
     lower
         .strip_suffix(".exe")
@@ -624,26 +627,6 @@ fn cargo_llvm_cov_install_allowed(args: &[String]) -> bool {
     rest.len() == 2 && rest.contains(&"--locked") && rest.contains(&"cargo-llvm-cov")
 }
 
-/// Executables that live inside the open repository and may be named as the
-/// program, mapped to the tool identity the allowlist reasons about.
-///
-/// Exact-string only — never a prefix, glob, or "anything under vendor/".
-/// A repository must not be able to nominate an arbitrary checked-in file as
-/// an executable by naming it, and `validate_manvi_paths` separately proves
-/// the file really resolves inside the repository before it is spawned.
-fn repo_local_program(normalized: &str) -> Option<&'static str> {
-    match normalized {
-        // Build wrappers a project checks in so nobody needs a system tool.
-        "./gradlew" | ".\\gradlew" => Some("./gradlew"),
-        "./mvnw" | ".\\mvnw" => Some("./mvnw"),
-        ".venv/bin/python" | "venv/bin/python" | ".venv/scripts/python" | "venv/scripts/python" => {
-            Some("python")
-        }
-        "vendor/bin/phpunit" => Some("phpunit"),
-        _ => None,
-    }
-}
-
 /// `python -m venv .venv` — creating the project's own virtualenv.
 ///
 /// The target directory is pinned to the two conventional names rather than
@@ -661,15 +644,66 @@ fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
         .find_map(|candidate| std::fs::canonicalize(candidate).ok())
 }
 
-/// True when `interpreter`, after every symlink is resolved, is the very
-/// Python GitPulse would have run from PATH anyway.
-fn resolves_to_host_python(interpreter: &std::path::Path) -> bool {
+/// True when `name` is a Python interpreter's file name (`python`, `python3`,
+/// `python3.14`, `python3.14t`), and not some other executable a symlink was
+/// pointed at. This is what separates a virtualenv from `.venv/bin/python`
+/// aimed at `/bin/sh`.
+fn is_python_interpreter_name(name: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    if name == "python" || name == "python3" {
+        return true;
+    }
+    name.strip_prefix("python3.")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// True when the virtualenv's interpreter resolves to a Python that GitPulse
+/// is willing to execute.
+///
+/// Two independent ways to qualify, because one of them is not always
+/// available:
+///
+/// 1. It is byte-for-byte the Python on PATH. Exact, and true whenever
+///    GitPulse runs from a shell.
+/// 2. It is *a* Python interpreter, by file name, resolving to somewhere
+///    outside the repository.
+///
+/// (2) exists because (1) silently fails for an installed app. A macOS app
+/// launched from Finder inherits launchd's PATH, not the user's shell PATH —
+/// on this machine that means `/usr/bin/python3` rather than the Homebrew
+/// interpreter every project virtualenv here is built from. Anchoring only on
+/// (1) made GitPulse refuse the very virtualenv it had just created, but only
+/// once installed, which is the configuration users actually run.
+///
+/// (2) keeps the property that matters. The realistic attack is a repository
+/// shipping `.venv/bin/python` as a symlink to a checked-in payload, or to a
+/// shell: the first is refused because the target must resolve *outside* the
+/// repository, the second because the target must be named like a Python.
+/// Writing a hostile binary named `python3` outside the repository already
+/// requires the code execution this check exists to prevent.
+fn resolves_to_trusted_python(repo: &std::path::Path, interpreter: &std::path::Path) -> bool {
     let Ok(target) = std::fs::canonicalize(interpreter) else {
         return false;
     };
-    ["python3", "python"]
+    if ["python3", "python"]
         .iter()
         .any(|name| resolve_on_path(name).is_some_and(|host| host == target))
+    {
+        return true;
+    }
+    // A target inside the repository is repository-authored content, never a
+    // system interpreter, whatever it is called.
+    if let Ok(root) = std::fs::canonicalize(repo) {
+        if target.starts_with(&root) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_python_interpreter_name)
 }
 
 /// Validates the project virtualenv's interpreter as a program.
@@ -707,8 +741,8 @@ pub(crate) fn check_venv_interpreter(
     if !interpreter.is_file() {
         return Err("is not a repository file");
     }
-    if !resolves_to_host_python(&interpreter) {
-        return Err("does not resolve to the Python interpreter on PATH");
+    if !resolves_to_trusted_python(repo, &interpreter) {
+        return Err("does not resolve to a Python interpreter outside the repository");
     }
     Ok(())
 }
@@ -739,11 +773,10 @@ fn program_is_repo_local(program_raw: &str) -> bool {
 fn python_venv_create_allowed(args: &[String]) -> bool {
     args.len() == 4
         && args.get(2).map(String::as_str) == Some("venv")
-        && matches!(args.get(3).map(String::as_str), Some(".venv" | "venv"))
+        && args
+            .get(3)
+            .is_some_and(|dir| VENV_DIR_NAMES.contains(&dir.as_str()))
 }
-
-/// The pytest coverage toolchain, and nothing else.
-const PYTEST_COVERAGE_PACKAGES: &[&str] = &["pytest", "pytest-cov"];
 
 /// `<repo venv>/bin/python -m pip install pytest pytest-cov`.
 ///
@@ -762,15 +795,8 @@ fn pip_coverage_install_allowed(args: &[String], interpreter_is_repo_local: bool
         return false;
     }
     let packages: Vec<&str> = args.iter().skip(4).map(String::as_str).collect();
-    !packages.is_empty()
-        && packages
-            .iter()
-            .all(|pkg| PYTEST_COVERAGE_PACKAGES.contains(pkg))
+    !packages.is_empty() && packages.iter().all(|pkg| PYTEST_PACKAGES.contains(pkg))
 }
-
-/// Coverage providers the scanner knows how to drive. Adding one here is what
-/// makes it installable; nothing else about the ecosystem is.
-const JS_COVERAGE_PROVIDERS: &[&str] = &["@vitest/coverage-v8", "@vitest/coverage-istanbul"];
 
 /// `npm install --save-dev @vitest/coverage-v8`.
 ///
@@ -961,7 +987,7 @@ fn python_module_allowed(
 /// shells/network/file utilities are absent, paths cannot be absolute or walk
 /// upward, and the separate MANVI policy gate still judges every accepted
 /// command immediately before execution.
-fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), String> {
+pub(crate) fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), String> {
     if args.is_empty() {
         return Err("MANVI action has no command".into());
     }
@@ -1139,7 +1165,7 @@ fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> Result<(), S
 /// Resolves every path-bearing option the supported tools can write or read.
 /// Lexical checks above reject obvious `/` and `..` escapes; canonical
 /// resolution here also refuses a repository symlink that points outside.
-fn validate_manvi_paths(
+pub(crate) fn validate_manvi_paths(
     repo: &std::path::Path,
     args: &[String],
     kind: ManviActionKind,
@@ -1448,6 +1474,80 @@ mod tests {
     /// The virtualenv interpreter is the one program GitPulse executes that
     /// is *expected* to symlink out of the repository, so it is exempted from
     /// canonical containment. These tests pin what replaced that guarantee.
+    /// Regression, found by running the installed app: the trust anchor used
+    /// to be "resolves to the Python on PATH". A macOS app launched from
+    /// Finder inherits launchd's PATH, not the shell's, so on a Homebrew
+    /// machine the installed GitPulse refused the very virtualenv it had just
+    /// created — while the shell-launched dev build accepted it. The rule must
+    /// not depend on how the app was launched.
+    #[cfg(unix)]
+    #[test]
+    fn venv_interpreter_is_accepted_without_a_matching_path_entry() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        std::fs::write(repo.join(".venv/pyvenv.cfg"), "home = /elsewhere/bin\n").unwrap();
+
+        // A Python interpreter that is deliberately NOT the one on PATH, in a
+        // directory PATH does not contain — the Homebrew-vs-/usr/bin split.
+        let elsewhere = tempfile::TempDir::new().expect("tempdir2");
+        let real_python = elsewhere.path().join("python3.14");
+        std::fs::write(&real_python, "#!/bin/sh\nexit 0\n").unwrap();
+        symlink(&real_python, repo.join(".venv/bin/python")).unwrap();
+
+        check_venv_interpreter(repo, ".venv/bin/python")
+            .expect("a Python outside the repo must qualify without a PATH match");
+    }
+
+    /// The relaxation must not become "run anything the repository points at".
+    #[cfg(unix)]
+    #[test]
+    fn venv_interpreter_still_refuses_non_python_and_in_repo_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        std::fs::write(repo.join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+
+        // (a) A real system binary that is not a Python.
+        symlink("/bin/sh", repo.join(".venv/bin/python")).unwrap();
+        assert!(
+            check_venv_interpreter(repo, ".venv/bin/python").is_err(),
+            "a shell is not a Python interpreter"
+        );
+        std::fs::remove_file(repo.join(".venv/bin/python")).unwrap();
+
+        // (b) A checked-in payload named like a Python. Being inside the
+        //     repository disqualifies it however it is named.
+        let payload = repo.join("tools/python3");
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, "#!/bin/sh\nexit 0\n").unwrap();
+        symlink(&payload, repo.join(".venv/bin/python")).unwrap();
+        assert!(
+            check_venv_interpreter(repo, ".venv/bin/python").is_err(),
+            "a repository-authored binary must never be executed as the interpreter"
+        );
+    }
+
+    #[test]
+    fn python_interpreter_names_are_recognized_precisely() {
+        for good in [
+            "python",
+            "python3",
+            "python3.14",
+            "python3.9",
+            "python3.14t",
+        ] {
+            assert!(is_python_interpreter_name(good), "{good}");
+        }
+        for bad in [
+            "sh", "bash", "node", "python2", "pythonic", "python3x", "", "py",
+        ] {
+            assert!(!is_python_interpreter_name(bad), "{bad}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn venv_interpreter_must_resolve_to_the_host_python() {

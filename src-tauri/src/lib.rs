@@ -2,6 +2,7 @@ pub mod ai;
 pub mod analyzer;
 pub mod ci_local;
 pub mod commands;
+pub(crate) mod coverage_toolchain;
 pub mod desktop;
 pub mod diff;
 pub mod engine;

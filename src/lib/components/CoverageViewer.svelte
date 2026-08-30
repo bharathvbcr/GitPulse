@@ -48,11 +48,11 @@
     buildCoverageIssueDraft,
     formatCoverageReport,
     formatFailedCoverageDiagnostics,
+    type FailedCoverageScript,
   } from "../coverage/report";
   import {
-    missingCoveragePipelines,
-    suggestedCoverageCommands,
-    coverageFamilyRunLabel,
+    coverageFamilyViews,
+    type CoverageFamilyView,
     type MissingCoveragePipeline,
   } from "../coverage/scripts";
   import {
@@ -92,12 +92,12 @@
     return guard;
   }
 
-  async function scan(repo: string, guard: AsyncGuard) {
+  async function scan(repo: string, guard: AsyncGuard): Promise<CoverageReport | null> {
     isScanning = true;
     scanError = null;
     try {
       const next = await invoke<CoverageReport>("cmd_scan_coverage", { repoPath: repo });
-      if (!guard.isLive()) return;
+      if (!guard.isLive()) return null;
       const prev = report;
       report = next;
       reportCache.set(repo, next);
@@ -126,9 +126,11 @@
       if (!prevEntry || !nextEntry || !sameCoverageSummary(prevEntry, nextEntry)) {
         reportVersion += 1;
       }
+      return next;
     } catch (err: unknown) {
-      if (!guard.isLive()) return;
+      if (!guard.isLive()) return null;
       scanError = reportPanelError("coverage", err);
+      return null;
     } finally {
       if (guard.isLive()) isScanning = false;
     }
@@ -139,6 +141,13 @@
     if (!repo) return;
     const guard = beginScan();
     void scan(repo, guard);
+  }
+
+  /** A rescan whose result the caller needs, not just its side effect. */
+  async function rescanAwaited(): Promise<CoverageReport | null> {
+    const repo = $repoStore.currentPath;
+    if (!repo) return null;
+    return await scan(repo, beginScan());
   }
 
   /** Copies the same complete, bounded snapshot used by MANVI analysis. */
@@ -185,10 +194,18 @@
     duration_ms: number;
   }
 
+  /**
+   * `no_data` is the outcome that used to be reported as `passed`: the command
+   * ran, exited 0, and the rescan still found no coverage for that family.
+   * A generator that produced nothing has not succeeded, and saying so is the
+   * whole point — `go test` over a package with no tests exits 0 and writes a
+   * coverprofile with no records, which is exactly how a repository ends up
+   * with a green checkmark and no coverage.
+   */
   interface ScriptStatus {
     label: string;
     running: boolean;
-    status?: "passed" | "failed";
+    status?: "passed" | "failed" | "no_data";
     detail?: string;
   }
 
@@ -221,8 +238,18 @@
   let issueUrl = $state<string | null>(null);
 
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
-  let missingPipelines = $derived.by(() =>
-    missingCoveragePipelines((report as CoverageReport | null)?.families),
+  /**
+   * The single decision point for what coverage generation is offered. Both
+   * the header strip and the empty-state sidebar render from this; neither
+   * re-derives runnability from the raw family rows.
+   */
+  let familyViews = $derived.by<CoverageFamilyView[]>(() =>
+    coverageFamilyViews((report as CoverageReport | null)?.families),
+  );
+  let missingPipelines = $derived.by<MissingCoveragePipeline[]>(() =>
+    familyViews
+      .map((view) => view.pipeline)
+      .filter((pipeline): pipeline is MissingCoveragePipeline => pipeline !== null),
   );
   /**
    * Exact retained/observed counts for the caps that fired, e.g.
@@ -237,8 +264,30 @@
       .join(" · "),
   );
   let anyScriptRunning = $derived(Object.values(scriptStatuses).some((status) => status.running));
-  let failedScriptList = $derived.by(() =>
-    Object.values(scriptStatuses).filter((status) => status.status === "failed"),
+  /**
+   * One predicate for "no coverage command may start right now". It was
+   * copy-pasted across five buttons, and one copy already differed from the
+   * rest — a set of conditions maintained in five places is a set that will
+   * disagree.
+   */
+  let runControlsDisabled = $derived(
+    runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting,
+  );
+  /**
+   * Every run that did not deliver coverage, in the shape the diagnostics
+   * formatter wants. A `no_data` run belongs here as much as a failed one:
+   * the user pressed a button, it did not produce coverage, and the output
+   * that explains why is the thing worth copying. The formatter prints each
+   * entry's own status so the two are never conflated.
+   */
+  let unsuccessfulScripts = $derived.by<FailedCoverageScript[]>(() =>
+    Object.values(scriptStatuses)
+      .filter((status) => status.status === "failed" || status.status === "no_data")
+      .map((status) => ({
+        label: status.label,
+        detail: status.detail,
+        status: status.status === "no_data" ? ("no_data" as const) : ("failed" as const),
+      })),
   );
 
   let aiSteps = $derived.by<RunnableStep[]>(() => {
@@ -406,9 +455,16 @@
   }
 
   async function copyFailedScript(key: string, status: ScriptStatus) {
-    const text = formatFailedCoverageDiagnostics([status], {
-      repoPath: $repoStore.currentPath,
-    });
+    const text = formatFailedCoverageDiagnostics(
+      [
+        {
+          label: status.label,
+          detail: status.detail,
+          status: status.status === "no_data" ? "no_data" : "failed",
+        },
+      ],
+      { repoPath: $repoStore.currentPath },
+    );
     if (await copyText(text)) {
       copiedScriptKey = key;
       if (copiedScriptTimer !== null) window.clearTimeout(copiedScriptTimer);
@@ -420,8 +476,8 @@
   }
 
   async function copyAllFailedScripts() {
-    if (failedScriptList.length === 0) return;
-    const text = formatFailedCoverageDiagnostics(failedScriptList, {
+    if (unsuccessfulScripts.length === 0) return;
+    const text = formatFailedCoverageDiagnostics(unsuccessfulScripts, {
       repoPath: $repoStore.currentPath,
       scanError,
     });
@@ -666,10 +722,55 @@
   }
 
   /**
+   * Did the family actually gain a coverage report?
+   *
+   * `null` means the question could not be answered — cancelled, no repo, or
+   * the rescan itself failed — and callers must not read that as either
+   * answer.
+   */
+  async function familyGainedCoverage(
+    family: string,
+    guard: AsyncGuard,
+  ): Promise<boolean | null> {
+    const fresh = await rescanAwaited();
+    if (!guard.isLive() || !fresh) return null;
+    return fresh.families.some((row) => row?.family === family && row.found === true);
+  }
+
+  /**
+   * Downgrades a command the runner recorded as `passed` to `no_data`.
+   *
+   * Only ever narrows: a command that failed keeps its failure, and a status
+   * the user has since replaced is left alone.
+   */
+  function markProducedNoCoverage(key: string, family: string) {
+    const prev = scriptStatuses[key];
+    if (!prev || prev.status !== "passed") return;
+    const note = `Exited 0, but rescanning found no ${family} coverage report.`;
+    const tail = prev.detail?.trim();
+    scriptStatuses[key] = {
+      ...prev,
+      status: "no_data",
+      detail: tail ? `${note}\n${tail}` : note,
+    };
+  }
+
+  /**
    * Setup then generate for one language. Rust workspace and Go module
    * commands are cumulative and all must pass; other ecosystems expose
    * alternative runners, so stop at the first success instead of overwriting
    * artifacts by running every alternative sequentially.
+   *
+   * Success is measured by *coverage appearing*, not by exit status. Those are
+   * not the same question, and treating them as one is how a repository ends
+   * up with a green checkmark and no coverage: `go test ./...` over packages
+   * with no test files exits 0 and writes a coverprofile containing no
+   * records, and a pytest run whose collection is aborted can do the same.
+   * Whenever a generate command exits 0, the family is rescanned and the run
+   * is only reported as passed if a report actually materialized — otherwise
+   * it is recorded as `no_data`, and for an ecosystem with alternative runners
+   * the next alternative is tried rather than the pipeline stopping on a
+   * success that produced nothing.
    */
   async function runCoveragePipeline(
     pipeline: MissingCoveragePipeline,
@@ -688,25 +789,58 @@
       });
       if (!passed) return false;
     }
-    let generated = generate.length === 0;
+
+    if (generate.length === 0) {
+      // Nothing to generate: the pipeline was setup-only, and there is no
+      // outcome to verify.
+      if ((options.rescan ?? true) && guard.isLive()) rescan();
+      return true;
+    }
+
+    let ranClean = false;
     for (const step of generate) {
       if (!guard.isLive()) return false;
+      const key = scriptKey(step.family, step.command);
       const passed = await runCoverageScript(step.family, step.command, {
         rescan: false,
         guard,
         kind: step.kind,
         durationHint: pipeline.durationHint,
       });
-      if (passed) {
-        generated = true;
-        if (pipeline.mode === "first_success") break;
-      } else if (pipeline.mode === "all") {
-        return false;
+      if (!passed) {
+        // Cumulative sets need every module; alternative runners get to fall
+        // through to the next candidate.
+        if (pipeline.mode === "all") return false;
+        continue;
+      }
+      ranClean = true;
+      if (pipeline.mode === "first_success") {
+        // One alternative exited 0. Ask whether that produced anything before
+        // declaring the language done.
+        const produced = await familyGainedCoverage(step.family, guard);
+        if (produced === null) return false;
+        if (produced) return true;
+        markProducedNoCoverage(key, step.family);
       }
     }
-    if (!generated) return false;
-    if ((options.rescan ?? true) && guard.isLive()) rescan();
-    return true;
+
+    if (!ranClean) return false;
+
+    if (pipeline.mode === "all") {
+      // Cumulative: every module ran, so verify once at the end and attribute
+      // an empty result to the whole set rather than to one arbitrary command.
+      const produced = await familyGainedCoverage(pipeline.family, guard);
+      if (produced === null) return false;
+      if (produced) return true;
+      for (const step of generate) {
+        markProducedNoCoverage(scriptKey(step.family, step.command), step.family);
+      }
+      return false;
+    }
+
+    // Every alternative either failed or produced nothing; the rescan above
+    // already refreshed the panel.
+    return false;
   }
 
   async function runCoverageFamily(familyName: string) {
@@ -899,6 +1033,25 @@
   }
 </script>
 
+<!-- The individual generate commands for one family, offered as chips.
+     Rendered identically by the header strip and the empty-state sidebar;
+     it existed as two copies that had already drifted apart in their
+     disabled condition. `view.commands` is empty unless the toolchain is
+     ready, so a chip can never stand in for a pipeline whose first step
+     installs the tool the command needs. -->
+{#snippet commandChips(view: CoverageFamilyView)}
+  {#each view.commands as cmd (`${view.family}:${cmd}`)}
+    <button
+      type="button"
+      class="shrink-0 px-1.5 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
+      title="Generate coverage artifacts with MANVI"
+      disabled={runControlsDisabled}
+      onclick={() => void runCoverageScript(view.family, cmd, { durationHint: view.durationHint })}
+    >{cmd}</button>
+  {/each}
+{/snippet}
+
+
 <div class="flex-1 flex flex-col bg-background h-full text-xs overflow-hidden">
   <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
@@ -1035,41 +1188,31 @@
   {#if report && (report.families.length > 0 || report.truncated)}
     <div class="border-b border-border/40 bg-surface/40 font-sans shrink-0">
       <div class="px-4 py-1.5 flex items-center gap-3 overflow-x-auto">
-        {#each report.families as family (family.family)}
-          <div class="flex items-center gap-1.5 shrink-0" title="{family.expected_formats.join(', ')} · {family.expected_paths.join(', ')}">
-            <span class="w-2 h-2 rounded-full" style="background-color: {family.color_hex}"></span>
-            <span class="text-textPrimary/80">{family.languages.join(", ")}</span>
-            <span class="text-textMuted/70">{family.family}</span>
-            {#if family.found}
+        {#each familyViews as view (view.family)}
+          <div class="flex items-center gap-1.5 shrink-0" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
+            <span class="w-2 h-2 rounded-full" style="background-color: {view.status.color_hex}"></span>
+            <span class="text-textPrimary/80">{view.status.languages.join(", ")}</span>
+            <span class="text-textMuted/70">{view.family}</span>
+            {#if view.found}
               <span class="text-emerald-400/80">report found</span>
             {:else}
               <span class="text-textMuted/60">no report</span>
-              {#if family.tool_ready === false && family.tool_detail}
-                <span class="text-amber-400/90">{family.tool_detail}</span>
+              {#if view.toolDetail}
+                <span class="text-amber-400/90">{view.toolDetail}</span>
               {/if}
-              {#if family.duration_hint}
-                <span class="text-textMuted/50">{family.duration_hint}</span>
+              {#if view.durationHint}
+                <span class="text-textMuted/50">{view.durationHint}</span>
               {/if}
-              {#if suggestedCoverageCommands(family).length > 0}
+              {#if view.pipeline}
                 <button
                   type="button"
                   class="shrink-0 px-1.5 py-0.5 rounded-full border border-accent/40 bg-accent/10 font-sans text-[10px] text-textPrimary hover:bg-accent/20 hover:text-accent transition-colors disabled:opacity-40"
-                  title={family.duration_hint || "Generate coverage artifacts with MANVI"}
-                  disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
-                  onclick={() => void runCoverageFamily(family.family)}
-                >Run {coverageFamilyRunLabel(family.family)} coverage</button>
+                  title={view.durationHint || "Generate coverage artifacts with MANVI"}
+                  disabled={runControlsDisabled}
+                  onclick={() => void runCoverageFamily(view.family)}
+                >Run {view.label} coverage</button>
               {/if}
-              {#if family.tool_ready !== false}
-                {#each suggestedCoverageCommands(family) as cmd (`${family.family}:${cmd}`)}
-                  <button
-                    type="button"
-                    class="shrink-0 px-1.5 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
-                    title="Generate coverage artifacts with MANVI"
-                    disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
-                    onclick={() => void runCoverageScript(family.family, cmd, { durationHint: family.duration_hint })}
-                  >{cmd}</button>
-                {/each}
-              {/if}
+              {@render commandChips(view)}
             {/if}
           </div>
         {/each}
@@ -1086,21 +1229,21 @@
       </div>
       {#if Object.keys(scriptStatuses).length > 0}
         <div class="px-4 pb-1.5 space-y-0.5 max-h-24 overflow-auto">
-          {#if failedScriptList.length > 0}
+          {#if unsuccessfulScripts.length > 0}
             <div class="flex items-center justify-between gap-2 pb-0.5">
-              <span class="text-[9px] uppercase tracking-wider text-rose-400 font-semibold">Failed coverage</span>
+              <span class="text-[9px] uppercase tracking-wider text-rose-400 font-semibold">Unsuccessful coverage</span>
               <button
                 type="button"
                 onclick={() => void copyAllFailedScripts()}
                 class="text-[10px] text-rose-400 hover:text-rose-300 underline inline-flex items-center gap-1 shrink-0"
-                title="Copy all failed coverage command diagnostics"
+                title="Copy diagnostics for every coverage command that did not produce coverage"
               >
                 {#if copiedAllFailed}
                   <Check size={10} class="text-emerald-400" />
                   <span class="text-emerald-400">Copied</span>
                 {:else}
                   <Clipboard size={10} />
-                  <span>Copy failure diagnostics{failedScriptList.length > 1 ? ` (${failedScriptList.length})` : ""}</span>
+                  <span>Copy failure diagnostics{unsuccessfulScripts.length > 1 ? ` (${unsuccessfulScripts.length})` : ""}</span>
                 {/if}
               </button>
             </div>
@@ -1113,6 +1256,11 @@
               {:else if status.status === "passed"}
                 <Check size={10} class="text-emerald-400 shrink-0" />
                 <span class="text-emerald-400/90 shrink-0">passed</span>
+              {:else if status.status === "no_data"}
+                <!-- Ran cleanly and produced nothing. Deliberately not a
+                     checkmark: the command succeeded, the generation did not. -->
+                <X size={10} class="text-amber-400 shrink-0" />
+                <span class="text-amber-400/90 shrink-0 whitespace-nowrap">no coverage produced</span>
               {:else}
                 <X size={10} class="text-rose-400 shrink-0" />
                 <span class="text-rose-400/90 shrink-0">failed</span>
@@ -1121,7 +1269,7 @@
               {#if briefDetail(status.detail)}
                 <span class="text-textMuted/70 truncate">{briefDetail(status.detail)}</span>
               {/if}
-              {#if status.status === "failed"}
+              {#if status.status === "failed" || status.status === "no_data"}
                 <button
                   type="button"
                   onclick={() => void copyFailedScript(key, status)}
@@ -1193,28 +1341,30 @@
       {:else if report}
         <div class="p-3 text-textMuted font-sans space-y-2">
           <p>No coverage reports for the detected languages.</p>
-          {#each missingPipelines as pipeline (pipeline.family)}
-            {#if pipeline.toolDetail}
-              <p class="text-amber-400/90">{pipeline.toolDetail}</p>
-            {/if}
-            {#if pipeline.durationHint}
-              <p>{pipeline.durationHint}</p>
-            {/if}
-            <button
-              type="button"
-              class="gp-btn-primary !py-1.5"
-              title={pipeline.durationHint || "Generate missing coverage artifacts with MANVI"}
-              onclick={() => void runCoverageFamily(pipeline.family)}
-              disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
-            >
-              {#if runningMissing}
-                <LoaderCircle size={12} class="animate-spin" />
-                Running…
-              {:else}
-                <Play size={12} />
-                Run {pipeline.label} coverage with MANVI
+          {#each familyViews as view (view.family)}
+            {#if view.pipeline}
+              {#if view.toolDetail}
+                <p class="text-amber-400/90">{view.toolDetail}</p>
               {/if}
-            </button>
+              {#if view.durationHint}
+                <p>{view.durationHint}</p>
+              {/if}
+              <button
+                type="button"
+                class="gp-btn-primary !py-1.5"
+                title={view.durationHint || "Generate missing coverage artifacts with MANVI"}
+                onclick={() => void runCoverageFamily(view.family)}
+                disabled={runControlsDisabled}
+              >
+                {#if runningMissing}
+                  <LoaderCircle size={12} class="animate-spin" />
+                  Running…
+                {:else}
+                  <Play size={12} />
+                  Run {view.label} coverage with MANVI
+                {/if}
+              </button>
+            {/if}
           {/each}
           {#if missingPipelines.length > 1}
             <button
@@ -1222,31 +1372,29 @@
               class="gp-btn !py-1.5"
               title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
               onclick={() => void runMissingCoverage()}
-              disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
+              disabled={runControlsDisabled}
             >
               Run all missing coverage
             </button>
           {/if}
-          {#each report.families as family (family.family)}
+          {#each familyViews as view (view.family)}
             <p>
-              Looked for {family.family} ({family.expected_formats.join(", ")}):
-              {family.expected_paths.join(", ")}
+              Looked for {view.family} ({view.status.expected_formats.join(", ")}):
+              {view.status.expected_paths.join(", ")}
             </p>
-            {#if !family.found && family.tool_ready !== false}
+            <!-- A family with no runnable plan still owes the reader a reason.
+                 This block used to print only the paths it searched, so the
+                 `native` and `beam` rows read as an unexplained blank. -->
+            {#if !view.found && !view.pipeline && view.toolDetail}
+              <p class="text-amber-400/90">{view.toolDetail}</p>
+            {/if}
+            {#if view.commands.length > 0}
               <div class="flex flex-wrap gap-1.5">
-                {#each suggestedCoverageCommands(family) as cmd (cmd)}
-                  <button
-                    type="button"
-                    class="px-2 py-0.5 rounded-full border border-border/70 bg-background/60 font-mono text-[10px] text-textPrimary hover:bg-surfaceHover hover:text-accent transition-colors disabled:opacity-40"
-                    title="Generate coverage artifacts with MANVI"
-                    disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
-                    onclick={() => void runCoverageScript(family.family, cmd, { durationHint: family.duration_hint })}
-                  >{cmd}</button>
-                {/each}
+                {@render commandChips(view)}
               </div>
             {/if}
           {/each}
-          {#if report.families.length === 0}
+          {#if familyViews.length === 0}
             <p>No programming languages found to scan.</p>
           {/if}
         </div>

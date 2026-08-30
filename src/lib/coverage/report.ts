@@ -306,9 +306,19 @@ export function buildCoverageIssueDraft(
   return { title, body: clipped.text, clipped: clipped.clipped };
 }
 
+/**
+ * A coverage command that did not deliver coverage.
+ *
+ * `status` distinguishes the two ways that happens, because they need
+ * different fixes and must not be reported as one: `failed` is a non-zero
+ * exit, while `no_data` is a command that exited 0 and still left the family
+ * without a report. Defaults to `failed` for callers that predate the
+ * distinction.
+ */
 export interface FailedCoverageScript {
   label: string;
   detail?: string | null;
+  status?: "failed" | "no_data";
 }
 
 export interface FailedCoverageDiagnosticsOptions {
@@ -378,9 +388,20 @@ export function coverageFailureHint(
   return null;
 }
 
-function appendFailureBlock(out: string[], label: string, detail: string | null | undefined): void {
+function statusLine(status: FailedCoverageScript["status"]): string {
+  return status === "no_data"
+    ? "Status: exited 0 but produced no coverage data"
+    : "Status: failed";
+}
+
+function appendFailureBlock(
+  out: string[],
+  label: string,
+  detail: string | null | undefined,
+  status: FailedCoverageScript["status"],
+): void {
   out.push(`Command: ${label}`);
-  out.push("Status: failed");
+  out.push(statusLine(status));
   const hint = coverageFailureHint(label, detail);
   if (hint) out.push(`Hint: ${hint}`);
   out.push("Output:");
@@ -415,14 +436,14 @@ export function formatFailedCoverageDiagnostics(
   if (validFailures.length === 1) {
     const f = validFailures[0];
     if (scanErr) out.push("");
-    appendFailureBlock(out, f.label, f.detail);
+    appendFailureBlock(out, f.label, f.detail, f.status);
   } else if (validFailures.length > 1) {
     if (scanErr) out.push("");
-    out.push(`Failed coverage commands (${validFailures.length}):`);
+    out.push(`Unsuccessful coverage commands (${validFailures.length}):`);
     validFailures.forEach((f, idx) => {
       out.push("");
       out.push(`[${idx + 1}] Command: ${f.label}`);
-      out.push("Status: failed");
+      out.push(statusLine(f.status));
       const hint = coverageFailureHint(f.label, f.detail);
       if (hint) out.push(`Hint: ${hint}`);
       out.push("Output:");

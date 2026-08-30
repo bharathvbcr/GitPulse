@@ -442,11 +442,44 @@ describe("formatFailedCoverageDiagnostics", () => {
       },
     ];
     const text = formatFailedCoverageDiagnostics(failures, { repoPath: "/repo/gitpulse" });
-    expect(text).toContain("Failed coverage commands (2):");
+    expect(text).toContain("Unsuccessful coverage commands (2):");
     expect(text).toContain("[1] Command: cargo llvm-cov");
     expect(text).toContain("failed to compile test harness");
     expect(text).toContain("[2] Command: pytest --cov");
     expect(text).toContain("FAILED test_api.py::test_login");
+  });
+
+  /**
+   * Regression: a command that exits 0 and produces no coverage was reported
+   * with the same "Status: failed" line as a command that crashed. They need
+   * different fixes — one is a broken suite, the other is a suite that ran and
+   * measured nothing — so the diagnostics must not flatten them together.
+   */
+  it("distinguishes a clean run that produced no coverage from a failure", () => {
+    const single = formatFailedCoverageDiagnostics(
+      [{ label: "go test ./... -coverprofile=coverage.out", detail: "ok  \tno test files", status: "no_data" }],
+      { repoPath: "/repo" },
+    );
+    expect(single).toContain("Status: exited 0 but produced no coverage data");
+    expect(single).not.toContain("Status: failed");
+
+    const batch = formatFailedCoverageDiagnostics(
+      [
+        { label: "npm run coverage", detail: "boom", status: "failed" },
+        { label: "go test ./...", detail: "no test files", status: "no_data" },
+      ],
+      { repoPath: "/repo" },
+    );
+    expect(batch).toContain("Status: failed");
+    expect(batch).toContain("Status: exited 0 but produced no coverage data");
+  });
+
+  it("still reports an unlabelled outcome as a failure", () => {
+    // Callers that predate the distinction must keep their old meaning.
+    const text = formatFailedCoverageDiagnostics([{ label: "make cov", detail: "x" }], {
+      repoPath: "/repo",
+    });
+    expect(text).toContain("Status: failed");
   });
 
   it("includes scan error when present", () => {

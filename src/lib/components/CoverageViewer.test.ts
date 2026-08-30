@@ -142,11 +142,10 @@ describe("CoverageViewer MANVI integration contracts", () => {
     expect(source).toContain("runCoverageFamily");
     expect(source).toContain("runCoveragePipeline");
     expect(source).toContain("Generate missing coverage artifacts with MANVI");
-    expect(source).toContain("suggestedCoverageCommands(family)");
-    expect(source).toMatch(/missingCoveragePipelines\([\s\S]*report[\s\S]*\?\.families\)/);
+    expect(source).toMatch(/coverageFamilyViews\([\s\S]*report[\s\S]*\?\.families\)/);
     expect(source).toContain('actionKind: "coverage_generator"');
     expect(source).toContain("tokenized.error");
-    expect(source).toContain("coverageFamilyRunLabel");
+    expect(source).toContain("view.label");
     expect(source).toContain("durationHint");
     expect(source).toContain("cargo-llvm-cov");
     expect(source).toContain("several minutes");
@@ -220,8 +219,10 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
     expect(source).toContain("formatFailedCoverageDiagnostics");
     expect(source).toContain("copyFailedScript");
     expect(source).toContain("copyAllFailedScripts");
-    expect(source).toContain("failedScriptList");
-    expect(source).toContain("Copy all failed coverage command diagnostics");
+    expect(source).toContain("unsuccessfulScripts");
+    expect(source).toContain(
+      "Copy diagnostics for every coverage command that did not produce coverage",
+    );
     expect(source).toContain("Copy failure diagnostics for");
   });
 
@@ -270,29 +271,45 @@ describe("CoverageViewer honesty contracts (regression)", () => {
   });
 
   it("shows the reason a family cannot be generated for", () => {
-    // The backend now guarantees a detail whenever it plans no command; the
-    // panel must actually render it rather than leaving a bare family label.
-    expect(source).toContain("family.tool_ready === false && family.tool_detail");
+    // The backend guarantees a detail whenever it plans no command; the panel
+    // must render it rather than leaving a bare family label. `view.toolDetail`
+    // carries it whether or not anything is runnable, which is the point: a
+    // family with no pipeline is exactly the one whose reason matters most.
+    expect(source).toContain("{#if view.toolDetail}");
+    // And the empty-state sidebar renders it too. It previously reached the
+    // reason only through a pipeline, so `native` and `beam` — the families
+    // that have none — appeared there as an unexplained blank.
+    expect(source).toContain("{#if !view.found && !view.pipeline && view.toolDetail}");
   });
 
   it("never offers a Run button for a family with no planned command", () => {
-    expect(source).toContain("suggestedCoverageCommands(family).length > 0");
+    // Gated on the resolved pipeline rather than on a re-derived command
+    // count. The strip used to draw the button from `suggested_commands` while
+    // the click handler resolved the family through `missingCoveragePipelines`,
+    // so a row the latter skipped rendered a button that did nothing.
+    expect(source).toContain("{#if view.pipeline}");
+    expect(source).not.toContain("suggestedCoverageCommands(family)");
   });
 });
 
 describe("CoverageViewer install-then-generate contracts (regression)", () => {
   it("offers the pipeline button whenever the scanner planned a generate command", () => {
-    // Gated on the command, not on tool_ready: a family whose toolchain is
-    // missing is precisely the one that needs the setup-then-generate run.
-    expect(source).toContain("suggestedCoverageCommands(family).length > 0");
-    expect(source).toContain("runCoverageFamily(family.family)");
+    // Gated on the pipeline, not on tool_ready: a family whose toolchain is
+    // missing is precisely the one that needs the setup-then-generate run,
+    // and `coverageFamilyViews` builds a pipeline for it.
+    expect(source).toContain("{#if view.pipeline}");
+    expect(source).toContain("runCoverageFamily(view.family)");
   });
 
-  it("hides the bare command chips until the toolchain is ready", () => {
+  it("renders the bare command chips from one snippet in both places", () => {
     // Running `vitest --coverage` or the venv pytest on its own, before setup,
-    // is the failure the pipeline exists to prevent. Only ready families get
-    // one-click access to the raw command.
-    expect(source).toContain("{#if family.tool_ready !== false}");
+    // is the failure the pipeline exists to prevent. That rule now lives in
+    // `coverageFamilyViews` (see its own test), and both render sites reach
+    // the chips through a single snippet rather than two copies whose
+    // disabled conditions had already drifted apart.
+    expect(source).toContain("{#snippet commandChips(view: CoverageFamilyView)}");
+    expect(source).toContain("{#each view.commands as cmd");
+    expect(source.match(/\{@render commandChips\(view\)\}/g)?.length).toBe(2);
   });
 
   it("runs every setup step before any generate step and stops on failure", () => {
@@ -324,3 +341,81 @@ describe("CoverageViewer install-then-generate contracts (regression)", () => {
   });
 });
 
+/**
+ * A coverage command's exit status and its *outcome* are different questions,
+ * and the panel used to answer only the first. `go test ./...` over packages
+ * with no test files exits 0 and writes a coverprofile containing no records;
+ * a pytest run whose collection aborts can do the same. Both were reported as
+ * a green "passed" against a report that had not moved.
+ */
+describe("CoverageViewer outcome-verification contracts (regression)", () => {
+  const pipelineBody = source.slice(
+    source.indexOf("async function runCoveragePipeline"),
+    source.indexOf("async function runCoverageFamily"),
+  );
+  /**
+   * The alternative-runner loop specifically. Slicing only the whole function
+   * is not enough: the cumulative (`mode === "all"`) branch verifies at the
+   * end, and an assertion that merely finds `familyGainedCoverage` somewhere
+   * in the function still passes when the loop itself breaks on a bare exit-0.
+   */
+  const generateLoop = pipelineBody.slice(
+    pipelineBody.indexOf("for (const step of generate)"),
+    pipelineBody.indexOf("if (!ranClean) return false;"),
+  );
+
+  it("never leaves the generate loop on exit status alone", () => {
+    // The old loop did `if (passed) { generated = true; break; }`, so a runner
+    // that exited 0 and measured nothing shadowed the alternative that would
+    // have worked, and the pipeline reported success.
+    expect(generateLoop.length).toBeGreaterThan(0);
+    expect(generateLoop).not.toContain("break;");
+    expect(generateLoop).toContain("await familyGainedCoverage(");
+    expect(generateLoop).toContain('pipeline.mode === "first_success"');
+  });
+
+  it("only returns success from the loop once coverage has appeared", () => {
+    const verifyAt = generateLoop.indexOf("await familyGainedCoverage(");
+    const successAt = generateLoop.indexOf("if (produced) return true;");
+    expect(successAt).toBeGreaterThan(verifyAt);
+  });
+
+  it("records a clean run that produced nothing as no_data, never as passed", () => {
+    expect(generateLoop).toContain("markProducedNoCoverage(");
+    const marker = source.slice(
+      source.indexOf("function markProducedNoCoverage"),
+      source.indexOf("async function runCoveragePipeline"),
+    );
+    // Only ever narrows an existing pass; a real failure keeps its failure.
+    expect(marker).toContain('if (!prev || prev.status !== "passed") return;');
+    expect(marker).toContain('status: "no_data"');
+  });
+
+  it("verifies the cumulative set once every module has run", () => {
+    // Rust workspaces and Go module sets are all-or-nothing, so the empty
+    // result is attributed to the whole set rather than one arbitrary command.
+    const cumulative = pipelineBody.slice(pipelineBody.indexOf("if (!ranClean) return false;"));
+    expect(cumulative).toContain("await familyGainedCoverage(pipeline.family, guard)");
+    expect(cumulative).toContain("markProducedNoCoverage(");
+  });
+
+  it("treats an unanswerable verification as failure, not success", () => {
+    // Cancelled, no repo, or a failed rescan cannot be read as "coverage
+    // appeared" — that would reinstate the bug through the error path.
+    expect(generateLoop).toContain("if (produced === null) return false;");
+    const helper = source.slice(
+      source.indexOf("async function familyGainedCoverage"),
+      source.indexOf("function markProducedNoCoverage"),
+    );
+    expect(helper).toContain("if (!guard.isLive() || !fresh) return null;");
+    expect(helper).toContain("row.found === true");
+  });
+
+  it("surfaces a no-data run distinctly in the status list and its diagnostics", () => {
+    expect(source).toContain("no coverage produced");
+    expect(source).toContain('status.status === "failed" || status.status === "no_data"');
+    // It is copyable: the output that explains why nothing was produced is the
+    // actionable payload.
+    expect(source).toContain('status.status === "no_data" ? ("no_data" as const)');
+  });
+});

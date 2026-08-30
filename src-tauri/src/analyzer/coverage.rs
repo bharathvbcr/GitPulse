@@ -6,6 +6,10 @@
 //! not searched for `coverage.out`.
 
 use crate::analyzer::language::LanguageDetector;
+use crate::coverage_toolchain::{
+    managed_venv_python, pytest_install_arguments, DEFAULT_JS_COVERAGE_PROVIDER,
+    JS_COVERAGE_PROVIDERS, MANAGED_VENV_DIR, VENV_PYTHON_RELPATHS,
+};
 use crate::engine::git_cli::{
     capture_command, git_text_partial, sandbox_join, sandbox_join_canonical, validate_repo,
 };
@@ -997,7 +1001,9 @@ fn package_script<'a>(pkg: &'a serde_json::Value, name: &str) -> Option<&'a str>
 }
 
 fn javascript_has_vitest_coverage_provider(pkg: &serde_json::Value) -> bool {
-    package_has_dep(pkg, "@vitest/coverage-v8") || package_has_dep(pkg, "@vitest/coverage-istanbul")
+    JS_COVERAGE_PROVIDERS
+        .iter()
+        .any(|provider| package_has_dep(pkg, provider))
 }
 
 fn javascript_coverage_commands(repo: &Path) -> Vec<String> {
@@ -1080,26 +1086,6 @@ fn rust_coverage_commands(repo: &Path, cargo_dirs: &[String]) -> Vec<String> {
 /// Repo-relative interpreter paths a project virtualenv puts its Python at.
 /// Unix and Windows layouts differ; both are probed so a checkout made on one
 /// platform is still recognized on the other.
-const VENV_PYTHON_PATHS: &[&str] = &[
-    ".venv/bin/python",
-    "venv/bin/python",
-    ".venv/Scripts/python.exe",
-    "venv/Scripts/python.exe",
-];
-
-/// Where GitPulse creates a virtualenv when the project has none, and the
-/// interpreter inside it. Kept as one pair so the create step and every later
-/// step cannot drift apart.
-const MANAGED_VENV_DIR: &str = ".venv";
-
-fn managed_venv_python() -> &'static str {
-    if cfg!(windows) {
-        ".venv/Scripts/python.exe"
-    } else {
-        ".venv/bin/python"
-    }
-}
-
 /// The project's existing virtualenv interpreter, if one is checked out.
 ///
 /// Presence is not enough: the interpreter must also pass the same trust rule
@@ -1107,7 +1093,7 @@ fn managed_venv_python() -> &'static str {
 /// it would produce a step that is guaranteed to be refused.
 fn existing_venv_python(repo: &Path) -> Result<Option<&'static str>, &'static str> {
     let mut rejection = None;
-    for rel in VENV_PYTHON_PATHS.iter().copied() {
+    for rel in VENV_PYTHON_RELPATHS.iter().copied() {
         // Lexical existence check: a virtualenv interpreter is a symlink out
         // to the host toolchain by construction, so canonical containment
         // (`manifest_is_file`) would report every real virtualenv as absent.
@@ -1125,25 +1111,31 @@ fn existing_venv_python(repo: &Path) -> Result<Option<&'static str>, &'static st
     }
 }
 
-/// True when `pytest` can actually be imported by this interpreter. A present
-/// virtualenv is not the same as a virtualenv that can generate coverage, and
-/// reporting "ready" for one would send the user into a failing run.
+/// True when the virtualenv actually has pytest installed.
+///
+/// Decided from the filesystem, never by running the interpreter. Probing with
+/// `python -m pytest --version` cost 0.1s from a shell and hung *indefinitely*
+/// in the installed app: a Finder-launched bundle executing an unsigned
+/// interpreter reached through a symlink chain into the host toolchain never
+/// returned, and `TOOL_PROBE_TIMEOUT` did not bound it, so the whole coverage
+/// scan wedged on any repository that had a virtualenv. A scan must never be
+/// able to hang on an optional readiness check; `pip install pytest` writes
+/// the console script next to the interpreter, so its presence answers the
+/// same question for free.
 fn interpreter_has_pytest(repo: &Path, python_rel: &str) -> bool {
-    // Already trust-checked by `existing_venv_python`; join lexically because
-    // the interpreter legitimately symlinks out of the repository.
-    let Ok(python) = sandbox_join(repo, python_rel) else {
+    let Some((bin_dir, _)) = python_rel.rsplit_once('/') else {
         return false;
     };
-    match capture_command(
-        &python.to_string_lossy(),
-        &["-m", "pytest", "--version"],
-        Some(repo),
-        TOOL_PROBE_TIMEOUT,
-        &[],
-    ) {
-        Ok(out) => out.success,
-        Err(_) => false,
-    }
+    let candidates = if cfg!(windows) {
+        ["pytest.exe", "pytest"]
+    } else {
+        ["pytest", "pytest.exe"]
+    };
+    candidates.iter().any(|name| {
+        sandbox_join(repo, &format!("{bin_dir}/{name}"))
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    })
 }
 
 /// The interpreter GitPulse creates virtualenvs with. `python3` first: on
@@ -1162,11 +1154,6 @@ fn pytest_generate_command(python_rel: Option<&str>) -> String {
         None => "pytest --cov --cov-report=xml".to_string(),
     }
 }
-
-/// Packages a coverage generate step needs from PyPI. Pinned as a set (not a
-/// user-supplied list) because the command gate allows exactly this
-/// installation and nothing else.
-const PYTEST_COVERAGE_PACKAGES: &str = "pytest pytest-cov";
 
 fn go_test_cover_command(dir: &str) -> Option<String> {
     let command = if dir.is_empty() {
@@ -1333,8 +1320,10 @@ fn javascript_provider_setup(repo: &Path) -> Option<(String, String)> {
         return None;
     }
     Some((
-        "npm install --save-dev @vitest/coverage-v8".to_string(),
-        "Vitest is present but no coverage provider is declared. GitPulse will add @vitest/coverage-v8 to devDependencies.".to_string(),
+        format!("npm install --save-dev {DEFAULT_JS_COVERAGE_PROVIDER}"),
+        format!(
+            "Vitest is present but no coverage provider is declared. GitPulse will add {DEFAULT_JS_COVERAGE_PROVIDER} to devDependencies."
+        ),
     ))
 }
 
@@ -1395,7 +1384,8 @@ fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
         return LanguageCoveragePlan {
             generate,
             setup: vec![format!(
-                "{python} -m pip install {PYTEST_COVERAGE_PACKAGES}"
+                "{python} -m pip install {}",
+                pytest_install_arguments()
             )],
             tool_ready: false,
             tool_detail: format!("pytest is not installed in the project virtualenv ({python})."),
@@ -1425,7 +1415,7 @@ fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
         generate: vec![pytest_generate_command(Some(python))],
         setup: vec![
             format!("{host_python} -m venv {MANAGED_VENV_DIR}"),
-            format!("{python} -m pip install {PYTEST_COVERAGE_PACKAGES}"),
+            format!("{python} -m pip install {}", pytest_install_arguments()),
         ],
         tool_ready: false,
         tool_detail: format!(
@@ -1462,27 +1452,37 @@ fn jvm_coverage_plan(repo: &Path, mvn_ready: bool) -> LanguageCoveragePlan {
     LanguageCoveragePlan::unavailable("No Gradle wrapper or pom.xml in the repository.")
 }
 
-fn native_coverage_commands(repo: &Path) -> Vec<String> {
-    let mut commands = Vec::new();
-    if manifest_is_file(repo, "CMakeLists.txt") {
-        commands.push("ctest --output-on-failure".into());
-    }
-    if manifest_is_file(repo, "Makefile") || manifest_is_file(repo, "GNUmakefile") {
-        commands.push("make test".into());
-    }
-    commands
-}
-
+/// C/C++ has no planned coverage generator, and says so.
+///
+/// This used to publish `ctest --output-on-failure` / `make test` as a ready
+/// generator. Both were wrong, in two independent ways, and the row shipped
+/// with a Run button that could not work:
+///
+/// 1. Neither command was ever on the coverage-generation allowlist, so the
+///    gate refused it the instant the button was pressed. The planner-gate
+///    contract test now catches that class outright.
+/// 2. Even spawned, neither produces what this family looks for. GitPulse
+///    expects `lcov` under `coverage/` or `build/`; running a test suite emits
+///    coverage only if the binaries were *built* instrumented
+///    (`-fprofile-arcs -ftest-coverage`) and a `gcov`/`lcov`/`gcovr` capture
+///    step then collects it. Those flags live in the project's own CMake or
+///    Make configuration, which GitPulse cannot edit or infer for an arbitrary
+///    checkout, and inventing a capture command for a build that was never
+///    instrumented would produce an empty report, not coverage.
+///
+/// So the honest answer is the same one `beam` gives: no generator, and the
+/// reason. A row that explains itself is worth more than a button that lies.
 fn native_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
-    let generate = native_coverage_commands(repo);
-    if generate.is_empty() {
+    let has_build = manifest_is_file(repo, "CMakeLists.txt")
+        || manifest_is_file(repo, "Makefile")
+        || manifest_is_file(repo, "GNUmakefile");
+    if has_build {
         return LanguageCoveragePlan::unavailable(
-            "No CMakeLists.txt or Makefile in this repository, so no C/C++ coverage build can be planned.",
+            "C/C++ coverage needs an instrumented build (-fprofile-arcs -ftest-coverage) and a gcovr/lcov capture step, which GitPulse cannot add to this project's build files. Generate lcov into coverage/ yourself, then rescan.",
         );
     }
-    LanguageCoveragePlan::ready(
-        generate,
-        "Native C/C++ coverage usually finishes in a few minutes.",
+    LanguageCoveragePlan::unavailable(
+        "No CMakeLists.txt or Makefile in this repository, so no C/C++ coverage build can be planned.",
     )
 }
 
@@ -3813,6 +3813,44 @@ src/main.go:4.1,4.8 1 0
         );
     }
 
+    /// Regression, found by running the installed app: readiness was decided
+    /// by spawning the virtualenv interpreter. That took 0.1s from a shell and
+    /// never returned in a Finder-launched bundle, wedging the whole scan on
+    /// any repository with a virtualenv. Readiness must be a filesystem
+    /// question.
+    #[test]
+    fn pytest_readiness_is_decided_without_running_anything() {
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join(".venv/bin")).unwrap();
+        assert!(
+            !interpreter_has_pytest(repo.path(), ".venv/bin/python"),
+            "an empty virtualenv has no pytest"
+        );
+        // The console script `pip install pytest` writes.
+        write(repo.path(), ".venv/bin/pytest", "#!/bin/sh\n");
+        assert!(
+            interpreter_has_pytest(repo.path(), ".venv/bin/python"),
+            "the installed console script is the readiness signal"
+        );
+    }
+
+    /// The probe must stay inside the repository and never panic on a
+    /// malformed interpreter path.
+    #[test]
+    fn pytest_readiness_probe_is_total_on_hostile_paths() {
+        let repo = git_repo();
+        for rel in [
+            "",
+            "python",
+            "../outside/bin/python",
+            "/abs/bin/python",
+            ".venv/bin/",
+            "a/b/c/d/e/python",
+        ] {
+            let _ = interpreter_has_pytest(repo.path(), rel);
+        }
+    }
+
     #[test]
     fn python_plan_installs_pytest_into_an_existing_project_venv() {
         let repo = git_repo();
@@ -4930,6 +4968,366 @@ src/main.go:4.1,4.8 1 0
                 );
             }));
             assert!(result.is_ok(), "{name} panicked parser pipeline");
+        }
+    }
+
+    /// ─── Planner ⇄ gate contract ──────────────────────────────────────────
+    ///
+    /// The planner publishes command text; the gate decides what may be
+    /// spawned. Nothing structural forces them to agree, and when they have
+    /// disagreed the symptom was not an error but a *dead button*: a command
+    /// offered in the UI and refused the instant it was pressed. It shipped
+    /// that way twice — `vendor/bin/phpunit` refused as an executable path,
+    /// and `bundle install` refused as outside the allowlist — because each
+    /// side was internally consistent and nothing compared them.
+    ///
+    /// These tests are that comparison. They build a fixture repository per
+    /// ecosystem, run the real planner over it, and assert the gate accepts
+    /// every setup and generate command the planner published.
+    mod plan_gate_contract {
+        use super::*;
+        use crate::terminal::{validate_manvi_action, ManviActionKind};
+
+        /// argv split for planner-emitted command text.
+        ///
+        /// The frontend's `tokenizeCommand` is the real tokenizer and lives in
+        /// TypeScript; reimplementing it here in full would be a third copy of
+        /// exactly the kind this module exists to remove. Instead this handles
+        /// only the subset the planner can emit, and
+        /// [`planned_command_is_unambiguous`] proves the planner stays inside
+        /// that subset — where a whitespace-and-double-quote split and the
+        /// real tokenizer cannot disagree.
+        fn split_planned(command: &str) -> Vec<String> {
+            let mut argv = Vec::new();
+            let mut current = String::new();
+            let mut has_token = false;
+            let mut quoted = false;
+            for ch in command.chars() {
+                match ch {
+                    '"' => {
+                        quoted = !quoted;
+                        has_token = true;
+                    }
+                    c if c.is_whitespace() && !quoted => {
+                        if has_token {
+                            argv.push(std::mem::take(&mut current));
+                            has_token = false;
+                        }
+                    }
+                    c => {
+                        current.push(c);
+                        has_token = true;
+                    }
+                }
+            }
+            if has_token {
+                argv.push(current);
+            }
+            argv
+        }
+
+        /// The planner may only emit command text whose tokenization is
+        /// unambiguous: no shell metacharacters (already an invariant), and no
+        /// single quotes or backslashes, so the only quoting in play is a
+        /// balanced pair of double quotes. Inside that subset the splitter
+        /// above and the frontend tokenizer agree by construction.
+        fn planned_command_is_unambiguous(command: &str) -> Result<(), String> {
+            if !command_line_is_argv_safe(command) {
+                return Err("contains a shell metacharacter".into());
+            }
+            if command.contains('\'') {
+                return Err("contains a single quote".into());
+            }
+            if command.contains('\\') {
+                return Err("contains a backslash escape".into());
+            }
+            if !command.matches('"').count().is_multiple_of(2) {
+                return Err("has an unbalanced double quote".into());
+            }
+            Ok(())
+        }
+
+        /// Runs the real scanner and asserts every command it published for
+        /// `family` is one the gate will actually run.
+        ///
+        /// Returns the number of commands checked so a caller can prove the
+        /// fixture exercised something — a planner that published nothing
+        /// would otherwise pass this vacuously.
+        fn assert_published_commands_are_runnable(repo: &TempDir, family: &str) -> usize {
+            let path = repo.path().to_str().expect("utf-8 repo path");
+            let report = CoverageScanner::scan(path).expect("scan");
+            let status = report
+                .families
+                .iter()
+                .find(|f| f.family == family)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "fixture did not seed the {family} family; got {:?}",
+                        report
+                            .families
+                            .iter()
+                            .map(|f| &f.family)
+                            .collect::<Vec<_>>()
+                    )
+                });
+
+            let mut checked = 0;
+            for (kind, command) in status
+                .setup_commands
+                .iter()
+                .map(|c| ("setup", c))
+                .chain(status.suggested_commands.iter().map(|c| ("generate", c)))
+            {
+                planned_command_is_unambiguous(command)
+                    .unwrap_or_else(|why| panic!("{family} {kind} command {command:?} {why}"));
+                let argv = split_planned(command);
+                assert!(
+                    !argv.is_empty(),
+                    "{family} {kind} command {command:?} tokenized to nothing"
+                );
+                validate_manvi_action(&argv, ManviActionKind::CoverageGenerator).unwrap_or_else(
+                    |err| {
+                        panic!(
+                            "the planner published a {family} {kind} command the gate refuses.\n  \
+                             command: {command}\n  argv:    {argv:?}\n  refusal: {err}"
+                        )
+                    },
+                );
+                checked += 1;
+            }
+            checked
+        }
+
+        /// A family whose plan is a dead end must publish no commands at all —
+        /// `apply_language_plan` enforces that — so the contract above is
+        /// vacuous for it. Assert the dead end instead, which is the other
+        /// half of the same honesty rule: no command, and a stated reason.
+        fn assert_dead_end_is_explained(repo: &TempDir, family: &str) {
+            let path = repo.path().to_str().expect("utf-8 repo path");
+            let report = CoverageScanner::scan(path).expect("scan");
+            let Some(status) = report.families.iter().find(|f| f.family == family) else {
+                return;
+            };
+            if !status.suggested_commands.is_empty() {
+                return;
+            }
+            assert!(
+                !status.tool_ready,
+                "{family} published no command but still claims the tool is ready"
+            );
+            assert!(
+                !status.tool_detail.trim().is_empty(),
+                "{family} published no command and no reason"
+            );
+        }
+
+        /// Python is the case that motivated all of this: the plan installs
+        /// into a project-local virtualenv, and the gate's `pip install`
+        /// exception is the narrowest arm in the allowlist.
+        #[test]
+        fn python_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "app.py", "def add(a, b):\n    return a + b\n");
+            write(
+                repo.path(),
+                "test_app.py",
+                "def test_add():\n    assert True\n",
+            );
+            let checked = assert_published_commands_are_runnable(&repo, "python");
+            assert!(checked > 0, "the python fixture published no commands");
+        }
+
+        /// The vendored PHPUnit step. This is one of the two commands that
+        /// shipped refused: the gate rejected `vendor/bin/phpunit` outright as
+        /// an executable path.
+        #[test]
+        fn php_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "src/App.php", "<?php\nclass App {}\n");
+            write(repo.path(), "composer.json", r#"{"name":"acme/app"}"#);
+            write(repo.path(), "vendor/bin/phpunit", "#!/bin/sh\nexit 0\n");
+            let checked = assert_published_commands_are_runnable(&repo, "php");
+            assert!(checked > 0, "the php fixture published no commands");
+        }
+
+        /// The other command that shipped refused: `bundle install` was
+        /// outside the purpose-specific allowlist, so Ruby coverage could
+        /// never have run.
+        #[test]
+        fn ruby_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "lib/app.rb", "class App\nend\n");
+            write(repo.path(), "Gemfile", "source 'https://rubygems.org'\n");
+            let checked = assert_published_commands_are_runnable(&repo, "ruby");
+            assert!(checked > 0, "the ruby fixture published no commands");
+        }
+
+        /// The vitest provider install — the only other setup step that writes
+        /// to the repository.
+        #[test]
+        fn javascript_provider_install_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "src/index.ts", "export const one = 1;\n");
+            write(
+                repo.path(),
+                "package.json",
+                r#"{"name":"app","devDependencies":{"vitest":"2.0.0"}}"#,
+            );
+            let checked = assert_published_commands_are_runnable(&repo, "javascript");
+            assert!(checked > 0, "the javascript fixture published no commands");
+        }
+
+        /// A Maven wrapper repository: the planner emits `./mvnw verify`,
+        /// which the gate must accept as a repository-local program.
+        #[test]
+        fn jvm_wrapper_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "src/main/java/App.java", "class App {}\n");
+            write(repo.path(), "pom.xml", "<project></project>\n");
+            write(repo.path(), "mvnw", "#!/bin/sh\nexit 0\n");
+            let checked = assert_published_commands_are_runnable(&repo, "jvm");
+            assert!(checked > 0, "the jvm fixture published no commands");
+        }
+
+        /// Go modules, including the `-C <dir>` form for a nested module.
+        #[test]
+        fn go_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "svc/main.go", "package main\n");
+            write(repo.path(), "svc/go.mod", "module svc\n\ngo 1.22\n");
+            let checked = assert_published_commands_are_runnable(&repo, "go");
+            assert!(checked > 0, "the go fixture published no commands");
+        }
+
+        /// C/C++ with a CMake build — the family the user's own report showed
+        /// as an unexplained dead end.
+        #[test]
+        fn native_plan_is_runnable_or_explained() {
+            // With a build system and without one: C/C++ has no planned
+            // generator either way, and must say so rather than publish a
+            // command. See `native_coverage_plan` for why.
+            let cmake = git_repo();
+            write(cmake.path(), "src/main.c", "int main(void) { return 0; }\n");
+            write(cmake.path(), "CMakeLists.txt", "project(app)\n");
+            assert_published_commands_are_runnable(&cmake, "native");
+            assert_dead_end_is_explained(&cmake, "native");
+
+            let bare = git_repo();
+            write(bare.path(), "src/main.c", "int main(void) { return 0; }\n");
+            assert_dead_end_is_explained(&bare, "native");
+        }
+
+        /// Families whose plan is gated on a host toolchain (`swift`,
+        /// `dotnet`, `dart`, `rust`, `jvm`) never reach their `ready` arm on a
+        /// machine that lacks the tool, so a scan-driven fixture silently
+        /// skips exactly the commands worth checking. Drive the plan functions
+        /// directly with their preconditions forced instead, so this holds on
+        /// any host.
+        #[test]
+        fn every_toolchain_gated_plan_is_runnable() {
+            let repo = git_repo();
+            write(repo.path(), "Cargo.toml", "[package]\nname = \"app\"\n");
+            write(repo.path(), "pom.xml", "<project></project>\n");
+            write(repo.path(), "mvnw", "#!/bin/sh\nexit 0\n");
+            write(repo.path(), "gradlew", "#!/bin/sh\nexit 0\n");
+            write(repo.path(), "composer.json", r#"{"name":"acme/app"}"#);
+            write(repo.path(), "vendor/bin/phpunit", "#!/bin/sh\nexit 0\n");
+            write(repo.path(), "Gemfile", "source 'x'\n");
+            write(repo.path(), "CMakeLists.txt", "project(app)\n");
+            let root = repo.path();
+
+            let plans: Vec<(&str, LanguageCoveragePlan)> = vec![
+                ("swift", swift_coverage_plan(true, true)),
+                ("dotnet", dotnet_coverage_plan(true, true)),
+                ("dart", dart_coverage_plan(true, true)),
+                ("rust", rust_coverage_plan(root, &["".to_string()], true)),
+                (
+                    "rust(setup)",
+                    rust_coverage_plan(root, &["".to_string()], false),
+                ),
+                ("jvm", jvm_coverage_plan(root, true)),
+                ("php", php_coverage_plan(root)),
+                ("ruby", ruby_coverage_plan(root)),
+                ("javascript", javascript_coverage_plan(root)),
+                ("native", native_coverage_plan(root)),
+            ];
+
+            let mut checked = 0;
+            for (label, plan) in plans {
+                for (kind, command) in plan
+                    .setup
+                    .iter()
+                    .map(|c| ("setup", c))
+                    .chain(plan.generate.iter().map(|c| ("generate", c)))
+                {
+                    planned_command_is_unambiguous(command)
+                        .unwrap_or_else(|why| panic!("{label} {kind} command {command:?} {why}"));
+                    let argv = split_planned(command);
+                    validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "the planner published a {label} {kind} command the gate refuses.\n  \
+                                 command: {command}\n  argv:    {argv:?}\n  refusal: {err}"
+                            )
+                        });
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked >= 8,
+                "expected the forced-ready plans to publish commands; only {checked} were checked"
+            );
+        }
+
+        /// Elixir/Erlang: GitPulse parses none of the formats the BEAM tooling
+        /// emits, so the contract here is the dead-end half.
+        #[test]
+        fn beam_dead_end_is_explained() {
+            let repo = git_repo();
+            write(repo.path(), "lib/app.ex", "defmodule App do\nend\n");
+            write(repo.path(), "mix.exs", "defmodule App.MixProject do\nend\n");
+            assert_dead_end_is_explained(&repo, "beam");
+        }
+
+        /// Falsification for the splitter's precondition: a command carrying
+        /// shell syntax must be caught here rather than silently mis-split.
+        #[test]
+        fn ambiguous_command_text_is_rejected_by_the_precondition() {
+            for hostile in [
+                "go test ./... | tee out",
+                "python -m pytest 'quoted arg'",
+                "npm install --save-dev pkg\\name",
+                "dotnet test --collect:\"unbalanced",
+            ] {
+                assert!(
+                    planned_command_is_unambiguous(hostile).is_err(),
+                    "{hostile:?} must not pass the tokenization precondition"
+                );
+            }
+            // And the shapes the planner really emits do pass.
+            for planned in [
+                "go -C \"my module\" test ./... -coverprofile=coverage.out",
+                "dotnet test --collect:\"XPlat Code Coverage\"",
+                ".venv/bin/python -m pip install pytest pytest-cov",
+            ] {
+                planned_command_is_unambiguous(planned)
+                    .unwrap_or_else(|why| panic!("{planned:?} {why}"));
+            }
+            assert_eq!(
+                split_planned("go -C \"my module\" test ./... -coverprofile=coverage.out"),
+                vec![
+                    "go",
+                    "-C",
+                    "my module",
+                    "test",
+                    "./...",
+                    "-coverprofile=coverage.out"
+                ]
+            );
+            assert_eq!(
+                split_planned("dotnet test --collect:\"XPlat Code Coverage\""),
+                vec!["dotnet", "test", "--collect:XPlat Code Coverage"]
+            );
         }
     }
 }

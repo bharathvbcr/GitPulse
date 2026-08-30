@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   coverageCommandsAreCumulative,
   coverageFamilyRunLabel,
+  coverageFamilyViews,
   missingCoveragePipelines,
   setupCoverageCommands,
   suggestedCoverageCommands,
@@ -319,3 +320,113 @@ describe("install-then-generate pipelines (regression)", () => {
   });
 });
 
+/**
+ * The panel offered coverage generation from two places — the header strip and
+ * the empty-state sidebar — each deciding for itself what was runnable. These
+ * tests pin the single decision that replaced them.
+ */
+describe("coverageFamilyViews (one decision point)", () => {
+  it("never yields a runnable view the pipeline lookup would then reject", () => {
+    // The dead button, exactly. The strip drew "Run coverage" whenever the
+    // scanner published a command, while `runCoverageFamily` resolved the row
+    // through `missingCoveragePipelines`, which additionally required a
+    // non-empty family name. A row with a blank name rendered a button that
+    // did nothing at all when pressed.
+    const views = coverageFamilyViews([
+      family({
+        family: "",
+        found: false,
+        tool_ready: true,
+        suggested_commands: ["npm run coverage"],
+      }),
+    ]);
+    expect(views).toEqual([]);
+
+    // And for every view that does render a Run button, the pipeline the click
+    // handler resolves is the one the view already carries.
+    const good = coverageFamilyViews([
+      family({
+        family: "javascript",
+        found: false,
+        tool_ready: true,
+        suggested_commands: ["npm run coverage"],
+      }),
+    ]);
+    expect(good).toHaveLength(1);
+    expect(good[0].pipeline).not.toBeNull();
+    expect(missingCoveragePipelines([good[0].status])).toEqual([good[0].pipeline]);
+  });
+
+  it("keeps the reason for a family that has no runnable plan at all", () => {
+    // `native` and `beam` publish no command and a stated reason. The sidebar
+    // reached `tool_detail` only through a pipeline, so those rows lost the one
+    // sentence that explained them.
+    const [view] = coverageFamilyViews([
+      family({
+        family: "native",
+        found: false,
+        tool_ready: false,
+        tool_detail: "C/C++ coverage needs an instrumented build.",
+        suggested_commands: [],
+      }),
+    ]);
+    expect(view.pipeline).toBeNull();
+    expect(view.commands).toEqual([]);
+    expect(view.toolDetail).toBe("C/C++ coverage needs an instrumented build.");
+  });
+
+  it("withholds the bare command chips until the toolchain is ready", () => {
+    // Running the venv pytest on its own, before the install step, is the
+    // failure the pipeline exists to prevent — so an unready family gets the
+    // pipeline button and no chips.
+    const [unready] = coverageFamilyViews([
+      family({
+        family: "python",
+        found: false,
+        tool_ready: false,
+        tool_detail: "pytest is not installed.",
+        setup_commands: [".venv/bin/python -m pip install pytest pytest-cov"],
+        suggested_commands: [".venv/bin/python -m pytest --cov --cov-report=xml"],
+      }),
+    ]);
+    expect(unready.commands).toEqual([]);
+    expect(unready.pipeline?.steps.map((s) => s.kind)).toEqual(["setup", "generate"]);
+
+    const [ready] = coverageFamilyViews([
+      family({
+        family: "python",
+        found: false,
+        tool_ready: true,
+        suggested_commands: [".venv/bin/python -m pytest --cov --cov-report=xml"],
+      }),
+    ]);
+    expect(ready.commands).toEqual([".venv/bin/python -m pytest --cov --cov-report=xml"]);
+  });
+
+  it("offers nothing for a family that already has a report", () => {
+    const [view] = coverageFamilyViews([
+      family({ family: "go", found: true, tool_ready: true, suggested_commands: ["go test ./..."] }),
+    ]);
+    expect(view.found).toBe(true);
+    expect(view.pipeline).toBeNull();
+    expect(view.commands).toEqual([]);
+  });
+
+  it("survives hostile family payloads without inventing an offer", () => {
+    const views = coverageFamilyViews([
+      null as unknown as CoverageFamilyStatus,
+      undefined as unknown as CoverageFamilyStatus,
+      "nope" as unknown as CoverageFamilyStatus,
+      family({ family: 7 as unknown as string, suggested_commands: ["rm -rf /"] }),
+      family({
+        family: "rust",
+        found: false,
+        tool_ready: true,
+        suggested_commands: [42 as unknown as string, "cargo llvm-cov --workspace"],
+      }),
+    ]);
+    expect(views).toHaveLength(1);
+    expect(views[0].family).toBe("rust");
+    expect(views[0].commands).toEqual(["cargo llvm-cov --workspace"]);
+  });
+});
