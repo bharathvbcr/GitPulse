@@ -14,6 +14,14 @@ lcov.info
 .claude/
 rust-coverage-summary.txt
 
+# Local-only documentation and promotional drafts
+/docs/PROMO.md
+/docs/assets/gitpulse-social-banner.jpg
+/docs/drafts/
+/docs/marketing/
+/docs/press/
+/docs/promo/
+
 # DevCouncil local state
 .devcouncil/*
 !.devcouncil/
