@@ -9,6 +9,10 @@ import {
   CHECKED_STRUCTS,
   DEFAULT_RUST_SOURCE,
   DEFAULT_TS_SOURCE,
+  TERMINAL_RUST_SOURCE,
+  TERMINAL_STRUCTS,
+  TERMINAL_TS_SOURCE,
+  runTypeCheck,
 } from "./check-coverage-types.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -58,11 +62,46 @@ describe("check:types coverage contract", () => {
     const { code, stdout } = await runScript([]);
     expect(code).toBe(0);
 
-    expect(countIn(stdout, "rust structs checked")).toBe(CHECKED_STRUCTS.length);
-    expect(countIn(stdout, "ts interfaces checked")).toBe(CHECKED_STRUCTS.length);
-    expect(countIn(stdout, "drifted structs")).toBe(0);
-    expect(countIn(stdout, "fields compared")).toBeGreaterThan(0);
-    expect(stdout).toMatch(/OK: coverage type contract holds/);
+    // With no flags every contract runs, so counts are asserted per report.
+    const [coverage, terminal] = stdout.split(/(?=^Terminal IPC type check)/m);
+    expect(countIn(coverage, "rust structs checked")).toBe(CHECKED_STRUCTS.length);
+    expect(countIn(coverage, "ts interfaces checked")).toBe(CHECKED_STRUCTS.length);
+    expect(countIn(coverage, "drifted structs")).toBe(0);
+    expect(countIn(coverage, "fields compared")).toBeGreaterThan(0);
+
+    expect(terminal, "the terminal contract must be checked too").toBeDefined();
+    expect(countIn(terminal, "rust structs checked")).toBe(TERMINAL_STRUCTS.length);
+    expect(countIn(terminal, "ts interfaces checked")).toBe(TERMINAL_STRUCTS.length);
+    expect(countIn(terminal, "drifted structs")).toBe(0);
+    expect(countIn(terminal, "fields compared")).toBeGreaterThan(0);
+
+    expect(stdout.match(/OK: type contract holds/g)).toHaveLength(2);
+    expect(stdout).not.toMatch(/FAIL:/);
+  });
+
+  /**
+   * `TerminalRunResult` is the payload every command-running panel reads and
+   * it had no gate at all — it was declared three times in TypeScript, so a
+   * backend rename would land as a silently `undefined` property in whichever
+   * panel had not been updated.
+   */
+  it("fails when the terminal wire type drifts from its Rust struct", async () => {
+    const tsCopy = await scratchCopy(TERMINAL_TS_SOURCE, "terminal-drift");
+    const source = await readFile(tsCopy, "utf8");
+    await writeFile(tsCopy, source.replace("stdout_tail: string;", "stdoutTail: string;"), "utf8");
+
+    const result = runTypeCheck({
+      rustPath: TERMINAL_RUST_SOURCE,
+      tsPath: tsCopy,
+      structs: TERMINAL_STRUCTS,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.violations.join("\n")).toMatch(
+      /TerminalRunResult\.stdout_tail exists in Rust but has no TS property/,
+    );
+    expect(result.violations.join("\n")).toMatch(
+      /TerminalRunResult\.stdoutTail exists in TS but Rust never sends it/,
+    );
   });
 
   it("fails when a Rust field is renamed away from its TS twin", async () => {
@@ -78,7 +117,7 @@ describe("check:types coverage contract", () => {
     expect(code).toBe(1);
     expect(stdout).toMatch(/drift: CoverageTotals\.lines_struck exists in Rust but has no TS property/);
     expect(stdout).toMatch(/drift: CoverageTotals\.lines_hit exists in TS but Rust never sends it/);
-    expect(stdout).toMatch(/FAIL: coverage type contract violated/);
+    expect(stdout).toMatch(/FAIL: type contract violated/);
   });
 
   it("honors per-field serde renames when matching wire names", async () => {

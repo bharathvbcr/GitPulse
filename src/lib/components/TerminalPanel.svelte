@@ -71,25 +71,15 @@
     ListChecks,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
+  import type { TerminalRunResult } from "../terminal/runResult";
   import { themeStore } from "../stores/themeStore";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { createListenerTracker } from "../dom/listenerTracker";
-  import type { PolicyVerdict } from "../stores/harnessStore";
 
-  /** Wire shape of `crate::terminal::TerminalRunResult`. */
-  interface TerminalRunResponse {
-    command: string;
-    gated: boolean;
-    policy?: PolicyVerdict | null;
-    timed_out: boolean;
-    exit_code: number | null;
-    stdout_tail: string;
-    stderr_tail: string;
-    truncated: boolean;
-    duration_ms: number;
-  }
+  /** The shared wire shape; aliased for this panel's existing call sites. */
+  type TerminalRunResponse = TerminalRunResult;
 
   interface ExecutionEntry {
     id: string;

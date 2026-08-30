@@ -12,10 +12,25 @@ const source = readFileSync(
 
 describe("HealthPanel source contracts & interactive remediation", () => {
   it("invokes the scoped Manvi runner for remediation steps", () => {
-    expect(source).toContain('invoke<{');
+    // The result type is the shared declaration, not an inline copy. This
+    // panel used to spell the whole wire shape out anonymously at the invoke
+    // call, which is why a backend field rename could reach it as `undefined`
+    // with nothing to catch it.
+    expect(source).toContain("invoke<TerminalRunResult>");
+    expect(source).not.toContain("invoke<{");
     expect(source).toContain('"cmd_manvi_run_action"');
     expect(source).toContain('actionKind: "health"');
     expect(source).toContain("args: step.argv,");
+  });
+
+  it("keeps both output streams, and marks a clipped tail as clipped", () => {
+    // Regression: this panel built its detail as `stderr || stdout`, so a
+    // non-empty stderr discarded stdout entirely, and it never noted
+    // truncation at all — a clipped tail was shown as the whole log.
+    expect(source).toContain("formatRunDetail(res)");
+    expect(source).toContain("formatRunSummary(res)");
+    expect(source).not.toContain("res.stderr_tail || res.stdout_tail");
+    expect(source).not.toContain('"Timed out and was killed."');
   });
 
   it("extracts plan steps and tokenizes commands safely", () => {

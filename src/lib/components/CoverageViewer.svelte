@@ -58,13 +58,18 @@
   import {
     harnessStore,
     type AiGeneration,
-    type PolicyVerdict,
     verdictLabel,
   } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { copyText } from "../desktop/clipboard";
   import { buildRunnablePlanSteps, tokenizeCommand } from "../terminal/tokenize";
+  import {
+    formatRunDetail,
+    formatRunSummary,
+    runPassed,
+    type TerminalRunResult,
+  } from "../terminal/runResult";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
 
@@ -181,19 +186,6 @@
     error?: string;
   }
 
-  /** Wire shape of `crate::terminal::TerminalRunResult`. */
-  interface TerminalRunResult {
-    command: string;
-    gated: boolean;
-    policy?: PolicyVerdict | null;
-    timed_out: boolean;
-    exit_code: number | null;
-    stdout_tail: string;
-    stderr_tail: string;
-    truncated: boolean;
-    duration_ms: number;
-  }
-
   /**
    * `no_data` is the outcome that used to be reported as `passed`: the command
    * ran, exited 0, and the rescan still found no coverage for that family.
@@ -206,7 +198,10 @@
     label: string;
     running: boolean;
     status?: "passed" | "failed" | "no_data";
+    /** Complete captured output, for the copied diagnostics. */
     detail?: string;
+    /** One line naming what happened, for the status row. */
+    summary?: string;
   }
 
   let aiOpen = $state(false);
@@ -218,7 +213,13 @@
   let opsInflight: AsyncGuard | null = null;
   let stepResults: Record<
     string,
-    { running: boolean; status?: "passed" | "failed"; detail?: string; duration_ms?: number }
+    {
+      running: boolean;
+      status?: "passed" | "failed";
+      detail?: string;
+      summary?: string;
+      duration_ms?: number;
+    }
   > = $state({});
   let runningAll = $state(false);
   let scriptStatuses: Record<string, ScriptStatus> = $state({});
@@ -526,10 +527,6 @@
    * follows.
    */
   /** Appends the tail-truncation note so a clipped log never reads as whole. */
-  function withClipNote(res: TerminalRunResult, base: string): string {
-    return res.truncated ? `${base}\n(output clipped)` : base;
-  }
-
   async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath || issueSubmitting) return false;
@@ -546,19 +543,14 @@
       });
       if (!guard.isLive()) return false;
 
-      passed = !res.timed_out && res.exit_code === 0;
-      const detail = withClipNote(
-        res,
-        res.timed_out
-          ? "Timed out and was killed."
-          : passed
-            ? res.stdout_tail || "Command completed successfully (exit 0)"
-            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
-      );
+      passed = runPassed(res);
+      const detail = formatRunDetail(res);
+      const summary = formatRunSummary(res);
       stepResults[step.id] = {
         running: false,
         status: passed ? "passed" : "failed",
         detail,
+        summary,
         duration_ms: res.duration_ms,
       };
 
@@ -612,7 +604,12 @@
     }
   }
 
-  /** First line of a command tail, capped so the chips strip stays readable. */
+  /**
+   * The status row's one-line text, capped so the chips strip stays readable.
+   *
+   * Prefers the run's own summary. Falls back to the detail's first line for
+   * statuses that carry no run result (a tokenization refusal, an IPC error).
+   */
   function briefDetail(detail: string | undefined): string {
     if (!detail) return "";
     const firstLine = detail.split("\n")[0]?.trim() ?? "";
@@ -672,20 +669,15 @@
       });
       if (!guard.isLive()) return false;
 
-      passed = !res.timed_out && res.exit_code === 0;
-      const detail = withClipNote(
-        res,
-        res.timed_out
-          ? "Timed out and was killed."
-          : passed
-            ? res.stdout_tail || "Command completed successfully (exit 0)"
-            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
-      );
+      passed = runPassed(res);
+      const detail = formatRunDetail(res);
+      const summary = formatRunSummary(res);
       scriptStatuses[key] = {
         label,
         running: false,
         status: passed ? "passed" : "failed",
         detail,
+        summary,
       };
 
       if (!passed) {
@@ -752,6 +744,9 @@
       ...prev,
       status: "no_data",
       detail: tail ? `${note}\n${tail}` : note,
+      // The row must say this too: the previous summary was the command's own
+      // cheerful last line, which is exactly the impression being corrected.
+      summary: note,
     };
   }
 
@@ -1266,8 +1261,8 @@
                 <span class="text-rose-400/90 shrink-0">failed</span>
               {/if}
               <span class="font-mono text-textPrimary/80 truncate shrink-0">{status.label}</span>
-              {#if briefDetail(status.detail)}
-                <span class="text-textMuted/70 truncate">{briefDetail(status.detail)}</span>
+              {#if status.summary || briefDetail(status.detail)}
+                <span class="text-textMuted/70 truncate">{status.summary || briefDetail(status.detail)}</span>
               {/if}
               {#if status.status === "failed" || status.status === "no_data"}
                 <button

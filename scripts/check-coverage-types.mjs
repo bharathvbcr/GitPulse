@@ -32,6 +32,18 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 export const DEFAULT_RUST_SOURCE = path.join(REPO_ROOT, "src-tauri", "src", "analyzer", "coverage.rs");
 export const DEFAULT_TS_SOURCE = path.join(REPO_ROOT, "src", "lib", "coverage", "types.ts");
 
+export const TERMINAL_RUST_SOURCE = path.join(REPO_ROOT, "src-tauri", "src", "terminal", "mod.rs");
+export const TERMINAL_TS_SOURCE = path.join(REPO_ROOT, "src", "lib", "terminal", "runResult.ts");
+
+/**
+ * `TerminalRunResult` is the payload every command-running panel reads, and it
+ * had no gate at all: it was declared three separate times in TypeScript
+ * (twice named, once inlined anonymously at an `invoke` call), so a Rust field
+ * rename would surface as a silently `undefined` property in whichever panels
+ * had not been updated. It is now declared once and checked here.
+ */
+export const TERMINAL_STRUCTS = Object.freeze(["TerminalRunResult"]);
+
 /**
  * The Rust structs whose serialized shape the frontend depends on, and the
  * TS interfaces that must mirror them field-for-field.
@@ -187,7 +199,7 @@ function parseRustFields(body) {
  *   violations: string[],
  * }}
  */
-export function parseRustStructs(rustSource) {
+export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
   const stripped = stripComments(rustSource);
   const structs = new Map();
   /** @type {Array<{ struct: string, segment: string }>} */
@@ -195,7 +207,7 @@ export function parseRustStructs(rustSource) {
   /** @type {string[]} */
   const violations = [];
 
-  for (const name of CHECKED_STRUCTS) {
+  for (const name of checked) {
     const declRe = new RegExp(`pub struct ${name}\\b`);
     const decl = declRe.exec(stripped);
     if (!decl) {
@@ -246,7 +258,7 @@ export function parseRustStructs(rustSource) {
  *   violations: string[],
  * }}
  */
-export function parseTsInterfaces(tsSource) {
+export function parseTsInterfaces(tsSource, checked = CHECKED_STRUCTS) {
   const stripped = stripComments(tsSource);
   const interfaces = new Map();
   /** @type {Array<{ interface: string, segment: string }>} */
@@ -254,7 +266,7 @@ export function parseTsInterfaces(tsSource) {
   /** @type {string[]} */
   const violations = [];
 
-  for (const name of CHECKED_STRUCTS) {
+  for (const name of checked) {
     const declRe = new RegExp(`export interface ${name}\\b`);
     const decl = declRe.exec(stripped);
     if (!decl) {
@@ -304,11 +316,11 @@ export function parseTsInterfaces(tsSource) {
  * @param {ReturnType<typeof parseRustStructs>} rust
  * @param {ReturnType<typeof parseTsInterfaces>} ts
  */
-export function compareTypes(rust, ts) {
+export function compareTypes(rust, ts, checked = CHECKED_STRUCTS) {
   /** @type {Array<{ struct: string, rustOnly: string[], tsOnly: string[] }>} */
   const drifts = [];
   let fieldCount = 0;
-  for (const name of CHECKED_STRUCTS) {
+  for (const name of checked) {
     const rustStruct = rust.structs.get(name);
     const tsIface = ts.interfaces.get(name);
     if (!rustStruct || !tsIface) continue;
@@ -321,12 +333,12 @@ export function compareTypes(rust, ts) {
 }
 
 /**
- * @param {{ rustPath: string, tsPath: string }} input
+ * @param {{ rustPath: string, tsPath: string, structs?: readonly string[] }} input
  */
-export function runTypeCheck({ rustPath, tsPath }) {
-  const rust = parseRustStructs(readFileSync(rustPath, "utf8"));
-  const ts = parseTsInterfaces(readFileSync(tsPath, "utf8"));
-  const { drifts, fieldCount } = compareTypes(rust, ts);
+export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS }) {
+  const rust = parseRustStructs(readFileSync(rustPath, "utf8"), structs);
+  const ts = parseTsInterfaces(readFileSync(tsPath, "utf8"), structs);
+  const { drifts, fieldCount } = compareTypes(rust, ts, structs);
 
   /** @type {string[]} */
   const violations = [...rust.violations, ...ts.violations];
@@ -361,9 +373,9 @@ export function runTypeCheck({ rustPath, tsPath }) {
  * @param {string} rustLabel
  * @param {string} tsLabel
  */
-export function formatReport(result, rustLabel, tsLabel) {
+export function formatReport(result, rustLabel, tsLabel, title = "Coverage IPC type check (Rust structs <-> TS interfaces)") {
   const lines = [
-    "Coverage IPC type check (Rust structs <-> TS interfaces)",
+    title,
     "",
     `  rust structs checked    : ${result.rustCount}  (${rustLabel})`,
     `  ts interfaces checked   : ${result.tsCount}  (${tsLabel})`,
@@ -380,7 +392,7 @@ export function formatReport(result, rustLabel, tsLabel) {
     for (const item of items) lines.push(`    - ${item}`);
   };
   detail("violations", result.violations);
-  lines.push("", result.ok ? "OK: coverage type contract holds." : "FAIL: coverage type contract violated.");
+  lines.push("", result.ok ? "OK: type contract holds." : "FAIL: type contract violated.");
   return lines.join("\n");
 }
 
@@ -410,16 +422,49 @@ export function main(argv = process.argv.slice(2)) {
     console.error(`check-coverage-types: ${/** @type {Error} */ (err).message}`);
     return 2;
   }
-  /** @type {ReturnType<typeof runTypeCheck>} */
-  let result;
-  try {
-    result = runTypeCheck(opts);
-  } catch (err) {
-    console.error(`check-coverage-types: internal error: ${/** @type {Error} */ (err).message}`);
-    return 2;
+
+  // An explicit --rust/--ts pair checks only the coverage contract on those
+  // scratch copies (how the tests simulate drift). With no flags, every
+  // contract is checked.
+  const explicit = opts.rustPath !== DEFAULT_RUST_SOURCE || opts.tsPath !== DEFAULT_TS_SOURCE;
+  const contracts = explicit
+    ? [{ title: "Coverage IPC type check (Rust structs <-> TS interfaces)", ...opts, structs: CHECKED_STRUCTS }]
+    : [
+        {
+          title: "Coverage IPC type check (Rust structs <-> TS interfaces)",
+          rustPath: DEFAULT_RUST_SOURCE,
+          tsPath: DEFAULT_TS_SOURCE,
+          structs: CHECKED_STRUCTS,
+        },
+        {
+          title: "Terminal IPC type check (Rust structs <-> TS interfaces)",
+          rustPath: TERMINAL_RUST_SOURCE,
+          tsPath: TERMINAL_TS_SOURCE,
+          structs: TERMINAL_STRUCTS,
+        },
+      ];
+
+  let code = 0;
+  for (const contract of contracts) {
+    /** @type {ReturnType<typeof runTypeCheck>} */
+    let result;
+    try {
+      result = runTypeCheck(contract);
+    } catch (err) {
+      console.error(`check-coverage-types: internal error: ${/** @type {Error} */ (err).message}`);
+      return 2;
+    }
+    console.log(
+      formatReport(
+        result,
+        path.relative(REPO_ROOT, contract.rustPath),
+        path.relative(REPO_ROOT, contract.tsPath),
+        contract.title,
+      ),
+    );
+    if (!result.ok) code = 1;
   }
-  console.log(formatReport(result, path.relative(REPO_ROOT, opts.rustPath), path.relative(REPO_ROOT, opts.tsPath)));
-  return result.ok ? 0 : 1;
+  return code;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

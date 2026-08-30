@@ -34,7 +34,6 @@
   import {
     harnessStore,
     type AiGeneration,
-    type PolicyVerdict,
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
   import { formatHealthReport, observedTotal, skippedAudits } from "../health/report";
@@ -51,6 +50,12 @@
     updateKindClass,
   } from "../health/format";
   import { formatError } from "../ui/formatError";
+  import {
+    formatRunDetail,
+    formatRunSummary,
+    runPassed,
+    type TerminalRunResult,
+  } from "../terminal/runResult";
   import { reportPanelError } from "../diagnostics/report";
   import Skeleton from "./Skeleton.svelte";
 
@@ -91,7 +96,10 @@
       {
         running: boolean;
         status?: "passed" | "failed";
+        /** Complete captured output, for the copied diagnostics. */
         detail?: string;
+        /** One line naming what happened, for the status row. */
+        summary?: string;
         duration_ms?: number;
       }
     >
@@ -255,18 +263,7 @@
     stepResults[step.id] = { running: true };
 
     try {
-      // Wire shape of `crate::terminal::TerminalRunResult`.
-      const res = await invoke<{
-        command: string;
-        gated: boolean;
-        policy?: PolicyVerdict | null;
-        timed_out: boolean;
-        exit_code: number | null;
-        stdout_tail: string;
-        stderr_tail: string;
-        truncated: boolean;
-        duration_ms: number;
-      }>("cmd_manvi_run_action", {
+      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
         repoPath,
         args: step.argv,
         actionKind: "health",
@@ -275,15 +272,15 @@
       });
       if (!guard.isLive()) return false;
 
-      const passed = !res.timed_out && res.exit_code === 0;
+      const passed = runPassed(res);
       stepResults[step.id] = {
         running: false,
         status: passed ? "passed" : "failed",
-        detail: res.timed_out
-          ? "Timed out and was killed."
-          : passed
-            ? res.stdout_tail || "Command completed successfully (exit 0)"
-            : res.stderr_tail || res.stdout_tail || `Command failed (exit ${res.exit_code ?? "?"})`,
+        // Both streams, kept on timeout, with a clipped tail marked as clipped
+        // — this panel previously dropped stdout whenever stderr had anything,
+        // and never noted truncation at all.
+        detail: formatRunDetail(res),
+        summary: formatRunSummary(res),
         duration_ms: res.duration_ms,
       };
 

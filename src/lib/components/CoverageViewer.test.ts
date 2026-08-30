@@ -57,7 +57,6 @@ describe("CoverageViewer report copy contract", () => {
     expect(source.match(/window\.clearTimeout\(reportCopyTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
   });
 });
-
 describe("CoverageViewer MANVI integration contracts", () => {
   it("sends the rendered report through the harness store to cmd_ai_coverage_report", () => {
     expect(source).toContain("harnessStore.coverageReport(");
@@ -417,5 +416,44 @@ describe("CoverageViewer outcome-verification contracts (regression)", () => {
     // It is copyable: the output that explains why nothing was produced is the
     // actionable payload.
     expect(source).toContain('status.status === "no_data" ? ("no_data" as const)');
+  });
+});
+
+/**
+ * Every panel that runs a command must present the result through the one
+ * owner, so that "what happened" is answered the same way everywhere and no
+ * captured stream is silently dropped.
+ */
+describe("CoverageViewer run-output contracts (regression)", () => {
+  it("builds detail and summary through the shared owner, not by hand", () => {
+    expect(source).toContain("formatRunDetail(res)");
+    expect(source).toContain("formatRunSummary(res)");
+    expect(source).toContain("runPassed(res)");
+  });
+
+  it("no longer lets stderr shadow stdout", () => {
+    // `res.stderr_tail || res.stdout_tail` discarded the entire diagnosis
+    // whenever stderr held anything at all — at both of this panel's run
+    // sites, and at HealthPanel's.
+    expect(source).not.toContain("res.stderr_tail || res.stdout_tail");
+    expect(source).not.toContain('"Timed out and was killed."');
+    // The wire shape is imported, not redeclared.
+    expect(source).not.toContain("interface TerminalRunResult {");
+    expect(source).toContain('from "../terminal/runResult"');
+  });
+
+  it("shows the row summary but copies the whole detail", () => {
+    expect(source).toContain("status.summary || briefDetail(status.detail)");
+    expect(source).toContain("summary?: string;");
+  });
+
+  it("corrects the row text when a run is downgraded to no_data", () => {
+    // The stored summary is the command's own last line, which for a clean
+    // run that measured nothing is exactly the impression being corrected.
+    const marker = source.slice(
+      source.indexOf("function markProducedNoCoverage"),
+      source.indexOf("async function runCoveragePipeline"),
+    );
+    expect(marker).toContain("summary: note");
   });
 });

@@ -329,6 +329,41 @@ export interface FailedCoverageDiagnosticsOptions {
 const GO_MISSING_MODULE =
   /directory prefix\s+\S+\s+does not contain main module/i;
 
+/**
+ * pytest aborted during *collection*, not during a test.
+ *
+ * A module that runs `sys.exit()` at import time takes the whole session down
+ * before anything is measured: pytest reports `INTERNALERROR` with a
+ * `SystemExit` traceback and "no tests ran". It is a common shape in
+ * repositories that keep runnable scripts next to their tests, because
+ * pytest's default `python_files` patterns (`test_*.py` and `*_test.py`)
+ * collect a script named e.g. `stress_test.py` and import it.
+ *
+ * Distinguishing this from an ordinary test failure matters: no test failed,
+ * and no amount of fixing tests will help. The fix is to stop collecting that
+ * file.
+ */
+const PYTEST_COLLECTION_ABORTED = /INTERNALERROR>[\s\S]*?\bSystemExit\b/i;
+
+/** The `File "<path>", line N, in <module>` frame of a collection abort. */
+const PYTEST_EXITING_MODULE = /File "([^"]+)", line (\d+), in <module>/g;
+
+/**
+ * The repository file whose import aborted collection — the last `<module>`
+ * frame that is not inside a virtualenv or the interpreter's own stdlib.
+ */
+function pytestAbortingModule(output: string): string | null {
+  let found: string | null = null;
+  // `matchAll` rather than a bare `exec` loop: it works on a clone, so the
+  // shared /g pattern's `lastIndex` is never carried between calls.
+  for (const match of output.matchAll(PYTEST_EXITING_MODULE)) {
+    const [, file, line] = match;
+    if (!file || /[/\\](site-packages|dist-packages)[/\\]|<frozen/.test(file)) continue;
+    found = `${file}:${line}`;
+  }
+  return found;
+}
+
 const TEST_SUITE_RAN_FAILURE = [
   /Test Files\s+\d+\s+failed/i,
   /Failed Tests/i,
@@ -377,6 +412,11 @@ export function coverageFailureHint(
   }
   if (/wrapper ['`].*['`] is not a repository file/i.test(output)) {
     return "No Gradle wrapper in this repository. GitPulse will not invent ./gradlew.";
+  }
+  if (PYTEST_COLLECTION_ABORTED.test(output)) {
+    const origin = pytestAbortingModule(output);
+    const where = origin ? ` The module was ${origin}.` : "";
+    return `pytest never ran a test: importing a collected module called sys.exit(), which aborts the whole session.${where} That file matches pytest's default collection patterns (test_*.py, *_test.py) but is a runnable script, not a test module. Rename it, guard its body with \`if __name__ == "__main__":\`, or exclude it (\`--ignore=<path>\`, or \`norecursedirs\`/\`python_files\` in pytest.ini).`;
   }
   if (TEST_SUITE_RAN_FAILURE.some((pattern) => pattern.test(output))) {
     const cmd = typeof command === "string" ? command : "";

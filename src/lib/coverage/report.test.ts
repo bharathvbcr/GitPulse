@@ -374,7 +374,6 @@ describe("formatCoverageReport", () => {
     expect(text.split("\n")[0]).toBe("Coverage report — /repo");
   });
 });
-
 describe("buildCoverageIssueDraft", () => {
   it("creates a bounded issue without leaking the local checkout path", () => {
     const repo = "/Users/example/Secret Checkout";
@@ -716,5 +715,88 @@ describe("coverage report — cap disclosure and no-data honesty (regression)", 
     const text = formatCoverageReport(report, "/repo");
     expect(text).toContain("- native (expected: lcov) — No CMakeLists.txt or Makefile");
     expect(text).not.toContain("no reason reported");
+  });
+});
+
+/**
+ * The failure the user hit repeatedly on a real repository: pytest imported a
+ * collected module that called `sys.exit()`, which aborts the whole session
+ * before a single test runs.
+ */
+describe("coverageFailureHint: pytest aborted during collection", () => {
+  const realOutput = [
+    "stderr:",
+    "mainloop: caught unexpected SystemExit!",
+    "stdout:",
+    "INTERNALERROR> Traceback (most recent call last):",
+    'INTERNALERROR>   File "/repo/.venv/lib/python3.14/site-packages/_pytest/runner.py", line 341, in from_call',
+    "INTERNALERROR>     result: TResult | None = func()",
+    'INTERNALERROR>   File "/repo/.venv/lib/python3.14/site-packages/_pytest/python.py", line 508, in importtestmodule',
+    "INTERNALERROR>     mod = import_path(",
+    'INTERNALERROR>   File "<frozen importlib._bootstrap>", line 1406, in _gcd_import',
+    'INTERNALERROR>   File "/repo/bench/stress_test.py", line 944, in <module>',
+    "INTERNALERROR>     sys.exit(1 if FAIL else 0)",
+    "INTERNALERROR> SystemExit: 0",
+    "",
+    "============================ no tests ran in 17.74s ============================",
+  ].join("\n");
+
+  it("names the repository module that aborted the session, not a pytest internal", () => {
+    const hint = coverageFailureHint(".venv/bin/python -m pytest --cov --cov-report=xml", realOutput);
+    expect(hint).toContain("sys.exit()");
+    expect(hint).toContain("/repo/bench/stress_test.py:944");
+    // The frames inside the virtualenv and the frozen importlib are pytest's
+    // own machinery; blaming them would send the reader to the wrong file.
+    expect(hint).not.toContain("site-packages");
+    expect(hint).not.toContain("importlib");
+    expect(hint).not.toContain("_pytest");
+  });
+
+  it("offers the three real remedies", () => {
+    const hint = coverageFailureHint("pytest --cov", realOutput) ?? "";
+    expect(hint).toContain("__main__");
+    expect(hint).toContain("--ignore=");
+    expect(hint).toContain("python_files");
+  });
+
+  it("still classifies without a usable traceback", () => {
+    const hint = coverageFailureHint(
+      "pytest --cov",
+      "INTERNALERROR> SystemExit: 1\nno tests ran in 0.4s",
+    );
+    expect(hint).toContain("sys.exit()");
+    // No frame to name, so it must not invent one.
+    expect(hint).not.toContain("The module was");
+  });
+
+  it("does not fire on an ordinary failing test suite", () => {
+    const hint = coverageFailureHint(
+      "pytest --cov",
+      "FAILED test_api.py::test_login - AssertionError\n1 failed, 3 passed in 2.1s",
+    );
+    expect(hint ?? "").not.toContain("sys.exit()");
+  });
+
+  it("does not fire on an INTERNALERROR that is not a SystemExit", () => {
+    const hint = coverageFailureHint(
+      "pytest --cov",
+      "INTERNALERROR> AttributeError: module has no attribute 'x'",
+    );
+    expect(hint ?? "").not.toContain("sys.exit()");
+  });
+
+  it("is reachable only because stdout is no longer discarded", () => {
+    // The whole traceback lives on stdout; stderr carried one line that
+    // classifies as nothing. This is the pairing that made the fix work.
+    expect(coverageFailureHint("pytest --cov", "mainloop: caught unexpected SystemExit!")).toBeNull();
+  });
+
+  it("is stateless across calls despite the global-flagged frame regex", () => {
+    // A shared /g pattern carries `lastIndex` between calls, which would make
+    // a second call start mid-string and miss.
+    const first = coverageFailureHint("pytest --cov", realOutput);
+    const second = coverageFailureHint("pytest --cov", realOutput);
+    expect(second).toBe(first);
+    expect(second).toContain("stress_test.py:944");
   });
 });
