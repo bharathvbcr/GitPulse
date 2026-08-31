@@ -42,7 +42,7 @@ GitPulse operates completely locally on your machine with strict IPC boundaries 
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        Views["12 Specialized Views<br/>(Graph, Diff, Coverage, Health, Storage...)"]
+        Views["13 Specialized Views<br/>(Files, Graph, Diff, Coverage, Health, Storage...)"]
         Stores["Reactive Svelte 5 Stores & Runes"]
         CanvasEngine["GPU-Accelerated HTML5 Canvas"]
         AsyncGuards["Async Cancellation Guards"]
@@ -54,7 +54,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(94 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(95 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon / Tokio)"]
@@ -86,11 +86,12 @@ flowchart TB
 
 ## View Catalog & Workflows
 
-GitPulse organizes 12 purpose-built views into three intuitive functional groups:
+GitPulse organizes 13 purpose-built views into three intuitive functional groups:
 
 ```mermaid
 flowchart LR
     subgraph Work["🔨 Work Views"]
+        Files["<b>Files</b> (<code>files</code>)<br/>IDE file explorer & code viewer"]
         Graph["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph & lanes"]
         Diff["<b>Diff</b> (<code>diff</code>)<br/>Word-level diff & selective staging"]
         Conflict["<b>Resolve</b> (<code>conflict</code>)<br/>3-way merge conflict editor"]
@@ -119,6 +120,7 @@ flowchart LR
 ### 🚀 Core Git & Visualization
 | Feature | Description |
 | --- | --- |
+| **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with avatar rendering, lane smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust. |
 | **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, and one-click selective hunk/line patch staging. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
@@ -127,7 +129,7 @@ flowchart LR
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
-| **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation and copyable diagnostics. |
+| **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. |
 | **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
 | **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
@@ -137,7 +139,7 @@ flowchart LR
 | --- | --- |
 | **MANVI Policy Gate** | Mutating Git actions are evaluated against a 5-verdict safety ladder (*Allowed*, *Demoted*, *Warned*, *Blocked*, *Unchecked*). Asymmetric degradation ensures wedged sidecars fail closed safely. |
 | **On-Device AI Assistance** | Context-calibrated AI assistance for commit messages, commit explanations, and branch naming against local LLMs (Ollama, LM Studio, llama.cpp, vLLM). |
-| **Scoped Action Allowlist** | AI-suggested coverage generation and dependency fixes execute via a purpose-limited command allowlist (`cmd_manvi_run_action`) requiring explicit user confirmation. |
+| **Scoped Action Allowlist** | AI-suggested coverage generation and dependency fixes execute via a purpose-limited command allowlist (`cmd_manvi_run_action`) across all major ecosystems (npm, cargo, pytest, go, swift, dart, etc.) requiring explicit user confirmation. |
 
 ```mermaid
 flowchart TD
@@ -247,11 +249,11 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 94 Rust commands match frontend `invoke()` calls with zero drift |
-| `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field |
-| `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, etc.) |
+| `npm run check:ipc` | Verify 95 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
+| `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests) |
-| `npm test` | Run Vitest unit and integration test suite |
+| `npm test` | Run Vitest unit and integration test suite (1,890+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |
 | `npm run build` | Build frontend production bundle |
 | `npm run tauri build` | Bundle native installers for the host platform |
@@ -263,8 +265,7 @@ npm run tauri dev
 For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- 🤖 **[MANVI Harness Guide](docs/MANVI.md)** — Policy gate ladder, local AI completion budgeting, loopback safety, and allowlist runner.
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 12 application views.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 13 application views and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.

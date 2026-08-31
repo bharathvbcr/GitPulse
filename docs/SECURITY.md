@@ -46,6 +46,12 @@ flowchart TD
 - AI models and the MANVI sidecar have **zero access** to the terminal PTY, its file descriptors, or keystrokes.
 - Model-assisted remediation actions (`cmd_manvi_run_action`) are restricted to a strict command allowlist and require explicit user confirmation.
 
+### Opt-In Release Checks
+- GitPulse does not auto-update and makes zero network checks by default.
+- When explicitly enabled under **Settings → Updates**, GitPulse compares public release tags once a day via `git ls-remote` against the upstream repository.
+- No user tokens, repository paths, or hardware telemetry are ever sent.
+- GitPulse never downloads or installs binaries automatically; checks only notify the user with a direct link to GitHub releases.
+
 ### Webview Content Security Policy (CSP)
 The webview operates under a strict CSP configured in `src-tauri/tauri.conf.json`:
 - `default-src 'self'`

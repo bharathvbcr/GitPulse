@@ -33,8 +33,8 @@ Closes #
 
 **If this changes versioned manifests:**
 
-- [ ] `npm run check:release` passes (`package.json`, `tauri.conf.json`,
-      `Cargo.toml`, and `Cargo.lock` all name one version).
+- [ ] `npm run check:release` passes (`package.json`, `package-lock.json`,
+      `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` all name one version).
 
 **Documentation:**
 

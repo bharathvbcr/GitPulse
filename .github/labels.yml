@@ -53,6 +53,10 @@
   color: "c5def5"
   description: "Commit graph, lane solver, canvas renderer"
 
+- name: "area: files"
+  color: "c5def5"
+  description: "File tree explorer, syntax code viewer, media previews"
+
 - name: "area: rust-core"
   color: "c5def5"
   description: "src-tauri — engine, analyzer, commands"

@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Tokio / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (94 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (95 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -84,6 +84,7 @@ Every view is registered in [`src/lib/views/viewRegistry.ts`](file:///Users/bhar
 ### Svelte 5 Runes & Dependency Injection
 - **Component State**: Uses modern Svelte 5 runes (`$state`, `$derived`, `$effect`) for local, reactive component state.
 - **Store Architecture**: Domain stores (e.g. `repoStore`, `graphStore`, `filterStore`, `harnessStore`) are instantiated using factory functions with injectable dependencies (`createRepoStore(deps)`), enabling 100% headless unit testing without requiring Tauri runtime mocks.
+- **Domain Modules**: Pure business logic is isolated under `src/lib/` (`files/`, `coverage/`, `health/`, `diff/`, `canvas/`, `terminal/`, `branches/`), completely independent of the DOM.
 
 ### Async Hygiene & Cancellation Guards
 When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
@@ -95,7 +96,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +94 Registered Handlers
+        +95 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -143,11 +144,12 @@ classDiagram
 - **`graph/`**: Native commit-history lane solver with branch folding, parent-child edge layout, and nogap lookback bounds.
 - **`analyzer/`**: 
   - `language.rs`: Multi-language classifier (60+ languages), GitHub Linguist color mappings, and fast line-of-code breakdown.
-  - `coverage.rs`: Universal coverage artifact scanner (LCOV, Cobertura, Go cover, Istanbul, JaCoCo, Clover) and file-level metrics.
+  - `coverage.rs`: Universal coverage artifact scanner (LCOV, Cobertura, Go cover, Istanbul, JaCoCo, Clover), toolchain installer detection, and file-level metrics.
   - `health.rs`: Ecosystem vulnerability checkers (`npm audit`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot).
 - **`storage/`**: Deep disk-usage auditor (packfiles, loose objects, reflogs, LFS, submodules, caches, oversized files) with time-series history tracking.
 - **`ops.rs`**: Safe, read-only MANVI operation planners for merged branch cleanups, outgoing commit review, and release publishing.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
+- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved command diagnostics and subprocess exit status tracking.
 
 ---
 
@@ -185,6 +187,6 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 94 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field across 47+ data fields. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 95 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field across 62 data fields (Coverage & Terminal). |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` agree. |

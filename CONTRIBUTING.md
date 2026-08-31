@@ -64,11 +64,11 @@ the narrower commands instead:
 
 | Command | Scope | Typical runtime |
 | --- | --- | --- |
-| `npm test` | Vitest suite (~1,600 tests across `src/`) | seconds |
+| `npm test` | Vitest suite (~1,890+ tests across `src/`) | seconds |
 | `npx vitest run src/lib/graph` | One directory | sub-second |
 | `npx vitest watch` | Re-runs on save | continuous |
 | `npm run coverage` | Vitest with V8 coverage into `coverage/` | ~1 min |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites | ~1 min |
+| `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites (~200+ tests) | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml updates::` | One Rust module | seconds |
 
 ### Test conventions
@@ -116,10 +116,10 @@ flowchart TD
 | Command | Purpose |
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
-| `npm test` | Runs the Vitest frontend unit and integration test suite |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry and frontend `invoke()` calls match with zero untracked orphans |
-| `npm run check:types` | Verifies that coverage serde structs in Rust match TypeScript interfaces field-for-field |
-| `npm run check:release` | Asserts all version manifests (`package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
+| `npm test` | Runs the Vitest frontend unit and integration test suite (1,890+ tests) |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (95 handlers) and frontend `invoke()` calls match with zero untracked orphans |
+| `npm run check:types` | Verifies that coverage and terminal serde structs in Rust match TypeScript interfaces field-for-field (62 fields) |
+| `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds) in one command |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
@@ -138,10 +138,10 @@ GitPulse/
 │   ├── lib/stores/       Reactive state (repo, graph, filter, theme, toasts, modals)
 │   ├── lib/components/   UI components; one .svelte + one .test.ts each
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
-│   ├── lib/views/        View registry + navigation (routerless)
-│   └── lib/<domain>/     Pure logic: diff, files, filter, graph, coverage, health…
+│   ├── lib/views/        View registry + navigation (routerless, 13 views)
+│   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (95 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, topology index, bezier geometry, folding
     ├── analyzer/         Language detection, LOC, coverage, dependency health

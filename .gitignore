@@ -14,13 +14,65 @@ lcov.info
 .claude/
 rust-coverage-summary.txt
 
-# Local-only documentation and promotional drafts
+# Local-only documentation, internal notes, and promotional drafts
+/docs/MANVI.md
 /docs/PROMO.md
+/docs/TODO.md
+/docs/NOTES.md
+/docs/SCRATCH.md
+/docs/IDEAS.md
+/docs/PLAN.md
 /docs/assets/gitpulse-social-banner.jpg
 /docs/drafts/
 /docs/marketing/
 /docs/press/
 /docs/promo/
+/docs/internal/
+/docs/notes/
+/docs/experiments/
+/docs/scratch/
+/docs/research/
+/docs/temp/
+/docs/tmp/
+/docs/private/
+/docs/generated/
+/docs/site/
+/docs/api-gen/
+/docs/rustdoc/
+/docs/_build/
+/docs/.vitepress/dist/
+/docs/.vitepress/cache/
+/docs/.docusaurus/
+/docs/*.draft.md
+/docs/*.local.md
+/docs/*.tmp.md
+/docs/*.scratch.md
+/docs/*.backup.md
+/docs/assets/drafts/
+/docs/assets/social/
+/docs/assets/promo/
+/docs/assets/*.psd
+/docs/assets/*.sketch
+/docs/assets/*.fig
+/docs/assets/*.ai
+/docs/assets/*.xcf
+
+# Local markdown notes, plans, release drafts, and scratchpads
+TODO.md
+NOTES.md
+SCRATCH.md
+IDEAS.md
+PLAN.md
+RELEASE_DRAFT.md
+CHANGELOG_DRAFT.md
+*.draft.md
+*.scratch.md
+*.local.md
+
+# Diagram source backups & temporary files
+*.drawio.bkp
+*.drawio.dtmp
+*.excalidraw.json.bkp
 
 # DevCouncil local state
 .devcouncil/*

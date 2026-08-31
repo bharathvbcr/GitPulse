@@ -70,27 +70,12 @@ dependency — this is a `Math.max` over label lengths and `padEnd`.
 
 ## B. CI/CD automation
 
-### B1 · Run the contract checkers in CI 🟢 — *highest value in this list*
-**Labels:** `good first issue`, `area: ci`, `bug`
+### B1 · Run the contract checkers in CI ✅ *(Completed)*
+**Labels:** `area: ci`
 
-`.github/workflows/ci.yml` runs the type check, Vitest, the Vite build, `cargo fmt`,
-`cargo clippy`, and `cargo test`. It **never runs** `check:ipc`, `check:types`, or
-`check:release`.
+*Implemented in `.github/workflows/ci.yml` (commits `445d096`, `4a5a7ac`).*
 
-So the three checks that exist specifically to catch cross-language drift are
-advisory: a pull request that orphans a handler or desynchronises a coverage struct
-passes CI. Only `release.yml` runs `check:release`, and only at tag time — meaning
-version drift is found after a release has been cut, not before it is merged.
-
-Add the three steps to `ci.yml`. They are fast (pure Node, no network) and need no
-new setup beyond the `npm ci` already present.
-
-- **Touch:** `.github/workflows/ci.yml`
-- **Done when:** all three run on every push and pull request, and a deliberately
-  drifted branch fails CI. Verify the failure locally first — `npm run check:ipc`
-  after removing an `invoke` call site should exit `1`.
-- **Note:** `check:release` compares manifests against each other; on a non-tag build
-  invoke it without `--tag`. Confirm the no-tag path behaves before wiring it up.
+`npm run check:ipc`, `npm run check:types`, and `npm run check:release` now run on every push and pull request across all matrix runners (Ubuntu, macOS, Windows) to prevent cross-language drift.
 
 ### B2 · Cache the Vite build across CI jobs 🟡
 **Labels:** `help wanted`, `area: ci`, `performance`
@@ -200,17 +185,12 @@ does.
 - **Done when:** `npm run check` reports `0 ERRORS 0 WARNINGS`, and each element is
   operable by keyboard alone.
 
-### D2 · Document the keyboard shortcut surface 🟢
-**Labels:** `good first issue`, `documentation`
+### D2 · Document the keyboard shortcut surface ✅ *(Completed)*
+**Labels:** `documentation`
 
-`ShortcutsModal.svelte` and the global handler in `App.svelte` are the only record of
-GitPulse's shortcuts. They are not in the README or `docs/FEATURES.md`, so they are
-undiscoverable before installing.
+*Completed in [`docs/FEATURES.md`](FEATURES.md#4-keyboard-shortcuts-reference).*
 
-- **Touch:** `docs/FEATURES.md`
-- **Done when:** every shortcut in `ShortcutsModal.svelte` and `App.svelte`'s
-  `handleGlobalKeydown` appears in the table, with macOS and Windows/Linux chords
-  given separately.
+All keyboard shortcuts from `ShortcutsModal.svelte`, `App.svelte`, and native OS menus are documented with macOS and Windows/Linux chords.
 
 ---
 

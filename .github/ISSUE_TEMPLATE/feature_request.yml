@@ -42,6 +42,7 @@ body:
       label: Which area does this touch?
       options:
         - Commit Graph / visualization
+        - Files / Code Viewer
         - Git operations (commit, branch, rebase, stash, worktrees)
         - Diff / merge conflict resolution
         - Code intelligence (coverage, health, language stats)
