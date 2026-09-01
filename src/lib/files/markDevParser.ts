@@ -210,6 +210,12 @@ const CALLOUT_MAP: Record<string, CalloutConfig> = {
 /**
  * Keep a URL only if its scheme is safe to put in an `href` or `src`.
  *
+ * This function's output is the application's only unescaped-HTML sink: the
+ * two `{@html}` sites in MarkDevViewer.svelte both render
+ * `renderMarkDevMarkdown(blob.text)`, and there is no `innerHTML` assignment
+ * anywhere in the frontend. Whatever this emits is what reaches the DOM
+ * unescaped, which is why the checks below live here rather than at the view.
+ *
  * Markdown rendered here is repository content, which is untrusted: a README
  * can carry `[click](javascript:...)`, and this used to interpolate the target
  * straight into the attribute. Quotes are already escaped by the time links are
