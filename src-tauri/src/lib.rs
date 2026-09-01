@@ -14,6 +14,7 @@ pub mod logging;
 pub mod ops;
 pub mod stack;
 pub mod storage;
+pub mod tasks;
 pub mod terminal;
 pub mod updates;
 pub mod watcher;
@@ -168,6 +169,11 @@ pub fn run() {
             cmd_diagnostic_log_tail,
             cmd_ledger_tail,
             cmd_ledger_status,
+            cmd_task_view,
+            cmd_task_scope,
+            cmd_bind_worktree_task,
+            cmd_unbind_worktree_task,
+            cmd_worktree_task,
             cmd_check_app_update,
         ])
         .build(context())

@@ -28,6 +28,7 @@
 //! still on disk, in a file that gets backed up and synced and read by every
 //! later consumer.
 
+pub mod bindings;
 pub mod ids;
 pub mod redact;
 
@@ -181,7 +182,7 @@ impl std::fmt::Display for LedgerError {
 }
 
 impl LedgerError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         LedgerError {
             code,
             message: message.into(),
@@ -520,6 +521,15 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             error: e.message,
             error_code: e.code.to_string(),
         },
+    }
+}
+
+/// Test-only helpers that need the private registry.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// Drops every cached connection, as a process restart would.
+    pub fn reset_registry() {
+        super::registry().lock().unwrap().clear();
     }
 }
 

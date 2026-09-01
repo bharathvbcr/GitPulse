@@ -34,6 +34,12 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # second table is how a key redacted by one gate leaks out of another.
 dc-verify = { path = "../../../../../Manvi/crates/dc-verify" }
 
+# Read-only view of DevCouncil's task and lease store. Manvi owns the schema
+# (crates/dc-store/src/schema.rs) and the migrations; GitPulse links the crate
+# rather than reimplementing the queries, and never writes: a UI process that
+# takes a lease can strand a task when the window closes.
+dc-store = { path = "../../../../../Manvi/crates/dc-store" }
+
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 

@@ -54,7 +54,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(109 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(114 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -253,7 +253,7 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 109 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 114 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |

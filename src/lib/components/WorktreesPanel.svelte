@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { WorktreeInfo } from "../branches/types";
+  import type { TaskScope, TaskView } from "../tasks/types";
   import { invoke } from "@tauri-apps/api/core";
   import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
@@ -18,6 +19,17 @@
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
+  /**
+   * DevCouncil state for this repository, and which worktree is bound to what.
+   *
+   * A worktree stops being a directory and becomes a task in flight once it is
+   * bound: every mutation inside it is then judged against that task's planned
+   * files rather than against no plan at all.
+   */
+  let taskView = $state<TaskView | null>(null);
+  let bindings = $state<Record<string, string | null>>({});
+  /** Declared scope per bound task, for the planned-file summary. */
+  let scopes = $state<Record<string, TaskScope>>({});
   let isLoading = $state(false);
   let error = $state<string | null>(null);
   let isCreating = $state(false);
@@ -66,11 +78,91 @@
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
       if (!guard.isLive()) return;
       worktrees = next;
+      await loadTaskState(repo, next, guard);
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       error = reportPanelError("worktrees", err);
     } finally {
       if (guard.isLive()) isLoading = false;
+    }
+  }
+
+  /**
+   * Loads DevCouncil leases and each worktree's binding.
+   *
+   * Deliberately non-fatal: most repositories have no DevCouncil store, and
+   * that is not an error. A failure here leaves the worktree list intact and
+   * simply shows no task column — the panel's own job still works.
+   */
+  async function loadTaskState(repo: string, list: WorktreeInfo[], guard: AsyncGuard) {
+    try {
+      const view = await invoke<TaskView>("cmd_task_view", { repoPath: repo });
+      if (!guard.isLive()) return;
+      taskView = view;
+      const resolved: Record<string, string | null> = {};
+      for (const wt of list) {
+        resolved[wt.path] = await invoke<string | null>("cmd_worktree_task", {
+          repoPath: repo,
+          worktreePath: wt.path,
+        });
+        if (!guard.isLive()) return;
+      }
+      bindings = resolved;
+
+      // The declared scope of each bound task, so a row can say how much this
+      // worktree is authorised to touch. Fetched only for tasks actually bound
+      // here — the store may hold hundreds.
+      const wanted = [...new Set(Object.values(resolved).filter((t): t is string => !!t))];
+      const loaded: Record<string, TaskScope> = {};
+      for (const taskId of wanted) {
+        const scope = await invoke<TaskScope | null>("cmd_task_scope", {
+          repoPath: repo,
+          taskId,
+        });
+        if (!guard.isLive()) return;
+        if (scope) loaded[taskId] = scope;
+      }
+      scopes = loaded;
+    } catch (err: unknown) {
+      if (!guard.isLive()) return;
+      // Reported to diagnostics, not to the panel's error banner: task state is
+      // an enrichment, and losing it must not read as "the worktrees failed".
+      reportPanelError("worktrees", err);
+      taskView = null;
+    }
+  }
+
+  /** Active leases keyed by task, for the lease badge. */
+  const leaseFor = $derived((taskId: string | null) =>
+    taskId ? (taskView?.leases.find((l) => l.task_id === taskId) ?? null) : null,
+  );
+
+  async function bindTask(wt: WorktreeInfo, taskId: string) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await invoke<number>("cmd_bind_worktree_task", {
+        repoPath: repo,
+        worktreePath: wt.path,
+        taskId,
+      });
+      bindings = { ...bindings, [wt.path]: taskId };
+    } catch (err: unknown) {
+      error = reportPanelError("worktrees", err);
+    }
+  }
+
+  async function unbindTask(wt: WorktreeInfo) {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    try {
+      await invoke<number>("cmd_unbind_worktree_task", {
+        repoPath: repo,
+        worktreePath: wt.path,
+      });
+      bindings = { ...bindings, [wt.path]: null };
+    } catch (err: unknown) {
+      error = reportPanelError("worktrees", err);
     }
   }
 
@@ -257,9 +349,10 @@
     <div class="space-y-0.5">
       {#each worktrees as wt (wt.path)}
         <div
-          class="px-2 py-1 rounded-full flex items-center justify-between hover:bg-surfaceHover group transition-colors
+          class="px-2 py-1 rounded-2xl flex flex-col hover:bg-surfaceHover group transition-colors
             {wt.is_main ? '' : 'ring-1 ring-inset ring-accent/25'}"
         >
+         <div class="flex items-center justify-between">
           <button
             class="flex items-center gap-1.5 min-w-0 flex-1 text-left"
             onclick={() => open(wt)}
@@ -313,6 +406,84 @@
               </button>
             {/if}
           </div>
+         </div>
+
+          <!--
+            The task line. A worktree bound to a DevCouncil task has every
+            mutation inside it judged against that task's planned files; an
+            unbound one is judged against no plan at all, which the harness
+            reports as task.absent. Showing which is which is the point: the
+            two are different safety postures and used to look identical.
+          -->
+          {#if taskView?.available}
+            {@const bound = bindings[wt.path] ?? null}
+            {@const lease = leaseFor(bound)}
+            <div class="flex items-center gap-1 pl-1 pb-0.5 min-w-0">
+              {#if bound}
+                <span
+                  class="shrink-0 text-[9px] font-mono rounded-full bg-accent/15 text-accent border border-accent/30 px-1.5"
+                  title="Mutations in this worktree are judged against {bound}'s planned files"
+                >{bound}</span>
+                {#if scopes[bound]}
+                  {@const sc = scopes[bound]}
+                  <span
+                    class="shrink-0 text-[9px] text-textMuted"
+                    title="Planned: {sc.planned_files.join(', ') || 'nothing'}{sc.agent_appended_files
+                      .length
+                      ? `\nAgent-appended: ${sc.agent_appended_files.join(', ')}`
+                      : ''}{sc.forbidden_changes.length
+                      ? `\nForbidden: ${sc.forbidden_changes.join(', ')}`
+                      : ''}"
+                  >{sc.planned_files.length} planned{sc.agent_appended_files.length
+                    ? ` +${sc.agent_appended_files.length} widened`
+                    : ""}</span>
+                {/if}
+                {#if lease}
+                  <span
+                    class="shrink-0 text-[9px] text-textMuted truncate"
+                    title="Leased by {lease.owner}{lease.agent ? ` (${lease.agent})` : ''}{lease.expires_at
+                      ? `, expires ${lease.expires_at}`
+                      : ', no expiry'}"
+                  >{lease.agent ?? lease.owner}{lease.expires_at ? "" : " · no expiry"}</span>
+                {:else}
+                  <!--
+                    Bound but unleased is a real state, not a missing one: the
+                    binding says what this checkout is for, the lease says who
+                    currently holds it, and a task can be bound here while
+                    nobody holds it.
+                  -->
+                  <span class="shrink-0 text-[9px] text-textMuted">not leased</span>
+                {/if}
+                <button
+                  onclick={() => void unbindTask(wt)}
+                  title="Clear this worktree's task binding"
+                  class="ml-auto shrink-0 text-[9px] text-textMuted hover:text-accent opacity-0 group-hover:opacity-100"
+                >unbind</button>
+              {:else if taskView.leases.length > 0}
+                <select
+                  class="text-[9px] bg-transparent text-textMuted border border-border/60 rounded-full px-1 py-px hover:text-accent focus:outline-none focus:border-accent/60"
+                  aria-label="Bind {wt.name} to a task"
+                  onchange={(e) => {
+                    const id = (e.currentTarget as HTMLSelectElement).value;
+                    if (id) void bindTask(wt, id);
+                  }}
+                >
+                  <option value="">no task</option>
+                  {#each taskView.leases as l (l.task_id)}
+                    <option value={l.task_id}>{l.task_id}</option>
+                  {/each}
+                </select>
+              {/if}
+            </div>
+          {:else if taskView && taskView.error}
+            <!--
+              A store we could not read is not a repository without one. Saying
+              so is the difference between "no tasks here" and "we do not know".
+            -->
+            <div class="pl-1 pb-0.5 text-[9px] text-amber-400 truncate" title={taskView.error}>
+              task state unavailable
+            </div>
+          {/if}
         </div>
       {/each}
     </div>

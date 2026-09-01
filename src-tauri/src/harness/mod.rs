@@ -15,7 +15,9 @@ pub mod sidecar;
 
 use serde::{Deserialize, Serialize};
 
-pub use policy::{check_command, check_file, render_command, PolicyStatus, PolicyVerdict};
+pub use policy::{
+    check_command, check_file, render_command, HostScope, PolicyStatus, PolicyVerdict,
+};
 pub use protocol::{HelloResult, PrepareResult, ProbeResult, SettleResult};
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
 
@@ -73,7 +75,7 @@ impl HarnessStatus {
 /// one both now share.
 pub(crate) fn guard_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
-    let verdict = check_command(repo_path, &command);
+    let verdict = check_command(repo_path, &command, scope_for(repo_path).as_ref());
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
     record_gate(repo_path, &action, &command, argv_json, &verdict);
@@ -86,10 +88,47 @@ pub(crate) fn guard_file(
     file_path: &str,
     op: &str,
 ) -> Result<PolicyVerdict, String> {
-    let verdict = check_file(repo_path, file_path, op);
+    let verdict = check_file(repo_path, file_path, op, scope_for(repo_path).as_ref());
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
     record_gate(repo_path, &action, file_path, None, &verdict);
     gated(verdict)
+}
+
+/// The task scope this checkout is working under, if it is bound to one.
+///
+/// Two lookups, both cheap and both allowed to come back empty:
+///
+/// 1. the ledger, for the binding recorded when the worktree was bound;
+/// 2. DevCouncil's store, for that task's declared scope.
+///
+/// Returning `None` is the ordinary case — most checkouts are bound to no
+/// task — and it reproduces exactly the behaviour that existed before scopes:
+/// the ladder stops at `task.absent` and the host posture demotes it.
+///
+/// A binding that resolves to a task the store cannot produce returns `None`
+/// rather than an empty scope. The difference matters: an empty scope
+/// authorises *nothing*, so every write in that checkout would be refused as
+/// unplanned — a store that is merely absent must not read as a plan that
+/// forbids everything.
+fn scope_for(repo_path: &str) -> Option<HostScope> {
+    let task_id = crate::ledger::bindings::resolve(repo_path, repo_path)
+        .ok()
+        .flatten()?;
+    let scope = crate::tasks::scope(repo_path, &task_id).ok().flatten()?;
+    Some(HostScope {
+        task_id: scope.id,
+        // The union the gate measures against: what the planner authorised
+        // plus what the executor argued into its own scope. They stay
+        // distinguishable in the store, and the harness reports a write
+        // authorised by the second half as `widened` rather than clean.
+        planned_files: scope
+            .planned_files
+            .into_iter()
+            .chain(scope.agent_appended_files)
+            .collect(),
+        forbidden_changes: scope.forbidden_changes,
+        worktree: repo_path.to_string(),
+    })
 }
 
 /// Writes one gate decision to the ledger.
@@ -134,6 +173,10 @@ fn record_gate(
 
     crate::ledger::record(Draft {
         repo_path: repo_path.to_string(),
+        // Taken from the verdict rather than looked up again: the ledger must
+        // record the task the gate actually measured against, not the one a
+        // second lookup would find now.
+        task_id: Some(verdict.task_id.clone()).filter(|t| !t.is_empty()),
         action: action.to_string(),
         object: Some(target.to_string()),
         argv_json,
@@ -273,5 +316,174 @@ mod ledger_seam_tests {
             crate::ledger::action_for_argv(&["git", "cherry-pick"]),
             "git.cherry_pick"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// A `manvi serve` stand-in that answers the handshake, records every
+    /// later request, and refuses with a scope verdict.
+    #[cfg(unix)]
+    const FAKE_RECORDER: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "@REQUESTS@"
+  reply "$line" '{"action":"deny","rule":"scope.unplanned","severity":"soft","reason":"outside the plan","target":"docs/elsewhere.md","task_id":"TASK-7","demoted":"","degraded":["repo_map.unavailable"]}'
+done
+"#;
+
+    /// GitPulse sends the declared scope on the wire, and keeps the task the
+    /// harness answers with.
+    ///
+    /// Hermetic on purpose: it drives a recording fake sidecar rather than
+    /// whatever `manvi` happens to be installed. An earlier version of this
+    /// test used the real binary and passed against a build with no scope
+    /// support at all — the verdict came back `task.absent`, which is not
+    /// `Allowed`, so a weak assertion called it a success. The bar here is that
+    /// the scope is provably on the wire.
+    #[cfg(unix)]
+    #[test]
+    fn a_bound_worktree_sends_its_scope_and_keeps_the_task() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_str().expect("utf8");
+
+        let db = crate::tasks::store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                 VALUES ('TASK-7', 'Ledger', '',
+                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+
+        // Unbound, there is nothing to declare — the behaviour every existing
+        // checkout keeps.
+        assert!(
+            scope_for(repo).is_none(),
+            "an unbound checkout declares nothing"
+        );
+
+        crate::ledger::bindings::bind(repo, repo, "TASK-7").expect("bind");
+        let scope = scope_for(repo).expect("a bound checkout declares its scope");
+        assert_eq!(scope.task_id, "TASK-7");
+        assert_eq!(scope.planned_files, vec!["src/planned.rs"]);
+        assert_eq!(scope.worktree, repo);
+
+        // A sidecar that records every request and refuses, so both halves of
+        // the round trip are observable.
+        let requests = dir.path().join("requests.ndjson");
+        let script = dir.path().join("recording-manvi");
+        let body = FAKE_RECORDER.replace("@REQUESTS@", &requests.display().to_string());
+        std::fs::write(&script, body).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        sidecar::set_test_binary(Some(script.to_string_lossy().into_owned()));
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                sidecar::set_test_binary(None);
+                sidecar::reset();
+            }
+        }
+        let _clear = Clear;
+        sidecar::reset();
+
+        let before = crate::ledger::latest_cursor(repo).expect("cursor");
+        let refused = guard_file(repo, "docs/elsewhere.md", "modify");
+        assert!(
+            refused.is_err(),
+            "a denied write must not become permission to act"
+        );
+
+        // What went onto the wire.
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(!sent.is_empty(), "no policy request reached the sidecar");
+        let request: serde_json::Value =
+            serde_json::from_str(sent.lines().next().unwrap()).expect("the request is JSON");
+        let params = &request["params"];
+        assert_eq!(
+            params["scope"]["task_id"], "TASK-7",
+            "the declared scope did not reach the harness: {params}"
+        );
+        assert_eq!(params["scope"]["planned_files"][0], "src/planned.rs");
+        assert_eq!(params["scope"]["worktree"], repo);
+
+        // And what came back was kept rather than dropped.
+        let events = crate::ledger::tail(repo, before, 10).expect("tail");
+        let row = events.last().expect("a row");
+        assert_eq!(
+            row.task_id.as_deref(),
+            Some("TASK-7"),
+            "the ledger row must name the task the gate measured against"
+        );
+        assert_eq!(row.outcome, "blocked", "a refused write is blocked, not ok");
+        let verdict: PolicyVerdict =
+            serde_json::from_str(row.verdict_json.as_deref().unwrap()).expect("verdict");
+        assert_eq!(
+            verdict.task_id, "TASK-7",
+            "this end used to drop the task id"
+        );
+        assert_eq!(verdict.rule, "scope.unplanned");
+        assert_eq!(verdict.status, PolicyStatus::Blocked);
+    }
+
+    /// A binding whose task the store cannot produce declares nothing.
+    ///
+    /// The alternative — an empty scope — authorises no file at all, so every
+    /// write in the checkout would be refused as unplanned. A missing store
+    /// must not read as a plan that forbids everything.
+    #[test]
+    fn a_binding_without_a_task_declares_no_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_str().expect("utf8");
+        crate::ledger::bindings::bind(repo, repo, "TASK-DOES-NOT-EXIST").expect("bind");
+        assert!(
+            scope_for(repo).is_none(),
+            "a task the store cannot produce must not become an empty plan"
+        );
+    }
+
+    /// Agent-appended scope reaches the gate, so a write it authorises is
+    /// permitted — and the harness reports it as `widened`, not clean.
+    #[test]
+    fn agent_appended_scope_is_part_of_what_the_gate_measures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_str().expect("utf8");
+        let db = crate::tasks::store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     agent_appended_planned_files_json, status)
+                 VALUES ('TASK-8', 'Widened', '',
+                     '[{\"path\":\"src/a.rs\",\"allowed_change\":\"modify\"}]',
+                     '[{\"path\":\"src/b.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        crate::ledger::bindings::bind(repo, repo, "TASK-8").expect("bind");
+
+        let scope = scope_for(repo).expect("scope");
+        assert!(
+            scope.planned_files.contains(&"src/b.rs".to_string()),
+            "appended scope must reach the gate: {:?}",
+            scope.planned_files
+        );
+        assert!(scope.planned_files.contains(&"src/a.rs".to_string()));
     }
 }

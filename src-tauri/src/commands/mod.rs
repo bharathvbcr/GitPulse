@@ -1845,7 +1845,7 @@ pub async fn cmd_policy_check_command(
     command: String,
 ) -> crate::harness::PolicyVerdict {
     let command_for_fallback = command.clone();
-    off_thread(move || Ok::<_, String>(crate::harness::check_command(&repo_path, &command)))
+    off_thread(move || Ok::<_, String>(crate::harness::check_command(&repo_path, &command, None)))
         .await
         .unwrap_or_else(|e| {
             crate::harness::PolicyVerdict::unchecked(
@@ -1937,6 +1937,7 @@ mod tests {
             severity: String::new(),
             reason: String::new(),
             demoted: String::new(),
+            task_id: String::new(),
             grant_id: String::new(),
             granted_by: String::new(),
             widened: String::new(),
@@ -2386,4 +2387,68 @@ pub async fn cmd_ledger_tail(
 #[tauri::command(async)]
 pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::LedgerStatus, String> {
     off_thread(move || Ok(crate::ledger::status(&repo_path))).await
+}
+
+// --- task binding ------------------------------------------------------
+
+/// DevCouncil tasks currently leased in this repository.
+///
+/// Read-only. GitPulse never acquires, renews or releases a lease: those
+/// contend with an active agent's writer lease, and a UI process that takes one
+/// strands the task when the window closes.
+#[tauri::command(async)]
+pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, String> {
+    off_thread(move || Ok(crate::tasks::view(&repo_path))).await
+}
+
+/// The scope one task declares, or `null` when the store or task is absent.
+#[tauri::command(async)]
+pub async fn cmd_task_scope(
+    repo_path: String,
+    task_id: String,
+) -> Result<Option<crate::tasks::TaskScope>, String> {
+    off_thread(move || crate::tasks::scope(&repo_path, &task_id)).await
+}
+
+/// Binds a worktree to a task, so every later mutation in it is judged against
+/// that task's plan.
+///
+/// Recorded as a ledger event rather than a setting, so a later audit can say
+/// which task a commit was made under — not merely which task the worktree is
+/// bound to now.
+#[tauri::command(async)]
+pub async fn cmd_bind_worktree_task(
+    repo_path: String,
+    worktree_path: String,
+    task_id: String,
+) -> Result<i64, String> {
+    off_thread(move || {
+        crate::ledger::bindings::bind(&repo_path, &worktree_path, &task_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Clears a worktree's task binding. The bind stays on the record.
+#[tauri::command(async)]
+pub async fn cmd_unbind_worktree_task(
+    repo_path: String,
+    worktree_path: String,
+) -> Result<i64, String> {
+    off_thread(move || {
+        crate::ledger::bindings::unbind(&repo_path, &worktree_path).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// The task a worktree is bound to, or `null`.
+#[tauri::command(async)]
+pub async fn cmd_worktree_task(
+    repo_path: String,
+    worktree_path: String,
+) -> Result<Option<String>, String> {
+    off_thread(move || {
+        crate::ledger::bindings::resolve(&repo_path, &worktree_path).map_err(|e| e.to_string())
+    })
+    .await
 }

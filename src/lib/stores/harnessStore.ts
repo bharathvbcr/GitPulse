@@ -43,6 +43,13 @@ export interface PolicyVerdict {
   widened: string;
   /** Checks that could not run. Empty means every rung ran. */
   degraded: string[];
+  /**
+   * The task this decision was measured against, empty when none was declared.
+   *
+   * The harness has always sent it; this end used to drop it, so a verdict
+   * could not be attributed to the work it belonged to.
+   */
+  task_id: string;
   detail: string;
   detail_code: string;
 }

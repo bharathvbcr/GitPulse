@@ -500,7 +500,7 @@ static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 
 #[cfg(test)]
 #[allow(dead_code)]
-fn set_test_binary(path: Option<String>) {
+pub(crate) fn set_test_binary(path: Option<String>) {
     let mut current = TEST_BINARY.lock().expect("test binary registry");
     *current = path;
 }

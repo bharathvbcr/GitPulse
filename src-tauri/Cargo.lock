@@ -747,6 +747,13 @@ name = "dc-glob"
 version = "0.1.0"
 
 [[package]]
+name = "dc-store"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+]
+
+[[package]]
 name = "dc-verify"
 version = "0.1.0"
 dependencies = [
@@ -1457,6 +1464,7 @@ name = "gitpulse"
 version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
+ "dc-store",
  "dc-verify",
  "log",
  "notify",

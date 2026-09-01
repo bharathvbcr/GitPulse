@@ -78,6 +78,13 @@ pub struct PolicyVerdict {
     pub widened: String,
     /// Checks that could not run. Empty means every rung ran.
     pub degraded: Vec<String>,
+    /// The task this decision was measured against, empty when none was
+    /// declared.
+    ///
+    /// The harness has always sent it; this end used to drop it. Without it a
+    /// verdict cannot be attributed to the work it belongs to, and the
+    /// scope rules that fire against a task have nothing to point at.
+    pub task_id: String,
     /// Why the gate did not run, when it did not.
     pub detail: String,
     /// A machine-readable reason for `detail` ("not_installed", "timeout", …).
@@ -124,6 +131,7 @@ impl PolicyVerdict {
             severity: d.severity,
             reason,
             demoted: d.demoted,
+            task_id: d.task_id,
             grant_id: d.grant_id,
             granted_by: d.granted_by,
             widened: d.widened,
@@ -142,6 +150,7 @@ impl PolicyVerdict {
             severity: String::new(),
             reason: String::new(),
             demoted: String::new(),
+            task_id: String::new(),
             grant_id: String::new(),
             granted_by: String::new(),
             widened: String::new(),
@@ -217,8 +226,30 @@ impl PolicyVerdict {
 /// before this reports unchecked. Without that retry, a single slow verdict
 /// would start the respawn backoff and leave every mutation unchecked for
 /// thirty seconds.
-pub fn check_command(root: &str, command: &str) -> PolicyVerdict {
-    let params = serde_json::json!({ "command": command, "root": root });
+/// The task scope a check is measured against.
+///
+/// Mirrors `serve.HostScope` in Manvi, which owns the shape. Sending one is
+/// what makes the scope rungs — `scope.unplanned`, `scope.read_only`,
+/// `scope.operation`, `task.forbidden_change` — reachable at all: without it
+/// the ladder stops at `task.absent` and the host posture demotes that to an
+/// allow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostScope {
+    pub task_id: String,
+    /// Repo-relative paths the plan authorises.
+    ///
+    /// An empty list is a real value: the task authorises nothing, and every
+    /// write is unplanned. It is never sent to mean "we did not look".
+    pub planned_files: Vec<String>,
+    pub forbidden_changes: Vec<String>,
+    pub worktree: String,
+}
+
+pub fn check_command(root: &str, command: &str, scope: Option<&HostScope>) -> PolicyVerdict {
+    let mut params = serde_json::json!({ "command": command, "root": root });
+    if let Some(scope) = scope {
+        params["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+    }
     match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_COMMAND, params, POLICY_TIMEOUT) {
         Ok(d) => PolicyVerdict::from_decision(command, d),
         Err(e) => PolicyVerdict::unchecked(command, &e),
@@ -230,8 +261,11 @@ pub fn check_command(root: &str, command: &str) -> PolicyVerdict {
 /// `op` is create, modify, delete, or write; an unknown value is refused by the
 /// harness rather than guessed at here. Like [`check_command`], the verdict is
 /// retried once on a fresh connection before being reported unchecked.
-pub fn check_file(root: &str, path: &str, op: &str) -> PolicyVerdict {
-    let params = serde_json::json!({ "root": root, "path": path, "op": op });
+pub fn check_file(root: &str, path: &str, op: &str, scope: Option<&HostScope>) -> PolicyVerdict {
+    let mut params = serde_json::json!({ "root": root, "path": path, "op": op });
+    if let Some(scope) = scope {
+        params["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+    }
     match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_FILE, params, POLICY_TIMEOUT) {
         Ok(d) => PolicyVerdict::from_decision(path, d),
         Err(e) => PolicyVerdict::unchecked(path, &e),

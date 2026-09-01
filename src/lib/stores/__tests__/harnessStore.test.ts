@@ -18,6 +18,7 @@ function verdict(overrides: Partial<PolicyVerdict>): PolicyVerdict {
     severity: "",
     reason: "",
     demoted: "",
+    task_id: "",
     grant_id: "",
     granted_by: "",
     widened: "",

@@ -129,7 +129,7 @@ fn harness_refuses_the_commands_it_exists_to_refuse() {
     let dir = fixture();
     let root = repo_path(&dir);
 
-    let force_push = check_command(&root, "git push --force origin main");
+    let force_push = check_command(&root, "git push --force origin main", None);
     // `PolicyVerdict::unchecked` swallows the cause into a string; surface it,
     // or a failure here says only "false is not true".
     assert!(
@@ -141,23 +141,23 @@ fn harness_refuses_the_commands_it_exists_to_refuse() {
     assert_eq!(force_push.rule, "command.force_push");
     assert_eq!(force_push.severity, "hard");
 
-    let bypass = check_command(&root, "git commit --no-verify -m x");
+    let bypass = check_command(&root, "git commit --no-verify -m x", None);
     assert_eq!(bypass.status, PolicyStatus::Blocked);
     assert_eq!(bypass.rule, "command.bypass_flag");
 
     // An ordinary commit is allowed — but under the host posture it is a
     // demoted allow, and the verdict must say so rather than reading clean.
-    let commit = check_command(&root, "git commit -m 'feat: add a thing'");
+    let commit = check_command(&root, "git commit -m 'feat: add a thing'", None);
     assert!(!commit.blocks());
     assert_eq!(commit.status, PolicyStatus::Demoted);
     assert!(!commit.demoted.is_empty());
 
     // Secret paths are refused whatever the host thinks it is doing.
-    let secret = check_file(&root, ".env", "modify");
+    let secret = check_file(&root, ".env", "modify", None);
     assert_eq!(secret.status, PolicyStatus::Blocked);
     assert_eq!(secret.rule, "path.secret");
 
-    let ordinary = check_file(&root, "src/main.rs", "modify");
+    let ordinary = check_file(&root, "src/main.rs", "modify", None);
     assert!(!ordinary.blocks());
 }
 
@@ -175,8 +175,8 @@ fn the_sidecar_never_writes_into_the_users_repository() {
     // must not do that to a repository the user merely opened, so the sidecar
     // is started elsewhere with initialisation disabled. This is the check that
     // the arrangement actually holds.
-    let _ = check_command(&root, "git status");
-    let _ = check_file(&root, "src/main.rs", "modify");
+    let _ = check_command(&root, "git status", None);
+    let _ = check_file(&root, "src/main.rs", "modify", None);
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
@@ -231,7 +231,7 @@ fn overlapping_gated_actions_are_all_actually_checked() {
                 let root = root.as_str();
                 scope.spawn(move || {
                     (0..ROUNDS)
-                        .map(|_| check_command(root, "git push --force origin main"))
+                        .map(|_| check_command(root, "git push --force origin main", None))
                         .collect::<Vec<_>>()
                 })
             })
