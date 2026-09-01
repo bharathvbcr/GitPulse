@@ -1,30 +1,17 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
 
-  interface StackNode {
-    branch_name: string;
-    parent_branch_name?: string | null;
-    commit_count_ahead_of_parent: number;
-    tip_commit_id: string;
-    child_branch_names: string[];
-  }
-
-  interface StackPayload {
-    nodes: StackNode[];
-    default_branch: string;
-    breadcrumb: {
-      current_branch: string;
-      root_branch: string;
-      breadcrumb_chain: string[];
-    };
-  }
 
   // Survives the per-tab remount so revisiting the stack view renders the
   // last-known hierarchy instantly; the fetch then refreshes it in place.
-  const stackCache = createRepoPanelCache<StackPayload>();
+  const stackCache = createRepoPanelCache<StackHierarchyPayload>();
 </script>
 
 <script lang="ts">
+  import type {
+    StackHierarchyPayload,
+    StackedBranchNode,
+  } from "../stack/types";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -33,8 +20,8 @@
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
 
-  let stackNodes: StackNode[] = $state([]);
-  let stackBreadcrumb = $state<StackPayload["breadcrumb"] | null>(null);
+  let stackNodes: StackedBranchNode[] = $state([]);
+  let stackBreadcrumb = $state<StackHierarchyPayload["breadcrumb"] | null>(null);
   let stackDefaultBranch = $state<string | null>(null);
   let isLoading = $state(false);
   let loadError = $state<string | null>(null);
@@ -55,7 +42,7 @@
     isLoading = true;
     restackError = null;
     try {
-      const next = await invoke<StackPayload>("cmd_get_stack_hierarchy", {
+      const next = await invoke<StackHierarchyPayload>("cmd_get_stack_hierarchy", {
         repoPath: path,
       });
       if (!guard.isLive()) return;
@@ -74,7 +61,7 @@
     }
   }
 
-  async function restack(node: StackNode) {
+  async function restack(node: StackedBranchNode) {
     const repoPath = $repoStore.currentPath;
     if (!repoPath || !node.parent_branch_name) return;
     if (restackingKey !== null) return;

@@ -23,32 +23,20 @@ const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "G
 /**
  * Unchecked IPC payload types, each with why it cannot be compared today.
  *
- * Two distinct causes. Some have a TypeScript mirror under a different name
- * whose nested types are inline, so pairing them means renaming across
- * components — deferred work, not absent work. The rest are returned by
- * commands the frontend never calls, which check-ipc-contract already tracks
- * in its ORPHAN_ALLOWLIST; those entries carry `orphanCommand` and defer to
- * that list rather than restating its reasoning here, so wiring up a UI
- * updates one place and this test points at the consequence.
+ * Every remaining entry has the same cause: the payload is returned by a
+ * command the frontend never calls, which check-ipc-contract already tracks in
+ * its ORPHAN_ALLOWLIST with a justification each. These defer to that list
+ * rather than restating its reasoning, so wiring up a caller updates one place
+ * and this test points at the consequence — a payload that now has a consumer
+ * and needs a type contract.
  *
- * An earlier version of this list said all of them were "consumed inline",
- * which was never verified and was wrong for five of the seven.
+ * The types that had TypeScript mirrors under other names (ConflictDoc,
+ * StackPayload) or no name at all are no longer here: they were renamed to
+ * match their Rust structs and added to CONTRACTS. An earlier version of this
+ * list claimed all seven were "consumed inline", which was never verified and
+ * was wrong for five of them.
  */
 const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
-  [
-    "ConflictDocument",
-    {
-      reason:
-        "mirrored as `ConflictDoc` in ConflictEditor: a deliberate subset omitting the four CRLF/newline fields the frontend never reads, with `segments` typed inline for the serde enum",
-    },
-  ],
-  [
-    "StackHierarchyPayload",
-    {
-      reason:
-        "mirrored as `StackPayload` in CodeStackViewer, with `breadcrumb` inline instead of BranchAncestryChain and nodes typed StackNode rather than StackedBranchNode",
-    },
-  ],
   [
     "ConventionalCommit",
     { reason: "returned only by an orphaned command", orphanCommand: "cmd_parse_conventional_commit" },

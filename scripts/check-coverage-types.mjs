@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 25 contracts over
- * 42 structs. That is most, not all, of the named types crossing the IPC
+ * SCOPE: see CONTRACTS below for exactly what is checked — 27 contracts over
+ * 47 structs. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
  * component rather than a module, so there is no single file to point this at.
  * "Type contract holds" means the listed contracts hold. The remaining gap is
@@ -88,11 +88,11 @@ export const CHECKED_STRUCTS = Object.freeze([
  * type in scripts/ipc-type-coverage-contract.test.ts — so a newly added IPC
  * payload cannot join the unchecked set without someone saying so.
  *
- * The types that were declared inside components (BlameLine, FileBlob,
- * ReflogEntry, WorktreeInfo, LanguageStatsReport, GitHubContext,
- * PullRequestInfo) were moved into modules so they could be listed here; what
- * remains unchecked is the set whose TypeScript side has no named interface at
- * all, which this checker has nothing to compare against.
+ * Every type that was declared inside a component, or mirrored there under a
+ * different name, has been moved into a module and listed here. What remains
+ * unchecked is only what no caller consumes: payloads returned by the commands
+ * in check-ipc-contract's ORPHAN_ALLOWLIST, which have no TypeScript type to
+ * compare against because nothing invokes them.
  */
 /** @param {...string} parts */
 const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
@@ -110,6 +110,7 @@ export const CONTRACTS = Object.freeze([
   { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo"] },
   { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
   { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
+  { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
@@ -123,6 +124,7 @@ export const CONTRACTS = Object.freeze([
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
+  { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
 ]);
