@@ -135,8 +135,22 @@ pub fn parse_base_url(base_url: &str) -> Result<Endpoint, String> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_ascii_lowercase();
-    let is_loopback = matches!(host_key.as_str(), "localhost" | "127.0.0.1" | "::1")
-        || host_key.starts_with("127.");
+    // Parsed as an address, never matched as a string. `starts_with("127.")`
+    // accepted `127.0.0.1.attacker.com` — a DNS name resolving wherever its
+    // owner points it — which turned the loopback guarantee into a prefix
+    // check and made a silent upload of unpublished work possible, the exact
+    // outcome this transport exists to prevent.
+    //
+    // `is_loopback()` covers all of 127.0.0.0/8 and `::1` without admitting
+    // anything that merely looks like them. "localhost" is kept by name
+    // because that is what a model server is usually configured as; resolving
+    // it elsewhere requires already having write access to the host's own
+    // resolver configuration.
+    let is_loopback = host_key == "localhost"
+        || host_key
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
     if !is_loopback {
         return Err(format!(
             "'{}' is not a loopback address; GitPulse's AI features only ever address a model \
