@@ -188,3 +188,53 @@ fn workflow_list_reports_truncation_rather_than_silently_dropping_rows() {
     assert_eq!(shown.len(), 10);
     assert!(truncated, "a capped list must say it was capped");
 }
+
+#[test]
+fn a_credential_embedded_in_a_remote_never_survives_parsing() {
+    // A remote can carry a token: `https://ghp_TOKEN@github.com/owner/repo` is
+    // a normal way to configure one. Keeping it in the host put the token into
+    // `html_url()` — shown in the UI and opened in a browser — and into the
+    // `--repo host/owner/name` argument handed to gh, where it would appear in
+    // the process list.
+    for url in [
+        "https://ghp_SECRETTOKEN@github.com/owner/repo.git",
+        "https://user:ghp_SECRETTOKEN@github.com/owner/repo.git",
+        "https://x-access-token:ghs_SECRETTOKEN@github.com/owner/repo.git",
+        "http://token@github.com/owner/repo",
+        "ssh://git@github.com/owner/repo.git",
+    ] {
+        let parsed = parse_github_remote_url(url).unwrap_or_else(|| panic!("{url} should parse"));
+        assert_eq!(parsed.host, "github.com", "{url} kept userinfo in the host");
+        assert_eq!(parsed.slug(), "owner/repo", "{url}");
+        for leaky in ["SECRETTOKEN", "ghp_", "ghs_", "x-access-token", "@"] {
+            assert!(
+                !parsed.html_url().contains(leaky),
+                "{url} leaked {leaky:?} into {}",
+                parsed.html_url()
+            );
+        }
+        // The argv handed to gh is built from the host, so check it too.
+        let argv = trigger_workflow_argv(&parsed, "ci.yml", "main").expect("valid input");
+        assert!(
+            !argv.iter().any(|arg| arg.contains("SECRETTOKEN")),
+            "{url} leaked a credential into {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn stripping_userinfo_does_not_disturb_ordinary_remotes() {
+    for (url, host) in [
+        ("https://github.com/owner/repo.git", "github.com"),
+        ("git@github.com:owner/repo.git", "github.com"),
+        ("ssh://git@github.com:22/owner/repo.git", "github.com"),
+        (
+            "https://github.example.com/owner/repo.git",
+            "github.example.com",
+        ),
+    ] {
+        let parsed = parse_github_remote_url(url).unwrap_or_else(|| panic!("{url} should parse"));
+        assert_eq!(parsed.host, host, "{url}");
+        assert_eq!(parsed.slug(), "owner/repo", "{url}");
+    }
+}

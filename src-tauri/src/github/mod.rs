@@ -254,6 +254,16 @@ fn is_valid_repo_component(component: &str) -> bool {
 /// user actually configured.
 fn split_owner_repo(host_and_path: &str, strip_port: bool) -> Option<GitHubRepoRef> {
     let (raw_host, path) = host_and_path.split_once('/')?;
+    // Strip any userinfo, not just a literal "git@". A remote may embed a
+    // credential — `https://ghp_TOKEN@github.com/owner/repo` is a common way
+    // to configure one — and keeping it in the host put the token into
+    // `html_url()`, which is shown in the UI and opened in a browser, and into
+    // the `--repo host/owner/name` argument handed to gh, where it would be
+    // visible in the process list. The credential is never needed here: the
+    // host is only ever used to identify and address the repository.
+    let raw_host = raw_host
+        .rsplit_once('@')
+        .map_or(raw_host, |(_userinfo, h)| h);
     let mut host = raw_host.trim();
     if strip_port {
         if let Some((h, port)) = host.split_once(':') {
