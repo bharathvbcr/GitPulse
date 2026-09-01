@@ -47,3 +47,49 @@ describe("native menu covers every registered view", () => {
     });
   }
 });
+
+describe("every actionable native id has a frontend handler", () => {
+  // The other direction of the same contract. A menu item whose id the
+  // dispatcher does not recognise is inert: it appears, it can be clicked, and
+  // nothing happens — with no error anywhere to notice.
+  const dispatcher = readFileSync(
+    new URL("../src/lib/desktop/nativeActions.ts", import.meta.url),
+    "utf8",
+  );
+
+  const rustIds = [...actions.matchAll(/pub const [A-Z_]+: &str = "([a-z-]+)"/g)].map(
+    (m) => m[1],
+  );
+  const handled = new Set(
+    [...dispatcher.matchAll(/case "([a-z-]+)":/g)].map((m) => m[1]),
+  );
+  const viewIds = new Set(REGISTERED_VIEWS.map((view) => nativeTabMenuId(view.id)));
+
+  /**
+   * Ids that intentionally have no handler, with the reason. `recent-empty` is
+   * the disabled "No Recent Repositories" placeholder — it is created with
+   * enabled=false, so it cannot be clicked.
+   */
+  const INERT = new Set(["recent-empty"]);
+
+  it("found both sides to compare", () => {
+    expect(rustIds.length).toBeGreaterThan(20);
+    expect(handled.size).toBeGreaterThan(15);
+  });
+
+  it("leaves no clickable id without a handler", () => {
+    const orphans = rustIds.filter(
+      (id) => !handled.has(id) && !viewIds.has(id) && !INERT.has(id),
+    );
+    expect(orphans).toEqual([]);
+  });
+
+  it("keeps the inert list honest", () => {
+    // An id listed as inert that gained a handler should leave the list, and
+    // one that no longer exists should not linger.
+    for (const id of INERT) {
+      expect(rustIds, `${id} is listed inert but no longer exists`).toContain(id);
+      expect(handled.has(id), `${id} is listed inert but is now handled`).toBe(false);
+    }
+  });
+});
