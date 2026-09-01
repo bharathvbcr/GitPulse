@@ -80,12 +80,18 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      - name: IPC Command Contract Gate
+        run: npm run check:ipc
+
+      - name: IPC Wire Type Contract Gate
+        run: npm run check:types
+
       # The gate that nothing else covers: the tag, tauri.conf.json (which
       # supplies __VERSION__ in the release name and the bundle version),
       # Cargo.toml/lock, and package.json/lock must all name one version.
       # Runs before any build minutes are spent.
       - name: Release Version Gate
-        run: node scripts/check-release-version.mjs --tag "$RELEASE_TAG"
+        run: npm run check:release -- --tag "$RELEASE_TAG"
 
       # Preflight mirrors ci.yml step-for-step. Previously it ran only the
       # type check and clippy, so a tag whose commit CI never covered — or
@@ -251,6 +257,11 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout Release Tag for Verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
       - name: Inventory Draft Release Assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -268,24 +279,13 @@ jobs:
             exit 1
           fi
 
-          names=$(jq -r '.assets[].name' assets.json)
-          echo "Assets on draft release $RELEASE_TAG:"
-          echo "$names" | awk '{ print "  " $0 }'
-
-          missing=0
-          for pattern in '\.dmg$' '\.AppImage$|\.deb$' '\.msi$|\.exe$'; do
-            if ! echo "$names" | grep -qE "$pattern"; then
-              echo "::error::No asset matching /$pattern/ — a platform produced no installer."
-              missing=1
-            fi
-          done
-          [ "$missing" -eq 0 ] || exit 1
+          node scripts/check-release-assets.mjs --tag "$RELEASE_TAG" --json assets.json | tee asset-manifest.txt
 
           {
             echo "### Release $RELEASE_TAG — draft assets verified"
             echo
             echo '```'
-            echo "$names"
+            cat asset-manifest.txt
             echo '```'
             echo
             echo "All three platforms produced an installer. The release is a **draft**; publish it manually."
