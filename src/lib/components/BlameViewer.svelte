@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { BlameLine } from "../files/types";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import { FileCode, PanelLeftClose, PanelLeftOpen, Search } from "lucide-svelte";
@@ -11,14 +12,6 @@
   import EmptyState from "./EmptyState.svelte";
   import FileExplorer from "./FileExplorer.svelte";
 
-  interface BlameLine {
-    line_no: number;
-    commit_id: string;
-    author_name: string;
-    author_email: string;
-    timestamp: number;
-    content: string;
-  }
 
   // Worktree-only blame lines carry an all-zero OID from --line-porcelain;
   // they have no commit to inspect and must not render as a dead link.

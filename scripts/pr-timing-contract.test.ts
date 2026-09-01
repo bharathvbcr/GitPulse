@@ -1,18 +1,18 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { CONTRACTS } from "./check-coverage-types.mjs";
 
 /**
  * Backlog C2 requires the Rust `PullRequestInfo` struct and the TypeScript
- * interface to agree field for field. The interface is declared inline in the
- * panel rather than in github/types.ts, so check:types does not cover it;
- * this does.
+ * interface to agree field for field. That comparison used to live here
+ * because the interface was declared inline in GitHubPanel, out of reach of
+ * check:types. It has since moved to github/types.ts and is covered by the
+ * `github` contract, which compares wire types and presence as well as names —
+ * strictly more than this file did. What remains here is everything that
+ * contract cannot see: gh's field vocabulary, and the distinction between
+ * "not reviewed" and "reviewed instantly".
  */
 const rust = readFileSync(new URL("../src-tauri/src/github/mod.rs", import.meta.url), "utf8");
-const panel = readFileSync(
-  new URL("../src/lib/components/GitHubPanel.svelte", import.meta.url),
-  "utf8",
-);
-
 /** Slice from a declaration to its closing brace at the given indent. */
 function block(source: string, header: string, closeIndent = ""): string {
   const start = source.indexOf(header);
@@ -23,23 +23,13 @@ function block(source: string, header: string, closeIndent = ""): string {
   return source.slice(from, to);
 }
 
-function rustFields(source: string): string[] {
-  return [...source.matchAll(/^\s*pub ([a-z_]+):/gm)].map((match) => match[1]).sort();
-}
-
-function tsFields(source: string): string[] {
-  return [...source.matchAll(/^\s{4}([a-z_]+)\??:/gm)].map((match) => match[1]).sort();
-}
-
 describe("pull-request timing contract", () => {
-  it("keeps the Rust struct and the TypeScript interface field-for-field identical", () => {
-    const fromRust = rustFields(block(rust, "pub struct PullRequestInfo"));
-    // The interface is indented two spaces inside <script module>, so the
-    // closing brace must be matched at that indent or the slice runs on into
-    // the next interface.
-    const fromTs = tsFields(block(panel, "interface PullRequestInfo", "  "));
-    expect(fromRust.length).toBeGreaterThan(8);
-    expect(fromTs).toEqual(fromRust);
+  it("keeps PullRequestInfo inside the check:types contract table", () => {
+    // The field-for-field comparison this file used to do by hand now belongs
+    // to check:types. Asserting the type is still listed there means moving it
+    // back into a component cannot silently drop the check on the way.
+    const covered = CONTRACTS.some((contract) => contract.structs.includes("PullRequestInfo"));
+    expect(covered, "PullRequestInfo must stay covered by a check:types contract").toBe(true);
   });
 
   it("requests only gh fields that were verified against `gh pr list --json`", () => {

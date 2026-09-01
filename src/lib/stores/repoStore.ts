@@ -100,7 +100,7 @@ interface BranchStatsUpdate {
   commits_behind_base: number;
 }
 
-interface BranchStatsReport {
+export interface BranchStatsReport {
   compared_to: string;
   updates: BranchStatsUpdate[];
   computed: number;

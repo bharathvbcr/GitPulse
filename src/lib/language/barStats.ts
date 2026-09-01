@@ -1,3 +1,20 @@
+/**
+ * Exactly what the backend sends for one language — every field present.
+ *
+ * Distinct from `LanguageStat` on purpose: that one is the bar's view model,
+ * and typing the wire payload as the view model told TypeScript that counts
+ * Rust always sends might be missing, and that the wire might carry an
+ * `other_languages` list it never does.
+ */
+export interface RepoLanguageStat {
+  language: string;
+  color_hex: string;
+  category: string;
+  code_lines: number;
+  file_count: number;
+  percentage: number;
+}
+
 export interface LanguageStat {
   language: string;
   color_hex: string;
@@ -7,6 +24,19 @@ export interface LanguageStat {
   percentage: number;
   /** Names of languages folded into an aggregate entry (set on "Other"). */
   other_languages?: string[];
+}
+
+/**
+ * The backend's language scan result. Declared in LanguageBar until
+ * `check:types` could reach it; `truncated` is the field that must never be
+ * dropped, since it is what stops a partial scan reading as a whole one.
+ */
+export interface LanguageStatsReport {
+  stats: RepoLanguageStat[];
+  /** True when the backend scan stopped early (deadline or cap). */
+  truncated: boolean;
+  scanned_files: number;
+  candidate_files: number;
 }
 
 const MAX_SHOWN = 6;
@@ -30,7 +60,7 @@ function finiteOrZero(value: number | undefined): number {
  * off the bar by lockfiles / JSON / Markdown. Remainder folds into Other.
  */
 export function pickLanguageBarStats(
-  stats: LanguageStat[],
+  stats: RepoLanguageStat[],
   maxShown = MAX_SHOWN,
 ): LanguageStat[] {
   if (stats.length === 0) return [];

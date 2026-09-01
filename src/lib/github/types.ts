@@ -1,3 +1,5 @@
+import type { IssueInfo } from "../ops/model";
+
 /**
  * Wire types for GitHub payloads returned by the Tauri commands. These are
  * the serde field names as serialized by src-tauri; do not rename fields.
@@ -88,4 +90,39 @@ export interface GitHubContextBase {
    * PR-listing parse failure). Empty while everything fetched cleanly.
    */
   warnings?: string[];
+}
+
+/** Mirrors `PullRequestInfo` in src-tauri/src/github/mod.rs field for field. */
+export interface PullRequestInfo {
+  number: number;
+  title: string;
+  state: string;
+  head_ref: string;
+  base_ref: string;
+  url: string;
+  is_draft: boolean;
+  ci_status: string;
+  created_at: string;
+  updated_at: string;
+  review_decision: string;
+  /** Empty when nobody has reviewed yet — not a zero-hour review. */
+  first_review_at: string;
+}
+
+/**
+ * The full context payload. Declared inside GitHubPanel until `check:types`
+ * grew `extends` resolution and could read it here, next to the base whose
+ * fields it inherits.
+ */
+export interface GitHubContext extends GitHubContextBase {
+  cli_present: boolean;
+  host: string;
+  html_url: string;
+  pull_requests: PullRequestInfo[];
+  /** True when more open PRs exist than the display cap kept. */
+  prs_truncated?: boolean;
+  issues: IssueInfo[];
+  /** True when more open issues exist than the display cap kept. */
+  issues_truncated: boolean;
+  issues_error?: string | null;
 }

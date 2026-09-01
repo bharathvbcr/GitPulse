@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { WorktreeInfo } from "../branches/types";
   import { invoke } from "@tauri-apps/api/core";
   import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
@@ -15,18 +16,6 @@
     AlertTriangle,
   } from "lucide-svelte";
 
-  interface WorktreeInfo {
-    path: string;
-    name: string;
-    head: string;
-    branch: string | null;
-    is_bare: boolean;
-    is_detached: boolean;
-    is_main: boolean;
-    is_locked: boolean;
-    is_prunable: boolean;
-    dirty_files: number | null;
-  }
 
   let worktrees = $state<WorktreeInfo[]>([]);
   let isLoading = $state(false);

@@ -130,7 +130,7 @@ flowchart TD
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (95 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 19 contracts (231 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 24 contracts (306 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -153,7 +153,8 @@ several were added after the drift had already happened.
 | `event-contract` | An event name that drifts. An emit nobody hears looks like a feature that never fires; a listener for an event nobody sends waits forever. Neither produces an error. |
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
-| `pr-timing-contract` | The pull-request struct and its inline TypeScript interface drifting; `check:types` does not reach an interface declared inside a component. |
+| `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
+| `ipc-type-coverage-contract` | The unchecked half of the IPC surface going unnoticed. `check:types` reports OK for the payloads it lists; this pins the ones it does not, with a reason each, so a new command cannot join the unchecked set silently. |
 | `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `npm run check` output. |
 | `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |

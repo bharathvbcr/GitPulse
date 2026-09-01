@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 19 contracts over
- * 31 structs. That is most, not all, of the named types crossing the IPC
+ * SCOPE: see CONTRACTS below for exactly what is checked — 24 contracts over
+ * 40 structs. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
  * component rather than a module, so there is no single file to point this at.
  * "Type contract holds" means the listed contracts hold. The remaining gap is
@@ -84,11 +84,15 @@ export const CHECKED_STRUCTS = Object.freeze([
  * were exactly what the uncovered types happened to use.
  *
  * A struct with no entry here is unchecked. That is a real gap, not an
- * implicit assertion of safety: the types still missing are the ones whose TS
- * interface is declared inside a component rather than a module
- * (BlameLine, FileBlob, ReflogEntry, WorktreeInfo, LanguageStatsReport,
- * BranchStatsReport), and PullRequestInfo, pinned separately in
- * scripts/pr-timing-contract.test.ts for the same reason.
+ * implicit assertion of safety, and it is enumerated with a reason for each
+ * type in scripts/ipc-type-coverage-contract.test.ts — so a newly added IPC
+ * payload cannot join the unchecked set without someone saying so.
+ *
+ * The types that were declared inside components (BlameLine, FileBlob,
+ * ReflogEntry, WorktreeInfo, LanguageStatsReport, GitHubContext,
+ * PullRequestInfo) were moved into modules so they could be listed here; what
+ * remains unchecked is the set whose TypeScript side has no named interface at
+ * all, which this checker has nothing to compare against.
  */
 /** @param {...string} parts */
 const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
@@ -106,10 +110,15 @@ export const CONTRACTS = Object.freeze([
   { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo"] },
   { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
   { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
-  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus"] },
+  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport"] },
+  { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
+  { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry"] },
+  { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo"] },
+  { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
   { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
+  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo"] },
   { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
@@ -360,7 +369,12 @@ function parseRustFields(body, renameAll) {
       if (!options) continue;
       if (options.has("skip")) skipped = true;
       if (options.has("skip_serializing_if")) skipIf = options.get("skip_serializing_if");
-      if (options.has("default") || options.has("skip_serializing_if")) optional = true;
+      // `skip_serializing_if` alone decides wire presence. `#[serde(default)]`
+      // is a *deserialization* attribute — it supplies a value when a field is
+      // missing from input, and never stops serde from writing the field out.
+      // Treating it as wire-optional demanded that TypeScript mark fields
+      // optional that Rust always sends, which is drift the checker invented.
+      if (options.has("skip_serializing_if")) optional = true;
       if (options.has("rename") && typeof options.get("rename") === "string") {
         wireName = /** @type {string} */ (options.get("rename"));
       }
@@ -446,6 +460,39 @@ export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
 }
 
 /**
+ * Parse one interface body into wire-name -> type/presence.
+ *
+ * @param {string} body comment-stripped interface body
+ * @param {string} name interface name, for diagnostics
+ * @param {Array<{ interface: string, segment: string }>} unparseable sink
+ */
+function parseInterfaceBody(body, name, unparseable) {
+  /** @type {Map<string, { type: string, optional: boolean }>} */
+  const props = new Map();
+  let depth = 0;
+  let current = "";
+  const flush = () => {
+    const segment = current.trim();
+    current = "";
+    if (segment === "") return;
+    const prop = /^(?:readonly\s+)?(\w+)\s*(\?)?:\s*([\s\S]+)$/.exec(segment);
+    if (!prop) {
+      unparseable.push({ interface: name, segment: segment.replace(/\s+/g, " ").slice(0, 80) });
+      return;
+    }
+    props.set(prop[1], { type: normalizeTsType(prop[3]), optional: prop[2] === "?" });
+  };
+  for (const ch of body) {
+    if (ch === "{" || ch === "(" || ch === "[") depth += 1;
+    if (ch === "}" || ch === ")" || ch === "]") depth -= 1;
+    if ((ch === ";" || ch === "\n") && depth === 0) flush();
+    else current += ch;
+  }
+  flush();
+  return props;
+}
+
+/**
  * Parse `export interface Name { ... }` bodies from the TS source.
  *
  * @param {string} tsSource raw types.ts contents
@@ -475,30 +522,44 @@ export function parseTsInterfaces(tsSource, checked = CHECKED_STRUCTS) {
       violations.push(`ts: interface ${name} has no brace body`);
       continue;
     }
+    // `interface A extends B` splits one wire shape across two declarations.
+    // Inherited props are resolved from this same file; a base declared
+    // elsewhere is reported rather than skipped, because skipping it would
+    // surface later as a pile of "Rust sends a field TS lacks" violations
+    // whose real cause is one unreadable base.
+    const heritage = stripped.slice(decl.index, openBrace);
+    const bases = /\bextends\b([^{]*)/.exec(heritage);
+    /** @type {Map<string, { type: string, optional: boolean }>} */
+    const inherited = new Map();
+    if (bases) {
+      for (const raw of bases[1].split(",")) {
+        const base = raw.trim();
+        if (base === "") continue;
+        const baseDecl = new RegExp(`(?:export\\s+)?interface ${base}\\b`).exec(stripped);
+        const baseBrace = baseDecl ? stripped.indexOf("{", baseDecl.index) : -1;
+        if (!baseDecl || baseBrace === -1) {
+          violations.push(
+            `ts: interface ${name} extends ${base}, which is not declared in this file — the wire shape cannot be assembled`,
+          );
+          continue;
+        }
+        for (const [key, value] of parseInterfaceBody(
+          balancedBody(stripped, baseBrace),
+          base,
+          unparseable,
+        )) {
+          inherited.set(key, value);
+        }
+      }
+    }
     try {
       const body = balancedBody(stripped, openBrace);
-      /** @type {Map<string, { type: string, optional: boolean }>} */
-      const props = new Map();
-      let depth = 0;
-      let current = "";
-      const flush = () => {
-        const segment = current.trim();
-        current = "";
-        if (segment === "") return;
-        const prop = /^(?:readonly\s+)?(\w+)\s*(\?)?:\s*([\s\S]+)$/.exec(segment);
-        if (!prop) {
-          unparseable.push({ interface: name, segment: segment.replace(/\s+/g, " ").slice(0, 80) });
-          return;
-        }
-        props.set(prop[1], { type: normalizeTsType(prop[3]), optional: prop[2] === "?" });
-      };
-      for (const ch of body) {
-        if (ch === "{" || ch === "(" || ch === "[") depth += 1;
-        if (ch === "}" || ch === ")" || ch === "]") depth -= 1;
-        if ((ch === ";" || ch === "\n") && depth === 0) flush();
-        else current += ch;
-      }
-      flush();
+      // Own props last: an interface narrowing an inherited one wins, exactly
+      // as TypeScript resolves it.
+      const props = new Map([
+        ...inherited,
+        ...parseInterfaceBody(body, name, unparseable),
+      ]);
       interfaces.set(name, { props, line: lineOf(tsSource, decl.index) });
     } catch (err) {
       violations.push(`ts: could not parse interface ${name}: ${/** @type {Error} */ (err).message}`);
@@ -576,9 +637,14 @@ export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS }) {
     }
   }
   for (const drift of typeDrifts) {
-    violations.push(
-      `drift: ${drift.struct}.${drift.field} type mismatch (Rust ${drift.rustType}; TS ${drift.tsType})`,
-    );
+    // Only when the types really differ: a presence-only mismatch used to
+    // print "type mismatch (Rust ReleaseInfo[]; TS ReleaseInfo[])", naming two
+    // identical types and hiding the actual problem in the next line.
+    if (drift.rustType !== drift.tsType) {
+      violations.push(
+        `drift: ${drift.struct}.${drift.field} type mismatch (Rust ${drift.rustType}; TS ${drift.tsType})`,
+      );
+    }
     if (drift.rustOptional && !drift.tsOptional) {
       violations.push(
         `drift: ${drift.struct}.${drift.field} may be absent from Rust but is required in TS`,
