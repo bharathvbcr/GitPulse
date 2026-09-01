@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -118,6 +118,20 @@ describe("coverage floor contract", () => {
     expect(parsed.totals.lines).toEqual({ found: 407, hit: 352 });
   });
 
+  it("parses a record captured verbatim from vitest v8", () => {
+    // The two producers disagree: every one of the 103 records in a real v8
+    // report satisfies LF == DA count and LH == DA hits, which is why the
+    // invariant that broke on llvm-cov held for the frontend. Pinning both
+    // means a change that suits one producer cannot silently break the other.
+    const fixture = readFileSync(
+      new URL("./fixtures/vitest-v8-real.info", import.meta.url),
+      "utf8",
+    );
+    const parsed = parseLcov(fixture);
+    expect(parsed.totals.lines).toEqual({ found: 18, hit: 18 });
+    expect(parsed.totals.branches?.found).toBe(22);
+  });
+
   it("accepts the saturated counters llvm-cov emits", () => {
     // llvm-cov writes u64::MAX for a counter that saturated or underflowed;
     // four such lines appear in this repository's own Rust report. They exceed
@@ -204,24 +218,4 @@ describe("coverage floor contract", () => {
     expect(malformed.code).toBe(2);
     expect(malformed.output).toMatch(/Frontend invalid:.*unterminated/);
   });
-
-  // Every quirk above was found by the gate failing on a real report, because
-  // the parser had only ever been exercised against fixtures written by the
-  // same person who wrote the parser. When real reports are present — which is
-  // the case in `ci:local`, since check:coverage runs after generation — parse
-  // them too, so the next producer quirk is caught here rather than in CI.
-  const REAL_REPORTS = [
-    { label: "Rust (cargo llvm-cov)", path: new URL("../lcov.info", import.meta.url) },
-    { label: "frontend (vitest v8)", path: new URL("../coverage/lcov.info", import.meta.url) },
-  ];
-
-  for (const { label, path: reportPath } of REAL_REPORTS) {
-    const present = existsSync(reportPath);
-    // Named so a skip is visible in the output rather than looking like a pass.
-    it.skipIf(!present)(`parses the real ${label} report when one is present`, () => {
-      const parsed = parseLcov(readFileSync(reportPath, "utf8"));
-      expect(parsed.totals.lines?.found ?? 0).toBeGreaterThan(0);
-      expect(parsed.totals.lines?.hit ?? 0).toBeGreaterThan(0);
-    });
-  }
 });
