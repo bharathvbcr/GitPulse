@@ -1,0 +1,30 @@
+{
+  "name": "GitPulse",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  // Tauri links against the system WebKit/GTK stack, and the repository's own
+  // gates need actionlint and cargo-llvm-cov. Installing them here keeps
+  // `npm run ci:local` runnable in the container rather than only on a host
+  // that happens to have them.
+  "onCreateCommand": "bash .devcontainer/setup.sh",
+  "postCreateCommand": "npm ci",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "svelte.svelte-vscode",
+        "tauri-apps.tauri-vscode",
+        "bradlc.vscode-tailwindcss"
+      ]
+    }
+  },
+  "remoteEnv": {
+    // The dev launcher picks a free port from 5173 upward; pin it so the
+    // forwarded port and the running server cannot disagree.
+    "GITPULSE_DEV_PORT": "5173"
+  },
+  "forwardPorts": [5173]
+}
