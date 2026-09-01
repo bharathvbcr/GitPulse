@@ -40,6 +40,11 @@ dc-verify = { path = "../../../../../Manvi/crates/dc-verify" }
 # takes a lease can strand a task when the window closes.
 dc-store = { path = "../../../../../Manvi/crates/dc-store" }
 
+# Phase 5 devmap integration. In-process code intelligence queries
+# over DevCouncil's .devcouncil/codeintel/devmap.sqlite database.
+devmap-query = { path = "../../../../../DevCouncil/rust-port/crates/devmap-query" }
+devmap-store = { path = "../../../../../DevCouncil/rust-port/crates/devmap-store" }
+
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 

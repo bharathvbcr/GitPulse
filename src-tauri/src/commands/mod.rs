@@ -2469,3 +2469,78 @@ pub async fn cmd_worktree_task(
 pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, String> {
     off_thread(move || Ok(crate::ingest::catch_up(&repo_path))).await
 }
+
+// --- code intelligence (devmap in-process) ----------------------------
+
+/// Status and metadata of the repository's code intelligence graph.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_status(
+    repo_path: String,
+) -> Result<crate::codeintel::CodeintelStatus, String> {
+    off_thread(move || Ok(crate::codeintel::status(&repo_path))).await
+}
+
+/// Symbol search across indexed code files.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_search(
+    repo_path: String,
+    query: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelSymbolHit>, String> {
+    off_thread(move || Ok(crate::codeintel::search(&repo_path, &query, token_budget))).await
+}
+
+/// Blast radius and impact graph for a symbol or file.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_impact(
+    repo_path: String,
+    target: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || Ok(crate::codeintel::impact(&repo_path, &target, token_budget))).await
+}
+
+/// Dependencies for an indexed file.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_dependencies(
+    repo_path: String,
+    file_path: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::dependencies(
+            &repo_path,
+            &file_path,
+            token_budget,
+        ))
+    })
+    .await
+}
+
+/// Dead code analysis across the repository.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_dead_symbols(
+    repo_path: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, String> {
+    off_thread(move || Ok(crate::codeintel::dead_symbols(&repo_path, token_budget))).await
+}
+
+/// Path trace between two symbols.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_trace_between(
+    repo_path: String,
+    from: String,
+    to: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::trace_between(
+            &repo_path,
+            &from,
+            &to,
+            token_budget,
+        ))
+    })
+    .await
+}

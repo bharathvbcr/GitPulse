@@ -28,7 +28,8 @@
     buildFilePatchForHunk,
     buildFilePatchFromLines,
   } from "../diff/patchBuilder";
-
+  import { getImpact } from "../codeintel/client";
+  import type { CodeintelEdge } from "../codeintel/types";
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
@@ -44,6 +45,31 @@
   let selectedLines = $state<Set<number>>(new Set());
   let dragAnchor = $state<number | null>(null);
   let isDragging = $state(false);
+
+  let impactEdges = $state<CodeintelEdge[]>([]);
+  let impactAvailable = $state(false);
+
+  $effect(() => {
+    const repoPath = $repoStore.currentPath;
+    const filePath = $repoStore.selectedFilePath;
+    if (!repoPath || !filePath) {
+      impactEdges = [];
+      impactAvailable = false;
+      return;
+    }
+    void getImpact(repoPath, filePath, 20).then((res) => {
+      if (res.available) {
+        impactEdges = res.items;
+        impactAvailable = true;
+      } else {
+        impactEdges = [];
+        impactAvailable = false;
+      }
+    }).catch(() => {
+      impactEdges = [];
+      impactAvailable = false;
+    });
+  });
 
   let allLines = $derived(parseCache.parse($repoStore.selectedDiff));
   let truncatedSource = $derived(allLines.length > MAX_RENDER_LINES);
@@ -354,6 +380,14 @@
       <span class="font-medium text-textPrimary truncate">{ $repoStore.selectedFilePath || $repoStore.selectedCommitId || "Diff View" }</span>
       {#if contentLineCount > 0}
         <span class="text-[10px] text-textMuted shrink-0">{contentLineCount.toLocaleString()} lines</span>
+      {/if}
+      {#if impactAvailable && impactEdges.length > 0}
+        <span
+          class="text-[10px] px-2 py-0.5 rounded-full bg-accent/15 text-accent border border-accent/30 shrink-0 font-sans"
+          title={`${impactEdges.length} downstream callers/dependencies affected by this file in devmap`}
+        >
+          {impactEdges.length} {impactEdges.length === 1 ? "affected caller" : "affected callers"}
+        </span>
       {/if}
     </div>
 

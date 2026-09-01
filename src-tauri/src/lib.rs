@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod analyzer;
 pub mod ci_local;
+pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
 pub mod desktop;
@@ -176,6 +177,12 @@ pub fn run() {
             cmd_unbind_worktree_task,
             cmd_worktree_task,
             cmd_catch_up,
+            cmd_codeintel_status,
+            cmd_codeintel_search,
+            cmd_codeintel_impact,
+            cmd_codeintel_dependencies,
+            cmd_codeintel_dead_symbols,
+            cmd_codeintel_trace_between,
             cmd_check_app_update,
         ])
         .build(context())

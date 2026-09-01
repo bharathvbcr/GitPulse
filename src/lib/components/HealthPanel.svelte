@@ -57,10 +57,14 @@
     type TerminalRunResult,
   } from "../terminal/runResult";
   import { reportPanelError } from "../diagnostics/report";
+  import { getDeadSymbols } from "../codeintel/client";
+  import type { CodeintelDeadSymbol } from "../codeintel/types";
   import Skeleton from "./Skeleton.svelte";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
+  let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
+  let deadSymbolsAvailable = $state(false);
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -169,12 +173,13 @@
     loading = true;
     errorMsg = null;
     actionError = null;
-    // Both sources run together so the Health page fills in as one picture,
-    // and each settles independently: a failed Dependabot fetch must not
-    // erase a finished local scan, or the reverse.
-    const [deps, alerts] = await Promise.allSettled([
+    // All sources run together so the Health page fills in as one picture,
+    // and each settles independently: a failed Dependabot fetch or codeintel
+    // query must not erase a finished local scan, or the reverse.
+    const [deps, alerts, dead] = await Promise.allSettled([
       invoke<DepsHealthReport>("cmd_scan_deps_health", { repoPath }),
       invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath }),
+      getDeadSymbols(repoPath),
     ]);
     if (!guard.isLive()) return;
     if (deps.status === "fulfilled") {
@@ -188,6 +193,13 @@
       // A failed scan must not mark the repo as scanned, or the effect above
       // would refuse to rescan it after something changes.
       scanned.path = "";
+    }
+    if (dead.status === "fulfilled" && dead.value.available) {
+      deadSymbols = dead.value.items;
+      deadSymbolsAvailable = true;
+    } else {
+      deadSymbols = [];
+      deadSymbolsAvailable = false;
     }
     // The Dependabot command reports its own unavailable/error states; only
     // an IPC-level failure is folded into that same shape here, so "could
@@ -923,6 +935,46 @@
           </div>
         {/if}
       </section>
+
+      {#if deadSymbolsAvailable && deadSymbols.length > 0}
+        <section class="space-y-2 pb-4">
+          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+            Dead code & unreferenced symbols ({deadSymbols.length})
+          </h3>
+          <div class="border border-border/70 rounded-2xl overflow-hidden max-w-5xl shadow-card">
+            <table class="w-full text-left">
+              <thead class="bg-surface text-[10px] uppercase text-textMuted">
+                <tr>
+                  <th class="px-3 py-2 font-medium">Symbol</th>
+                  <th class="px-3 py-2 font-medium">File</th>
+                  <th class="px-3 py-2 font-medium">Confidence</th>
+                  <th class="px-3 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each deadSymbols as sym}
+                  <tr class="border-t border-border/40">
+                    <td class="px-3 py-1.5 font-mono text-textPrimary font-medium">{sym.symbol_name}</td>
+                    <td class="px-3 py-1.5 font-mono text-textMuted">{sym.file_path}</td>
+                    <td class="px-3 py-1.5 font-mono text-textMuted">{(sym.confidence * 100).toFixed(0)}%</td>
+                    <td class="px-3 py-1.5 text-textMuted">
+                      {#if sym.is_exempt}
+                        <span class="px-1.5 py-0.5 rounded text-[10px] bg-surfaceHover text-textMuted">
+                          Exempt{sym.exemption_reason ? `: ${sym.exemption_reason}` : ""}
+                        </span>
+                      {:else}
+                        <span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-500/15 text-rose-300 font-medium">
+                          Unreferenced
+                        </span>
+                      {/if}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      {/if}
     {:else}
       <div class="text-textMuted">Open a repository to scan dependency health.</div>
     {/if}

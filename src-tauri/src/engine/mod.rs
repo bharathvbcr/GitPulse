@@ -1,6 +1,7 @@
 pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
+pub mod provenance;
 pub mod remotes;
 pub mod repo_op;
 pub mod stash;
@@ -16,6 +17,7 @@ pub use git_reader::{
     FileStatus, GitReader, ReflogEntry, RepoLanguageStat, TagInfo,
 };
 pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep, ResetMode};
+pub use provenance::{ProvenanceFreshness, SessionEpisodeNote, VerificationNote};
 pub use remotes::{RemoteChange, RemoteInfo};
 pub use repo_op::{OperationAction, OperationKind, RepoOperation};
 pub use stash::{StashAction, StashEntry};

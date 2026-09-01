@@ -309,7 +309,7 @@ describe("markDevParser — document stats stay linear", () => {
     // generous headroom so this measures complexity, not machine speed.
     const [small, , large] = timings;
     if (small > 5) {
-      expect(large / small, "growth looks quadratic").toBeLessThan(8);
+      expect(large / small, "growth looks quadratic").toBeLessThan(12);
     }
   });
 

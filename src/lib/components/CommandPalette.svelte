@@ -41,9 +41,12 @@
     FileCode,
     Keyboard,
   } from "lucide-svelte";
+  import { searchSymbols } from "../codeintel/client";
+  import type { CodeintelSymbolHit } from "../codeintel/types";
 
   let isOpen = $state(false);
   let query = $state("");
+  let symbolHits = $state<CodeintelSymbolHit[]>([]);
   let highlighted = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
   let listEl: HTMLDivElement | undefined = $state();
@@ -224,25 +227,59 @@
     action: () => void;
   }
 
-  let mode = $derived.by<"commands" | "commits" | "branches" | "help">(() => {
+  let mode = $derived.by<"commands" | "commits" | "branches" | "symbols" | "help">(() => {
     const trimmed = query.trim();
     if (trimmed.startsWith("#")) return "commits";
     if (trimmed.startsWith("@")) return "branches";
+    if (trimmed.startsWith(":")) return "symbols";
     if (trimmed.startsWith("?")) return "help";
     return "commands";
   });
 
   let effectiveSearchText = $derived.by(() => {
     const trimmed = query.trim();
-    if (trimmed.startsWith(">") || trimmed.startsWith("#") || trimmed.startsWith("@") || trimmed.startsWith("?")) {
+    if (trimmed.startsWith(">") || trimmed.startsWith("#") || trimmed.startsWith("@") || trimmed.startsWith(":") || trimmed.startsWith("?")) {
       return trimmed.slice(1).trim();
     }
     return trimmed;
   });
 
+  $effect(() => {
+    const currentMode = mode;
+    const text = effectiveSearchText;
+    const repoPath = $repoStore.currentPath;
+    if (currentMode !== "symbols" || !repoPath || !text) {
+      symbolHits = [];
+      return;
+    }
+    void searchSymbols(repoPath, text, 30).then((res) => {
+      if (res.available) {
+        symbolHits = res.items;
+      } else {
+        symbolHits = [];
+      }
+    }).catch(() => {
+      symbolHits = [];
+    });
+  });
+
   let allAvailableItems = $derived.by<PaletteItem[]>(() => {
     const currentMode = mode;
     const search = effectiveSearchText.toLowerCase();
+
+    if (currentMode === "symbols") {
+      // Symbol & Code Search Mode (devmap)
+      return symbolHits.map((hit) => ({
+        id: `symbol:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`,
+        label: `${hit.symbol_name} (${hit.kind}) — ${hit.file_path}:${hit.span_start_line}`,
+        icon: FileCode,
+        category: "Code Intelligence",
+        action: () => {
+          repoStore.selectFilePath(hit.file_path);
+          repoStore.setActiveTab("files");
+        },
+      }));
+    }
 
     if (currentMode === "commits") {
       // Commit Search Mode
@@ -296,6 +333,12 @@
           label: "Type @ to jump between branches",
           icon: GitBranch,
           action: () => { query = "@"; },
+        },
+        {
+          id: "help_symbols",
+          label: "Type : to search symbols and code graph",
+          icon: FileCode,
+          action: () => { query = ":"; },
         },
       ];
     }

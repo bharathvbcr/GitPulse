@@ -16,10 +16,11 @@ describe("CommandPalette", () => {
     expect(source).toContain("GitCommit");
   });
 
-  it("supports mode prefixes for commits and branches", () => {
+  it("supports mode prefixes for commits, branches, and code symbols", () => {
     expect(source).toContain('mode = $derived.by');
     expect(source).toContain('trimmed.startsWith("#")');
     expect(source).toContain('trimmed.startsWith("@")');
+    expect(source).toContain('trimmed.startsWith(":")');
     expect(source).toContain('trimmed.startsWith("?")');
   });
 
