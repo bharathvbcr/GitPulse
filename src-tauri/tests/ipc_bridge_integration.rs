@@ -20,6 +20,17 @@ use tauri::{ipc::CallbackFn, WebviewWindowBuilder};
 /// them so dispatch and (de)serialization are the real implementations.
 fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
     let app = mock_builder()
+        // A hand-picked subset rather than lib.rs's full registry. Sharing the
+        // real list was tried and does not work: exposing it as
+        // `fn invoke_handler<R: Runtime>()` fails to compile because commands
+        // like cmd_watch_repo and cmd_terminal_spawn take a concrete
+        // `AppHandle` (AppHandle<Wry>), so the list cannot be generic over the
+        // runtime, and MockRuntime needs it to be. Making those commands
+        // generic would change production signatures for a testing
+        // convenience. The cost of the subset is that a newly added command is
+        // not automatically covered here — add it below when it is worth
+        // driving over the bridge.
+        //
         // Full paths: generate_handler! resolves each command's hidden macro
         // from the crate that defined it, which an external test crate cannot
         // see by bare name.
