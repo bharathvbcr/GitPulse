@@ -149,24 +149,33 @@ upstream-gone, threshold boundaries, custom thresholds, and a tip dated in the f
 Only branches needing attention draw an indicator: a dot on every row would make the
 healthy majority noisy and the exceptions invisible.
 
-### C2 · Pull-request review velocity in the GitHub panel 🟡
-**Labels:** `help wanted`, `enhancement`, `area: github`
+### C2 · Pull-request review velocity in the GitHub panel ✅ *(Completed)*
+**Labels:** `enhancement`, `area: github`
 
-`GitHubContext.pull_requests` carries `PullRequestInfo` with state and CI status but
-no timing. Time-to-first-review and time-open are the numbers that tell a team where
-its pipeline is stalling.
+*Implemented in `src-tauri/src/github/mod.rs`,
+[`src/lib/github/prVelocity.ts`](../src/lib/github/prVelocity.ts), and
+[`GitHubPanel.svelte`](../src/lib/components/GitHubPanel.svelte).*
 
-Extend the `gh pr list --json` field set with the timestamps, and render an age
-column plus an aggregate in `GitHubPanel.svelte`.
+On the entry's warning: every added field name — `createdAt`, `updatedAt`,
+`reviewDecision`, `reviews` — was checked against `gh pr list --json` with no
+arguments (gh 2.95.0) before being wired in, since an unknown field fails the whole
+listing rather than one column.
 
-- **Touch:** `src-tauri/src/github/mod.rs`, `src/lib/github/types.ts`,
-  `src/lib/components/GitHubPanel.svelte`
-- **Done when:** timings appear for open PRs, the Rust struct and TS interface agree
-  field for field, and `npm run check:ipc` still reports zero drift.
-- **⚠️ Read first:** `release_list_leading_args` in `github/mod.rs` documents a real
-  trap — requesting a field `gh` does not support fails the *entire* listing, which
-  once degraded a whole panel into an error. Verify every field name against
-  `gh pr list --json` with no arguments (it prints the valid set) before wiring it in.
+`PullRequestInfo` gains `created_at`, `updated_at`, `review_decision`, and
+`first_review_at`, the last derived from the earliest *submitted* review — PENDING
+reviews are excluded, because counting one would report a pull request as reviewed
+when nobody had looked at it. Empty stays distinguishable from "reviewed at time
+zero" on both sides of the boundary, and `prVelocity.ts` returns `null` rather than
+`0` for an unreviewed pull request throughout.
+
+The aggregate uses the median, so one pull request left open for a year does not
+become the headline for the queue, and excludes drafts, which are not waiting on
+anyone. The longest-open one is still shown separately so the outlier stays visible.
+
+`scripts/pr-timing-contract.test.ts` pins the Rust struct and the TypeScript
+interface field-for-field — the interface is declared inline in the panel, so
+`check:types` does not reach it — and pins that the requested gh fields stay in gh's
+camelCase vocabulary.
 
 ### C3 · Commit cadence sparkline ✅ *(Completed)*
 **Labels:** `enhancement`, `area: frontend`

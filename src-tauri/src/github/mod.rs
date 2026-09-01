@@ -35,6 +35,16 @@ pub struct PullRequestInfo {
     pub url: String,
     pub is_draft: bool,
     pub ci_status: String,
+    /// RFC 3339, as gh emits it. Empty when gh did not supply it.
+    pub created_at: String,
+    pub updated_at: String,
+    /// GitHub's own verdict: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or
+    /// empty when the API reported none.
+    pub review_decision: String,
+    /// Earliest submitted review, so the frontend can show time-to-first
+    /// review. Empty when nobody has reviewed yet — which is the interesting
+    /// case, and must stay distinguishable from "reviewed at time zero".
+    pub first_review_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,6 +377,47 @@ struct GhPullRequest {
     is_draft: bool,
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<serde_json::Value>,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: Option<String>,
+    #[serde(rename = "reviewDecision", default)]
+    review_decision: Option<String>,
+    #[serde(default)]
+    reviews: Option<Vec<GhReview>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReview {
+    #[serde(rename = "submittedAt", default)]
+    submitted_at: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Earliest submitted review timestamp, or empty when there is none.
+///
+/// RFC 3339 timestamps from one source sort correctly as strings, so this
+/// avoids pulling in date parsing for a comparison. PENDING reviews are
+/// excluded: they have not been submitted, and counting one as a review would
+/// report a PR as reviewed when nobody has looked at it.
+fn earliest_review(reviews: &Option<Vec<GhReview>>) -> String {
+    let Some(reviews) = reviews else {
+        return String::new();
+    };
+    reviews
+        .iter()
+        .filter(|review| {
+            !review
+                .state
+                .as_deref()
+                .is_some_and(|state| state.eq_ignore_ascii_case("PENDING"))
+        })
+        .filter_map(|review| review.submitted_at.as_deref())
+        .filter(|submitted| !submitted.is_empty())
+        .min()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// GitHub's check/conclusion vocabulary that means the pipeline is broken.
@@ -549,7 +600,10 @@ fn list_pull_requests(remote: &GitHubRepoRef) -> Result<(Vec<PullRequestInfo>, b
             "--limit",
             &fetch_limit,
             "--json",
-            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup",
+            // Every name here is verified against `gh pr list --json` with no
+            // arguments, which prints the valid set. A field gh does not know
+            // fails the WHOLE listing, not just that column.
+            "number,title,state,headRefName,baseRefName,url,isDraft,statusCheckRollup,createdAt,updatedAt,reviewDecision,reviews",
         ],
         Duration::from_secs(45),
         None,
@@ -617,6 +671,10 @@ fn parse_pr_list(
             url: pr.url,
             is_draft: pr.is_draft,
             ci_status: summarize_checks(&pr.status_check_rollup),
+            first_review_at: earliest_review(&pr.reviews),
+            created_at: pr.created_at.unwrap_or_default(),
+            updated_at: pr.updated_at.unwrap_or_default(),
+            review_decision: pr.review_decision.unwrap_or_default(),
         })
         .collect();
     Ok((prs, truncated))
@@ -1287,6 +1345,50 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn earliest_review_picks_the_first_submitted_one() {
+        let reviews = Some(vec![
+            GhReview {
+                submitted_at: Some("2026-03-02T10:00:00Z".into()),
+                state: Some("APPROVED".into()),
+            },
+            GhReview {
+                submitted_at: Some("2026-03-01T09:00:00Z".into()),
+                state: Some("COMMENTED".into()),
+            },
+        ]);
+        assert_eq!(earliest_review(&reviews), "2026-03-01T09:00:00Z");
+    }
+
+    #[test]
+    fn earliest_review_ignores_pending_reviews() {
+        // A PENDING review has not been submitted; counting it would report a
+        // pull request as reviewed when nobody has looked at it.
+        let reviews = Some(vec![
+            GhReview {
+                submitted_at: Some("2026-01-01T00:00:00Z".into()),
+                state: Some("pending".into()),
+            },
+            GhReview {
+                submitted_at: Some("2026-03-05T00:00:00Z".into()),
+                state: Some("APPROVED".into()),
+            },
+        ]);
+        assert_eq!(earliest_review(&reviews), "2026-03-05T00:00:00Z");
+    }
+
+    #[test]
+    fn earliest_review_is_empty_when_there_is_none() {
+        assert_eq!(earliest_review(&None), "");
+        assert_eq!(earliest_review(&Some(vec![])), "");
+        // An entry with no timestamp must not become an empty-string "review".
+        let missing = Some(vec![GhReview {
+            submitted_at: None,
+            state: Some("APPROVED".into()),
+        }]);
+        assert_eq!(earliest_review(&missing), "");
+    }
     use super::*;
 
     /// Regression (audit M7): `gh` succeeding but emitting anything other

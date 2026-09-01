@@ -1,7 +1,14 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import {
+    formatAge,
+    hoursToFirstReview,
+    openHours,
+    summarizeVelocity,
+  } from "../github/prVelocity";
   import type { WorkflowsReport, GitHubContextBase } from "../github/types";
 
+  // Mirrors `PullRequestInfo` in src-tauri/src/github/mod.rs field for field.
   interface PullRequestInfo {
     number: number;
     title: string;
@@ -11,6 +18,11 @@
     url: string;
     is_draft: boolean;
     ci_status: string;
+    created_at: string;
+    updated_at: string;
+    review_decision: string;
+    /** Empty when nobody has reviewed yet — not a zero-hour review. */
+    first_review_at: string;
   }
 
   interface GitHubContext extends GitHubContextBase {
@@ -71,6 +83,11 @@
   import Skeleton from "./Skeleton.svelte";
 
   let ctx = $state<GitHubContext | null>(null);
+
+  // Read once per render pass: a fresh Date.now() per row would make two PRs
+  // opened in the same second disagree about their age.
+  let velocityNow = $state(Date.now());
+  const velocity = $derived(summarizeVelocity(ctx?.pull_requests ?? [], velocityNow));
   let loading = $state(false);
   /** PR numbers with a checkout in flight; any in-flight checkout disables all. */
   const checkingOut = new SvelteSet<number>();
@@ -517,6 +534,23 @@
         {:else if ctx.pull_requests.length === 0}
           <EmptyState icon={GitPullRequest} title="No open pull requests shown" compact />
         {:else}
+          <!-- Median rather than mean: one PR left open for a year should not
+               become the headline number for the queue. Drafts are excluded
+               because they are not waiting on anyone. -->
+          <div class="mb-2 text-[11px] text-textMuted font-mono flex flex-wrap gap-x-3">
+            <span title="Median time the {velocity.considered} non-draft open pull requests have been open">
+              median open {formatAge(velocity.medianOpenHours)}
+            </span>
+            <span title="Median time from opening to the first submitted review, across pull requests that have one">
+              median to first review {formatAge(velocity.medianFirstReviewHours)}
+            </span>
+            <span class={velocity.awaitingReview > 0 ? "text-amber-400" : ""} title="Non-draft open pull requests with no review yet">
+              {velocity.awaitingReview} awaiting review
+            </span>
+            <span title="Longest-open non-draft pull request">
+              oldest {formatAge(velocity.oldestOpenHours)}
+            </span>
+          </div>
           <div class="space-y-2">
             {#each ctx.pull_requests as pr}
               <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
@@ -531,6 +565,16 @@
                   <div class="mt-1 text-[11px] text-textMuted font-mono">
                     {pr.head_ref} → {pr.base_ref}
                     <span class="{ciClass(pr.ci_status)} ml-2">CI {pr.ci_status}</span>
+                    <span class="ml-2" title="Open for {formatAge(openHours(pr, velocityNow))}">
+                      open {formatAge(openHours(pr, velocityNow))}
+                    </span>
+                    {#if hoursToFirstReview(pr) !== null}
+                      <span class="ml-2 text-emerald-400" title="First review came {formatAge(hoursToFirstReview(pr))} after opening">
+                        reviewed +{formatAge(hoursToFirstReview(pr))}
+                      </span>
+                    {:else if !pr.is_draft}
+                      <span class="ml-2 text-amber-400" title="No review submitted yet">awaiting review</span>
+                    {/if}
                   </div>
                 </div>
                 <div class="flex items-center gap-1 shrink-0">
