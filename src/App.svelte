@@ -373,6 +373,20 @@
     );
   });
 
+  // Catching up on a newly-opened repository.
+  //
+  // Correctness never depends on GitPulse having been running: git's reflog and
+  // the agent transcripts both recorded what happened while it was closed, and
+  // this replays them into the ledger. Guarded on a genuine repo switch because
+  // the effect re-runs on every store emission — the ~6s status poll included.
+  let lastCaughtUpPath: string | null = null;
+  $effect(() => {
+    const path = $repoStore.currentPath;
+    if (!path || path === lastCaughtUpPath) return;
+    lastCaughtUpPath = path;
+    void harnessStore.catchUp(path);
+  });
+
   $effect(() => {
     // Only a genuine repo switch closes the Rebase modal: this effect re-runs
     // on every repoStore emission (status poll, stats batches) and must not

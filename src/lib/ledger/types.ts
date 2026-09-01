@@ -65,3 +65,4 @@ export type Outcome = "ok" | "failed" | "blocked";
 
 /** The three actor kinds the schema's CHECK constraint permits. */
 export type ActorKind = "human" | "agent" | "system";
+

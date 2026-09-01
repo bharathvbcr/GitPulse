@@ -9,6 +9,7 @@ pub mod engine;
 pub mod github;
 pub mod graph;
 pub mod harness;
+pub mod ingest;
 pub mod ledger;
 pub mod logging;
 pub mod ops;
@@ -174,6 +175,7 @@ pub fn run() {
             cmd_bind_worktree_task,
             cmd_unbind_worktree_task,
             cmd_worktree_task,
+            cmd_catch_up,
             cmd_check_app_update,
         ])
         .build(context())

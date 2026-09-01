@@ -2452,3 +2452,16 @@ pub async fn cmd_worktree_task(
     })
     .await
 }
+
+// --- catching up ------------------------------------------------------
+
+/// Replays what happened while GitPulse was closed.
+///
+/// Two sources, both observed rather than self-reported: git's reflog, which is
+/// authoritative for ref movements and survives GitPulse being uninstalled, and
+/// agent transcripts, which attribute file edits and commands to a session.
+/// Both replays are idempotent, so this is safe to run on every repo open.
+#[tauri::command(async)]
+pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, String> {
+    off_thread(move || Ok(crate::ingest::catch_up(&repo_path))).await
+}

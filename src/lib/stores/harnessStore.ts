@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { mergeEvents } from "../ledger/projection";
 import type { LedgerEvent, LedgerStatus } from "../ledger/types";
+import type { CatchUp } from "../ingest/types";
 import {
   appendAction,
   makeAgentAction,
@@ -158,6 +159,14 @@ export interface HarnessState {
   /** Highest ledger id projected so far; where the next tail resumes. */
   ledgerCursor: number;
   /**
+   * What the last catch-up found — the "while you were gone" summary.
+   *
+   * `skipped_lines` is part of it deliberately: a transcript line this build
+   * could not read is a gap in what was observed, and a summary that hid it
+   * would make a partial history look complete.
+   */
+  catchUp: CatchUp | null;
+  /**
    * Whether the ledger is recording. Null before the first check.
    *
    * Rendered rather than assumed: a repository whose ledger cannot be opened
@@ -234,6 +243,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     error: null,
     actions: [],
     ledgerCursor: 0,
+    catchUp: null,
     ledger: null,
   });
 
@@ -271,7 +281,46 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     }
   }
 
-  return {
+  async function syncLedger(repoPath: string): Promise<void> {
+    if (!repoPath) return;
+    try {
+      const status = await invokeFn<LedgerStatus>("cmd_ledger_status", { repoPath });
+      update((s) => ({ ...s, ledger: status }));
+      let cursor = get({ subscribe }).ledgerCursor;
+      // Page until drained, so opening a repo with a long history shows all
+      // of it rather than only the first window.
+      for (;;) {
+        const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
+          repoPath,
+          cursor,
+          limit: LEDGER_PAGE,
+        });
+        if (events.length === 0) break;
+        cursor = events[events.length - 1].id;
+        update((s) => ({
+          ...s,
+          actions: mergeEvents(s.actions, events, MAX_AGENT_ACTIONS),
+          ledgerCursor: Math.max(s.ledgerCursor, cursor),
+        }));
+        if (events.length < LEDGER_PAGE) break;
+      }
+    } catch (e) {
+      // A ledger read that fails must not blank the journal: the rows already
+      // projected are still true. Record why, and leave them.
+      update((s) => ({
+        ...s,
+        ledger: {
+          recording: false,
+          path: s.ledger?.path ?? "",
+          dropped: s.ledger?.dropped ?? 0,
+          error: formatError(e),
+          error_code: "read_failed",
+        },
+      }));
+    }
+  }
+
+  const store = {
     subscribe,
 
     /** Handshakes the sidecar and sweeps for local model servers. */
@@ -343,50 +392,44 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     },
 
     /**
+     * Replays what happened while GitPulse was closed, then projects it.
+     *
+     * Both sources are observed rather than self-reported — git's reflog and
+     * the agent transcripts — and both replays are idempotent, so this is safe
+     * on every repo open. A failure is recorded and does not stop the ledger
+     * sync: an incomplete catch-up still leaves the events already on disk
+     * worth showing.
+     */
+    catchUp: async (repoPath: string): Promise<CatchUp | null> => {
+      if (!repoPath) return null;
+      let summary: CatchUp | null = null;
+      try {
+        summary = await invokeFn<CatchUp>("cmd_catch_up", { repoPath });
+        update((s) => ({ ...s, catchUp: summary }));
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          catchUp: {
+            recorded: 0,
+            transcripts: 0,
+            skipped_lines: 0,
+            reflog_entries: 0,
+            error: formatError(e),
+          },
+        }));
+      }
+      await syncLedger(repoPath);
+      return summary;
+    },
+
+    /**
      * Loads durable events for a repository into the journal.
      *
      * Called on repo open and again whenever `ledger-appended` fires. Paging
      * from the stored cursor means a missed notification costs nothing: the
      * next call collects whatever was appended in between.
      */
-    syncLedger: async (repoPath: string): Promise<void> => {
-      if (!repoPath) return;
-      try {
-        const status = await invokeFn<LedgerStatus>("cmd_ledger_status", { repoPath });
-        update((s) => ({ ...s, ledger: status }));
-        let cursor = get({ subscribe }).ledgerCursor;
-        // Page until drained, so opening a repo with a long history shows all
-        // of it rather than only the first window.
-        for (;;) {
-          const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
-            repoPath,
-            cursor,
-            limit: LEDGER_PAGE,
-          });
-          if (events.length === 0) break;
-          cursor = events[events.length - 1].id;
-          update((s) => ({
-            ...s,
-            actions: mergeEvents(s.actions, events, MAX_AGENT_ACTIONS),
-            ledgerCursor: Math.max(s.ledgerCursor, cursor),
-          }));
-          if (events.length < LEDGER_PAGE) break;
-        }
-      } catch (e) {
-        // A ledger read that fails must not blank the journal: the rows already
-        // projected are still true. Record why, and leave them.
-        update((s) => ({
-          ...s,
-          ledger: {
-            recording: false,
-            path: s.ledger?.path ?? "",
-            dropped: s.ledger?.dropped ?? 0,
-            error: formatError(e),
-            error_code: "read_failed",
-          },
-        }));
-      }
-    },
+    syncLedger,
 
     generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
       const preferred = currentPreferred();
@@ -438,6 +481,8 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       });
     },
   };
+
+  return store;
 }
 
 export const harnessStore = createHarnessStore();
