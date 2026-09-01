@@ -2358,3 +2358,32 @@ pub async fn cmd_manvi_run_action(
 pub fn cmd_check_app_update() -> crate::updates::UpdateCheck {
     crate::updates::check_for_update()
 }
+
+// --- the action ledger -------------------------------------------------
+
+/// Reads durable ledger events after `cursor`, oldest first.
+///
+/// The frontend's action list is a projection of this, not a store of its own:
+/// it holds the last cursor it saw and asks for what followed. That is what
+/// makes the history survive a reload, a crash, and a restart — and what makes
+/// "everything visible is a projection of the log" true rather than aspirational.
+#[tauri::command(async)]
+pub async fn cmd_ledger_tail(
+    repo_path: String,
+    cursor: i64,
+    limit: u32,
+) -> Result<Vec<crate::ledger::LedgerEvent>, String> {
+    off_thread(move || crate::ledger::tail(&repo_path, cursor, limit).map_err(|e| e.to_string()))
+        .await
+}
+
+/// Reports whether the ledger is recording for this repository.
+///
+/// Separate from the events themselves on purpose. A repository whose ledger
+/// cannot be opened returns an empty history, and an empty history is exactly
+/// what a repository with nothing in it returns; without this, the two would be
+/// the same picture.
+#[tauri::command(async)]
+pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::LedgerStatus, String> {
+    off_thread(move || Ok(crate::ledger::status(&repo_path))).await
+}

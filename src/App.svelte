@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { RepoChangedPayload } from "./lib/repos/events";
+  import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
@@ -8,6 +9,7 @@
   import { filterStore } from "./lib/stores/filterStore";
   import { interfaceStore } from "./lib/stores/interfaceStore";
   import { toastStore } from "./lib/stores/toastStore";
+  import { harnessStore } from "./lib/stores/harnessStore";
   import { applyPlatformClass, isMacOS } from "./lib/platform";
   import { displayName } from "./lib/repos/paths";
   import { formatError } from "./lib/ui/formatError";
@@ -279,6 +281,20 @@
       },
       [...$repoStore.recentRepos],
       shellHandlers,
+    );
+
+    // The action journal follows the durable ledger rather than accumulating
+    // in memory. Every guarded mutation announces its cursor; the store pages
+    // from where it left off, so a missed notification costs nothing.
+    void listen<LedgerAppended>("ledger-appended", (event) => {
+      const path = event.payload?.repo_path;
+      if (path) void harnessStore.syncLedger(path);
+    }).then(
+      // `track` takes the unlisten, not the promise of one. Routing it through
+      // the tracker is what makes a listener that resolves *after* teardown
+      // unregister itself instead of outliving the webview.
+      (unlisten) => track(unlisten),
+      (err) => diagnostics.warn("boot:ledger-appended", err),
     );
 
     // Opt-in release check. `maybeNotifyUpdate` makes no request at all while

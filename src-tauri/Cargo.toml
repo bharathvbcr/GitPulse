@@ -24,6 +24,16 @@ portable-pty = "0.9"
 base64 = "0.22"
 log = "0.4"
 
+# Phase 1 ledger. WAL SQLite is the durable substrate for the action history;
+# the bundled feature avoids depending on a system libsqlite3.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Credential redaction on the ledger write path. This is a link rather than a
+# copy on purpose: `SECRET_PATTERNS` in dc-verify is documented as the single
+# seam through which every consumer decides what counts as a credential, and a
+# second table is how a key redacted by one gate leaks out of another.
+dc-verify = { path = "../../../../../Manvi/crates/dc-verify" }
+
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 

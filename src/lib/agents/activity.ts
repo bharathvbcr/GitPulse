@@ -19,7 +19,14 @@ export interface AgentActionEntry {
   verdict: PolicyVerdict | null;
 }
 
-/** Ring-buffer size. Enough to reconstruct a session, small enough to hold. */
+/**
+ * How many journal entries the UI holds for display.
+ *
+ * This was the ring-buffer size — the hard limit on how much history existed
+ * at all, and everything past it was gone. The durable ledger is now the
+ * record, so this is a *display* cap: rows beyond it are on disk and reachable
+ * by paging `cmd_ledger_tail`.
+ */
 export const MAX_AGENT_ACTIONS = 200;
 
 let nextId = 1;

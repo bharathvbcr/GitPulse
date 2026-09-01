@@ -9,6 +9,7 @@ pub mod engine;
 pub mod github;
 pub mod graph;
 pub mod harness;
+pub mod ledger;
 pub mod logging;
 pub mod ops;
 pub mod stack;
@@ -43,6 +44,9 @@ pub fn run() {
         .manage(crate::terminal::TerminalSessions::default())
         .manage(desktop::DesktopState::default())
         .setup(|app| {
+            // Installed before anything can mutate, so the first guarded action
+            // of the session is announced like every one after it.
+            crate::ledger::set_app_handle(app.handle().clone());
             if let Err(e) = desktop::install_menu(app.handle()) {
                 log::error!(target: "setup", "menu installation failed: {e}");
                 return Err(e.into());
@@ -162,6 +166,8 @@ pub fn run() {
             cmd_set_recent_menu,
             cmd_resolve_git_root,
             cmd_diagnostic_log_tail,
+            cmd_ledger_tail,
+            cmd_ledger_status,
             cmd_check_app_update,
         ])
         .build(context())

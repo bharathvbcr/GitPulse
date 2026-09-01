@@ -129,8 +129,8 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (107 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 35 contracts (389 fields) |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (109 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 36 contracts (415 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -187,7 +187,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 14 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (107 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (109 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, topology index, bezier geometry, folding
     ├── analyzer/         Language detection, LOC, coverage, dependency health

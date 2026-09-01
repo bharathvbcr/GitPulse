@@ -112,6 +112,7 @@ export const CONTRACTS = Object.freeze([
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
   { label: "harness", rustPath: rust("harness", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["HarnessStatus"] },
   { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
+  { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport"] },
   { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
   // The envelope on every gated command: `policy` travels with `output` so the

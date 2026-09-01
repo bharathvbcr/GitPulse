@@ -1,9 +1,12 @@
 import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
+import { mergeEvents } from "../ledger/projection";
+import type { LedgerEvent, LedgerStatus } from "../ledger/types";
 import {
   appendAction,
   makeAgentAction,
+  MAX_AGENT_ACTIONS,
   type AgentActionEntry,
 } from "../agents/activity";
 
@@ -137,11 +140,35 @@ export interface HarnessState {
   /** Most recent policy decision, for the status strip. */
   lastVerdict: PolicyVerdict | null;
   error: string | null;
-  /** Journal of guarded actions, newest last. Survives for the session. */
+  /**
+   * Journal of guarded actions, newest last.
+   *
+   * A *projection* of the durable ledger, not a store of its own: the rows are
+   * on disk, this holds the tail of them for display. What is dropped past the
+   * display cap is still queryable.
+   */
   actions: AgentActionEntry[];
+  /** Highest ledger id projected so far; where the next tail resumes. */
+  ledgerCursor: number;
+  /**
+   * Whether the ledger is recording. Null before the first check.
+   *
+   * Rendered rather than assumed: a repository whose ledger cannot be opened
+   * shows an empty journal, and so does a repository where nothing has
+   * happened. Without this the two are the same picture.
+   */
+  ledger: LedgerStatus | null;
 }
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
+
+/**
+ * Rows per `cmd_ledger_tail` call.
+ *
+ * Distinct from `MAX_AGENT_ACTIONS`, which is now only a *display* cap: this
+ * is how much is read per round trip while draining a repository's history.
+ */
+const LEDGER_PAGE = 200;
 
 /**
  * An AI status probe nests a HarnessStatus that is often empty even when the
@@ -199,6 +226,8 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     lastVerdict: null,
     error: null,
     actions: [],
+    ledgerCursor: 0,
+    ledger: null,
   });
 
   /**
@@ -300,7 +329,56 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     },
 
     clearActions: () => {
-      update((s) => ({ ...s, actions: [] }));
+      // Clears the *view*, never the ledger. The record on disk is what makes
+      // the history answerable after a crash; a UI button must not be able to
+      // erase it.
+      update((s) => ({ ...s, actions: [], ledgerCursor: 0 }));
+    },
+
+    /**
+     * Loads durable events for a repository into the journal.
+     *
+     * Called on repo open and again whenever `ledger-appended` fires. Paging
+     * from the stored cursor means a missed notification costs nothing: the
+     * next call collects whatever was appended in between.
+     */
+    syncLedger: async (repoPath: string): Promise<void> => {
+      if (!repoPath) return;
+      try {
+        const status = await invokeFn<LedgerStatus>("cmd_ledger_status", { repoPath });
+        update((s) => ({ ...s, ledger: status }));
+        let cursor = get({ subscribe }).ledgerCursor;
+        // Page until drained, so opening a repo with a long history shows all
+        // of it rather than only the first window.
+        for (;;) {
+          const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
+            repoPath,
+            cursor,
+            limit: LEDGER_PAGE,
+          });
+          if (events.length === 0) break;
+          cursor = events[events.length - 1].id;
+          update((s) => ({
+            ...s,
+            actions: mergeEvents(s.actions, events, MAX_AGENT_ACTIONS),
+            ledgerCursor: Math.max(s.ledgerCursor, cursor),
+          }));
+          if (events.length < LEDGER_PAGE) break;
+        }
+      } catch (e) {
+        // A ledger read that fails must not blank the journal: the rows already
+        // projected are still true. Record why, and leave them.
+        update((s) => ({
+          ...s,
+          ledger: {
+            recording: false,
+            path: s.ledger?.path ?? "",
+            dropped: s.ledger?.dropped ?? 0,
+            error: formatError(e),
+            error_code: "read_failed",
+          },
+        }));
+      }
     },
 
     generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
