@@ -28,6 +28,23 @@ before that tag is pushed.
   auto-update and does not phone home on its own.
 - Coverage tooling: missing toolchains are installed on request, completeness
   reporting is hardened, and reports can be copied out persistently.
+- Branch health verdicts in the sidebar. Each branch is classified from data already
+  fetched — upstream gone, merged, diverged, stale, behind, unpublished — and only
+  branches worth acting on draw an indicator, so the exceptions stay visible. The
+  staleness threshold is a parameter with a documented default rather than a fixed
+  number.
+- Pull-request review velocity in the GitHub panel: how long each pull request has
+  been open, how long it waited for its first review, and a median across the queue.
+  Drafts are excluded and the median is used, so one pull request left open for a year
+  does not become the headline figure.
+- A commit cadence sparkline in the status bar, bucketed by local calendar days so a
+  daylight-saving transition does not shift the boundaries. It reads the commits the
+  graph already loaded and costs no extra fetch.
+- Developer tooling: every script entry point answers `--help` with usage and exits 0,
+  the contract checkers and the coverage floor checker emit `--json` for machines, and
+  report columns align from their labels instead of hand-counted padding.
+- A dev container (`.devcontainer/`) that installs the same Linux dependencies CI uses
+  plus actionlint and cargo-llvm-cov, so `npm run ci:local` is runnable in it.
 
 ### Changed
 
@@ -46,6 +63,19 @@ before that tag is pushed.
 - Terminal and diagnostics failures preserve their full context instead of truncating
   it across builds.
 - Dependency coverage is reported accurately in the health panel.
+- The architecture diagrams no longer imply a direct Tokio dependency. Tokio reaches
+  the build transitively through Tauri; `rayon` is the only direct concurrency
+  dependency, and blocking work leaves the IPC thread via
+  `tauri::async_runtime::spawn_blocking`.
+
+### Internal
+
+- Integration coverage for the `terminal`, `github`, `updates`, and `desktop` modules,
+  which had inline tests but nothing exercising them through their public surface
+  against real repositories and real child processes.
+- The Vite build-caching question (sharing `dist/` across CI legs) was investigated and
+  declined; the measurements and the reasoning are recorded above the build step in
+  `ci.yml`.
 
 ## [0.0.3] - 2026-08-28
 
