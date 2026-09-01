@@ -259,7 +259,9 @@
   class="flex flex-col h-full bg-background font-sans text-xs min-h-0 relative select-text"
   onkeydown={handleKeydown}
   tabindex="0"
-  role="region"
+  role="textbox"
+  aria-multiline="true"
+  aria-readonly={isEditing ? "false" : "true"}
   aria-label="Code Viewer"
 >
   <!-- Top Editor Actions Bar -->

@@ -63,6 +63,7 @@
   let isCopied = $state(false);
   let isMenuOpen = $state(false);
   let menuPos = $state<{ left: number; top: number }>({ left: 0, top: 0 });
+  let menuEl = $state<HTMLDivElement | undefined>();
 
   const isCompact = $derived(density === "compact");
   const avatar = $derived(authorIdentity(row.author_name, row.author_email));
@@ -95,12 +96,10 @@
     }, 1500);
   }
 
-  function handleContextMenu(e: MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
+  function openContextMenu(clientX: number, clientY: number) {
     const clamped = clampMenuPosition(
-      e.clientX,
-      e.clientY,
+      clientX,
+      clientY,
       200,
       180,
       window.innerWidth,
@@ -108,6 +107,12 @@
     );
     menuPos = clamped;
     isMenuOpen = true;
+  }
+
+  function handleContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    openContextMenu(e.clientX, e.clientY);
   }
 
   function closeMenu() {
@@ -135,7 +140,23 @@
     }
   }
 
+  function handleMenuKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeMenu();
+    }
+  }
+
   function handleKeydown(e: KeyboardEvent) {
+    if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+      e.preventDefault();
+      const target = e.currentTarget;
+      if (target instanceof HTMLElement) {
+        const bounds = target.getBoundingClientRect();
+        openContextMenu(bounds.left + Math.min(bounds.width, 32), bounds.bottom);
+      }
+      return;
+    }
     if (e.key === "Escape") {
       closeMenu();
       onBlurRow?.();
@@ -152,6 +173,14 @@
     onFocusRow?.(el, isKeyboardFocus(el));
   }
 
+  $effect(() => {
+    if (!isMenuOpen) return;
+    const focusTimer = setTimeout(() => {
+      menuEl?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    }, 0);
+    return () => clearTimeout(focusTimer);
+  });
+
   let conventional = $derived(getConventionalType(row.summary || ""));
 </script>
 
@@ -166,6 +195,8 @@
   onblur={() => onBlurRow?.()}
   oncontextmenu={handleContextMenu}
   aria-pressed={isSelected}
+  aria-haspopup="menu"
+  aria-expanded={isMenuOpen}
   class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg group {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-sm' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
 >
   <!-- Short SHA with interactive Copy Button -->
@@ -261,15 +292,15 @@
 
 <!-- Context Menu -->
 {#if isMenuOpen}
-  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div
+    bind:this={menuEl}
     use:portal={"body"}
     class="fixed z-50 min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-none shadow-float"
     style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU};"
     role="menu"
     aria-orientation="vertical"
     tabindex="-1"
-    onclick={(e) => e.stopPropagation()}
+    onkeydown={handleMenuKeydown}
   >
     <button
       role="menuitem"

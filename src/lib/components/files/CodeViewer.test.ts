@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { compile } from "svelte/compiler";
 import { describe, expect, it } from "vitest";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -46,5 +47,16 @@ describe("CodeViewer", () => {
     expect(source).toContain("bind:scrollTop");
     expect(source).toContain("MAX_RENDER_LINES");
     expect(source).toContain("linesTruncated");
+  });
+
+  it("has no accessibility compiler warnings", () => {
+    const { warnings } = compile(source, { generate: "client" });
+    expect(warnings.filter(({ code }) => code.startsWith("a11y_"))).toEqual([]);
+  });
+
+  it("exposes the focused code surface as a read-only-capable multiline text editor", () => {
+    expect(source).toContain('role="textbox"');
+    expect(source).toContain('aria-multiline="true"');
+    expect(source).toContain("aria-readonly=");
   });
 });

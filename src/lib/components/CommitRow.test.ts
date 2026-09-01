@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
+import { compile } from "svelte/compiler";
 import type { VisualCommitRow } from "../canvas/GraphRenderer";
 import CommitRow from "./CommitRow.svelte";
+
+const source = readFileSync(new URL("./CommitRow.svelte", import.meta.url), "utf8");
 
 /**
  * Keyboard/AT parity for the graph's connector attribution.
@@ -55,5 +59,15 @@ describe("CommitRow accessible graph context", () => {
     const { body } = render(CommitRow, { props: { row } });
     expect(body).toContain('role="button"');
     expect(body).toContain('tabindex="0"');
+  });
+
+  it("has no accessibility compiler warnings", () => {
+    const { warnings } = compile(source, { generate: "client" });
+    expect(warnings.filter(({ code }) => code.startsWith("a11y_"))).toEqual([]);
+  });
+
+  it("opens the context menu through the standard keyboard context-menu keys", () => {
+    expect(source).toContain('e.key === "ContextMenu"');
+    expect(source).toContain('e.key === "F10"');
   });
 });
