@@ -129,7 +129,7 @@
     aria-modal="true"
     aria-label="Keyboard Shortcuts"
     tabindex="-1"
-    onclick={close}
+    onclick={(e) => e.target === e.currentTarget && close()}
     onkeydown={(e) => e.key === "Escape" && close()}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
@@ -137,11 +137,8 @@
     style="z-index: {LAYERS.MODAL};"
   >
     <!-- Modal Card -->
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       use:trapFocus
-      onclick={(e) => e.stopPropagation()}
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
       class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-3xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"

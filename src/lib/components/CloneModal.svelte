@@ -65,18 +65,15 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={requestClose}
+    onclick={(e) => e.target === e.currentTarget && requestClose()}
     onkeydown={(e) => e.key === "Escape" && requestClose()}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       use:trapFocus
-      onclick={(e) => e.stopPropagation()}
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"

@@ -53,27 +53,23 @@
 </script>
 
 {#if pending && options}
-  <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <div
     role="dialog"
     aria-modal="true"
     aria-label={options.title}
     tabindex="-1"
-    onclick={cancelPrompt}
+    onclick={(e) => e.target === e.currentTarget && cancelPrompt()}
     onkeydown={handleKeydown}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
     class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 select-none gp-gpu"
     style="z-index: {LAYERS.PROMPT}"
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- autofocus:false — the $effect below focuses the input or confirm
          button by prompt mode; the trap still cycles Tab and restores focus
          on close. -->
     <div
       use:trapFocus={{ autofocus: false }}
-      onclick={(e) => e.stopPropagation()}
       in:scale={cardScale()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >

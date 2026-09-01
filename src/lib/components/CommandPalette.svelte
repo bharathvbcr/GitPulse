@@ -398,7 +398,7 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    onclick={() => (isOpen = false)}
+    onclick={(e) => e.target === e.currentTarget && (isOpen = false)}
     onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
@@ -406,11 +406,8 @@
     style="z-index: {LAYERS.MODAL}"
   >
     <!-- Modal Card -->
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       use:trapFocus={{ initial: () => inputEl ?? null }}
-      onclick={(e) => e.stopPropagation()}
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
       class="w-full max-w-lg gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"

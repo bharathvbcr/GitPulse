@@ -556,6 +556,12 @@
       <!-- Hunk Rail / Diff Minimap -->
       {#if railTicks.length > 0}
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <!-- Accepted, not fixed: the minimap is a pointer-only shortcut for
+             scrolling the virtual list beside it, and is marked
+             role="presentation" so assistive tech skips it. Keyboard users
+             scroll the list itself. Giving the rail its own key bindings
+             would add a second way to do one thing; if the list ever stops
+             being keyboard-scrollable, this becomes a real gap. -->
         <div
           class="w-3 bg-surface/90 border-l border-border/70 relative h-full shrink-0 cursor-pointer overflow-hidden group/rail hover:w-4 transition-[width] duration-150"
           title="Diff Minimap (click to navigate)"

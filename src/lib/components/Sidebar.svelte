@@ -543,6 +543,10 @@
          so the div-with-role warnings are intentional. -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <!-- Justified: this is the WAI-ARIA window-splitter pattern — a focusable
+         `separator` with aria-valuenow/min/max, which the spec defines as
+         interactive precisely when it is focusable. The rule treats every
+         `separator` as non-interactive. -->
     <div
       role="separator"
       aria-orientation="vertical"

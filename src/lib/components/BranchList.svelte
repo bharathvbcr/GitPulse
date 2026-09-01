@@ -791,6 +791,10 @@
   screen readers. Rows stay real buttons so native semantics carry instead.
 -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
+<!-- Justified: `tree` is a composite widget role, so it is *required* to be
+     focusable and to handle arrow keys (WAI-ARIA Authoring Practices, Tree
+     View). The rule models `tree` as non-interactive, which is wrong here;
+     removing the tabindex would make the branch list keyboard-unreachable. -->
 <div
   class="flex flex-col h-full focus:outline-none"
   role="tree"
@@ -982,6 +986,9 @@
 
 {#if menu}
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+  <!-- Justified: `menu` is an interactive role the rule does not model. The
+       menu is keyboard-operable — it is opened from the tree's keydown
+       handler and closes on Escape; each item is a real <button>. -->
   <div
     bind:this={menuEl}
     use:portal={"body"}
