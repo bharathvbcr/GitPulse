@@ -51,6 +51,19 @@ jobs:
       # The three contract checkers are pure Node and run in well under a
       # second, so they gate the slow steps rather than trailing them: they
       # catch Rust<->TS drift that neither svelte-check nor cargo can see.
+      # release.yml runs only on a `v*` tag, so nothing else in CI ever reads
+      # it — a syntax error there would surface when a release is cut. Lint the
+      # workflows here instead. Linux-only: the result is platform-independent
+      # and the download script targets Linux/macOS.
+      - name: Install actionlint
+        if: matrix.os == 'ubuntu-latest'
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+        shell: bash
+
+      - name: Workflow Lint
+        if: matrix.os == 'ubuntu-latest'
+        run: ./actionlint -color
+
       - name: IPC Contract Check
         run: npm run check:ipc
 

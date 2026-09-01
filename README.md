@@ -233,6 +233,8 @@ date".
 - **Git**: Recent version
 - **cargo-llvm-cov**: required by `npm run ci:local` for the Rust coverage floor —
   `rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --locked`
+- **actionlint**: required by `npm run ci:local` to lint the GitHub Actions
+  workflows — `brew install actionlint` (see [install docs](https://github.com/rhysd/actionlint/blob/main/docs/install.md))
 
 ### Getting Started
 
@@ -258,6 +260,7 @@ npm run tauri dev
 | `npm test` | Run Vitest unit and integration test suite (1,890+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |
 | `npm run check:coverage` | Validate both LCOV reports and enforce coverage floors (frontend 90% lines / 85% branches, Rust 80% lines) |
+| `npm run check:workflows` | Lint `.github/workflows/*` with actionlint — the only gate that reads `release.yml`, which CI otherwise sees only on a tag |
 | `npm run build` | Build frontend production bundle |
 | `npm run tauri build` | Bundle native installers for the host platform |
 

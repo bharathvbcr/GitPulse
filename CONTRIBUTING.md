@@ -13,6 +13,7 @@ Ensure you have the following tools installed on your development machine:
 | **Node.js** | `22.x` or later | The version CI runs (`.github/workflows/ci.yml`). Vite 6 and Vitest 3 require `>=20`; 22 is what release builds are verified against. |
 | **Rust** | `stable`, edition 2021 | Needs the `clippy` and `rustfmt` components — CI fails on either. `rustup component add clippy rustfmt` |
 | **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `npm run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
+| **actionlint** | latest | Lints the GitHub Actions workflows in `npm run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
 | **Git** | any maintained release | Not just for version control: GitPulse shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
 | **GitHub CLI** (`gh`) | optional | Only the GitHub panel (PRs, issues, workflow runs, Dependabot alerts) uses it. Everything else works without it. |
 
@@ -108,6 +109,7 @@ flowchart TD
         TypeCheck["Type Contract: <code>npm run check:types</code>"]
         ReleaseCheck["Release Manifests: <code>npm run check:release</code>"]
         CoverageCheck["Coverage Floors: <code>npm run check:coverage</code>"]
+        WorkflowCheck["Workflow Lint: <code>npm run check:workflows</code>"]
     end
 
     FrontendChecks --> AllPass{"All Checks Pass?"}
@@ -116,6 +118,7 @@ flowchart TD
     TypeCheck --> AllPass
     ReleaseCheck --> AllPass
     CoverageCheck --> AllPass
+    WorkflowCheck --> AllPass
 
     AllPass -->|Yes| ReadyPR["Ready for Pull Request"]
     AllPass -->|No| FixCode["Fix Drift / Errors"]
@@ -129,6 +132,7 @@ flowchart TD
 | `npm run check:types` | Verifies that coverage and terminal serde structs in Rust match TypeScript interfaces field-for-field (62 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default |
+| `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
 | `npm run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
