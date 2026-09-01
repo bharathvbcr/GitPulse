@@ -104,6 +104,20 @@ describe("coverage floor contract", () => {
     expect(parsed.totals.lines).toEqual({ found: 10, hit: 1 });
   });
 
+  it("parses a record captured verbatim from cargo llvm-cov", () => {
+    // scripts/fixtures/llvm-cov-real.info is the exact ops.rs record that
+    // broke check:coverage: LF 407 with 385 DA entries, and LH 352 while 354
+    // DA entries show hits. Both bugs in this parser came from inventing an
+    // invariant and testing it against data invented by the same hand, so this
+    // case is the producer's own bytes.
+    const fixture = readFileSync(
+      new URL("./fixtures/llvm-cov-real.info", import.meta.url),
+      "utf8",
+    );
+    const parsed = parseLcov(fixture);
+    expect(parsed.totals.lines).toEqual({ found: 407, hit: 352 });
+  });
+
   it("accepts the saturated counters llvm-cov emits", () => {
     // llvm-cov writes u64::MAX for a counter that saturated or underflowed;
     // four such lines appear in this repository's own Rust report. They exceed
