@@ -154,6 +154,7 @@ several were added after the drift had already happened.
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
 | `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
+| `wire-type-locality-contract` | A serde payload shape being declared inside a component, where `check:types` cannot reach it and a second copy can drift silently. Every instance found so far had already gone stale — TerminalRunResult, GitHubContext, ConflictChunk, CommitDetailsPayload, FileBlobPayload. |
 | `ipc-type-coverage-contract` | The unchecked half of the IPC surface going unnoticed. `check:types` reports OK for the payloads it lists; this pins the ones it does not, with a reason each, so a new command cannot join the unchecked set silently. |
 | `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `npm run check` output. |
 | `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |

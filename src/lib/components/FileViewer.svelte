@@ -1,6 +1,7 @@
 <script lang="ts" module>
   import { createRepoPanelCache } from "../panels/repoPanelCache";
   import type { EditorTabState } from "../files/editorTabs";
+  import type { FileBlob } from "../files/types";
 
   const tabCache = createRepoPanelCache<{
     tabs: EditorTabState;
@@ -49,20 +50,12 @@
     type EditorTabState as Tabs,
   } from "../files/editorTabs";
 
-  interface FileBlobPayload {
-    path: string;
-    is_binary: boolean;
-    is_image: boolean;
-    mime: string;
-    text?: string | null;
-    base64?: string | null;
-  }
 
   let explorerOpen = $state(true);
   let dashboardOpen = $state(true);
   let tabState = $state<Tabs>(emptyEditorTabs());
 
-  let activeBlob = $state<FileBlobPayload | null>(null);
+  let activeBlob = $state<FileBlob | null>(null);
   let isLoadingFile = $state(false);
   let fileError = $state<string | null>(null);
   let inflightGuard: AsyncGuard | null = null;
@@ -103,7 +96,7 @@
     isLoadingFile = true;
     fileError = null;
     try {
-      const blob = await invoke<FileBlobPayload>("cmd_get_file_blob", {
+      const blob = await invoke<FileBlob>("cmd_get_file_blob", {
         repoPath: repo,
         filePath: path,
         commitId: null,

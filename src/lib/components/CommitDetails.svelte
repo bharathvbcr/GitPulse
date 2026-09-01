@@ -23,30 +23,11 @@
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
+  // The canonical wire types, not local copies: both were declared here as
+  // well, and the CommitDetails one had silently fallen four fields behind.
+  // `import type` is erased, so this pulls in no store at runtime.
+  import type { CommitDetails as CommitDetailsPayload } from "../stores/graphStore";
 
-  interface CommitFileChange {
-    path: string;
-    status_code: string;
-    additions: number;
-    deletions: number;
-  }
-
-  interface CommitDetailsPayload {
-    id: string;
-    author_name: string;
-    author_email: string;
-    author_date: string;
-    summary: string;
-    body: string;
-    gpg_status: string;
-    co_authors: string[];
-    changed_files: CommitFileChange[];
-    total_additions: number;
-    total_deletions: number;
-    /** Optional during the backend transition; absent means "not truncated". */
-    files_total_count?: number;
-    files_list_truncated?: boolean;
-  }
 
   let selectedCommit = $derived(
     $graphStore.rows.find((r) => r.id === $repoStore.selectedCommitId) || $graphStore.selectedCommit
