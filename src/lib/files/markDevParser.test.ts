@@ -265,3 +265,32 @@ describe("markDevParser — bounded rendering", () => {
     expect(out).toContain("not shown");
   });
 });
+
+describe("markDevParser — document stats stay linear", () => {
+  it("does not slow quadratically on unmatched brackets", () => {
+    // The stats run on the same untrusted content as the render, and are not
+    // covered by the render cap, so the quadratic link pattern had to be fixed
+    // here too rather than bounded around.
+    const timings = [20000, 40000, 80000].map((n) => {
+      const started = Date.now();
+      calculateDocumentStats("[".repeat(n));
+      return Date.now() - started;
+    });
+    for (const ms of timings) {
+      expect(ms, `took ${ms}ms`).toBeLessThan(1000);
+    }
+    // Quadratic would quadruple per doubling; linear roughly doubles. Allow
+    // generous headroom so this measures complexity, not machine speed.
+    const [small, , large] = timings;
+    if (small > 5) {
+      expect(large / small, "growth looks quadratic").toBeLessThan(8);
+    }
+  });
+
+  it("still counts links, wikilinks and headings", () => {
+    const stats = calculateDocumentStats("# Title\n\n[a](https://b.c) and [[wiki]] here\n");
+    expect(stats.linkCount).toBe(2);
+    expect(stats.headingCount).toBe(1);
+    expect(stats.wordCount).toBeGreaterThan(0);
+  });
+});

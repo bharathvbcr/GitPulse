@@ -57,7 +57,15 @@ export function calculateDocumentStats(text: string): DocumentStats {
   const headings = text.match(/^#{1,6}\s+.+$/gm);
   const headingCount = headings ? headings.length : 0;
 
-  const links = text.match(/\[([^\]]+)\]\(([^)]+)\)|\[\[([^\]]+)\]\]/g);
+  // Bounded for the same reason as the link patterns in the renderer: an
+  // unbounded `[^\]]+` scans from every `[` to the end of the string, so a run
+  // of unmatched brackets costs O(n) at O(n) positions. This is the only
+  // pattern here with that shape — the `*`, `_`, `~`, `=` and backtick pairs
+  // open and close on the same character, so a run of them fails immediately
+  // rather than scanning. Measured: 1235ms at 40k brackets before, 0ms after.
+  const links = text.match(
+    /\[([^\]]{1,500})\]\(([^)]{1,2000})\)|\[\[([^\]]{1,500})\]\]/g,
+  );
   const linkCount = links ? links.length : 0;
 
   return {
