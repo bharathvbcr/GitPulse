@@ -8,6 +8,7 @@
 </script>
 
 <script lang="ts">
+  import type { FileBlob } from "../files/types";
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -28,14 +29,6 @@
     buildFilePatchFromLines,
   } from "../diff/patchBuilder";
 
-  interface FileBlob {
-    path: string;
-    is_binary: boolean;
-    is_image: boolean;
-    mime: string;
-    text?: string | null;
-    base64?: string | null;
-  }
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.

@@ -1,28 +1,9 @@
 <script module lang="ts">
-  /**
-   * Mirrors the Rust `ConflictResolutionChoice` enum's serde form: unit
-   * variants travel as plain strings, the tuple variant as an externally
-   * tagged map.
-   */
-  type ConflictResolution = "Unresolved" | "AcceptOurs" | "AcceptTheirs" | "AcceptBothOursFirst" | "AcceptBothTheirsFirst" | { Custom: string };
-
-  interface ConflictChunk {
-    chunk_index: number;
-    start_line: number;
-    end_line: number;
-    ours_label: string;
-    ours_content: string;
-    base_content?: string;
-    theirs_label: string;
-    theirs_content: string;
-    resolution: ConflictResolution;
-  }
-
-  interface ConflictDoc {
-    file_path: string;
-    segments: Array<{ Normal?: string; Conflict?: ConflictChunk }>;
-    total_conflicts: number;
-  }
+  import type {
+    ConflictChunk,
+    ConflictDocument,
+    ConflictResolutionChoice,
+  } from "../diff/conflict";
 
   /**
    * A fresh parse lands every chunk back at Unresolved. When it belongs to
@@ -31,9 +12,9 @@
    * chunk resolutions — so carry any made choices over by chunk index.
    * A different file starts from its own parse untouched.
    */
-  export function adoptResolutions(next: ConflictDoc, current: ConflictDoc | null): ConflictDoc {
+  export function adoptResolutions(next: ConflictDocument, current: ConflictDocument | null): ConflictDocument {
     if (!current || current.file_path !== next.file_path) return next;
-    const carried = new Map<number, ConflictResolution>();
+    const carried = new Map<number, ConflictResolutionChoice>();
     for (const seg of current.segments) {
       const chunk = seg.Conflict;
       if (chunk && chunk.resolution !== "Unresolved") {
@@ -72,7 +53,7 @@
    */
   let parked = $derived(operationState.operation !== null);
   let selectedFile = $state<string | null>(null);
-  let parsedDoc = $state<ConflictDoc | null>(null);
+  let parsedDoc = $state<ConflictDocument | null>(null);
   let loadError = $state<string | null>(null);
   let previewError = $state<string | null>(null);
   let resolvedPreview = $state<string>("");
@@ -149,7 +130,7 @@
           commitId: null,
         });
         if (!guard.isLive()) return;
-        const doc = await invoke<ConflictDoc>("cmd_parse_conflict", {
+        const doc = await invoke<ConflictDocument>("cmd_parse_conflict", {
           filePath: file,
           content,
         });
@@ -168,7 +149,7 @@
     })();
   });
 
-  function setChunkResolution(chunkIndex: number, choice: ConflictResolution) {
+  function setChunkResolution(chunkIndex: number, choice: ConflictResolutionChoice) {
     if (!parsedDoc) return;
     for (const seg of parsedDoc.segments) {
       if (seg.Conflict && seg.Conflict.chunk_index === chunkIndex) {
@@ -178,7 +159,7 @@
     void updatePreview(parsedDoc);
   }
 
-  function resolveAll(choice: ConflictResolution) {
+  function resolveAll(choice: ConflictResolutionChoice) {
     if (!parsedDoc) return;
     for (const seg of parsedDoc.segments) {
       if (seg.Conflict) {
@@ -202,7 +183,7 @@
     );
   }
 
-  async function updatePreview(doc: ConflictDoc) {
+  async function updatePreview(doc: ConflictDocument) {
     const repo = $repoStore.currentPath;
     const file = selectedFile;
     previewGuard?.cancel();

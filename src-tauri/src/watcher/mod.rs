@@ -40,8 +40,8 @@ pub struct WatcherState {
 }
 
 #[derive(Clone, Serialize)]
-struct RepoChangedPayload {
-    path: String,
+pub struct RepoChangedPayload {
+    pub path: String,
 }
 
 impl WatcherState {

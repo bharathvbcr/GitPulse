@@ -1464,3 +1464,258 @@ fn run_git_expect_failure(cwd: &Path, args: &[&str]) {
         "git {args:?} was expected to fail but succeeded"
     );
 }
+
+/// A commit's changed-file list crosses IPC in full, so a vendored-dependency
+/// drop or an initial import shipped an unbounded payload. The frontend has
+/// rendered a "+only first N listed" notice from `files_list_truncated` since
+/// hardening wave 2 — but the backend never set the flag, so the notice could
+/// not fire and the list was never cut.
+///
+/// Fails before the cap landed: the two fields did not exist backend-side, so
+/// `changed_files` held every entry and the flag was permanently false.
+#[test]
+fn commit_details_caps_a_massive_file_list_and_reports_the_true_total() {
+    const OVER_CAP: usize = 5_001;
+    const CAP: usize = 5_000;
+    let repo = TestRepo::init();
+    for i in 0..OVER_CAP {
+        repo.write(&format!("files/{i:05}.txt"), "one line\n");
+    }
+    repo.commit_all("import a vendored tree");
+    let head = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    let details = GitReader::get_commit_details(&repo.path_str(), &head).expect("details");
+    assert!(
+        details.files_list_truncated,
+        "a commit over the cap must say so"
+    );
+    assert_eq!(details.files_total_count, Some(OVER_CAP));
+    assert_eq!(
+        details.changed_files.len(),
+        CAP,
+        "the list is cut to the cap"
+    );
+    // The trap this guards: summing the *truncated* slice would understate a
+    // huge commit's churn while the header still read as fact. One line lands
+    // per file, so the total must count every file, capped list or not.
+    assert_eq!(details.total_additions, OVER_CAP);
+}
+
+/// The uncapped path is the common one, and both fields are declared optional
+/// in TypeScript ("absent otherwise"), so they must be absent from the wire
+/// rather than serialized as `null`/`false`.
+#[test]
+fn commit_details_omits_the_truncation_fields_for_an_ordinary_commit() {
+    let repo = TestRepo::init();
+    repo.write("src/lib.rs", "fn main() {}\n");
+    repo.commit_all("feat: ordinary");
+    let head = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    let details = GitReader::get_commit_details(&repo.path_str(), &head).expect("details");
+    assert!(!details.files_list_truncated);
+    assert_eq!(details.files_total_count, None);
+
+    let wire = serde_json::to_value(&details).expect("serialize");
+    assert!(
+        wire.get("files_list_truncated").is_none(),
+        "absent, not false: the TS property is optional"
+    );
+    assert!(wire.get("files_total_count").is_none(), "absent, not null");
+}
+
+/// Run git with a distinct author and committer, which the shared helper
+/// cannot do: it sets both identities to the same person, so a swapped pair
+/// in a `--format` string looks identical either way.
+fn run_git_with_identities(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Ada Author")
+        .env("GIT_AUTHOR_EMAIL", "ada@authors.invalid")
+        .env("GIT_AUTHOR_DATE", "2021-01-02T03:04:05+00:00")
+        .env("GIT_COMMITTER_NAME", "Cy Committer")
+        .env("GIT_COMMITTER_EMAIL", "cy@committers.invalid")
+        .env("GIT_COMMITTER_DATE", "2022-06-07T08:09:10+00:00")
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `get_commit_details` reads eleven NUL-separated fields out of one
+/// `--format` string by position: %H %P %an %ae %ad %cn %ce %cd %G? %s %b.
+/// The format string and the indices that read it sit in different places, so
+/// reordering two placeholders assigns one field's value to another — no
+/// error, no panic, just an author's email rendered as their commit date.
+///
+/// Every other test in this suite commits with the same name and address for
+/// author and committer, which makes exactly that swap invisible. This one
+/// gives all eleven fields distinguishable values.
+#[test]
+fn commit_details_assigns_every_format_field_to_its_own_slot() {
+    let repo = TestRepo::init();
+    repo.write("first.txt", "one\n");
+    repo.commit_all("feat: the parent commit");
+    let parent = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    repo.write("second.txt", "two\n");
+    run_git_with_identities(repo.dir.path(), &["add", "-A"]);
+    run_git_with_identities(
+        repo.dir.path(),
+        &[
+            "commit",
+            "-m",
+            "subject stays on its own line\n\nbody first paragraph\n\nbody second paragraph",
+        ],
+    );
+
+    let head = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+    let details = GitReader::get_commit_details(&repo.path_str(), &head).expect("details");
+
+    assert_eq!(details.id, head, "%H");
+    assert_eq!(details.parent_ids, vec![parent], "%P");
+    assert_eq!(details.author_name, "Ada Author", "%an");
+    assert_eq!(details.author_email, "ada@authors.invalid", "%ae");
+    assert_eq!(details.committer_name, "Cy Committer", "%cn");
+    assert_eq!(details.committer_email, "cy@committers.invalid", "%ce");
+
+    // Dates are asserted by year rather than by git's exact rendering, which
+    // varies with format config; the point is only that they do not swap.
+    assert!(
+        details.author_date.contains("2021") && !details.author_date.contains("2022"),
+        "%ad landed in the wrong slot: {}",
+        details.author_date
+    );
+    assert!(
+        details.committer_date.contains("2022") && !details.committer_date.contains("2021"),
+        "%cd landed in the wrong slot: {}",
+        details.committer_date
+    );
+
+    assert_eq!(details.gpg_status, "N", "%G? with no signature");
+    assert_eq!(details.summary, "subject stays on its own line", "%s");
+    assert!(
+        details.body.contains("body first paragraph")
+            && details.body.contains("body second paragraph"),
+        "%b lost part of the message: {:?}",
+        details.body
+    );
+    // %s must not leak into %b, which a missing separator would cause.
+    assert!(
+        !details.body.contains("subject stays on its own line"),
+        "the subject leaked into the body: {:?}",
+        details.body
+    );
+}
+
+/// The reflog reader splits four positional fields out of one `--format`
+/// string: %H %gd %gs %ct. The only existing coverage asserted the list was
+/// non-empty, so every one of those four could have swapped places without a
+/// test noticing — a selector rendered as a commit id, a timestamp parsed out
+/// of hex and silently falling back to 0.
+///
+/// Each field is checked by a property only it can satisfy, so this holds
+/// without pinning git's exact reflog wording.
+#[test]
+fn reflog_assigns_every_format_field_to_its_own_slot() {
+    let repo = TestRepo::init();
+    repo.write("a.txt", "one\n");
+    repo.commit_all("feat: first");
+    repo.write("b.txt", "two\n");
+    repo.commit_all("feat: second");
+
+    let entries = GitReader::get_reflog(&repo.path_str(), 10).expect("reflog");
+    assert!(!entries.is_empty(), "the reflog must have entries to check");
+    let newest = &entries[0];
+
+    assert_eq!(newest.index, 0, "entries are indexed newest-first");
+    // %H: a full object id, which nothing else in this record looks like.
+    assert_eq!(
+        newest.commit_id.len(),
+        40,
+        "commit_id: {}",
+        newest.commit_id
+    );
+    assert!(
+        newest.commit_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "commit_id is not hex: {}",
+        newest.commit_id
+    );
+    // %gd: the selector, which is the only field shaped like HEAD@{n}.
+    assert!(
+        newest.selector.starts_with("HEAD@{"),
+        "selector: {}",
+        newest.selector
+    );
+    // %gs: the subject, split at its first colon into action and message.
+    assert!(
+        newest.action.starts_with("commit"),
+        "action came from the wrong field: {}",
+        newest.action
+    );
+    assert_eq!(newest.message, "feat: second", "message");
+    // %ct: seconds since the epoch. A hex object id parsed here yields 0, and
+    // any real commit made after 2001 is well past this floor.
+    assert!(
+        newest.timestamp > 1_000_000_000,
+        "timestamp did not come from %ct: {}",
+        newest.timestamp
+    );
+}
+
+/// The history reader splits six positional fields out of one `--format`
+/// string: %H %P %ct %s %an %ae. Existing coverage asserted the summary and
+/// the author name, leaving four that could swap unnoticed — an email
+/// rendered as a name, a timestamp read out of a subject line and quietly
+/// becoming 0.
+///
+/// The author's name and address are deliberately unlike each other here, and
+/// unlike the summary, so no two fields could pass each other's assertion.
+#[test]
+fn history_assigns_every_format_field_to_its_own_slot() {
+    let repo = TestRepo::init();
+    repo.write("first.txt", "one\n");
+    repo.commit_all("feat: the parent commit");
+    let parent = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    repo.write("second.txt", "two\n");
+    run_git_with_identities(repo.dir.path(), &["add", "-A"]);
+    run_git_with_identities(repo.dir.path(), &["commit", "-m", "feat: the child commit"]);
+
+    let history = GitReader::read_commit_history(&repo.path_str(), 5, None).expect("history");
+    let newest = &history[0];
+
+    assert_eq!(newest.id.len(), 40, "%H: {}", newest.id);
+    assert!(
+        newest.id.chars().all(|c| c.is_ascii_hexdigit()),
+        "%H: {}",
+        newest.id
+    );
+    assert_eq!(newest.parent_ids, vec![parent], "%P");
+    assert_eq!(newest.summary, "feat: the child commit", "%s");
+    assert_eq!(newest.author_name, "Ada Author", "%an");
+    assert_eq!(newest.author_email, "ada@authors.invalid", "%ae");
+    // %ct is the *committer* timestamp, not the author's — `%at` would be the
+    // author's. The two are set to different years here precisely so the
+    // difference is visible: this is what the graph orders rows by, and
+    // reading the author date instead would reorder history whenever a commit
+    // was rebased or amended long after it was written.
+    assert_eq!(
+        newest.timestamp, 1_654_589_350,
+        "%ct must be the committer date (2022), not the author date (2021)"
+    );
+}

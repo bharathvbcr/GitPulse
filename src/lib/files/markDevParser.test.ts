@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_RENDER_BYTES,
   calculateDocumentStats,
   extractDocumentOutline,
   parseFrontmatter,
@@ -223,5 +224,99 @@ describe("markDevParser — link and image URL schemes", () => {
         true,
       );
     }
+  });
+});
+
+describe("markDevParser — bounded rendering", () => {
+  const block = "## Heading\n\nProse with a [link](https://example.com) and `code`.\n\n";
+  const docOf = (bytes: number) => block.repeat(Math.ceil(bytes / block.length));
+
+  it("renders a normal document whole, with no notice", () => {
+    const out = renderMarkDevMarkdown(docOf(MAX_RENDER_BYTES / 2));
+    expect(out).not.toContain("not shown");
+    expect(out).toContain("Heading");
+  });
+
+  it("caps a document that would take too long, and says so", () => {
+    // Rendering is quadratic in length, so an uncapped megabyte-scale file
+    // freezes the view. A silently truncated document reads exactly like a
+    // complete one that ends abruptly, so the cap has to announce itself.
+    const out = renderMarkDevMarkdown(docOf(MAX_RENDER_BYTES * 4));
+    expect(out).toContain("not shown");
+    expect(out).toMatch(/Rendered the first \d+ KB/);
+    // The reader is told how much is missing, not merely that something is.
+    expect(out).toMatch(/[\d,]+ more characters/);
+  });
+
+  it("stays fast no matter how large the input is", () => {
+    for (const size of [MAX_RENDER_BYTES * 2, MAX_RENDER_BYTES * 16, MAX_RENDER_BYTES * 32]) {
+      const started = Date.now();
+      renderMarkDevMarkdown(docOf(size));
+      expect(Date.now() - started, `${size} bytes took too long`).toBeLessThan(2000);
+    }
+  });
+
+  it("does not choke on a long run of unmatched brackets", () => {
+    // The shape that makes the link patterns scan from every '[' to the end of
+    // the string: O(n) work at O(n) positions.
+    const started = Date.now();
+    const out = renderMarkDevMarkdown("[".repeat(MAX_RENDER_BYTES * 4));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(out).toContain("not shown");
+  });
+});
+
+// Scaling audit of the frontend's repository-scale data paths, measured by
+// doubling the input and watching the ratio rather than by reading the code:
+//
+//   markdown render          quadratic -> fixed (bounded quantifiers + cap)
+//   calculateDocumentStats   quadratic -> fixed (bounded quantifier)
+//   tokenizeLine             non-terminating -> fixed (see syntaxHighlight)
+//   extractDocumentOutline   linear
+//   parseFrontmatter         linear
+//   computeWordDiff          linear (bounded by its own maxTokens)
+//   annotateUnifiedDiff      linear
+//   buildFileTree            linear (0ms at 8000 paths)
+//
+// Only the asymmetric `[`/`]` patterns had the quadratic shape.
+//
+// Worth noting where the defects were: this repository already had sixteen
+// frontend stress and fuzz suites, several with timing budgets. buildFileTree
+// has one and measured clean. The two modules in files/ that had none were
+// markDevParser and syntaxHighlight — and both turned out to be defective, one
+// quadratic and one non-terminating. The gap was which modules were stressed,
+// not whether the project stresses anything.
+//
+// The pattern is suggestive rather than reliable, which is worth stating so it
+// is not over-trusted: the other two substantial unstressed modules,
+// terminal/tokenize.ts and diagnostics/diagnostics.ts, were measured the same
+// way and are both linear and terminating. Two of four unstressed modules were
+// defective, and every stressed one was clean.
+describe("markDevParser — document stats stay linear", () => {
+  it("does not slow quadratically on unmatched brackets", () => {
+    // The stats run on the same untrusted content as the render, and are not
+    // covered by the render cap, so the quadratic link pattern had to be fixed
+    // here too rather than bounded around.
+    const timings = [20000, 40000, 80000].map((n) => {
+      const started = Date.now();
+      calculateDocumentStats("[".repeat(n));
+      return Date.now() - started;
+    });
+    for (const ms of timings) {
+      expect(ms, `took ${ms}ms`).toBeLessThan(1000);
+    }
+    // Quadratic would quadruple per doubling; linear roughly doubles. Allow
+    // generous headroom so this measures complexity, not machine speed.
+    const [small, , large] = timings;
+    if (small > 5) {
+      expect(large / small, "growth looks quadratic").toBeLessThan(8);
+    }
+  });
+
+  it("still counts links, wikilinks and headings", () => {
+    const stats = calculateDocumentStats("# Title\n\n[a](https://b.c) and [[wiki]] here\n");
+    expect(stats.linkCount).toBe(2);
+    expect(stats.headingCount).toBe(1);
+    expect(stats.wordCount).toBeGreaterThan(0);
   });
 });

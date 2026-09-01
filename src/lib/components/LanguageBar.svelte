@@ -10,16 +10,13 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { pickLanguageBarStats, type LanguageStat } from "../language/barStats";
+  import {
+    pickLanguageBarStats,
+    type LanguageStat,
+    type LanguageStatsReport,
+  } from "../language/barStats";
 
   /** Wire shape of `crate::engine::git_reader::LanguageStatsReport`. */
-  interface LanguageStatsReport {
-    stats: LanguageStat[];
-    /** True when the backend scan stopped early (deadline or cap). */
-    truncated: boolean;
-    scanned_files: number;
-    candidate_files: number;
-  }
 
   let stats: LanguageStat[] = $state([]);
   /** Non-null when the shown percentages cover only part of the worktree. */

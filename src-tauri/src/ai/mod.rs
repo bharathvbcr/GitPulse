@@ -13,6 +13,24 @@
 //!   calls are separated out (`chat.settle`).
 //! * `prompt` decides what to send and reads the answer back.
 //!
+//! ## What is and is not covered by tests
+//!
+//! The entry points here (`generate_commit_message`, `explain_commit`,
+//! `suggest_branch_name`, `fix_health`, `coverage_report`) resolve their
+//! endpoint through `discovery` rather than taking one, so there is no seam to
+//! point them at a stub and they only run with a model server present —
+//! `tests/local_ai_live.rs`, gated behind `GITPULSE_LIVE_AI=1`. That is why
+//! this file's line coverage is low, and it is a deliberate trade: adding an
+//! endpoint parameter purely so tests could inject one would change the public
+//! surface for testing's sake.
+//!
+//! What the model server can do to this application is covered without it.
+//! `http` is tested against adversarial servers — including one that dribbles
+//! bytes forever, to prove the overall deadline holds — and against every
+//! refusal the transport makes, in `tests/ai_transport_integration.rs`.
+//! `prompt` parses replies as pure functions. So the untrusted half is
+//! exercised; what is not is the orchestration between them.
+//!
 //! With no harness installed the features still work, on a declared context
 //! window and a local reply parser, and every result says which of the two it
 //! was — `AiGeneration::warnings` carries the difference rather than hiding it.

@@ -5,7 +5,7 @@ import { isTauri } from "../platform";
 import {
   dispatchNativeMenu,
   type NativeMenuHandlers,
-  type NativeMenuPayload,
+  type NativeEvent,
 } from "./nativeActions";
 
 export async function takePendingOpen(): Promise<string | null> {
@@ -38,12 +38,12 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
   const unlistenAll: Array<() => void> = [];
   try {
     unlistenAll.push(
-      await listen<NativeMenuPayload>("gitpulse-menu", (event) => {
+      await listen<NativeEvent>("gitpulse-menu", (event) => {
         dispatchNativeMenu(event.payload, handlers);
       }),
     );
     unlistenAll.push(
-      await listen<NativeMenuPayload>("gitpulse-open-repo", (event) => {
+      await listen<NativeEvent>("gitpulse-open-repo", (event) => {
         if (event.payload.path) handlers.openRepo(event.payload.path);
       }),
     );

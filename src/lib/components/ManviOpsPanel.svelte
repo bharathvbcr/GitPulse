@@ -28,16 +28,10 @@
     summarizeCommitReview,
     type BranchCleanupPlan,
     type CommitReviewReport,
-    type IssueInfo,
   } from "../ops/model";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
-  import type { WorkflowRunInfo, GitHubContextBase } from "../github/types";
+  import type { WorkflowRunInfo, GitHubContext } from "../github/types";
 
-  interface OpsGitHubContext extends GitHubContextBase {
-    issues: IssueInfo[];
-    issues_truncated: boolean;
-    issues_error?: string | null;
-  }
 
   const ISSUE_REFRESH_MS = 60_000;
 
@@ -54,7 +48,7 @@
   let cleanup = $state<BranchCleanupPlan | null>(null);
   let selectedBranches = $state<string[]>([]);
   let review = $state<CommitReviewReport | null>(null);
-  let github = $state<OpsGitHubContext | null>(null);
+  let github = $state<GitHubContext | null>(null);
   let busy = $state<string | null>(null);
   /**
    * Set only while the once-a-minute poll refreshes issues in the
@@ -142,7 +136,7 @@
       busy = "issues";
     }
     try {
-      const next = await invoke<OpsGitHubContext>("cmd_github_context", { repoPath: repo });
+      const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;

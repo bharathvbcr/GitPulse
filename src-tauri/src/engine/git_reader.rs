@@ -41,6 +41,24 @@ const MAX_WORKING_TREE_BYTES: u64 = 64 * 1024 * 1024;
 /// as complete would read as fact.
 const MAX_REPO_FILES: usize = 200_000;
 
+/// Ceiling on the changed-file list shipped with a single commit.
+///
+/// A vendored-dependency drop or an initial import touches six figures of
+/// paths, and every one crosses IPC as a `CommitFileChange`. The frontend has
+/// been able to render a capped list honestly since hardening wave 2 — the
+/// `files_list_truncated` flag drives both the "+only first N listed" note and
+/// a header that reports the true count rather than the slice's — but the
+/// backend never set the flag, so the list stayed unbounded and the notice
+/// could never fire. Totals are summed over the full list before the cut, so a
+/// capped commit still reports its real churn.
+const MAX_COMMIT_FILES: usize = 5_000;
+
+/// serde `skip_serializing_if` for a flag that should be absent, not `false`,
+/// when it does not apply — the frontend declares it optional.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     pub name: String,
@@ -160,6 +178,14 @@ pub struct CommitDetails {
     pub changed_files: Vec<CommitFileChange>,
     pub total_additions: usize,
     pub total_deletions: usize,
+    /// The true changed-file count, set only when [`MAX_COMMIT_FILES`] cut the
+    /// list so the header can say "12,000 files" above a 5,000-row slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_total_count: Option<usize>,
+    /// Absent rather than `false` for an uncapped commit, matching the
+    /// frontend interface that has declared both optional all along.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub files_list_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -975,9 +1001,16 @@ impl GitReader {
         let body = fields[10].trim().to_string();
         // Surface file-list failures instead of reporting a commit with
         // silently-empty changes.
-        let changed_files = Self::get_commit_files(repo_path, commit_id)?;
+        let mut changed_files = Self::get_commit_files(repo_path, commit_id)?;
+        // Summed over the full list, before the cap below cuts it: summing the
+        // truncated slice would understate a huge commit's churn silently.
         let total_additions = changed_files.iter().map(|f| f.additions).sum();
         let total_deletions = changed_files.iter().map(|f| f.deletions).sum();
+        let files_total = changed_files.len();
+        let files_list_truncated = files_total > MAX_COMMIT_FILES;
+        if files_list_truncated {
+            changed_files.truncate(MAX_COMMIT_FILES);
+        }
         Ok(CommitDetails {
             id: fields[0].to_string(),
             parent_ids: if fields[1].is_empty() {
@@ -998,6 +1031,8 @@ impl GitReader {
             changed_files,
             total_additions,
             total_deletions,
+            files_total_count: files_list_truncated.then_some(files_total),
+            files_list_truncated,
         })
     }
 

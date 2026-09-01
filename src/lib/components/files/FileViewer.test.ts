@@ -14,7 +14,11 @@ describe("FileViewer", () => {
   });
 
   it("loads file content via cmd_get_file_blob with async protection", () => {
-    expect(source).toContain('invoke<FileBlobPayload>("cmd_get_file_blob"');
+    // FileBlobPayload was a component-local copy of the canonical FileBlob,
+    // field-for-field identical and unable to fail on drift. Asserting the
+    // shared type keeps a local re-declaration from creeping back.
+    expect(source).toContain('invoke<FileBlob>("cmd_get_file_blob"');
+    expect(source).toContain('import type { FileBlob } from "../files/types"');
     expect(source).toContain("createAsyncGuard");
     expect(source).toContain("guard.isLive()");
   });

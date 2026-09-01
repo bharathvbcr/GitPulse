@@ -71,7 +71,12 @@
     ListChecks,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
-  import type { TerminalRunResult } from "../terminal/runResult";
+  import type {
+    TerminalRunResult,
+    TerminalSpawned,
+    TerminalOutputPayload,
+    TerminalExitPayload,
+  } from "../terminal/runResult";
   import { themeStore } from "../stores/themeStore";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
@@ -220,7 +225,7 @@
     term.reset();
     try {
       const dims = fitAddon?.proposeDimensions();
-      const spawned = await invoke<{ id: string; shell: string; cwd: string }>(
+      const spawned = await invoke<TerminalSpawned>(
         "cmd_terminal_spawn",
         {
           repoPath,
@@ -262,7 +267,7 @@
   onMount(() => {
     inputEl?.focus();
     void Promise.all([
-      listen<{ id: string; data_b64: string }>("terminal-output", (event) => {
+      listen<TerminalOutputPayload>("terminal-output", (event) => {
         const bytes = base64ToBytes(event.payload.data_b64);
         if (ptySessionId === event.payload.id) {
           writePty(bytes);
@@ -271,7 +276,7 @@
           if (earlyOutput.length > 64) earlyOutput.shift();
         }
       }),
-      listen<{ id: string; exit_code: number | null; signal: string }>(
+      listen<TerminalExitPayload>(
         "terminal-exit",
         (event) => {
           if (ptySessionId !== event.payload.id) return;

@@ -24,7 +24,11 @@ describe("LivePulseDashboard", () => {
   });
 
   it("detects language and loads file history for active file", () => {
-    expect(source).toContain('invoke<{ name: string; color_hex: string; category: string }>');
+    // The payload was an anonymous object type here until it was named, which
+    // is what puts it under check:types — assert the named type, so reverting
+    // to an inline shape (and out of the contract) fails.
+    expect(source).toContain("invoke<LanguageInfo>");
+    expect(source).toContain('import type { LanguageInfo } from "../../files/types"');
     expect(source).toContain('"cmd_detect_language"');
     expect(source).toContain('"cmd_get_commit_graph"');
   });

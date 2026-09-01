@@ -45,3 +45,30 @@ export interface BranchSection {
 }
 
 export type BranchFilterTab = "all" | "local" | "remote" | "active" | "stale" | "tags" | "pinned";
+
+/**
+ * A single `git reflog` record. Lived inside ReflogViewer until `check:types`
+ * grew wide enough to check it, which needs a module rather than a component.
+ */
+export interface ReflogEntry {
+  index: number;
+  commit_id: string;
+  selector: string;
+  action: string;
+  message: string;
+  timestamp: number;
+}
+
+/** One linked worktree, as reported by `git worktree list --porcelain`. */
+export interface WorktreeInfo {
+  path: string;
+  name: string;
+  head: string;
+  branch: string | null;
+  is_bare: boolean;
+  is_detached: boolean;
+  is_main: boolean;
+  is_locked: boolean;
+  is_prunable: boolean;
+  dirty_files: number | null;
+}

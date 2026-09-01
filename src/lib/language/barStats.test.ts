@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { pickLanguageBarStats, type LanguageStat } from "./barStats";
+import { pickLanguageBarStats, type RepoLanguageStat } from "./barStats";
 
 function stat(
   language: string,
   percentage: number,
   category = "programming",
-): LanguageStat {
+): RepoLanguageStat {
   return { language, color_hex: "#000", category, percentage, code_lines: percentage, file_count: 1 };
 }
 

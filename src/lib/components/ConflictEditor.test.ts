@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import type {
+  ConflictChunk,
+  ConflictDocument,
+  ConflictResolutionChoice,
+} from "../diff/conflict";
 import { render } from "svelte/server";
 import ConflictEditor, { adoptResolutions } from "./ConflictEditor.svelte";
 
@@ -10,34 +15,12 @@ const source = readFileSync(
   "utf8",
 );
 
-/** Structural mirrors of the wire types in ConflictEditor's module script. */
-type TestResolution =
-  | "Unresolved"
-  | "AcceptOurs"
-  | "AcceptTheirs"
-  | "AcceptBothOursFirst"
-  | "AcceptBothTheirsFirst"
-  | { Custom: string };
-
-interface TestChunk {
-  chunk_index: number;
-  start_line: number;
-  end_line: number;
-  ours_label: string;
-  ours_content: string;
-  base_content?: string;
-  theirs_label: string;
-  theirs_content: string;
-  resolution: TestResolution;
-}
-
-interface TestDoc {
-  file_path: string;
-  segments: Array<{ Normal?: string; Conflict?: TestChunk }>;
-  total_conflicts: number;
-}
-
-function chunk(index: number, resolution: TestResolution): TestChunk {
+/**
+ * The real wire types, not structural mirrors. The mirrors could not fail on
+ * drift: they were assignable to whatever the component declared, so both
+ * sides could go stale together.
+ */
+function chunk(index: number, resolution: ConflictResolutionChoice): ConflictChunk {
   return {
     chunk_index: index,
     start_line: index * 10,
@@ -47,14 +30,23 @@ function chunk(index: number, resolution: TestResolution): TestChunk {
     theirs_label: "feature",
     theirs_content: `theirs ${index}`,
     resolution,
+    // Rust has always sent these; the structural mirror this file used to
+    // declare simply left them out, and nothing could say so.
+    ours_crlf: [],
+    theirs_crlf: [],
+    local_crlf: false,
   };
 }
 
-function doc(path: string, chunks: TestChunk[]): TestDoc {
+function doc(path: string, chunks: ConflictChunk[]): ConflictDocument {
   return {
     file_path: path,
     segments: chunks.map((Conflict) => ({ Conflict })),
     total_conflicts: chunks.length,
+    crlf: false,
+    trailing_newline: true,
+    final_crlf: false,
+    normal_crlf_flags: [],
   };
 }
 

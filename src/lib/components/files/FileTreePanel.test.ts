@@ -21,6 +21,21 @@ describe("FileTreePanel", () => {
     expect(source).toContain("'conflicted'");
   });
 
+  /**
+   * Rust flags a row whose numstat record it could not parse, meaning the
+   * +/- counts understate the file. That field crossed IPC from the day it
+   * was added and no TypeScript property received it, so a possibly-wrong
+   * count rendered identically to a verified one.
+   */
+  it("marks churn counts the backend could not verify", () => {
+    expect(source).toContain("status.warnings ?? []");
+    // A distinct colour and a tilde, so the uncertainty survives without hover.
+    expect(source).toContain("text-amber-400");
+    expect(source).toContain('churnWarnings.length > 0 ? "~" : ""');
+    // And the reasons themselves, not just the fact that there were reasons.
+    expect(source).toContain('churnWarnings.join("; ")');
+  });
+
   it("supports file operations (stage, unstage, discard, create file/folder)", () => {
     expect(source).toContain("stageFile");
     expect(source).toContain("unstageFile");

@@ -106,3 +106,27 @@ export function formatRunDetail(res: TerminalRunResult): string {
   if (res.truncated) parts.push("(output clipped)");
   return parts.join("\n");
 }
+
+/** The spawn acknowledgement: which session was started, and where. */
+export interface TerminalSpawned {
+  id: string;
+  shell: string;
+  cwd: string;
+}
+
+/**
+ * Streamed terminal output. Consumed as an anonymous `{ id; data_b64 }` at the
+ * listen() call until it was named — events are a wire surface too, and
+ * check:types could not see this one at all.
+ */
+export interface TerminalOutputPayload {
+  id: string;
+  data_b64: string;
+}
+
+/** Sent once when a session ends: `exit_code` is null when a signal killed it. */
+export interface TerminalExitPayload {
+  id: string;
+  exit_code: number | null;
+  signal: string;
+}

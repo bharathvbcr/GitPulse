@@ -104,12 +104,18 @@ export type SelectionKind = "file" | "commit" | "range";
 
 export interface FileStatus {
   path: string;
-  old_path?: string;
+  old_path?: string | null;
   status_code: string;
   is_staged: boolean;
   is_conflicted: boolean;
   additions: number;
   deletions: number;
+  /**
+   * Why this row's additions/deletions may understate reality — its numstat
+   * record could not be parsed. Rust omits the key entirely while empty, so
+   * this is absent on the overwhelming majority of rows.
+   */
+  warnings?: string[];
 }
 
 export interface ResolvedRepo {
@@ -131,7 +137,7 @@ interface BranchStatsUpdate {
   commits_behind_base: number;
 }
 
-interface BranchStatsReport {
+export interface BranchStatsReport {
   compared_to: string;
   updates: BranchStatsUpdate[];
   computed: number;

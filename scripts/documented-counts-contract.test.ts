@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseRegisteredHandlers, DEFAULT_LIB_RS } from "./check-ipc-contract.mjs";
 import * as checkCoverageTypes from "./check-coverage-types.mjs";
@@ -6,7 +7,7 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
 
 /**
  * README, CONTRIBUTING and ARCHITECTURE state precise counts — 95 IPC
- * handlers, 62 compared fields, 13 views. Numbers in prose rot silently: the
+ * handlers, 357 compared fields, 13 views. Numbers in prose rot silently: the
  * Rust test count sat at "~200+" while the real figure was 890.
  *
  * Each count is taken from the canonical implementation rather than recounted
@@ -81,6 +82,50 @@ describe("documented counts match the code", () => {
     expect(contributing).toContain("2,000+ tests");
     expect(contributing).toContain("850+ tests");
     expect(contributing).not.toContain("~200+");
+  });
+});
+
+describe("the contract-test table in CONTRIBUTING stays honest", () => {
+  // A table listing the safety net is itself a claim that can drift: a test
+  // deleted still listed, or one added and never mentioned, and the table
+  // quietly stops describing what protects the repository.
+  const contributing = read("CONTRIBUTING.md");
+  const files = readdirSync(fileURLToPath(new URL(".", import.meta.url)))
+    .filter((name) => name.endsWith(".test.ts"))
+    .map((name) => name.replace(/\.test\.ts$/, ""));
+
+  /** Tests that belong to a `check:*` script rather than being a contract of their own. */
+  const SCRIPT_UNIT_TESTS = new Set([
+    "check-ipc-contract",
+    "check-coverage-types",
+    "check-coverage-floor",
+    "check-release-version",
+    "check-release-assets",
+    "check-workflows",
+    "release-notes",
+    "dev-port",
+    "vite-config",
+    "usage",
+    "columns",
+  ]);
+
+  it("names only tests that exist", () => {
+    const named = [...contributing.matchAll(/`([a-z-]+-contract|release-workflow)`/g)].map(
+      (m) => m[1],
+    );
+    expect(named.length).toBeGreaterThan(10);
+    for (const name of new Set(named)) {
+      expect(files, `CONTRIBUTING names ${name}, which does not exist`).toContain(name);
+    }
+  });
+
+  it("mentions every contract test that is not a script's own unit test", () => {
+    const undocumented = files.filter(
+      (name) =>
+        !SCRIPT_UNIT_TESTS.has(name) &&
+        !contributing.includes(`\`${name}\``),
+    );
+    expect(undocumented).toEqual([]);
   });
 });
 

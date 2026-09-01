@@ -771,8 +771,21 @@
                   {#if status && changeKind !== "clean"}
                     <span class="px-1 py-0.2 text-[9px] font-bold rounded {rowKindClass(changeKind)}">{rowKindLabel(changeKind)}</span>
                     {#if status.additions > 0 || status.deletions > 0}
-                      <span class="text-[9px] font-mono text-emerald-400">+{status.additions}</span>
-                      <span class="text-[9px] font-mono text-rose-400">-{status.deletions}</span>
+                      {@const churnWarnings = status.warnings ?? []}
+                      <!-- A count the backend flagged as possibly understated
+                           must not render identically to one it verified: the
+                           tilde and amber say "at least this much". -->
+                      <span
+                        class="text-[9px] font-mono {churnWarnings.length > 0
+                          ? 'text-amber-400'
+                          : 'text-emerald-400'}"
+                        title={churnWarnings.length > 0
+                          ? `Line counts may understate this file — ${churnWarnings.join("; ")}`
+                          : undefined}>{churnWarnings.length > 0 ? "~" : ""}+{status.additions}</span>
+                      <span
+                        class="text-[9px] font-mono {churnWarnings.length > 0
+                          ? 'text-amber-400'
+                          : 'text-rose-400'}">-{status.deletions}</span>
                     {/if}
                   {/if}
 

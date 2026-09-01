@@ -6,33 +6,9 @@
     openHours,
     summarizeVelocity,
   } from "../github/prVelocity";
-  import type { WorkflowsReport, GitHubContextBase } from "../github/types";
+  import type { WorkflowsReport, GitHubContext } from "../github/types";
 
-  // Mirrors `PullRequestInfo` in src-tauri/src/github/mod.rs field for field.
-  interface PullRequestInfo {
-    number: number;
-    title: string;
-    state: string;
-    head_ref: string;
-    base_ref: string;
-    url: string;
-    is_draft: boolean;
-    ci_status: string;
-    created_at: string;
-    updated_at: string;
-    review_decision: string;
-    /** Empty when nobody has reviewed yet — not a zero-hour review. */
-    first_review_at: string;
-  }
 
-  interface GitHubContext extends GitHubContextBase {
-    cli_present: boolean;
-    host: string;
-    html_url: string;
-    pull_requests: PullRequestInfo[];
-    /** True when more open PRs exist than the display cap kept. */
-    prs_truncated?: boolean;
-  }
 
   // Survive the per-tab remount so revisiting the GitHub view renders the
   // last-known context and workflow listing instantly; the fetches then
@@ -126,6 +102,8 @@
       html_url: "",
       pull_requests: [],
       prs_truncated: false,
+      issues: [],
+      issues_truncated: false,
       workflow_runs: [],
       runs_error: null,
       runs_truncated: false,

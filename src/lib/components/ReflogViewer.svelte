@@ -1,14 +1,6 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
 
-  interface ReflogEntry {
-    index: number;
-    commit_id: string;
-    selector: string;
-    action: string;
-    message: string;
-    timestamp: number;
-  }
 
   // Survives the per-tab remount so revisiting the reflog view renders the
   // last-known table instantly; the fetch then refreshes it in place.
@@ -16,6 +8,7 @@
 </script>
 
 <script lang="ts">
+  import type { ReflogEntry } from "../branches/types";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import { History } from "lucide-svelte";
