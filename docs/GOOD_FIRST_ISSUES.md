@@ -4,10 +4,11 @@ A staging ground for scoped, self-contained work. Each entry names the files to
 touch, what "done" means, and how to verify it — enough that a contributor can start
 without a design conversation first.
 
-> **Status: draft.** These are not yet open GitHub issues. A maintainer files them
-> (title, body, and labels are ready to copy) and applies the label set in
-> [`.github/labels.yml`](../.github/labels.yml). Until then, comment on an existing
-> issue or open one referencing the entry ID below.
+> **Status: every entry above is closed.** A1–A3, B1–B3, C1–C3, and D1–D2 are
+> implemented (B2 investigated and declined), so this file currently reads as a record
+> of completed work rather than an invitation. New entries follow the format in
+> *Proposing an entry* below, and a maintainer files them as GitHub issues with the
+> label set in [`.github/labels.yml`](../.github/labels.yml).
 
 Every entry assumes you have read [CONTRIBUTING.md](../CONTRIBUTING.md) and can get
 `npm run ci:local` green.
@@ -202,21 +203,24 @@ already loaded, so it costs no additional fetch.
 
 ## D. Documentation & accessibility
 
-### D1 · Fix the three outstanding a11y warnings 🟢
+### D1 · Fix the three outstanding a11y warnings ✅ *(Completed)*
 **Labels:** `good first issue`, `area: frontend`
 
-`npm run check` reports three warnings, unchanged for some time:
+*Fixed in `CommitRow.svelte` and `files/CodeViewer.svelte`; `npm run check` reports
+`0 ERRORS 0 WARNINGS`.*
 
-- `CommitRow.svelte:265` — clickable `<div>` with no keyboard handler
-- `files/CodeViewer.svelte:258` — non-interactive element with a non-negative
-  `tabIndex`, and mouse/keyboard listeners on a non-interactive element
+The commit row's context menu now opens on the ContextMenu key and Shift+F10, anchored
+to the row, and moves focus to its first item; the row advertises the relationship with
+`aria-haspopup`/`aria-expanded`, and Escape closes the menu from inside it. CodeViewer's
+`role="region"` — on an element that takes keystrokes and edits text — became
+`role="textbox"` with `aria-multiline` and an `aria-readonly` that tracks edit mode. Both
+suppression comments were removed rather than relocated.
 
-Each needs a real fix — a keyboard path, or the correct role and semantics — not a
-suppression comment. Keyboard-only navigation must reach the same behaviour the mouse
-does.
-
-- **Done when:** `npm run check` reports `0 ERRORS 0 WARNINGS`, and each element is
-  operable by keyboard alone.
+A follow-up pass found the wider problem this entry only sampled: twenty bare
+`svelte-ignore` comments across ten components meant `npm run check` reporting zero
+warnings said "zero *unsuppressed* warnings". Seven modal dialogs were fixed properly and
+the five genuinely-correct suppressions now state their reasoning, with
+`scripts/a11y-suppression-contract.test.ts` failing on any bare one.
 
 ### D2 · Document the keyboard shortcut surface ✅ *(Completed)*
 **Labels:** `documentation`
