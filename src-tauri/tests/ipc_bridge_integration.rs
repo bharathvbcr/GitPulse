@@ -39,6 +39,9 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_list_branches,
             gitpulse_lib::commands::cmd_get_status,
             gitpulse_lib::commands::cmd_stage_file,
+            gitpulse_lib::commands::cmd_get_commit_graph,
+            gitpulse_lib::commands::cmd_branch_stats,
+            gitpulse_lib::commands::cmd_get_file_diff,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
         // The app's own context, from the same accessor run() uses, so the
@@ -266,4 +269,108 @@ fn a_repo_path_that_is_not_a_repository_fails_on_the_error_channel() {
     )
     .expect_err("a non-repository must not report an empty status");
     assert!(error.is_string(), "expected a string error, got {error}");
+}
+
+#[test]
+fn optional_arguments_may_be_omitted_entirely_by_the_caller() {
+    // The frontend leaves `query`, `revision` and `skip` out rather than
+    // sending nulls. Option<T> must deserialize from an absent key, or every
+    // graph load fails at the bridge before reaching the reader.
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_get_commit_graph",
+        json!({ "repoPath": repo.path().to_string_lossy(), "maxCommits": 50 }),
+    )
+    .expect("the graph loads without the optional arguments");
+    assert!(value.get("rows").is_some(), "payload: {value}");
+}
+
+#[test]
+fn an_explicit_null_is_accepted_where_the_caller_sends_one() {
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_get_commit_graph",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "maxCommits": 50,
+            "query": null,
+            "revision": null,
+            "skip": null
+        }),
+    )
+    .expect("explicit nulls are equivalent to omission");
+    assert!(value.get("rows").is_some(), "payload: {value}");
+}
+
+#[test]
+fn a_wrongly_typed_argument_is_refused_at_the_bridge() {
+    // maxCommits is a usize; a string must not be coerced into one.
+    let repo = repo_with_change();
+    let error = invoke(
+        "cmd_get_commit_graph",
+        json!({ "repoPath": repo.path().to_string_lossy(), "maxCommits": "fifty" }),
+    )
+    .expect_err("a string is not a usize");
+    assert!(
+        error.to_string().contains("maxCommits") || error.to_string().contains("max_commits"),
+        "the failure should name the argument: {error}"
+    );
+}
+
+#[test]
+fn a_boolean_argument_round_trips_rather_than_being_coerced() {
+    let repo = repo_with_change();
+    // isStaged=false is the unstaged diff, which exists for the modified file.
+    let unstaged = invoke(
+        "cmd_get_file_diff",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "README.md",
+            "isStaged": false
+        }),
+    )
+    .expect("an unstaged diff");
+    assert!(unstaged.is_string(), "a raw diff is a string: {unstaged}");
+    assert!(unstaged.as_str().unwrap_or_default().contains("changed"));
+
+    // isStaged=true is a different question with a different answer, so the
+    // flag is genuinely being read rather than defaulted.
+    let staged = invoke(
+        "cmd_get_file_diff",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "README.md",
+            "isStaged": true
+        }),
+    )
+    .expect("a staged diff query");
+    assert_ne!(staged, unstaged, "isStaged must change the result");
+}
+
+#[test]
+fn a_nested_report_struct_keeps_its_shape_across_the_bridge() {
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_branch_stats",
+        json!({ "repoPath": repo.path().to_string_lossy() }),
+    )
+    .expect("branch stats");
+    // An object carrying the nested list, not a flattened scalar the frontend
+    // would have to reconstruct. Asserting only `is_object()` would pass for
+    // almost any payload, so check the fields the TS side actually reads.
+    assert!(value.is_object(), "got: {value}");
+    assert!(
+        value["updates"].is_array(),
+        "updates missing or not a list: {value}"
+    );
+    for field in ["compared_to", "computed", "cached"] {
+        assert!(value.get(field).is_some(), "missing {field} in {value}");
+    }
+    // usize fields must arrive as JSON numbers, not stringified.
+    assert!(
+        value["computed"].is_number(),
+        "computed: {}",
+        value["computed"]
+    );
+    assert!(value["cached"].is_number(), "cached: {}", value["cached"]);
 }
