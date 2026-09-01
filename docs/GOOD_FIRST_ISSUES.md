@@ -163,20 +163,26 @@ column plus an aggregate in `GitHubPanel.svelte`.
   once degraded a whole panel into an error. Verify every field name against
   `gh pr list --json` with no arguments (it prints the valid set) before wiring it in.
 
-### C3 · Commit cadence sparkline 🟢
-**Labels:** `good first issue`, `enhancement`, `area: frontend`
+### C3 · Commit cadence sparkline ✅ *(Completed)*
+**Labels:** `enhancement`, `area: frontend`
 
-The graph store already holds every loaded commit with author timestamps. A small
-commits-per-day sparkline in the status bar or sidebar makes repository rhythm
-visible at no fetch cost.
+*Implemented in [`src/lib/metrics/commitCadence.ts`](../src/lib/metrics/commitCadence.ts)
+and [`CommitCadence.svelte`](../src/lib/components/CommitCadence.svelte), mounted in
+the status bar's centre segment.*
 
-`src/lib/language/barStats.ts` is a working model for a compact stats bar, and
-`ChurnBar.svelte` for the rendering approach.
+Buckets are **local calendar days**, not fixed 86 400-second windows: a calendar day
+is 23 or 25 hours across a DST transition, and dividing epoch seconds would shift
+every later boundary. The axis is built by stepping calendar days, and a test pins
+the March 2026 US transition.
 
-- **Touch:** new `src/lib/metrics/commitCadence.ts` + test, and a component
-- **Done when:** the bucketing function is pure and unit-tested (empty history, a
-  single commit, commits spanning a DST boundary, all commits on one day), and the
-  visual degrades cleanly on a repository with fewer commits than buckets.
+Commits outside the window are excluded rather than clamped into an edge bucket,
+which would invent activity that never happened, and a history shorter than the
+window is reported as `partial` so the view can say the span is the whole loaded
+history rather than implying a quiet stretch.
+
+Tested for empty history, a single commit, all commits on one day, the DST
+boundary, unusable timestamps, and window clamping. It reads the commits the graph
+already loaded, so it costs no additional fetch.
 
 ---
 

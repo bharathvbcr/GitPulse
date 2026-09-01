@@ -1,5 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { graphStore } from "../stores/graphStore";
+  import CommitCadence from "./CommitCadence.svelte";
   import {
     GitBranch,
     RefreshCw,
@@ -118,6 +120,12 @@
 
   <!-- Center Segment: Background Activity -->
   <div class="hidden sm:flex items-center gap-2 text-[10px]">
+    <!-- Cadence reads the commits already loaded for the graph, so it costs
+         no additional fetch. Hidden while syncing, when the window would be
+         drawn from a partially loaded history. -->
+    {#if !$repoStore.isLoading && $graphStore.commits.length > 0}
+      <CommitCadence commits={$graphStore.commits} days={30} />
+    {/if}
     {#if $repoStore.isLoading}
       <div class="flex items-center gap-1.5 text-accent font-medium">
         <RefreshCw size={10} class="animate-spin shrink-0" />
