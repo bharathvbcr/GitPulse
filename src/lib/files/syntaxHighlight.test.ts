@@ -265,9 +265,16 @@ describe("syntaxHighlight — losslessness", () => {
 describe("syntaxHighlight — termination invariant", () => {
   // The at-rule hang came from a scan whose entry condition accepted a
   // character its continuation class rejected, so the index never advanced.
-  // The other scans are safe today because those two classes match. This
-  // asserts the property directly, for every language, so a future divergence
-  // fails here instead of hanging the viewer.
+  //
+  // The rest of the codebase was audited for the same shape and is clean: this
+  // file's other scans use matching entry and continuation classes;
+  // diff/wordDiff.ts advances unconditionally before its inner loop and
+  // already carried a token bound; and the Rust percent-decode
+  // (analyzer/coverage.rs) and base64 encoder (engine/git_reader.rs) advance
+  // in every branch. syntaxHighlight was the only outlier.
+  //
+  // This asserts the property directly, for every language, so a future
+  // divergence fails here instead of hanging the viewer.
   const LANGUAGES = [
     "typescript", "javascript", "rust", "svelte", "html", "css", "json",
     "yaml", "markdown", "python", "go", "shell", "c", "cpp", "sql", "toml",
