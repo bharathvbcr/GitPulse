@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_RENDER_BYTES,
   calculateDocumentStats,
   extractDocumentOutline,
   parseFrontmatter,
@@ -223,5 +224,44 @@ describe("markDevParser — link and image URL schemes", () => {
         true,
       );
     }
+  });
+});
+
+describe("markDevParser — bounded rendering", () => {
+  const block = "## Heading\n\nProse with a [link](https://example.com) and `code`.\n\n";
+  const docOf = (bytes: number) => block.repeat(Math.ceil(bytes / block.length));
+
+  it("renders a normal document whole, with no notice", () => {
+    const out = renderMarkDevMarkdown(docOf(MAX_RENDER_BYTES / 2));
+    expect(out).not.toContain("not shown");
+    expect(out).toContain("Heading");
+  });
+
+  it("caps a document that would take too long, and says so", () => {
+    // Rendering is quadratic in length, so an uncapped megabyte-scale file
+    // freezes the view. A silently truncated document reads exactly like a
+    // complete one that ends abruptly, so the cap has to announce itself.
+    const out = renderMarkDevMarkdown(docOf(MAX_RENDER_BYTES * 4));
+    expect(out).toContain("not shown");
+    expect(out).toMatch(/Rendered the first \d+ KB/);
+    // The reader is told how much is missing, not merely that something is.
+    expect(out).toMatch(/[\d,]+ more characters/);
+  });
+
+  it("stays fast no matter how large the input is", () => {
+    for (const size of [MAX_RENDER_BYTES * 2, MAX_RENDER_BYTES * 16, MAX_RENDER_BYTES * 32]) {
+      const started = Date.now();
+      renderMarkDevMarkdown(docOf(size));
+      expect(Date.now() - started, `${size} bytes took too long`).toBeLessThan(2000);
+    }
+  });
+
+  it("does not choke on a long run of unmatched brackets", () => {
+    // The shape that makes the link patterns scan from every '[' to the end of
+    // the string: O(n) work at O(n) positions.
+    const started = Date.now();
+    const out = renderMarkDevMarkdown("[".repeat(MAX_RENDER_BYTES * 4));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(out).toContain("not shown");
   });
 });

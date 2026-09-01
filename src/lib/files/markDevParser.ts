@@ -241,8 +241,37 @@ function safeUrl(raw: string): string | null {
   return /^(https?|mailto|tel)$/i.test(scheme[1]) ? url : null;
 }
 
+/**
+ * Ceiling on how much markdown is rendered in one pass.
+ *
+ * Rendering is quadratic in document length: the link and wikilink patterns
+ * scan from every `[`, and an unmatched one makes each scan run to the end of
+ * the string. Measured on real content it is ~360ms at 144 KB, ~1.5s at 288 KB
+ * and rising by four for every doubling, so a megabyte-scale CHANGELOG would
+ * lock the viewer for the better part of a minute.
+ *
+ * 128 KB renders in roughly a third of a second and is far above any README
+ * this is likely to meet. Past it the document is rendered up to the cap and
+ * says so, because a silently truncated document reads exactly like a complete
+ * one that ends abruptly.
+ */
+export const MAX_RENDER_BYTES = 128 * 1024;
+
 export function renderMarkDevMarkdown(markdown: string): string {
   if (!markdown) return "";
+
+  if (markdown.length > MAX_RENDER_BYTES) {
+    const shown = markdown.slice(0, MAX_RENDER_BYTES);
+    const remaining = markdown.length - MAX_RENDER_BYTES;
+    return (
+      renderMarkDevMarkdown(shown) +
+      `<div class="my-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3.5 py-2 text-[11px] text-amber-300">` +
+      `Rendered the first ${Math.round(MAX_RENDER_BYTES / 1024)} KB of this document. ` +
+      `${remaining.toLocaleString()} more characters are not shown — rendering the whole file ` +
+      `would take long enough to freeze the view. Open it in the code viewer to read all of it.` +
+      `</div>`
+    );
+  }
 
   // 1. Extract frontmatter
   const { frontmatter, content } = parseFrontmatter(markdown);
@@ -668,15 +697,20 @@ function renderInline(text: string): string {
   out = out.replace(/~~([^~]+)~~/g, '<del class="line-through text-textMuted/70">$1</del>');
 
   // Wikilinks: [[Target|Alias]] or [[Target]]
-  out = out.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => {
+  out = out.replace(/\[\[([^\]|]{1,500})(?:\|([^\]]{1,500}))?\]\]/g, (_m, target, alias) => {
     const label = alias || target;
     return `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 font-mono text-[11px] border border-purple-500/30 font-medium"><span>[[</span><span class="text-textPrimary font-normal">${escapeHtml(
       label
     )}</span><span>]]</span></span>`;
   });
 
+  // The {1,500} / {1,2000} bounds are not cosmetic. With an unbounded
+  // `[^\]]+`, each `[` scans to the end of the string looking for a closing
+  // bracket, so a run of unmatched brackets costs O(n) at O(n) positions: 80k
+  // of them took 6.4 seconds. Bounding the scan makes that 200ms while staying
+  // far above any real link label or URL.
   // Images: ![alt](src)
-  out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt, src) => {
+  out = out.replace(/!\[([^\]]{0,500})\]\(([^)]{1,2000})\)/g, (_m, alt, src) => {
     const safe = safeUrl(src);
     // An image with an unusable source renders as its alt text rather than a
     // broken frame, so the reader still sees what the author wrote.
@@ -689,7 +723,7 @@ function renderInline(text: string): string {
   });
 
   // Links: [text](url)
-  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, text, href) => {
+  out = out.replace(/\[([^\]]{1,500})\]\(([^)]{1,2000})\)/g, (_m, text, href) => {
     const safe = safeUrl(href);
     // A refused link keeps its text: dropping it would hide content, and
     // rendering it as a link would be the thing being prevented.
