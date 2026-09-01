@@ -222,6 +222,12 @@ pub fn build_native_menu<R: Runtime>(
             )?,
             &item(app, actions::TAB_TERMINAL, "Terminal", None)?,
             &item(app, actions::TAB_MANVI, "MANVI", None)?,
+            // Storage and Reflog are registered views with a menu group, but
+            // had no menu item: Storage had no action at all, and Reflog had
+            // one that nothing could emit. Both were reachable only through
+            // the command palette.
+            &item(app, actions::TAB_STORAGE, "Storage", None)?,
+            &item(app, actions::TAB_REFLOG, "Reflog", None)?,
             &PredefinedMenuItem::separator(app)?,
             &item(
                 app,
