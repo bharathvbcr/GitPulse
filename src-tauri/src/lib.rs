@@ -21,6 +21,17 @@ use commands::*;
 use desktop::{cmd_resolve_git_root, cmd_set_recent_menu, cmd_take_pending_open};
 use logging::cmd_diagnostic_log_tail;
 
+/// The application's Tauri context, generated once.
+///
+/// `generate_context!` embeds the bundle metadata (including Info.plist on
+/// macOS) at each expansion site, so calling it in both `run` and the IPC
+/// bridge tests made the linker warn about a duplicate `__EMBED_INFO_PLIST`
+/// symbol. Generating it here lets the tests build a webview with the app's
+/// real capabilities from the same source `run` uses.
+pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
+    tauri::generate_context!()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     logging::init();
@@ -141,7 +152,7 @@ pub fn run() {
             cmd_diagnostic_log_tail,
             cmd_check_app_update,
         ])
-        .build(tauri::generate_context!())
+        .build(context())
         .expect("error while building GitPulse")
         .run(|app, event| {
             desktop::handle_run_event(app, &event);

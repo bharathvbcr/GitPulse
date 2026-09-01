@@ -27,9 +27,10 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_compute_word_diff,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
-        // The real context, not a mock one: it carries the capabilities that
-        // decide whether a command is allowed to be invoked at all.
-        .build(tauri::generate_context!())
+        // The app's own context, from the same accessor run() uses, so the
+        // capabilities deciding whether a command may be invoked are the real
+        // ones — and the bundle metadata is embedded once, not twice.
+        .build(gitpulse_lib::context())
         .expect("mock app builds");
     WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
