@@ -16,7 +16,12 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** `v0.0.3` and `0.0.3` both address the `## [0.0.3]` heading. */
+/**
+ * `v0.0.3` and `0.0.3` both address the `## [0.0.3]` heading.
+ *
+ * @param {unknown} tag
+ * @returns {string}
+ */
 export function normalizeTag(tag) {
   const trimmed = String(tag ?? "").trim();
   if (!trimmed) throw new Error("tag is empty");
@@ -54,8 +59,13 @@ export function extractNotes(markdown, tag) {
   return { found: true, version, date: sections[at].date, body };
 }
 
+/**
+ * @param {string[]} argv
+ * @returns {{ tag: string | null, changelog: string | null, help: boolean }}
+ */
 function parseArgs(argv) {
-  const options = { tag: null, changelog: null };
+  /** @type {{ tag: string | null, changelog: string | null, help: boolean }} */
+  const options = { tag: null, changelog: null, help: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--help" || flag === "-h") return { ...options, help: true };
@@ -69,6 +79,7 @@ function parseArgs(argv) {
   return options;
 }
 
+/** @param {string[]} [argv] */
 export function main(argv = process.argv.slice(2)) {
   let options;
   try {

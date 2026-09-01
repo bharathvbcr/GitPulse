@@ -257,10 +257,12 @@ describe("report alignment (A3)", () => {
       invokedCount: 87,
       siteCount: 106,
       productionFiles: 157,
-      orphans: [],
-      missing: [],
-      allowedOrphans: [],
-      manualReviews: [],
+      orphans: [] as string[],
+      missing: [] as string[],
+      allowedOrphans: [] as string[],
+      staleAllowlist: [] as string[],
+      manualReviews: [] as { file: string; line: number; detail: string }[],
+      violations: [] as string[],
       ok: true,
     };
     const long = formatReport(result, "a/very/deeply/nested/path/to/src-tauri/src/lib.rs".repeat(3));

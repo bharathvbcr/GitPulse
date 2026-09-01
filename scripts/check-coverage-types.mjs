@@ -550,7 +550,7 @@ export function main(argv = process.argv.slice(2)) {
     console.log(usage());
     return 0;
   }
-  /** @type {{ rustPath: string, tsPath: string }} */
+  /** @type {{ rustPath: string, tsPath: string, json: boolean }} */
   let opts;
   try {
     opts = parseArgs(argv);

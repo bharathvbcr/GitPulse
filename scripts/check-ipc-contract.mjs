@@ -563,7 +563,7 @@ export function main(argv = process.argv.slice(2)) {
     console.log(usage());
     return 0;
   }
-  /** @type {{libPath: string, srcDirs: string[]}} */
+  /** @type {{libPath: string, srcDirs: string[], json: boolean}} */
   let opts;
   try {
     opts = parseArgs(argv);
