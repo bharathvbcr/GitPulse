@@ -331,13 +331,29 @@ pub fn cmd_compute_word_diff(old_line: String, new_line: String) -> IntraLineDif
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<(), String> {
-    off_thread(move || GitWriter::stage_file(&repo_path, &file_path)).await
+pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        // GitWriter uses this literal pathspec, so the harness judges the
+        // command that will actually reach Git rather than a paraphrase.
+        let spec = format!(":(literal){file_path}");
+        let argv = ["git", "add", "--", spec.as_str()];
+        let policy = guard(&repo_path, &argv)?;
+        GitWriter::stage_file(&repo_path, &file_path)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<(), String> {
-    off_thread(move || GitWriter::unstage_file(&repo_path, &file_path)).await
+pub async fn cmd_unstage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let spec = format!(":(literal){file_path}");
+        let argv = ["git", "restore", "--staged", "--", spec.as_str()];
+        let policy = guard(&repo_path, &argv)?;
+        GitWriter::unstage_file(&repo_path, &file_path)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -787,8 +803,26 @@ pub async fn cmd_review_outgoing_commits(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_fetch(repo_path: String, remote: Option<String>) -> Result<String, String> {
-    off_thread(move || GitWriter::fetch(&repo_path, remote.as_deref())).await
+pub async fn cmd_fetch(
+    repo_path: String,
+    remote: Option<String>,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let argv: Vec<String> = match remote.as_deref() {
+            Some(remote) => vec!["git".into(), "fetch".into(), remote.into()],
+            None => vec![
+                "git".into(),
+                "fetch".into(),
+                "--all".into(),
+                "--prune".into(),
+            ],
+        };
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = GitWriter::fetch(&repo_path, remote.as_deref())?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -910,13 +944,30 @@ pub async fn cmd_restack(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stash_save(repo_path: String, message: Option<String>) -> Result<String, String> {
-    off_thread(move || GitWriter::stash_save(&repo_path, message.as_deref())).await
+pub async fn cmd_stash_save(
+    repo_path: String,
+    message: Option<String>,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let mut argv = vec!["git", "stash", "push", "-u"];
+        if message.is_some() {
+            argv.extend(["-m", message.as_deref().unwrap_or_default()]);
+        }
+        let policy = guard(&repo_path, &argv)?;
+        let output = GitWriter::stash_save(&repo_path, message.as_deref())?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
-pub async fn cmd_stash_pop(repo_path: String) -> Result<String, String> {
-    off_thread(move || GitWriter::stash_pop(&repo_path)).await
+pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let policy = guard(&repo_path, &["git", "stash", "pop"])?;
+        let output = GitWriter::stash_pop(&repo_path)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 /// Throws away a file's working-tree changes, after the write gate has judged
