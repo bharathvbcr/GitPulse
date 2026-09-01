@@ -421,13 +421,16 @@ function parseRustFields(body, renameAll) {
  * Locate each checked struct's declaration and body in the Rust source.
  *
  * @param {string} rustSource raw coverage.rs contents
+ * @param {readonly string[]} [checked] struct names to parse
+ * @param {{ requirePub?: boolean }} [options] `requirePub: false` reads structs
+ *        that never cross IPC on their own, such as the `gh` JSON DTOs
  * @returns {{
  *   structs: Map<string, { fields: Map<string, { type: string, optional: boolean }>, line: number }>,
  *   unparseable: Array<{ struct: string, segment: string }>,
  *   violations: string[],
  * }}
  */
-export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
+export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS, { requirePub = true } = {}) {
   const stripped = stripComments(rustSource);
   const structs = new Map();
   /** @type {Array<{ struct: string, segment: string }>} */
@@ -436,10 +439,13 @@ export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
   const violations = [];
 
   for (const name of checked) {
-    const declRe = new RegExp(`pub struct ${name}\\b`);
+    // IPC payloads must be `pub` to be returned by a command, so a private one
+    // is a real finding. Callers reading structs that never cross IPC on their
+    // own — the `gh` JSON DTOs, say — opt out of that requirement.
+    const declRe = new RegExp(`${requirePub ? "pub " : "(?:pub )?"}struct ${name}\\b`);
     const decl = declRe.exec(stripped);
     if (!decl) {
-      violations.push(`rust: struct ${name} not found (renamed, removed, or made private?)`);
+      violations.push(`rust: struct ${name} not found (renamed, removed${requirePub ? ", or made private" : ""}?)`);
       continue;
     }
     const openBrace = stripped.indexOf("{", decl.index);
