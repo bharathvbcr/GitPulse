@@ -17,8 +17,15 @@ import { ORPHAN_ALLOWLIST } from "./check-ipc-contract.mjs";
  */
 const RUST_ROOT = fileURLToPath(new URL("../src-tauri/src/", import.meta.url));
 
-/** Types that appear in command signatures but are not payload structs. */
-const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "Guarded", "Box"]);
+/**
+ * Types that appear in command signatures but are not payload structs.
+ *
+ * Only language and std containers belong here. `Guarded` sat in this list for
+ * a while and did not belong: it is this codebase's own serde struct, with
+ * `policy` and `output` fields, riding on 33 commands — excluding it meant the
+ * envelope was neither checked nor counted as unchecked.
+ */
+const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "Box"]);
 
 /**
  * Unchecked IPC payload types, each with why it cannot be compared today.

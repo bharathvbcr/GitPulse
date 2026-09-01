@@ -7,7 +7,7 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
 
 /**
  * README, CONTRIBUTING and ARCHITECTURE state precise counts — 95 IPC
- * handlers, 351 compared fields, 13 views. Numbers in prose rot silently: the
+ * handlers, 357 compared fields, 13 views. Numbers in prose rot silently: the
  * Rust test count sat at "~200+" while the real figure was 890.
  *
  * Each count is taken from the canonical implementation rather than recounted

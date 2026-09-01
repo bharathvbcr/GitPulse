@@ -19,9 +19,11 @@ import { describe, expect, it } from "vitest";
  *   - CommitDetailsPayload, four fields behind the canonical CommitDetails.
  *   - FileBlobPayload, a byte-identical copy of FileBlob.
  *
- * The heuristic is snake_case property names. The frontend writes camelCase,
- * so two or more snake_case fields in one declaration means it is mirroring a
- * serde struct.
+ * The heuristic is snake_case property names: the frontend writes camelCase,
+ * so a snake_case field in a declaration means it is mirroring a serde struct.
+ * One is enough — a mirror of `RebaseStep { commit_id, action }` carries
+ * exactly one — and at the time this was tightened from two, it flagged
+ * nothing new, so the stricter rule cost nothing to adopt.
  */
 const COMPONENT_ROOT = fileURLToPath(new URL("../src/", import.meta.url));
 
@@ -66,7 +68,7 @@ function wireShapedTypesIn(source: string): string[] {
     const fields = new Set(
       [...body(source, match.index ?? 0).matchAll(/^\s*(\w+_\w+)\s*\??\s*:/gm)].map((f) => f[1]),
     );
-    if (fields.size >= 2) found.push(match[1]);
+    if (fields.size >= 1) found.push(match[1]);
   }
   return found;
 }
@@ -134,6 +136,10 @@ describe("wire types live in modules, not components", () => {
     expect(
       wireShapedTypesIn("<script>\n  interface P {\n    a_b: string;\n    c_d: number;\n  }\n</script>"),
     ).toEqual(["P"]);
+    // A single snake_case field is enough, as RebaseStep would have.
+    expect(
+      wireShapedTypesIn("<script>\n  interface R {\n    commit_id: string;\n    action: string;\n  }\n</script>"),
+    ).toEqual(["R"]);
     // camelCase is the frontend's own vocabulary and must not trip it.
     expect(
       wireShapedTypesIn("<script>\n  interface Q {\n    aB: string;\n    cD: number;\n  }\n</script>"),

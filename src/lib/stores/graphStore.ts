@@ -142,9 +142,17 @@ export interface FoldedBranchRun {
 }
 
 /** A branch, remote branch, tag or detached HEAD pointing at a row. */
+/**
+ * Mirrors Rust's `RefKind` enum, which carries
+ * `#[serde(rename_all = "lowercase")]`. Named rather than inlined so the
+ * enum-variant contract can compare the two sides: a renamed variant would
+ * otherwise leave TypeScript compiling while the comparison stopped matching.
+ */
+export type RefKind = "local" | "remote" | "tag" | "head";
+
 export interface RefDecoration {
   name: string;
-  kind: "local" | "remote" | "tag" | "head";
+  kind: RefKind;
   commit_id: string;
   is_head: boolean;
 }

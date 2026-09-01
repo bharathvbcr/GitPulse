@@ -13,8 +13,10 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 29 contracts over
- * 51 structs, spanning both wire surfaces: command returns and event payloads. That is most, not all, of the named types crossing the IPC
+ * SCOPE: see CONTRACTS below for exactly what is checked — 31 contracts over
+ * 53 structs, spanning both wire surfaces: command returns and event payloads.
+ * Enums are still skipped here and covered separately, by
+ * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
  * component rather than a module, so there is no single file to point this at.
  * "Type contract holds" means the listed contracts hold. The remaining gap is
@@ -112,9 +114,14 @@ export const CONTRACTS = Object.freeze([
   { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport"] },
   { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  // The envelope on every gated command: `policy` travels with `output` so the
+  // UI can tell an approved action from one that ran with no gate available.
+  // Renaming either field would have broken 33 commands at once, silently.
+  { label: "guarded", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["Guarded"] },
   { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo"] },
   { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
   { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
+  { label: "refs", rustPath: rust("graph", "refs.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["RefDecoration"] },
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
