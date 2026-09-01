@@ -243,13 +243,7 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
         );
     }
 
-    let mut results: Vec<CiStepResult> = Vec::with_capacity(plan.len());
-    let mut failed_early = false;
-    for step in plan {
-        if failed_early {
-            results.push(skipped_result(&step));
-            continue;
-        }
+    let results = run_plan(plan, |step| {
         let step_started = Instant::now();
         let arg_refs: Vec<&str> = step.args.iter().map(String::as_str).collect();
         let outcome = capture_command(
@@ -260,21 +254,54 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
             NPM_CI_ENV,
         );
         let duration_ms = u64::try_from(step_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (outcome, duration_ms)
+    });
+
+    Ok(summarize(
+        results,
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Walk the plan, stopping at the first step that does not pass.
+///
+/// The runner is injected so the sequencing can be tested without spawning
+/// anything: what a user sees after a failure — every later step marked
+/// "skipped" rather than silently missing, or worse, still attempted — is
+/// behaviour, and it had no test while it lived inside the loop that shells
+/// out to npm and cargo.
+fn run_plan(
+    plan: Vec<CiStep>,
+    mut run: impl FnMut(&CiStep) -> (Result<CapturedOutput, String>, u64),
+) -> Vec<CiStepResult> {
+    let mut results: Vec<CiStepResult> = Vec::with_capacity(plan.len());
+    let mut failed_early = false;
+    for step in plan {
+        if failed_early {
+            results.push(skipped_result(&step));
+            continue;
+        }
+        let (outcome, duration_ms) = run(&step);
         let result = step_result(&step, outcome, duration_ms);
         failed_early = result.status != "passed";
         results.push(result);
     }
+    results
+}
 
-    let passed = results.iter().filter(|r| r.status == "passed").count();
-    let failed = results.iter().filter(|r| r.status == "failed").count();
-    let skipped = results.iter().filter(|r| r.status == "skipped").count();
-    Ok(CiLocalReport {
-        passed,
-        failed,
-        skipped,
+/// Tally the run.
+///
+/// The frontend colours its header red on `failed > 0` alone, so miscounting
+/// a skipped step as failed — or a failed one as skipped — is the difference
+/// between a run that reads as broken and one that reads as fine.
+fn summarize(results: Vec<CiStepResult>, total_duration_ms: u64) -> CiLocalReport {
+    CiLocalReport {
+        passed: results.iter().filter(|r| r.status == "passed").count(),
+        failed: results.iter().filter(|r| r.status == "failed").count(),
+        skipped: results.iter().filter(|r| r.status == "skipped").count(),
         steps: results,
-        total_duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-    })
+        total_duration_ms,
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +404,98 @@ mod tests {
     /// the question of whether the run should carry on past it — and the
     /// frontend, which colours by these three and sums `failed` to decide
     /// whether the header goes red, cannot be handed a fourth silently.
+    fn plan_of(names: &[&'static str]) -> Vec<CiStep> {
+        names
+            .iter()
+            .map(|name| CiStep {
+                name,
+                program: "npm".into(),
+                args: vec!["test".into()],
+            })
+            .collect()
+    }
+
+    /// After one step fails, every later step must be recorded as skipped —
+    /// not attempted, and not quietly dropped from the report. The injected
+    /// runner counts its own calls, so "not attempted" is asserted rather
+    /// than assumed from the output.
+    #[test]
+    fn a_failure_skips_every_later_step_without_running_it() {
+        let mut attempted: Vec<&str> = Vec::new();
+        let results = run_plan(plan_of(&["one", "two", "three"]), |step| {
+            attempted.push(step.name);
+            let outcome = if step.name == "two" {
+                Ok(captured(false, 1, "", "Error: boom"))
+            } else {
+                Ok(captured(true, 0, "", ""))
+            };
+            (outcome, 7)
+        });
+
+        assert_eq!(
+            attempted,
+            vec!["one", "two"],
+            "the third step must never be spawned"
+        );
+        let statuses: Vec<&str> = results.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, vec!["passed", "failed", "skipped"]);
+        assert_eq!(results.len(), 3, "a skipped step still gets a row");
+        assert_eq!(results[2].duration_ms, 0);
+    }
+
+    /// A step that could not be spawned stops the run for the same reason a
+    /// failing one does: nothing after it can be trusted to mean anything.
+    #[test]
+    fn a_step_that_could_not_run_also_stops_the_run() {
+        let results = run_plan(plan_of(&["one", "two"]), |step| {
+            let outcome = if step.name == "one" {
+                Err("no such file or directory".to_string())
+            } else {
+                Ok(captured(true, 0, "", ""))
+            };
+            (outcome, 3)
+        });
+        assert!(results[0].detail.starts_with(COULD_NOT_RUN));
+        assert_eq!(results[1].status, "skipped");
+    }
+
+    #[test]
+    fn an_all_passing_plan_runs_every_step() {
+        let mut count = 0;
+        let results = run_plan(plan_of(&["one", "two", "three"]), |_| {
+            count += 1;
+            (Ok(captured(true, 0, "", "")), 1)
+        });
+        assert_eq!(count, 3);
+        assert!(results.iter().all(|r| r.status == "passed"));
+    }
+
+    /// The header goes red on `failed > 0` alone, so the tallies decide
+    /// whether a run reads as broken or fine. A skipped step is not a failure
+    /// and must not be counted as one.
+    #[test]
+    fn the_tally_counts_each_status_in_its_own_column() {
+        let results = run_plan(plan_of(&["one", "two", "three", "four"]), |step| {
+            let outcome = if step.name == "two" {
+                Ok(captured(false, 1, "", "Error: boom"))
+            } else {
+                Ok(captured(true, 0, "", ""))
+            };
+            (outcome, 1)
+        });
+        let report = summarize(results, 4_200);
+
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.total_duration_ms, 4_200);
+        assert_eq!(
+            report.passed + report.failed + report.skipped,
+            report.steps.len(),
+            "every step lands in exactly one column"
+        );
+    }
+
     #[test]
     fn the_status_vocabulary_is_exactly_these_three() {
         let produced: Vec<String> = vec![
