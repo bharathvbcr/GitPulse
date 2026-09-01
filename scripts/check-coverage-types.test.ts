@@ -120,6 +120,34 @@ describe("check:types coverage contract", () => {
     expect(stdout).toMatch(/FAIL: type contract violated/);
   });
 
+  it("fails when a shared Rust field changes wire type without changing its name", async () => {
+    const rustCopy = await scratchCopy(DEFAULT_RUST_SOURCE, "rust-type-drift");
+    const source = await readFile(rustCopy, "utf8");
+    const seeded = source.replace("pub lines_hit: usize,", "pub lines_hit: String,");
+    expect(seeded).toContain("pub lines_hit: String");
+    await writeFile(rustCopy, seeded);
+
+    const { code, stdout } = await runScript(["--rust", rustCopy]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(
+      /drift: CoverageTotals\.lines_hit type mismatch \(Rust string; TS number\)/,
+    );
+  });
+
+  it("fails when a shared TypeScript field changes wire type without changing its name", async () => {
+    const tsCopy = await scratchCopy(DEFAULT_TS_SOURCE, "ts-type-drift");
+    const source = await readFile(tsCopy, "utf8");
+    const seeded = source.replace("  lines_hit: number;", "  lines_hit: string;");
+    expect(seeded).toContain("lines_hit: string");
+    await writeFile(tsCopy, seeded);
+
+    const { code, stdout } = await runScript(["--ts", tsCopy]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(
+      /drift: CoverageTotals\.lines_hit type mismatch \(Rust number; TS string\)/,
+    );
+  });
+
   it("honors per-field serde renames when matching wire names", async () => {
     const rustCopy = await scratchCopy(DEFAULT_RUST_SOURCE, "serde-rename");
     const source = await readFile(rustCopy, "utf8");

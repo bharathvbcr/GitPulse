@@ -10,6 +10,8 @@
  *
  *   (a) a Rust field with no TS property (TS reads `undefined` for it), or
  *   (b) a TS property with no Rust field (Rust never sends it).
+ *   (c) a shared field whose normalized wire type or backend-required
+ *       presence no longer agrees.
  *
  * Serde awareness: per-field `#[serde(rename = "x")]` changes the wire name
  * and is honored; `#[serde(skip)]` drops the field from the wire; a checked
@@ -131,12 +133,84 @@ function serdeOptions(attr) {
 }
 
 /**
+ * Normalize the Rust types used by the checked payloads to their JSON wire
+ * equivalents. This is deliberately small and explicit: an unfamiliar type
+ * is kept as a named token so a refactor cannot silently become `unknown`.
+ *
+ * @param {string} type
+ * @returns {string}
+ */
+function normalizeRustType(type) {
+  const compact = type.replace(/\s+/g, "");
+  const option = /^Option<(.*)>$/.exec(compact);
+  if (option) return [normalizeRustType(option[1]), "null"].sort().join("|");
+  const vector = /^Vec<(.*)>$/.exec(compact);
+  if (vector) return `${normalizeRustType(vector[1])}[]`;
+  const array = /^\[(.*);\d+\]$/.exec(compact);
+  if (array) return `${normalizeRustType(array[1])}[]`;
+  if (compact === "String" || compact === "&str" || compact === "str") return "string";
+  if (compact === "bool") return "boolean";
+  if (/^(?:u|i)(?:8|16|32|64|128|size)$/.test(compact) || /^(?:f32|f64)$/.test(compact)) {
+    return "number";
+  }
+  return compact;
+}
+
+/**
+ * Split a type expression at top-level separators only.
+ * @param {string} type
+ * @param {string} separator
+ * @returns {string[]}
+ */
+function splitTopLevel(type, separator) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of type) {
+    if ("<[{(".includes(ch)) depth += 1;
+    if (">]})".includes(ch)) depth -= 1;
+    if (ch === separator && depth === 0) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  parts.push(current);
+  return parts;
+}
+
+/**
+ * Normalize the TypeScript types used by the checked interfaces to the same
+ * compact wire vocabulary as the Rust side.
+ *
+ * @param {string} type
+ * @returns {string}
+ */
+function normalizeTsType(type) {
+  const compact = type.replace(/\s+/g, "");
+  const unionParts = splitTopLevel(compact, "|");
+  if (unionParts.length > 1) {
+    const unions = unionParts.map((part) => normalizeTsType(part));
+    return [...new Set(unions)].sort().join("|");
+  }
+  const array = /^(.*)\[\]$/.exec(compact);
+  if (array) return `${normalizeTsType(array[1])}[]`;
+  const genericArray = /^Array<(.*)>$/.exec(compact);
+  if (genericArray) return `${normalizeTsType(genericArray[1])}[]`;
+  if (compact === "string" || compact === "boolean" || compact === "number" || compact === "null" || compact === "undefined") {
+    return compact;
+  }
+  return compact;
+}
+
+/**
  * Extract field entries from a Rust struct body: top-level comma segments,
  * each optionally led by attributes, shaped `pub name: Type`.
  *
  * @param {string} body comment-stripped struct body
- * @returns {{ fields: Map<string, string>, unparseable: string[] }}
- *          wire-name -> nothing (map keys only); unparseable segments verbatim
+ * @returns {{ fields: Map<string, { type: string, optional: boolean }>, unparseable: string[] }}
+ *          wire-name -> normalized wire type/presence; unparseable segments verbatim
  */
 function parseRustFields(body) {
   /** @type {string[]} */
@@ -155,6 +229,7 @@ function parseRustFields(body) {
   }
   if (current.trim() !== "") segments.push(current);
 
+  /** @type {Map<string, { type: string, optional: boolean }>} */
   const fields = new Map();
   const unparseable = [];
   for (const rawSegment of segments) {
@@ -176,15 +251,20 @@ function parseRustFields(body) {
     }
     let wireName = fieldDecl[1];
     let skipped = false;
+    let optional = false;
     for (const attr of attrs) {
       const options = serdeOptions(attr);
       if (!options) continue;
       if (options.has("skip")) skipped = true;
+      if (options.has("default") || options.has("skip_serializing_if")) optional = true;
       if (options.has("rename") && typeof options.get("rename") === "string") {
         wireName = /** @type {string} */ (options.get("rename"));
       }
     }
-    if (!skipped) fields.set(wireName, rest.trim());
+    if (!skipped) {
+      const type = rest.trim().slice(rest.trim().indexOf(":") + 1).trim();
+      fields.set(wireName, { type: normalizeRustType(type), optional });
+    }
   }
   return { fields, unparseable };
 }
@@ -194,7 +274,7 @@ function parseRustFields(body) {
  *
  * @param {string} rustSource raw coverage.rs contents
  * @returns {{
- *   structs: Map<string, { fields: Map<string, string>, line: number }>,
+ *   structs: Map<string, { fields: Map<string, { type: string, optional: boolean }>, line: number }>,
  *   unparseable: Array<{ struct: string, segment: string }>,
  *   violations: string[],
  * }}
@@ -253,7 +333,7 @@ export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
  *
  * @param {string} tsSource raw types.ts contents
  * @returns {{
- *   interfaces: Map<string, { props: Set<string>, line: number }>,
+ *   interfaces: Map<string, { props: Map<string, { type: string, optional: boolean }>, line: number }>,
  *   unparseable: Array<{ interface: string, segment: string }>,
  *   violations: string[],
  * }}
@@ -280,20 +360,20 @@ export function parseTsInterfaces(tsSource, checked = CHECKED_STRUCTS) {
     }
     try {
       const body = balancedBody(stripped, openBrace);
-      /** @type {Set<string>} */
-      const props = new Set();
+      /** @type {Map<string, { type: string, optional: boolean }>} */
+      const props = new Map();
       let depth = 0;
       let current = "";
       const flush = () => {
         const segment = current.trim();
         current = "";
         if (segment === "") return;
-        const prop = /^(\w+)\s*(\?)?:/.exec(segment);
+        const prop = /^(?:readonly\s+)?(\w+)\s*(\?)?:\s*([\s\S]+)$/.exec(segment);
         if (!prop) {
           unparseable.push({ interface: name, segment: segment.replace(/\s+/g, " ").slice(0, 80) });
           return;
         }
-        props.add(prop[1]);
+        props.set(prop[1], { type: normalizeTsType(prop[3]), optional: prop[2] === "?" });
       };
       for (const ch of body) {
         if (ch === "{" || ch === "(" || ch === "[") depth += 1;
@@ -319,6 +399,8 @@ export function parseTsInterfaces(tsSource, checked = CHECKED_STRUCTS) {
 export function compareTypes(rust, ts, checked = CHECKED_STRUCTS) {
   /** @type {Array<{ struct: string, rustOnly: string[], tsOnly: string[] }>} */
   const drifts = [];
+  /** @type {Array<{ struct: string, field: string, rustType: string, tsType: string, rustOptional: boolean, tsOptional: boolean }>} */
+  const typeDrifts = [];
   let fieldCount = 0;
   for (const name of checked) {
     const rustStruct = rust.structs.get(name);
@@ -326,10 +408,30 @@ export function compareTypes(rust, ts, checked = CHECKED_STRUCTS) {
     if (!rustStruct || !tsIface) continue;
     fieldCount += rustStruct.fields.size;
     const rustOnly = [...rustStruct.fields.keys()].filter((f) => !tsIface.props.has(f)).sort();
-    const tsOnly = [...tsIface.props].filter((f) => !rustStruct.fields.has(f)).sort();
+    const tsOnly = [...tsIface.props.keys()].filter((f) => !rustStruct.fields.has(f)).sort();
     if (rustOnly.length > 0 || tsOnly.length > 0) drifts.push({ struct: name, rustOnly, tsOnly });
+    for (const field of rustStruct.fields.keys()) {
+      const tsField = tsIface.props.get(field);
+      if (!tsField) continue;
+      const rustField = rustStruct.fields.get(field);
+      if (!rustField) continue;
+      // A TS optional property is a safe compatibility widening for a Rust
+      // field that is always serialized (Option<T> is nullable, not absent).
+      // The dangerous direction is Rust being able to omit a field while TS
+      // requires it; that would surface as undefined at runtime.
+      if (rustField.type !== tsField.type || (rustField.optional && !tsField.optional)) {
+        typeDrifts.push({
+          struct: name,
+          field,
+          rustType: rustField.type,
+          tsType: tsField.type,
+          rustOptional: rustField.optional,
+          tsOptional: tsField.optional,
+        });
+      }
+    }
   }
-  return { drifts, fieldCount };
+  return { drifts, typeDrifts, fieldCount };
 }
 
 /**
@@ -338,7 +440,7 @@ export function compareTypes(rust, ts, checked = CHECKED_STRUCTS) {
 export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS }) {
   const rust = parseRustStructs(readFileSync(rustPath, "utf8"), structs);
   const ts = parseTsInterfaces(readFileSync(tsPath, "utf8"), structs);
-  const { drifts, fieldCount } = compareTypes(rust, ts, structs);
+  const { drifts, typeDrifts, fieldCount } = compareTypes(rust, ts, structs);
 
   /** @type {string[]} */
   const violations = [...rust.violations, ...ts.violations];
@@ -356,12 +458,24 @@ export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS }) {
       violations.push(`drift: ${drift.struct}.${field} exists in TS but Rust never sends it (renamed or deleted backend-side?)`);
     }
   }
+  for (const drift of typeDrifts) {
+    violations.push(
+      `drift: ${drift.struct}.${drift.field} type mismatch (Rust ${drift.rustType}; TS ${drift.tsType})`,
+    );
+    if (drift.rustOptional && !drift.tsOptional) {
+      violations.push(
+        `drift: ${drift.struct}.${drift.field} may be absent from Rust but is required in TS`,
+      );
+    }
+  }
 
   return {
     rustCount: rust.structs.size,
     tsCount: ts.interfaces.size,
     fieldCount,
     driftCount: drifts.length,
+    typeDriftCount: typeDrifts.length,
+    typeDrifts,
     drifts,
     violations,
     ok: violations.length === 0,
@@ -381,6 +495,7 @@ export function formatReport(result, rustLabel, tsLabel, title = "Coverage IPC t
     `  ts interfaces checked   : ${result.tsCount}  (${tsLabel})`,
     `  fields compared         : ${result.fieldCount}`,
     `  drifted structs         : ${result.driftCount}`,
+    `  drifted field types      : ${result.typeDriftCount}`,
   ];
   /**
    * @param {string} title
