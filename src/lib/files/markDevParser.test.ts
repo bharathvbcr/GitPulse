@@ -286,6 +286,12 @@ describe("markDevParser — bounded rendering", () => {
 // markDevParser and syntaxHighlight — and both turned out to be defective, one
 // quadratic and one non-terminating. The gap was which modules were stressed,
 // not whether the project stresses anything.
+//
+// The pattern is suggestive rather than reliable, which is worth stating so it
+// is not over-trusted: the other two substantial unstressed modules,
+// terminal/tokenize.ts and diagnostics/diagnostics.ts, were measured the same
+// way and are both linear and terminating. Two of four unstressed modules were
+// defective, and every stressed one was clean.
 describe("markDevParser — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
     // The stats run on the same untrusted content as the render, and are not
