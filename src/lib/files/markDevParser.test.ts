@@ -266,6 +266,19 @@ describe("markDevParser — bounded rendering", () => {
   });
 });
 
+// Scaling audit of the frontend's repository-scale data paths, measured by
+// doubling the input and watching the ratio rather than by reading the code:
+//
+//   markdown render          quadratic -> fixed (bounded quantifiers + cap)
+//   calculateDocumentStats   quadratic -> fixed (bounded quantifier)
+//   tokenizeLine             non-terminating -> fixed (see syntaxHighlight)
+//   extractDocumentOutline   linear
+//   parseFrontmatter         linear
+//   computeWordDiff          linear (bounded by its own maxTokens)
+//   annotateUnifiedDiff      linear
+//   buildFileTree            linear (0ms at 8000 paths)
+//
+// Only the asymmetric `[`/`]` patterns had the quadratic shape.
 describe("markDevParser — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
     // The stats run on the same untrusted content as the render, and are not
