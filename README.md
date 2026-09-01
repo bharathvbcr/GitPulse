@@ -231,6 +231,8 @@ date".
 - **Node.js**: `22.x+`
 - **Rust**: `stable` (edition 2021)
 - **Git**: Recent version
+- **cargo-llvm-cov**: required by `npm run ci:local` for the Rust coverage floor —
+  `rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --locked`
 
 ### Getting Started
 
@@ -252,9 +254,10 @@ npm run tauri dev
 | `npm run check:ipc` | Verify 95 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
-| `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests) |
+| `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
 | `npm test` | Run Vitest unit and integration test suite (1,890+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |
+| `npm run check:coverage` | Validate both LCOV reports and enforce coverage floors (frontend 90% lines / 85% branches, Rust 80% lines) |
 | `npm run build` | Build frontend production bundle |
 | `npm run tauri build` | Bundle native installers for the host platform |
 

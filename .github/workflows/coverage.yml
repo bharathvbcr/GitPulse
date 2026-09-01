@@ -76,6 +76,9 @@ jobs:
             exit 1;
           }
 
+      - name: Enforce Coverage Floors and Validate LCOV
+        run: npm run check:coverage
+
       - name: Upload Rust Coverage Artifact
         uses: actions/upload-artifact@v4
         with:

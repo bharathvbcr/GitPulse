@@ -48,7 +48,8 @@ Add a shared usage printer: flag list, one-line descriptions, exit `0` for an
 explicit `--help` (asking for help is not an error).
 
 - **Touch:** `scripts/check-ipc-contract.mjs`, `check-coverage-types.mjs`,
-  `check-release-version.mjs`, `dev-port.mjs`, and their tests
+  `check-release-version.mjs`, `dev-port.mjs`, and their tests.
+  `check-coverage-floor.mjs` already implements the pattern to copy.
 - **Done when:** every script answers `--help` with usage and exit `0`, and a test
   asserts the exit code — the distinction between "helped" and "failed" is the
   point.
@@ -93,20 +94,26 @@ the rebuild saves, the correct outcome is a comment in the workflow saying so.
   recorded as a workflow comment with the numbers. A negative result documented is a
   successful outcome here.
 
-### B3 · Fail the coverage workflow on a coverage drop 🟡
-**Labels:** `help wanted`, `area: ci`, `test`
+### B3 · Fail the coverage workflow on a coverage drop ✅ *(Completed)*
+**Labels:** `area: ci`, `test`
 
-`coverage.yml` generates LCOV for both languages, verifies the files were produced,
-uploads them, and prints a summary. Nothing acts on the numbers — coverage can fall
-indefinitely without CI noticing.
+*Implemented in [`scripts/check-coverage-floor.mjs`](../scripts/check-coverage-floor.mjs),
+wired as `npm run check:coverage`.*
 
-Add a floor. Keep it honest: a threshold that cannot be computed (missing report,
-parse failure) must **fail loudly**, never pass by default. A check that could not
-run must not report the same result as a check that ran and passed.
+The checker parses both LCOV reports, validates them structurally before trusting any
+number (duplicate `SF` records, `LH` above `LF`, `BRH` disagreeing with the `BRDA`
+rows, and malformed fields all abort), then applies the floors in
+`DEFAULT_THRESHOLDS`: frontend 90% lines / 85% branches, Rust 80% lines. A report that
+cannot be parsed exits `2` — distinct from `1` for a missed floor and `0` for a pass —
+so a check that could not run never reports the same result as one that ran and passed.
 
-- **Touch:** `.github/workflows/coverage.yml`
-- **Done when:** an artificially lowered threshold fails the job, a corrupt LCOV file
-  fails the job, and the failure message names the actual and required percentages.
+It runs in two places: the *Enforce Coverage Floors and Validate LCOV* step of
+[`coverage.yml`](../.github/workflows/coverage.yml), and the tail of `npm run ci:local`,
+which regenerates both reports (`npm run coverage` and `cargo llvm-cov`) before checking
+them so a stale `lcov.info` cannot be mistaken for a passing run.
+
+Thresholds are overridable per invocation via `--frontend-lines`, `--frontend-branches`,
+and `--rust-lines`; `--help` prints the full flag list.
 
 ---
 
