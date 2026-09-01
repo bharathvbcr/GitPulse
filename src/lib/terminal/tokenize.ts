@@ -294,5 +294,3 @@ function extractCodeSpans(text: string): string[] {
   }
   return commands;
 }
-
-export const tokenizeArgv = tokenizeCommand;

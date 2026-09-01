@@ -11,7 +11,6 @@
  */
 
 import type { StorageLike } from "../repos/persist";
-import { memoryStorage } from "../repos/persist";
 
 export const STORAGE_KEY_STORAGE_HISTORY = "gitpulse_storage_history_v1";
 
@@ -203,9 +202,4 @@ export function clearRepoHistory(map: StorageHistoryMap, repoKey: string): Stora
     if (key !== repoKey) out[key] = value;
   }
   return out;
-}
-
-/** Test convenience: an isolated in-memory store preloaded with nothing. */
-export function memoryHistoryStorage(): StorageLike {
-  return memoryStorage();
 }

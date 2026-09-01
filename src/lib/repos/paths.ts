@@ -70,12 +70,6 @@ export function displayName(path: string): string {
   return parts[parts.length - 1];
 }
 
-export function parentName(path: string): string {
-  const parts = pathSegments(path);
-  if (parts.length < 2) return "";
-  return parts[parts.length - 2];
-}
-
 /**
  * Last `depth` segments joined with "/", capped at the whole path. Depth 1 is
  * the bare display name; every deepening step prepends one more segment.

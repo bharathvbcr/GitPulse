@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
+import { nativeTabMenuId, REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
 
 /**
  * Every registered view that belongs in a menu must be reachable from the
@@ -33,8 +33,12 @@ describe("native menu covers every registered view", () => {
     const constName = `TAB_${view.id.toUpperCase()}`;
 
     it(`${view.id} has an id constant, a parse arm and a menu item`, () => {
+      // The id comes from the registry's own helper rather than being spelled
+      // out again here, so the format has one owner. That helper existed to
+      // make ids derivable "so a new view cannot be missed" and had no caller;
+      // this is the caller.
       expect(actions, `${constName} constant missing`).toContain(
-        `pub const ${constName}: &str = "tab-${view.id}"`,
+        `pub const ${constName}: &str = "${nativeTabMenuId(view.id)}"`,
       );
       expect(actions, `${constName} has no parse arm`).toContain(`${constName} => Self::`);
       // A constant with no menu item is an action nothing can emit — exactly
