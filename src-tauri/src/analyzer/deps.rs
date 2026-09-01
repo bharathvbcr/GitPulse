@@ -2940,6 +2940,101 @@ mod tests {
       }
     }"#;
 
+    /// `via` is npm's most shape-shifting field: an array mixing plain
+    /// package-name strings (the chain a vulnerability arrives through) with
+    /// advisory objects carrying title and url. Both forms appear in one
+    /// array, order is not guaranteed, and a package can repeat.
+    #[test]
+    fn via_handles_both_shapes_in_one_array() {
+        let via = serde_json::json!([
+            "lodash",
+            { "title": "Prototype Pollution", "url": "https://example.invalid/1", "name": "minimist" },
+            "lodash",
+            { "title": "A later advisory", "url": "https://example.invalid/2", "name": "minimist" }
+        ]);
+        let (title, url, names) = via_details(Some(&via));
+        // First advisory wins for the human-facing fields, so the headline
+        // does not change depending on array order downstream.
+        assert_eq!(title, "Prototype Pollution");
+        assert_eq!(url, "https://example.invalid/1");
+        // Names are deduplicated across both shapes.
+        assert_eq!(names, vec!["lodash", "minimist"]);
+    }
+
+    #[test]
+    fn via_survives_shapes_it_was_not_built_for() {
+        // Absent, not an array, and an array of neither strings nor objects:
+        // npm has changed this field before, and none of these may panic.
+        assert_eq!(
+            via_details(None),
+            (String::new(), String::new(), Vec::new())
+        );
+        let scalar = serde_json::json!("lodash");
+        assert_eq!(
+            via_details(Some(&scalar)),
+            (String::new(), String::new(), Vec::new())
+        );
+        let odd = serde_json::json!([1, true, null, { "no_title": "x" }]);
+        let (title, url, names) = via_details(Some(&odd));
+        assert!(title.is_empty() && url.is_empty() && names.is_empty());
+    }
+
+    /// `fixAvailable` is `true`, `false`, or an object describing the upgrade
+    /// — and the object form is the one that tells a user whether the fix is
+    /// breaking. Reporting a major-version bump as a plain "yes" would send
+    /// someone into an unexpected breaking upgrade.
+    #[test]
+    fn fix_available_distinguishes_a_breaking_upgrade() {
+        use serde_json::json;
+        assert_eq!(format_fix_available(Some(&json!(true))), "yes");
+        assert_eq!(format_fix_available(Some(&json!(false))), "no");
+        assert_eq!(format_fix_available(None), "no");
+        assert_eq!(
+            format_fix_available(Some(
+                &json!({ "name": "vite", "version": "5.0.0", "isSemVerMajor": false })
+            )),
+            "vite@5.0.0"
+        );
+        assert_eq!(
+            format_fix_available(Some(
+                &json!({ "name": "vite", "version": "7.0.0", "isSemVerMajor": true })
+            )),
+            "vite@7.0.0 (breaking)",
+            "a major bump must say so"
+        );
+        // An object with no name says nothing useful about which package to
+        // upgrade, so it degrades to the bare affirmative rather than "@".
+        assert_eq!(
+            format_fix_available(Some(&json!({ "version": "1.0.0" }))),
+            "yes"
+        );
+        // A shape from neither format is named unknown rather than guessed at
+        // as either yes or no.
+        assert_eq!(format_fix_available(Some(&json!("maybe"))), "unknown");
+    }
+
+    #[test]
+    fn outdated_rejects_shapes_it_cannot_read_and_accepts_emptiness() {
+        // npm prints nothing at all when everything is current.
+        assert_eq!(parse_npm_outdated_json("").unwrap().len(), 0);
+        assert_eq!(parse_npm_outdated_json("   \n ").unwrap().len(), 0);
+        // A JSON array is not the keyed object this format promises.
+        assert!(parse_npm_outdated_json("[]").is_err());
+        // An npm error payload surfaces as an error, not as "nothing outdated".
+        let err = parse_npm_outdated_json(
+            r#"{"error": {"code": "ENOLOCK", "summary": "no lockfile", "detail": "run npm install"}}"#,
+        )
+        .expect_err("an npm error is not an empty result");
+        assert!(err.contains("ENOLOCK"), "{err}");
+        // Non-object entries are skipped rather than aborting the whole list.
+        let rows = parse_npm_outdated_json(
+            r#"{ "good": { "current": "1.0.0", "latest": "2.0.0" }, "junk": "not an object" }"#,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "good");
+    }
+
     #[test]
     fn a_clean_npm11_audit_reads_as_clean() {
         let (vulns, err) = parse_npm_audit_json(NPM11_AUDIT_CLEAN).expect("parses");
