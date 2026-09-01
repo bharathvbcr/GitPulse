@@ -257,7 +257,7 @@ npm run tauri dev
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
-| `npm test` | Run Vitest unit and integration test suite (1,890+ tests) |
+| `npm test` | Run Vitest unit and integration test suite (2,000+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |
 | `npm run check:coverage` | Validate both LCOV reports and enforce coverage floors (frontend 90% lines / 85% branches, Rust 80% lines) |
 | `npm run check:workflows` | Lint `.github/workflows/*` with actionlint — the only gate that reads `release.yml`, which CI otherwise sees only on a tag |

@@ -70,11 +70,11 @@ iterating you will usually want the narrower commands instead:
 
 | Command | Scope | Typical runtime |
 | --- | --- | --- |
-| `npm test` | Vitest suite (~1,890+ tests across `src/`) | seconds |
+| `npm test` | Vitest suite (2,000+ tests across `src/`) | seconds |
 | `npx vitest run src/lib/graph` | One directory | sub-second |
 | `npx vitest watch` | Re-runs on save | continuous |
 | `npm run coverage` | Vitest with V8 coverage into `coverage/` | ~1 min |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites (~200+ tests) | ~1 min |
+| `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites (850+ tests) | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml updates::` | One Rust module | seconds |
 | `npm run check:coverage` | Validate both LCOV reports and enforce floors (needs a prior `npm run coverage` and `cargo llvm-cov` run) | seconds |
 
@@ -127,7 +127,7 @@ flowchart TD
 | Command | Purpose |
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
-| `npm test` | Runs the Vitest frontend unit and integration test suite (1,890+ tests) |
+| `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (95 handlers) and frontend `invoke()` calls match with zero untracked orphans |
 | `npm run check:types` | Verifies that coverage and terminal serde structs in Rust match TypeScript interfaces field-for-field (62 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
