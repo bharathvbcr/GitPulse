@@ -13,6 +13,15 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
+ * SCOPE: this covers the coverage and terminal contracts only — the two that
+ * carry the most fields and have drifted before. Roughly 35 distinct named
+ * types cross the IPC boundary in total, so "type contract holds" means those
+ * two contracts hold, not that every IPC payload is verified. Widening the set
+ * is a matter of adding to CHECKED_STRUCTS/TERMINAL_STRUCTS with a matching TS
+ * source; the PullRequestInfo timings, for instance, are pinned separately in
+ * scripts/pr-timing-contract.test.ts because their interface is declared
+ * inline in the panel rather than in a types module.
+ *
  * Serde awareness: per-field `#[serde(rename = "x")]` changes the wire name
  * and is honored; `#[serde(skip)]` drops the field from the wire; a checked
  * struct carrying `rename_all` is refused loudly unless it is "snake_case"
@@ -29,6 +38,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { alignRows } from "./columns.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -492,11 +502,15 @@ export function formatReport(result, rustLabel, tsLabel, title = "Coverage IPC t
   const lines = [
     title,
     "",
-    `  rust structs checked    : ${result.rustCount}  (${rustLabel})`,
-    `  ts interfaces checked   : ${result.tsCount}  (${tsLabel})`,
-    `  fields compared         : ${result.fieldCount}`,
-    `  drifted structs         : ${result.driftCount}`,
-    `  drifted field types      : ${result.typeDriftCount}`,
+    // A3's aligner, same as check-ipc-contract: widths come from the labels,
+    // so the "drifted field types" row can no longer be a space out of line.
+    ...alignRows([
+      { label: "rust structs checked", value: String(result.rustCount), note: rustLabel },
+      { label: "ts interfaces checked", value: String(result.tsCount), note: tsLabel },
+      { label: "fields compared", value: String(result.fieldCount) },
+      { label: "drifted structs", value: String(result.driftCount) },
+      { label: "drifted field types", value: String(result.typeDriftCount) },
+    ]),
   ];
   /**
    * @param {string} title
