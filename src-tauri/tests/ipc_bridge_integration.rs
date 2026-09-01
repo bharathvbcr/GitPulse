@@ -42,6 +42,9 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_get_commit_graph,
             gitpulse_lib::commands::cmd_branch_stats,
             gitpulse_lib::commands::cmd_get_file_diff,
+            gitpulse_lib::commands::cmd_get_file_content,
+            gitpulse_lib::commands::cmd_write_file_content,
+            gitpulse_lib::commands::cmd_list_tags,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
         // The app's own context, from the same accessor run() uses, so the
@@ -373,4 +376,105 @@ fn a_nested_report_struct_keeps_its_shape_across_the_bridge() {
         value["computed"]
     );
     assert!(value["cached"].is_number(), "cached: {}", value["cached"]);
+}
+
+#[test]
+fn non_ascii_content_survives_the_json_boundary_intact() {
+    // A JSON boundary is exactly where encoding damage shows up, and file
+    // content is user data the app must not corrupt: combining marks, CJK,
+    // emoji outside the BMP, and RTL text all round-trip or none do.
+    let repo = repo_with_change();
+    let payload = "héllo café ｜ 日本語 ｜ العربية ｜ 👩‍👩‍👧‍👦 ｜ e\u{0301}\n";
+    invoke(
+        "cmd_write_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "unicode.txt",
+            "content": payload
+        }),
+    )
+    .expect("the write succeeds");
+
+    let read_back = invoke(
+        "cmd_get_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "unicode.txt"
+        }),
+    )
+    .expect("the read succeeds");
+    assert_eq!(
+        read_back.as_str().expect("a string"),
+        payload,
+        "content changed crossing the bridge"
+    );
+}
+
+#[test]
+fn content_with_json_metacharacters_is_not_reinterpreted() {
+    // Content that looks like JSON, or contains quotes and backslashes, must
+    // travel as data rather than being parsed or mangled by the transport.
+    let repo = repo_with_change();
+    let payload = "{\"looks\":\"like json\"}\n\\backslash\\ \"quoted\" \t tab\n";
+    invoke(
+        "cmd_write_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "tricky.txt",
+            "content": payload
+        }),
+    )
+    .expect("the write succeeds");
+
+    let read_back = invoke(
+        "cmd_get_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "tricky.txt"
+        }),
+    )
+    .expect("the read succeeds");
+    assert_eq!(read_back.as_str().expect("a string"), payload);
+}
+
+#[test]
+fn an_empty_collection_arrives_as_an_empty_array_not_null() {
+    // A fresh repository has no tags. `[]` and `null` are different values to
+    // the frontend: one maps and renders nothing, the other throws.
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_list_tags",
+        json!({ "repoPath": repo.path().to_string_lossy() }),
+    )
+    .expect("tags list");
+    assert!(value.is_array(), "expected [], got: {value}");
+    assert_eq!(value.as_array().expect("an array").len(), 0);
+    assert!(!value.is_null());
+}
+
+#[test]
+fn a_large_payload_crosses_the_bridge_without_truncation() {
+    // The transport must not silently cap content; a truncated file written
+    // back would be data loss the user never sees.
+    let repo = repo_with_change();
+    let payload = "abcdefghij\n".repeat(50_000); // ~550 KB
+    invoke(
+        "cmd_write_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "large.txt",
+            "content": payload
+        }),
+    )
+    .expect("the write succeeds");
+
+    let read_back = invoke(
+        "cmd_get_file_content",
+        json!({
+            "repoPath": repo.path().to_string_lossy(),
+            "filePath": "large.txt"
+        }),
+    )
+    .expect("the read succeeds");
+    assert_eq!(read_back.as_str().expect("a string").len(), payload.len());
 }
