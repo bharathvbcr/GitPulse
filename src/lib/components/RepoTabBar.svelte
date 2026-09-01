@@ -18,6 +18,7 @@
     FolderGit2,
     FolderOpen,
   } from "lucide-svelte";
+  import WorkspaceActions from "./WorkspaceActions.svelte";
 
   let {
     onOpen,
@@ -365,6 +366,11 @@
         </div>
       {/if}
     </div>
+
+    <!-- Workspace-wide actions live here rather than in a view: they act on
+         every open repository, so they belong to the tab strip that owns
+         them. Hidden with a single tab open, where they say nothing new. -->
+    <WorkspaceActions />
   </div>
 {/if}
 

@@ -158,6 +158,9 @@ function makeInvoke(overrides: Partial<Record<string, InvokeFn>> = {}): InvokeFn
       return snapshotFor(String(args?.repoPath)).statuses as never;
     }
     if (cmd === "cmd_list_tags") return [] as never;
+    // Idle by default; suites that care park an operation via overrides.
+    if (cmd === "cmd_repo_operation") return null as never;
+    if (cmd === "cmd_stash_list") return [] as never;
     if (cmd === "cmd_branch_stats") return statsFor(String(args?.repoPath)) as never;
     if (cmd === "cmd_watch_repo") return String(args?.repoPath) as never;
     if (cmd === "cmd_unwatch_repo") return undefined as never;
@@ -1904,5 +1907,579 @@ describe("repoStore refresh query forwarding", () => {
     await store.refresh();
     const pathLoad = graph.loads[graph.loads.length - 1];
     expect(pathLoad).toEqual({ path: "/r/launder", query: "path:src", revision: "feature" });
+  });
+});
+
+describe("repoStore parked operations", () => {
+  const mergeOp = {
+    kind: "Merge" as const,
+    current_step: null,
+    total_steps: null,
+    head_ref: "main",
+    incoming_ref: "Merge branch 'side'",
+    conflicted_paths: ["f.txt"],
+    conflicted_total: 1,
+    available: ["abort" as const],
+    warnings: [],
+  };
+
+  it("carries the parked operation onto the active session", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async () => mergeOp as never,
+      }),
+    );
+    await store.openRepo("/r/merging");
+    const state = get(store);
+    expect(state.operation.probeFailed).toBe(false);
+    expect(state.operation.operation?.kind).toBe("Merge");
+    expect(state.operation.operation?.conflicted_total).toBe(1);
+  });
+
+  it("records a failed probe as unknown rather than as an idle repository", async () => {
+    // The dangerous failure: the probe throws, the UI renders a clean repo,
+    // and the user acts on a state that was never actually checked.
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async () => {
+          throw new Error("git exploded");
+        },
+      }),
+    );
+    await store.openRepo("/r/broken-probe");
+    const state = get(store);
+    expect(state.operation.probeFailed).toBe(true);
+    expect(state.operation.operation).toBeNull();
+    // And it must not fail the whole snapshot: branches still rendered.
+    expect(state.branches.length).toBeGreaterThan(0);
+    expect(state.error).toBeNull();
+  });
+
+  it("keeps each repository's operation on its own tab", async () => {
+    // A merge parked in one repo must never bleed into another tab's banner.
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async (_cmd, args) =>
+          (String(args?.repoPath) === "/r/parked" ? mergeOp : null) as never,
+      }),
+    );
+    await store.openRepo("/r/parked");
+    expect(get(store).operation.operation?.kind).toBe("Merge");
+
+    await store.openRepo("/r/idle");
+    expect(get(store).operation.operation).toBeNull();
+
+    await store.activateTab(get(store).openTabs[0].id);
+    expect(get(store).operation.operation?.kind).toBe("Merge");
+  });
+
+  it("does not republish when an unchanged operation is refetched", async () => {
+    // The regression this guards: the snapshot rebuilds the operation object
+    // every poll, so reference equality would republish the whole store to
+    // every subscriber every six seconds on a repository where nothing moved.
+    const { store } = makeStore(
+      makeInvoke({
+        // A fresh object each call, deliberately — same content, new identity.
+        cmd_repo_operation: async () => ({ ...mergeOp, conflicted_paths: ["f.txt"] }) as never,
+      }),
+    );
+    await store.openRepo("/r/quiet");
+    let publishes = 0;
+    const stop = store.subscribe(() => {
+      publishes += 1;
+    });
+    const baseline = publishes;
+    await store.refresh("/r/quiet");
+    expect(publishes - baseline).toBe(0);
+    stop();
+  });
+
+  it("republishes when the operation actually changes", async () => {
+    let conflicts = 2;
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async () =>
+          ({ ...mergeOp, conflicted_total: conflicts }) as never,
+      }),
+    );
+    await store.openRepo("/r/moving");
+    expect(get(store).operation.operation?.conflicted_total).toBe(2);
+    conflicts = 0;
+    await store.refresh("/r/moving");
+    expect(get(store).operation.operation?.conflicted_total).toBe(0);
+  });
+
+  it("sends the action without a kind and refreshes afterwards", async () => {
+    // The kind is re-detected by the backend under its lock. Sending a
+    // client-side kind would let a stale banner abort the wrong operation.
+    const calls: Record<string, unknown>[] = [];
+    let parked: unknown = mergeOp;
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async () => parked as never,
+        cmd_repo_operation_action: async (_cmd, args) => {
+          calls.push(args ?? {});
+          parked = null;
+          return { policy: null, output: "aborted" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/act");
+    const outcome = await store.operationAction("abort");
+    expect(outcome.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({ repoPath: "/r/act", action: "abort" });
+    expect(calls[0]).not.toHaveProperty("kind");
+    // The post-action refresh is what clears the banner.
+    expect(get(store).operation.operation).toBeNull();
+  });
+
+  it("reports a refused action instead of pretending it ran", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async () => mergeOp as never,
+        cmd_repo_operation_action: async () => {
+          throw new Error("Cannot continue this merge while 1 file still has conflict markers");
+        },
+      }),
+    );
+    await store.openRepo("/r/refused");
+    const outcome = await store.operationAction("continue");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("conflict markers");
+    // The operation is untouched — a refusal is not a state change.
+    expect(get(store).operation.operation?.kind).toBe("Merge");
+  });
+});
+
+describe("repoStore workspace-wide operations", () => {
+  const parkedMerge = {
+    kind: "Merge" as const,
+    current_step: null,
+    total_steps: null,
+    head_ref: "main",
+    incoming_ref: null,
+    conflicted_paths: ["f.txt"],
+    conflicted_total: 1,
+    available: ["abort" as const],
+    warnings: [],
+  };
+
+  async function openAll(store: ReturnType<typeof makeStore>["store"], paths: string[]) {
+    for (const path of paths) await store.openRepo(path);
+  }
+
+  it("fetches every open repository and reports a clean sweep", async () => {
+    const fetched: string[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_fetch: async (_cmd, args) => {
+          fetched.push(String(args?.repoPath));
+          return "ok" as never;
+        },
+      }),
+    );
+    await openAll(store, ["/r/a", "/r/b", "/r/c"]);
+
+    const report = await store.runAcrossOpenRepos("fetch");
+    expect(fetched.sort()).toEqual(["/r/a", "/r/b", "/r/c"]);
+    expect(report.succeeded).toBe(3);
+    expect(report.failed).toBe(0);
+    expect(report.skipped).toBe(0);
+  });
+
+  it("skips a parked repository and says so rather than counting it fetched", async () => {
+    // The honesty property: a repository that was NOT fetched must never be
+    // indistinguishable from one that was.
+    const fetched: string[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_repo_operation: async (_cmd, args) =>
+          (String(args?.repoPath) === "/r/parked" ? parkedMerge : null) as never,
+        cmd_fetch: async (_cmd, args) => {
+          fetched.push(String(args?.repoPath));
+          return "ok" as never;
+        },
+      }),
+    );
+    await openAll(store, ["/r/clean", "/r/parked"]);
+
+    const report = await store.runAcrossOpenRepos("fetch");
+    expect(fetched).toEqual(["/r/clean"]);
+    expect(report.succeeded).toBe(1);
+    expect(report.skipped).toBe(1);
+    const skipped = report.results.find((r) => r.status === "skipped");
+    expect(skipped?.path).toBe("/r/parked");
+    expect(skipped?.reason).toContain("merge is in progress");
+  });
+
+  it("keeps going when one repository's fetch fails", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_fetch: async (_cmd, args) => {
+          if (String(args?.repoPath) === "/r/b") throw new Error("remote unreachable");
+          return "ok" as never;
+        },
+      }),
+    );
+    await openAll(store, ["/r/a", "/r/b", "/r/c"]);
+
+    const report = await store.runAcrossOpenRepos("fetch");
+    expect(report.succeeded).toBe(2);
+    expect(report.failed).toBe(1);
+    expect(report.results.find((r) => r.status === "failed")?.error).toContain(
+      "remote unreachable",
+    );
+  });
+
+  it("pulls rather than fetches when asked", async () => {
+    const calls: string[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_pull: async () => {
+          calls.push("pull");
+          return { policy: null, output: "ok" } as never;
+        },
+        cmd_fetch: async () => {
+          calls.push("fetch");
+          return "ok" as never;
+        },
+      }),
+    );
+    await openAll(store, ["/r/a"]);
+    await store.runAcrossOpenRepos("pull");
+    expect(calls).toEqual(["pull"]);
+  });
+
+  it("reports nothing to do for an empty workspace", async () => {
+    const { store } = makeStore();
+    const report = await store.runAcrossOpenRepos("fetch");
+    expect(report.results).toEqual([]);
+  });
+});
+
+describe("repoStore workspace work-in-progress", () => {
+  it("reports a clean workspace as all clear", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_get_status: async () => [] as never,
+      }),
+    );
+    await store.openRepo("/r/clean");
+    const wip = store.workspaceWip();
+    expect(wip.examined).toBe(1);
+    expect(wip.allClear).toBe(true);
+  });
+
+  it("counts uncommitted changes from the live session", async () => {
+    // The default mock snapshot carries one modified file.
+    const { store } = makeStore();
+    await store.openRepo("/r/dirty");
+    const wip = store.workspaceWip();
+    expect(wip.allClear).toBe(false);
+    expect(wip.repos[0].reasons.some((r) => r.kind === "uncommitted")).toBe(true);
+  });
+
+  it("counts a stash as work in progress", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_get_status: async () => [] as never,
+        cmd_stash_list: async () =>
+          [
+            {
+              index: 0,
+              selector: "stash@{0}",
+              oid: "abc123",
+              subject: "On main: wip",
+              message: "wip",
+              branch: "main",
+              timestamp: 1,
+            },
+          ] as never,
+      }),
+    );
+    await store.openRepo("/r/stashed");
+    const wip = store.workspaceWip();
+    expect(wip.repos[0].reasons.some((r) => r.kind === "stash")).toBe(true);
+  });
+
+  it("treats a repository whose stash probe failed as unknown, not clean", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_get_status: async () => [] as never,
+        cmd_stash_list: async () => {
+          throw new Error("git exploded");
+        },
+      }),
+    );
+    await store.openRepo("/r/broken");
+    const wip = store.workspaceWip();
+    expect(wip.allClear).toBe(false);
+    expect(wip.unknown).toBe(1);
+  });
+
+  it("separates each repository's work", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_get_status: async (_cmd, args) =>
+          (String(args?.repoPath) === "/r/dirty"
+            ? [
+                {
+                  path: "a.txt",
+                  status_code: "M",
+                  is_staged: false,
+                  is_conflicted: false,
+                  additions: 1,
+                  deletions: 0,
+                },
+              ]
+            : []) as never,
+      }),
+    );
+    await store.openRepo("/r/clean");
+    await store.openRepo("/r/dirty");
+    const wip = store.workspaceWip();
+    expect(wip.examined).toBe(2);
+    expect(wip.repos).toHaveLength(1);
+    expect(wip.repos[0].path).toBe("/r/dirty");
+  });
+});
+
+describe("repoStore stash actions", () => {
+  const entry = {
+    index: 2,
+    selector: "stash@{2}",
+    oid: "deadbeef",
+    subject: "On main: wip",
+    message: "wip",
+    branch: "main",
+    timestamp: 1,
+  };
+
+  it("always sends the object id beside the index", async () => {
+    // Sending the index alone is what lets a stale list drop the wrong entry.
+    const calls: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_stash_action: async (_cmd, args) => {
+          calls.push(args ?? {});
+          return { policy: null, output: "dropped" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.stashAction("drop", entry);
+    expect(outcome.ok).toBe(true);
+    expect(calls[0]).toEqual({
+      repoPath: "/r/a",
+      action: "drop",
+      index: 2,
+      expectedOid: "deadbeef",
+    });
+  });
+
+  it("surfaces the backend's stale-stack refusal instead of swallowing it", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_stash_action: async () => {
+          throw new Error(
+            "Stash entry 2 changed since it was listed. Refresh the stash list and try again.",
+          );
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.stashAction("drop", entry);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("Refresh the stash list");
+  });
+});
+
+describe("repoStore live-update health", () => {
+  it("records a working watcher as live", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/live");
+    expect(get(store).watch.status).toBe("watching");
+    expect(get(store).watch.reason).toBeNull();
+  });
+
+  it("records a failed watch as degraded instead of swallowing it", async () => {
+    // The pre-fix behaviour: cmd_watch_repo threw, the catch discarded it, and
+    // the repository was indistinguishable from a watched one while its
+    // branches, graph and operation state went stale.
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_watch_repo: async () => {
+          throw new Error("Too many watched repositories (max 24)");
+        },
+      }),
+    );
+    await store.openRepo("/r/unwatched");
+    const state = get(store).watch;
+    expect(state.status).toBe("degraded");
+    expect(state.reason).toContain("Too many watched repositories");
+  });
+
+  it("still opens the repository when the watch fails", async () => {
+    // A watcher failure must degrade the experience, never block the work.
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_watch_repo: async () => {
+          throw new Error("inotify limit reached");
+        },
+      }),
+    );
+    const opened = await store.openRepo("/r/unwatched");
+    expect(opened).toBe(true);
+    expect(get(store).error).toBeNull();
+    expect(get(store).branches.length).toBeGreaterThan(0);
+  });
+
+  it("polls statuses only while the watcher is healthy", async () => {
+    vi.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      const { store } = makeStore(
+        makeInvoke({
+          cmd_get_status: async (_cmd, args) => {
+            calls.push("status");
+            return snapshotFor(String(args?.repoPath)).statuses as never;
+          },
+          cmd_list_branches: async (_cmd, args) => {
+            calls.push("branches");
+            return snapshotFor(String(args?.repoPath)).branches as never;
+          },
+        }),
+      );
+      await store.openRepo("/r/live");
+      calls.length = 0;
+
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 10);
+      expect(calls).toContain("status");
+      expect(calls).not.toContain("branches");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("upgrades the poll to a full refresh when the watcher is degraded", async () => {
+    // The functional half of the fix. Without it the indicator would announce
+    // staleness and do nothing about it: the watcher is what refreshes
+    // branches, the graph, the operation banner and the stash on an open tab.
+    vi.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      const { store } = makeStore(
+        makeInvoke({
+          cmd_watch_repo: async () => {
+            throw new Error("Too many watched repositories (max 24)");
+          },
+          cmd_get_status: async (_cmd, args) => {
+            calls.push("status");
+            return snapshotFor(String(args?.repoPath)).statuses as never;
+          },
+          cmd_list_branches: async (_cmd, args) => {
+            calls.push("branches");
+            return snapshotFor(String(args?.repoPath)).branches as never;
+          },
+          cmd_repo_operation: async () => {
+            calls.push("operation");
+            return null as never;
+          },
+        }),
+      );
+      await store.openRepo("/r/unwatched");
+      calls.length = 0;
+
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 10);
+      // A full snapshot: the facets the watcher would have refreshed.
+      expect(calls).toContain("branches");
+      expect(calls).toContain("operation");
+      expect(calls).toContain("status");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("repoStore watch self-healing", () => {
+  it("re-asserts the watch periodically so a reaped watcher recovers", async () => {
+    // The backend reaps a watch whose event stream closes or whose thread
+    // panics, and nothing tells the frontend. Re-asserting repairs it:
+    // cmd_watch_repo returns immediately when still registered, and creates a
+    // fresh watcher when it was reaped.
+    vi.useFakeTimers();
+    try {
+      let watchCalls = 0;
+      const { store } = makeStore(
+        makeInvoke({
+          cmd_watch_repo: async (_cmd, args) => {
+            watchCalls += 1;
+            return String(args?.repoPath) as never;
+          },
+        }),
+      );
+      await store.openRepo("/r/live");
+      expect(watchCalls).toBe(1);
+
+      // Nine ticks: no re-assert yet, so the 6s path stays subprocess-free.
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS * 9 + 10);
+      expect(watchCalls).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 10);
+      expect(watchCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("downgrades to degraded when a re-assert reveals the watch is gone", async () => {
+    vi.useFakeTimers();
+    try {
+      let healthy = true;
+      const { store } = makeStore(
+        makeInvoke({
+          cmd_watch_repo: async (_cmd, args) => {
+            if (!healthy) throw new Error("watch session was reaped");
+            return String(args?.repoPath) as never;
+          },
+        }),
+      );
+      await store.openRepo("/r/live");
+      expect(get(store).watch.status).toBe("watching");
+
+      // The watcher dies out from under us.
+      healthy = false;
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS * 10 + 50);
+
+      const state = get(store).watch;
+      expect(state.status).toBe("degraded");
+      expect(state.reason).toContain("reaped");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers back to live when a later re-assert succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      let healthy = false;
+      const { store } = makeStore(
+        makeInvoke({
+          cmd_watch_repo: async (_cmd, args) => {
+            if (!healthy) throw new Error("watch table full");
+            return String(args?.repoPath) as never;
+          },
+        }),
+      );
+      await store.openRepo("/r/flaky");
+      expect(get(store).watch.status).toBe("degraded");
+
+      healthy = true;
+      await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS * 10 + 50);
+      expect(get(store).watch.status).toBe("watching");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

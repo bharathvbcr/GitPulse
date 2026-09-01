@@ -78,7 +78,24 @@ export function actionKindForCommand(cmd: string): string {
     case "stash_save":
       return "stash";
     case "stash_pop":
+    case "stash_action":
       return "unstash";
+    // Every mutating surface must land in the journal under a verb a human
+    // recognises. An unmapped command falls through to its raw name, which is
+    // legible but inconsistent — and the journal is the record of what an
+    // unattended agent did to the repository.
+    case "cherry_pick":
+      return "cherry-pick";
+    case "revert":
+      return "revert";
+    case "reset":
+      return "reset";
+    case "repo_operation_action":
+      return "operation";
+    case "remote_change":
+      return "remote";
+    case "submodule_change":
+      return "submodule";
     case "add_worktree":
     case "remove_worktree":
       return "worktree";

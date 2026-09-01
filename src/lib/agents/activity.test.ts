@@ -67,6 +67,30 @@ describe("actionKindForCommand", () => {
     expect(actionKindForCommand("cmd_stage_selective_patch")).toBe("stage");
     expect(actionKindForCommand("cmd_add_worktree")).toBe("worktree");
     expect(actionKindForCommand("cmd_write_file_content")).toBe("edit");
+  });
+
+  it("maps every mutating surface to a human-readable verb", () => {
+    // The journal is the record of what an unattended agent did; a raw
+    // command name there is legible but inconsistent with its neighbours.
+    expect(actionKindForCommand("cmd_cherry_pick")).toBe("cherry-pick");
+    expect(actionKindForCommand("cmd_revert")).toBe("revert");
+    expect(actionKindForCommand("cmd_reset")).toBe("reset");
+    expect(actionKindForCommand("cmd_stash_action")).toBe("unstash");
+    expect(actionKindForCommand("cmd_repo_operation_action")).toBe("operation");
+    expect(actionKindForCommand("cmd_remote_change")).toBe("remote");
+    expect(actionKindForCommand("cmd_submodule_change")).toBe("submodule");
+    // The ones whose raw name is not already a verb must not leak it.
+    // `cmd_revert` and `cmd_reset` are excluded on purpose: their command
+    // name IS the verb, so mapping them to themselves is correct.
+    for (const cmd of [
+      "cmd_cherry_pick",
+      "cmd_stash_action",
+      "cmd_repo_operation_action",
+      "cmd_remote_change",
+      "cmd_submodule_change",
+    ]) {
+      expect(actionKindForCommand(cmd), cmd).not.toBe(cmd.slice(4));
+    }
     expect(actionKindForCommand("cmd_terminal_run")).toBe("terminal");
   });
 

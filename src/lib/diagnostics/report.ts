@@ -22,6 +22,8 @@ export type PanelSource =
   | "ops"
   | "clone"
   | "rebase"
+  | "remotes"
+  | "submodules"
   | "conflict";
 
 export interface ReporterOptions {

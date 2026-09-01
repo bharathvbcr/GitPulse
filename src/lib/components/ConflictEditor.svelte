@@ -56,12 +56,21 @@
   import { harnessStore } from "../stores/harnessStore";
   import { Check, ShieldAlert, AlertTriangle } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
+  import OperationBanner from "./OperationBanner.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { planConflictSave } from "../diff/conflictSave";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
 
   let conflictedFiles = $derived($repoStore.statuses.filter((s) => s.is_conflicted));
+  let operationState = $derived($repoStore.operation);
+  /**
+   * A parked operation with every file already staged has no conflicted
+   * rows, but the repository is emphatically NOT "clean and ready" — it is
+   * one button away from finishing. Telling the user the tree is clean
+   * there is the exact wording that sends them to a terminal.
+   */
+  let parked = $derived(operationState.operation !== null);
   let selectedFile = $state<string | null>(null);
   let parsedDoc = $state<ConflictDoc | null>(null);
   let loadError = $state<string | null>(null);
@@ -254,11 +263,19 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans select-none overflow-hidden">
+  {#if operationState.operation || operationState.probeFailed}
+    <div class="px-3 pt-3">
+      <OperationBanner {operationState} />
+    </div>
+  {/if}
+
   {#if conflictedFiles.length === 0}
     <EmptyState
       icon={Check}
-      title="No merge conflicts"
-      hint="Your working tree is clean and ready."
+      title={parked ? "All conflicts resolved" : "No merge conflicts"}
+      hint={parked
+        ? "Nothing is left to resolve here — finish the operation using the actions above."
+        : "Your working tree is clean and ready."}
     />
   {:else}
     <!-- Top Selector Bar -->

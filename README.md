@@ -42,7 +42,7 @@ GitPulse operates completely locally on your machine with strict IPC boundaries 
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        Views["13 Specialized Views<br/>(Files, Graph, Diff, Coverage, Health, Storage...)"]
+        Views["14 Specialized Views<br/>(Files, Graph, Diff, Coverage, Health, Storage...)"]
         Stores["Reactive Svelte 5 Stores & Runes"]
         CanvasEngine["GPU-Accelerated HTML5 Canvas"]
         AsyncGuards["Async Cancellation Guards"]
@@ -54,7 +54,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(95 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(107 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -86,7 +86,7 @@ flowchart TB
 
 ## View Catalog & Workflows
 
-GitPulse organizes 13 purpose-built views into three intuitive functional groups:
+GitPulse organizes 14 purpose-built views into three intuitive functional groups:
 
 ```mermaid
 flowchart LR
@@ -253,7 +253,7 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 95 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 107 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
@@ -272,7 +272,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 13 application views and keyboard shortcuts.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 14 application views and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.

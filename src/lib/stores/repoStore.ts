@@ -40,6 +40,36 @@ import {
   type ViewTab,
 } from "../repos/persist";
 import { summarizeBulkOutcome } from "../repos/bulkOps";
+import type { StashAction, StashEntry } from "../repos/stash";
+import {
+  WATCH_ACTIVE,
+  WATCH_UNKNOWN,
+  needsFullPoll,
+  watchFailed,
+  watchStatesEqual,
+  type WatchState,
+} from "../repos/watchState";
+import type { RemoteChange } from "../repos/remotes";
+import type { SubmoduleChange } from "../repos/submodules";
+import {
+  runAcrossRepos,
+  type BulkRunReport,
+  type RepoTarget,
+  type RunOptions,
+} from "../repos/workspaceOps";
+import {
+  summarizeWorkspace,
+  bulkSkipReason,
+  type RepoWipInput,
+  type WorkspaceWip,
+} from "../repos/wipSummary";
+import {
+  IDLE_OPERATION,
+  operationStatesEqual,
+  type OperationAction,
+  type OperationState,
+  type RepoOperation,
+} from "../repos/operation";
 import {
   STATUS_POLL_INTERVAL_MS,
   shallowRecordListEqual,
@@ -60,7 +90,14 @@ export interface MutationOutcome<T = unknown> {
 }
 
 export type { BranchInfo, TagInfo, ViewTab };
+export type { OperationAction, OperationState, RepoOperation };
+export type { StashAction, StashEntry, RemoteChange, SubmoduleChange };
+export type { WatchState };
+export type { BulkRunReport, WorkspaceWip };
 export type { InvokeFn };
+
+/** Mirrors the Rust `ResetMode` under `rename_all = "lowercase"`. */
+export type ResetMode = "soft" | "mixed" | "keep" | "hard";
 
 /** How the current selection was created; decides what a preference flip may refetch. */
 export type SelectionKind = "file" | "commit" | "range";
@@ -160,6 +197,29 @@ export interface RepoSession {
    * would otherwise show fake zeros; cleared by the next successful drain.
    */
   statsFailed: boolean;
+  /**
+   * The multi-step git operation this worktree is parked in, if any, plus
+   * whether the probe itself failed. Refreshed with every snapshot: an
+   * operation can start or end from the terminal panel, another GitPulse
+   * window, or an agent, so it is never inferred from our own mutations.
+   */
+  operation: OperationState;
+  /**
+   * The stash stack. Carried on the session because it is part of the
+   * work-in-progress answer: a stash is work that exists only here, and it is
+   * invisible from every other surface in the app.
+   */
+  stashEntries: StashEntry[];
+  /** True when the stash probe failed, so an empty list is not read as "none". */
+  stashFailed: boolean;
+  /**
+   * Whether this repository is receiving live filesystem updates.
+   *
+   * A failed watch used to be swallowed, leaving the session indistinguishable
+   * from a watched one while its branches, graph and operation state went
+   * stale. Recorded here so the poll can compensate and the UI can say so.
+   */
+  watch: WatchState;
 }
 
 export interface RepoState {
@@ -190,6 +250,14 @@ export interface RepoState {
   statsPending: boolean;
   /** True when the active session's last branch-stats attempt failed. */
   statsFailed: boolean;
+  /** The active session's parked operation, if any. */
+  operation: OperationState;
+  /** The active session's stash stack. */
+  stashEntries: StashEntry[];
+  /** True when the active session's stash probe failed. */
+  stashFailed: boolean;
+  /** Whether the active session is receiving live filesystem updates. */
+  watch: WatchState;
 }
 
 interface InternalState {
@@ -296,6 +364,10 @@ function emptyProjected(): RepoState {
     generation: 0,
     statsPending: false,
     statsFailed: false,
+    operation: IDLE_OPERATION,
+    stashEntries: [],
+    stashFailed: false,
+    watch: WATCH_UNKNOWN,
   };
 }
 
@@ -331,6 +403,10 @@ function createSession(
     hasHydrated: extras.hasHydrated ?? false,
     statsPending: extras.statsPending ?? false,
     statsFailed: extras.statsFailed ?? false,
+    operation: extras.operation ?? IDLE_OPERATION,
+    stashEntries: extras.stashEntries ?? [],
+    stashFailed: extras.stashFailed ?? false,
+    watch: extras.watch ?? WATCH_UNKNOWN,
   };
 }
 
@@ -386,6 +462,10 @@ function project(internal: InternalState): RepoState {
     generation: active?.generation ?? 0,
     statsPending: active?.statsPending ?? false,
     statsFailed: active?.statsFailed ?? false,
+    operation: active?.operation ?? IDLE_OPERATION,
+    stashEntries: active?.stashEntries ?? [],
+    stashFailed: active?.stashFailed ?? false,
+    watch: active?.watch ?? WATCH_UNKNOWN,
   };
 }
 
@@ -424,6 +504,24 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // only moves on tab activation, so it cannot order two rapid selections of
   // the same tab; this does.
   const selectionGeneration = beginGeneration();
+
+  /**
+   * How many poll ticks between re-asserting the active repository's watch.
+   *
+   * A watch can die AFTER it was established — the backend reaps a session
+   * whose event stream closes, whose thread panics, or whose repository
+   * disappears, and its own log says "UI refresh for this repo is dead until
+   * it is re-watched". Nothing told the frontend, so the session went on
+   * believing it was live and the compensating full poll never engaged.
+   *
+   * Re-asserting repairs rather than merely reports: `cmd_watch_repo` returns
+   * immediately when the session is still registered, and creates a fresh
+   * watcher when it was reaped. Every 10 ticks (~60s) keeps a dead watch's
+   * blind window bounded to about a minute without putting a subprocess on
+   * the 6-second path.
+   */
+  const WATCH_REASSERT_EVERY_TICKS = 10;
+  let pollTickCount = 0;
 
   function ensureStatusPoll() {
     if (pollTimer !== null || typeof setInterval === "undefined") return;
@@ -468,6 +566,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const path = session!.path;
     const generation = session!.generation;
     const sessionId = session!.id;
+
+    // Periodically re-assert the watch so a watcher that died after startup
+    // self-heals, and so its loss becomes visible if it cannot. Deliberately
+    // not awaited: the status tick must not wait on it, and its own result is
+    // generation-guarded before it lands.
+    pollTickCount += 1;
+    if (pollTickCount % WATCH_REASSERT_EVERY_TICKS === 0) {
+      void watch(path).then((state) => {
+        applyToSession(sessionId, generation, { watch: state });
+      });
+    }
+
+    // A repository with no live watcher gets a FULL refresh on this tick
+    // instead of the statuses-only one. The watcher is what refreshes
+    // branches, the graph, the parked-operation banner and the stash stack on
+    // a tab the user is already sitting on; without it those go stale forever
+    // while the file list keeps updating, which reads as "everything is
+    // current". This is the compensation that makes the indicator honest
+    // rather than merely apologetic. Bounded to the ACTIVE session, so the
+    // extra cost is one snapshot per interval and only while degraded.
+    if (needsFullPoll(session!.watch)) {
+      pollInflight = true;
+      try {
+        await hydrate(sessionId, path, generation);
+      } finally {
+        pollInflight = false;
+      }
+      return;
+    }
     // Ordering tokens: the result must lose to BOTH a newer poll and any
     // hydrate started after this tick — otherwise a slow poll lands after a
     // watcher refresh's snapshot and clobbers fresher statuses for up to a
@@ -601,6 +728,28 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     for (const key of Object.keys(patch) as (keyof RepoSession)[]) {
       const incoming = patch[key];
       if (incoming === session[key]) continue;
+      // `operation` is the one object-valued field, and the snapshot rebuilds
+      // it every poll — reference equality would republish the whole store to
+      // every subscriber every six seconds on a repository where nothing
+      // happened. Compared through its owner rather than a generic deep-equal,
+      // so no other field silently acquires expensive comparison semantics.
+      if (key === "watch") {
+        if (watchStatesEqual(session.watch, incoming as unknown as WatchState)) {
+          continue;
+        }
+        return false;
+      }
+      if (key === "operation") {
+        if (
+          operationStatesEqual(
+            session.operation,
+            incoming as unknown as OperationState,
+          )
+        ) {
+          continue;
+        }
+        return false;
+      }
       if (
         Array.isArray(incoming) &&
         Array.isArray(session[key]) &&
@@ -697,25 +846,62 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     tags: TagInfo[];
     currentBranch: string | null;
     defaultBranch: string | null;
+    operation: OperationState;
+    stashEntries: StashEntry[];
+    stashFailed: boolean;
   }> {
-    const [branches, statuses, tags] = await Promise.all([
+    const [branches, statuses, tags, operation, stash] = await Promise.all([
       invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path }),
       invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path }),
       invokeFn<TagInfo[]>("cmd_list_tags", { repoPath: path }).catch(
         () => [] as TagInfo[],
       ),
+      // A failed probe is recorded as a failure, never folded into "idle".
+      // Reporting "no operation in progress" because the check itself broke
+      // is what strands a user mid-merge in a UI insisting all is well. It
+      // does not fail the snapshot, though: branches and statuses are still
+      // worth rendering, and the marker says the state is unknown.
+      invokeFn<RepoOperation | null>("cmd_repo_operation", { repoPath: path })
+        .then((value) => ({ operation: value ?? null, probeFailed: false }))
+        .catch(() => ({ operation: null, probeFailed: true })),
+      // Same fail-soft-but-honest treatment as the operation probe: an empty
+      // stash list and an unreadable one must not render the same, because a
+      // forgotten stash is work that exists nowhere else.
+      invokeFn<StashEntry[]>("cmd_stash_list", { repoPath: path })
+        .then((entries) => ({ entries: entries ?? [], failed: false }))
+        .catch(() => ({ entries: [] as StashEntry[], failed: true })),
     ]);
     const currentBranch = branches.find((b) => b.is_current)?.name || null;
     const defaultBranch =
       branches.find((b) => b.is_default)?.name || currentBranch || "main";
-    return { branches, statuses, tags, currentBranch, defaultBranch };
+    return {
+      branches,
+      statuses,
+      tags,
+      currentBranch,
+      defaultBranch,
+      operation,
+      stashEntries: stash.entries,
+      stashFailed: stash.failed,
+    };
   }
 
-  async function watch(path: string) {
+  /**
+   * Starts the filesystem watch and REPORTS the outcome.
+   *
+   * Still best-effort in the sense that a failure never blocks opening a
+   * repository — but the failure is no longer invisible. `cmd_watch_repo`
+   * fails for ordinary reasons (the backend's watch table is full, the
+   * platform refuses another inotify handle), and a repository with no watcher
+   * silently stops receiving branch, graph, operation and stash updates while
+   * looking exactly like one that is live.
+   */
+  async function watch(path: string): Promise<WatchState> {
     try {
       await invokeFn("cmd_watch_repo", { repoPath: path });
-    } catch {
-      /* watcher is best-effort */
+      return WATCH_ACTIVE;
+    } catch (err: unknown) {
+      return watchFailed(err);
     }
   }
 
@@ -757,6 +943,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       tags: TagInfo[];
       currentBranch: string | null;
       defaultBranch: string | null;
+      operation: OperationState;
+      stashEntries: StashEntry[];
+      stashFailed: boolean;
     },
   ) {
     if (live.branches.length === 0) return snapshot;
@@ -1115,7 +1304,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       publish();
       if (!resolved) return true;
-      await watch(path);
+      // Recorded before the hydrate so the first snapshot already carries an
+      // honest live/degraded answer, rather than briefly claiming live updates
+      // for a repository that never got a watcher.
+      const watchState = await watch(path);
+      applyToSession(opened.id, session.generation, { watch: watchState });
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
       if (
@@ -1635,6 +1828,158 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         (path) =>
           invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
       ),
+    // --- stash ----------------------------------------------------------
+
+    /**
+     * Applies, pops, or drops a stash entry.
+     *
+     * Takes the entry rather than an index so the object id it was listed with
+     * always travels with it: the backend re-resolves the index under its lock
+     * and refuses the pair on a mismatch, which is what keeps a stale list from
+     * dropping a stash that someone else pushed in the meantime.
+     */
+    stashAction: async (action: StashAction, entry: StashEntry) =>
+      runMutating(`stash-${action}`, entry.selector, (path) =>
+        invokeFn("cmd_stash_action", {
+          repoPath: path,
+          action,
+          index: entry.index,
+          expectedOid: entry.oid,
+        }),
+      ),
+
+    /** The diff a stash entry holds, addressed by object id. */
+    stashShow: async (oid: string): Promise<string> => {
+      const session = activeSession();
+      if (!session) throw new Error("No repository is open.");
+      return invokeFn<string>("cmd_stash_show", { repoPath: session.path, oid });
+    },
+
+    // --- replaying and rewinding commits --------------------------------
+
+    /**
+     * Replays commits onto the current branch. A conflict parks the repository,
+     * which the operation banner then offers a way out of.
+     */
+    cherryPick: async (commits: string[], noCommit = false) =>
+      runMutating("cherry-pick", commits.join(", "), (path) =>
+        invokeFn("cmd_cherry_pick", { repoPath: path, commits, noCommit }),
+      ),
+
+    /** Records the inverse of the given commits as new commits. */
+    revertCommits: async (commits: string[], noCommit = false) =>
+      runMutating("revert", commits.join(", "), (path) =>
+        invokeFn("cmd_revert", { repoPath: path, commits, noCommit }),
+      ),
+
+    /**
+     * Moves the current branch to `target`.
+     *
+     * `"hard"` destroys uncommitted work irrecoverably; callers are expected to
+     * have confirmed with the user first — this is the last layer that could,
+     * and it deliberately does not second-guess an explicit instruction.
+     */
+    resetTo: async (mode: ResetMode, target: string) =>
+      runMutating(`reset-${mode}`, target, (path) =>
+        invokeFn("cmd_reset", { repoPath: path, mode, target }),
+      ),
+
+    // --- remotes and submodules ----------------------------------------
+
+    listRemotes: async (): Promise<unknown[]> => {
+      const session = activeSession();
+      if (!session) return [];
+      return invokeFn<unknown[]>("cmd_list_remotes", { repoPath: session.path });
+    },
+
+    remoteChange: async (change: RemoteChange) =>
+      runMutating(`remote-${change.kind}`, change.name, (path) =>
+        invokeFn("cmd_remote_change", { repoPath: path, change }),
+      ),
+
+    listSubmodules: async (): Promise<unknown[]> => {
+      const session = activeSession();
+      if (!session) return [];
+      return invokeFn<unknown[]>("cmd_list_submodules", { repoPath: session.path });
+    },
+
+    submoduleChange: async (change: SubmoduleChange) =>
+      runMutating(
+        `submodule-${change.kind}`,
+        ("path" in change && change.path) || "all submodules",
+        (path) => invokeFn("cmd_submodule_change", { repoPath: path, change }),
+      ),
+
+    // --- workspace-wide -------------------------------------------------
+
+    /**
+     * The work-in-progress answer for every open repository.
+     *
+     * Derived from live session state rather than refetched, so it is free to
+     * call and always agrees with what the tabs are showing.
+     */
+    workspaceWip: (): WorkspaceWip => summarizeWorkspace(wipInputs()),
+
+    /**
+     * Runs `fetch` (or `pull`) across every open repository.
+     *
+     * Repositories that are parked mid-operation, still loading, or holding
+     * conflicts are SKIPPED and reported as skipped — never silently counted as
+     * fetched. After the sweep every visited repository is refreshed so the
+     * tabs reflect what actually landed.
+     */
+    runAcrossOpenRepos: async (
+      kind: "fetch" | "pull",
+      options: RunOptions = {},
+    ): Promise<BulkRunReport> => {
+      const byPath = new Map(wipInputs().map((input) => [input.path, input]));
+      const targets: RepoTarget[] = internal.workspace.tabs.map((tab) => ({
+        path: tab.path,
+        label: byPath.get(tab.path)?.label ?? displayName(tab.path),
+      }));
+      const report = await runAcrossRepos(
+        targets,
+        async (target) => {
+          const input = byPath.get(target.path);
+          const skip = input ? bulkSkipReason(input) : "Repository is no longer open.";
+          if (skip) return { skip };
+          // Both commands are named literally rather than selected into a
+          // variable: the IPC contract checker verifies every invoked command
+          // against the Rust registry statically, and a computed name is a
+          // hole in that check rather than a shortcut.
+          if (kind === "fetch") {
+            await invokeFn("cmd_fetch", { repoPath: target.path });
+          } else {
+            await invokeFn("cmd_pull", { repoPath: target.path });
+          }
+          mutationEchoUntil.set(target.path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+        },
+        options,
+      );
+      // Refresh only what actually ran: re-hydrating a skipped repository would
+      // cost a full snapshot for a repository nothing happened to.
+      await Promise.all(
+        report.results
+          .filter((result) => result.status === "ok")
+          .map((result) => store.refresh(result.path)),
+      );
+      return report;
+    },
+
+    /**
+     * Aborts, continues, or skips the parked operation.
+     *
+     * The kind is deliberately NOT sent: the backend re-detects it under the
+     * repository lock, so a banner rendered before someone aborted from the
+     * terminal cannot send `git rebase --abort` at a repository that has since
+     * become idle. The refresh that `runMutating` triggers is what clears the
+     * banner, so the UI never has to guess whether the operation ended.
+     */
+    operationAction: async (action: OperationAction) =>
+      runMutating(`operation-${action}`, action, (path) =>
+        invokeFn("cmd_repo_operation_action", { repoPath: path, action }),
+      ),
+
     mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
       runMutating("merge", branchName, (path) =>
         invokeFn("cmd_merge_branch", { repoPath: path, branchName, ffOnly }),
@@ -1721,6 +2066,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * action into the agent journal, so an agent-driven session stays
    * reconstructible after the fact.
    */
+  /**
+   * Per-repository facts for the work-in-progress summary.
+   *
+   * `unpushedCommits` comes from the current branch's ahead count; a session
+   * that has not hydrated reports zero, and `hydrated: false` is what tells the
+   * summary to treat that zero as unknown rather than as "nothing to push".
+   */
+  function wipInputs(): RepoWipInput[] {
+    const labels = disambiguateLabels(internal.workspace.tabs.map((tab) => tab.path));
+    return internal.workspace.tabs.map((tab) => {
+      const session = internal.sessions[tab.id];
+      const statuses = session?.statuses ?? [];
+      const current = session?.branches.find(
+        (branch) => branch.is_current || branch.name === session?.currentBranch,
+      );
+      return {
+        path: tab.path,
+        label: labels.get(tab.path) ?? displayName(tab.path),
+        changedFiles: statuses.length,
+        conflictedFiles: statuses.filter((file) => file.is_conflicted).length,
+        unpushedCommits: current?.ahead_count ?? 0,
+        // An unreadable stash list must not read as an empty one; the summary
+        // treats a failed probe as unknown through `loadFailed`.
+        stashEntries: session?.stashEntries.length ?? 0,
+        operation: session?.operation ?? IDLE_OPERATION,
+        loadFailed: Boolean(session?.error) || Boolean(session?.stashFailed),
+        hydrated: Boolean(session?.hasHydrated),
+      };
+    });
+  }
+
   async function runMutating<T = unknown>(
     kind: string,
     label: string,

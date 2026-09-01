@@ -18,6 +18,50 @@ pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Upper bound on commits replayed by one cherry-pick or revert call.
+///
+/// A replay is a sequence of merges; an unbounded list from a "select all"
+/// click would park the repository in a sequencer thousands of steps deep with
+/// no realistic way back out.
+const MAX_REPLAY_COMMITS: usize = 200;
+
+/// How much of the working state a reset discards.
+///
+/// An enum rather than a passthrough string: no caller can invent a mode, and
+/// the write gate is handed a line whose destructiveness it can rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResetMode {
+    /// Move the branch; keep the index and the working tree.
+    Soft,
+    /// Move the branch and reset the index; keep the working tree.
+    Mixed,
+    /// Move the branch and reset the index, keeping local changes that do not
+    /// collide. Refuses rather than overwriting.
+    Keep,
+    /// Move the branch and overwrite the index AND the working tree.
+    /// Uncommitted work is destroyed and is not recoverable from git.
+    Hard,
+}
+
+impl ResetMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Keep => "--keep",
+            ResetMode::Hard => "--hard",
+        }
+    }
+
+    /// True for the mode that destroys uncommitted work. The UI uses this to
+    /// decide whether an extra confirmation is owed; it is derived here so the
+    /// answer cannot drift from the flag it describes.
+    pub fn discards_working_tree(self) -> bool {
+        matches!(self, ResetMode::Hard)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RebaseActionKind {
     Pick,
@@ -575,34 +619,12 @@ impl GitWriter {
         .unwrap_or_else(|| onto.to_string()))
     }
 
-    /// True when a rebase or merge is mid-flight (`rebase-merge`,
-    /// `rebase-apply`, `MERGE_HEAD`). Stacking on top of one corrupts both
-    /// operations; refuse before touching anything.
-    fn rebase_or_merge_in_progress(repo_canon: &Path) -> Result<bool, String> {
-        for state in ["rebase-merge", "rebase-apply", "MERGE_HEAD"] {
-            let raw = git_text(repo_canon, &["rev-parse", "--git-path", state])?;
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
-            }
-            let path = std::path::Path::new(raw);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                repo_canon.join(path)
-            };
-            if path.exists() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Executes a restack with full preflight and rollback semantics. Caller
     /// MUST hold the repo mutation lock.
     ///
-    /// - Preflight refuses a dirty worktree and an in-progress rebase/merge
-    ///   before any state is touched.
+    /// - Preflight refuses a dirty worktree and any in-progress operation
+    ///   (merge, rebase, cherry-pick, revert, `am`, bisect) before any state
+    ///   is touched, naming the one it actually found.
     /// - On failure the half-applied rebase is aborted and the user's
     ///   original checkout restored; the error says what was rolled back.
     /// - On success `git rebase <branch>` leaves `branch` checked out, which
@@ -626,12 +648,15 @@ impl GitWriter {
         // In-progress detection runs BEFORE the dirty-tree check: a mid-rebase
         // worktree is by definition dirty, and "finish the other rebase" is
         // the actionable cause while "commit your changes" is its symptom.
-        if Self::rebase_or_merge_in_progress(repo_canon)? {
-            return Err(
-                "A rebase or merge is already in progress in this repository; \
-                 finish it before restacking"
-                    .into(),
-            );
+        // Naming the actual operation matters: "finish the rebase" sends the
+        // user hunting for a rebase that is really a parked cherry-pick, and
+        // `git rebase --abort` does not clear one.
+        if let Some(parked) = crate::engine::repo_op::detect(repo_canon)? {
+            return Err(format!(
+                "A {} is already in progress in this repository; \
+                 finish or abort it before restacking",
+                parked.kind.label()
+            ));
         }
         let dirty = git_text(repo_canon, &["status", "--porcelain"])?;
         if !dirty.trim().is_empty() {
@@ -815,6 +840,132 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         git_text(&repo, &["stash", "pop"])
+    }
+
+    /// Refuses when the worktree is already parked mid-operation, naming it.
+    ///
+    /// Starting a cherry-pick on top of a parked rebase does not queue behind
+    /// it — git refuses with a message about internals, or worse, the second
+    /// operation's control files collide with the first's. Consulting the same
+    /// detector the recovery banner uses means the refusal names the operation
+    /// the user can actually see and abort.
+    fn refuse_if_parked(repo_canon: &Path, verb: &str) -> Result<(), String> {
+        if let Some(parked) = crate::engine::repo_op::detect(repo_canon)? {
+            return Err(format!(
+                "Cannot {verb} while a {} is in progress. Finish or abort it first.",
+                parked.kind.label()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Renders the argv for a cherry-pick or revert of `commits`.
+    ///
+    /// Shared by the write gate and the executor so the judged line is the run
+    /// line. `--` is not applicable (these take revisions, not paths), so the
+    /// leading-dash rejection in `validate_oid_or_revision` is what keeps a
+    /// commit-ish from turning into a flag.
+    pub fn replay_argv<'a>(
+        subcommand: &'a str,
+        commits: &'a [String],
+        no_commit: bool,
+    ) -> Vec<&'a str> {
+        let mut argv = vec!["git", subcommand];
+        if no_commit {
+            argv.push("--no-commit");
+        } else {
+            // Both verbs open an editor for the message by default. The editor
+            // is pinned to `true` process-wide, but saying `--no-edit` here
+            // makes the intent explicit in the line the gate judges.
+            argv.push("--no-edit");
+        }
+        for commit in commits {
+            argv.push(commit.as_str());
+        }
+        argv
+    }
+
+    /// Validates the commit list shared by cherry-pick and revert.
+    ///
+    /// An empty list would make git operate on `HEAD` implicitly for some
+    /// verbs, which is never what a UI meant to send.
+    fn validate_replay_commits(commits: &[String]) -> Result<(), String> {
+        if commits.is_empty() {
+            return Err("No commits were selected".into());
+        }
+        if commits.len() > MAX_REPLAY_COMMITS {
+            return Err(format!(
+                "Too many commits selected ({}); the limit is {MAX_REPLAY_COMMITS}",
+                commits.len()
+            ));
+        }
+        for commit in commits {
+            validate_oid_or_revision(commit)?;
+        }
+        Ok(())
+    }
+
+    /// Replays `commits` onto the current branch.
+    ///
+    /// A conflict leaves the repository parked mid-cherry-pick, which is a
+    /// legitimate outcome rather than a corruption: `repo_op` detects it and
+    /// the banner offers continue/skip/abort. The error therefore reports the
+    /// conflict without attempting a rollback that would discard the user's
+    /// chance to resolve it.
+    pub fn cherry_pick(
+        repo_path: &str,
+        commits: &[String],
+        no_commit: bool,
+    ) -> Result<String, String> {
+        Self::replay(repo_path, "cherry-pick", commits, no_commit)
+    }
+
+    /// Records the inverse of `commits` as new commits. Same parked-on-conflict
+    /// semantics as [`cherry_pick`].
+    pub fn revert(repo_path: &str, commits: &[String], no_commit: bool) -> Result<String, String> {
+        Self::replay(repo_path, "revert", commits, no_commit)
+    }
+
+    fn replay(
+        repo_path: &str,
+        subcommand: &str,
+        commits: &[String],
+        no_commit: bool,
+    ) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::validate_replay_commits(commits)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::refuse_if_parked(&repo, subcommand)?;
+        let argv = Self::replay_argv(subcommand, commits, no_commit);
+        git_text(&repo, &argv[1..])
+    }
+
+    /// Renders the argv for a reset. Shared by the gate and the executor.
+    pub fn reset_argv(mode: ResetMode, target: &str) -> Vec<&str> {
+        vec!["git", "reset", mode.flag(), target]
+    }
+
+    /// Moves the current branch to `target`, discarding as much as `mode` says.
+    ///
+    /// `--hard` destroys uncommitted work irrecoverably, which is why the mode
+    /// is an enum rather than a passthrough string: no caller can invent a
+    /// fifth mode, and the write gate sees a rendered line it can rank by
+    /// destructiveness.
+    pub fn reset(repo_path: &str, mode: ResetMode, target: &str) -> Result<String, String> {
+        let repo = validate_repo(repo_path)?;
+        validate_oid_or_revision(target)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reset mid-merge silently abandons the merge's state instead of
+        // ending it; the user wants abort, and the banner offers it.
+        Self::refuse_if_parked(&repo, "reset")?;
+        let argv = Self::reset_argv(mode, target);
+        git_text(&repo, &argv[1..])
     }
 
     pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {

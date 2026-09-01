@@ -46,6 +46,7 @@ describe("viewRegistry", () => {
       "health",
       "storage",
       "stack",
+      "repo",
       "terminal",
       "manvi",
       "github",

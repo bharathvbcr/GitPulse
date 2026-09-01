@@ -331,6 +331,22 @@ fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
             cmd.env_remove(&name);
         }
     }
+    // Editors are neutralized AFTER the strip loop, which would otherwise
+    // remove GIT_SEQUENCE_EDITOR right back out again.
+    //
+    // Stripping the editor variables is not enough on its own: with none set,
+    // git falls back to `core.editor` and then to vi, and any subcommand that
+    // wants a message (`rebase --continue`, `am --continue`, `merge
+    // --continue`, a bare `commit`) launches it against a null stdin and
+    // blocks until the 90s command timeout — surfacing as "git timed out"
+    // rather than a result. `true` is a real program that exits 0 immediately,
+    // so git accepts the message it prepared and the command completes.
+    //
+    // This changes no existing caller's behavior: every message-bearing call
+    // in this codebase already passes `-m` or `--no-edit`, so no editor was
+    // ever supposed to open. It converts a whole class of hangs into success.
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -656,8 +672,15 @@ pub(crate) fn build_capture_command(
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_SEQUENCE_EDITOR")
         .env_remove("GIT_EXEC_PATH")
+        // Same editor pin as [`git_command`], for the same two reasons: these
+        // tools shell out to git themselves (`gh pr checkout` fetches and
+        // merges), and a spawned editor against a null stdin blocks until the
+        // timeout. Removal alone would leave git's `core.editor` config
+        // fallback open, so both variables are pinned to a program that exits
+        // immediately.
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GH_PROMPT_DISABLED", "1")
         // gh consults this before printing update notices; keep subprocess
         // output deterministic instead of interleaving a self-update banner.
@@ -1940,10 +1963,41 @@ mod tests {
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_SYSTEM",
             "GIT_EXTERNAL_DIFF",
-            "GIT_SEQUENCE_EDITOR",
             "GIT_EXEC_PATH",
         ] {
             assert!(removed.contains(key), "git_command must remove {key}");
+        }
+    }
+
+    /// The editor variables are PINNED rather than removed, and the difference
+    /// is a security property, not a style choice.
+    ///
+    /// Removing `GIT_SEQUENCE_EDITOR` only clears the environment channel; git
+    /// then falls back to the `sequence.editor` / `core.editor` config of
+    /// whatever repository is open, and a repository directory carrying
+    /// `sequence.editor = sh -c '…'` in its `.git/config` gets that command
+    /// executed by any invocation that wants an editor. Pinning to `true`
+    /// closes the config fallback as well as the environment one, and makes
+    /// every editor-opening subcommand terminate immediately instead of
+    /// blocking on a null stdin until the command timeout.
+    #[test]
+    fn git_command_pins_editors_to_a_harmless_program() {
+        let cmd = git_command(Some(Path::new("/tmp")), &["rebase", "--continue"]);
+        let pinned: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] {
+            assert_eq!(
+                pinned.get(key).cloned().flatten().as_deref(),
+                Some("true"),
+                "{key} must be pinned to `true`, not merely removed"
+            );
         }
     }
 
@@ -2091,13 +2145,25 @@ mod tests {
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
             "GIT_EXTERNAL_DIFF",
-            "GIT_SEQUENCE_EDITOR",
             "GIT_EXEC_PATH",
         ] {
             assert_eq!(
                 value_of(key),
                 Some(None),
                 "{key} must be stripped from captured-tool children"
+            );
+        }
+        // The editors are pinned, not stripped: captured tools shell out to
+        // git, and removal alone leaves git's `core.editor` config fallback
+        // open (a repository carrying `sequence.editor = sh -c '…'` would get
+        // it executed). See git_command_pins_editors_to_a_harmless_program.
+        for key in ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"] {
+            assert_eq!(
+                value_of(key)
+                    .and_then(|v| v.map(|s| s.to_string_lossy().into_owned()))
+                    .as_deref(),
+                Some("true"),
+                "{key} must be pinned for captured-tool children, not merely removed"
             );
         }
         assert_eq!(

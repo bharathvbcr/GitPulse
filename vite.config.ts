@@ -3,7 +3,20 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
 import { appVersion } from "./scripts/app-version.mjs";
 
-const MAX_PRODUCTION_CHUNK_BYTES = 650_000;
+/**
+ * Entry-chunk ceiling. Vendor runtimes (svelte, xterm, lucide, tauri) are split
+ * out by `gitpulseManualChunk`, so this bounds FIRST-PARTY application code
+ * only — its job is to catch a dependency accidentally landing in the entry
+ * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
+ *
+ * Measured at 680 KB after the repository-surface pass (remotes, submodules,
+ * stash lifecycle, workspace bulk operations); 656 KB before it, 648 KB before
+ * the parked-operation work. Growth is first-party: the vendor chunks below
+ * are unchanged across all three, which is the check to run before raising
+ * this again — a jump with vendor chunks unchanged is app code, a jump with
+ * them changed is a dependency that leaked into the entry chunk.
+ */
+const MAX_PRODUCTION_CHUNK_BYTES = 690_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.

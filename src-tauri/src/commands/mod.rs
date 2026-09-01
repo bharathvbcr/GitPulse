@@ -12,7 +12,9 @@ use crate::engine::git_reader::{
 };
 use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
-    BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, TagInfo, WorktreeInfo,
+    BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, OperationAction, RemoteChange,
+    RemoteInfo, RepoOperation, ResetMode, StashAction, StashEntry, SubmoduleChange, SubmoduleInfo,
+    TagInfo, WorktreeInfo,
 };
 use crate::github::{
     checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
@@ -965,6 +967,198 @@ pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, String>
     off_thread(move || {
         let policy = guard(&repo_path, &["git", "stash", "pop"])?;
         let output = GitWriter::stash_pop(&repo_path)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+// --- stash -------------------------------------------------------------
+
+/// Lists the stash stack. Read-only and ungated.
+#[tauri::command(async)]
+pub async fn cmd_stash_list(repo_path: String) -> Result<Vec<StashEntry>, String> {
+    off_thread(move || crate::engine::stash::list(&repo_path)).await
+}
+
+/// Renders the diff a stash entry holds, addressed by object id.
+#[tauri::command(async)]
+pub async fn cmd_stash_show(repo_path: String, oid: String) -> Result<String, String> {
+    off_thread(move || crate::engine::stash::show(&repo_path, &oid)).await
+}
+
+/// Applies, pops, or drops a stash entry.
+///
+/// `expected_oid` is what the client believed `index` held. The engine
+/// re-resolves the index under the repository lock and refuses on a mismatch,
+/// so a stale list can fail loudly but can never destroy an entry the user did
+/// not choose — the stash stack is shared with every other worktree, client
+/// and agent touching this repository.
+#[tauri::command(async)]
+pub async fn cmd_stash_action(
+    repo_path: String,
+    action: StashAction,
+    index: usize,
+    expected_oid: String,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let (policy, output) = crate::engine::stash::run_action_with(
+            &repo_path,
+            action,
+            index,
+            &expected_oid,
+            |argv| guard(&repo_path, argv),
+        )?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+// --- replaying and rewinding commits -----------------------------------
+
+/// Replays commits onto the current branch.
+///
+/// A conflict parks the repository mid-cherry-pick, which `cmd_repo_operation`
+/// then reports and the banner offers continue/skip/abort for. That is a
+/// supported outcome, not a failure to roll back.
+#[tauri::command(async)]
+pub async fn cmd_cherry_pick(
+    repo_path: String,
+    commits: Vec<String>,
+    no_commit: Option<bool>,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let no_commit = no_commit.unwrap_or(false);
+        let argv = GitWriter::replay_argv("cherry-pick", &commits, no_commit);
+        let policy = guard(&repo_path, &argv)?;
+        let output = GitWriter::cherry_pick(&repo_path, &commits, no_commit)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Records the inverse of the given commits as new commits.
+#[tauri::command(async)]
+pub async fn cmd_revert(
+    repo_path: String,
+    commits: Vec<String>,
+    no_commit: Option<bool>,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let no_commit = no_commit.unwrap_or(false);
+        let argv = GitWriter::replay_argv("revert", &commits, no_commit);
+        let policy = guard(&repo_path, &argv)?;
+        let output = GitWriter::revert(&repo_path, &commits, no_commit)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Moves the current branch to `target`.
+///
+/// `ResetMode::Hard` destroys uncommitted work irrecoverably; the mode is an
+/// enum so the rendered line the gate judges names the exact flag, and the UI
+/// can require its own confirmation from `discards_working_tree`.
+#[tauri::command(async)]
+pub async fn cmd_reset(
+    repo_path: String,
+    mode: ResetMode,
+    target: String,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let argv = GitWriter::reset_argv(mode, &target);
+        let policy = guard(&repo_path, &argv)?;
+        let output = GitWriter::reset(&repo_path, mode, &target)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+// --- remotes -----------------------------------------------------------
+
+/// Lists configured remotes with their fetch/push URLs. Read-only and ungated.
+#[tauri::command(async)]
+pub async fn cmd_list_remotes(repo_path: String) -> Result<Vec<RemoteInfo>, String> {
+    off_thread(move || crate::engine::remotes::list(&repo_path)).await
+}
+
+/// Adds, removes, renames, repoints, or prunes a remote.
+///
+/// The gate runs inside the engine, under the repository lock and against the
+/// argv that executes — the same discipline every other mutating path follows.
+#[tauri::command(async)]
+pub async fn cmd_remote_change(
+    repo_path: String,
+    change: RemoteChange,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let (policy, output) = crate::engine::remotes::apply_with(&repo_path, &change, |argv| {
+            guard(&repo_path, argv)
+        })?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+// --- submodules --------------------------------------------------------
+
+/// Lists embedded submodules and whether each is usable. Read-only and ungated.
+#[tauri::command(async)]
+pub async fn cmd_list_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>, String> {
+    off_thread(move || crate::engine::submodules::list(&repo_path)).await
+}
+
+/// Initializes, syncs, or deinitializes submodules.
+#[tauri::command(async)]
+pub async fn cmd_submodule_change(
+    repo_path: String,
+    change: SubmoduleChange,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let (policy, output) =
+            crate::engine::submodules::apply_with(&repo_path, &change, |argv| {
+                guard(&repo_path, argv)
+            })?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Reports the multi-step git operation this worktree is parked in, if any.
+///
+/// Read-only and ungated: it runs on every status refresh, and putting a
+/// sidecar round trip in front of a background read would buy no decision.
+#[tauri::command(async)]
+pub async fn cmd_repo_operation(repo_path: String) -> Result<Option<RepoOperation>, String> {
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        crate::engine::repo_op::detect(&repo)
+    })
+    .await
+}
+
+/// Aborts, continues, or skips the parked operation.
+///
+/// The gate judges the argv that [`crate::engine::repo_op::action_argv`]
+/// renders, and `run_action` re-renders the same line from the same function
+/// under the repo lock — so the judged line is the executed line. The kind is
+/// re-detected on both sides rather than trusted from the client: a stale UI
+/// asking to abort a rebase that has since become a cherry-pick must not send
+/// `git rebase --abort`.
+#[tauri::command(async)]
+pub async fn cmd_repo_operation_action(
+    repo_path: String,
+    action: OperationAction,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        // The gate runs inside `run_action_with`, under the repository lock and
+        // against the same argv that executes. Detecting and judging out here
+        // would let a concurrent abort change the operation in between, so the
+        // gate would approve `git rebase --abort` while a cherry-pick abort is
+        // what actually ran.
+        let (policy, output) =
+            crate::engine::repo_op::run_action_with(&repo_path, action, |argv| {
+                guard(&repo_path, argv)
+            })?;
         Ok(Guarded { policy, output })
     })
     .await

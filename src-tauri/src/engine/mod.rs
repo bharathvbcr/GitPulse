@@ -1,6 +1,10 @@
 pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
+pub mod remotes;
+pub mod repo_op;
+pub mod stash;
+pub mod submodules;
 pub mod worktree;
 
 pub use git_cli::{
@@ -11,5 +15,9 @@ pub use git_reader::{
     BlameLine, BranchInfo, BranchStatsReport, BranchStatsUpdate, CommitDetails, CommitFileChange,
     FileStatus, GitReader, ReflogEntry, RepoLanguageStat, TagInfo,
 };
-pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep};
+pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep, ResetMode};
+pub use remotes::{RemoteChange, RemoteInfo};
+pub use repo_op::{OperationAction, OperationKind, RepoOperation};
+pub use stash::{StashAction, StashEntry};
+pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleState};
 pub use worktree::WorktreeInfo;
