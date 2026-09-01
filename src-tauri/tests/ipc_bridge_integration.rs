@@ -493,3 +493,118 @@ fn a_large_payload_crosses_the_bridge_without_truncation() {
     .expect("the read succeeds");
     assert_eq!(read_back.as_str().expect("a string").len(), payload.len());
 }
+
+#[test]
+fn a_path_escaping_the_repository_is_refused_across_the_bridge() {
+    // The sandbox rejects absolute paths, parent traversal and NUL bytes. Those
+    // refusals only protect anything if they survive the IPC boundary as
+    // errors — a refusal that arrived on the success channel would hand the
+    // frontend whatever the read produced.
+    let repo = repo_with_change();
+    let root = repo.path().to_string_lossy().into_owned();
+    for hostile in [
+        "../../../etc/passwd",
+        "/etc/passwd",
+        "subdir/../../escape.txt",
+        "",
+    ] {
+        let result = invoke(
+            "cmd_get_file_content",
+            json!({ "repoPath": root, "filePath": hostile }),
+        );
+        assert!(
+            result.is_err(),
+            "{hostile:?} must be refused, got success: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_write_escaping_the_repository_is_refused_across_the_bridge() {
+    // The write side matters more than the read side: a traversal that
+    // succeeded would modify a file outside the repository the user opened.
+    //
+    // Two layers refuse this, and the policy gate fires before `sandbox_write`
+    // is reached — bypassing the sandbox alone leaves the write still refused.
+    // This asserts the outcome rather than which layer produced it, so it
+    // keeps holding if the order changes, and it fails if both layers are lost:
+    // verified by bypassing guard_file and sandbox_write together, which makes
+    // the escape succeed and this test fail.
+    // The repository lives inside a private directory, so "did a traversal
+    // escape" is answerable. Using the TempDir's own parent would ask about
+    // the shared system temp directory, where unrelated files exist and the
+    // answer means nothing.
+    let enclosing = tempfile::TempDir::new().expect("tempdir");
+    let repo = enclosing.path().join("repo");
+    std::fs::create_dir(&repo).expect("repo dir");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test User"]);
+    let root = repo.to_string_lossy().into_owned();
+
+    for hostile in ["../escaped.txt", "a/../../escaped.txt"] {
+        let result = invoke(
+            "cmd_write_file_content",
+            json!({ "repoPath": root, "filePath": hostile, "content": "escaped\n" }),
+        );
+        assert!(
+            result.is_err(),
+            "{hostile:?} must be refused, got {result:?}"
+        );
+    }
+    let escaped = enclosing.path().join("escaped.txt");
+    assert!(
+        !escaped.exists(),
+        "a refused write still created {}",
+        escaped.display()
+    );
+    // An absolute path is refused too; assert on the refusal rather than on
+    // the absence of a file in a directory this test does not own.
+    assert!(invoke(
+        "cmd_write_file_content",
+        json!({ "repoPath": root, "filePath": "/tmp/escaped.txt", "content": "escaped\n" }),
+    )
+    .is_err());
+}
+
+#[test]
+fn concurrent_invocations_do_not_interfere() {
+    // Commands run on a blocking pool; two in flight must return their own
+    // answers rather than one another's.
+    let repo = repo_with_change();
+    let root = repo.path().to_string_lossy().into_owned();
+    for (name, body) in [("a.txt", "alpha\n"), ("b.txt", "beta\n")] {
+        invoke(
+            "cmd_write_file_content",
+            json!({ "repoPath": root, "filePath": name, "content": body }),
+        )
+        .expect("write succeeds");
+    }
+    let handles: Vec<_> = [("a.txt", "alpha\n"), ("b.txt", "beta\n")]
+        .into_iter()
+        .map(|(name, expected)| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let value = invoke(
+                        "cmd_get_file_content",
+                        json!({ "repoPath": root, "filePath": name }),
+                    )
+                    .expect("read succeeds");
+                    assert_eq!(value.as_str().expect("a string"), expected);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("no thread panicked");
+    }
+}
