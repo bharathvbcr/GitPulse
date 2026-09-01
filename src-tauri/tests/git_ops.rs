@@ -1464,3 +1464,65 @@ fn run_git_expect_failure(cwd: &Path, args: &[&str]) {
         "git {args:?} was expected to fail but succeeded"
     );
 }
+
+/// A commit's changed-file list crosses IPC in full, so a vendored-dependency
+/// drop or an initial import shipped an unbounded payload. The frontend has
+/// rendered a "+only first N listed" notice from `files_list_truncated` since
+/// hardening wave 2 — but the backend never set the flag, so the notice could
+/// not fire and the list was never cut.
+///
+/// Fails before the cap landed: the two fields did not exist backend-side, so
+/// `changed_files` held every entry and the flag was permanently false.
+#[test]
+fn commit_details_caps_a_massive_file_list_and_reports_the_true_total() {
+    const OVER_CAP: usize = 5_001;
+    const CAP: usize = 5_000;
+    let repo = TestRepo::init();
+    for i in 0..OVER_CAP {
+        repo.write(&format!("files/{i:05}.txt"), "one line\n");
+    }
+    repo.commit_all("import a vendored tree");
+    let head = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    let details = GitReader::get_commit_details(&repo.path_str(), &head).expect("details");
+    assert!(
+        details.files_list_truncated,
+        "a commit over the cap must say so"
+    );
+    assert_eq!(details.files_total_count, Some(OVER_CAP));
+    assert_eq!(
+        details.changed_files.len(),
+        CAP,
+        "the list is cut to the cap"
+    );
+    // The trap this guards: summing the *truncated* slice would understate a
+    // huge commit's churn while the header still read as fact. One line lands
+    // per file, so the total must count every file, capped list or not.
+    assert_eq!(details.total_additions, OVER_CAP);
+}
+
+/// The uncapped path is the common one, and both fields are declared optional
+/// in TypeScript ("absent otherwise"), so they must be absent from the wire
+/// rather than serialized as `null`/`false`.
+#[test]
+fn commit_details_omits_the_truncation_fields_for_an_ordinary_commit() {
+    let repo = TestRepo::init();
+    repo.write("src/lib.rs", "fn main() {}\n");
+    repo.commit_all("feat: ordinary");
+    let head = GitReader::read_commit_history(&repo.path_str(), 1, None).expect("history")[0]
+        .id
+        .clone();
+
+    let details = GitReader::get_commit_details(&repo.path_str(), &head).expect("details");
+    assert!(!details.files_list_truncated);
+    assert_eq!(details.files_total_count, None);
+
+    let wire = serde_json::to_value(&details).expect("serialize");
+    assert!(
+        wire.get("files_list_truncated").is_none(),
+        "absent, not false: the TS property is optional"
+    );
+    assert!(wire.get("files_total_count").is_none(), "absent, not null");
+}
