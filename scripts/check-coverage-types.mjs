@@ -13,14 +13,14 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: this covers the coverage and terminal contracts only — the two that
- * carry the most fields and have drifted before. Roughly 35 distinct named
- * types cross the IPC boundary in total, so "type contract holds" means those
- * two contracts hold, not that every IPC payload is verified. Widening the set
- * is a matter of adding to CHECKED_STRUCTS/TERMINAL_STRUCTS with a matching TS
- * source; the PullRequestInfo timings, for instance, are pinned separately in
- * scripts/pr-timing-contract.test.ts because their interface is declared
- * inline in the panel rather than in a types module.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 19 contracts over
+ * 31 structs. That is most, not all, of the named types crossing the IPC
+ * boundary: the ones still missing declare their TypeScript interface inside a
+ * component rather than a module, so there is no single file to point this at.
+ * "Type contract holds" means the listed contracts hold. The remaining gap is
+ * named in the CONTRACTS docstring rather than left for a reader to assume
+ * away; PullRequestInfo is pinned separately in
+ * scripts/pr-timing-contract.test.ts for the same reason.
  *
  * Serde awareness: per-field `#[serde(rename = "x")]` changes the wire name
  * and is honored; `#[serde(skip)]` drops the field from the wire; a checked
@@ -74,6 +74,50 @@ export const CHECKED_STRUCTS = Object.freeze([
 ]);
 
 /**
+ * Every Rust serde struct that crosses IPC and has a TypeScript twin, paired
+ * with the module each side lives in.
+ *
+ * The two original entries (coverage, terminal) were the two contracts that
+ * had already drifted. The rest were added once the checker stopped reporting
+ * false drift on module-qualified type paths, `skip_serializing_if`-omitted
+ * options, and `rename_all = "camelCase"` — limitations that, not coincidence,
+ * were exactly what the uncovered types happened to use.
+ *
+ * A struct with no entry here is unchecked. That is a real gap, not an
+ * implicit assertion of safety: the types still missing are the ones whose TS
+ * interface is declared inside a component rather than a module
+ * (BlameLine, FileBlob, ReflogEntry, WorktreeInfo, LanguageStatsReport,
+ * BranchStatsReport), and PullRequestInfo, pinned separately in
+ * scripts/pr-timing-contract.test.ts for the same reason.
+ */
+/** @param {...string} parts */
+const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
+/** @param {...string} parts */
+const ts = (...parts) => path.join(REPO_ROOT, "src", "lib", ...parts);
+
+export const CONTRACTS = Object.freeze([
+  { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
+  { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
+  { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
+  { label: "harness", rustPath: rust("harness", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["HarnessStatus"] },
+  { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
+  { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport"] },
+  { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo"] },
+  { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
+  { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
+  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus"] },
+  { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
+  { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
+  { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
+  { label: "dependabot", rustPath: rust("github", "mod.rs"), tsPath: ts("health", "types.ts"), structs: ["DependabotReport"] },
+  { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },
+  { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
+  { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
+  { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
+]);
+
+/**
  * Strip // and block comments so they cannot masquerade as code tokens.
  * @param {string} source
  */
@@ -115,10 +159,15 @@ function balancedBody(source, openIndex) {
  * @param {number} declIndex index of `pub struct` / `pub enum` keyword start
  */
 function precedingAttributes(stripped, declIndex) {
+  // -1, not 0: the floor is "nothing precedes it", and slicing from 0 + 1
+  // ate the leading `#` of an attribute on the first item in a file. That
+  // dropped the attribute silently — including a rename_all this checker is
+  // supposed to refuse loudly, which would have reported an unverifiable
+  // struct as verified.
   const prevEnd = Math.max(
     stripped.lastIndexOf("}", declIndex),
     stripped.lastIndexOf(";", declIndex),
-    0,
+    -1,
   );
   return stripped.slice(prevEnd + 1, declIndex);
 }
@@ -144,6 +193,33 @@ function serdeOptions(attr) {
 }
 
 /**
+ * Apply serde's `rename_all` to a snake_case field ident.
+ *
+ * Only the rules this repo actually uses are implemented; anything else is
+ * still refused loudly by the caller rather than guessed at. This mirrors
+ * serde's own algorithm (segments capitalized and joined, then the first
+ * character lowered for camelCase) rather than approximating it with a regex,
+ * so `a__b` maps the way serde maps it and not one character differently.
+ *
+ * @param {string} ident
+ * @param {string | undefined} rule
+ */
+export function applyRenameAll(ident, rule) {
+  if (rule === undefined || rule === "snake_case") return ident;
+  if (rule === "camelCase") {
+    const pascal = ident
+      .split("_")
+      .map((part) => (part === "" ? "" : part[0].toUpperCase() + part.slice(1)))
+      .join("");
+    return pascal === "" ? "" : pascal[0].toLowerCase() + pascal.slice(1);
+  }
+  throw new Error(`unsupported rename_all rule: ${rule}`);
+}
+
+/** rename_all rules this checker can resolve statically. */
+export const SUPPORTED_RENAME_ALL = Object.freeze(["snake_case", "camelCase"]);
+
+/**
  * Normalize the Rust types used by the checked payloads to their JSON wire
  * equivalents. This is deliberately small and explicit: an unfamiliar type
  * is kept as a named token so a refactor cannot silently become `unknown`.
@@ -164,7 +240,19 @@ function normalizeRustType(type) {
   if (/^(?:u|i)(?:8|16|32|64|128|size)$/.test(compact) || /^(?:f32|f64)$/.test(compact)) {
     return "number";
   }
-  return compact;
+  // `crate::graph::RefDecoration` and `RefDecoration` are one wire type; serde
+  // never writes a struct's path, and TypeScript has no notion of one. Keeping
+  // the qualifier made every cross-module field read as drift, which is why
+  // this checker only ever covered types whose fields stayed in one module.
+  return stripTypePath(compact);
+}
+
+/**
+ * Drop leading `foo::bar::` module qualifiers from a named type.
+ * @param {string} type
+ */
+function stripTypePath(type) {
+  return type.replace(/^(?:[A-Za-z_]\w*::)+/, "");
 }
 
 /**
@@ -220,10 +308,11 @@ function normalizeTsType(type) {
  * each optionally led by attributes, shaped `pub name: Type`.
  *
  * @param {string} body comment-stripped struct body
+ * @param {string | undefined} [renameAll] struct-level serde rename_all rule
  * @returns {{ fields: Map<string, { type: string, optional: boolean }>, unparseable: string[] }}
  *          wire-name -> normalized wire type/presence; unparseable segments verbatim
  */
-function parseRustFields(body) {
+function parseRustFields(body, renameAll) {
   /** @type {string[]} */
   const segments = [];
   let depth = 0;
@@ -260,13 +349,17 @@ function parseRustFields(body) {
       unparseable.push(segment.replace(/\s+/g, " ").slice(0, 80));
       continue;
     }
-    let wireName = fieldDecl[1];
+    // rename_all first; a per-field `rename` overrides it below, literally.
+    let wireName = applyRenameAll(fieldDecl[1], renameAll);
     let skipped = false;
     let optional = false;
+    /** @type {string | undefined} */
+    let skipIf;
     for (const attr of attrs) {
       const options = serdeOptions(attr);
       if (!options) continue;
       if (options.has("skip")) skipped = true;
+      if (options.has("skip_serializing_if")) skipIf = options.get("skip_serializing_if");
       if (options.has("default") || options.has("skip_serializing_if")) optional = true;
       if (options.has("rename") && typeof options.get("rename") === "string") {
         wireName = /** @type {string} */ (options.get("rename"));
@@ -274,7 +367,17 @@ function parseRustFields(body) {
     }
     if (!skipped) {
       const type = rest.trim().slice(rest.trim().indexOf(":") + 1).trim();
-      fields.set(wireName, { type: normalizeRustType(type), optional });
+      // `Option<T>` is normally nullable on the wire, but paired with
+      // `skip_serializing_if = "Option::is_none"` the key is omitted instead —
+      // absent-or-T, never null. That is exactly TypeScript's `p?: T`, so
+      // normalizing it to `null|T` would report the idiomatic serde spelling
+      // of an optional field as drift.
+      const omitsNone = skipIf === "Option::is_none";
+      const inner = /^Option<([\s\S]*)>$/.exec(type.replace(/\s+/g, ""));
+      fields.set(wireName, {
+        type: normalizeRustType(omitsNone && inner ? inner[1] : type),
+        optional,
+      });
     }
   }
   return { fields, unparseable };
@@ -314,20 +417,23 @@ export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS) {
     // Struct-level serde renames change every wire name; only identity-safe
     // snake_case passes. Anything else must be resolved by hand, loudly.
     const attrs = precedingAttributes(stripped, decl.index);
+    /** @type {string | undefined} */
+    let renameAll;
     const serdeAttr = /#\[\s*serde\s*\([\s\S]*?\)\s*\]/.exec(attrs);
     if (serdeAttr) {
       const options = serdeOptions(serdeAttr[0]);
-      const renameAll = options?.get("rename_all");
-      if (renameAll !== undefined && renameAll !== "snake_case") {
+      const rule = options?.get("rename_all");
+      if (rule !== undefined && !SUPPORTED_RENAME_ALL.includes(rule)) {
         violations.push(
-          `rust: struct ${name} carries #[serde(rename_all = "${renameAll}")] — wire names cannot be verified statically; resolve manually`,
+          `rust: struct ${name} carries #[serde(rename_all = "${rule}")] — only ${SUPPORTED_RENAME_ALL.join(", ")} can be resolved statically; resolve manually`,
         );
         continue;
       }
+      renameAll = rule;
     }
 
     try {
-      const parsed = parseRustFields(balancedBody(stripped, openBrace));
+      const parsed = parseRustFields(balancedBody(stripped, openBrace), renameAll);
       for (const segment of parsed.unparseable) {
         unparseable.push({ struct: name, segment });
       }
@@ -527,6 +633,15 @@ export function formatReport(result, rustLabel, tsLabel, title = "Coverage IPC t
 }
 
 /**
+ * Human title for a contract label, used only when a contract fails and its
+ * full report is printed.
+ * @param {string} label
+ */
+function titleFor(label) {
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)} IPC type check`;
+}
+
+/**
  * @param {string[]} argv
  */
 function parseArgs(argv) {
@@ -574,30 +689,24 @@ export function main(argv = process.argv.slice(2)) {
   }
 
   // An explicit --rust/--ts pair checks only the coverage contract on those
-  // scratch copies (how the tests simulate drift). With no flags, every
-  // contract is checked.
+  // scratch copies (how the tests simulate drift), and keeps the single
+  // detailed report. With no flags every contract in CONTRACTS runs.
   const explicit = opts.rustPath !== DEFAULT_RUST_SOURCE || opts.tsPath !== DEFAULT_TS_SOURCE;
   const contracts = explicit
-    ? [{ title: "Coverage IPC type check (Rust structs <-> TS interfaces)", ...opts, structs: CHECKED_STRUCTS }]
-    : [
-        {
-          title: "Coverage IPC type check (Rust structs <-> TS interfaces)",
-          rustPath: DEFAULT_RUST_SOURCE,
-          tsPath: DEFAULT_TS_SOURCE,
-          structs: CHECKED_STRUCTS,
-        },
-        {
-          title: "Terminal IPC type check (Rust structs <-> TS interfaces)",
-          rustPath: TERMINAL_RUST_SOURCE,
-          tsPath: TERMINAL_TS_SOURCE,
-          structs: TERMINAL_STRUCTS,
-        },
-      ];
+    ? [{ label: "coverage", ...opts, structs: CHECKED_STRUCTS }]
+    : CONTRACTS;
 
   let code = 0;
   /** @type {unknown[]} */
   const collected = [];
+  /** @type {Array<{ label: string, value: string, note: string }>} */
+  const rows = [];
+  /** @type {string[]} */
+  const failures = [];
+  const totals = { structs: 0, fields: 0, drifted: 0, typeDrifted: 0 };
+
   for (const contract of contracts) {
+    const title = `${titleFor(contract.label)} (Rust structs <-> TS interfaces)`;
     /** @type {ReturnType<typeof runTypeCheck>} */
     let result;
     try {
@@ -606,19 +715,65 @@ export function main(argv = process.argv.slice(2)) {
       console.error(`check-coverage-types: internal error: ${/** @type {Error} */ (err).message}`);
       return 2;
     }
-    // Every contract is checked before emitting, so --json returns one array
-    // rather than a stream of objects a consumer would have to reassemble.
-    if (opts.json) collected.push({ title: contract.title, ...result });
-    else
-      console.log(
+    totals.structs += result.rustCount;
+    totals.fields += result.fieldCount;
+    totals.drifted += result.driftCount;
+    totals.typeDrifted += result.typeDriftCount;
+    if (opts.json) collected.push({ title, label: contract.label, ...result });
+    rows.push({
+      label: contract.label,
+      value: `${result.rustCount} struct${result.rustCount === 1 ? "" : "s"}, ${result.fieldCount} fields`,
+      note: result.ok ? "ok" : "DRIFT",
+    });
+    // A passing contract needs no detail; a failing one needs all of it, so
+    // the noise appears exactly where someone has to act on it.
+    if (!result.ok) {
+      failures.push(
         formatReport(
           result,
           path.relative(REPO_ROOT, contract.rustPath),
           path.relative(REPO_ROOT, contract.tsPath),
-          contract.title,
+          title,
         ),
       );
-    if (!result.ok) code = 1;
+      code = 1;
+    }
+  }
+
+  if (!opts.json) {
+    if (explicit) {
+      // Single-contract mode keeps the original detailed report either way,
+      // so the drift-simulation tests read the same output they always have.
+      const only = contracts[0];
+      console.log(
+        failures[0] ??
+          formatReport(
+            runTypeCheck(only),
+            path.relative(REPO_ROOT, only.rustPath),
+            path.relative(REPO_ROOT, only.tsPath),
+            `${titleFor(only.label)} (Rust structs <-> TS interfaces)`,
+          ),
+      );
+    } else {
+      for (const failure of failures) console.log(failure, "\n");
+      console.log(
+        [
+          "IPC wire type check (Rust serde structs <-> TS interfaces)",
+          "",
+          ...alignRows([
+            { label: "contracts checked", value: String(contracts.length) },
+            { label: "structs checked", value: String(totals.structs) },
+            { label: "fields compared", value: String(totals.fields) },
+            { label: "drifted structs", value: String(totals.drifted) },
+            { label: "drifted field types", value: String(totals.typeDrifted) },
+          ]),
+          "",
+          ...alignRows(rows),
+          "",
+          code === 0 ? "OK: type contract holds." : "FAIL: type contract violated.",
+        ].join("\n"),
+      );
+    }
   }
   if (opts.json) console.log(JSON.stringify(collected, null, 2));
   return code;

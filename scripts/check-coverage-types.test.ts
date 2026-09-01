@@ -7,6 +7,9 @@ import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   CHECKED_STRUCTS,
+  CONTRACTS,
+  applyRenameAll,
+  parseRustStructs,
   DEFAULT_RUST_SOURCE,
   DEFAULT_TS_SOURCE,
   TERMINAL_RUST_SOURCE,
@@ -58,33 +61,37 @@ function countIn(stdout: string, label: string): number {
 }
 
 describe("check:types coverage contract", () => {
-  it("passes on the current tree and reports both sides", async () => {
+  it("passes on the current tree and reports every contract", async () => {
     const { code, stdout } = await runScript([]);
     expect(code).toBe(0);
 
-    // With no flags every contract runs, so counts are asserted per report.
-    const [coverage, terminal] = stdout.split(/(?=^Terminal IPC type check)/m);
-    expect(countIn(coverage, "rust structs checked")).toBe(CHECKED_STRUCTS.length);
-    expect(countIn(coverage, "ts interfaces checked")).toBe(CHECKED_STRUCTS.length);
-    expect(countIn(coverage, "drifted structs")).toBe(0);
-    expect(countIn(coverage, "fields compared")).toBeGreaterThan(0);
+    expect(countIn(stdout, "contracts checked")).toBe(CONTRACTS.length);
+    expect(countIn(stdout, "structs checked")).toBe(
+      CONTRACTS.reduce((total, contract) => total + contract.structs.length, 0),
+    );
+    expect(countIn(stdout, "fields compared")).toBeGreaterThan(0);
+    expect(countIn(stdout, "drifted structs")).toBe(0);
+    expect(countIn(stdout, "drifted field types")).toBe(0);
 
-    expect(terminal, "the terminal contract must be checked too").toBeDefined();
-    expect(countIn(terminal, "rust structs checked")).toBe(TERMINAL_STRUCTS.length);
-    expect(countIn(terminal, "ts interfaces checked")).toBe(TERMINAL_STRUCTS.length);
-    expect(countIn(terminal, "drifted structs")).toBe(0);
-    expect(countIn(terminal, "fields compared")).toBeGreaterThan(0);
-
-    expect(stdout.match(/OK: type contract holds/g)).toHaveLength(2);
+    // Every contract is named in the summary: a contract silently dropped
+    // from the table would otherwise still report "OK".
+    for (const contract of CONTRACTS) {
+      expect(stdout, `${contract.label} must appear in the summary`).toContain(contract.label);
+    }
+    expect(stdout.match(/OK: type contract holds/g)).toHaveLength(1);
     expect(stdout).not.toMatch(/FAIL:/);
   });
 
-  /**
-   * `TerminalRunResult` is the payload every command-running panel reads and
-   * it had no gate at all — it was declared three times in TypeScript, so a
-   * backend rename would land as a silently `undefined` property in whichever
-   * panel had not been updated.
-   */
+  it("covers the coverage and terminal contracts it started with", () => {
+    const labels = CONTRACTS.map((contract) => contract.label);
+    expect(labels).toContain("coverage");
+    expect(labels).toContain("terminal");
+    // Widening the table must not quietly drop the two contracts that had
+    // already drifted before this checker existed.
+    expect(CONTRACTS.find((c) => c.label === "coverage")?.structs).toEqual(CHECKED_STRUCTS);
+    expect(CONTRACTS.find((c) => c.label === "terminal")?.structs).toEqual(TERMINAL_STRUCTS);
+  });
+
   it("fails when the terminal wire type drifts from its Rust struct", async () => {
     const tsCopy = await scratchCopy(TERMINAL_TS_SOURCE, "terminal-drift");
     const source = await readFile(tsCopy, "utf8");
@@ -205,5 +212,83 @@ describe("check:types coverage contract", () => {
   it("defaults point at this repo's real coverage type sources", () => {
     expect(DEFAULT_RUST_SOURCE).toMatch(/[\\/]src-tauri[\\/]src[\\/]analyzer[\\/]coverage\.rs$/);
     expect(DEFAULT_TS_SOURCE).toMatch(/[\\/]src[\\/]lib[\\/]coverage[\\/]types\.ts$/);
+  });
+});
+
+/**
+ * The three normalizations that let this checker grow from 2 structs to 31.
+ * Each one teaches it that two spellings mean the same wire shape, so each one
+ * risks the opposite failure — calling genuinely different shapes equal. These
+ * pin both directions.
+ */
+describe("wire-shape normalization", () => {
+  const structOf = (source: string, name: string) =>
+    parseRustStructs(source, [name]).structs.get(name)?.fields;
+
+  it("reads a module-qualified type as the same wire type as its bare name", () => {
+    const fields = structOf(
+      `pub struct P { pub refs: Vec<crate::graph::RefDecoration>, pub one: discovery::Endpoint }`,
+      "P",
+    );
+    expect(fields?.get("refs")?.type).toBe("RefDecoration[]");
+    expect(fields?.get("one")?.type).toBe("Endpoint");
+  });
+
+  it("does not make two differently named types agree", () => {
+    // The danger of stripping paths: only the qualifier is noise, never the
+    // name. `a::Foo` and `Bar` must still read as different wire types.
+    const fields = structOf(`pub struct P { pub v: crate::a::Foo }`, "P");
+    expect(fields?.get("v")?.type).toBe("Foo");
+    expect(fields?.get("v")?.type).not.toBe("Bar");
+  });
+
+  it("treats an Option omitted by skip_serializing_if as absent-or-T, not null", () => {
+    const fields = structOf(
+      `pub struct P {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         pub capped: Option<usize>,
+         pub plain: Option<usize>
+       }`,
+      "P",
+    );
+    // Omitted-when-none is exactly TypeScript's `capped?: number`.
+    expect(fields?.get("capped")).toEqual({ type: "number", optional: true });
+    // An Option without it really does serialize `null`, and must keep saying so.
+    expect(fields?.get("plain")).toEqual({ type: "null|number", optional: false });
+  });
+
+  it("resolves rename_all = camelCase the way serde resolves it", () => {
+    expect(applyRenameAll("model_info", "camelCase")).toBe("modelInfo");
+    expect(applyRenameAll("ready", "camelCase")).toBe("ready");
+    // serde capitalizes each underscore-separated segment and joins, so an
+    // empty segment collapses; a regex on `_([a-z])` would return `a_B` here.
+    expect(applyRenameAll("a__b", "camelCase")).toBe("aB");
+    expect(applyRenameAll("model_info", "snake_case")).toBe("model_info");
+    expect(applyRenameAll("model_info", undefined)).toBe("model_info");
+  });
+
+  it("still refuses a rename_all rule it cannot resolve", () => {
+    expect(() => applyRenameAll("model_info", "SCREAMING-KEBAB-CASE")).toThrow(/unsupported/);
+    const { violations } = parseRustStructs(
+      `#[serde(rename_all = "PascalCase")]
+       pub struct P { pub a: u8 }`,
+      ["P"],
+    );
+    expect(violations.join("\n")).toMatch(/PascalCase/);
+    // Refused, not guessed at: no struct is reported as checked.
+    expect(parseRustStructs(`#[serde(rename_all = "PascalCase")] pub struct P { pub a: u8 }`, ["P"]).structs.size).toBe(0);
+  });
+
+  it("lets a per-field rename override rename_all, literally", () => {
+    const fields = structOf(
+      `#[serde(rename_all = "camelCase")]
+       pub struct P {
+         pub model_info: u8,
+         #[serde(rename = "kept_as_is")]
+         pub other_field: u8
+       }`,
+      "P",
+    );
+    expect([...(fields?.keys() ?? [])].sort()).toEqual(["kept_as_is", "modelInfo"]);
   });
 });

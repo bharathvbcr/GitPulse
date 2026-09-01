@@ -51,7 +51,12 @@ export interface DiscoveredEndpoint {
   detail: string;
 }
 
-export interface ModelInfo {
+/**
+ * The capability probe's result — named for the harness protocol type it
+ * mirrors (`PrepareResult` / `ProbeResult` / `SettleResult`), so the wire
+ * contract checker can see the two sides are the same type.
+ */
+export interface ProbeResult {
   model: string;
   context_window: number;
   source: string;
@@ -75,7 +80,7 @@ export interface AiStatus {
   harness: HarnessStatus;
   endpoints: DiscoveredEndpoint[];
   selected: AiSelection | null;
-  model_info: ModelInfo | null;
+  model_info: ProbeResult | null;
   model_detail: string;
   ready: boolean;
   detail: string;
