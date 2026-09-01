@@ -207,6 +207,34 @@ const CALLOUT_MAP: Record<string, CalloutConfig> = {
 /**
  * High-performance, robust, and safe MarkDev Markdown to HTML renderer.
  */
+/**
+ * Keep a URL only if its scheme is safe to put in an `href` or `src`.
+ *
+ * Markdown rendered here is repository content, which is untrusted: a README
+ * can carry `[click](javascript:...)`, and this used to interpolate the target
+ * straight into the attribute. Quotes are already escaped by the time links are
+ * rendered, so an attribute breakout was not possible, but the scheme itself
+ * was never checked.
+ *
+ * The app's CSP (`script-src 'self'`, no `unsafe-inline`) should stop such a
+ * URL from executing. That is a second line, not the first, and it is enforced
+ * by three different webviews across the supported platforms.
+ *
+ * Relative and anchor targets are kept — they are the common case in a
+ * repository — and anything carrying an unrecognised scheme is dropped.
+ */
+function safeUrl(raw: string): string | null {
+  const url = raw.trim();
+  if (url === "") return null;
+  // A scheme is [a-z][a-z0-9+.-]* before the first ':', and only these are
+  // allowed. Control characters are stripped first: "java\tscript:" and
+  // "java\nscript:" are treated as the scheme by some parsers.
+  const bare = url.replace(/[\u0000-\u001f\u007f]/g, "");
+  const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(bare);
+  if (!scheme) return url; // relative path, anchor, or protocol-relative
+  return /^(https?|mailto|tel)$/i.test(scheme[1]) ? url : null;
+}
+
 export function renderMarkDevMarkdown(markdown: string): string {
   if (!markdown) return "";
 
@@ -643,16 +671,27 @@ function renderInline(text: string): string {
 
   // Images: ![alt](src)
   out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt, src) => {
-    return `<span class="block my-3 rounded-xl border border-border/80 overflow-hidden bg-surface max-w-xl"><img src="${src}" alt="${alt}" class="w-full h-auto object-contain max-h-[450px]" loading="lazy" />${
+    const safe = safeUrl(src);
+    // An image with an unusable source renders as its alt text rather than a
+    // broken frame, so the reader still sees what the author wrote.
+    if (safe === null) {
+      return `<span class="text-textMuted font-mono text-[11px]">${alt || "image"}</span>`;
+    }
+    return `<span class="block my-3 rounded-xl border border-border/80 overflow-hidden bg-surface max-w-xl"><img src="${safe}" alt="${alt}" class="w-full h-auto object-contain max-h-[450px]" loading="lazy" />${
       alt ? `<span class="block text-center py-1 text-[10px] text-textMuted font-mono border-t border-border/60 bg-surfaceHover/30">${alt}</span>` : ""
     }</span>`;
   });
 
   // Links: [text](url)
-  out = out.replace(
-    /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-accent underline underline-offset-2 hover:text-accent/80 transition-colors">$1 ↗</a>'
-  );
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, text, href) => {
+    const safe = safeUrl(href);
+    // A refused link keeps its text: dropping it would hide content, and
+    // rendering it as a link would be the thing being prevented.
+    if (safe === null) {
+      return `<span class="text-textPrimary/90">${text}</span>`;
+    }
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer" class="text-accent underline underline-offset-2 hover:text-accent/80 transition-colors">${text} ↗</a>`;
+  });
 
   // Bold / Italic
   out = out.replace(/\*\*([^*]+)\*\*/g, '<strong class="font-bold text-textPrimary">$1</strong>');

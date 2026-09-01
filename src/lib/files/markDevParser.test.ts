@@ -169,3 +169,59 @@ Here is the real body.`;
     });
   });
 });
+
+describe("markDevParser — link and image URL schemes", () => {
+  const tagOf = (markdown: string) =>
+    renderMarkDevMarkdown(markdown).match(/<(?:a|img)[^>]*>/)?.[0] ?? null;
+
+  it("refuses schemes that can execute", () => {
+    // Repository markdown is untrusted: a README can carry any target. The CSP
+    // should also stop these, but it is the second line and is enforced by
+    // three different webviews across the supported platforms.
+    for (const hostile of [
+      "[c](javascript:alert(1))",
+      "[c](JaVaScRiPt:alert(1))",
+      "[c](vbscript:msgbox(1))",
+      "[c](data:text/html,x)",
+      "![i](javascript:alert(1))",
+    ]) {
+      expect(tagOf(hostile), hostile).toBeNull();
+    }
+  });
+
+  it("keeps the author's text when a link is refused", () => {
+    // Dropping the content would hide what was written; linking it would be
+    // the thing being prevented.
+    expect(renderMarkDevMarkdown("[click me](javascript:alert(1))")).toContain("click me");
+  });
+
+  it("keeps the schemes a repository actually uses", () => {
+    for (const [markdown, expected] of [
+      ["[c](https://example.com)", "https://example.com"],
+      ["[c](http://example.com)", "http://example.com"],
+      ["[c](mailto:a@b.c)", "mailto:a@b.c"],
+      ["[c](./relative.md)", "./relative.md"],
+      ["[c](../up.md)", "../up.md"],
+      ["[c](#anchor)", "#anchor"],
+      ["[c](/absolute/path)", "/absolute/path"],
+    ] as const) {
+      expect(tagOf(markdown), markdown).toContain(expected);
+    }
+    expect(tagOf("![i](./pic.png)")).toContain("./pic.png");
+  });
+
+  it("is not fooled by control characters inside the scheme", () => {
+    // Some parsers strip these before resolving, so "java\tscript:" can become
+    // an executable scheme after the check has already passed it.
+    for (const hostile of [
+      "[c](java\u0009script:alert(1))",
+      "[c](java\u000ascript:alert(1))",
+      "[c](\u0000javascript:alert(1))",
+    ]) {
+      const tag = tagOf(hostile);
+      expect(tag === null || !/javascript:/i.test(tag.replace(/[\u0000-\u001f]/g, "")), hostile).toBe(
+        true,
+      );
+    }
+  });
+});
