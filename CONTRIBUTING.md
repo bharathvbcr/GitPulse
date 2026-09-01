@@ -139,6 +139,32 @@ flowchart TD
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
+### Contracts enforced by tests rather than scripts
+
+The `check:*` commands above are the gates you run by name. A second set of
+contracts is enforced by tests under `scripts/`, which run with `npm test`.
+They exist because each guards a class of drift that no type check can see —
+several were added after the drift had already happened.
+
+| Test | What breaks without it |
+| --- | --- |
+| `invoke-args-contract` | A renamed command argument. `check:ipc` proves the command exists; nothing proved the call sites send what it declares, and a wrong name fails at runtime with a deserialization error in whichever path calls it. 94 call sites. |
+| `view-menu-contract` | A registered view missing from the native menu, in either direction. This happened three times — `tab-manvi`, then Storage and Reflog — because view ids are derived from the registry in TypeScript and hand-written as constants in Rust. |
+| `event-contract` | An event name that drifts. An emit nobody hears looks like a feature that never fires; a listener for an event nobody sends waits forever. Neither produces an error. |
+| `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
+| `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
+| `pr-timing-contract` | The pull-request struct and its inline TypeScript interface drifting; `check:types` does not reach an interface declared inside a component. |
+| `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `npm run check` output. |
+| `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |
+| `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
+| `documented-counts-contract` | A count in the docs drifting from the code. The Rust test total was understated fourfold before this existed. |
+| `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
+| `cli-help-contract`, `cli-json-contract` | A script entry point losing `--help` or `--json`, or their exit codes diverging. |
+| `release-workflow` | Release preflight losing a gate, or the release body reverting to a literal block. |
+
+Adding a contract test is preferred over adding a `check:*` script unless the
+check is something you would want to run on its own.
+
 ---
 
 ## 5. Architecture Orientation
