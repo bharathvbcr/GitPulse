@@ -169,6 +169,24 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      # The release body comes from CHANGELOG.md rather than a literal block
+      # here, which described v0.0.3 regardless of the tag being built. A tag
+      # with no changelog section fails the job: publishing a release whose
+      # notes silently vanished is worse than not publishing.
+      - name: Release Notes from Changelog
+        run: |
+          # Capture first so the failure is visible without relying on the
+          # runner's `set -e`: appending the extractor's output straight into a
+          # `{ ... } >> $GITHUB_ENV` group makes the group's status the last
+          # echo, so the guarantee would hinge on a shell flag rather than on
+          # this command.
+          notes=$(node scripts/release-notes.mjs --tag "$RELEASE_TAG")
+          {
+            echo "RELEASE_NOTES<<GITPULSE_NOTES_EOF"
+            echo "$notes"
+            echo "GITPULSE_NOTES_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Build Tauri Desktop Application
         uses: tauri-apps/tauri-action@v0
         env:
@@ -181,37 +199,7 @@ jobs:
           # dead on a tag push and actively wrong on a dispatch, where
           # github.sha is the branch head rather than the tagged commit.
           releaseName: 'GitPulse v__VERSION__'
-          releaseBody: |
-            ### 🚀 GitPulse v__VERSION__
-
-            GitPulse v__VERSION__ introduces major graph visualization upgrades, multi-language detection expansions, robust MANVI coverage runner integrations, and comprehensive cross-platform stability hardening across macOS, Linux, and Windows.
-
-            #### 🌟 Highlights & Features
-            - **High-Performance Canvas / GPU Graph Rendering**:
-              - Optimized curved rail rendering and strict bounding envelope invariants for complex branching topologies and octopus merges.
-              - Author avatars in commit graph nodes with persistent caching and high-DPI scaling.
-              - Interactive tooltip cards with richer commit metadata and branch context.
-              - Virtualized graph lanes and smooth lookback windowing.
-
-            - **Expanded Multi-Language & Stack Detection**:
-              - Support for 60+ programming languages and frameworks with fast heuristic scanning.
-              - Deep repository inspection for JVM (Maven/Gradle), Swift (SPM), Dart/Flutter, .NET, Go, Python, and JavaScript/TypeScript ecosystems.
-              - Bounded language LOC analysis preventing hangs on massive directories.
-
-            - **MANVI Policy & Coverage Engine**:
-              - Native coverage runner integrations for `cargo llvm-cov`, `pytest-cov`, `vitest`, `jest`, `jacoco`, `dotnet test`, `swift test`, and `dart test`.
-              - Strict security allowlisting and purpose-specific validation for developer test generators.
-              - Granular error diagnostics with copyable action hints and resolution guides for missing toolchains or manifests.
-
-            - **Storage & Worktree Management**:
-              - Multi-worktree inspection with safe atomic concurrent operations.
-              - Fast storage analyzer with symlink-loop detection and permission degradation handling.
-
-            #### 🛡️ Hardening & Bug Fixes
-            - Gated platform-specific symlink tests and filesystem permissions for clean Windows/Linux CI builds.
-            - Isolated Git author/committer identities in test fixtures preventing CI failures in pristine environments.
-            - Hardened micro-benchmark timing thresholds and vitest timeouts for CI VM runners.
-            - Automated release version gate asserting synchronous parity across all 5 workspace manifests.
+          releaseBody: ${{ env.RELEASE_NOTES }}
           releaseDraft: true
           prerelease: false
           # No updater plugin is configured in tauri.conf.json, so there is no

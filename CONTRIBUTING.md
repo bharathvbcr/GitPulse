@@ -133,6 +133,7 @@ flowchart TD
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
+| `npm run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
 | `npm run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |

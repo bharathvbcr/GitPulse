@@ -19,6 +19,7 @@
     "check:release": "node scripts/check-release-version.mjs",
     "check:coverage": "node scripts/check-coverage-floor.mjs",
     "check:workflows": "node scripts/check-workflows.mjs",
+    "release:notes": "node scripts/release-notes.mjs",
     "ci:local": "npm run check:ipc && npm run check:types && npm run check:release && npm run check:workflows && npm run check && npm run coverage && npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info && npm run check:coverage",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
