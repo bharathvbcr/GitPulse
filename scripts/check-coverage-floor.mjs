@@ -22,7 +22,7 @@ const INTEGER = /^\d+$/;
 /** @typedef {{ startLine: number, sourceFile: string | null, dataLines: Map<number, { line: number, count: number }>, branches: Array<{ taken: number }>, lineFound: number | null, lineHit: number | null, branchFound: number | null, branchHit: number | null, functionFound: number | null, functionHit: number | null }} RawRecord */
 /** @typedef {{ sourceFile: string, lines: CoverageMetric, branches: CoverageMetric | null }} CoverageRecord */
 /** @typedef {{ records: CoverageRecord[], totals: { lines: CoverageMetric, branches: CoverageMetric | null }, branchRecords: number }} ParsedLcov */
-/** @typedef {{ root: string, frontendPath: string | null, rustPath: string | null, frontendLines: number, frontendBranches: number, rustLines: number, help: boolean }} CliOptions */
+/** @typedef {{ root: string, frontendPath: string | null, rustPath: string | null, frontendLines: number, frontendBranches: number, rustLines: number, help: boolean, json: boolean }} CliOptions */
 /** @typedef {{ ok: true, invalid: false, parsed: ParsedLcov } | { ok: false, invalid: true, error: string }} CheckedReport */
 
 export const DEFAULT_THRESHOLDS = Object.freeze({
@@ -369,6 +369,7 @@ function parseArgs(argv) {
     root: REPO_ROOT,
     frontendPath: null,
     rustPath: null,
+    json: false,
     frontendLines: DEFAULT_THRESHOLDS.frontend.lines,
     frontendBranches: DEFAULT_THRESHOLDS.frontend.branches,
     rustLines: DEFAULT_THRESHOLDS.rust.lines,
@@ -379,6 +380,10 @@ function parseArgs(argv) {
     if (flag === "--help" || flag === "-h") {
       options.help = true;
       return options;
+    }
+    if (flag === "--json") {
+      options.json = true;
+      continue;
     }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) {
@@ -419,6 +424,7 @@ function printHelp() {
   console.log("  --frontend-lines <percent>   frontend line floor (default: 90)");
   console.log("  --frontend-branches <percent> frontend branch floor (default: 85)");
   console.log("  --rust-lines <percent>       Rust line floor (default: 80)");
+  console.log("  --json                       emit the result as JSON instead of the text report");
 }
 
 /** @param {CoverageMetric} metric */
@@ -457,32 +463,57 @@ export function main(argv = process.argv.slice(2)) {
   ];
   let invalid = false;
   let belowFloor = false;
+  /** @type {Array<Record<string, unknown>>} */
+  const collected = [];
   for (const report of reports) {
     const checked = readReport(report.path, report.label);
     if (!checked.ok) {
       invalid = true;
+      // Recorded as well as printed: a consumer must be able to tell a report
+      // that could not be read from one that was read and passed.
+      collected.push({ report: report.label, path: report.path, ok: false, error: checked.error });
       console.error(`FAIL: ${report.label} invalid: ${checked.error}`);
       continue;
     }
     const evaluation = evaluateCoverage(checked.parsed, report.thresholds);
     /** @type {Array<"lines" | "branches">} */
     const metricNames = ["lines", "branches"];
+    /** @type {Record<string, unknown>} */
+    const metrics = {};
     for (const metricName of metricNames) {
       const metric = checked.parsed.totals[metricName];
       const threshold = report.thresholds[metricName];
       if (threshold === undefined) continue;
-      console.log(
-        `${report.label} ${metricName} ${metric ? formatMetric(metric) : "unavailable"} (required >= ${threshold.toFixed(2)}%)`,
-      );
+      metrics[metricName] = {
+        found: metric ? metric.found : null,
+        hit: metric ? metric.hit : null,
+        percent: metric ? percentage(metric) : null,
+        required: threshold,
+      };
+      if (!config.json) {
+        console.log(
+          `${report.label} ${metricName} ${metric ? formatMetric(metric) : "unavailable"} (required >= ${threshold.toFixed(2)}%)`,
+        );
+      }
     }
+    collected.push({
+      report: report.label,
+      path: report.path,
+      ok: evaluation.failures.length === 0,
+      metrics,
+      failures: evaluation.failures,
+    });
     for (const failure of evaluation.failures) {
       belowFloor = true;
       console.error(`FAIL: ${report.label} ${failure}`);
     }
   }
+  if (config.json) {
+    console.log(JSON.stringify({ ok: !invalid && !belowFloor, invalid, reports: collected }, null, 2));
+  }
   if (invalid) return 2;
   if (belowFloor) return 1;
-  console.log("OK: coverage floors hold");
+  if (!config.json) console.log("OK: coverage floors hold");
   return 0;
 }
 

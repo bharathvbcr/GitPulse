@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as checkIpcContract from "./check-ipc-contract.mjs";
 import * as checkCoverageTypes from "./check-coverage-types.mjs";
 import * as checkReleaseVersion from "./check-release-version.mjs";
+import * as checkCoverageFloor from "./check-coverage-floor.mjs";
 
 /**
  * Backlog A1. `--json` must emit the result object the checker already builds,
@@ -13,6 +14,7 @@ const CHECKERS: Array<[string, { main: (argv: string[]) => number }]> = [
   ["check-ipc-contract", checkIpcContract],
   ["check-coverage-types", checkCoverageTypes],
   ["check-release-version", checkReleaseVersion],
+  ["check-coverage-floor", checkCoverageFloor],
 ];
 
 function capture(run: () => number): { code: number; text: string } {
@@ -75,5 +77,26 @@ describe("CLI --json contract", () => {
     expect(text.code).toBe(1);
     expect(json.code).toBe(1);
     expect(JSON.parse(json.text).ok).toBe(false);
+  });
+
+  it("keeps an unreadable coverage report visible in JSON rather than absent", () => {
+    // The floor checker's whole point is that a report which could not be read
+    // never looks like one that passed; --json must carry that too.
+    const original = console.error;
+    console.error = () => {};
+    let text = "";
+    const log = console.log;
+    console.log = (...args: unknown[]) => void (text += args.join(" "));
+    try {
+      const code = checkCoverageFloor.main(["--frontend", "/nonexistent/lcov.info", "--json"]);
+      expect(code).toBe(2);
+      const parsed = JSON.parse(text);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.invalid).toBe(true);
+      expect(parsed.reports.some((r: { ok: boolean }) => r.ok === false)).toBe(true);
+    } finally {
+      console.error = original;
+      console.log = log;
+    }
   });
 });
