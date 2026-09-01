@@ -25,7 +25,7 @@ flowchart TB
         Invoke -.-> ContractCheck
     end
 
-    subgraph Backend["Rust Backend (Tauri 2 / Tokio / Rayon)"]
+    subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
         CmdRegistry["Command Registry (95 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
@@ -175,6 +175,7 @@ sequenceDiagram
 ```
 
 - **Topological Lane Solver**: Runs natively in Rust using Rayon for parallel traversal when loading large commit histories.
+- **Async runtime**: `rayon` is the only direct concurrency dependency in `src-tauri/Cargo.toml`. Blocking work leaves the IPC thread through `tauri::async_runtime::spawn_blocking` (see `off_thread` in `commands/mod.rs`). Tokio is present, but transitively through Tauri — nothing here depends on it directly, so `use tokio::…` will not compile without adding the crate first.
 - **Nogap Lookback Bounds**: Prevents disconnected lane lines across virtualized scrolling regions.
 - **Author Avatars**: Fast on-canvas rendering with caching for author initials, identicons, and GitHub avatars.
 - **Frame Scheduling**: Renders at 60/120 FPS using requestAnimationFrame batches, avoiding UI thrashing during rapid kinetic scrolling.

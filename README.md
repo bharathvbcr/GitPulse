@@ -57,7 +57,7 @@ flowchart TB
         IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(95 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
-    subgraph Backend["Rust Backend (Tauri 2 / Rayon / Tokio)"]
+    subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
         GitSandbox["Git Execution Sandbox & Blame"]
         GraphSolver["Topological Lane Solver & Nogap Bounds"]
