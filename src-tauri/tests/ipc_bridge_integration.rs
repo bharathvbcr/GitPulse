@@ -45,6 +45,9 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_get_file_content,
             gitpulse_lib::commands::cmd_write_file_content,
             gitpulse_lib::commands::cmd_list_tags,
+            gitpulse_lib::commands::cmd_get_commit_details,
+            gitpulse_lib::commands::cmd_get_commit_files,
+            gitpulse_lib::commands::cmd_get_reflog,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
         // The app's own context, from the same accessor run() uses, so the
@@ -607,4 +610,90 @@ fn concurrent_invocations_do_not_interfere() {
     for handle in handles {
         handle.join().expect("no thread panicked");
     }
+}
+
+/// The head commit id of a repository, for commands that address one.
+fn head_of(repo: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git on PATH");
+    assert!(out.status.success(), "rev-parse failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn a_nested_commit_payload_keeps_its_field_names() {
+    let repo = repo_with_change();
+    let head = head_of(repo.path());
+    let value = invoke(
+        "cmd_get_commit_details",
+        json!({ "repoPath": repo.path().to_string_lossy(), "commitId": head }),
+    )
+    .expect("commit details");
+    assert!(value.is_object(), "got: {value}");
+    // The names the TypeScript side reads; a serde rename here would break the
+    // detail pane without any type error to catch it.
+    for field in ["id", "summary", "author_name", "author_email"] {
+        assert!(value.get(field).is_some(), "missing {field} in {value}");
+    }
+    // The full commit id round-trips rather than being abbreviated in transit.
+    assert_eq!(value["id"].as_str().unwrap_or_default(), head);
+}
+
+#[test]
+fn a_commit_with_no_parent_is_reported_rather_than_erroring() {
+    // The initial commit is the edge case every history walker gets wrong: it
+    // has no parent, and the detail pane still has to render it.
+    let repo = repo_with_change();
+    let head = head_of(repo.path());
+    let files = invoke(
+        "cmd_get_commit_files",
+        json!({ "repoPath": repo.path().to_string_lossy(), "commitId": head }),
+    )
+    .expect("the root commit's files list");
+    let entries = files.as_array().expect("an array");
+    assert!(
+        !entries.is_empty(),
+        "the initial commit added a file: {files}"
+    );
+    assert!(entries[0].get("path").is_some(), "entry: {}", entries[0]);
+}
+
+#[test]
+fn an_unknown_commit_id_fails_on_the_error_channel() {
+    let repo = repo_with_change();
+    for bad in ["", "not-a-sha", "0000000000000000000000000000000000000000"] {
+        let result = invoke(
+            "cmd_get_commit_details",
+            json!({ "repoPath": repo.path().to_string_lossy(), "commitId": bad }),
+        );
+        assert!(
+            result.is_err(),
+            "commit id {bad:?} must be refused, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn an_optional_numeric_argument_is_honoured_and_bounded() {
+    // maxEntries is Option<usize> with a default; omitting it and passing it
+    // must both work, and the cap must actually limit the result.
+    let repo = repo_with_change();
+    let root = repo.path().to_string_lossy().into_owned();
+
+    let defaulted =
+        invoke("cmd_get_reflog", json!({ "repoPath": root })).expect("reflog with the default cap");
+    assert!(defaulted.is_array(), "got: {defaulted}");
+
+    let capped = invoke(
+        "cmd_get_reflog",
+        json!({ "repoPath": root, "maxEntries": 1 }),
+    )
+    .expect("reflog with an explicit cap");
+    assert!(
+        capped.as_array().expect("an array").len() <= 1,
+        "cap ignored: {capped}"
+    );
 }
