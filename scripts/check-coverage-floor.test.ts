@@ -82,10 +82,30 @@ describe("coverage floor contract", () => {
     });
   });
 
+  it("accepts a report whose LF/LH disagree with its DA records", () => {
+    // `cargo llvm-cov` computes LF/LH from its own line model and emits DA
+    // only for instrumented lines, so a valid report carries LF above the DA
+    // count and LH below the number of DA entries showing hits — real output
+    // for ops.rs was LF 407 / 385 DA entries / LH 352 against 354 DA hits.
+    // Treating that shape as corruption failed the gate on a genuine report.
+    const llvmCovShape = [
+      "TN:",
+      "SF:src-tauri/src/example.rs",
+      "DA:1,1",
+      "DA:2,1",
+      "DA:3,0",
+      "LF:10",
+      "LH:1",
+      "end_of_record",
+    ].join("\n");
+    const parsed = parseLcov(llvmCovShape);
+    // The summaries are what the floors are computed from, so they win.
+    expect(parsed.totals.lines).toEqual({ found: 10, hit: 1 });
+  });
+
   it("rejects forged summaries, missing data, duplicate lines, and truncation", () => {
-    expect(() => parseLcov(report({ lineCounts: [1, 0] }).replace("LH:1", "LH:0"))).toThrow(
-      /LH cannot be below DA hit count/,
-    );
+    // Still corruption: a summary that is internally impossible.
+    expect(() => parseLcov(report().replace("LH:1", "LH:99"))).toThrow(/LH cannot exceed LF/);
     expect(() => parseLcov("TN:\nSF:src/example.ts\nLF:1\nLH:1\nend_of_record")).toThrow(
       /no DA data records/,
     );
