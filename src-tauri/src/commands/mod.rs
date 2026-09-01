@@ -1608,19 +1608,32 @@ fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict
 
 /// Picks the verdict a multi-command action should report.
 ///
-/// Ranking, strictest first: Blocked > Warned > Demoted > Unchecked > Allowed.
+/// Ranking, strictest first:
+/// Blocked > Warned > Widened > Granted > Degraded > Demoted > Unchecked > Allowed.
+///
 /// Blocked never actually reaches here as a survivor — `guard` refuses on it —
 /// but the ranking still documents intent. A warning is an explicit rule
 /// firing, a demotion is posture noise, an unchecked gate is an absence of a
 /// check, and a clean allow carries nothing worth surfacing over its peers.
+///
+/// The three middle rungs are all "a rule fired and something waived it", and
+/// they are ordered by who did the waiving and how long it lasts. `Widened`
+/// outranks `Granted` because a grant expires and appended scope does not: the
+/// widening is still there in the next run with no grant beside it, so it is
+/// the one worth surfacing when a multi-command action produced both.
+/// `Degraded` sits below them because no rule fired at all — some simply could
+/// not be asked — but above `Demoted`, which is a posture the user chose.
 fn strictest_verdict(
     a: crate::harness::PolicyVerdict,
     b: crate::harness::PolicyVerdict,
 ) -> crate::harness::PolicyVerdict {
     use crate::harness::PolicyStatus::*;
     let rank = |v: &crate::harness::PolicyVerdict| match v.status {
-        Blocked => 5,
-        Warned => 4,
+        Blocked => 8,
+        Warned => 7,
+        Widened => 6,
+        Granted => 5,
+        Degraded => 4,
         Demoted => 3,
         Unchecked => 2,
         Allowed => 1,
@@ -1924,6 +1937,10 @@ mod tests {
             severity: String::new(),
             reason: String::new(),
             demoted: String::new(),
+            grant_id: String::new(),
+            granted_by: String::new(),
+            widened: String::new(),
+            degraded: Vec::new(),
             detail: String::new(),
             detail_code: String::new(),
         }

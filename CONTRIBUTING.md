@@ -130,7 +130,7 @@ flowchart TD
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (107 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 35 contracts (385 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 35 contracts (389 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -152,6 +152,7 @@ several were added after the drift had already happened.
 | `view-menu-contract` | A registered view missing from the native menu, in either direction. This happened three times — `tab-manvi`, then Storage and Reflog — because view ids are derived from the registry in TypeScript and hand-written as constants in Rust. |
 | `event-contract` | An event name that drifts. An emit nobody hears looks like a feature that never fires; a listener for an event nobody sends waits forever. Neither produces an error. |
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
+| `verdict-contract` | Two consumers of the shared policy contract disagreeing about what a decision means. The harness reports `action: "allow"` for five different things — a clean pass, a posture demotion, a grant, an executor-widened scope, and a decision reached with rungs that could not run — and only one of them is a clean pass. It also pins the vendored `contracts/` copy against its checksums, so a contract edited here instead of at its source fails rather than forking. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
 | `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
 | `wire-type-locality-contract` | A serde payload shape being declared inside a component, or inlined as an `invoke<{...}>` / `listen<{...}>` type argument, where `check:types` cannot reach it and a second copy can drift silently. Every instance found so far had already gone stale — TerminalRunResult, GitHubContext, ConflictChunk, CommitDetailsPayload, FileBlobPayload. |

@@ -1,0 +1,951 @@
+{
+  "version": 1,
+  "generated_by": "contracts/tools/generate_verdict_cases.py",
+  "description": "Cross-product of every classification-relevant field on a policy verdict, with the state each must render as. Regenerate rather than edit: hand-edited cases stop covering the space.",
+  "classification_order": [
+    "no decision at all -> unchecked",
+    "action == deny -> denied",
+    "grant_id non-empty -> granted",
+    "demoted non-empty -> demoted",
+    "widened non-empty -> widened",
+    "degraded non-empty -> degraded",
+    "action == warn -> warned",
+    "otherwise -> clean"
+  ],
+  "cases": [
+    {
+      "name": "no-decision",
+      "why": "The gate did not run. This is the absence of a verdict, not a verdict of allow.",
+      "decision": null,
+      "expect": "unchecked"
+    },
+    {
+      "name": "allow",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts"
+      },
+      "expect": "clean"
+    },
+    {
+      "name": "allow-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "degraded"
+    },
+    {
+      "name": "allow-widened",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**"
+      },
+      "expect": "widened"
+    },
+    {
+      "name": "allow-widened-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "widened"
+    },
+    {
+      "name": "allow-demoted",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "allow-demoted-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "allow-demoted-widened",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "allow-demoted-widened-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "allow-granted",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-widened",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-widened-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-demoted",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-demoted-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-demoted-widened",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "allow-granted-demoted-widened-degraded",
+      "decision": {
+        "action": "allow",
+        "rule": "",
+        "severity": "none",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts"
+      },
+      "expect": "warned"
+    },
+    {
+      "name": "warn-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "degraded"
+    },
+    {
+      "name": "warn-widened",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**"
+      },
+      "expect": "widened"
+    },
+    {
+      "name": "warn-widened-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "widened"
+    },
+    {
+      "name": "warn-demoted",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "warn-demoted-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "warn-demoted-widened",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "warn-demoted-widened-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "demoted"
+    },
+    {
+      "name": "warn-granted",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-widened",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-widened-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-demoted",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-demoted-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-demoted-widened",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "warn-granted-demoted-widened-degraded",
+      "decision": {
+        "action": "warn",
+        "rule": "path.protected_write",
+        "severity": "warn",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "granted"
+    },
+    {
+      "name": "deny",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-demoted",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-demoted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-demoted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-demoted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-demoted",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-demoted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-demoted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-granted-demoted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "scope.unplanned",
+        "severity": "soft",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-demoted",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-demoted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-demoted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-demoted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-demoted",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-demoted-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-demoted-widened",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**"
+      },
+      "expect": "denied"
+    },
+    {
+      "name": "deny-hard-granted-demoted-widened-degraded",
+      "decision": {
+        "action": "deny",
+        "rule": "path.secret",
+        "severity": "hard",
+        "reason": "generated contract case",
+        "target": "src/lib/example.ts",
+        "grant_id": "GRANT-01",
+        "granted_by": "bharath",
+        "demoted": "policy.file.mode=advisory (env)",
+        "widened": "src/lib/**",
+        "degraded": [
+          "repo_map.unavailable"
+        ]
+      },
+      "expect": "denied"
+    }
+  ]
+}

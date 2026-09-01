@@ -1,10 +1,21 @@
 //! Policy verdicts: the harness's decision, rendered for a Git client.
 //!
 //! The one rule this module exists to keep is that a check which could not run
-//! never looks like a check that ran and passed. `PolicyStatus` therefore has
-//! five values, not two: an allow, a demoted allow, a warning, a refusal, and
-//! "nobody checked". The last is not a failure of the user's action — GitPulse
-//! works with no harness installed — but it is never rendered as approval.
+//! never looks like a check that ran and passed. It has a mirror that matters
+//! just as much: a check that ran and *failed* must not look like one that
+//! passed either. `PolicyStatus` therefore has eight values, not two.
+//!
+//! Four of them are kinds of "the operation may proceed" that are emphatically
+//! not clean passes: `Demoted` (a posture waived it), `Granted` (a human
+//! waived it), `Widened` (the executor waived it for itself), and `Degraded`
+//! (some rungs could not run at all). The harness reports `action: allow` for
+//! every one of them, which is why the extra fields on the decision — not the
+//! action — are what this module classifies on.
+//!
+//! The classification and its evaluation order are the shared contract in
+//! `contracts/verdict.schema.json` ($defs.classification), and
+//! `contracts/verdict.cases.json` holds the 65 generated cases all three
+//! products are held to.
 
 use std::time::Duration;
 
@@ -18,10 +29,19 @@ const POLICY_TIMEOUT: Duration = DEFAULT_CALL_TIMEOUT;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyStatus {
-    /// The ladder ran and nothing fired.
+    /// The ladder ran, every rung ran, and nothing fired.
     Allowed,
     /// A soft denial the host posture demoted. Allowed, but not clean.
     Demoted,
+    /// A soft denial an override grant cleared. A human waived a rule that
+    /// fired; that is not the same as no rule firing.
+    Granted,
+    /// Authorised by scope the executor appended to its own task rather than
+    /// by the plan. The narrowest kind of allow, and the easiest to launder.
+    Widened,
+    /// Allowed, but reached without some rungs — the repo map was missing, a
+    /// check was disabled. Not a refusal, and not a clean pass.
+    Degraded,
     /// A rule fired that allows with a note.
     Warned,
     /// A rule refused it. GitPulse does not perform the action.
@@ -50,6 +70,14 @@ pub struct PolicyVerdict {
     pub reason: String,
     /// Non-empty when a soft denial was demoted by the host posture.
     pub demoted: String,
+    /// Non-empty when an override grant cleared a soft block.
+    pub grant_id: String,
+    /// Who issued the grant named by `grant_id`.
+    pub granted_by: String,
+    /// Non-empty when executor-appended scope, not the plan, authorised this.
+    pub widened: String,
+    /// Checks that could not run. Empty means every rung ran.
+    pub degraded: Vec<String>,
     /// Why the gate did not run, when it did not.
     pub detail: String,
     /// A machine-readable reason for `detail` ("not_installed", "timeout", …).
@@ -58,11 +86,22 @@ pub struct PolicyVerdict {
 
 impl PolicyVerdict {
     fn from_decision(target: &str, d: RawDecision) -> Self {
-        let status = match d.action.to_ascii_lowercase().as_str() {
-            "allow" if !d.demoted.is_empty() => PolicyStatus::Demoted,
-            "allow" => PolicyStatus::Allowed,
-            "warn" => PolicyStatus::Warned,
+        // The shared classification, in the contract's evaluation order. A
+        // decision satisfies several of these at once — a granted decision is
+        // also an allow — and the earlier branch is the more honest reading.
+        //
+        // Order and semantics: contracts/verdict.schema.json
+        // ($defs.classification). Held to contracts/verdict.cases.json by
+        // scripts/verdict-contract.test.ts and the Rust test below.
+        let action = d.action.to_ascii_lowercase();
+        let status = match action.as_str() {
             "deny" | "block" => PolicyStatus::Blocked,
+            "allow" | "warn" if !d.grant_id.is_empty() => PolicyStatus::Granted,
+            "allow" | "warn" if !d.demoted.is_empty() => PolicyStatus::Demoted,
+            "allow" | "warn" if !d.widened.is_empty() => PolicyStatus::Widened,
+            "allow" | "warn" if !d.degraded.is_empty() => PolicyStatus::Degraded,
+            "warn" => PolicyStatus::Warned,
+            "allow" => PolicyStatus::Allowed,
             // An action this build does not recognise is treated as a refusal.
             // Failing closed on an unknown decision is the only safe reading:
             // a future rung that means "stop" must not be executed as an allow.
@@ -85,6 +124,10 @@ impl PolicyVerdict {
             severity: d.severity,
             reason,
             demoted: d.demoted,
+            grant_id: d.grant_id,
+            granted_by: d.granted_by,
+            widened: d.widened,
+            degraded: d.degraded,
             detail: String::new(),
             detail_code: String::new(),
         }
@@ -99,6 +142,10 @@ impl PolicyVerdict {
             severity: String::new(),
             reason: String::new(),
             demoted: String::new(),
+            grant_id: String::new(),
+            granted_by: String::new(),
+            widened: String::new(),
+            degraded: Vec::new(),
             detail: err.message(),
             detail_code: err.code().to_string(),
         }
@@ -228,6 +275,7 @@ mod tests {
             target: "git push --force".into(),
             task_id: "host-scope".into(),
             demoted: demoted.into(),
+            ..Default::default()
         }
     }
 
@@ -330,6 +378,242 @@ mod tests {
         assert_eq!(
             render_command(&["git", "commit", "-m", "it's"]),
             "git commit -m 'it'\\''s'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::harness::protocol::RawDecision;
+
+    /// The generated parity fixture every product is held to.
+    ///
+    /// GitPulse is a *consumer* of the verdict contract, so its job here is to
+    /// agree with Manvi and DevCouncil about what a decision means — not to
+    /// have its own opinion. The cases enumerate the cross-product of every
+    /// classification-relevant field, so a combination cannot go uncovered.
+    #[derive(serde::Deserialize)]
+    struct CasesFile {
+        version: u32,
+        cases: Vec<Case>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        decision: Option<RawDecision>,
+        expect: String,
+    }
+
+    fn status_name(s: PolicyStatus) -> &'static str {
+        match s {
+            PolicyStatus::Allowed => "clean",
+            PolicyStatus::Demoted => "demoted",
+            PolicyStatus::Granted => "granted",
+            PolicyStatus::Widened => "widened",
+            PolicyStatus::Degraded => "degraded",
+            PolicyStatus::Warned => "warned",
+            PolicyStatus::Blocked => "denied",
+            PolicyStatus::Unchecked => "unchecked",
+        }
+    }
+
+    fn load() -> CasesFile {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../contracts/verdict.cases.json"
+        );
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        serde_json::from_str(&raw).expect("parsing verdict.cases.json")
+    }
+
+    #[test]
+    fn classification_matches_the_shared_contract() {
+        let file = load();
+        assert_eq!(file.version, 1, "cases file version this test understands");
+        assert!(
+            file.cases.len() >= 8,
+            "only {} cases; the fixture is not covering the decision space",
+            file.cases.len()
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for case in &file.cases {
+            let got = match &case.decision {
+                // No decision at all is not a verdict of allow. GitPulse
+                // reaches this state through `unchecked`, which is
+                // constructed from a transport error rather than a decision.
+                None => "unchecked",
+                Some(d) => status_name(PolicyVerdict::from_decision(&d.target, d.clone()).status),
+            };
+            seen.insert(case.expect.clone());
+            assert_eq!(
+                got, case.expect,
+                "case {:?}: classified {:?}, contract says {:?}",
+                case.name, got, case.expect
+            );
+        }
+
+        for state in [
+            "unchecked",
+            "denied",
+            "granted",
+            "demoted",
+            "widened",
+            "degraded",
+            "warned",
+            "clean",
+        ] {
+            assert!(
+                seen.contains(state),
+                "no case in the fixture reaches {state:?}"
+            );
+        }
+    }
+
+    /// The regression this whole extension exists to prevent.
+    ///
+    /// Before it, `RawDecision` dropped `grant_id`, `widened` and `degraded`
+    /// on the floor, so a grant-cleared write, a self-widened write, and a
+    /// write judged without the repo map all rendered as `Allowed` — the exact
+    /// same pixels as a decision where every rung ran and none fired.
+    #[test]
+    fn the_four_kinds_of_unclean_allow_are_distinguishable() {
+        let base = RawDecision {
+            action: "allow".into(),
+            rule: "scope.unplanned".into(),
+            severity: "soft".into(),
+            reason: "outside the plan".into(),
+            target: "src/lib/x.ts".into(),
+            task_id: "TASK-1".into(),
+            demoted: String::new(),
+            grant_id: String::new(),
+            granted_by: String::new(),
+            widened: String::new(),
+            degraded: Vec::new(),
+        };
+
+        let clean = PolicyVerdict::from_decision(
+            "t",
+            RawDecision {
+                rule: String::new(),
+                severity: "none".into(),
+                ..base.clone()
+            },
+        );
+        let granted = PolicyVerdict::from_decision(
+            "t",
+            RawDecision {
+                grant_id: "G-1".into(),
+                granted_by: "bharath".into(),
+                ..base.clone()
+            },
+        );
+        let demoted = PolicyVerdict::from_decision(
+            "t",
+            RawDecision {
+                demoted: "policy.file.mode=advisory".into(),
+                ..base.clone()
+            },
+        );
+        let widened = PolicyVerdict::from_decision(
+            "t",
+            RawDecision {
+                widened: "src/lib/**".into(),
+                ..base.clone()
+            },
+        );
+        let degraded = PolicyVerdict::from_decision(
+            "t",
+            RawDecision {
+                degraded: vec!["repo_map.unavailable".into()],
+                ..base.clone()
+            },
+        );
+
+        assert_eq!(clean.status, PolicyStatus::Allowed);
+        assert_eq!(granted.status, PolicyStatus::Granted);
+        assert_eq!(demoted.status, PolicyStatus::Demoted);
+        assert_eq!(widened.status, PolicyStatus::Widened);
+        assert_eq!(degraded.status, PolicyStatus::Degraded);
+
+        // All five permit the action. That is precisely why the status has to
+        // carry the difference: `blocks()` cannot.
+        for v in [&clean, &granted, &demoted, &widened, &degraded] {
+            assert!(!v.blocks(), "none of these refuse the action");
+            assert!(v.checked, "the gate ran for all of them");
+        }
+
+        // And none of the four may collapse onto the clean one.
+        for v in [&granted, &demoted, &widened, &degraded] {
+            assert_ne!(
+                v.status, clean.status,
+                "an unclean allow must not render as a clean pass"
+            );
+        }
+    }
+
+    /// A grant outranks a demotion outranks a widening outranks a degradation.
+    /// The order is the contract's, and it is not arbitrary: it reports the
+    /// most specific thing that actually happened to this decision.
+    #[test]
+    fn classification_order_is_stable_when_several_apply() {
+        let all = RawDecision {
+            action: "allow".into(),
+            rule: "scope.unplanned".into(),
+            severity: "soft".into(),
+            reason: String::new(),
+            target: "t".into(),
+            task_id: String::new(),
+            demoted: "mode=advisory".into(),
+            grant_id: "G-1".into(),
+            granted_by: "bharath".into(),
+            widened: "src/**".into(),
+            degraded: vec!["repo_map.unavailable".into()],
+        };
+        assert_eq!(
+            PolicyVerdict::from_decision("t", all.clone()).status,
+            PolicyStatus::Granted
+        );
+
+        let no_grant = RawDecision {
+            grant_id: String::new(),
+            granted_by: String::new(),
+            ..all.clone()
+        };
+        assert_eq!(
+            PolicyVerdict::from_decision("t", no_grant.clone()).status,
+            PolicyStatus::Demoted
+        );
+
+        let no_demote = RawDecision {
+            demoted: String::new(),
+            ..no_grant.clone()
+        };
+        assert_eq!(
+            PolicyVerdict::from_decision("t", no_demote.clone()).status,
+            PolicyStatus::Widened
+        );
+
+        let no_widen = RawDecision {
+            widened: String::new(),
+            ..no_demote.clone()
+        };
+        assert_eq!(
+            PolicyVerdict::from_decision("t", no_widen).status,
+            PolicyStatus::Degraded
+        );
+
+        // A denial outranks every one of them: it is the only one that stops
+        // the operation, so nothing may reclassify it into an allow.
+        let denied = RawDecision {
+            action: "deny".into(),
+            ..all
+        };
+        assert_eq!(
+            PolicyVerdict::from_decision("t", denied).status,
+            PolicyStatus::Blocked
         );
     }
 }

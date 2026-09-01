@@ -84,6 +84,27 @@ pub struct RawDecision {
     /// one.
     #[serde(default)]
     pub demoted: String,
+    /// Non-empty when an override grant cleared a soft block. The harness
+    /// reports `allow`, but a granted allow is not a clean pass either: the
+    /// rule fired and a human waived it.
+    #[serde(default)]
+    pub grant_id: String,
+    /// Who issued the grant named by `grant_id`.
+    #[serde(default)]
+    pub granted_by: String,
+    /// Non-empty when the write was authorised by scope the *executor appended
+    /// to its own task*, rather than by the plan the task was created with.
+    ///
+    /// Reported apart from `grant_id` because a grant expires and appended
+    /// scope does not. Without this field every later write against that scope
+    /// reports as an ordinary planned write, in this run and every run after
+    /// it — which is exactly how a self-granted widening launders into a plan.
+    #[serde(default)]
+    pub widened: String,
+    /// Names checks that could not run. A decision reached without the repo
+    /// map is not the same decision as one reached with it.
+    #[serde(default)]
+    pub degraded: Vec<String>,
 }
 
 /// A model's discovered dimensions, and where each answer came from.

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devcouncil.local/contracts/event.schema.json",
+  "title": "Ledger event v1",
+  "description": "One append-only entry in GitPulse's action ledger. GitPulse is the canonical owner: it holds the resident watcher and the UI. Manvi session logs and DevCouncil traces.jsonl feed it through importers, which go through the same single writer. Additive-only within v1.",
+  "type": "object",
+  "required": ["ulid", "ts_utc", "schema_version", "repo_path", "actor_kind", "action", "outcome"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic cursor, assigned by the writer. Absent on an event being submitted for append; present on every event read back. Consumers page with it."
+    },
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "Stable identity, unique across repos and machines. Lexicographically sortable by creation time, so it orders correctly even when two writers' ids do not."
+    },
+    "ts_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the action happened, not when it was appended. An importer replaying a transcript sets the original time."
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "This contract's version. A reader that does not recognise the value must degrade to displaying the event as unstructured, never drop it and never guess."
+    },
+    "repo_path": {
+      "type": "string",
+      "description": "Absolute path of the repository root. Present on every event: the ledger is queried per-repo and globally."
+    },
+    "worktree_path": {
+      "type": ["string", "null"],
+      "description": "Absolute path of the worktree the action happened in, when it differs from repo_path. This is what binds an event to a task, via the worktree binding recorded at checkout."
+    },
+    "actor_kind": {
+      "type": "string",
+      "enum": ["human", "agent", "system"],
+      "description": "Who acted. `system` is GitPulse itself — importers, catch-up synthesis, background maintenance — and must never be conflated with a human action."
+    },
+    "actor_id": {
+      "type": ["string", "null"],
+      "description": "Which actor: 'claude-code', 'codex', a username. Null when the actor could not be determined; an unattributed event is recorded as unattributed, never guessed."
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "description": "Agent session or transcript id, when the event came from or could be joined to one."
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "description": "DevCouncil task id, resolved from the worktree binding. Null when the worktree is bound to no task — which is a real state, not a missing value."
+    },
+    "action": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "description": "Dotted action name: 'git.commit', 'git.push', 'file.edit', 'ci.step', 'session.start'. Namespaced by subsystem so a consumer can filter a family without enumerating members.",
+      "examples": ["git.commit", "git.push", "file.edit", "ci.step", "worktree.add"]
+    },
+    "object": {
+      "type": ["string", "null"],
+      "description": "What was acted on: a ref, a file path, or a digest of the argv when neither applies."
+    },
+    "argv_json": {
+      "type": ["string", "null"],
+      "description": "The command line as a JSON array string. MUST be redacted before insert, never at display time — see contracts/README.md, Redaction."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["ok", "failed", "blocked"],
+      "description": "`blocked` means the policy gate refused it and GitPulse did not perform it. It is distinct from `failed`, which means it ran and did not succeed."
+    },
+    "verdict_json": {
+      "type": ["string", "null"],
+      "description": "The policy verdict as a JSON string conforming to verdict.schema.json, plus the consumer-side `checked` flag. Null ONLY when no gate decision applies to this event kind — never null to mean 'allowed'. An event whose gate did not run carries a verdict with checked=false."
+    },
+    "before_ref": {
+      "type": ["string", "null"],
+      "description": "Commit the repository was at before the action. Enables replay and 'restore to here'."
+    },
+    "after_ref": {
+      "type": ["string", "null"],
+      "description": "Commit the repository was at after the action."
+    },
+    "duration_ms": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Wall-clock duration of the action. Null when not measured — which is not the same as zero."
+    },
+    "detail_json": {
+      "type": ["string", "null"],
+      "description": "Per-action payload as a JSON string. MUST be redacted before insert. Shape varies by `action` and is deliberately not constrained here: a consumer reads what it recognises and ignores the rest."
+    }
+  }
+}

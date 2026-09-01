@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devcouncil.local/contracts/verdict.schema.json",
+  "title": "Policy verdict v1",
+  "description": "One policy decision, as produced by Manvi's gate and carried on the `manvi serve` wire. Transcribed from manvi/policy/decision.go (type Decision). Manvi is the canonical owner; DevCouncil emits this shape and GitPulse consumes it. Additive-only within v1.",
+  "type": "object",
+  "required": ["action", "rule", "severity", "reason", "target"],
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/action",
+      "description": "What the gate decided. Note that `allow` alone does not mean the rules passed: see grant_id, demoted, widened and degraded."
+    },
+    "rule": {
+      "$ref": "#/$defs/ruleId",
+      "description": "The rung that fired. Empty on a clean allow. Preserved even when the outcome is demoted or granted, so a consumer can find every place a posture or grant carried a denial."
+    },
+    "severity": {
+      "$ref": "#/$defs/severity",
+      "description": "How firmly the rule refuses. Only `soft` denials are demotable by posture or clearable by a grant; no grant from any authority clears a `hard` one."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Human-readable explanation. May be empty on a clean allow."
+    },
+    "target": {
+      "type": "string",
+      "description": "What was judged: a path on disk, or a shell command line. Which one is determined by the rule's subject (see subjects in decision.go)."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "The task whose scope this decision was measured against. Absent when the host declared no scope."
+    },
+    "degraded": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Names checks that COULD NOT RUN. A decision reached without the repo map is not the same decision as one reached with it. Empty or absent means every check ran. A decision with a non-empty `degraded` is never `clean`.",
+      "examples": [["repo_map.unavailable", "scope.same_dir.disabled"]]
+    },
+    "demoted": {
+      "type": "string",
+      "description": "Set when a gate mode or host posture downgraded this outcome to an allow, naming the flag responsible. An allow produced by demotion is not an allow produced by the rules passing."
+    },
+    "grant_id": {
+      "type": "string",
+      "description": "Set when an override cleared a soft block. The decision reports `allow`, but must never render as a clean allow."
+    },
+    "granted_by": {
+      "type": "string",
+      "description": "Who issued the grant named by grant_id."
+    },
+    "widened": {
+      "type": "string",
+      "description": "Names the path pattern that authorised this write when the pattern came from scope an executor appended to its OWN task, rather than from the plan the task was created with. Reported apart from grant_id because a grant expires and appended scope does not: without this, every later write against that scope would report as an ordinary planned write, in this run and in every run after it."
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "string",
+      "enum": ["allow", "warn", "deny"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["hard", "soft", "warn", "none"]
+    },
+    "ruleId": {
+      "type": "string",
+      "description": "The authoritative rule set. Kept in sync with manvi/policy/decision.go by contracts/verdict-rules-contract; a rule added in Go and not here fails CI in all three repos.",
+      "enum": [
+        "",
+        "path.malformed",
+        "path.outside_root",
+        "path.secret",
+        "path.restricted",
+        "path.protected_write",
+        "task.absent",
+        "task.forbidden_change",
+        "scope.unplanned",
+        "scope.read_only",
+        "scope.operation",
+        "command.empty",
+        "command.no_lease",
+        "command.not_allowed",
+        "command.bypass_flag",
+        "command.force_push",
+        "command.protected_reset",
+        "command.protected_branch_push",
+        "command.substitution",
+        "command.heredoc",
+        "command.reparse",
+        "command.too_long"
+      ]
+    },
+    "severityByRule": {
+      "description": "The authoritative rule-to-severity classification, transcribed from `severities` in decision.go. A rule ABSENT from that map is treated as Hard — a new rule is un-overridable until someone decides otherwise, which is the fail-closed direction. Consumers must not re-derive severity from the rule name.",
+      "type": "object",
+      "properties": {
+        "path.malformed": { "const": "hard" },
+        "path.outside_root": { "const": "hard" },
+        "path.secret": { "const": "hard" },
+        "path.restricted": { "const": "hard" },
+        "path.protected_write": { "const": "warn" },
+        "task.absent": { "const": "soft" },
+        "task.forbidden_change": { "const": "soft" },
+        "scope.unplanned": { "const": "soft" },
+        "scope.read_only": { "const": "soft" },
+        "scope.operation": { "const": "soft" },
+        "command.empty": { "const": "hard" },
+        "command.no_lease": { "const": "soft" },
+        "command.not_allowed": { "const": "soft" },
+        "command.bypass_flag": { "const": "hard" },
+        "command.force_push": { "const": "hard" },
+        "command.protected_reset": { "const": "hard" },
+        "command.protected_branch_push": { "const": "warn" },
+        "command.substitution": { "const": "hard" },
+        "command.heredoc": { "const": "hard" },
+        "command.reparse": { "const": "hard" },
+        "command.too_long": { "const": "hard" }
+      }
+    },
+    "classification": {
+      "description": "The state a consumer must render a decision as. This is a TOTAL function over the decision, evaluated in this exact order — the order matters, because a decision can satisfy several conditions at once and the earlier one is the more honest reading. Transcribed from the tally switch in manvi/gate/gate.go and Decision.Clean(). `unchecked` has no Manvi decision behind it at all: it is the ABSENCE of a verdict, and is the consumer's own state.",
+      "type": "string",
+      "enum": ["unchecked", "denied", "granted", "demoted", "widened", "degraded", "warned", "clean"],
+      "$comment": "Order of evaluation: (0) no decision at all -> unchecked; (1) action==deny -> denied; (2) grant_id!='' -> granted; (3) demoted!='' -> demoted; (4) widened!='' -> widened; (5) degraded non-empty -> degraded; (6) action==warn -> warned; (7) otherwise -> clean. Clean() in decision.go requires action==allow AND grant_id=='' AND demoted=='' AND widened=='' AND degraded empty."
+    }
+  }
+}

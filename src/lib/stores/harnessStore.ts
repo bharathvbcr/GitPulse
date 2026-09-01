@@ -14,7 +14,15 @@ import {
  * there to check" are different events, and the UI must never render them the
  * same way.
  */
-export type PolicyStatus = "allowed" | "demoted" | "warned" | "blocked" | "unchecked";
+export type PolicyStatus =
+  | "allowed"
+  | "demoted"
+  | "granted"
+  | "widened"
+  | "degraded"
+  | "warned"
+  | "blocked"
+  | "unchecked";
 
 export interface PolicyVerdict {
   status: PolicyStatus;
@@ -24,6 +32,14 @@ export interface PolicyVerdict {
   severity: string;
   reason: string;
   demoted: string;
+  /** Non-empty when an override grant cleared a soft block. */
+  grant_id: string;
+  /** Who issued the grant named by `grant_id`. */
+  granted_by: string;
+  /** Non-empty when executor-appended scope, not the plan, authorised this. */
+  widened: string;
+  /** Checks that could not run. Empty means every rung ran. */
+  degraded: string[];
   detail: string;
   detail_code: string;
 }
@@ -348,6 +364,12 @@ export function verdictLabel(verdict: PolicyVerdict): string {
       return "Policy: clean";
     case "demoted":
       return "Policy: allowed (no task scope)";
+    case "granted":
+      return "Policy: allowed by grant";
+    case "widened":
+      return "Policy: allowed by widened scope";
+    case "degraded":
+      return "Policy: allowed, not fully checked";
     case "warned":
       return "Policy: allowed with a warning";
     case "blocked":
@@ -364,6 +386,16 @@ export function verdictDetail(verdict: PolicyVerdict): string {
       return "The MANVI gate ran and no rule fired.";
     case "demoted":
       return verdict.demoted || verdict.reason;
+    case "granted":
+      // A rule fired and someone waived it. Naming the grantor is the point:
+      // an unattributed waiver is indistinguishable from no rule firing.
+      return verdict.granted_by
+        ? `${verdict.rule} waived by ${verdict.granted_by} (${verdict.grant_id}).`
+        : `${verdict.rule} waived by grant ${verdict.grant_id}.`;
+    case "widened":
+      return `Authorised by scope the agent added to its own task: ${verdict.widened}.`;
+    case "degraded":
+      return `Allowed, but these checks could not run: ${verdict.degraded.join(", ")}.`;
     case "warned":
       return verdict.reason;
     case "blocked":
