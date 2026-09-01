@@ -25,6 +25,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DEFAULT_LIB_RS = path.join(REPO_ROOT, "src-tauri", "src", "lib.rs");
@@ -518,7 +519,27 @@ function parseArgs(argv) {
 /**
  * @param {string[]} [argv]
  */
+
+/** Backlog A2: asking for help is not an error, so this exits 0. */
+export function usage() {
+  return formatUsage({
+    name: "check-ipc-contract",
+    summary: "Verify every Rust `cmd_*` handler matches a frontend invoke() call, with no orphans on either side.",
+    flags: [
+      { flag: "--lib <path>".replace(/^"|"$/g, ""), description: "path to lib.rs holding the command registry" },
+      { flag: "--src <dir>".replace(/^"|"$/g, ""), description: "frontend source directory to scan for invoke() calls" },
+      { flag: "--extra-dir <dir>".replace(/^"|"$/g, ""), description: "additional directory to scan (repeatable)" },
+      { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
+    ],
+    exits: "0 the contract holds · 1 drift was found · 2 the check could not run",
+  });
+}
+
 export function main(argv = process.argv.slice(2)) {
+  if (wantsHelp(argv)) {
+    console.log(usage());
+    return 0;
+  }
   /** @type {{libPath: string, srcDirs: string[]}} */
   let opts;
   try {

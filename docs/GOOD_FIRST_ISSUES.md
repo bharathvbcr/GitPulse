@@ -36,23 +36,23 @@ report. Keep exit codes identical: `0` holds, `1` violated, `2` internal error.
   boolean, the text mode is byte-for-byte unchanged, and exit codes are covered by a
   test for both modes.
 
-### A2 · Add `--help` to every script entry point 🟢
+### A2 · Add `--help` to every script entry point ✅ *(Completed)*
 **Labels:** `good first issue`, `area: ci`
 
-`parseArgs()` in the checker scripts rejects an unknown argument with
-`unknown argument: --foo` and exit code 2. There is no way to discover the valid
-ones short of reading the source. `scripts/dev-port.mjs:226` already anticipates
-`--help`/`-h` but nothing implements it.
+*Implemented in [`scripts/usage.mjs`](../scripts/usage.mjs).*
 
-Add a shared usage printer: flag list, one-line descriptions, exit `0` for an
-explicit `--help` (asking for help is not an error).
+`formatUsage()` renders a summary, the flag list with descriptions aligned into one
+column, and the script's exit-code contract; `wantsHelp()` recognises `--help` and
+`-h` anywhere in argv. Every entry point answers with usage and exits `0` — asking
+for help is not an error — while an unknown flag still exits `2`.
 
-- **Touch:** `scripts/check-ipc-contract.mjs`, `check-coverage-types.mjs`,
-  `check-release-version.mjs`, `dev-port.mjs`, and their tests.
-  `check-coverage-floor.mjs` already implements the pattern to copy.
-- **Done when:** every script answers `--help` with usage and exit `0`, and a test
-  asserts the exit code — the distinction between "helped" and "failed" is the
-  point.
+`scripts/cli-help-contract.test.ts` asserts both halves of that distinction for each
+entry point, so a new script cannot quietly ship without help.
+
+`dev-port.mjs` needed no usage of its own: it is a library, and its `--help` handling
+correctly defers to the tool being wrapped. `vite-dev.mjs` now forwards `--help`
+straight to vite rather than resolving a dev port first, which printed a port notice
+and could reclaim a held port as a side effect of asking a question.
 
 ### A3 · Aligned column output for the contract report 🟢
 **Labels:** `good first issue`, `area: ci`

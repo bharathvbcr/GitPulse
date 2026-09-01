@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseTag } from "./check-release-version.mjs";
+import { formatUsage, wantsHelp } from "./usage.mjs";
 
 /**
  * These are the seven artifacts emitted by the current three-runner matrix:
@@ -177,7 +178,26 @@ function parseArgs(argv) {
 }
 
 /** @param {string[]} [argv] */
+
+/** Backlog A2: asking for help is not an error, so this exits 0. */
+export function usage() {
+  return formatUsage({
+    name: "check-release-assets",
+    summary: "Verify a draft release's assets against the exact per-platform installer manifest.",
+    flags: [
+      { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag being verified" },
+      { flag: "--json <path>".replace(/^"|"$/g, ""), description: "path to the release JSON from the GitHub API" },
+      { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
+    ],
+    exits: "0 every expected asset is present · 1 one is missing · 2 the check could not run",
+  });
+}
+
 export function main(argv = process.argv.slice(2)) {
+  if (wantsHelp(argv)) {
+    console.log(usage());
+    return 0;
+  }
   try {
     const options = parseArgs(argv);
     const tag = options.tag;

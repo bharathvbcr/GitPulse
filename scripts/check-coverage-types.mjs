@@ -29,6 +29,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DEFAULT_RUST_SOURCE = path.join(REPO_ROOT, "src-tauri", "src", "analyzer", "coverage.rs");
@@ -528,7 +529,26 @@ function parseArgs(argv) {
 /**
  * @param {string[]} [argv]
  */
+
+/** Backlog A2: asking for help is not an error, so this exits 0. */
+export function usage() {
+  return formatUsage({
+    name: "check-coverage-types",
+    summary: "Verify Rust serde structs and TypeScript interfaces agree field-for-field and wire-type-for-wire-type.",
+    flags: [
+      { flag: "--rust <path>".replace(/^"|"$/g, ""), description: "Rust source to read the serde structs from" },
+      { flag: "--ts <path>".replace(/^"|"$/g, ""), description: "TypeScript source to read the interfaces from" },
+      { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
+    ],
+    exits: "0 the contract holds · 1 drift was found · 2 the check could not run",
+  });
+}
+
 export function main(argv = process.argv.slice(2)) {
+  if (wantsHelp(argv)) {
+    console.log(usage());
+    return 0;
+  }
   /** @type {{ rustPath: string, tsPath: string }} */
   let opts;
   try {

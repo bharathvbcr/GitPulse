@@ -33,6 +33,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -299,7 +300,31 @@ export function parseArgs(argv) {
 /**
  * @param {string[]} [argv]
  */
+
+/** Backlog A2: asking for help is not an error, so this exits 0. */
+export function usage() {
+  return formatUsage({
+    name: "check-release-version",
+    summary: "Assert every version manifest names one version, and that it matches the release tag when given.",
+    flags: [
+      { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag the manifests must match (empty means no tag known)" },
+      { flag: "--root <dir>".replace(/^"|"$/g, ""), description: "repository root to resolve the default manifest paths from" },
+      { flag: "--package <path>".replace(/^"|"$/g, ""), description: "override package.json" },
+      { flag: "--package-lock <path>".replace(/^"|"$/g, ""), description: "override package-lock.json" },
+      { flag: "--tauri-conf <path>".replace(/^"|"$/g, ""), description: "override tauri.conf.json" },
+      { flag: "--cargo-toml <path>".replace(/^"|"$/g, ""), description: "override Cargo.toml" },
+      { flag: "--cargo-lock <path>".replace(/^"|"$/g, ""), description: "override Cargo.lock" },
+      { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
+    ],
+    exits: "0 the manifests agree · 1 they disagree · 2 the check could not run",
+  });
+}
+
 export function main(argv = process.argv.slice(2)) {
+  if (wantsHelp(argv)) {
+    console.log(usage());
+    return 0;
+  }
   /** @type {ReturnType<typeof parseArgs>} */
   let opts;
   try {
