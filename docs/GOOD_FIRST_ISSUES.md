@@ -78,21 +78,27 @@ report.
 
 `npm run check:ipc`, `npm run check:types`, and `npm run check:release` now run on every push and pull request across all matrix runners (Ubuntu, macOS, Windows) to prevent cross-language drift.
 
-### B2 · Cache the Vite build across CI jobs 🟡
-**Labels:** `help wanted`, `area: ci`, `performance`
+### B2 · Cache the Vite build across CI jobs ✅ *(Investigated — declined)*
+**Labels:** `area: ci`, `performance`
 
-`ci.yml` runs `npm run build` on all three runners, and `release.yml`'s preflight
-builds a fourth time on Linux before the platform matrix builds again. The frontend
-bundle is platform-independent — the same `dist/` would serve every leg.
+*Result recorded as a comment above the build step in
+[`ci.yml`](../.github/workflows/ci.yml).*
 
-Investigate building the frontend once and sharing it via `actions/upload-artifact`
-/ `download-artifact`. Measure before and after: if artifact transfer costs more than
-the rebuild saves, the correct outcome is a comment in the workflow saying so.
+The entry called a documented negative result a successful outcome, and that is
+what this is. A cold `npm run build` measures ~5.0s and produces 1.2 MB across 12
+files; a warm build is no faster. That is the whole prize per leg.
 
-- **Touch:** `.github/workflows/ci.yml`
-- **Done when:** either total CI wall-clock measurably drops, or the investigation is
-  recorded as a workflow comment with the numbers. A negative result documented is a
-  successful outcome here.
+An artifact round trip is an upload step plus a download step plus both actions'
+own setup, which does not plausibly beat a 5s rebuild. The structural cost decides
+it regardless: the matrix legs depend on nothing today, and sharing `dist/` would
+make each wait on a build job, converting parallel work into a serialized edge.
+Every leg building from its own checkout also removes a way for a stale artifact
+to be tested.
+
+Measured on a developer machine rather than on a runner, so the absolute numbers
+are optimistic; the conclusion rests on the ordering and on the serialization
+argument, neither of which turns on runner speed. Worth revisiting if the bundle
+grows enough that the build stops being cheap.
 
 ### B3 · Fail the coverage workflow on a coverage drop ✅ *(Completed)*
 **Labels:** `area: ci`, `test`
@@ -200,6 +206,19 @@ does.
 All keyboard shortcuts from `ShortcutsModal.svelte`, `App.svelte`, and native OS menus are documented with macOS and Windows/Linux chords.
 
 ---
+
+## Declined proposals
+
+Kept so they are not re-proposed as though they were never considered.
+
+### Dependabot auto-merge for patch updates ❌ *(Declined)*
+
+Auto-merging patch bumps once CI is green would remove the friction of approving
+every `1.2.3 → 1.2.4`. It would also mean dependency code reaches `main`, and from
+there a signed desktop binary, without a human having read the diff. For an app
+distributed as an installer, that widens supply-chain exposure more than it saves
+review time, and CI passing is not evidence that a dependency did not change what
+it does. Dependabot still opens the PRs; a person still merges them.
 
 ## Proposing an entry
 

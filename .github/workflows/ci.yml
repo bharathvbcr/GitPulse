@@ -82,6 +82,23 @@ jobs:
       - name: Frontend Unit Tests (Vitest)
         run: npm test
 
+      # Backlog B2, investigated and declined. The frontend bundle is
+      # platform-independent, so in principle one leg could build it and share
+      # `dist/` with the others through upload-artifact/download-artifact.
+      # Measured locally: a cold `npm run build` is ~5.0s producing 1.2MB
+      # across 12 files, and a warm build is no faster, so there is ~5s per leg
+      # to win. (Runner hardware is slower than the machine measured on, but
+      # the figure is the right order of magnitude.)
+      #
+      # An artifact round trip is an upload step plus a download step plus both
+      # actions' own setup, which does not plausibly come in under the rebuild
+      # it replaces. The structural cost is worse than the transfer cost: the
+      # matrix legs currently depend on nothing, and sharing `dist/` would make
+      # each of them wait on a build job, turning parallel work into a
+      # serialized edge. Every leg building from its own checkout is also one
+      # less way for a stale artifact to be tested.
+      #
+      # Revisit if the bundle grows enough that the build stops being cheap.
       - name: Frontend Vite Build
         run: npm run build
 
