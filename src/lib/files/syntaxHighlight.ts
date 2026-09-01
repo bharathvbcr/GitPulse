@@ -147,6 +147,16 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
   const len = line.length;
 
   while (i < len) {
+    // Every token holds at least one character, so a line can never yield more
+    // tokens than it has characters. A scan whose entry condition accepts a
+    // character its continuation class rejects leaves `i` unmoved — the
+    // difference between a mis-coloured line and a hung viewer whose token
+    // array eats memory until the process dies, which is what an unhandled
+    // '@' did in CSS. Bounded so that failure degrades to a visible artefact.
+    if (tokens.length > len) {
+      tokens.push({ text: line.slice(i), type: "text" });
+      break;
+    }
     const char = line[i];
 
     // Single-line comments
@@ -322,6 +332,16 @@ function tokenizeJsonLine(line: string): SyntaxToken[] {
   const len = line.length;
 
   while (i < len) {
+    // Every token holds at least one character, so a line can never yield more
+    // tokens than it has characters. A scan whose entry condition accepts a
+    // character its continuation class rejects leaves `i` unmoved — the
+    // difference between a mis-coloured line and a hung viewer whose token
+    // array eats memory until the process dies, which is what an unhandled
+    // '@' did in CSS. Bounded so that failure degrades to a visible artefact.
+    if (tokens.length > len) {
+      tokens.push({ text: line.slice(i), type: "text" });
+      break;
+    }
     const char = line[i];
 
     if (char === '"') {

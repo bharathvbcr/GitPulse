@@ -261,3 +261,51 @@ describe("syntaxHighlight — losslessness", () => {
     }
   });
 });
+
+describe("syntaxHighlight — termination invariant", () => {
+  // The at-rule hang came from a scan whose entry condition accepted a
+  // character its continuation class rejected, so the index never advanced.
+  // The other scans are safe today because those two classes match. This
+  // asserts the property directly, for every language, so a future divergence
+  // fails here instead of hanging the viewer.
+  const LANGUAGES = [
+    "typescript", "javascript", "rust", "svelte", "html", "css", "json",
+    "yaml", "markdown", "python", "go", "shell", "c", "cpp", "sql", "toml",
+    "xml", "diff", "plaintext",
+  ] as const;
+
+  it("terminates and stays lossless for every single character, in every language", () => {
+    const chars: string[] = [];
+    for (let code = 32; code < 127; code += 1) chars.push(String.fromCharCode(code));
+    chars.push("\t", "é", "日", "👩", "\u200b");
+
+    for (const language of LANGUAGES) {
+      for (const char of chars) {
+        // Bare, doubled, and with a trailing space: a scan that stalls on the
+        // character alone may still advance when something follows it.
+        for (const line of [char, char + char, `${char} `, ` ${char}`]) {
+          const started = Date.now();
+          const tokens = tokenizeLine(line, language);
+          expect(
+            Date.now() - started,
+            `${language} stalled on ${JSON.stringify(line)}`,
+          ).toBeLessThan(500);
+          expect(
+            tokens.map((t) => t.text).join(""),
+            `${language} altered ${JSON.stringify(line)}`,
+          ).toBe(line);
+        }
+      }
+    }
+  });
+
+  it("terminates on pathological repetition", () => {
+    for (const language of LANGUAGES) {
+      for (const line of ["@".repeat(200), '"'.repeat(200), "/*".repeat(200), ":".repeat(200)]) {
+        const started = Date.now();
+        expect(tokenizeLine(line, language).map((t) => t.text).join("")).toBe(line);
+        expect(Date.now() - started, `${language} stalled`).toBeLessThan(500);
+      }
+    }
+  });
+});
