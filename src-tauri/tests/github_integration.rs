@@ -10,7 +10,7 @@ use gitpulse_lib::github::actions::{
     cancel_run_argv, parse_workflow_list, rerun_run_argv, trigger_workflow_argv,
     validate_workflow_selector,
 };
-use gitpulse_lib::github::{parse_github_remote_url, GitHubRepoRef};
+use gitpulse_lib::github::{parse_github_remote_url, pick_github_remote, GitHubRepoRef};
 
 fn remote() -> GitHubRepoRef {
     parse_github_remote_url("https://github.com/bharathvbcr/GitPulse.git").expect("a github remote")
@@ -237,4 +237,32 @@ fn stripping_userinfo_does_not_disturb_ordinary_remotes() {
         assert_eq!(parsed.host, host, "{url}");
         assert_eq!(parsed.slug(), "owner/repo", "{url}");
     }
+}
+
+#[test]
+fn a_credential_in_real_remote_output_never_reaches_the_parsed_ref() {
+    // The realistic entry point: this is what `git remote -v` prints for a
+    // repository configured with a token, tab-separated exactly as git emits
+    // it, with the fetch and push lines git always writes as a pair.
+    let output = concat!(
+        "origin\thttps://ghp_SECRETTOKEN@github.com/owner/repo.git (fetch)\n",
+        "origin\thttps://ghp_SECRETTOKEN@github.com/owner/repo.git (push)\n",
+    );
+    let picked = pick_github_remote(output).expect("a github remote");
+    assert_eq!(picked.host, "github.com");
+    assert_eq!(picked.slug(), "owner/repo");
+    assert!(
+        !picked.html_url().contains("SECRETTOKEN"),
+        "{}",
+        picked.html_url()
+    );
+
+    // A push-only credentialed remote alongside a clean fetch remote must not
+    // contribute its userinfo either.
+    let mixed = concat!(
+        "origin\thttps://github.com/owner/repo.git (fetch)\n",
+        "origin\thttps://ghp_SECRETTOKEN@github.com/owner/repo.git (push)\n",
+    );
+    let picked = pick_github_remote(mixed).expect("a github remote");
+    assert!(!picked.html_url().contains("SECRETTOKEN"));
 }
