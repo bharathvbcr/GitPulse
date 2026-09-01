@@ -279,6 +279,13 @@ describe("markDevParser — bounded rendering", () => {
 //   buildFileTree            linear (0ms at 8000 paths)
 //
 // Only the asymmetric `[`/`]` patterns had the quadratic shape.
+//
+// Worth noting where the defects were: this repository already had sixteen
+// frontend stress and fuzz suites, several with timing budgets. buildFileTree
+// has one and measured clean. The two modules in files/ that had none were
+// markDevParser and syntaxHighlight — and both turned out to be defective, one
+// quadratic and one non-terminating. The gap was which modules were stressed,
+// not whether the project stresses anything.
 describe("markDevParser — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
     // The stats run on the same untrusted content as the render, and are not
