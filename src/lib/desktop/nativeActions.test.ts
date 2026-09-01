@@ -112,3 +112,79 @@ describe("repoWindowTitle", () => {
     expect(repoWindowTitle("/Users/acme/gitpulse", null)).toBe("gitpulse");
   });
 });
+
+describe("dispatchNativeMenu — every id reaches its own handler", () => {
+  // Every no-argument handler has the identical type `() => void`, so wiring
+  // "push" to handlers.pull() compiles cleanly and no type check can catch it.
+  // Asserting the exact call for each id is the only thing that does.
+  // [menu id, handler name on the interface, label the stub records]. The
+  // last two differ for the tab handlers, and conflating them made this
+  // completeness check report handlers that were in fact routed.
+  const ROUTES: Array<[string, string, string]> = [
+    ["open", "open", "open"],
+    ["clone", "clone", "clone"],
+    ["settings", "settings", "settings"],
+    ["refresh", "refresh", "refresh"],
+    ["toggle-theme", "toggleTheme", "toggleTheme"],
+    ["theme-system", "themeSystem", "themeSystem"],
+    ["theme-light", "themeLight", "themeLight"],
+    ["theme-dark", "themeDark", "themeDark"],
+    ["fetch", "fetch", "fetch"],
+    ["pull", "pull", "pull"],
+    ["push", "push", "push"],
+    ["stash", "stash", "stash"],
+    ["stash-pop", "stashPop", "stashPop"],
+    ["rebase", "rebase", "rebase"],
+    ["quick-commit", "quickCommit", "quickCommit"],
+    ["palette", "palette", "palette"],
+    ["focus-filter", "focusFilter", "focusFilter"],
+    ["close-tab", "closeRepoTab", "closeTab"],
+    ["next-repo-tab", "nextRepoTab", "nextTab"],
+    ["prev-repo-tab", "prevRepoTab", "prevTab"],
+    ["reopen-repo-tab", "reopenRepoTab", "reopenTab"],
+  ];
+
+  for (const [id, , label] of ROUTES) {
+    it(`"${id}" calls ${label} and nothing else`, () => {
+      const h = handlers();
+      expect(dispatchNativeMenu({ id }, h)).toBe(true);
+      expect(h.calls).toEqual([label]);
+    });
+  }
+
+  it("covers every no-argument handler in the interface", () => {
+    // A handler added without a route here would otherwise go unnoticed; the
+    // path-taking and error handlers are routed separately below.
+    const routed = new Set(ROUTES.map(([, handler]) => handler));
+    const exempt = new Set(["setTab", "openRecent", "openRepo", "openError", "setDropActive"]);
+    const declared = Object.keys(handlers()).filter((k) => k !== "calls");
+    const unrouted = declared.filter((k) => !routed.has(k) && !exempt.has(k));
+    expect(unrouted).toEqual([]);
+  });
+});
+
+describe("dispatchNativeMenu — path-carrying and unknown ids", () => {
+  it("refuses an open without a path rather than opening nothing", () => {
+    const h = handlers();
+    // Returning true would tell the caller the menu action was handled.
+    expect(dispatchNativeMenu({ id: "open-recent" }, h)).toBe(false);
+    expect(dispatchNativeMenu({ id: "open-repo", path: null }, h)).toBe(false);
+    expect(dispatchNativeMenu({ id: "open-recent", path: "" }, h)).toBe(false);
+    expect(h.calls).toEqual([]);
+  });
+
+  it("passes the path through unchanged when one is given", () => {
+    const h = handlers();
+    expect(dispatchNativeMenu({ id: "open-recent", path: "/a/b c/repo" }, h)).toBe(true);
+    expect(dispatchNativeMenu({ id: "open-repo", path: "/x/日本語" }, h)).toBe(true);
+    expect(h.calls).toEqual(["recent:/a/b c/repo", "repo:/x/日本語"]);
+  });
+
+  it("reports an unknown id as unhandled without calling anything", () => {
+    const h = handlers();
+    for (const id of ["", "nope", "tab-", "tab-nonexistent", "OPEN", " open", "\u0000"]) {
+      expect(dispatchNativeMenu({ id }, h), id).toBe(false);
+    }
+    expect(h.calls).toEqual([]);
+  });
+});
