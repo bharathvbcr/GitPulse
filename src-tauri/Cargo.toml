@@ -29,6 +29,11 @@ tauri-build = { version = "2.0.0", features = [] }
 
 [dev-dependencies]
 tempfile = "3.10"
+# Tauri's own headless test runtime (MockRuntime). Not a new third-party
+# dependency — it enables a feature of the tauri crate already in
+# [dependencies] — and it is what lets tests drive commands through the real
+# IPC bridge instead of calling the functions directly.
+tauri = { version = "2.0.0", features = ["test"] }
 
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.

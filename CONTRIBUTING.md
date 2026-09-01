@@ -76,6 +76,7 @@ iterating you will usually want the narrower commands instead:
 | `npm run coverage` | Vitest with V8 coverage into `coverage/` | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust unit + integration suites (850+ tests) | ~1 min |
 | `cargo test --manifest-path src-tauri/Cargo.toml updates::` | One Rust module | seconds |
+| `cargo test --manifest-path src-tauri/Cargo.toml --test ipc_bridge_integration` | Commands driven through the real IPC bridge on Tauri's MockRuntime | seconds |
 | `npm run check:coverage` | Validate both LCOV reports and enforce floors (needs a prior `npm run coverage` and `cargo llvm-cov` run) | seconds |
 
 ### Test conventions
