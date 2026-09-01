@@ -35,7 +35,38 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** @param {string} value @param {string} field @param {string} location */
+/**
+ * Parse an *execution count* — a DA hit count or a BRDA taken count.
+ *
+ * These are u64 on the producer side and llvm-cov emits `u64::MAX`
+ * (18446744073709551615) for a counter that saturated or underflowed; four
+ * such lines appear in this repository's own Rust report. They exceed
+ * JavaScript's safe integer range, and rejecting them failed the gate on a
+ * report cargo-llvm-cov had just produced.
+ *
+ * Nothing is computed from these counts — the floors come from the LF/LH and
+ * BRF/BRH summaries — so the value only needs to be well-formed. It is clamped
+ * rather than dropped so a caller reading it still sees "very large" rather
+ * than a wrapped or negative number. Malformed text is still rejected.
+ *
+ * @param {string} value @param {string} field @param {string} location
+ */
+function parseExecutionCount(value, field, location) {
+  if (!INTEGER.test(value)) {
+    throw new Error(`${location}: ${field} must be a non-negative integer, got ${JSON.stringify(value)}`);
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Parse a *summary* count — LF/LH/BRF/BRH/FNF/FNH, or a line number.
+ *
+ * These stay strict: a summary outside the safe integer range is corruption,
+ * not saturation, and the floors are computed from them.
+ *
+ * @param {string} value @param {string} field @param {string} location
+ */
 function parseNonNegativeInteger(value, field, location) {
   if (!INTEGER.test(value)) {
     throw new Error(`${location}: ${field} must be a non-negative integer, got ${JSON.stringify(value)}`);
@@ -67,7 +98,7 @@ function parseDa(value, location) {
   }
   return {
     line: parseNonNegativeInteger(fields[0], "DA line", location),
-    count: parseNonNegativeInteger(fields[1], "DA execution count", location),
+    count: parseExecutionCount(fields[1], "DA execution count", location),
   };
 }
 
@@ -78,7 +109,8 @@ function parseBrda(value, location) {
     throw new Error(`${location}: BRDA must contain line, block, branch, and taken fields`);
   }
   if (fields[0] !== "-") parseNonNegativeInteger(fields[0], "BRDA line", location);
-  const taken = fields[3] === "-" ? 0 : parseNonNegativeInteger(fields[3], "BRDA taken", location);
+  // Same saturation case as DA counts: a taken count is an execution count.
+  const taken = fields[3] === "-" ? 0 : parseExecutionCount(fields[3], "BRDA taken", location);
   return { taken };
 }
 

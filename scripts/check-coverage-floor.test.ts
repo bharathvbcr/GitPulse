@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -103,6 +104,38 @@ describe("coverage floor contract", () => {
     expect(parsed.totals.lines).toEqual({ found: 10, hit: 1 });
   });
 
+  it("accepts the saturated counters llvm-cov emits", () => {
+    // llvm-cov writes u64::MAX for a counter that saturated or underflowed;
+    // four such lines appear in this repository's own Rust report. They exceed
+    // JavaScript's safe integer range, and rejecting them failed the gate on a
+    // report cargo-llvm-cov had just produced.
+    const saturated = [
+      "TN:",
+      "SF:src-tauri/src/example.rs",
+      "DA:1,18446744073709551615",
+      "DA:2,0",
+      "BRF:2",
+      "BRH:1",
+      "BRDA:1,0,0,18446744073709551615",
+      "BRDA:1,0,1,0",
+      "LF:2",
+      "LH:1",
+      "end_of_record",
+    ].join("\n");
+    const parsed = parseLcov(saturated);
+    expect(parsed.totals.lines).toEqual({ found: 2, hit: 1 });
+    expect(parsed.totals.branches).toEqual({ found: 2, hit: 1 });
+  });
+
+  it("still rejects an execution count that is not a number at all", () => {
+    // Relaxing the range must not relax the shape.
+    for (const bad of ["abc", "-5", "1.5", ""]) {
+      expect(() =>
+        parseLcov(`TN:\nSF:a.rs\nDA:1,${bad}\nLF:1\nLH:1\nend_of_record`),
+      ).toThrow();
+    }
+  });
+
   it("rejects forged summaries, missing data, duplicate lines, and truncation", () => {
     // Still corruption: a summary that is internally impossible.
     expect(() => parseLcov(report().replace("LH:1", "LH:99"))).toThrow(/LH cannot exceed LF/);
@@ -157,4 +190,24 @@ describe("coverage floor contract", () => {
     expect(malformed.code).toBe(2);
     expect(malformed.output).toMatch(/Frontend invalid:.*unterminated/);
   });
+
+  // Every quirk above was found by the gate failing on a real report, because
+  // the parser had only ever been exercised against fixtures written by the
+  // same person who wrote the parser. When real reports are present — which is
+  // the case in `ci:local`, since check:coverage runs after generation — parse
+  // them too, so the next producer quirk is caught here rather than in CI.
+  const REAL_REPORTS = [
+    { label: "Rust (cargo llvm-cov)", path: new URL("../lcov.info", import.meta.url) },
+    { label: "frontend (vitest v8)", path: new URL("../coverage/lcov.info", import.meta.url) },
+  ];
+
+  for (const { label, path: reportPath } of REAL_REPORTS) {
+    const present = existsSync(reportPath);
+    // Named so a skip is visible in the output rather than looking like a pass.
+    it.skipIf(!present)(`parses the real ${label} report when one is present`, () => {
+      const parsed = parseLcov(readFileSync(reportPath, "utf8"));
+      expect(parsed.totals.lines?.found ?? 0).toBeGreaterThan(0);
+      expect(parsed.totals.lines?.hit ?? 0).toBeGreaterThan(0);
+    });
+  }
 });
