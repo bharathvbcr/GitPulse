@@ -25,6 +25,7 @@
   import type { BranchFilterTab, BranchSection } from "../branches/types";
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
+  import BranchHealthDot from "./BranchHealthDot.svelte";
   import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
   import { clampMenuPosition } from "../branches/menuPosition";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
@@ -689,6 +690,7 @@
         <span class="text-[9px] text-textMuted font-mono" title="Uncommitted working tree">wt</span>
         <ChurnBar additions={workAdd} deletions={workDel} />
       {/if}
+      <BranchHealthDot {branch} />
       {#if branch.ahead_count > 0}
         <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
       {/if}

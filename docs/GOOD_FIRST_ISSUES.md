@@ -125,24 +125,29 @@ and `--rust-lines`; `--help` prints the full flag list.
 
 ## C. Metric trackers
 
-### C1 · Branch health scoring in the sidebar 🟡
-**Labels:** `help wanted`, `enhancement`, `area: rust-core`
+### C1 · Branch health scoring in the sidebar ✅ *(Completed)*
+**Labels:** `enhancement`, `area: frontend`
 
-`cmd_branch_stats` returns ahead/behind counts and `cmd_branch_cleanup_plan` already
-reasons about stale branches. There is no single at-a-glance signal for "this branch
-needs attention".
+*Implemented in [`src/lib/branches/health.ts`](../src/lib/branches/health.ts) and
+[`BranchHealthDot.svelte`](../src/lib/components/BranchHealthDot.svelte).*
 
-Derive a health verdict per branch from data already fetched — staleness (days since
-last commit), divergence (ahead/behind), and whether it is merged into the default
-branch. Surface it as a small indicator in `BranchList.svelte`.
+No backend change was needed: `BranchInfo` already carries `last_commit_timestamp`,
+`commits_ahead_of_base`/`commits_behind_base`, `upstream`, `is_gone`, and
+`is_default`, so the verdict is derived from data the sidebar has already fetched.
 
-- **Touch:** `src-tauri/src/engine/git_reader.rs` or a new `analyzer` module,
-  `src/lib/branches/`, `src/lib/components/BranchList.svelte`
-- **Done when:** the scoring function is pure and unit-tested against fixture inputs
-  (fresh, stale, merged, diverged, and a branch with no upstream), and the indicator
-  has a tooltip explaining the verdict.
-- **Design note:** agree the thresholds on the issue before implementing. An
-  arbitrary "30 days = stale" baked into a PR is the part most likely to be rejected.
+On the entry's design note — thresholds are a `BranchHealthThresholds` parameter with
+documented defaults rather than a constant buried in a comparison, so changing
+`staleDays` is a call-site decision and the tests pin behaviour either side of the
+boundary. 30 days is a stated default, not a claim about what is right for a team.
+
+Exactly one verdict is returned, so the priority order is the design: upstream gone,
+then merged, then diverged, then stale, then behind, then unpublished. It runs
+most-actionable first — a merged branch is told it can be deleted rather than that it
+is old. Tested for fresh, stale, merged, diverged, behind, unpublished, default,
+upstream-gone, threshold boundaries, custom thresholds, and a tip dated in the future.
+
+Only branches needing attention draw an indicator: a dot on every row would make the
+healthy majority noisy and the exceptions invisible.
 
 ### C2 · Pull-request review velocity in the GitHub panel 🟡
 **Labels:** `help wanted`, `enhancement`, `area: github`
