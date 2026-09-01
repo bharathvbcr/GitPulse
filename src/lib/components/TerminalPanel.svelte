@@ -209,6 +209,27 @@
     }
   }
 
+  type LauncherKind = "shell" | "claude" | "manvi" | "codex";
+  let launcher = $state<LauncherKind>("shell");
+
+  function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
+    switch (kind) {
+      case "claude":
+        return { program: "claude", args: [] };
+      case "manvi":
+        return { program: "manvi", args: [] };
+      case "codex":
+        return { program: "codex", args: [] };
+      default:
+        return {};
+    }
+  }
+
+  function selectLauncher(kind: LauncherKind) {
+    launcher = kind;
+    void restartPty();
+  }
+
   async function restartPty() {
     const path = $repoStore.currentPath;
     if (path) await spawnPty(path);
@@ -225,12 +246,15 @@
     term.reset();
     try {
       const dims = fitAddon?.proposeDimensions();
+      const cfg = launcherConfig(launcher);
       const spawned = await invoke<TerminalSpawned>(
         "cmd_terminal_spawn",
         {
           repoPath,
           rows: Math.max(dims?.rows ?? 24, 2),
           cols: Math.max(dims?.cols ?? 80, 2),
+          program: cfg.program,
+          args: cfg.args,
         },
       );
       if (epoch !== spawnEpoch) {
@@ -249,7 +273,7 @@
       earlyOutput = [];
       harnessStore.recordAction({
         kind: "terminal-session",
-        label: `Interactive shell started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
+        label: `${launcher === "shell" ? "Interactive shell" : `Agent (${launcher})`} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
         ok: true,
       });
     } catch (err) {
@@ -560,6 +584,40 @@
         </button>
       </div>
       {#if mode === "shell"}
+        <div class="flex items-center gap-1 bg-surface border border-border/60 rounded-full p-0.5 text-[10px]">
+          <button
+            type="button"
+            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'shell' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => selectLauncher('shell')}
+            title="Interactive system shell"
+          >
+            Shell
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'claude' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => selectLauncher('claude')}
+            title="Launch Claude Code agent CLI in this worktree"
+          >
+            Claude
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'manvi' ? 'bg-emerald-500/20 text-emerald-300 font-medium' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => selectLauncher('manvi')}
+            title="Launch Manvi CLI in this worktree"
+          >
+            Manvi
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'codex' ? 'bg-sky-500/20 text-sky-300 font-medium' : 'text-textMuted hover:text-textPrimary'}"
+            onclick={() => selectLauncher('codex')}
+            title="Launch Codex CLI in this worktree"
+          >
+            Codex
+          </button>
+        </div>
         <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface border border-border/60 text-[10px] text-textMuted">
           <AlertCircle size={11} class="text-amber-400 shrink-0" />
           <span>unguarded: a shell runs outside the MANVI gate</span>

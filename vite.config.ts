@@ -9,14 +9,14 @@ import { appVersion } from "./scripts/app-version.mjs";
  * only — its job is to catch a dependency accidentally landing in the entry
  * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
  *
- * Measured at 680 KB after the repository-surface pass (remotes, submodules,
- * stash lifecycle, workspace bulk operations); 656 KB before it, 648 KB before
+ * Measured at 692 KB after the control-plane Phase 4 agent launcher and grants
+ * pass; 680 KB after the repository-surface pass; 656 KB before it, 648 KB before
  * the parked-operation work. Growth is first-party: the vendor chunks below
- * are unchanged across all three, which is the check to run before raising
+ * are unchanged across all four, which is the check to run before raising
  * this again — a jump with vendor chunks unchanged is app code, a jump with
  * them changed is a dependency that leaked into the entry chunk.
  */
-const MAX_PRODUCTION_CHUNK_BYTES = 690_000;
+const MAX_PRODUCTION_CHUNK_BYTES = 710_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.

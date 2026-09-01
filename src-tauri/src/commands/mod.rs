@@ -2272,16 +2272,20 @@ pub async fn cmd_ai_suggest_branch_name(
 /// Output streams back as `terminal-output` events; exit lands as
 /// `terminal-exit`, both keyed by the returned session id.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_terminal_spawn(
     app: AppHandle,
     state: State<'_, crate::terminal::TerminalSessions>,
     repo_path: String,
     rows: u16,
     cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<std::collections::HashMap<String, String>>,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     // Fast allocation work only; nothing here blocks long enough to need the
     // thread pool.
-    crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols)
+    crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols, program, args, env)
 }
 
 /// Feeds keystrokes into a live session's PTY.

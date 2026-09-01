@@ -246,6 +246,35 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
     let results = run_plan(plan, |step| {
         let step_started = Instant::now();
         let arg_refs: Vec<&str> = step.args.iter().map(String::as_str).collect();
+
+        // Every step is judged before it runs.
+        //
+        // This runner used to bypass the gate entirely: `npm test`, `cargo
+        // clippy` and everything else it spawned ran unjudged and unrecorded.
+        // In a product whose claim is to be the trust boundary between agents
+        // and the repository, a privileged unlogged execution path is the one
+        // thing that cannot exist — and this was one, by design, because the
+        // command gate fails closed on non-git commands.
+        //
+        // The answer is to declare the step rather than to skip the check. The
+        // step's own command line is the allowlist, so the harness can answer
+        // with a clean allow instead of demoting `command.not_allowed`; the
+        // hard rungs still run, so a step that force-pushed or wrote a
+        // credential path is still refused. Either way the step reaches the
+        // ledger with its verdict.
+        let mut argv = Vec::with_capacity(arg_refs.len() + 1);
+        argv.push(step.program.as_str());
+        argv.extend(arg_refs.iter().copied());
+        let allowed = vec![step.rendered_command()];
+        let repo_str = repo.to_string_lossy();
+        if let Err(refusal) = crate::harness::guard_command_allowing(&repo_str, &argv, &allowed) {
+            let duration_ms = u64::try_from(step_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // A refusal is not a step that failed: it is a step that never ran.
+            // `COULD_NOT_RUN` is the same marker a spawn failure carries, so a
+            // reader is never told a check passed when it did not happen.
+            return (Err(refusal), duration_ms);
+        }
+
         let outcome = capture_command(
             &step.program,
             &arg_refs,
@@ -599,5 +628,69 @@ mod tests {
             err.contains("No supported CI manifests"),
             "empty plan should name the reason, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    /// Every CI step reaches the ledger with a verdict.
+    ///
+    /// The bypass this closes was deliberate and documented: the command gate
+    /// fails closed on non-git commands, so routing `npm test` through it
+    /// refused the run. Declaring the step as its own allowlist is what makes
+    /// the check answerable instead of skippable.
+    ///
+    /// Asserted on the *ledger* rather than on the report, because the report
+    /// would look identical either way — a step that ran unjudged and a step
+    /// that ran with a clean verdict both read as "passed". The whole point is
+    /// that those are no longer the same event.
+    #[test]
+    fn ci_steps_are_judged_and_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_str().expect("utf8");
+        // A real git repository: the runner refuses anything else, and a test
+        // that skipped that check would not be exercising the runner.
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["init", "-b", "main"]);
+
+        // A manifest, so the planner produces at least one step.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"t","scripts":{"test":"echo ok"}}"#,
+        )
+        .expect("write manifest");
+
+        let before = crate::ledger::latest_cursor(repo).expect("cursor");
+        // The run itself may pass or fail — npm may not even be installed — and
+        // that is not what is under test. What matters is that nothing was
+        // spawned without a verdict landing first.
+        // The run itself may pass or fail — npm may not even be installed —
+        // and that is not what is under test.
+        let _ = super::run_ci_local(repo);
+        let events = crate::ledger::tail(repo, before, 100).expect("tail");
+
+        assert!(
+            !events.is_empty(),
+            "the CI runner spawned steps without recording any of them"
+        );
+        for row in &events {
+            assert!(
+                row.verdict_json.is_some(),
+                "a CI step reached the ledger with no verdict: {:?}",
+                row.object
+            );
+            assert!(
+                matches!(row.outcome.as_str(), "ok" | "blocked"),
+                "unexpected outcome {:?}",
+                row.outcome
+            );
+        }
     }
 }

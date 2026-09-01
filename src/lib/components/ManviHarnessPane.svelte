@@ -45,12 +45,21 @@
     switch (status) {
       case "blocked":
         return "bg-rose-500/20 text-rose-300 border-rose-500/40";
-      case "unchecked":
-        return "bg-amber-500/15 text-amber-400 border-amber-500/30";
+      case "granted":
+        return "bg-purple-500/20 text-purple-300 border-purple-500/40";
+      case "demoted":
+        return "bg-blue-500/20 text-blue-300 border-blue-500/40";
+      case "widened":
+        return "bg-amber-500/20 text-amber-300 border-amber-500/40";
+      case "degraded":
+        return "bg-yellow-500/20 text-yellow-300 border-yellow-500/40";
       case "warned":
         return "bg-sky-500/15 text-sky-300 border-sky-500/30";
-      default:
+      case "allowed":
         return "bg-emerald-500/10 text-emerald-300 border-emerald-500/25";
+      case "unchecked":
+      default:
+        return "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
     }
   }
 
@@ -388,14 +397,34 @@
     {:else}
       <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-56 overflow-y-auto">
         {#each recentActions as action (action.id)}
-          <div class="px-3 py-1.5 flex items-center gap-2 text-[11px]" title={action.verdict?.detail ?? action.label}>
-            <span class="font-mono text-[10px] text-textMuted shrink-0">{actionTime(action.ts)}</span>
-            <span class="shrink-0 px-1.5 py-0.5 rounded-full font-mono text-[9px] uppercase border {verdictChip(
-              !action.ok ? 'blocked' : (action.verdict?.status ?? 'unchecked')
-            )}">
-              {action.kind}
-            </span>
-            <span class="truncate {action.ok ? 'text-textPrimary' : 'text-rose-400'}">{action.label || "—"}</span>
+          <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]" title={action.verdict?.detail ?? action.label}>
+            <div class="flex items-center gap-2">
+              <span class="font-mono text-[10px] text-textMuted shrink-0">{actionTime(action.ts)}</span>
+              <span class="shrink-0 px-1.5 py-0.5 rounded-full font-mono text-[9px] uppercase border {verdictChip(
+                !action.ok ? 'blocked' : (action.verdict?.status ?? 'unchecked')
+              )}">
+                {action.verdict?.status ?? action.kind}
+              </span>
+              <span class="truncate {action.ok ? 'text-textPrimary' : 'text-rose-400'}">{action.label || "—"}</span>
+              {#if action.verdict?.task_id}
+                <span class="ml-auto font-mono text-[9px] px-1.5 py-0.2 rounded bg-surfaceHover text-textMuted shrink-0">
+                  {action.verdict.task_id}
+                </span>
+              {/if}
+            </div>
+            {#if action.verdict?.grant_id}
+              <div class="text-[10px] text-purple-300/80 font-mono pl-14">
+                Grant {action.verdict.grant_id} by {action.verdict.granted_by || "human"} · {action.verdict.reason || "waived"}
+              </div>
+            {:else if action.verdict?.demoted}
+              <div class="text-[10px] text-blue-300/80 font-mono pl-14">
+                Posture demoted: {action.verdict.demoted}
+              </div>
+            {:else if action.verdict?.widened}
+              <div class="text-[10px] text-amber-300/80 font-mono pl-14">
+                Scope widened: {action.verdict.widened}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>

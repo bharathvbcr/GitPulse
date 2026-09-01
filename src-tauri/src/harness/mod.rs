@@ -16,7 +16,8 @@ pub mod sidecar;
 use serde::{Deserialize, Serialize};
 
 pub use policy::{
-    check_command, check_file, render_command, HostScope, PolicyStatus, PolicyVerdict,
+    check_command, check_command_allowing, check_file, render_command, HostScope, PolicyStatus,
+    PolicyVerdict,
 };
 pub use protocol::{HelloResult, PrepareResult, ProbeResult, SettleResult};
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
@@ -74,8 +75,25 @@ impl HarnessStatus {
 /// private reimplementation in `commands`); this signature is the canonical
 /// one both now share.
 pub(crate) fn guard_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
+    guard_command_allowing(repo_path, argv, &[])
+}
+
+/// Guards a command while declaring an allowlist for it.
+///
+/// The local CI runner is the caller this exists for. It used to bypass the
+/// gate entirely — every `npm test` and `cargo clippy` it spawned ran
+/// unjudged and unrecorded, which is a privileged unlogged execution path in a
+/// product whose claim is to be the trust boundary between agents and the
+/// repository. Declaring the step it is about to run lets the harness answer
+/// cleanly instead of demoting a `command.not_allowed` on every step.
+pub(crate) fn guard_command_allowing(
+    repo_path: &str,
+    argv: &[&str],
+    allowed: &[String],
+) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
-    let verdict = check_command(repo_path, &command, scope_for(repo_path).as_ref());
+    let verdict =
+        check_command_allowing(repo_path, &command, scope_for(repo_path).as_ref(), allowed);
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
     record_gate(repo_path, &action, &command, argv_json, &verdict);
@@ -128,6 +146,7 @@ fn scope_for(repo_path: &str) -> Option<HostScope> {
             .collect(),
         forbidden_changes: scope.forbidden_changes,
         worktree: repo_path.to_string(),
+        allowed_commands: scope.allowed_commands,
     })
 }
 
@@ -232,7 +251,11 @@ mod ledger_seam_tests {
     #[test]
     fn a_guarded_command_leaves_a_durable_row() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = dir.path().to_str().expect("utf8 path");
+        let repo_buf = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        let repo = repo_buf.to_str().expect("utf8 path");
 
         let before = crate::ledger::latest_cursor(repo).expect("cursor");
         let _ = guard_command(repo, &["git", "commit", "-m", "hello"]);

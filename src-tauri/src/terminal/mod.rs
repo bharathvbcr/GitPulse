@@ -219,13 +219,17 @@ where
     });
 }
 
-/// Spawns a PTY session running an interactive shell in `repo_path`.
+/// Spawns a PTY session running an interactive shell or agent CLI in `repo_path`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session(
     app: &AppHandle,
     state: &TerminalSessions,
     repo_path: &str,
     rows: u16,
     cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
 ) -> Result<TerminalSpawned, String> {
     let repo = validate_repo(repo_path)?;
     let reservation = reserve_session(state)?;
@@ -235,8 +239,20 @@ pub fn spawn_session(
         .openpty(size)
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    let shell = default_shell();
+    let shell = program
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(default_shell);
     let mut cmd = CommandBuilder::new(&shell);
+    if let Some(ref args_vec) = args {
+        for arg in args_vec {
+            cmd.arg(arg);
+        }
+    }
+    if let Some(ref env_map) = env {
+        for (k, v) in env_map {
+            cmd.env(k, v);
+        }
+    }
     cmd.cwd(&repo);
 
     // The child handle is owned: the killer is split off for SessionEntry
@@ -245,7 +261,7 @@ pub fn spawn_session(
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn shell '{shell}': {e}"))?;
+        .map_err(|e| format!("Failed to spawn process '{shell}': {e}"))?;
     let killer: Box<dyn ChildKiller + Send> = child.clone_killer();
 
     // Drop slave explicitly; master remains open.
@@ -344,6 +360,39 @@ pub fn spawn_session(
         return Err(format!("Failed to spawn PTY reader thread: {e}"));
     }
     reservation.commit();
+
+    let actor_kind = if shell.contains("claude")
+        || shell.contains("manvi")
+        || shell.contains("codex")
+        || shell.contains("agy")
+    {
+        crate::ledger::ActorKind::Agent
+    } else {
+        crate::ledger::ActorKind::Human
+    };
+    let draft = crate::ledger::Draft {
+        repo_path: repo.to_string_lossy().into_owned(),
+        worktree_path: Some(repo.to_string_lossy().into_owned()),
+        actor_kind: Some(actor_kind),
+        actor_id: Some(shell.clone()),
+        session_id: Some(session_id.clone()),
+        task_id: crate::ledger::bindings::resolve(repo_path, repo_path)
+            .ok()
+            .flatten(),
+        action: "session.spawn".to_string(),
+        object: Some(shell.clone()),
+        argv_json: args.as_ref().and_then(|a| serde_json::to_string(a).ok()),
+        outcome: Some(crate::ledger::Outcome::Ok),
+        verdict_json: None,
+        before_ref: None,
+        after_ref: None,
+        duration_ms: None,
+        detail_json: None,
+    };
+    // `record` rather than `append`: a PTY that could not be logged is still a
+    // PTY the user asked for. The failure is counted and surfaced through
+    // LedgerStatus rather than refusing the session.
+    let _ = crate::ledger::record(draft);
 
     Ok(TerminalSpawned {
         id: session_id,
@@ -2473,5 +2522,11 @@ mod tests {
             reserve_session(&state).is_ok(),
             "released slots must be reusable"
         );
+    }
+
+    #[test]
+    fn default_shell_is_non_empty() {
+        let shell = default_shell();
+        assert!(!shell.trim().is_empty());
     }
 }

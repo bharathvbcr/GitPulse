@@ -243,12 +243,42 @@ pub struct HostScope {
     pub planned_files: Vec<String>,
     pub forbidden_changes: Vec<String>,
     pub worktree: String,
+    /// Commands the task authorises, in fnmatch form.
+    ///
+    /// Read from the bound task rather than invented here: a task that declares
+    /// what it may run should have that honoured, and dropping it made every
+    /// command in a bound worktree fall to `command.not_allowed`.
+    pub allowed_commands: Vec<String>,
 }
 
 pub fn check_command(root: &str, command: &str, scope: Option<&HostScope>) -> PolicyVerdict {
+    check_command_allowing(root, command, scope, &[])
+}
+
+/// Evaluates a command while declaring an allowlist for it.
+///
+/// The allowlist is how a caller says "these are the commands I intend to run",
+/// which is what lets the harness answer with a clean allow rather than a
+/// demoted `command.not_allowed`. It never widens anything the hard rules
+/// refuse: a declared command that force-pushes is still refused, because those
+/// rungs run before the allowlist and carry Severity Hard.
+///
+/// `enforce_allowlist` is deliberately left false. Turning it on would make
+/// "not in the list" a refusal, and this host's list is a statement of intent
+/// rather than a complete inventory of what a repository may legitimately run.
+pub fn check_command_allowing(
+    root: &str,
+    command: &str,
+    scope: Option<&HostScope>,
+    allowed: &[String],
+) -> PolicyVerdict {
     let mut params = serde_json::json!({ "command": command, "root": root });
     if let Some(scope) = scope {
         params["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+    }
+    if !allowed.is_empty() {
+        params["allowed_commands"] =
+            serde_json::to_value(allowed).unwrap_or(serde_json::Value::Null);
     }
     match sidecar::call_policy::<RawDecision>(OP_POLICY_CHECK_COMMAND, params, POLICY_TIMEOUT) {
         Ok(d) => PolicyVerdict::from_decision(command, d),

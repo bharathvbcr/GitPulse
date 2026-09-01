@@ -287,9 +287,26 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The canonical spelling of a repository path.
+///
+/// One repository must have exactly one ledger, and a path can be spelled
+/// several ways: through a symlink, with a trailing slash, or — on macOS — as
+/// `/var/...` where the real path is `/private/var/...`. `validate_repo`
+/// canonicalises before running git, so without this the same repository
+/// accumulated two ledgers and neither held the whole history.
+///
+/// Falls back to the path as given when it cannot be canonicalised, which is
+/// what a removed repository needs: a caller still gets a stable answer rather
+/// than an error on a read.
+fn canonical_repo(repo_path: &str) -> String {
+    std::fs::canonicalize(repo_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| repo_path.trim_end_matches('/').to_string())
+}
+
 /// Where a repository's ledger lives.
 pub fn ledger_path(repo_path: &str) -> PathBuf {
-    Path::new(repo_path)
+    Path::new(&canonical_repo(repo_path))
         .join(".devcouncil")
         .join("ledger.sqlite")
 }
@@ -368,6 +385,10 @@ pub fn append(draft: Draft) -> Result<i64, LedgerError> {
         ));
     }
 
+    // Stored canonically for the same reason the file is located canonically:
+    // otherwise one repository appears under two names in one database.
+    let repo_path = canonical_repo(&draft.repo_path);
+
     let ms = ids::now_millis();
     let ulid = ids::ulid(ms);
     let ts = ids::iso8601_utc(ms);
@@ -393,7 +414,7 @@ pub fn append(draft: Draft) -> Result<i64, LedgerError> {
                 ulid,
                 ts,
                 SCHEMA_VERSION,
-                draft.repo_path,
+                repo_path,
                 draft.worktree_path,
                 actor_kind.as_str(),
                 draft.actor_id,
@@ -745,5 +766,56 @@ mod tests {
             }
         });
         assert_eq!(tail(&repo, 0, 1000).expect("tail").len(), 200);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// One repository, one ledger — however its path is spelled.
+    ///
+    /// `validate_repo` canonicalises before running git, so a caller that
+    /// passed the raw path and a caller that passed the canonical one wrote to
+    /// two different databases. Each held part of the history and neither knew
+    /// about the other, which is worse than either being empty.
+    #[test]
+    fn a_symlinked_or_uncanonical_path_uses_the_same_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().to_str().unwrap().to_string();
+        let canonical = std::fs::canonicalize(&raw)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        append(Draft {
+            repo_path: raw.clone(),
+            action: "git.commit".into(),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("append via the raw path");
+
+        // The canonical spelling must see it.
+        let events = tail(&canonical, 0, 10).expect("tail");
+        assert_eq!(
+            events.len(),
+            1,
+            "the canonical path opened a different ledger from the raw one"
+        );
+        assert_eq!(events[0].repo_path, canonical, "rows store one spelling");
+
+        // ...and so must a trailing slash.
+        assert_eq!(tail(&format!("{raw}/"), 0, 10).expect("tail").len(), 1);
+        assert_eq!(ledger_path(&raw), ledger_path(&canonical));
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_canonicalised_still_resolves() {
+        // A removed repository must not turn a read into an error.
+        let p = ledger_path("/definitely/not/here");
+        assert!(p.ends_with("ledger.sqlite"));
+        assert_eq!(ledger_path("/definitely/not/here/"), p);
     }
 }
