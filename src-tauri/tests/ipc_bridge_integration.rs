@@ -25,6 +25,9 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
         // see by bare name.
         .invoke_handler(tauri::generate_handler![
             gitpulse_lib::commands::cmd_compute_word_diff,
+            gitpulse_lib::commands::cmd_list_branches,
+            gitpulse_lib::commands::cmd_get_status,
+            gitpulse_lib::commands::cmd_stage_file,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
         // The app's own context, from the same accessor run() uses, so the
@@ -150,4 +153,106 @@ fn a_successful_result_arrives_unwrapped_on_the_success_channel() {
     // Ok(String) must serialize as a bare JSON string, not as {"Ok": ...}.
     assert!(value.is_string(), "got: {value}");
     assert!(!value.as_str().unwrap_or_default().is_empty());
+}
+
+/// A repository with one commit and one unstaged change.
+fn repo_with_change() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test User"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("README.md"), "hello\n").expect("write");
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+    std::fs::write(dir.path().join("README.md"), "changed\n").expect("write");
+    dir
+}
+
+#[test]
+fn a_list_returning_command_serializes_as_an_array_of_the_expected_shape() {
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_list_branches",
+        json!({ "repoPath": repo.path().to_string_lossy() }),
+    )
+    .expect("branches list");
+    let branches = value.as_array().expect("an array, not an object");
+    assert!(!branches.is_empty());
+    // Field names the TypeScript BranchInfo interface reads.
+    for field in [
+        "name",
+        "is_current",
+        "is_remote",
+        "ahead_count",
+        "last_commit_timestamp",
+    ] {
+        assert!(
+            branches[0].get(field).is_some(),
+            "missing {field} in {}",
+            branches[0]
+        );
+    }
+    // snake_case must survive: serde is not renaming to camelCase on the way out.
+    assert!(branches[0].get("isCurrent").is_none());
+}
+
+#[test]
+fn status_reports_the_working_tree_change_through_the_bridge() {
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_get_status",
+        json!({ "repoPath": repo.path().to_string_lossy() }),
+    )
+    .expect("status");
+    let entries = value.as_array().expect("an array");
+    assert_eq!(entries.len(), 1, "one modified file: {value}");
+    assert_eq!(entries[0]["path"], "README.md");
+    assert!(entries[0].get("is_staged").is_some());
+}
+
+#[test]
+fn a_guarded_command_returns_the_policy_verdict_beside_its_output() {
+    // The frontend's runMutating unwraps `{ policy, output }`. If the envelope
+    // ever flattened or renamed, mutations would appear to succeed while the
+    // harness verdict silently vanished.
+    let repo = repo_with_change();
+    let value = invoke(
+        "cmd_stage_file",
+        json!({ "repoPath": repo.path().to_string_lossy(), "filePath": "README.md" }),
+    )
+    .expect("staging succeeds");
+    assert!(value.get("policy").is_some(), "no policy in {value}");
+    assert!(value.get("output").is_some(), "no output in {value}");
+    // PolicyVerdict must carry a status the frontend can branch on.
+    assert!(
+        value["policy"].get("status").is_some(),
+        "verdict has no status: {}",
+        value["policy"]
+    );
+    // Unit output serializes as null, not as an omitted key.
+    assert!(value["output"].is_null());
+}
+
+#[test]
+fn a_repo_path_that_is_not_a_repository_fails_on_the_error_channel() {
+    let plain = tempfile::TempDir::new().expect("tempdir");
+    let error = invoke(
+        "cmd_get_status",
+        json!({ "repoPath": plain.path().to_string_lossy() }),
+    )
+    .expect_err("a non-repository must not report an empty status");
+    assert!(error.is_string(), "expected a string error, got {error}");
 }
