@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,8 @@ import {
   DEFAULT_SRC_DIR,
   ORPHAN_ALLOWLIST,
   formatReport,
+  runContractCheck,
+  scanAnnotatedCommands,
 } from "./check-ipc-contract.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -263,6 +265,8 @@ describe("report alignment (A3)", () => {
       staleAllowlist: [] as string[],
       manualReviews: [] as { file: string; line: number; detail: string }[],
       violations: [] as string[],
+      unregistered: [] as string[],
+      annotatedCount: 95,
       ok: true,
     };
     const long = formatReport(result, "a/very/deeply/nested/path/to/src-tauri/src/lib.rs".repeat(3));
@@ -270,5 +274,61 @@ describe("report alignment (A3)", () => {
     const columns = metricLines.map((line) => line.indexOf(": "));
     expect(metricLines.length).toBeGreaterThan(3);
     expect(new Set(columns).size).toBe(1);
+  });
+});
+
+describe("annotated but unregistered commands", () => {
+  it("finds every #[tauri::command] in the crate, including async and attribute-separated ones", () => {
+    const found = scanAnnotatedCommands([
+      fileURLToPath(new URL("../src-tauri/src", import.meta.url)),
+    ]);
+    // Cross-checked three ways against the real crate: the generate_handler!
+    // list, a raw attribute count, and this scanner all report the same total.
+    expect(found.size).toBe(95);
+    expect(found.has("cmd_stage_file")).toBe(true);
+    for (const [, site] of found) {
+      expect(site.file).toMatch(/^src-tauri\/src\//);
+      expect(site.line).toBeGreaterThan(0);
+    }
+  });
+
+  it("reports a command that is annotated but absent from generate_handler!", async () => {
+    // This compiles cleanly and was invisible to every gate: the registry does
+    // not list it so it is not an orphan, and no frontend calls it so it is
+    // not missing. It is a dead IPC entry point.
+    const dir = await mkdtemp(path.join(tmpdir(), "gp-unregistered-"));
+    tempDirs.push(dir);
+    const srcDir = path.join(dir, "src-tauri", "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(
+      path.join(srcDir, "lib.rs"),
+      "fn main() {\n  tauri::generate_handler![commands::cmd_live];\n}\n",
+    );
+    await writeFile(
+      path.join(srcDir, "commands.rs"),
+      [
+        "#[tauri::command]",
+        "pub fn cmd_live() -> String { String::new() }",
+        "",
+        "#[tauri::command(async)]",
+        "/// a doc comment between the attribute and the fn",
+        "pub async fn cmd_dead(repo: String) -> Result<(), String> { let _ = repo; Ok(()) }",
+      ].join("\n"),
+    );
+    const found = scanAnnotatedCommands([srcDir]);
+    expect([...found.keys()].sort()).toEqual(["cmd_dead", "cmd_live"]);
+
+    const frontend = path.join(dir, "src");
+    await mkdir(frontend, { recursive: true });
+    await writeFile(path.join(frontend, "app.ts"), 'invoke("cmd_live");\n');
+    const result = runContractCheck({
+      libPath: path.join(srcDir, "lib.rs"),
+      srcDirs: [frontend],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.unregistered).toEqual(["cmd_dead"]);
+    expect(result.violations.join(" ")).toContain("cmd_dead");
+    // The text report must name it, not just the JSON.
+    expect(formatReport(result, "lib.rs")).toContain("annotated but never registered");
   });
 });

@@ -22,7 +22,7 @@
  *   --extra-dir <dir>  additional directory scanned for invoke call sites
  *                      (repeatable)
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { alignRows } from "./columns.mjs";
@@ -129,6 +129,54 @@ export function parseRegisteredHandlers(libRsSource) {
     }
   }
   return { handlers, errors };
+}
+
+/**
+ * Every `#[tauri::command]` function defined in the Rust crate.
+ *
+ * A command can be annotated and never added to `generate_handler!`. That
+ * compiles cleanly, and nothing else notices: the registry does not list it,
+ * so it is not an orphan, and no frontend calls it, so it is not missing. It
+ * is simply a dead IPC entry point wearing the same attribute as a live one.
+ *
+ * @param {string[]} roots directories to scan for .rs files
+ * @returns {Map<string, { file: string, line: number }>}
+ */
+export function scanAnnotatedCommands(roots) {
+  /** @type {Map<string, { file: string, line: number }>} */
+  const found = new Map();
+  /** @param {string} dir */
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".rs")) continue;
+      const lines = readFileSync(full, "utf8").split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!/^\s*#\[tauri::command\b/.test(lines[index])) continue;
+        // The fn may sit a few lines below the attribute (other attributes,
+        // doc comments, or a multi-line signature can intervene).
+        for (let ahead = index + 1; ahead < Math.min(index + 8, lines.length); ahead += 1) {
+          const match = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(
+            lines[ahead],
+          );
+          if (match) {
+            if (!found.has(match[1])) {
+              found.set(match[1], { file: path.relative(REPO_ROOT, full), line: ahead + 1 });
+            }
+            break;
+          }
+        }
+      }
+    }
+  };
+  for (const root of roots) {
+    if (existsSync(root)) walk(root);
+  }
+  return found;
 }
 
 /**
@@ -415,6 +463,10 @@ export function compareContract(registered, invoked) {
 export function runContractCheck({ libPath, srcDirs }) {
   const libSource = readFileSync(libPath, "utf8");
   const { handlers: registered, errors } = parseRegisteredHandlers(libSource);
+  // The Rust crate root is lib.rs's directory: scan it for annotated commands
+  // that were never registered.
+  const annotated = scanAnnotatedCommands([path.dirname(libPath)]);
+  const unregistered = [...annotated.keys()].filter((name) => !registered.has(name)).sort();
   const files = collectFrontendFiles(srcDirs);
   const { invoked, manualReviews, siteCount } = scanInvokeCallSites(files);
   const { missing, orphans, allowedOrphans, staleAllowlist } = compareContract(
@@ -425,6 +477,12 @@ export function runContractCheck({ libPath, srcDirs }) {
   /** @type {string[]} */
   const violations = [];
   for (const error of errors) violations.push(`registry: ${error}`);
+  for (const name of unregistered) {
+    const site = annotated.get(name);
+    violations.push(
+      `unregistered: "${name}" is a #[tauri::command] (${site?.file}:${site?.line}) but is absent from generate_handler!, so nothing can call it`,
+    );
+  }
   for (const name of missing) {
     const sites = invoked.get(name) ?? [];
     violations.push(
@@ -445,6 +503,8 @@ export function runContractCheck({ libPath, srcDirs }) {
   }
 
   return {
+    unregistered,
+    annotatedCount: annotated.size,
     registeredCount: registered.size,
     invokedCount: invoked.size,
     siteCount,
@@ -488,6 +548,11 @@ export function formatReport(result, libLabel) {
         note: "see ORPHAN_ALLOWLIST justifications",
       },
       {
+        label: "annotated commands",
+        value: String(result.annotatedCount ?? 0),
+        note: "#[tauri::command] functions found in the Rust crate",
+      },
+      {
         label: "manual-review sites",
         value: String(result.manualReviews.length),
         note: "dynamic call sites needing human eyes",
@@ -506,6 +571,16 @@ export function formatReport(result, libLabel) {
   detail("missing commands", result.missing);
   detail("orphaned handlers", result.orphans);
   detail("manual-review sites", result.manualReviews.map((r) => `${r.file}:${r.line} ${r.detail}`));
+  detail("annotated but never registered", result.unregistered ?? []);
+  // Anything else the check objected to. Without this a failing run printed
+  // "FAIL: IPC contract violated." and nothing else — the reason was only ever
+  // visible in --json, which is not what a person reads.
+  detail(
+    "other violations",
+    (result.violations ?? []).filter(
+      (v) => !/^(missing|orphan|unregistered):/.test(v),
+    ),
+  );
   lines.push("", result.ok ? "OK: IPC contract holds." : "FAIL: IPC contract violated.");
   return lines.join("\n");
 }
