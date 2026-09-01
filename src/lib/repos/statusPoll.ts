@@ -10,10 +10,15 @@
 
 export const STATUS_POLL_INTERVAL_MS = 6_000;
 
-/** Structural shape the publish gate compares; FileStatus is compatible. */
+/**
+ * Structural shape the publish gate compares; FileStatus is compatible.
+ * `old_path` mirrors Rust's `Option<String>`, which serializes to `null` —
+ * not absence — for a non-rename. Assignability from FileStatus is what keeps
+ * this copy honest, and it is checked at every call site.
+ */
 export interface StatusLike {
   path: string;
-  old_path?: string;
+  old_path?: string | null;
   status_code: string;
   is_staged: boolean;
   is_conflicted: boolean;
