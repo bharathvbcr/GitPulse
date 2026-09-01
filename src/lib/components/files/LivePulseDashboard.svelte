@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { LanguageInfo } from "../../files/types";
   import { onMount } from "svelte";
   import { repoStore } from "../../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -127,7 +128,7 @@
     try {
       // 1. Language detection
       try {
-        const langInfo = await invoke<{ name: string; color_hex: string; category: string }>(
+        const langInfo = await invoke<LanguageInfo>(
           "cmd_detect_language",
           { filePath: path }
         );

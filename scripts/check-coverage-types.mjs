@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 24 contracts over
- * 40 structs. That is most, not all, of the named types crossing the IPC
+ * SCOPE: see CONTRACTS below for exactly what is checked — 25 contracts over
+ * 42 structs. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
  * component rather than a module, so there is no single file to point this at.
  * "Type contract holds" means the listed contracts hold. The remaining gap is
@@ -55,7 +55,7 @@ export const TERMINAL_TS_SOURCE = path.join(REPO_ROOT, "src", "lib", "terminal",
  * rename would surface as a silently `undefined` property in whichever panels
  * had not been updated. It is now declared once and checked here.
  */
-export const TERMINAL_STRUCTS = Object.freeze(["TerminalRunResult"]);
+export const TERMINAL_STRUCTS = Object.freeze(["TerminalRunResult", "TerminalSpawned"]);
 
 /**
  * The Rust structs whose serialized shape the frontend depends on, and the
@@ -112,6 +112,7 @@ export const CONTRACTS = Object.freeze([
   { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
+  { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo"] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
@@ -237,7 +238,9 @@ export const SUPPORTED_RENAME_ALL = Object.freeze(["snake_case", "camelCase"]);
  * @returns {string}
  */
 function normalizeRustType(type) {
-  const compact = type.replace(/\s+/g, "");
+  // Drop reference lifetimes before collapsing whitespace, or `&'static str`
+  // survives as the token `&'staticstr` and never matches `&str`.
+  const compact = type.replace(/&\s*'\w+\s+/g, "&").replace(/\s+/g, "");
   const option = /^Option<(.*)>$/.exec(compact);
   if (option) return [normalizeRustType(option[1]), "null"].sort().join("|");
   const vector = /^Vec<(.*)>$/.exec(compact);

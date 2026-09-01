@@ -106,3 +106,10 @@ export function formatRunDetail(res: TerminalRunResult): string {
   if (res.truncated) parts.push("(output clipped)");
   return parts.join("\n");
 }
+
+/** The spawn acknowledgement: which session was started, and where. */
+export interface TerminalSpawned {
+  id: string;
+  shell: string;
+  cwd: string;
+}

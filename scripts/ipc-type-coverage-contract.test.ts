@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { CONTRACTS } from "./check-coverage-types.mjs";
+import { ORPHAN_ALLOWLIST } from "./check-ipc-contract.mjs";
 
 /**
  * check:types verifies the payloads listed in its CONTRACTS table. This pins
@@ -22,20 +23,44 @@ const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "G
 /**
  * Unchecked IPC payload types, each with why it cannot be compared today.
  *
- * Every entry here shares one cause: the TypeScript side has no interface of
- * that name for the checker to read — the payload is consumed through an
- * inline or anonymous type at the `invoke` call. Giving each a named interface
- * is what would move it into CONTRACTS; until then the exposure is that a Rust
- * field rename surfaces as a silently `undefined` property.
+ * Two distinct causes. Some have a TypeScript mirror under a different name
+ * whose nested types are inline, so pairing them means renaming across
+ * components — deferred work, not absent work. The rest are returned by
+ * commands the frontend never calls, which check-ipc-contract already tracks
+ * in its ORPHAN_ALLOWLIST; those entries carry `orphanCommand` and defer to
+ * that list rather than restating its reasoning here, so wiring up a UI
+ * updates one place and this test points at the consequence.
+ *
+ * An earlier version of this list said all of them were "consumed inline",
+ * which was never verified and was wrong for five of the seven.
  */
-const UNCHECKED = new Map<string, string>([
-  ["ConflictDocument", "conflict parse result; consumed inline by the merge editor"],
-  ["ConventionalCommit", "commit-message parse result; consumed inline by the composer"],
-  ["CubicBezierCurve", "graph connector geometry; consumed inline by the canvas renderer"],
-  ["LanguageInfo", "single-file language detection; consumed inline by the viewers"],
-  ["LineCounts", "line-count tally; consumed inline by the viewers"],
-  ["StackHierarchyPayload", "stack hierarchy; consumed inline by the stack viewer"],
-  ["TerminalSpawned", "terminal spawn ack; consumed inline at the invoke call"],
+const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
+  [
+    "ConflictDocument",
+    {
+      reason:
+        "mirrored as `ConflictDoc` in ConflictEditor: a deliberate subset omitting the four CRLF/newline fields the frontend never reads, with `segments` typed inline for the serde enum",
+    },
+  ],
+  [
+    "StackHierarchyPayload",
+    {
+      reason:
+        "mirrored as `StackPayload` in CodeStackViewer, with `breadcrumb` inline instead of BranchAncestryChain and nodes typed StackNode rather than StackedBranchNode",
+    },
+  ],
+  [
+    "ConventionalCommit",
+    { reason: "returned only by an orphaned command", orphanCommand: "cmd_parse_conventional_commit" },
+  ],
+  [
+    "CubicBezierCurve",
+    { reason: "returned only by an orphaned command", orphanCommand: "cmd_get_bezier_connector" },
+  ],
+  [
+    "LineCounts",
+    { reason: "returned only by an orphaned command", orphanCommand: "cmd_count_loc" },
+  ],
 ]);
 
 /**
@@ -95,8 +120,22 @@ describe("IPC type coverage is accounted for, not assumed", () => {
   });
 
   it("gives every exemption a real reason", () => {
-    for (const [name, reason] of UNCHECKED) {
+    for (const [name, { reason }] of UNCHECKED) {
       expect(reason.length, `${name} needs a reason, not a placeholder`).toBeGreaterThan(20);
+    }
+  });
+
+  it("defers to the IPC orphan allowlist instead of restating it", () => {
+    // These types are unchecked only because nothing calls the command that
+    // returns them, and check-ipc-contract already owns that fact with a
+    // justification per command. Wiring up a caller removes the allowlist
+    // entry, and this fails — which is the prompt to add a type contract.
+    for (const [name, { orphanCommand }] of UNCHECKED) {
+      if (!orphanCommand) continue;
+      expect(
+        Object.keys(ORPHAN_ALLOWLIST),
+        `${name} is exempt because ${orphanCommand} has no caller; if that changed, it needs a contract`,
+      ).toContain(orphanCommand);
     }
   });
 });

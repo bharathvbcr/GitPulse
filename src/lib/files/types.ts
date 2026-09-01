@@ -27,3 +27,15 @@ export interface FileBlob {
   text?: string | null;
   base64?: string | null;
 }
+
+/**
+ * Single-file language detection. Consumed as an anonymous
+ * `{ name; color_hex; category }` at the invoke call until it was named here —
+ * the shape TerminalRunResult was in before a rename could silently blank a
+ * field in one caller and not another.
+ */
+export interface LanguageInfo {
+  name: string;
+  color_hex: string;
+  category: string;
+}

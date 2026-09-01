@@ -71,7 +71,7 @@
     ListChecks,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
-  import type { TerminalRunResult } from "../terminal/runResult";
+  import type { TerminalRunResult, TerminalSpawned } from "../terminal/runResult";
   import { themeStore } from "../stores/themeStore";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
@@ -220,7 +220,7 @@
     term.reset();
     try {
       const dims = fitAddon?.proposeDimensions();
-      const spawned = await invoke<{ id: string; shell: string; cwd: string }>(
+      const spawned = await invoke<TerminalSpawned>(
         "cmd_terminal_spawn",
         {
           repoPath,
