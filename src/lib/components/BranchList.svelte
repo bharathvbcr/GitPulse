@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { AiGeneration } from "../stores/harnessStore";
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
@@ -360,7 +361,7 @@
     if (!repo) return;
     suggesting = true;
     try {
-      const gen = await invoke<{ text: string }>("cmd_ai_suggest_branch_name", {
+      const gen = await invoke<AiGeneration>("cmd_ai_suggest_branch_name", {
         repoPath: repo,
       });
       // The suggestion raced a tab switch: it belongs to another repo now.

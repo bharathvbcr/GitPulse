@@ -1,7 +1,13 @@
 import type { RepoState } from "../stores/repoStore";
 import { viewTabForMenuId } from "../views/viewRegistry";
 
-export interface NativeMenuPayload {
+/**
+ * Payload for every native-shell event, not just menu ones — `gitpulse-menu`
+ * and `gitpulse-open-repo` both carry it. Named for the Rust struct it
+ * mirrors, which is what lets check:types compare them; the old name
+ * (NativeMenuPayload) described only half its uses.
+ */
+export interface NativeEvent {
   id: string;
   path?: string | null;
 }
@@ -36,7 +42,7 @@ export interface NativeMenuHandlers {
 }
 
 export function dispatchNativeMenu(
-  payload: NativeMenuPayload,
+  payload: NativeEvent,
   handlers: NativeMenuHandlers,
 ): boolean {
   switch (payload.id) {

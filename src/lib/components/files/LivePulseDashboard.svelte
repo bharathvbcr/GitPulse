@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { LanguageInfo } from "../../files/types";
+  import type { CommitGraphPayload } from "../../stores/graphStore";
   import { onMount } from "svelte";
   import { repoStore } from "../../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -138,7 +139,7 @@
       }
 
       // 2. Commit history touching this file
-      const graph = await invoke<{ rows: Array<{ id: string; author_name: string; timestamp: number; summary: string }> }>(
+      const graph = await invoke<CommitGraphPayload>(
         "cmd_get_commit_graph",
         {
           repoPath: repo,

@@ -71,6 +71,56 @@ function wireShapedTypesIn(source: string): string[] {
   return found;
 }
 
+/**
+ * The anonymous form of the same bug: an inline object literal as the type
+ * argument to invoke() or listen(), which mirrors a payload without naming it.
+ * Every one found was a partial mirror of a type that already had a canonical
+ * interface — `invoke<{ text: string }>` for the 15-field AiGeneration,
+ * `invoke<{ rows: ... }>` for CommitGraphPayload, and three event payloads.
+ */
+const INLINE_PAYLOAD = /\b(?:invoke|listen)\s*<\s*\{/g;
+
+/** Every .ts and .svelte file that is not a test. */
+function frontendFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...frontendFiles(full));
+    else if (
+      entry.isFile() &&
+      (entry.name.endsWith(".svelte") || entry.name.endsWith(".ts")) &&
+      !/\.(test|spec)\.ts$/.test(entry.name)
+    ) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+describe("IPC and event payloads are named, not inlined", () => {
+  it("has no invoke or listen call typed with an inline object literal", () => {
+    const offenders: string[] = [];
+    for (const file of frontendFiles(COMPONENT_ROOT)) {
+      const source = readFileSync(file, "utf8");
+      for (const match of source.matchAll(INLINE_PAYLOAD)) {
+        const line = source.slice(0, match.index).split("\n").length;
+        offenders.push(`${path.relative(COMPONENT_ROOT, file)}:${line}`);
+      }
+    }
+    expect(
+      offenders,
+      "name the payload in a types module so check:types can compare it",
+    ).toEqual([]);
+  });
+
+  it("detects an inline payload when there is one", () => {
+    // The heuristic guards itself, as above.
+    expect('await invoke<{ a: string }>("cmd_x")'.match(INLINE_PAYLOAD)).toHaveLength(1);
+    expect('await listen<{ a: string }>("evt")'.match(INLINE_PAYLOAD)).toHaveLength(1);
+    expect('await invoke<NamedPayload>("cmd_x")'.match(INLINE_PAYLOAD)).toBeNull();
+  });
+});
+
 describe("wire types live in modules, not components", () => {
   const components = svelteFiles(COMPONENT_ROOT);
 

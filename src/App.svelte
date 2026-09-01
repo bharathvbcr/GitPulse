@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { RepoChangedPayload } from "./lib/repos/events";
   import { onDestroy, onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
@@ -269,7 +270,7 @@
         syncRecentMenu,
         handleRepoChanged: (path) => void repoStore.handleRepoChanged(path),
         listenRepoChanged: (changed) =>
-          listen<{ path?: string }>("repo-changed", (event) =>
+          listen<RepoChangedPayload>("repo-changed", (event) =>
             changed(event.payload?.path),
           ),
         track,

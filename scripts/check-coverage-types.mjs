@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 27 contracts over
- * 47 structs. That is most, not all, of the named types crossing the IPC
+ * SCOPE: see CONTRACTS below for exactly what is checked — 29 contracts over
+ * 51 structs, spanning both wire surfaces: command returns and event payloads. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
  * component rather than a module, so there is no single file to point this at.
  * "Type contract holds" means the listed contracts hold. The remaining gap is
@@ -55,7 +55,12 @@ export const TERMINAL_TS_SOURCE = path.join(REPO_ROOT, "src", "lib", "terminal",
  * rename would surface as a silently `undefined` property in whichever panels
  * had not been updated. It is now declared once and checked here.
  */
-export const TERMINAL_STRUCTS = Object.freeze(["TerminalRunResult", "TerminalSpawned"]);
+export const TERMINAL_STRUCTS = Object.freeze([
+  "TerminalRunResult",
+  "TerminalSpawned",
+  "TerminalOutputPayload",
+  "TerminalExitPayload",
+]);
 
 /**
  * The Rust structs whose serialized shape the frontend depends on, and the
@@ -127,6 +132,9 @@ export const CONTRACTS = Object.freeze([
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
+  // Events are a second wire surface: emitted payloads, not command returns.
+  { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload"] },
+  { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
 ]);
 
 /**
