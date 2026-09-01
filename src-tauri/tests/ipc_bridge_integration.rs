@@ -261,6 +261,21 @@ fn a_guarded_command_returns_the_policy_verdict_beside_its_output() {
     );
     // Unit output serializes as null, not as an omitted key.
     assert!(value["output"].is_null());
+
+    // The security-relevant half: no MANVI sidecar runs in tests, so the gate
+    // could not actually judge this write. A missing harness is the one
+    // unchecked verdict allowed to proceed — but it must not arrive looking
+    // like a check that ran and passed, or the UI would report a guarded
+    // mutation that nothing guarded.
+    // Observed here: "demoted", which the verdict ranking in commands/mod.rs
+    // places strictly above "allowed" (Blocked > Warned > Demoted > Unchecked
+    // > Allowed). Asserting the negative rather than the exact value keeps this
+    // from breaking if a sidecar is present in some environment.
+    let status = value["policy"]["status"].as_str().expect("a status string");
+    assert_ne!(
+        status, "allow",
+        "an unrun gate must not report the same status as one that ran and allowed"
+    );
 }
 
 #[test]
