@@ -25,6 +25,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { alignRows } from "./columns.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -466,12 +467,32 @@ export function formatReport(result, libLabel) {
   const lines = [
     "IPC contract check (Rust registry <-> frontend invoke)",
     "",
-    `  registered handlers     : ${result.registeredCount}  (${libLabel})`,
-    `  invoked commands        : ${result.invokedCount}  (${result.siteCount} call sites across ${result.productionFiles} production files)`,
-    `  orphaned handlers       : ${result.orphans.length}  (registered, never invoked, NOT allowlisted)`,
-    `  missing commands        : ${result.missing.length}  (invoked, never registered)`,
-    `  allowed Rust-only       : ${result.allowedOrphans.length}  (see ORPHAN_ALLOWLIST justifications)`,
-    `  manual-review sites     : ${result.manualReviews.length}  (dynamic call sites needing human eyes)`,
+    // Widths come from the labels themselves: adding a metric here needs no
+    // space re-counting, and a long label cannot ragged-edge the column.
+    ...alignRows([
+      { label: "registered handlers", value: String(result.registeredCount), note: libLabel },
+      {
+        label: "invoked commands",
+        value: String(result.invokedCount),
+        note: `${result.siteCount} call sites across ${result.productionFiles} production files`,
+      },
+      {
+        label: "orphaned handlers",
+        value: String(result.orphans.length),
+        note: "registered, never invoked, NOT allowlisted",
+      },
+      { label: "missing commands", value: String(result.missing.length), note: "invoked, never registered" },
+      {
+        label: "allowed Rust-only",
+        value: String(result.allowedOrphans.length),
+        note: "see ORPHAN_ALLOWLIST justifications",
+      },
+      {
+        label: "manual-review sites",
+        value: String(result.manualReviews.length),
+        note: "dynamic call sites needing human eyes",
+      },
+    ]),
   ];
   /**
    * @param {string} title

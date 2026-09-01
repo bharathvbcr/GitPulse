@@ -9,6 +9,7 @@ import {
   DEFAULT_LIB_RS,
   DEFAULT_SRC_DIR,
   ORPHAN_ALLOWLIST,
+  formatReport,
 } from "./check-ipc-contract.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -246,5 +247,26 @@ describe("check:ipc contract", () => {
     const bad = await runScript(["--extra-dir", srcDir]);
     expect(bad.code).toBe(1);
     expect(bad.stdout).toMatch(/missing commands\s*:\s*1/);
+  });
+});
+
+describe("report alignment (A3)", () => {
+  it("keeps the metric column aligned regardless of how long the lib label is", () => {
+    const result = {
+      registeredCount: 95,
+      invokedCount: 87,
+      siteCount: 106,
+      productionFiles: 157,
+      orphans: [],
+      missing: [],
+      allowedOrphans: [],
+      manualReviews: [],
+      ok: true,
+    };
+    const long = formatReport(result, "a/very/deeply/nested/path/to/src-tauri/src/lib.rs".repeat(3));
+    const metricLines = long.split("\n").filter((line) => /^ {2}\S/.test(line) && line.includes(": "));
+    const columns = metricLines.map((line) => line.indexOf(": "));
+    expect(metricLines.length).toBeGreaterThan(3);
+    expect(new Set(columns).size).toBe(1);
   });
 });

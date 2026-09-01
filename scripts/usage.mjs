@@ -10,6 +10,8 @@
  * @typedef {{ name: string, summary: string, usage?: string, flags: UsageFlag[], exits?: string }} UsageSpec
  */
 
+import { alignFlags } from "./columns.mjs";
+
 /** Flags every entry point accepts. */
 export const HELP_FLAGS = Object.freeze(["--help", "-h"]);
 
@@ -26,11 +28,8 @@ export function wantsHelp(argv) {
  * @returns {string}
  */
 export function formatUsage({ name, summary, usage, flags, exits }) {
-  const width = flags.reduce((max, { flag }) => Math.max(max, flag.length), 0);
   const lines = [summary, "", `Usage: ${usage ?? `node scripts/${name}.mjs [options]`}`, ""];
-  for (const { flag, description } of flags) {
-    lines.push(`  ${flag.padEnd(width)}  ${description}`);
-  }
+  lines.push(...alignFlags(flags));
   if (exits) lines.push("", `Exit codes: ${exits}`);
   return lines.join("\n");
 }

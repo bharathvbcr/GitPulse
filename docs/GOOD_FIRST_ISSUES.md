@@ -54,18 +54,20 @@ correctly defers to the tool being wrapped. `vite-dev.mjs` now forwards `--help`
 straight to vite rather than resolving a dev port first, which printed a port notice
 and could reclaim a held port as a side effect of asking a question.
 
-### A3 · Aligned column output for the contract report 🟢
+### A3 · Aligned column output for the contract report ✅ *(Completed)*
 **Labels:** `good first issue`, `area: ci`
 
-`formatReport()` pads labels by hand with fixed-width string literals. Adding a
-metric means re-counting spaces, and a long command name breaks the alignment.
+*Implemented in [`scripts/columns.mjs`](../scripts/columns.mjs).*
 
-Extract a small column formatter (compute the widest label, pad to it). No
-dependency — this is a `Math.max` over label lengths and `padEnd`.
+`alignRows()` computes the label column from the labels themselves, so adding a
+metric needs no space re-counting and a long label cannot ragged-edge the report.
+`alignFlags()` does the same for the usage printer, so the two share one aligner
+rather than each padding by hand.
 
-- **Touch:** `scripts/check-ipc-contract.mjs`, `scripts/check-ipc-contract.test.ts`
-- **Done when:** a report with a very long command name stays aligned, and a test
-  pins the alignment so it cannot silently regress.
+`scripts/columns.test.ts` pins the invariant directly — every value lands in one
+column, a longer label re-aligns the whole block, and an oversized value or note
+does not disturb it — and `check-ipc-contract.test.ts` pins it through the real
+report.
 
 ---
 
