@@ -514,10 +514,11 @@ export function formatReport(result, libLabel) {
  * @param {string[]} argv
  */
 function parseArgs(argv) {
-  const opts = /** @type {{libPath: string, srcDirs: string[], extraDirs: string[]}} */ ({
+  const opts = /** @type {{libPath: string, srcDirs: string[], extraDirs: string[], json: boolean}} */ ({
     libPath: DEFAULT_LIB_RS,
     srcDirs: [DEFAULT_SRC_DIR],
     extraDirs: [],
+    json: false,
   });
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -529,7 +530,8 @@ function parseArgs(argv) {
       if (value === undefined) throw new Error(`${flag} requires a value`);
       return value;
     };
-    if (arg === "--lib") opts.libPath = path.resolve(next(arg));
+    if (arg === "--json") opts.json = true;
+    else if (arg === "--lib") opts.libPath = path.resolve(next(arg));
     else if (arg === "--src") opts.srcDirs = [path.resolve(next(arg))];
     else if (arg === "--extra-dir") opts.extraDirs.push(path.resolve(next(arg)));
     else throw new Error(`unknown argument: ${arg}`);
@@ -577,7 +579,10 @@ export function main(argv = process.argv.slice(2)) {
     console.error(`check-ipc-contract: internal error: ${/** @type {Error} */ (err).message}`);
     return 2;
   }
-  console.log(formatReport(result, path.relative(REPO_ROOT, opts.libPath)));
+  // A1: --json emits the result object the checker already built and
+  // suppresses the text report. Exit codes are identical in both modes.
+  if (opts.json) console.log(JSON.stringify(result, null, 2));
+  else console.log(formatReport(result, path.relative(REPO_ROOT, opts.libPath)));
   if (!result.ok) {
     return 1;
   }

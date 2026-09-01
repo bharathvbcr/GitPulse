@@ -516,10 +516,11 @@ export function formatReport(result, rustLabel, tsLabel, title = "Coverage IPC t
  * @param {string[]} argv
  */
 function parseArgs(argv) {
-  const opts = { rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE };
+  const opts = { rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--rust") opts.rustPath = path.resolve(argv[++i]);
+    if (arg === "--json") opts.json = true;
+    else if (arg === "--rust") opts.rustPath = path.resolve(argv[++i]);
     else if (arg === "--ts") opts.tsPath = path.resolve(argv[++i]);
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -580,6 +581,8 @@ export function main(argv = process.argv.slice(2)) {
       ];
 
   let code = 0;
+  /** @type {unknown[]} */
+  const collected = [];
   for (const contract of contracts) {
     /** @type {ReturnType<typeof runTypeCheck>} */
     let result;
@@ -589,16 +592,21 @@ export function main(argv = process.argv.slice(2)) {
       console.error(`check-coverage-types: internal error: ${/** @type {Error} */ (err).message}`);
       return 2;
     }
-    console.log(
-      formatReport(
-        result,
-        path.relative(REPO_ROOT, contract.rustPath),
-        path.relative(REPO_ROOT, contract.tsPath),
-        contract.title,
-      ),
-    );
+    // Every contract is checked before emitting, so --json returns one array
+    // rather than a stream of objects a consumer would have to reassemble.
+    if (opts.json) collected.push({ title: contract.title, ...result });
+    else
+      console.log(
+        formatReport(
+          result,
+          path.relative(REPO_ROOT, contract.rustPath),
+          path.relative(REPO_ROOT, contract.tsPath),
+          contract.title,
+        ),
+      );
     if (!result.ok) code = 1;
   }
+  if (opts.json) console.log(JSON.stringify(collected, null, 2));
   return code;
 }
 

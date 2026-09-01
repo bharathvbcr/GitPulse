@@ -18,23 +18,21 @@ Every entry assumes you have read [CONTRIBUTING.md](../CONTRIBUTING.md) and can 
 
 ## A. Developer tooling & CLI ergonomics
 
-### A1 · Add `--json` output to the contract checkers 🟢
-**Labels:** `good first issue`, `documentation`, `area: ci`
+### A1 · Add `--json` output to the contract checkers ✅ *(Completed)*
+**Labels:** `documentation`, `area: ci`
 
-`scripts/check-ipc-contract.mjs`, `check-coverage-types.mjs`, and
-`check-release-version.mjs` print a human-readable report through `formatReport()`
-and signal outcome via exit code. That is right for a terminal and useless for a
-machine — CI cannot annotate a pull request with which handler drifted without
-re-parsing prose.
+*Implemented across `scripts/check-ipc-contract.mjs`, `check-coverage-types.mjs`, and
+`check-release-version.mjs`.*
 
-Add a `--json` flag that emits the result object the checker already builds
-(`runContractCheck()` returns exactly the right shape) and suppresses the text
-report. Keep exit codes identical: `0` holds, `1` violated, `2` internal error.
+`--json` emits the result object each checker already builds and suppresses the text
+report; exit codes are identical in both modes (`0` holds, `1` violated, `2` the check
+could not run). `check-coverage-types` checks several contracts in one run, so it
+emits a single array rather than a stream of objects a consumer would have to
+reassemble.
 
-- **Touch:** `scripts/check-*.mjs`, plus the matching `scripts/*.test.ts`
-- **Done when:** `node scripts/check-ipc-contract.mjs --json | jq .ok` prints a
-  boolean, the text mode is byte-for-byte unchanged, and exit codes are covered by a
-  test for both modes.
+`scripts/cli-json-contract.test.ts` pins the parity in both directions — including
+that the human report never leaks into the machine-readable stream — and covers the
+violated and internal-error codes, not just the passing one.
 
 ### A2 · Add `--help` to every script entry point ✅ *(Completed)*
 **Labels:** `good first issue`, `area: ci`

@@ -271,6 +271,7 @@ export function parseArgs(argv) {
   const overrides = {};
   /** @type {string | undefined} */
   let tag;
+  let json = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -280,7 +281,8 @@ export function parseArgs(argv) {
       if (value === undefined) throw new Error(`${flag} requires a value`);
       return value;
     };
-    if (arg === "--tag") tag = next(arg);
+    if (arg === "--json") json = true;
+    else if (arg === "--tag") tag = next(arg);
     else if (arg === "--root") root = path.resolve(next(arg));
     else if (arg === "--package") overrides.packagePath = path.resolve(next(arg));
     else if (arg === "--package-lock") overrides.packageLockPath = path.resolve(next(arg));
@@ -294,7 +296,7 @@ export function parseArgs(argv) {
   // on a tag-push run). Treat it as absent rather than as an invalid tag.
   if (tag !== undefined && tag.trim() === "") tag = undefined;
 
-  return { root, sources: { ...defaultSources(root), ...overrides }, tag };
+  return { root, sources: { ...defaultSources(root), ...overrides }, tag, json };
 }
 
 /**
@@ -341,7 +343,8 @@ export function main(argv = process.argv.slice(2)) {
     console.error(`check-release-version: internal error: ${/** @type {Error} */ (err).message}`);
     return 2;
   }
-  console.log(formatReport(result, path.relative(REPO_ROOT, opts.root) || "."));
+  if (opts.json) console.log(JSON.stringify(result, null, 2));
+  else console.log(formatReport(result, path.relative(REPO_ROOT, opts.root) || "."));
   return result.ok ? 0 : 1;
 }
 
