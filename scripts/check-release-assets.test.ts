@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -93,5 +94,37 @@ describe("release asset completeness contract", () => {
     expect(inspectReleaseAssets({ tag: "v0.0.3", json: "not json" }).invalid).toBe(true);
     const cli = await runScript("release-0.0.3", payload());
     expect(cli.code).toBe(2);
+  });
+
+  it("accepts the real payload gh produced for v0.0.2", () => {
+    // scripts/fixtures/gh-release-view.json is `gh release view --json assets`
+    // for the only release this project has published — the exact command
+    // release.yml runs — with per-account noise (urls, ids, download counts)
+    // dropped and every other field kept verbatim.
+    //
+    // This checker runs only on a `v*` tag, so a wrong expectation here would
+    // surface at release time after the whole matrix had built. The hardcoded
+    // manifest was compared against that release: all seven names match.
+    const payload = readFileSync(
+      new URL("./fixtures/gh-release-view.json", import.meta.url),
+      "utf8",
+    );
+    const result = inspectReleaseAssets({ tag: "v0.0.2", json: payload });
+    expect(result.violations).toEqual([]);
+    expect(result.invalid).toBe(false);
+    expect(result.ok).toBe(true);
+    expect(result.actual).toEqual(expectedAssetNames("0.0.2"));
+  });
+
+  it("notices if a platform silently stops producing an installer", () => {
+    // The failure this exists to catch: a green matrix that uploaded less
+    // than it should have.
+    const payload = JSON.parse(
+      readFileSync(new URL("./fixtures/gh-release-view.json", import.meta.url), "utf8"),
+    ) as { assets: Array<{ name: string }> };
+    payload.assets = payload.assets.filter((asset) => !asset.name.endsWith(".msi"));
+    const result = inspectReleaseAssets({ tag: "v0.0.2", json: JSON.stringify(payload) });
+    expect(result.ok).toBe(false);
+    expect(result.violations.join(" ")).toContain(".msi");
   });
 });
