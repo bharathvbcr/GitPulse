@@ -701,7 +701,13 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> bool
         ran = true;
         match run_npm_json(&cwd, &["outdated", "--json"], env) {
             Ok(text) => match parse_npm_outdated_json(&text) {
-                Ok(mut rows) => report.outdated.append(&mut rows),
+                Ok(mut rows) => {
+                    fill_dependency_types(
+                        &mut rows,
+                        &declared_dependency_sections(&cwd.join("package.json")),
+                    );
+                    report.outdated.append(&mut rows);
+                }
                 Err(e) => push_issue(
                     &mut report.issues,
                     "warning",
@@ -1814,7 +1820,27 @@ pub(crate) fn parse_npm_audit_json(
         .and_then(|v| v.as_object())
         .is_some()
     {
-        return Ok((parse_npm_audit_v2(&value), None));
+        let vulns = parse_npm_audit_v2(&value);
+        // npm states its own count in `metadata`. Finding nothing while npm
+        // says there is something means this parser stopped understanding the
+        // format — and silently reporting a clean audit is the one outcome a
+        // security check must never produce by accident. Only the
+        // unambiguous direction is flagged: npm counts advisories and this
+        // counts affected packages, so the two need not be equal, but "npm
+        // found some, we found none" cannot be a counting difference.
+        let reported_total = value
+            .pointer("/metadata/vulnerabilities/total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if reported_total > 0 && vulns.is_empty() {
+            return Ok((
+                vulns,
+                Some(format!(
+                    "npm audit reported {reported_total} vulnerabilities but none could be read from the report; treat this as unscanned, not clean"
+                )),
+            ));
+        }
+        return Ok((vulns, None));
     }
     if value
         .get("advisories")
@@ -2040,6 +2066,63 @@ pub(crate) fn parse_npm_outdated_json(text: &str) -> Result<Vec<OutdatedPackage>
         });
     }
     Ok(out)
+}
+
+/// The package.json sections that declare a dependency, keyed by package name.
+///
+/// npm 7 removed the `type` field from `npm outdated --json` — it reports
+/// `dependent` instead — so from npm 7 onward the JSON simply does not say
+/// what kind of dependency a package is. Every npm since 2020 is affected, and
+/// the manifest is the only local source left. Read here rather than derived
+/// from the `location` path, which says where a package was installed and not
+/// how it was asked for.
+///
+/// A manifest that cannot be read or parsed yields an empty map, leaving
+/// `dep_type` blank exactly as it was before — degrading to "unknown", never
+/// to a guess.
+fn declared_dependency_sections(manifest_path: &Path) -> BTreeMap<String, String> {
+    const SECTIONS: [&str; 4] = [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ];
+    let mut sections = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(manifest_path) else {
+        return sections;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return sections;
+    };
+    for section in SECTIONS {
+        let Some(entries) = value.get(section).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for name in entries.keys() {
+            // First section wins, so a package listed in both `dependencies`
+            // and `devDependencies` reports the stronger of the two rather
+            // than whichever was visited last.
+            sections
+                .entry(name.clone())
+                .or_insert_with(|| section.to_string());
+        }
+    }
+    sections
+}
+
+/// Fill in `dep_type` for rows npm did not label.
+///
+/// Kept separate from parsing so the parser stays a pure function of the JSON:
+/// an npm 6 payload that still carries `type` keeps its own value, and this
+/// only supplies what the newer format dropped.
+fn fill_dependency_types(rows: &mut [OutdatedPackage], sections: &BTreeMap<String, String>) {
+    for row in rows.iter_mut() {
+        if row.dep_type.is_empty() {
+            if let Some(section) = sections.get(&row.name) {
+                row.dep_type = section.clone();
+            }
+        }
+    }
 }
 
 fn json_str(value: &Value, key: &str) -> String {
@@ -2817,6 +2900,167 @@ mod tests {
         assert_eq!(ts.dep_type, "devDependencies");
         assert!(parse_npm_outdated_json("{}").unwrap().is_empty());
         assert!(parse_npm_outdated_json("").unwrap().is_empty());
+    }
+
+    /// Captured verbatim from `npm outdated --json` on npm 11.17.0. The
+    /// hand-written fixture above still carries a `type` field, which npm 7
+    /// removed in 2020 — so that test kept passing while the real format had
+    /// no such key, and `dep_type` came out empty on every install anyone
+    /// actually has. The Health panel's Type column has rendered "—" ever
+    /// since, and the markdown report has said "dep".
+    ///
+    /// A fixture from the tool beats a fixture from memory: this one would
+    /// have failed the day npm dropped the field.
+    const NPM11_OUTDATED: &str = r#"{
+      "@sveltejs/vite-plugin-svelte": {
+        "current": "5.1.1",
+        "wanted": "5.1.1",
+        "latest": "7.3.0",
+        "dependent": "GitPulse",
+        "location": "/repo/node_modules/@sveltejs/vite-plugin-svelte"
+      },
+      "some-transitive-thing": {
+        "current": "1.0.0",
+        "wanted": "1.0.1",
+        "latest": "2.0.0",
+        "dependent": "GitPulse",
+        "location": "/repo/node_modules/some-transitive-thing"
+      }
+    }"#;
+
+    /// Captured verbatim from `npm audit --json` on npm 11.17.0 with a clean
+    /// tree. `vulnerabilities` is an empty object, not an absent key and not
+    /// an empty array, and the report carries `auditReportVersion: 2`.
+    const NPM11_AUDIT_CLEAN: &str = r#"{
+      "auditReportVersion": 2,
+      "vulnerabilities": {},
+      "metadata": {
+        "vulnerabilities": { "info": 0, "low": 0, "moderate": 0, "high": 0, "critical": 0, "total": 0 },
+        "dependencies": { "prod": 26, "dev": 261, "optional": 65, "peer": 0, "peerOptional": 0, "total": 286 }
+      }
+    }"#;
+
+    #[test]
+    fn a_clean_npm11_audit_reads_as_clean() {
+        let (vulns, err) = parse_npm_audit_json(NPM11_AUDIT_CLEAN).expect("parses");
+        assert!(vulns.is_empty());
+        assert_eq!(err, None, "a clean audit is not an error");
+    }
+
+    /// The invariant a security check lives or dies on: a report this parser
+    /// cannot read must never produce the same answer as a report it read and
+    /// found clean. Both yield zero rows; only one of them is a fact.
+    #[test]
+    fn an_unreadable_audit_report_is_never_mistaken_for_a_clean_one() {
+        // A shape from neither format — e.g. a future npm emitting a list.
+        let err = parse_npm_audit_json(r#"{"vulnerabilities": [], "auditReportVersion": 3}"#)
+            .expect_err("an unknown shape must fail loudly");
+        assert!(err.contains("unrecognised"), "{err}");
+
+        // And the subtler one: the right shape, but nothing could be read out
+        // of it while npm itself says there were findings.
+        let (vulns, note) = parse_npm_audit_json(
+            r#"{
+              "auditReportVersion": 2,
+              "vulnerabilities": {},
+              "metadata": { "vulnerabilities": { "total": 7 } }
+            }"#,
+        )
+        .expect("parses");
+        assert!(vulns.is_empty());
+        let note = note.expect("a count mismatch must be reported, not swallowed");
+        assert!(note.contains("7"), "{note}");
+        assert!(note.contains("unscanned"), "{note}");
+    }
+
+    #[test]
+    fn npm11_outdated_carries_no_type_field() {
+        // Pin the premise. If a future npm restores `type`, this fails and the
+        // manifest fallback below can be reconsidered rather than left to rot.
+        let rows = parse_npm_outdated_json(NPM11_OUTDATED).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(
+                row.dep_type.is_empty(),
+                "npm 11 does not report a dependency type; got {:?}",
+                row.dep_type
+            );
+            assert!(!row.latest.is_empty(), "the other fields still parse");
+        }
+    }
+
+    #[test]
+    fn dependency_types_are_recovered_from_the_manifest() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+              "dependencies": { "runtime-thing": "^1.0.0" },
+              "devDependencies": { "@sveltejs/vite-plugin-svelte": "^5.0.0" },
+              "optionalDependencies": { "maybe-thing": "^1.0.0" },
+              "peerDependencies": { "peer-thing": "^1.0.0" }
+            }"#,
+        )
+        .expect("write manifest");
+        let sections = declared_dependency_sections(&dir.path().join("package.json"));
+        assert_eq!(
+            sections
+                .get("@sveltejs/vite-plugin-svelte")
+                .map(String::as_str),
+            Some("devDependencies")
+        );
+        assert_eq!(
+            sections.get("runtime-thing").map(String::as_str),
+            Some("dependencies")
+        );
+        assert_eq!(
+            sections.get("maybe-thing").map(String::as_str),
+            Some("optionalDependencies")
+        );
+        assert_eq!(
+            sections.get("peer-thing").map(String::as_str),
+            Some("peerDependencies")
+        );
+
+        let mut rows = parse_npm_outdated_json(NPM11_OUTDATED).unwrap();
+        fill_dependency_types(&mut rows, &sections);
+        let plugin = rows
+            .iter()
+            .find(|r| r.name == "@sveltejs/vite-plugin-svelte")
+            .expect("row");
+        assert_eq!(
+            plugin.dep_type, "devDependencies",
+            "the Type column should say what the manifest says"
+        );
+        // A package no section declares stays blank rather than being guessed.
+        let unknown = rows
+            .iter()
+            .find(|r| r.name == "some-transitive-thing")
+            .unwrap();
+        assert_eq!(unknown.dep_type, "");
+    }
+
+    #[test]
+    fn npm6_type_field_wins_over_the_manifest() {
+        // Where npm still labels the row itself, its answer is authoritative:
+        // the fallback fills gaps, it does not override.
+        let mut rows = parse_npm_outdated_json(
+            r#"{ "typescript": { "current": "1.0.0", "wanted": "1.0.0", "latest": "2.0.0", "type": "devDependencies" } }"#,
+        )
+        .unwrap();
+        let mut sections = BTreeMap::new();
+        sections.insert("typescript".to_string(), "dependencies".to_string());
+        fill_dependency_types(&mut rows, &sections);
+        assert_eq!(rows[0].dep_type, "devDependencies");
+    }
+
+    #[test]
+    fn an_unreadable_manifest_leaves_types_blank_rather_than_wrong() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // No manifest at all, then one that is not JSON.
+        assert!(declared_dependency_sections(&dir.path().join("package.json")).is_empty());
+        std::fs::write(dir.path().join("package.json"), "{ not json").expect("write");
+        assert!(declared_dependency_sections(&dir.path().join("package.json")).is_empty());
     }
 
     #[test]
