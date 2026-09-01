@@ -240,7 +240,13 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
 
     // Words (identifiers, keywords, types, function names)
     if (/[a-zA-Z_$]/.test(char) || (char === "@" && (language === "svelte" || language === "css"))) {
-      let j = i;
+      // '@' may start a word but is not a word character, so scanning must
+      // begin past it. Starting at `i` left `j === i` for an at-rule, giving an
+      // empty word and `i = j` — an infinite loop that grew the token array
+      // until the process ran out of memory. Any CSS with `@media`, `@import`
+      // or `@tailwind` hung the viewer; this repository's own app.css has 34
+      // such lines.
+      let j = char === "@" ? i + 1 : i;
       while (j < len && /[a-zA-Z0-9_$:-]/.test(line[j])) j++;
       const word = line.slice(i, j);
 
@@ -273,9 +279,11 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
         type = "keyword"; // Svelte 5 runes / stores: $state, $derived, $effect, etc.
       } else if (word.startsWith("@")) {
         type = "attribute";
-      } else if (language === "yaml" && line[j] === ":") {
-        type = "property";
-      } else if (language === "css" && line[j] === ":") {
+      } else if ((language === "yaml" || language === "css") && word.endsWith(":")) {
+        // The word scanner consumes ':' as a word character, so the colon is
+        // already inside `word` and `line[j]` is whatever follows it. Testing
+        // line[j] here could never match, which left every YAML key and CSS
+        // property rendering as plain text.
         type = "property";
       }
 
