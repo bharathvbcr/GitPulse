@@ -22,7 +22,6 @@ pub const TAB_TERMINAL: &str = "tab-terminal";
 pub const TAB_MANVI: &str = "tab-manvi";
 pub const TAB_REFLOG: &str = "tab-reflog";
 pub const TAB_STORAGE: &str = "tab-storage";
-pub const TAB_REPO: &str = "tab-repo";
 pub const FETCH: &str = "fetch";
 pub const PULL: &str = "pull";
 pub const PUSH: &str = "push";
@@ -64,7 +63,6 @@ pub enum NativeAction {
     TabManvi,
     TabReflog,
     TabStorage,
-    TabRepo,
     Fetch,
     Pull,
     Push,
@@ -112,7 +110,6 @@ impl NativeAction {
             TAB_MANVI => Self::TabManvi,
             TAB_REFLOG => Self::TabReflog,
             TAB_STORAGE => Self::TabStorage,
-            TAB_REPO => Self::TabRepo,
             FETCH => Self::Fetch,
             PULL => Self::Pull,
             PUSH => Self::Push,
@@ -155,7 +152,6 @@ impl NativeAction {
             Self::TabManvi => TAB_MANVI,
             Self::TabReflog => TAB_REFLOG,
             Self::TabStorage => TAB_STORAGE,
-            Self::TabRepo => TAB_REPO,
             Self::Fetch => FETCH,
             Self::Pull => PULL,
             Self::Push => PUSH,

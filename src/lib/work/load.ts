@@ -5,6 +5,7 @@ import type { GrantView, Grant } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
 import type { TaskScope, TaskView } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
+import type { RepoOperation } from "../repos/operation";
 import { projectWork, type WorkInputs, type WorkProjection, type WorkSources } from "./projection";
 
 /**
@@ -24,6 +25,14 @@ export const MAX_BINDING_LOOKUPS = 64;
 
 /** Task scopes fetched for their titles. */
 export const MAX_TITLE_LOOKUPS = 32;
+
+/**
+ * Worktrees probed for a parked merge/rebase/cherry-pick. One IPC round trip
+ * each, and the probe is a single `git rev-parse` on an idle worktree — but a
+ * repository with hundreds of worktrees must not turn opening this screen into
+ * hundreds of subprocesses, so the sweep is bounded like every other here.
+ */
+export const MAX_OPERATION_PROBES = 32;
 
 export interface WorkLoadDeps {
   invoke?: typeof invoke;
@@ -66,6 +75,7 @@ export async function loadWork(
     runs: null,
     events: null,
     grants: null,
+    operations: {},
     sources,
   };
 
@@ -113,6 +123,30 @@ export async function loadWork(
   } else {
     sources.worktrees = { ...READ };
     input.worktrees = worktrees.v;
+
+    // Parked operations, per worktree. `cmd_repo_operation` answers for the
+    // worktree it is given — MERGE_HEAD and friends live in the linked
+    // worktree's own git dir — so this is the only way to learn that the
+    // worktree in the NEXT window is stuck mid-rebase.
+    //
+    // A probe that fails is recorded as "no operation" for that worktree
+    // rather than failing the screen, but it does not silently claim the
+    // worktree is clean: `operations` simply has no entry, and the row shows
+    // nothing where it would otherwise show a banner.
+    const probes = worktrees.v.slice(0, MAX_OPERATION_PROBES).filter((w) => !w.is_bare);
+    const parked = await Promise.all(
+      probes.map((w) =>
+        call<RepoOperation | null>("cmd_repo_operation", { repoPath: w.path }).then(
+          (v) => [w.path, v] as const,
+          () => [w.path, null] as const,
+        ),
+      ),
+    );
+    const operations: Record<string, RepoOperation | null> = {};
+    for (const [path, operation] of parked) {
+      if (operation) operations[path] = operation;
+    }
+    input.operations = operations;
   }
 
   if (!github.ok) {

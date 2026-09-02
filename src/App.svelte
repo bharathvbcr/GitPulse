@@ -35,7 +35,6 @@
   import StoragePanel from "./lib/components/StoragePanel.svelte";
   import TerminalPanel from "./lib/components/TerminalPanel.svelte";
   import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
-  import RepoPanel from "./lib/components/RepoPanel.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
@@ -581,8 +580,6 @@
                 <StoragePanel />
               {:else if $repoStore.activeTab === "stack"}
                 <CodeStackViewer />
-              {:else if $repoStore.activeTab === "repo"}
-                <RepoPanel />
               {:else if $repoStore.activeTab === "github"}
                 <GitHubPanel />
               {:else if $repoStore.activeTab === "manvi"}

@@ -10,6 +10,8 @@
    */
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
+
+  let { embedded = false }: { embedded?: boolean } = $props();
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
@@ -179,8 +181,15 @@
   const initializable = $derived(initializableSubmodules(submodules));
 </script>
 
-<div class="flex-1 min-h-0 overflow-auto bg-background p-4 text-xs font-sans">
-  <div class="mx-auto max-w-4xl space-y-4">
+<!-- `embedded` drops the pane chrome so this can be a section inside the Work
+     view without nesting a second scroll container inside the first, which
+     traps the wheel and strands the reader mid-page. -->
+<div
+  class={embedded
+    ? "text-xs font-sans"
+    : "flex-1 min-h-0 overflow-auto bg-background p-4 text-xs font-sans"}
+>
+  <div class={embedded ? "space-y-4" : "mx-auto max-w-4xl space-y-4"}>
     <!-- Remotes -->
     <section class="gp-card rounded-2xl p-4">
       <header class="mb-3 flex items-center justify-between gap-2">

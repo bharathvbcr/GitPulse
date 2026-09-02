@@ -6,6 +6,7 @@ import {
   noteworthyStatuses,
   projectWork,
   UNBOUND_ROW_ID,
+  dirtyCount,
   verdictStatus,
   type WorkInputs,
   type WorkSources,
@@ -41,6 +42,7 @@ function inputs(over: Partial<WorkInputs> = {}): WorkInputs {
     runs: [],
     events: [],
     grants: [],
+    operations: {},
     sources: sources(),
     ...over,
   };
@@ -351,5 +353,184 @@ describe("tally helpers", () => {
       ["degraded", 1],
       ["blocked", 2],
     ]);
+  });
+});
+
+/**
+ * The repository this app is actually used in: no DevCouncil store, several
+ * Claude Code worktrees, each on its own branch. Keying on task collapsed all
+ * of it into one row labelled "Not bound to a task" — a screen that reported
+ * nothing while four agents were mid-change.
+ */
+describe("worktree rows, when there is no task store", () => {
+  function op(kind = "Rebase" as const, extra = {}) {
+    return {
+      kind,
+      current_step: 2,
+      total_steps: 7,
+      head_ref: "feature",
+      incoming_ref: null,
+      conflicted_paths: ["a.ts"],
+      conflicted_total: 1,
+      available: ["abort" as const],
+      warnings: [],
+      ...extra,
+    };
+  }
+
+  it("gives every worktree its own row instead of one unbound blob", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [
+          worktree("/repo", "main"),
+          worktree("/wt/alpha", "claude/alpha"),
+          worktree("/wt/beta", "claude/beta"),
+        ],
+      }),
+    );
+    expect(p.rows).toHaveLength(3);
+    expect(p.rows.every((r) => r.kind === "worktree")).toBe(true);
+    expect(p.rows.map((r) => r.key).sort()).toEqual(["/repo", "/wt/alpha", "/wt/beta"]);
+    // And none of them is the catch-all.
+    expect(p.rows.some((r) => r.key === UNBOUND_ROW_ID)).toBe(false);
+  });
+
+  it("titles each row with its branch", () => {
+    const p = projectWork(
+      inputs({ leases: null, worktrees: [worktree("/wt/alpha", "claude/alpha")] }),
+    );
+    expect(p.rows[0].title).toBe("claude/alpha");
+    // A worktree row carries no task id — claiming one would be a fiction.
+    expect(p.rows[0].taskId).toBe("");
+  });
+
+  it("falls back to the directory name for a detached worktree", () => {
+    // "" as a title renders as an untitled row the user cannot identify.
+    const p = projectWork(inputs({ leases: null, worktrees: [worktree("/wt/detached", null)] }));
+    expect(p.rows[0].title).toBe("detached");
+  });
+
+  it("attaches a parked operation to the worktree it is parked in", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [worktree("/wt/alpha", "claude/alpha"), worktree("/wt/beta", "claude/beta")],
+        operations: { "/wt/beta": op() },
+      }),
+    );
+    expect(p.rows.find((r) => r.key === "/wt/alpha")!.operation).toBeNull();
+    expect(p.rows.find((r) => r.key === "/wt/beta")!.operation?.kind).toBe("Rebase");
+  });
+
+  it("puts a blocked worktree above a busier unblocked one", () => {
+    // Being stuck mid-rebase is the one thing on this screen that needs a
+    // person right now; more pull requests must not bury it.
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [worktree("/wt/busy", "busy"), worktree("/wt/stuck", "stuck")],
+        pullRequests: [pr(1, "busy"), pr(2, "busy"), pr(3, "busy")],
+        operations: { "/wt/stuck": op() },
+      }),
+    );
+    expect(p.rows[0].key).toBe("/wt/stuck");
+  });
+
+  it("joins pull requests and runs to the worktree on that branch", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [worktree("/wt/alpha", "claude/alpha"), worktree("/wt/beta", "claude/beta")],
+        pullRequests: [pr(7, "claude/alpha")],
+        runs: [run(70, "claude/beta")],
+      }),
+    );
+    expect(p.rows.find((r) => r.key === "/wt/alpha")!.pullRequests.map((x) => x.number)).toEqual([7]);
+    expect(p.rows.find((r) => r.key === "/wt/beta")!.runs.map((x) => x.id)).toEqual([70]);
+  });
+
+  it("keeps a pull request on a branch no worktree holds in the catch-all", () => {
+    const p = projectWork(
+      inputs({ leases: null, worktrees: [worktree("/wt/alpha", "claude/alpha")], pullRequests: [pr(9, "orphan")] }),
+    );
+    const unbound = p.rows.find((r) => r.key === UNBOUND_ROW_ID)!;
+    expect(unbound.pullRequests.map((x) => x.number)).toEqual([9]);
+    expect(unbound.kind).toBe("unbound");
+  });
+
+  it("tallies verdicts per worktree, using the column it keys by", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [worktree("/wt/alpha", "a"), worktree("/wt/beta", "b")],
+        events: [
+          event({ worktree_path: "/wt/alpha", verdict_json: '{"status":"blocked"}' }),
+          event({ worktree_path: "/wt/alpha", verdict_json: '{"status":"allowed"}' }),
+          event({ worktree_path: "/wt/beta", verdict_json: '{"status":"warned"}' }),
+        ],
+      }),
+    );
+    const alpha = p.rows.find((r) => r.key === "/wt/alpha")!;
+    expect(alpha.verdicts.events).toBe(2);
+    expect(alpha.verdicts.byStatus.blocked).toBe(1);
+    expect(p.rows.find((r) => r.key === "/wt/beta")!.verdicts.byStatus.warned).toBe(1);
+  });
+
+  it("does not conjure a row for a worktree git no longer lists", () => {
+    // The ledger outlives the worktree. An event naming a removed directory
+    // must not produce a row for a place that does not exist.
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [worktree("/wt/alpha", "a")],
+        events: [event({ worktree_path: "/wt/deleted", verdict_json: '{"status":"blocked"}' })],
+      }),
+    );
+    expect(p.rows.some((r) => r.key === "/wt/deleted")).toBe(false);
+    expect(p.rows.find((r) => r.key === UNBOUND_ROW_ID)!.verdicts.byStatus.blocked).toBe(1);
+  });
+
+  it("leaves grants in the catch-all, since they are scoped to tasks", () => {
+    const p = projectWork(
+      inputs({ leases: null, worktrees: [worktree("/wt/alpha", "a")], grants: [grant("g1", "TASK-1")] }),
+    );
+    expect(p.rows.find((r) => r.key === "/wt/alpha")!.grants).toEqual([]);
+    expect(p.rows.find((r) => r.key === UNBOUND_ROW_ID)!.grants).toHaveLength(1);
+  });
+
+  it("switches back to task rows the moment a store answers", () => {
+    // Regression guard on the mode switch itself.
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        worktrees: [worktree("/wt/alpha", "claude/alpha")],
+        bindings: { "/wt/alpha": "TASK-1" },
+      }),
+    );
+    expect(p.rows.map((r) => r.key)).toEqual(["TASK-1"]);
+    expect(p.rows[0].kind).toBe("task");
+    expect(p.rows[0].taskId).toBe("TASK-1");
+  });
+});
+
+describe("dirtyCount", () => {
+  it("sums uncommitted files across a row's worktrees", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [{ ...worktree("/wt/a", "a"), dirty_files: 3 }],
+      }),
+    );
+    expect(dirtyCount(p.rows[0])).toBe(3);
+  });
+
+  it("reports -1 rather than 0 when nothing was scanned", () => {
+    // 0 means "clean"; -1 means "not counted". Collapsing them would render a
+    // worktree past the scan cap as verified clean.
+    const p = projectWork(
+      inputs({ leases: null, worktrees: [{ ...worktree("/wt/a", "a"), dirty_files: null }] }),
+    );
+    expect(dirtyCount(p.rows[0])).toBe(-1);
   });
 });

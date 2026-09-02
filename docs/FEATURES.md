@@ -1,6 +1,6 @@
 # GitPulse Features & View Catalog
 
-GitPulse provides 15 specialized views categorized into **Work**, **Inspect**, and **System/Ops** groups.
+GitPulse provides 14 specialized views categorized into **Work**, **Inspect**, and **System/Ops** groups.
 
 ```mermaid
 flowchart TD
@@ -18,7 +18,6 @@ flowchart TD
         Health["<b>Health</b> (<code>health</code>)<br/>Multi-ecosystem vulnerability & staleness audits, Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage breakdown, unignored caches, snapshot trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization & rebase workflow manager"]
-        Repo["<b>Repo</b> (<code>repo</code>)<br/>Remotes, stashes & submodules management"]
     end
 
     subgraph SystemGroup["System & Ops Views (Terminal & Automation)"]
@@ -34,12 +33,17 @@ flowchart TD
 ## 1. Work Views
 
 ### 1.0 Work (`work`)
-- **One Screen Per Task**: Joins DevCouncil task leases, linked worktrees, open pull requests, workflow runs, policy verdicts and grants into a single row per task. Everything else in GitPulse shows one of these; this shows how they relate.
+- **One Row Per Place Work Is Happening**: Joins linked worktrees, open pull requests, workflow runs, policy verdicts and grants into one row each. Everything else in GitPulse shows one of these; this shows how they relate.
+- **Keyed On What Exists Here**: With a DevCouncil store, the unit is the task. Without one — the ordinary case for a repository driven by Claude Code or by hand — the unit is the **worktree**, because that is where a branch, its uncommitted changes, its parked operation and its pull request actually live. Keying on task regardless collapsed the whole repository into a single row labelled "Not bound to a task".
+- **Agent Worktrees Are Named As Such**: A worktree under `.claude/worktrees/` is marked, because a stale agent session and a stale hand-made checkout want opposite remedies — resume or merge, versus prune. Detection reads the directory layout, never the branch name, so a human naming a branch `claude/…` is not mislabelled.
+- **Blocked Worktrees Sort First**: A worktree parked mid-merge, rebase, cherry-pick or revert is the one thing on the screen that cannot progress without a person, so it outranks rows with more pull requests, and clicking it opens that worktree in the Resolve view.
+- **Uncommitted Is Counted, Unscanned Is Not Claimed**: A worktree past the scan cap shows nothing rather than `0`, which would report it as verified clean.
+- **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight.
 - **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
 - **A Branch on Two Tasks Appears on Both**: Assigning it to one would hide the work from the other with nothing on screen to say so.
 - **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
 - **Unreadable Is Its Own State**: A verdict this build cannot parse is counted as `unreadable`, never as `allowed` — a check that could not be read must never render as one that ran and passed.
-- **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem).
+- **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem). The absence itself is never the headline: a reader who does not run one is told what *is* here, not what is missing.
 - **Shortcut**: `F10`.
 
 ### 1.1 Files (`files`)
@@ -114,12 +118,6 @@ flowchart TD
 ### 2.5 Stack (`stack`)
 - **Stacked Branch Management**: Visualizes branch chains and dependencies.
 - **Interactive Rebase Helper**: Smooth workflow for updating and rebasing stacked PR branches.
-
-### 2.6 Repo (`repo`)
-- **Remotes & Upstreams**: Inspect, add, edit, and remove remotes, validating URLs and connection state.
-- **Stash Management**: Browse stashes with commit diffs, apply or drop individual stashes safely under repository locks.
-- **Submodule Lifecycle**: Inspect, initialize, and update Git submodules across the workspace.
-- **Workspace Bulk Operations**: Coordinated fetch, pull, and stash operations across all workspace repositories.
 
 ---
 

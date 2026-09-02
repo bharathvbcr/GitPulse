@@ -234,7 +234,6 @@ pub fn build_native_menu<R: Runtime>(
             // one that nothing could emit. Both were reachable only through
             // the command palette.
             &item(app, actions::TAB_STORAGE, "Storage", None)?,
-            &item(app, actions::TAB_REPO, "Repo", None)?,
             &item(app, actions::TAB_REFLOG, "Reflog", None)?,
             &PredefinedMenuItem::separator(app)?,
             &item(

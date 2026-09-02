@@ -21,6 +21,7 @@ import type { TaskLease } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
 import type { PullRequestInfo, WorkflowRunInfo } from "../github/types";
 import type { PolicyStatus } from "../stores/harnessStore";
+import type { RepoOperation } from "../repos/operation";
 
 /** Whether one source could be consulted, and why not when it could not. */
 export interface WorkSourceState {
@@ -61,8 +62,24 @@ export interface VerdictTally {
   events: number;
 }
 
+/**
+ * What a row is keyed on.
+ *
+ * A DevCouncil store makes the task the unit of work. Without one — the
+ * ordinary case for a repository driven by Claude Code or by hand — the unit
+ * is the **worktree**: that is where a branch, its uncommitted changes, its
+ * parked operation and its pull request actually live. Keying everything on
+ * task in that case collapsed the entire repository into a single row labelled
+ * "Not bound to a task", which is why the screen read as empty even when four
+ * agents were mid-change.
+ */
+export type WorkRowKind = "task" | "worktree" | "unbound";
+
 /** One line of the Work view. */
 export interface WorkRow {
+  /** Stable identity: task id, worktree path, or "" for the catch-all. */
+  key: string;
+  kind: WorkRowKind;
   /** Empty for the catch-all row holding everything bound to no task. */
   taskId: string;
   title: string;
@@ -73,6 +90,13 @@ export interface WorkRow {
   runs: WorkflowRunInfo[];
   grants: Grant[];
   verdicts: VerdictTally;
+  /**
+   * The multi-step git operation parked in this row's worktree, if any.
+   *
+   * A worktree stopped mid-rebase is the single most important thing this
+   * screen can say about it — it is blocked, and it is blocked on a person.
+   */
+  operation: RepoOperation | null;
 }
 
 export interface WorkProjection {
@@ -140,6 +164,8 @@ export interface WorkInputs {
   /** The ledger tail this projection saw. Null when it could not be read. */
   events: readonly LedgerEvent[] | null;
   grants: readonly Grant[] | null;
+  /** Worktree path → the operation parked there. Absent means none/unknown. */
+  operations: Readonly<Record<string, RepoOperation | null>>;
   sources: WorkSources;
 }
 
@@ -148,6 +174,17 @@ export const UNBOUND_ROW_ID = "";
 
 function branchOf(worktree: WorktreeInfo): string {
   return worktree.branch ?? "";
+}
+
+/**
+ * Whether this repository has a task model to key rows on.
+ *
+ * True when the store answered with at least one lease or binding. An absent
+ * or unreadable store falls through to worktree rows, which every repository
+ * has — so the screen is never keyed on something that does not exist here.
+ */
+function usesTaskRows(input: WorkInputs): boolean {
+  return (input.leases?.length ?? 0) > 0 || Object.keys(input.bindings).length > 0;
 }
 
 /**
@@ -172,13 +209,16 @@ function branchOf(worktree: WorktreeInfo): string {
  */
 export function projectWork(input: WorkInputs): WorkProjection {
   const rows = new Map<string, WorkRow>();
+  const byTask = usesTaskRows(input);
 
-  function rowFor(taskId: string): WorkRow {
-    const existing = rows.get(taskId);
+  function rowFor(key: string, kind: WorkRowKind): WorkRow {
+    const existing = rows.get(key);
     if (existing) return existing;
     const created: WorkRow = {
-      taskId,
-      title: input.titles[taskId] ?? "",
+      key,
+      kind: key === UNBOUND_ROW_ID ? "unbound" : kind,
+      taskId: kind === "task" ? key : "",
+      title: kind === "task" ? (input.titles[key] ?? "") : "",
       status: "",
       lease: null,
       worktrees: [],
@@ -186,55 +226,82 @@ export function projectWork(input: WorkInputs): WorkProjection {
       runs: [],
       grants: [],
       verdicts: emptyTally(),
+      operation: null,
     };
-    rows.set(taskId, created);
+    rows.set(key, created);
     return created;
   }
 
+  /** The catch-all, in either mode. */
+  const unbound = () => rowFor(UNBOUND_ROW_ID, "unbound");
+
   for (const lease of input.leases ?? []) {
-    const row = rowFor(lease.task_id);
+    const row = rowFor(lease.task_id, "task");
     row.lease = lease;
     row.status = lease.status;
   }
 
-  // Branch → the tasks its worktrees are bound to. A branch checked out in two
-  // worktrees bound to different tasks belongs to both, and a PR on it is
-  // shown on both rather than arbitrarily assigned to one.
-  const tasksByBranch = new Map<string, Set<string>>();
+  // Branch → the row keys its worktrees belong to. A branch checked out in two
+  // worktrees belongs to both, and a PR on it is shown on both rather than
+  // arbitrarily assigned to one.
+  const keysByBranch = new Map<string, Set<string>>();
   for (const worktree of input.worktrees ?? []) {
     const taskId = input.bindings[worktree.path] ?? UNBOUND_ROW_ID;
-    rowFor(taskId).worktrees.push({ worktree, taskId });
+    // In worktree mode the worktree IS the row, so it never lands in the
+    // catch-all: a repository with no task store still shows one row per
+    // place work is happening.
+    const key = byTask ? taskId : worktree.path;
+    const row = rowFor(key, byTask ? "task" : "worktree");
+    row.worktrees.push({ worktree, taskId });
+    if (!byTask) {
+      // The branch is the row's name; a detached worktree keeps its directory
+      // name rather than rendering as an untitled row.
+      row.title = branchOf(worktree) || worktree.name;
+      row.operation = input.operations[worktree.path] ?? null;
+    }
     const branch = branchOf(worktree);
     if (branch.length === 0) continue;
-    const set = tasksByBranch.get(branch) ?? new Set<string>();
-    set.add(taskId);
-    tasksByBranch.set(branch, set);
+    const set = keysByBranch.get(branch) ?? new Set<string>();
+    set.add(key);
+    keysByBranch.set(branch, set);
   }
 
+  const rowKind: WorkRowKind = byTask ? "task" : "worktree";
+
   for (const pr of input.pullRequests ?? []) {
-    const owners = tasksByBranch.get(pr.head_ref);
+    const owners = keysByBranch.get(pr.head_ref);
     if (owners) {
-      for (const taskId of owners) rowFor(taskId).pullRequests.push(pr);
+      for (const key of owners) rowFor(key, rowKind).pullRequests.push(pr);
     } else {
-      rowFor(UNBOUND_ROW_ID).pullRequests.push(pr);
+      unbound().pullRequests.push(pr);
     }
   }
 
   for (const run of input.runs ?? []) {
-    const owners = tasksByBranch.get(run.head_branch);
+    const owners = keysByBranch.get(run.head_branch);
     if (owners) {
-      for (const taskId of owners) rowFor(taskId).runs.push(run);
+      for (const key of owners) rowFor(key, rowKind).runs.push(run);
     } else {
-      rowFor(UNBOUND_ROW_ID).runs.push(run);
+      unbound().runs.push(run);
     }
   }
 
   for (const grant of input.grants ?? []) {
-    rowFor(grant.scope.task_id || UNBOUND_ROW_ID).grants.push(grant);
+    // A grant is scoped to a task and to nothing else, so in worktree mode it
+    // has no row of its own to sit on and stays in the catch-all rather than
+    // being attributed to a worktree that never claimed it.
+    const key = byTask ? grant.scope.task_id || UNBOUND_ROW_ID : UNBOUND_ROW_ID;
+    rowFor(key, "task").grants.push(grant);
   }
 
   for (const event of input.events ?? []) {
-    const row = rowFor(event.task_id || UNBOUND_ROW_ID);
+    // The ledger records both, so each mode joins on the column it actually
+    // keys by rather than inferring one from the other.
+    const key = byTask ? event.task_id || UNBOUND_ROW_ID : event.worktree_path || UNBOUND_ROW_ID;
+    // An event naming a worktree git no longer lists would otherwise conjure
+    // a row for a directory that is gone; those fall into the catch-all.
+    const target = !byTask && key !== UNBOUND_ROW_ID && !rows.has(key) ? UNBOUND_ROW_ID : key;
+    const row = rowFor(target, rowKind);
     row.verdicts.events += 1;
     const status = verdictStatus(event);
     if (status === null) continue;
@@ -256,22 +323,38 @@ export function projectWork(input: WorkInputs): WorkProjection {
 /** How much is going on, for ordering. Never a claim about importance. */
 function weight(row: WorkRow): number {
   return (
+    // A parked operation outranks everything: that worktree is blocked on a
+    // person, and burying it under a row with more pull requests would hide
+    // the only thing on this screen that needs doing right now.
+    (row.operation ? 16 : 0) +
     (row.lease ? 8 : 0) +
     row.pullRequests.length * 4 +
     row.worktrees.length * 2 +
     row.runs.length +
-    row.grants.length
+    row.grants.length +
+    (dirtyCount(row) > 0 ? 1 : 0)
   );
+}
+
+/** Uncommitted files across this row's worktrees; -1 when none were scanned. */
+export function dirtyCount(row: WorkRow): number {
+  let total = -1;
+  for (const binding of row.worktrees) {
+    const dirty = binding.worktree.dirty_files;
+    if (dirty === null || dirty === undefined) continue;
+    total = total < 0 ? dirty : total + dirty;
+  }
+  return total;
 }
 
 function compareRows(a: WorkRow, b: WorkRow): number {
   // The unbound row is last whatever it holds: it is a bucket, not a task, and
   // in a repository that has just started binding it holds everything.
-  if (a.taskId === UNBOUND_ROW_ID) return 1;
-  if (b.taskId === UNBOUND_ROW_ID) return -1;
+  if (a.key === UNBOUND_ROW_ID) return 1;
+  if (b.key === UNBOUND_ROW_ID) return -1;
   const byWeight = weight(b) - weight(a);
   if (byWeight !== 0) return byWeight;
-  return a.taskId.localeCompare(b.taskId);
+  return a.key.localeCompare(b.key);
 }
 
 /**
