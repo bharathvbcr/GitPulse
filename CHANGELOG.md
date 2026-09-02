@@ -11,6 +11,8 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-09-02
+
 ### Added
 
 - GitHub panel lists open issues (already fetched by `cmd_github_context`) and a **New pull request** action that opens GitHub's compare form for the current branch onto the default branch.
@@ -22,29 +24,6 @@ before that tag is pushed.
 - Integrated language logos across LanguageBar, FileTreePanel, FileViewer editor tabs, Sidebar staged/unstaged changes, CommitDetails changed files list, DiffViewer toolbar, LivePulse dashboard, and CommandPalette symbol/file searches.
 - File path hierarchy formatting (`formatPathParts`) in Sidebar and CommitDetails, dimming directory paths and highlighting filenames for improved scannability.
 - Interactive LanguageBar pills that switch directly to the Files tab and dispatch custom filter events.
-
-### Changed
-
-- Work view keys on worktrees when there is no DevCouncil task store, so a repository driven by Claude Code, Cursor, or by hand is one row per checkout instead of a single "Not bound to a task" bucket. Remotes, stash and submodules fold into a collapsed section on that screen; the separate Repo view is gone.
-- Agent worktrees are recognised by the `/.<agent>/worktrees/` layout, not only Claude Code's `.claude/` directory. Git's own `.git/worktrees/` metadata is never labelled an agent session.
-- `gitpulse_status` reports worktrees, matching the description it already advertised.
-
-### Fixed
-
-- A parked merge/rebase on a task-keyed Work row is shown and sorts first. Task mode previously left `operation` null, so a DevCouncil repository mid-rebase rendered as idle.
-- An operation probe that throws degrades the Work screen rather than looking like an idle worktree. Bare worktrees no longer steal probe slots from later checkouts.
-- A persisted `repo` view tab opens Work (its successor), not Graph.
-- Work view refreshes when the repository's status generation changes, so a parked rebase or dirty count cannot sit stale next to a sidebar that already updated.
-- Removing a worktree never passes `--force` for an unscanned tree (`dirty_files === null` is not zero). A scanned dirty tree is force-removed only after the armed confirm names the discard cost.
-- Menu and palette "Pop stash" pop the listed top entry by object id through `cmd_stash_action`. The unaddressed `git stash pop` of `stash@{0}` is no longer on that path.
-- A newly opened repository, and a restored tab with no saved view, lands on Work. The commit-search bar is shown only on Graph, Diff, Blame, Stack, and Reflog. ⌘F and native Search Commits switch to Graph from Work (and other non-filter views) instead of no-opping; Files still uses ⌘F for in-file search.
-- `cmd_list_tags`, `cmd_list_remotes`, and `cmd_list_submodules` return a truncated flag. A listing cut by the cap is no longer indistinguishable from a complete one.
-- The shortcuts cheat sheet lists Open (`⌘O` / `⌘T`), Clone (`⌘⇧O`), and Work (`F10`) to match the native menu.
-- MCP `gitpulse_task_view` requires only `repo_path`, matching the handler.
-
-## [0.0.3] - 2026-09-02
-
-### Added
 
 - Control plane: GitPulse now records what agents do to a repository and judges it.
   A durable WAL SQLite ledger at the Rust guard seam records every mutation with the
@@ -88,6 +67,9 @@ before that tag is pushed.
 
 ### Changed
 
+- Work view keys on worktrees when there is no DevCouncil task store, so a repository driven by Claude Code, Cursor, or by hand is one row per checkout instead of a single "Not bound to a task" bucket. Remotes, stash and submodules fold into a collapsed section on that screen; the separate Repo view is gone.
+- Agent worktrees are recognised by the `/.<agent>/worktrees/` layout, not only Claude Code's `.claude/` directory. Git's own `.git/worktrees/` metadata is never labelled an agent session.
+- `gitpulse_status` reports worktrees, matching the description it already advertised.
 - GitPulse builds from a checkout of GitPulse. The eight Rust crates it links from
   Manvi and DevCouncil are vendored under `src-tauri/vendored/` instead of reached by
   relative path, so a lone clone no longer needs two sibling repositories present.
@@ -145,6 +127,16 @@ before that tag is pushed.
 
 ### Fixed
 
+- A parked merge/rebase on a task-keyed Work row is shown and sorts first. Task mode previously left `operation` null, so a DevCouncil repository mid-rebase rendered as idle.
+- An operation probe that throws degrades the Work screen rather than looking like an idle worktree. Bare worktrees no longer steal probe slots from later checkouts.
+- A persisted `repo` view tab opens Work (its successor), not Graph.
+- Work view refreshes when the repository's status generation changes, so a parked rebase or dirty count cannot sit stale next to a sidebar that already updated.
+- Removing a worktree never passes `--force` for an unscanned tree (`dirty_files === null` is not zero). A scanned dirty tree is force-removed only after the armed confirm names the discard cost.
+- Menu and palette "Pop stash" pop the listed top entry by object id through `cmd_stash_action`. The unaddressed `git stash pop` of `stash@{0}` is no longer on that path.
+- A newly opened repository, and a restored tab with no saved view, lands on Work. The commit-search bar is shown only on Graph, Diff, Blame, Stack, and Reflog. ⌘F and native Search Commits switch to Graph from Work (and other non-filter views) instead of no-opping; Files still uses ⌘F for in-file search.
+- `cmd_list_tags`, `cmd_list_remotes`, and `cmd_list_submodules` return a truncated flag. A listing cut by the cap is no longer indistinguishable from a complete one.
+- The shortcuts cheat sheet lists Open (`⌘O` / `⌘T`), Clone (`⌘⇧O`), and Work (`F10`) to match the native menu.
+- MCP `gitpulse_task_view` requires only `repo_path`, matching the handler.
 - A failed clone no longer claims a cleanup it did not perform. git materializes
   `<dest>/.git` before transferring objects, so a failed clone leaves a skeleton that
   blocks every retry; the error said it had removed that skeleton whether or not the
