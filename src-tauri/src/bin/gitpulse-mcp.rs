@@ -163,9 +163,20 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     }
 }
 
-fn process_request(req: JsonRpcRequest) -> JsonRpcResponse {
-    let id = req.id.clone().unwrap_or(Value::Null);
-    match req.method.as_str() {
+/// Answers one request, or `None` when the message was a notification.
+///
+/// JSON-RPC distinguishes the two by the presence of `id`, and a notification
+/// must never be answered. MCP clients send `notifications/initialized`
+/// immediately after the handshake, so a server that replies to it puts an
+/// unmatched response on the wire before the first tool call — which a strict
+/// client reads as a response to a request it never made.
+fn process_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    let Some(id) = req.id.clone() else {
+        // A notification. Nothing to answer, and nothing to log to stdout —
+        // that channel carries protocol and nothing else.
+        return None;
+    };
+    Some(match req.method.as_str() {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -225,7 +236,7 @@ fn process_request(req: JsonRpcRequest) -> JsonRpcResponse {
                 "message": format!("Method not found: {}", req.method)
             })),
         },
-    }
+    })
 }
 
 fn main() {
@@ -257,10 +268,14 @@ fn main() {
             }
         };
 
-        let resp = process_request(req);
-        let out = serde_json::to_string(&resp).unwrap();
-        let _ = writeln!(stdout, "{out}");
-        let _ = stdout.flush();
+        // A notification produces nothing. Writing an empty line, or a
+        // response with a null id, would both be protocol on a channel that
+        // carries only protocol.
+        if let Some(resp) = process_request(req) {
+            let out = serde_json::to_string(&resp).unwrap();
+            let _ = writeln!(stdout, "{out}");
+            let _ = stdout.flush();
+        }
     }
 }
 
@@ -288,8 +303,146 @@ mod tests {
             method: "initialize".into(),
             params: json!({}),
         };
-        let resp = process_request(req);
+        let resp = process_request(req).expect("a request with an id is answered");
         assert!(resp.error.is_none());
         assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "gitpulse-mcp");
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn request(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: method.into(),
+            params,
+        }
+    }
+
+    /// A notification is never answered.
+    ///
+    /// MCP clients send `notifications/initialized` straight after the
+    /// handshake. A server that replies puts an unmatched response on the wire
+    /// before the first tool call, which a strict client reads as an answer to
+    /// a request it never sent.
+    #[test]
+    fn a_notification_gets_no_response() {
+        assert!(
+            process_request(request("notifications/initialized", None, json!({}))).is_none(),
+            "a message with no id was answered"
+        );
+        assert!(
+            process_request(request("notifications/cancelled", None, json!({}))).is_none(),
+            "every id-less message is a notification, not only the ones we know"
+        );
+    }
+
+    /// ...and a request always is, including one this build does not implement.
+    #[test]
+    fn every_request_with_an_id_is_answered() {
+        for method in ["initialize", "tools/list", "tools/call", "no/such/method"] {
+            let resp = process_request(request(method, Some(json!(7)), json!({})));
+            let resp = resp.unwrap_or_else(|| panic!("{method} went unanswered"));
+            assert_eq!(resp.id, json!(7), "{method} answered the wrong id");
+            assert!(
+                resp.result.is_some() || resp.error.is_some(),
+                "{method} answered with neither a result nor an error"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_is_an_error_not_a_silent_success() {
+        let resp = process_request(request("no/such/method", Some(json!(1)), json!({})))
+            .expect("answered");
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.expect("error")["code"], -32601);
+    }
+
+    #[test]
+    fn an_unknown_tool_is_refused_rather_than_answered_emptily() {
+        // A tool call that silently returned nothing would read to an agent as
+        // "the repository has nothing to report", which is a different claim.
+        let resp = process_request(request(
+            "tools/call",
+            Some(json!(2)),
+            json!({ "name": "gitpulse_not_a_tool", "arguments": {} }),
+        ))
+        .expect("answered");
+        assert!(resp.result.is_none(), "an unknown tool returned a result");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn every_advertised_tool_declares_a_schema_and_its_required_arguments() {
+        // A tool an agent cannot call correctly is worse than one that is
+        // absent: the agent tries, fails, and cannot tell why.
+        let tools = handle_tools_list();
+        let list = tools["tools"].as_array().expect("array");
+        assert!(!list.is_empty());
+        for tool in list {
+            let name = tool["name"].as_str().expect("every tool is named");
+            assert!(
+                tool["description"].as_str().is_some_and(|d| d.len() > 20),
+                "{name} has no useful description"
+            );
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object", "{name} has no object schema");
+            assert!(
+                schema["properties"].is_object(),
+                "{name} declares no properties"
+            );
+            let required = schema["required"].as_array().expect("required list");
+            for field in required {
+                let field = field.as_str().expect("required names a field");
+                assert!(
+                    schema["properties"][field].is_object(),
+                    "{name} requires {field}, which its schema does not describe"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_names_are_unique() {
+        let tools = handle_tools_list();
+        let list = tools["tools"].as_array().expect("array");
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in list {
+            let name = tool["name"].as_str().expect("named");
+            assert!(seen.insert(name), "two tools are called {name}");
+        }
+    }
+
+    /// This build's surface is read-only, and that is pinned rather than
+    /// assumed.
+    ///
+    /// Not a permanent prohibition: the migration plan anticipates
+    /// `checkpoint_workspace`, and a mutation here is legitimate *provided it
+    /// goes through `harness::guard_command`* like every other write. What this
+    /// test prevents is one arriving that does not — an agent mutating through
+    /// MCP while the ledger and the gate know nothing about it. Adding a
+    /// mutating tool means changing this test deliberately, with the routing
+    /// in place.
+    #[test]
+    fn no_advertised_tool_offers_an_ungated_mutation() {
+        let tools = handle_tools_list();
+        for tool in tools["tools"].as_array().expect("array") {
+            let name = tool["name"].as_str().expect("named");
+            for verb in [
+                "write", "commit", "push", "checkout", "apply", "delete", "revert", "ingest",
+                "bind", "revoke",
+            ] {
+                assert!(
+                    !name.contains(verb),
+                    "{name} looks like a mutation. This surface is read-only in this \
+                     build; a mutating tool must route through harness::guard_command \
+                     so the ledger and the gate see it, and must update this test"
+                );
+            }
+        }
     }
 }
