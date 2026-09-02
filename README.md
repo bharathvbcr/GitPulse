@@ -42,7 +42,7 @@ GitPulse operates completely locally on your machine with strict IPC boundaries 
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        Views["14 Specialized Views<br/>(Files, Graph, Diff, Coverage, Health, Storage...)"]
+        Views["15 Specialized Views<br/>(Work, Files, Graph, Diff, Coverage, Health...)"]
         Stores["Reactive Svelte 5 Stores & Runes"]
         CanvasEngine["GPU-Accelerated HTML5 Canvas"]
         AsyncGuards["Async Cancellation Guards"]
@@ -86,11 +86,12 @@ flowchart TB
 
 ## View Catalog & Workflows
 
-GitPulse organizes 14 purpose-built views into three intuitive functional groups:
+GitPulse organizes 15 purpose-built views into three intuitive functional groups:
 
 ```mermaid
 flowchart LR
     subgraph Work["🔨 Work Views"]
+        WorkTab["<b>Work</b> (<code>work</code>)<br/>Tasks, worktrees, PRs & verdicts"]
         Files["<b>Files</b> (<code>files</code>)<br/>IDE file explorer & code viewer"]
         Graph["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph & lanes"]
         Diff["<b>Diff</b> (<code>diff</code>)<br/>Word-level diff & selective staging"]
@@ -103,6 +104,7 @@ flowchart LR
         Health["<b>Health</b> (<code>health</code>)<br/>Vulnerabilities & Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage & history trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization"]
+        Repo["<b>Repo</b> (<code>repo</code>)<br/>Remotes, stashes & submodules"]
     end
 
     subgraph System["⚙️ System & Ops"]
@@ -120,19 +122,23 @@ flowchart LR
 ### 🚀 Core Git & Visualization
 | Feature | Description |
 | --- | --- |
+| **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil tasks to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with avatar rendering, lane smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust. |
-| **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, and one-click selective hunk/line patch staging. |
+| **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, impact edge annotations, and one-click selective hunk/line patch staging. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
 
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
+| **In-Process Code Intelligence** | Impact analysis, symbol search, and dead-code detection answered in-process from DevCouncil's persisted code map without background daemons or runtime parsers. |
+| **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
 | **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. |
 | **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
 | **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
+| **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
 
 ### 🤖 Local AI & Policy Safety Gate
 | Feature | Description |

@@ -1,6 +1,6 @@
 # GitPulse Features & View Catalog
 
-GitPulse provides 13 specialized views categorized into **Work**, **Inspect**, and **System/Ops** groups.
+GitPulse provides 15 specialized views categorized into **Work**, **Inspect**, and **System/Ops** groups.
 
 ```mermaid
 flowchart TD
@@ -18,6 +18,7 @@ flowchart TD
         Health["<b>Health</b> (<code>health</code>)<br/>Multi-ecosystem vulnerability & staleness audits, Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage breakdown, unignored caches, snapshot trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization & rebase workflow manager"]
+        Repo["<b>Repo</b> (<code>repo</code>)<br/>Remotes, stashes & submodules management"]
     end
 
     subgraph SystemGroup["System & Ops Views (Terminal & Automation)"]
@@ -113,6 +114,12 @@ flowchart TD
 ### 2.5 Stack (`stack`)
 - **Stacked Branch Management**: Visualizes branch chains and dependencies.
 - **Interactive Rebase Helper**: Smooth workflow for updating and rebasing stacked PR branches.
+
+### 2.6 Repo (`repo`)
+- **Remotes & Upstreams**: Inspect, add, edit, and remove remotes, validating URLs and connection state.
+- **Stash Management**: Browse stashes with commit diffs, apply or drop individual stashes safely under repository locks.
+- **Submodule Lifecycle**: Inspect, initialize, and update Git submodules across the workspace.
+- **Workspace Bulk Operations**: Coordinated fetch, pull, and stash operations across all workspace repositories.
 
 ---
 

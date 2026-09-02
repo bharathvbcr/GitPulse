@@ -11,6 +11,8 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-09-02
+
 ### Added
 
 - Control plane: GitPulse now records what agents do to a repository and judges it.
@@ -51,6 +53,7 @@ before that tag is pushed.
   errors, showed a banner and recorded nothing, leaving `clone` and `rebase` declared
   in `PanelSource` and used by no one; the contract test now fails on any panel source
   that is declared and silent.
+- IDE-style file viewer, promoted to the primary work tab.
 
 ### Changed
 
@@ -59,7 +62,6 @@ before that tag is pushed.
   relative path, so a lone clone no longer needs two sibling repositories present.
   `npm run vendor:check` reports edits made here and drift from upstream, and says
   "not compared" rather than "matches" when a sibling is absent.
-
 - Coverage floors are enforced rather than merely reported. `npm run check:coverage`
   validates both LCOV reports structurally before trusting any number and applies
   explicit floors (frontend 90% lines / 85% branches, Rust 80% lines). An unparseable
@@ -98,9 +100,6 @@ before that tag is pushed.
   report columns align from their labels instead of hand-counted padding.
 - A dev container (`.devcontainer/`) that installs the same Linux dependencies CI uses
   plus actionlint and cargo-llvm-cov, so `npm run ci:local` is runnable in it.
-
-### Changed
-
 - Native Git mutations (`stage`, `unstage`, `fetch`, `stash save`, `stash pop`) route
   through the harness write gate and return the policy verdict alongside their output.
 - Stash actions are reverified against both the stash index and object ID under the
@@ -139,6 +138,7 @@ before that tag is pushed.
   the build transitively through Tauri; `rayon` is the only direct concurrency
   dependency, and blocking work leaves the IPC thread via
   `tauri::async_runtime::spawn_blocking`.
+- Windows clippy warnings from dead code and unused imports in the test harness.
 
 ### Internal
 
@@ -151,16 +151,6 @@ before that tag is pushed.
 - Cross-language contract coverage now includes command registration and arguments,
   serde variants, events, GitHub CLI fields, and repository-surface payloads, with
   integration and stress suites exercising real repositories and child processes.
-
-## [0.0.3] - 2026-08-28
-
-### Added
-
-- IDE-style file viewer, promoted to the primary work tab.
-
-### Fixed
-
-- Windows clippy warnings from dead code and unused imports in the test harness.
 
 ## [0.0.2] - 2026-08-26
 
