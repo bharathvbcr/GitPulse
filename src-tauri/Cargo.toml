@@ -96,5 +96,8 @@ tauri = { version = "2.0.0", features = ["test"] }
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"
-# Strip debug symbols from shipped binaries; smaller artifacts, zero runtime cost.
-strip = true
+# Strip DWARF, keep the symbol table. `true` strips both, which left every
+# frame of a shipped panic's backtrace as a bare address — a stack trace that
+# names nothing is not a stack trace. "debuginfo" drops the bulk (the debug
+# info) and keeps the names the panic hook's capture is written to produce.
+strip = "debuginfo"

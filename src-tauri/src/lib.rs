@@ -24,7 +24,7 @@ pub mod watcher;
 
 use commands::*;
 use desktop::{cmd_resolve_git_root, cmd_set_recent_menu, cmd_take_pending_open};
-use logging::cmd_diagnostic_log_tail;
+use logging::{cmd_diagnostic_log_tail, cmd_diagnostic_persisted_log};
 
 /// The application's Tauri context, generated once.
 ///
@@ -170,6 +170,7 @@ pub fn run() {
             cmd_set_recent_menu,
             cmd_resolve_git_root,
             cmd_diagnostic_log_tail,
+            cmd_diagnostic_persisted_log,
             cmd_ledger_tail,
             cmd_ledger_status,
             cmd_task_view,

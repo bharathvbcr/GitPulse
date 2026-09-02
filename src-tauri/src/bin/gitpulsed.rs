@@ -241,6 +241,12 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
 }
 
 fn main() {
+    // The daemon runs unattended for hours, which is precisely when nobody is
+    // watching stderr. Without this it had no durable record and no panic
+    // hook at all: a crash mid-catch-up left the ledger hole it exists to
+    // fill, and nothing anywhere that said why.
+    gitpulse_lib::logging::init();
+    gitpulse_lib::logging::install_panic_hook();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse(&argv) {
         Parsed::Help => {

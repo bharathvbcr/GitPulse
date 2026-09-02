@@ -13,7 +13,7 @@
   import { seedRebasePlan, shouldReseed } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import { GitMerge, Check, AlertCircle } from "lucide-svelte";
 
   let {
@@ -105,7 +105,7 @@
       );
       onClose?.();
     } catch (err: unknown) {
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("rebase", err);
     } finally {
       isExecuting = false;
     }

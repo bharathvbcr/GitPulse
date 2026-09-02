@@ -10,7 +10,7 @@
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import { Download, FolderOpen, Check } from "lucide-svelte";
 
   let {
@@ -31,7 +31,7 @@
       const folder = await invoke<string | null>("cmd_pick_folder");
       if (folder) targetDir = folder;
     } catch (err) {
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("clone", err);
     }
   }
 
@@ -47,7 +47,7 @@
       await repoStore.openRepo(clonedPath);
       onClose?.();
     } catch (err: unknown) {
-      errorMsg = formatError(err);
+      errorMsg = reportPanelError("clone", err);
     } finally {
       isCloning = false;
     }

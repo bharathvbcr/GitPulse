@@ -4,7 +4,9 @@ import {
   createReporter,
   reportPanelError,
   withBackendLogSection,
+  withPersistedLogSection,
 } from "./report";
+import { unreadablePersistedLog, type PersistedLog } from "./types";
 import { diagnostics } from "./diagnostics";
 
 /** Recording sink shaped like the DiagnosticsStore slice the reporter uses. */
@@ -99,5 +101,56 @@ describe("withBackendLogSection", () => {
     const out = withBackendLogSection("r", ["a", "b", "c"]);
     expect(out).toContain("Backend log (last 3)");
     expect(out.endsWith("\n  c")).toBe(true);
+  });
+});
+
+describe("withPersistedLogSection", () => {
+  const healthy = (lines: string[]): PersistedLog => ({
+    path: "/tmp/gitpulse.log",
+    lines,
+    degraded: null,
+  });
+
+  it("renders the durable tail oldest-first under a header naming the file", () => {
+    const out = withPersistedLogSection("report body", healthy(["older", "newer"]));
+    expect(out).toBe(
+      "report body\n\nDurable backend log (2 line(s) from /tmp/gitpulse.log)\n  older\n  newer",
+    );
+    expect(out.indexOf("older")).toBeLessThan(out.indexOf("newer"));
+  });
+
+  it("still writes a section when the durable log is empty", () => {
+    // Silence here would be read as "the backend said nothing went wrong",
+    // which is a different fact from "the backend recorded nothing".
+    const out = withPersistedLogSection("report body", healthy([]));
+    expect(out).toContain("Durable backend log (0 line(s) from /tmp/gitpulse.log)");
+  });
+
+  it("says the log is unavailable rather than omitting the section", () => {
+    const out = withPersistedLogSection("report body", {
+      path: "",
+      lines: [],
+      degraded: "no durable log for this binary",
+    });
+    expect(out).toContain("Durable backend log — unavailable");
+    expect(out).toContain("! incomplete: no durable log for this binary");
+  });
+
+  it("marks a truncated log as incomplete beside the lines it did keep", () => {
+    // The dangerous case: lines are present, so the section looks whole.
+    const out = withPersistedLogSection("report body", {
+      path: "/tmp/gitpulse.log",
+      lines: ["kept"],
+      degraded: "rotate failed, truncated instead: EACCES",
+    });
+    expect(out).toContain("! incomplete: rotate failed, truncated instead: EACCES");
+    expect(out).toContain("  kept");
+    expect(out.indexOf("! incomplete")).toBeLessThan(out.indexOf("  kept"));
+  });
+
+  it("turns a failed read into a stated reason, not an empty log", () => {
+    const out = withPersistedLogSection("r", unreadablePersistedLog("IPC rejected"));
+    expect(out).toContain("Durable backend log — unavailable");
+    expect(out).toContain("could not be read: IPC rejected");
   });
 });

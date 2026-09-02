@@ -35,6 +35,22 @@ before that tag is pushed.
 - `gitpulse-mcp`, an MCP server exposing the control plane read-only to an agent,
   held in step by a contract deriving both its advertised tools and its dispatch arms
   from its own source.
+- A crash now leaves evidence behind. The backend's diagnostics ring was memory-only,
+  so the panic hook recorded the one entry explaining a crash into a buffer that died
+  with the process producing it. Entries are now also appended to a per-binary log
+  under the platform log directory (`GITPULSE_LOG_DIR` overrides it), rotated at 1 MB
+  across two generations, and read back through `cmd_diagnostic_persisted_log` — so
+  after a relaunch the previous session's last words are still there. The panic hook
+  also records a bounded backtrace, and the release profile now strips debuginfo only,
+  keeping the symbols that make those frames name anything. Nothing leaves the machine.
+- `gitpulsed` and `gitpulse-mcp` install the logger and the panic hook the GUI installs.
+  Both ran with neither: a panic in either left a closed pipe or a stalled ingest loop
+  and no record anywhere of why. `scripts/diagnostics-contract.test.ts` derives the
+  binary list from `Cargo.toml`, so a fourth binary cannot join them silently.
+- Failed clones and rebases reach the diagnostics report. Both modals caught their
+  errors, showed a banner and recorded nothing, leaving `clone` and `rebase` declared
+  in `PanelSource` and used by no one; the contract test now fails on any panel source
+  that is declared and silent.
 
 ### Changed
 

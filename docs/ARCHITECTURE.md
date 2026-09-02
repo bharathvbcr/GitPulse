@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (123 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (124 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -96,7 +96,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +123 Registered Handlers
+        +124 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -150,6 +150,7 @@ classDiagram
 - **`ops.rs`**: Safe, read-only MANVI operation planners for merged branch cleanups, outgoing commit review, and release publishing.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
 - **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved command diagnostics and subprocess exit status tracking.
+- **`logging.rs`**: Diagnostics for the backend. A 1,000-entry in-memory ring behind the `log` facade, a panic hook that records the payload, the location and a bounded backtrace, and a durable append-only mirror under the platform log directory (`~/Library/Logs/GitPulse` on macOS, `%LOCALAPPDATA%\\GitPulse\\logs` on Windows, `$XDG_STATE_HOME/gitpulse` otherwise; `GITPULSE_LOG_DIR` overrides all three). See [Diagnostics](#5-diagnostics) below.
 
 ---
 
@@ -189,5 +190,48 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `npm run check:ipc` | Verifies all 123 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 521 data fields, in 40 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 524 data fields, in 41 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` agree. |
+
+---
+
+## 5. Diagnostics
+
+Everything that goes wrong is recorded on both sides of the IPC boundary, and
+the two halves differ in one way that matters: **only the durable half can
+describe a crash, because the other half dies with the process it was
+describing.**
+
+| | Frontend | Backend |
+| --- | --- | --- |
+| Owner | `src/lib/diagnostics/` | `src-tauri/src/logging.rs` |
+| Captures | uncaught errors, unhandled rejections, `console.error/warn`, `<svelte:boundary>` pane crashes, panel catches via `reportPanelError` | `log::*` calls and the panic hook (payload, location, bounded backtrace) |
+| In memory | 500-entry ring, coalesced by fingerprint | 1,000-entry ring |
+| Survives a crash | yes — persisted to `localStorage` | yes — appended to `<log dir>/<binary>.log` |
+| Read back by | the Diagnostics panel | `cmd_diagnostic_log_tail` (this session) and `cmd_diagnostic_persisted_log` (durable, spans sessions) |
+
+Each of the three shipped binaries — `gitpulse`, `gitpulsed`, `gitpulse-mcp` —
+installs the logger and the panic hook and writes its own log file. The file is
+appended rather than truncated at startup, so the lines above a session marker
+are the previous run's: after a crash and a relaunch, the reason is still there
+to read. It rotates to `<binary>.log.1` at 1 MB, bounding the record at two
+generations.
+
+Three properties are deliberate and are pinned by
+`scripts/diagnostics-contract.test.ts`:
+
+1. **The panic hook is installed after `logging::init()`, never before.** It
+   captures its logger at install time, so an early install binds nothing and
+   every later panic is recorded where no one can read it — a hook that looks
+   installed and is inert.
+2. **Nothing on the sink's write path can panic.** A panic raised while a panic
+   is being handled aborts the process immediately, destroying the evidence at
+   the one moment it matters. Write failures are recorded, not raised.
+3. **A log that could not be written never looks like a quiet one.**
+   `PersistedLog` carries `path` and `degraded` beside its lines, and the copied
+   report always writes the section — so "nothing went wrong", "nothing could be
+   recorded" and "this build keeps no log" stay three distinct answers.
+
+There is no remote crash reporting, by design: nothing here leaves the machine.
+The Diagnostics panel copies the whole report to the clipboard and the user
+decides where it goes.

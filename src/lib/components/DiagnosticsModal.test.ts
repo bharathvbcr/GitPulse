@@ -99,4 +99,17 @@ describe("DiagnosticsModal backend log context", () => {
     expect(openTry).toBeGreaterThan(-1);
     expect(closeCatch).toBeGreaterThan(invokeIdx);
   });
+
+  it("fetches the durable log too, and never drops its section on failure", () => {
+    const invokeIdx = source.indexOf('"cmd_diagnostic_persisted_log"');
+    expect(invokeIdx).toBeGreaterThan(-1);
+    const openTry = source.lastIndexOf("try {", invokeIdx);
+    const closeCatch = source.indexOf("} catch (err) {", invokeIdx);
+    expect(openTry).toBeGreaterThan(-1);
+    expect(closeCatch).toBeGreaterThan(invokeIdx);
+    // The catch must synthesize a stated-unavailable log rather than skip the
+    // section: an omitted section reads as a backend with nothing to report.
+    expect(source.slice(closeCatch, closeCatch + 200)).toContain("unreadablePersistedLog");
+    expect(source).toContain("withPersistedLogSection");
+  });
 });

@@ -1,5 +1,6 @@
 import { formatError } from "../ui/formatError";
 import { diagnostics, type DiagnosticsStore } from "./diagnostics";
+import type { PersistedLog } from "./types";
 
 /**
  * One seam between panel-level caught errors and the persistent diagnostics
@@ -69,4 +70,22 @@ export function withBackendLogSection(report: string, lines: readonly string[]):
     `Backend log (last ${lines.length})`,
     ...lines.map((line) => `  ${line}`),
   ].join("\n");
+}
+
+/**
+ * Appends the backend's durable log — the half that survives the process that
+ * wrote it, and therefore the only half that can still describe a crash after
+ * the relaunch.
+ *
+ * Unlike {@link withBackendLogSection} this always writes a section. An
+ * omitted one would be read as "the backend had nothing to say", which is the
+ * same shape as "the backend could not be asked" and as "this build keeps no
+ * durable log" — three different facts, only one of them reassuring.
+ */
+export function withPersistedLogSection(report: string, log: PersistedLog): string {
+  const header = log.path
+    ? `Durable backend log (${log.lines.length} line(s) from ${log.path})`
+    : "Durable backend log — unavailable";
+  const note = log.degraded ? [`  ! incomplete: ${log.degraded}`] : [];
+  return [report, "", header, ...note, ...log.lines.map((line) => `  ${line}`)].join("\n");
 }

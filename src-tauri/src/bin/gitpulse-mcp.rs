@@ -282,6 +282,12 @@ fn process_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
 }
 
 fn main() {
+    // stdout is the JSON-RPC channel and carries nothing else; the logger
+    // writes to stderr and to its own file, so installing it here cannot
+    // corrupt a response. A panic used to leave the client with a closed pipe
+    // and no explanation on either end.
+    gitpulse_lib::logging::init();
+    gitpulse_lib::logging::install_panic_hook();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 

@@ -129,9 +129,9 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (123 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (124 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 40 contracts (521 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 41 contracts (524 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -166,6 +166,7 @@ several were added after the drift had already happened.
 | `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `npm run check` output. |
 | `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
+| `diagnostics-contract` | The crash log going quiet. The panic hook captures its logger at install time, so installing it before `logging::init()` binds nothing and every later panic is recorded where no one can read it — a hook that looks installed and is inert. It also pins the reverse gap: a new `[[bin]]` inherits neither the logger nor the hook and is absent from `LOGGED_BINARIES`, so it writes no durable log, and nothing about a silent binary looks wrong. Both lists are derived from Cargo.toml rather than restated here. |
 | `documented-counts-contract` | A count in the docs drifting from the code. The Rust test total was understated fourfold before this existed. |
 | `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
 | `cli-help-contract`, `cli-json-contract` | A script entry point losing `--help` or `--json`, or their exit codes diverging. |
@@ -191,7 +192,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 15 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (123 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (124 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, topology index, bezier geometry, folding
     ├── analyzer/         Language detection, LOC, coverage, dependency health

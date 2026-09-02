@@ -19,7 +19,9 @@
   import { LAYERS } from "../ui/layers";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "@tauri-apps/api/core";
-  import { withBackendLogSection } from "../diagnostics/report";
+  import { withBackendLogSection, withPersistedLogSection } from "../diagnostics/report";
+  import { unreadablePersistedLog, type PersistedLog } from "../diagnostics/types";
+  import { formatError } from "../ui/formatError";
   import { TriangleAlert, CircleAlert, ClipboardCopy, Trash2, Activity, Check } from "lucide-svelte";
 
   let {
@@ -79,7 +81,19 @@
     } catch {
       backendLines = [];
     }
-    const report = withBackendLogSection(formatDiagnosticReport($diagnostics), backendLines);
+    // The durable log is fetched separately and its section is written even
+    // on failure: an omitted section reads as a quiet backend, which is the
+    // one thing a crash report must never imply when it does not know.
+    let persisted: PersistedLog;
+    try {
+      persisted = await invoke<PersistedLog>("cmd_diagnostic_persisted_log", {});
+    } catch (err) {
+      persisted = unreadablePersistedLog(formatError(err));
+    }
+    const report = withPersistedLogSection(
+      withBackendLogSection(formatDiagnosticReport($diagnostics), backendLines),
+      persisted,
+    );
     void copyText(report).then((ok) => {
       if (!ok) {
         copyFailed = true;

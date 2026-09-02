@@ -157,6 +157,9 @@ export const CONTRACTS = Object.freeze([
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
   { label: "provenance", rustPath: rust("engine", "provenance.rs"), tsPath: ts("provenance", "types.ts"), structs: ["VerificationNote", "SessionEpisodeNote", "ProvenanceFreshness"] },
+  // The durable log's self-report. `degraded` is the field that must not
+  // drift: drop it and an incomplete log renders as a complete one.
+  { label: "diagnostics", rustPath: rust("logging.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["PersistedLog"] },
 ]);
 
 /**
