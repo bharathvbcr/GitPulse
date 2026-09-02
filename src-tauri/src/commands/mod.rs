@@ -2502,23 +2502,6 @@ pub async fn cmd_codeintel_impact(
     off_thread(move || Ok(crate::codeintel::impact(&repo_path, &target, token_budget))).await
 }
 
-/// Dependencies for an indexed file.
-#[tauri::command(async)]
-pub async fn cmd_codeintel_dependencies(
-    repo_path: String,
-    file_path: String,
-    token_budget: Option<u32>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
-    off_thread(move || {
-        Ok(crate::codeintel::dependencies(
-            &repo_path,
-            &file_path,
-            token_budget,
-        ))
-    })
-    .await
-}
-
 /// Dead code analysis across the repository.
 #[tauri::command(async)]
 pub async fn cmd_codeintel_dead_symbols(
@@ -2526,25 +2509,6 @@ pub async fn cmd_codeintel_dead_symbols(
     token_budget: Option<u32>,
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, String> {
     off_thread(move || Ok(crate::codeintel::dead_symbols(&repo_path, token_budget))).await
-}
-
-/// Path trace between two symbols.
-#[tauri::command(async)]
-pub async fn cmd_codeintel_trace_between(
-    repo_path: String,
-    from: String,
-    to: String,
-    token_budget: Option<u32>,
-) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
-    off_thread(move || {
-        Ok(crate::codeintel::trace_between(
-            &repo_path,
-            &from,
-            &to,
-            token_budget,
-        ))
-    })
-    .await
 }
 
 /// The harness's grant ledger for this repository.

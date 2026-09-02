@@ -35,18 +35,6 @@ export async function getImpact(
   });
 }
 
-export async function getDependencies(
-  repoPath: string,
-  filePath: string,
-  tokenBudget?: number,
-): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_dependencies", {
-    repoPath,
-    filePath,
-    tokenBudget,
-  });
-}
-
 export async function getDeadSymbols(
   repoPath: string,
   tokenBudget?: number,
@@ -57,16 +45,3 @@ export async function getDeadSymbols(
   });
 }
 
-export async function traceBetween(
-  repoPath: string,
-  from: string,
-  to: string,
-  tokenBudget?: number,
-): Promise<CodeintelResponse<CodeintelEdge>> {
-  return invoke<CodeintelResponse<CodeintelEdge>>("cmd_codeintel_trace_between", {
-    repoPath,
-    from,
-    to,
-    tokenBudget,
-  });
-}

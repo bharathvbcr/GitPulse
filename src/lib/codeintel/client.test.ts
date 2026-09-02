@@ -4,9 +4,7 @@ import {
   getCodeintelStatus,
   searchSymbols,
   getImpact,
-  getDependencies,
   getDeadSymbols,
-  traceBetween,
 } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -88,25 +86,6 @@ describe("codeintel client", () => {
     expect(res.items[0].confidence).toBe(0.95);
   });
 
-  it("computes dependencies", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce({
-      available: true,
-      reason: null,
-      items: [],
-      total: 0,
-      shown: 0,
-      truncated: false,
-    });
-
-    const res = await getDependencies("/repo", "src/main.rs");
-    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_dependencies", {
-      repoPath: "/repo",
-      filePath: "src/main.rs",
-      tokenBudget: undefined,
-    });
-    expect(res.available).toBe(true);
-  });
-
   it("queries dead symbols", async () => {
     vi.mocked(invoke).mockResolvedValueOnce({
       available: true,
@@ -131,33 +110,5 @@ describe("codeintel client", () => {
       tokenBudget: 1000,
     });
     expect(res.items[0].symbol_name).toBe("unused_helper");
-  });
-
-  it("traces path between two symbols", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce({
-      available: true,
-      reason: null,
-      items: [
-        {
-          source_file: "src/a.rs",
-          target_file: "src/b.rs",
-          source_symbol: "a",
-          target_symbol: "b",
-          confidence: 1.0,
-        },
-      ],
-      total: 1,
-      shown: 1,
-      truncated: false,
-    });
-
-    const res = await traceBetween("/repo", "a", "b");
-    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_trace_between", {
-      repoPath: "/repo",
-      from: "a",
-      to: "b",
-      tokenBudget: undefined,
-    });
-    expect(res.items).toHaveLength(1);
   });
 });

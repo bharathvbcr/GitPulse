@@ -93,6 +93,33 @@ fn handle_tools_list() -> Value {
                 }
             },
             {
+                "name": "gitpulse_codeintel_dependencies",
+                "description": "What a file depends on — the mirror of impact. Answers outgoing edges from the devmap code graph",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": { "type": "string", "description": "Absolute path to git repository" },
+                        "file_path": { "type": "string", "description": "Repo-relative file whose dependencies to read" },
+                        "budget": { "type": "number", "description": "Maximum tokens of results" }
+                    },
+                    "required": ["repo_path", "file_path"]
+                }
+            },
+            {
+                "name": "gitpulse_codeintel_trace",
+                "description": "Shortest edge path between two symbols in the devmap code graph",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": { "type": "string", "description": "Absolute path to git repository" },
+                        "from": { "type": "string", "description": "Symbol to trace from" },
+                        "to": { "type": "string", "description": "Symbol to trace to" },
+                        "budget": { "type": "number", "description": "Maximum tokens of results" }
+                    },
+                    "required": ["repo_path", "from", "to"]
+                }
+            },
+            {
                 "name": "gitpulse_provenance",
                 "description": "Read Git-native verification notes and confidence decay for a commit",
                 "inputSchema": {
@@ -147,6 +174,21 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let target = arguments["target"].as_str().ok_or("missing target")?;
             let budget = arguments["budget"].as_u64().map(|b| b as u32);
             let res = gitpulse_lib::codeintel::impact(repo, target, budget);
+            Ok(json!(res))
+        }
+        "gitpulse_codeintel_dependencies" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let file = arguments["file_path"].as_str().ok_or("missing file_path")?;
+            let budget = arguments["budget"].as_u64().map(|b| b as u32);
+            let res = gitpulse_lib::codeintel::dependencies(repo, file, budget);
+            Ok(json!(res))
+        }
+        "gitpulse_codeintel_trace" => {
+            let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
+            let from = arguments["from"].as_str().ok_or("missing from")?;
+            let to = arguments["to"].as_str().ok_or("missing to")?;
+            let budget = arguments["budget"].as_u64().map(|b| b as u32);
+            let res = gitpulse_lib::codeintel::trace_between(repo, from, to, budget);
             Ok(json!(res))
         }
         "gitpulse_provenance" => {
@@ -293,6 +335,52 @@ mod tests {
             .iter()
             .any(|t| t["name"] == "gitpulse_codeintel_search"));
         assert!(list.iter().any(|t| t["name"] == "gitpulse_provenance"));
+    }
+
+    /// Advertised tools and dispatch arms are the same set.
+    ///
+    /// The two halves are written 100 lines apart, and drift either way is
+    /// silent: a tool advertised with no arm answers "unknown tool" to a
+    /// client that was told it existed, and an arm nobody advertises is code
+    /// no client will ever reach. Derived from this file's own source rather
+    /// than from a list kept here, so a tool added to one half and not the
+    /// other fails without anyone remembering to update a fixture.
+    #[test]
+    fn every_advertised_tool_has_a_dispatch_arm_and_the_reverse() {
+        let source = include_str!("gitpulse-mcp.rs");
+
+        let advertised: std::collections::BTreeSet<String> = handle_tools_list()["tools"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name").to_string())
+            .collect();
+
+        // Dispatch arms look like `        "gitpulse_x" => {` at one indent
+        // level inside the match; the advertisement above uses `"name":`, so
+        // the two cannot be confused.
+        let dispatched: std::collections::BTreeSet<String> = source
+            .lines()
+            .filter_map(|line| {
+                let t = line.trim();
+                let rest = t.strip_prefix('"')?;
+                let (name, tail) = rest.split_once('"')?;
+                if !tail.trim_start().starts_with("=>") || !name.starts_with("gitpulse_") {
+                    return None;
+                }
+                Some(name.to_string())
+            })
+            .collect();
+
+        assert!(
+            advertised.len() >= 6,
+            "the scan found only {} advertised tools, which means it stopped working",
+            advertised.len()
+        );
+        assert_eq!(
+            advertised, dispatched,
+            "advertised tools and dispatch arms have drifted"
+        );
     }
 
     #[test]

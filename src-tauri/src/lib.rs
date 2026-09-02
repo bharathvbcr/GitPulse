@@ -185,9 +185,7 @@ pub fn run() {
             cmd_codeintel_status,
             cmd_codeintel_search,
             cmd_codeintel_impact,
-            cmd_codeintel_dependencies,
             cmd_codeintel_dead_symbols,
-            cmd_codeintel_trace_between,
             cmd_check_app_update,
         ])
         .build(context())

@@ -57,14 +57,24 @@
     type TerminalRunResult,
   } from "../terminal/runResult";
   import { reportPanelError } from "../diagnostics/report";
-  import { getDeadSymbols } from "../codeintel/client";
-  import type { CodeintelDeadSymbol } from "../codeintel/types";
+  import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
+  import type { CodeintelDeadSymbol, CodeintelStatus } from "../codeintel/types";
   import Skeleton from "./Skeleton.svelte";
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
   let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
   let deadSymbolsAvailable = $state(false);
+  /**
+   * Whether this repository has a devmap code graph at all.
+   *
+   * Three features query it — impact edges in the diff pane, symbol search in
+   * the palette, dead symbols below — and each of them renders nothing when
+   * the graph is missing. Without this, "there is no code graph here" and
+   * "the graph is here and found nothing" are the same blank space, and a
+   * reader has no way to tell which they are looking at.
+   */
+  let codegraph = $state<CodeintelStatus | null>(null);
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -176,10 +186,11 @@
     // All sources run together so the Health page fills in as one picture,
     // and each settles independently: a failed Dependabot fetch or codeintel
     // query must not erase a finished local scan, or the reverse.
-    const [deps, alerts, dead] = await Promise.allSettled([
+    const [deps, alerts, dead, graph] = await Promise.allSettled([
       invoke<DepsHealthReport>("cmd_scan_deps_health", { repoPath }),
       invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath }),
       getDeadSymbols(repoPath),
+      getCodeintelStatus(repoPath),
     ]);
     if (!guard.isLive()) return;
     if (deps.status === "fulfilled") {
@@ -201,6 +212,17 @@
       deadSymbols = [];
       deadSymbolsAvailable = false;
     }
+    // An IPC-level failure is folded into the same unavailable shape the
+    // command itself uses, so "could not ask" never renders as "asked, and
+    // there is no graph".
+    codegraph =
+      graph.status === "fulfilled"
+        ? graph.value
+        : {
+            available: false,
+            db_path: "",
+            reason: formatError(graph.reason),
+          };
     // The Dependabot command reports its own unavailable/error states; only
     // an IPC-level failure is folded into that same shape here, so "could
     // not check" never renders as a clean bill of health.
@@ -935,6 +957,35 @@
           </div>
         {/if}
       </section>
+
+      <!-- Stated whether or not there is anything to show. Impact edges,
+           symbol search and the dead-code table all go quiet without a code
+           graph, and this is the only thing that says which kind of quiet
+           it is. -->
+      {#if codegraph}
+        <section class="pb-4">
+          <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted mb-1.5">
+            Code graph
+          </h3>
+          {#if codegraph.available}
+            <p class="text-[11px] text-textMuted font-mono">
+              {codegraph.total_files ?? "?"} files · {codegraph.total_symbols ?? "?"} symbols ·
+              {codegraph.total_edges ?? "?"} edges
+              {#if codegraph.generation_id != null}
+                <span class="opacity-70">· generation {codegraph.generation_id}</span>
+              {/if}
+            </p>
+          {:else}
+            <p class="text-[11px] text-amber-300">
+              No code graph for this repository — impact edges, symbol search and dead-code
+              detection have nothing to read.
+              {#if codegraph.reason}
+                <span class="text-textMuted font-mono">({codegraph.reason})</span>
+              {/if}
+            </p>
+          {/if}
+        </section>
+      {/if}
 
       {#if deadSymbolsAvailable && deadSymbols.length > 0}
         <section class="space-y-2 pb-4">
