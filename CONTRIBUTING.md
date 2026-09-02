@@ -195,8 +195,36 @@ GitPulse/
     ├── harness/          MANVI policy gate, sidecar protocol
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot)
     ├── updates/          Opt-in release check
+    ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
+    ├── bin/              Headless entry points (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
 ```
+
+### Headless binaries
+
+The desktop app is not the only way into the control plane. Two binaries build
+from the same crate and share its modules, so neither can drift from what the
+app enforces:
+
+| Binary | Shape | What it is for |
+| --- | --- | --- |
+| `gitpulse-mcp` | JSON-RPC over stdio (MCP) | Lets an agent *read* the control plane: ledger events, task view, code graph, provenance freshness, git reader. Request/response only; it starts nothing and schedules nothing. |
+| `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
+
+`gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
+a second surface answering the same questions from the same store would be a
+second thing to keep in step) and never takes a lease, checks out a task, or
+writes a file — those belong to DevCouncil and Manvi, and a background process
+holding a writer lease would contend with the agent doing the work.
+
+```bash
+gitpulsed --interval 300 /path/to/repo
+```
+
+Interruption is safe by construction rather than by signal handling: each
+append is one transaction against a WAL database, and catch-up is idempotent
+against a watermark read back out of the ledger, so the next cycle re-does
+whatever an interrupted one did not finish and writes it exactly once.
 
 ### The layers, and what each one owns
 
