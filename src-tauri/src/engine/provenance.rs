@@ -30,9 +30,22 @@ pub struct SessionEpisodeNote {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProvenanceFreshness {
     pub commit_sha: String,
-    pub distance: u32,
-    pub confidence: f32,
+    /// Commits between this one and the base, or `None` when it could not be
+    /// measured.
+    ///
+    /// `None` is not zero. Zero means "nothing has moved since this was
+    /// verified", which is the strongest possible statement; a failed
+    /// measurement means nothing at all, and the two must never render the
+    /// same. This field was a bare `u32` defaulting to 0 on failure, so an
+    /// unreachable base branch — or a commit that is not an ancestor of it —
+    /// reported maximum freshness.
+    pub distance: Option<u32>,
+    /// Decays with distance. `None` when distance could not be measured.
+    pub confidence: Option<f32>,
+    /// True only when the distance was measured *and* is zero.
     pub is_fresh: bool,
+    /// Empty when the distance was measured; otherwise why it was not.
+    pub unmeasured_reason: String,
     pub verification: Option<VerificationNote>,
     pub session: Option<SessionEpisodeNote>,
 }
@@ -154,24 +167,35 @@ pub fn compute_freshness(
     base_branch: Option<&str>,
 ) -> ProvenanceFreshness {
     let base = base_branch.unwrap_or("HEAD");
-    let count_output = Command::new("git")
+
+    // Every failure below yields `None` with a reason, never 0. A distance of
+    // zero is the strongest claim this type can make — "nothing has moved since
+    // this commit was verified" — and handing that to a caller because git
+    // could not answer is how a stale badge comes to read as a fresh one.
+    let (distance, unmeasured_reason) = match Command::new("git")
         .args(["rev-list", "--count", &format!("{commit_sha}..{base}")])
         .current_dir(repo_path)
-        .output();
+        .output()
+    {
+        Err(e) => (None, format!("could not run git rev-list: {e}")),
+        Ok(out) if !out.status.success() => (
+            None,
+            format!(
+                "git rev-list {commit_sha}..{base} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ),
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match text.parse::<u32>() {
+                Ok(n) => (Some(n), String::new()),
+                Err(_) => (None, format!("git rev-list returned {text:?}, not a count")),
+            }
+        }
+    };
 
-    let distance = count_output
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
-        })
-        .unwrap_or(0);
-
-    let confidence = 1.0 / (1.0 + 0.1 * distance as f32);
-    let is_fresh = distance == 0;
+    let confidence = distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32));
+    let is_fresh = distance == Some(0);
 
     let verification = read_verification_note(repo_path, commit_sha).unwrap_or(None);
     let session = read_session_note(repo_path, commit_sha).unwrap_or(None);
@@ -181,6 +205,7 @@ pub fn compute_freshness(
         distance,
         confidence,
         is_fresh,
+        unmeasured_reason,
         verification,
         session,
     }
@@ -241,8 +266,140 @@ mod tests {
         assert_eq!(read, Some(note));
 
         let freshness = compute_freshness(path, &sha, None);
-        assert_eq!(freshness.distance, 0);
+        assert_eq!(freshness.distance, Some(0));
         assert!(freshness.is_fresh);
-        assert_eq!(freshness.confidence, 1.0);
+        assert_eq!(freshness.confidence, Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod freshness_honesty_tests {
+    use super::*;
+
+    fn repo_with_commits(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "T"]);
+        git(&["config", "user.email", "t@e.com"]);
+        for i in 0..n {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-m", &format!("c{i}")]);
+        }
+        dir
+    }
+
+    fn head(dir: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The regression this type exists to prevent.
+    ///
+    /// `distance` was a bare `u32` that defaulted to 0 whenever `rev-list`
+    /// failed — an unreachable base, a commit that is not its ancestor, a
+    /// missing repository. Zero is the strongest claim the type can make
+    /// ("nothing has moved since this was verified"), so every failed
+    /// measurement rendered as maximum freshness and confidence 1.0.
+    #[test]
+    fn an_unmeasurable_distance_is_not_a_distance_of_zero() {
+        let dir = repo_with_commits(1);
+        let sha = head(dir.path());
+
+        let f = compute_freshness(
+            dir.path().to_str().unwrap(),
+            &sha,
+            Some("no-such-branch-anywhere"),
+        );
+        assert_eq!(f.distance, None, "an unreachable base is not zero distance");
+        assert_eq!(f.confidence, None, "no distance means no confidence");
+        assert!(!f.is_fresh, "an unmeasured commit must never read as fresh");
+        assert!(
+            !f.unmeasured_reason.is_empty(),
+            "the failure must explain itself"
+        );
+    }
+
+    #[test]
+    fn a_commit_at_the_tip_is_fresh() {
+        let dir = repo_with_commits(1);
+        let sha = head(dir.path());
+        let f = compute_freshness(dir.path().to_str().unwrap(), &sha, Some("main"));
+        assert_eq!(f.distance, Some(0));
+        assert_eq!(f.confidence, Some(1.0));
+        assert!(f.is_fresh);
+        assert!(f.unmeasured_reason.is_empty());
+    }
+
+    #[test]
+    fn confidence_decays_as_the_base_moves_ahead() {
+        let dir = repo_with_commits(4);
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD~3"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        let old = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let f = compute_freshness(dir.path().to_str().unwrap(), &old, Some("main"));
+        assert_eq!(f.distance, Some(3));
+        assert!(!f.is_fresh, "three commits behind is not fresh");
+        let c = f.confidence.expect("measured");
+        assert!(c < 1.0 && c > 0.0, "confidence should decay, got {c}");
+    }
+
+    #[test]
+    fn a_missing_repository_reports_why_rather_than_full_confidence() {
+        let f = compute_freshness("/definitely/not/a/repo", "deadbeef", Some("main"));
+        assert_eq!(f.distance, None);
+        assert_eq!(f.confidence, None);
+        assert!(!f.is_fresh);
+        assert!(!f.unmeasured_reason.is_empty());
+    }
+
+    /// A note round-trips, and a commit with none is distinguishable from one
+    /// whose note could not be read.
+    #[test]
+    fn a_verification_note_round_trips() {
+        let dir = repo_with_commits(1);
+        let repo = dir.path().to_str().unwrap();
+        let sha = head(dir.path());
+
+        assert_eq!(read_verification_note(repo, &sha).unwrap(), None);
+
+        let note = VerificationNote {
+            verdict: "passed".into(),
+            verified_at: 1_788_000_000,
+            checked_by: "ci.local".into(),
+            task_id: Some("TASK-1".into()),
+            details: Some("6 steps".into()),
+        };
+        write_verification_note(repo, &sha, &note).expect("write");
+        assert_eq!(read_verification_note(repo, &sha).unwrap(), Some(note));
+
+        // ...and it is in git, not only in our memory: a fresh clone would
+        // carry it, which is the whole point of storing it here.
+        let out = Command::new("git")
+            .args(["notes", &format!("--ref={VERIFICATION_NOTES_REF}"), "list"])
+            .current_dir(repo)
+            .output()
+            .expect("git");
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&sha[..8]),
+            "the note is not attached to the commit in git"
+        );
     }
 }
