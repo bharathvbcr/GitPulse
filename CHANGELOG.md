@@ -18,6 +18,10 @@ before that tag is pushed.
 - Remotes panel: add, rename, set URL, prune, and remove, with a two-step confirm that names the cost for prune/remove/set-url.
 - Tag create/delete/checkout from the branch list. A capped or unreadable tag list says so instead of looking like the whole history.
 - Submodule sync and deinit (working-copy remove) alongside initialize. Deinit never passes `--force`.
+- Zero-dependency vector language logo icon system covering 34+ programming languages, configuration formats, and markup types (`LanguageLogo.svelte`, `languageLogos.ts`).
+- Integrated language logos across LanguageBar, FileTreePanel, FileViewer editor tabs, Sidebar staged/unstaged changes, CommitDetails changed files list, DiffViewer toolbar, LivePulse dashboard, and CommandPalette symbol/file searches.
+- File path hierarchy formatting (`formatPathParts`) in Sidebar and CommitDetails, dimming directory paths and highlighting filenames for improved scannability.
+- Interactive LanguageBar pills that switch directly to the Files tab and dispatch custom filter events.
 
 ### Changed
 

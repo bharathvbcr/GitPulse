@@ -59,6 +59,9 @@ flowchart TD
   - **Images & Media**: Visual viewer with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters for compiled and binary artifacts.
 - **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators.
+- **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
+- **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
+- **Interactive Language Bar**: Live breakdown of repository language distribution with click-to-filter navigation into the Files view.
 
 ### 1.2 Graph (`history`)
 - **GPU Canvas Rendering**: High-performance commit graph capable of rendering repositories with 100,000+ commits smoothly.

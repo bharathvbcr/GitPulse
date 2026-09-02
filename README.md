@@ -129,6 +129,7 @@ flowchart LR
 | **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, impact edge annotations, and one-click selective hunk/line patch staging. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
+| **Language Vector Logos & Path Scannability** | Zero-dependency vector logos for 34+ programming languages, configs, and markups across the file tree, editor tabs, diff toolbar, and dashboard, with dimmed path hierarchy for scannable file lists. |
 
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
