@@ -10,8 +10,18 @@
     /** Rows to window over. Omit and pass `itemCount` to render blanks. */
     items?: readonly T[];
     itemCount?: number;
-    /** Fixed row height in px; rows must not wrap. */
+    /** Fixed row height in px; rows must not wrap while virtualizing. */
     rowHeight: number;
+    /**
+     * Set false to lay every row out in normal flow instead of windowing.
+     *
+     * Windowing positions row `n` at `n * rowHeight`, so it is only correct
+     * while every row really is that tall. A row that wraps is not: it draws
+     * over its neighbours and its own overflow is clipped away. Callers that
+     * allow wrapping turn this off and accept rendering the whole list, which
+     * is why they also have to bound how much they will render.
+     */
+    virtualize?: boolean;
     overscan?: number;
     /**
      * Two-way bound scroll position. Binding several lists to one variable
@@ -27,6 +37,7 @@
     items,
     itemCount,
     rowHeight,
+    virtualize = true,
     overscan = 8,
     scrollTop = $bindable(0),
     row,
@@ -84,14 +95,23 @@
 </script>
 
 <div bind:this={scroller} onscroll={handleScroll} class="overflow-auto gp-scroll relative {className}">
-  <div style="height: {total * rowHeight}px; position: relative;">
-    <div
-      class="absolute inset-x-0 top-0"
-      style="transform: translate3d(0, {win.start * rowHeight}px, 0);"
-    >
-      {#each { length: win.end - win.start } as _, i}
-        {@render row(items?.[win.start + i], win.start + i)}
-      {/each}
+  {#if virtualize}
+    <div style="height: {total * rowHeight}px; position: relative;">
+      <div
+        class="absolute inset-x-0 top-0"
+        style="transform: translate3d(0, {win.start * rowHeight}px, 0);"
+      >
+        {#each { length: win.end - win.start } as _, i}
+          {@render row(items?.[win.start + i], win.start + i)}
+        {/each}
+      </div>
     </div>
-  </div>
+  {:else}
+    <!-- Normal flow: each row takes the height its content needs, and the
+         browser does the layout. Scroll binding still works, so split panes
+         stay in lockstep. -->
+    {#each { length: total } as _, i}
+      {@render row(items?.[i], i)}
+    {/each}
+  {/if}
 </div>

@@ -52,6 +52,19 @@
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
   const ROW_HEIGHT = 20;
+  /**
+   * How many diff lines may be wrapped at once.
+   *
+   * Wrapping makes rows variable-height, and variable-height rows cannot be
+   * windowed against a fixed `rowHeight` — that is what produced overlapping
+   * rows whose first and last wrapped segments were clipped away, hiding code
+   * rather than reflowing it. So a wrapped diff renders in full, and the cap
+   * is what keeps "renders in full" from meaning a hundred thousand rows.
+   *
+   * Diffs read closely enough to want wrapping are small; a diff larger than
+   * this is being skimmed, and skimming works better unwrapped anyway.
+   */
+  const WRAP_MAX_LINES = 4_000;
   const OVERSCAN = 20;
   /** Beyond this, even the light parse stops being worth its memory. */
   const MAX_RENDER_LINES = 300_000;
@@ -455,6 +468,17 @@
     return rows;
   });
 
+  /**
+   * Whether wrapping is offered at all for this diff.
+   *
+   * Counted over whichever list is on screen, because split rows pair lines
+   * and are therefore fewer than the unified lines they came from.
+   */
+  const wrapRowCount = $derived(viewMode === "split" ? splitRows.length : lines.length);
+  const wrapAvailable = $derived(wrapRowCount <= WRAP_MAX_LINES);
+  /** Wrapping actually in effect — asked for, and permitted. */
+  const wrapping = $derived(wordWrap && wrapAvailable);
+
   function annotateSplitPair(row: SplitRow): void {
     const left = row.left;
     const right = row.right;
@@ -565,7 +589,7 @@
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
   <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
-    <div class="flex items-center gap-2 truncate">
+    <div class="flex gap-2 {wrapping ? 'items-start' : 'items-center'} truncate">
       {#if $repoStore.selectedFilePath}
         <LanguageLogo filePath={$repoStore.selectedFilePath} size={16} class="shrink-0" />
       {:else}
@@ -633,9 +657,15 @@
       <button
         type="button"
         onclick={() => (wordWrap = !wordWrap)}
-        aria-pressed={wordWrap}
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-xs {wordWrap ? 'border-accent/60 text-accent font-semibold bg-accent/10' : 'text-textMuted'}"
-        title="Toggle word wrap"
+        aria-pressed={wrapping}
+        disabled={!wrapAvailable}
+        title={wrapAvailable
+          ? "Wrap long lines"
+          : `Wrapping is unavailable above ${WRAP_MAX_LINES.toLocaleString()} lines — this diff has ${wrapRowCount.toLocaleString()}. Wrapped rows vary in height and cannot be windowed, so the whole diff would render at once.`}
+        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-xs disabled:opacity-40 {wrapping
+          ? 'border-accent/60 text-accent font-semibold bg-accent/10'
+          : 'text-textMuted'}"
+        aria-label="Toggle word wrap"
       >
         <WrapText size={13} />
         <span class="hidden sm:inline">Wrap</span>
@@ -683,7 +713,7 @@
   </div>
 
   {#if truncatedSource}
-    <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-600 dark:text-amber-300 font-sans flex items-center gap-2 shrink-0">
+    <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-600 dark:text-amber-300 font-sans flex gap-2 {wrapping ? 'items-start' : 'items-center'} shrink-0">
       <span>⚠</span>
       <span>Diff exceeds {MAX_RENDER_LINES.toLocaleString()} lines — showing the first {MAX_RENDER_LINES.toLocaleString()}. Use the filter bar or open specific files instead of one massive commit.</span>
     </div>
@@ -713,12 +743,12 @@
       {/if}
       <!-- Main Virtualized Diff Surface -->
       {#if viewMode === "unified"}
-        <VirtualList items={lines} rowHeight={ROW_HEIGHT} overscan={OVERSCAN} bind:scrollTop={unifiedScroll} class="flex-1 min-h-0">
+        <VirtualList items={lines} rowHeight={ROW_HEIGHT} virtualize={!wrapping} overscan={OVERSCAN} bind:scrollTop={unifiedScroll} class="flex-1 min-h-0">
           {#snippet row(_, index)}
             {@const line = unifiedRow(index)}
             {#if line}
               {#if line.type === "hdr"}
-                <div class="px-3 bg-surfaceHover text-textMuted text-[11px] font-medium flex items-center justify-between h-5 overflow-x-auto" style="height: {ROW_HEIGHT}px;">
+                <div class="px-3 bg-surfaceHover text-textMuted text-[11px] font-medium flex items-center justify-between h-5 overflow-x-auto" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
                   <span class="truncate font-mono">{line.content}</span>
                   {#if isWorkingTreeFile && line.content.startsWith("@@")}
                     <button
@@ -734,18 +764,18 @@
                   {/if}
                 </div>
               {:else if line.type === "meta"}
-                <div class="px-3 bg-surfaceHover/40 text-textMuted/70 text-[10px] italic flex items-center h-5 select-none overflow-x-auto" style="height: {ROW_HEIGHT}px;">
+                <div class="px-3 bg-surfaceHover/40 text-textMuted/70 text-[10px] italic flex items-center h-5 select-none overflow-x-auto" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
                   <span class="whitespace-pre">{line.content}</span>
                 </div>
               {:else if line.type === "binary"}
-                <div class="px-3 bg-amber-500/10 text-amber-700 dark:text-amber-300/90 text-[11px] flex items-center gap-2 h-5 select-none overflow-x-auto" style="height: {ROW_HEIGHT}px;">
+                <div class="px-3 bg-amber-500/10 text-amber-700 dark:text-amber-300/90 text-[11px] flex gap-2 {wrapping ? 'items-start' : 'items-center'} h-5 select-none overflow-x-auto" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
                   <span class="shrink-0 rounded-sm bg-amber-500/20 px-1 font-sans">binary</span>
                   <span class="whitespace-pre">{line.content}</span>
                 </div>
               {:else if line.type === "add"}
                 <div
-                  class="px-3 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 flex items-center gap-2 hover:bg-emerald-500/25 {wordWrap ? 'overflow-hidden' : 'overflow-x-auto'} {selectedLines.has(index) ? 'ring-1 ring-inset ring-accent/60 bg-emerald-500/25' : ''}"
-                  style="height: {ROW_HEIGHT}px;"
+                  class="px-3 bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 flex gap-2 {wrapping ? 'items-start' : 'items-center'} hover:bg-emerald-500/25 {wrapping ? '' : 'overflow-x-auto'} {selectedLines.has(index) ? 'ring-1 ring-inset ring-accent/60 bg-emerald-500/25' : ''}"
+                  style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}
                   role="group"
                   onpointerdown={(e) => onLinePointerDown(index, e)}
                   onpointerenter={() => onLinePointerEnter(index)}
@@ -765,12 +795,12 @@
                   {/if}
                   <span class="w-10 text-right text-textMuted/50 text-[10px] select-none shrink-0">{line.newNo ?? ""}</span>
                   <span class="text-emerald-600 dark:text-emerald-400 select-none font-bold shrink-0">+</span>
-                  <span class="{wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
+                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
                 </div>
               {:else if line.type === "del"}
                 <div
-                  class="px-3 bg-rose-500/15 text-rose-800 dark:text-rose-300 flex items-center gap-2 hover:bg-rose-500/25 {wordWrap ? 'overflow-hidden' : 'overflow-x-auto'} {selectedLines.has(index) ? 'ring-1 ring-inset ring-accent/60 bg-rose-500/25' : ''}"
-                  style="height: {ROW_HEIGHT}px;"
+                  class="px-3 bg-rose-500/15 text-rose-800 dark:text-rose-300 flex gap-2 {wrapping ? 'items-start' : 'items-center'} hover:bg-rose-500/25 {wrapping ? '' : 'overflow-x-auto'} {selectedLines.has(index) ? 'ring-1 ring-inset ring-accent/60 bg-rose-500/25' : ''}"
+                  style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}
                   role="group"
                   onpointerdown={(e) => onLinePointerDown(index, e)}
                   onpointerenter={() => onLinePointerEnter(index)}
@@ -790,39 +820,39 @@
                   {/if}
                   <span class="w-10 text-right text-textMuted/50 text-[10px] select-none shrink-0">{line.oldNo ?? ""}</span>
                   <span class="text-rose-600 dark:text-rose-400 select-none font-bold shrink-0">-</span>
-                  <span class="{wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
+                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
                 </div>
               {:else}
-                <div class="px-3 text-textPrimary/80 flex items-center gap-2 hover:bg-surfaceHover/40 {wordWrap ? 'overflow-hidden' : 'overflow-x-auto'}" style="height: {ROW_HEIGHT}px;">
+                <div class="px-3 text-textPrimary/80 flex gap-2 {wrapping ? 'items-start' : 'items-center'} hover:bg-surfaceHover/40 {wrapping ? '' : 'overflow-x-auto'}" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
                   {#if isWorkingTreeFile}
                     <span class="w-3.5 shrink-0"></span>
                   {/if}
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.oldNo ?? line.newNo ?? ""}</span>
                   <span class="w-2 select-none shrink-0"></span>
-                  <span class="{wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{line.content.startsWith(" ") ? line.content.substring(1) : line.content}</span>
+                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{line.content.startsWith(" ") ? line.content.substring(1) : line.content}</span>
                 </div>
               {/if}
             {/if}
           {/snippet}
         </VirtualList>
       {:else}
-        <VirtualList items={splitRows} rowHeight={ROW_HEIGHT} overscan={OVERSCAN} bind:scrollTop={splitScroll} class="flex-1 min-h-0 border-r border-border/80">
+        <VirtualList items={splitRows} rowHeight={ROW_HEIGHT} virtualize={!wrapping} overscan={OVERSCAN} bind:scrollTop={splitScroll} class="flex-1 min-h-0 border-r border-border/80">
           {#snippet row(_, index)}
             {@const row = splitRow(index)}
             {#if row}
               {@const left = row.left}
               {@const right = row.right}
-              <div class="grid grid-cols-2 divide-x divide-border" style="height: {ROW_HEIGHT}px;">
-                <div class="px-3 flex items-center gap-2 {wordWrap ? 'overflow-hidden' : 'overflow-x-auto'} {left ? (left.type === 'del' ? 'bg-rose-500/15 text-rose-800 dark:text-rose-300' : left.type === 'add' ? '' : left.type === 'meta' || left.type === 'binary' || left.type === 'hdr' ? 'bg-surfaceHover text-textMuted' : 'text-textPrimary/80') : ''}">
+              <div class="grid grid-cols-2 divide-x divide-border" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
+                <div class="px-3 flex min-w-0 gap-2 {wrapping ? 'items-start' : 'items-center'} {wrapping ? '' : 'overflow-x-auto'} {left ? (left.type === 'del' ? 'bg-rose-500/15 text-rose-800 dark:text-rose-300' : left.type === 'add' ? '' : left.type === 'meta' || left.type === 'binary' || left.type === 'hdr' ? 'bg-surfaceHover text-textMuted' : 'text-textPrimary/80') : ''}">
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{left?.oldNo ?? ""}</span>
                   {#if left}
-                    <span class="{wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if left.segments}{#each left.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{left.type === "add" || left.type === "del" ? left.content.substring(1) : left.content}{/if}</span>
+                    <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if left.segments}{#each left.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{left.type === "add" || left.type === "del" ? left.content.substring(1) : left.content}{/if}</span>
                   {/if}
                 </div>
-                <div class="px-3 flex items-center gap-2 {wordWrap ? 'overflow-hidden' : 'overflow-x-auto'} {right ? (right.type === 'add' ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300' : right.type === 'meta' || right.type === 'binary' || right.type === 'hdr' ? 'bg-surfaceHover text-textMuted italic' : 'text-textPrimary/80') : ''}">
+                <div class="px-3 flex min-w-0 gap-2 {wrapping ? 'items-start' : 'items-center'} {wrapping ? '' : 'overflow-x-auto'} {right ? (right.type === 'add' ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300' : right.type === 'meta' || right.type === 'binary' || right.type === 'hdr' ? 'bg-surfaceHover text-textMuted italic' : 'text-textPrimary/80') : ''}">
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{right?.newNo ?? ""}</span>
                   {#if right}
-                    <span class="{wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if right.segments}{#each right.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{right.type === "add" || right.type === "del" ? right.content.substring(1) : right.content}{/if}</span>
+                    <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if right.segments}{#each right.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{right.type === "add" || right.type === "del" ? right.content.substring(1) : right.content}{/if}</span>
                   {/if}
                 </div>
               </div>
@@ -860,7 +890,7 @@
     {#if isWorkingTreeFile && selectedLines.size > 0}
       <div class="p-2.5 border-t border-border/80 bg-surface flex items-center justify-between font-sans text-xs shrink-0 shadow-lg">
         <span class="text-textMuted font-mono text-[11px]">{selectedLines.size} line(s) selected for staging</span>
-        <div class="flex items-center gap-2">
+        <div class="flex gap-2 {wrapping ? 'items-start' : 'items-center'}">
           <button onclick={() => selectedLines = new Set()} class="gp-btn !py-1 !text-xs">
             Clear
           </button>

@@ -15,9 +15,45 @@ describe("DiffViewer row chrome", () => {
   });
 
   it("lets long diff lines scroll instead of clipping silently", () => {
-    // Every unified row container scrolls horizontally; none hard-clips.
+    // Unwrapped rows scroll horizontally, and nothing hard-clips a row: an
+    // `overflow-hidden` row with a pinned height throws the remainder away.
     expect(source).not.toMatch(/overflow-hidden[^"']*whitespace-pre/);
-    expect(source).toContain('overflow-x-auto" style="height: {ROW_HEIGHT}px;"');
+    // Scoped to rows: the pane, its body and the minimap rail legitimately
+    // clip, and a blanket ban would fail on those without saying anything
+    // about a diff line.
+    expect(source).not.toMatch(/wrapping \? 'overflow-hidden'/);
+    expect(source).toContain("'overflow-x-auto'");
+  });
+
+  it("never pins a row's height while it is wrapping", () => {
+    // The regression this guards: every row carried `height: ROW_HEIGHT` while
+    // wrap set `whitespace-pre-wrap`, so a line wrapping to three visual rows
+    // was squeezed into 20px — drawn over its neighbours, centred so only the
+    // middle slice showed, with the start of the line invisible. Wrapping made
+    // code disappear rather than reflow.
+    expect(source).toContain("min-height: ${ROW_HEIGHT}px");
+    expect(source).not.toContain('style="height: {ROW_HEIGHT}px;"');
+  });
+
+  it("stops windowing while wrapping, because rows are no longer uniform", () => {
+    // VirtualList places row n at n * rowHeight. That is only true while every
+    // row is that tall, which wrapping breaks.
+    expect(source).toContain("virtualize={!wrapping}");
+  });
+
+  it("bounds how much it will render unwrapped, and says why when it will not", () => {
+    // Rendering a wrapped diff in full is what makes it correct; the cap is
+    // what keeps that from meaning a hundred thousand rows. A toggle that
+    // silently does nothing is a control users keep pressing.
+    expect(source).toContain("WRAP_MAX_LINES");
+    expect(source).toContain("disabled={!wrapAvailable}");
+    expect(source).toContain("Wrapping is unavailable above");
+  });
+
+  it("top-aligns a wrapped row instead of centring it", () => {
+    // Centring is right for one line and wrong for three: it shows the middle
+    // and cuts the rest.
+    expect(source).toContain("wrapping ? 'items-start' : 'items-center'");
   });
 
   it("renders commit metadata and binary notices as their own row kinds", () => {
