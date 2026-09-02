@@ -114,6 +114,7 @@ export const CONTRACTS = Object.freeze([
   { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
   { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"] },
   { label: "ingest", rustPath: rust("ingest", "mod.rs"), tsPath: ts("ingest", "types.ts"), structs: ["CatchUp"] },
+  { label: "grants", rustPath: rust("grants", "mod.rs"), tsPath: ts("grants", "types.ts"), structs: ["Grant", "Grantor", "GrantScope", "GrantView"] },
   { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskView"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport"] },
   { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },

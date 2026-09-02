@@ -2,6 +2,8 @@
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
+  import { invoke } from "@tauri-apps/api/core";
+  import type { GrantView } from "../grants/types";
   import { formatError } from "../ui/formatError";
   import {
     RefreshCw,
@@ -29,6 +31,41 @@
   let preferred = $derived($harnessStore.preferred);
   // Newest first: the question the journal answers is "what just happened".
   let recentActions = $derived($harnessStore.actions.slice().reverse());
+
+  /**
+   * The harness's grant ledger.
+   *
+   * A verdict whose status is `granted` says a rule fired and someone waived
+   * it. Until this pane showed the ledger, there was no way to see who, why, or
+   * until when — so a granted allow was indistinguishable from a clean one to
+   * anyone reading the journal.
+   */
+  let grants = $state<GrantView | null>(null);
+  let grantsRepo: string | null = null;
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    // Guarded on a genuine repo switch: this effect re-runs on every store
+    // emission, and the ~6s status poll is one.
+    if (!repo || repo === grantsRepo) return;
+    grantsRepo = repo;
+    void invoke<GrantView>("cmd_grants_view", { repoPath: repo })
+      .then((v) => {
+        grants = v;
+      })
+      .catch(() => {
+        // A failed read leaves the section hidden rather than claiming there
+        // are no grants. The two are different and must not look the same.
+        grants = null;
+      });
+  });
+
+  /** Grants that have not expired, newest first. */
+  let activeGrants = $derived(
+    (grants?.grants ?? [])
+      .filter((g) => !g.expires_at || Date.parse(g.expires_at) > Date.now())
+      .slice()
+      .reverse(),
+  );
 
   type CapabilityTab = "health" | "coverage" | "terminal" | "github";
 
@@ -360,6 +397,57 @@
       {#each branchWarnings as warning}
         <div class="text-amber-400">{warning}</div>
       {/each}
+    </section>
+  {/if}
+
+  <!-- Grant ledger: who waived which rule, and until when -->
+  {#if grants?.available}
+    <section class="gp-card p-4 space-y-2">
+      <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted flex items-center gap-1.5">
+        <ShieldAlert size={11} />
+        <span>Grants ({activeGrants.length} active of {grants.grants.length})</span>
+      </h3>
+      {#if grants.error}
+        <!--
+          A ledger that exists and could not be parsed must never render as a
+          repository where nothing was ever granted.
+        -->
+        <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3 text-[11px] text-amber-400 leading-relaxed">
+          The grant ledger could not be read, so this list is not the whole
+          truth: {grants.error}
+        </div>
+      {:else if grants.grants.length === 0}
+        <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
+          No rule has been waived in this repository.
+        </div>
+      {:else}
+        <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-40 overflow-y-auto">
+          {#each activeGrants as grant (grant.id)}
+            <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]">
+              <div class="flex items-center gap-1.5 min-w-0">
+                <span class="font-mono text-[10px] text-accent shrink-0">{grant.scope.rule || "policy"}</span>
+                <span class="truncate text-textPrimary">{grant.scope.target}</span>
+                {#if grant.consumed}
+                  <span class="ml-auto shrink-0 text-[9px] uppercase text-textMuted">used</span>
+                {/if}
+              </div>
+              <div class="text-textMuted truncate">
+                {grant.grantor.name || grant.grantor.authority || "unknown"}
+                {#if grant.reason}· {grant.reason}{/if}
+                {#if grant.expires_at}· expires {grant.expires_at}{/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+        <!--
+          Revocation is Manvi's to perform. GitPulse is a read-only consumer of
+          this state, and a second writer could interleave with the harness's
+          own serialised writes to the same file.
+        -->
+        <p class="text-[10px] text-textMuted">
+          Revoke with <code class="font-mono">manvi grants revoke &lt;id&gt;</code>; GitPulse only reads this ledger.
+        </p>
+      {/if}
     </section>
   {/if}
 

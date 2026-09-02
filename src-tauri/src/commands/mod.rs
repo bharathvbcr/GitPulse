@@ -2544,3 +2544,14 @@ pub async fn cmd_codeintel_trace_between(
     })
     .await
 }
+
+/// The harness's grant ledger for this repository.
+///
+/// Read-only, and a file read rather than a protocol op: the serve plane holds
+/// no grant ledger, so an op there could only ever answer "none". Revocation is
+/// deliberately absent — it mutates state Manvi owns, and a second writer could
+/// interleave with the harness's own serialised writes.
+#[tauri::command(async)]
+pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantView, String> {
+    off_thread(move || Ok(crate::grants::view(&repo_path))).await
+}

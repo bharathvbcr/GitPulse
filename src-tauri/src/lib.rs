@@ -8,6 +8,7 @@ pub mod desktop;
 pub mod diff;
 pub mod engine;
 pub mod github;
+pub mod grants;
 pub mod graph;
 pub mod harness;
 pub mod ingest;
@@ -177,6 +178,7 @@ pub fn run() {
             cmd_unbind_worktree_task,
             cmd_worktree_task,
             cmd_catch_up,
+            cmd_grants_view,
             cmd_codeintel_status,
             cmd_codeintel_search,
             cmd_codeintel_impact,

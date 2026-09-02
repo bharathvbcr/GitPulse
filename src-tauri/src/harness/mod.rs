@@ -413,6 +413,9 @@ done
         std::fs::write(&script, body).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        let _serial = sidecar::SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         sidecar::set_test_binary(Some(script.to_string_lossy().into_owned()));
         struct Clear;
         impl Drop for Clear {

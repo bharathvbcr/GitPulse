@@ -497,6 +497,8 @@ pub fn resolve_binary() -> Option<String> {
 /// parallel; this stays inside `cfg(test)` builds only.
 #[cfg(test)]
 static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) static SLOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -1148,10 +1150,6 @@ mod tests {
         );
         assert!(!status.success(), "a SIGKILLed sleep cannot report success");
     }
-
-    /// Serializes the tests below that drive the process-wide slot, so they
-    /// cannot interleave their seeding/poisoning with each other.
-    static SLOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Builds a live [`Sidecar`] around an arbitrary shell script, mirroring
     /// `spawn`'s reader plumbing but skipping its handshake — each test wants
