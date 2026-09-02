@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
-import type { BranchInfo, TagInfo } from "../branches/types";
+import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
 import { graphStore, serverFetchableQuery } from "./graphStore";
 import type { InvokeFn } from "./graphStore";
@@ -49,8 +49,8 @@ import {
   watchStatesEqual,
   type WatchState,
 } from "../repos/watchState";
-import type { RemoteChange } from "../repos/remotes";
-import type { SubmoduleChange } from "../repos/submodules";
+import { parseRemoteList, type RemoteChange, type RemoteInfo } from "../repos/remotes";
+import { parseSubmoduleList, type SubmoduleChange, type SubmoduleInfo } from "../repos/submodules";
 import {
   runAcrossRepos,
   type BulkRunReport,
@@ -218,6 +218,10 @@ export interface RepoSession {
   stashEntries: StashEntry[];
   /** True when the stash probe failed, so an empty list is not read as "none". */
   stashFailed: boolean;
+  /** True when older tags exist beyond the listing cap. */
+  tagsTruncated: boolean;
+  /** True when the tag list could not be read, so empty is not "no tags". */
+  tagsFailed: boolean;
   /**
    * Whether this repository is receiving live filesystem updates.
    *
@@ -262,6 +266,10 @@ export interface RepoState {
   stashEntries: StashEntry[];
   /** True when the active session's stash probe failed. */
   stashFailed: boolean;
+  /** True when older tags exist beyond the listing cap. */
+  tagsTruncated: boolean;
+  /** True when the active session's tag list could not be read. */
+  tagsFailed: boolean;
   /** Whether the active session is receiving live filesystem updates. */
   watch: WatchState;
 }
@@ -361,7 +369,7 @@ function emptyProjected(): RepoState {
     selectedIsStaged: false,
     selectedIgnoreWhitespace: false,
     selectedDiff: null,
-    activeTab: "history",
+    activeTab: "work",
     isLoading: false,
     error: null,
     commitDraft: "",
@@ -373,6 +381,8 @@ function emptyProjected(): RepoState {
     operation: IDLE_OPERATION,
     stashEntries: [],
     stashFailed: false,
+    tagsTruncated: false,
+    tagsFailed: false,
     watch: WATCH_UNKNOWN,
   };
 }
@@ -398,7 +408,7 @@ function createSession(
     selectedIgnoreWhitespace: extras.selectedIgnoreWhitespace ?? false,
     selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
-    activeTab: extras.activeTab ?? "history",
+    activeTab: extras.activeTab ?? "work",
     searchQuery: extras.searchQuery ?? "",
     selectedBranch: extras.selectedBranch ?? null,
     commitDraft: extras.commitDraft ?? "",
@@ -412,6 +422,8 @@ function createSession(
     operation: extras.operation ?? IDLE_OPERATION,
     stashEntries: extras.stashEntries ?? [],
     stashFailed: extras.stashFailed ?? false,
+    tagsTruncated: extras.tagsTruncated ?? false,
+    tagsFailed: extras.tagsFailed ?? false,
     watch: extras.watch ?? WATCH_UNKNOWN,
   };
 }
@@ -459,7 +471,7 @@ function project(internal: InternalState): RepoState {
     selectedIsStaged: active?.selectedIsStaged ?? false,
     selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
     selectedDiff: active?.selectedDiff ?? null,
-    activeTab: active?.activeTab ?? "history",
+    activeTab: active?.activeTab ?? "work",
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
     commitDraft: active?.commitDraft ?? "",
@@ -471,6 +483,8 @@ function project(internal: InternalState): RepoState {
     operation: active?.operation ?? IDLE_OPERATION,
     stashEntries: active?.stashEntries ?? [],
     stashFailed: active?.stashFailed ?? false,
+    tagsTruncated: active?.tagsTruncated ?? false,
+    tagsFailed: active?.tagsFailed ?? false,
     watch: active?.watch ?? WATCH_UNKNOWN,
   };
 }
@@ -855,13 +869,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     operation: OperationState;
     stashEntries: StashEntry[];
     stashFailed: boolean;
+    tagsTruncated: boolean;
+    tagsFailed: boolean;
   }> {
     const [branches, statuses, tags, operation, stash] = await Promise.all([
       invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path }),
       invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path }),
-      invokeFn<TagInfo[]>("cmd_list_tags", { repoPath: path }).catch(
-        () => [] as TagInfo[],
-      ),
+      invokeFn<unknown>("cmd_list_tags", { repoPath: path })
+        .then((raw) => parseTagList(raw))
+        .catch(() => ({ tags: [] as TagInfo[], truncated: false, failed: true })),
       // A failed probe is recorded as a failure, never folded into "idle".
       // Reporting "no operation in progress" because the check itself broke
       // is what strands a user mid-merge in a UI insisting all is well. It
@@ -883,12 +899,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return {
       branches,
       statuses,
-      tags,
+      tags: tags.tags,
       currentBranch,
       defaultBranch,
       operation,
       stashEntries: stash.entries,
       stashFailed: stash.failed,
+      tagsTruncated: tags.truncated,
+      tagsFailed: tags.failed,
     };
   }
 
@@ -952,6 +970,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       operation: OperationState;
       stashEntries: StashEntry[];
       stashFailed: boolean;
+      tagsTruncated: boolean;
+      tagsFailed: boolean;
     },
   ) {
     if (live.branches.length === 0) return snapshot;
@@ -1892,10 +1912,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
     // --- remotes and submodules ----------------------------------------
 
-    listRemotes: async (): Promise<unknown[]> => {
+    listRemotes: async (): Promise<{ remotes: RemoteInfo[]; truncated: boolean }> => {
       const session = activeSession();
-      if (!session) return [];
-      return invokeFn<unknown[]>("cmd_list_remotes", { repoPath: session.path });
+      if (!session) return { remotes: [], truncated: false };
+      const raw = await invokeFn<unknown>("cmd_list_remotes", { repoPath: session.path });
+      const parsed = parseRemoteList(raw);
+      if (parsed.failed) {
+        throw new Error("The remote list was not readable.");
+      }
+      return { remotes: parsed.remotes, truncated: parsed.truncated };
     },
 
     remoteChange: async (change: RemoteChange) =>
@@ -1903,10 +1928,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_remote_change", { repoPath: path, change }),
       ),
 
-    listSubmodules: async (): Promise<unknown[]> => {
+    listSubmodules: async (): Promise<{ submodules: SubmoduleInfo[]; truncated: boolean }> => {
       const session = activeSession();
-      if (!session) return [];
-      return invokeFn<unknown[]>("cmd_list_submodules", { repoPath: session.path });
+      if (!session) return { submodules: [], truncated: false };
+      const raw = await invokeFn<unknown>("cmd_list_submodules", { repoPath: session.path });
+      const parsed = parseSubmoduleList(raw);
+      if (parsed.failed) {
+        throw new Error("The submodule list was not readable.");
+      }
+      return { submodules: parsed.submodules, truncated: parsed.truncated };
     },
 
     submoduleChange: async (change: SubmoduleChange) =>
@@ -1914,6 +1944,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         `submodule-${change.kind}`,
         ("path" in change && change.path) || "all submodules",
         (path) => invokeFn("cmd_submodule_change", { repoPath: path, change }),
+      ),
+
+    createTag: async (tagName: string, commitId?: string, message?: string) =>
+      runMutating("tag", tagName, (path) =>
+        invokeFn("cmd_create_tag", {
+          repoPath: path,
+          tagName,
+          commitId: commitId ?? null,
+          message: message ?? null,
+        }),
+      ),
+
+    deleteTag: async (tagName: string) =>
+      runMutating("tag-delete", tagName, (path) =>
+        invokeFn("cmd_delete_tag", { repoPath: path, tagName }),
       ),
 
     // --- workspace-wide -------------------------------------------------
@@ -2024,10 +2069,32 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("stash", message ?? "", (path) =>
         invokeFn("cmd_stash_save", { repoPath: path, message }),
       ),
-    stashPop: async () =>
-      runMutating("unstash", "", (path) =>
-        invokeFn("cmd_stash_pop", { repoPath: path }),
-      ),
+    stashPop: async () => {
+      // The menu/palette "Pop" used to call `git stash pop` on stash@{0}
+      // sight-unseen. The stash stack is shared with every worktree and
+      // agent: that path is what silently applied (or dropped) someone
+      // else's entry. Pop the entry this session last listed, by object
+      // id; refuse if the list could not be read or is empty.
+      const session = activeSession();
+      if (!session) return { ok: false as const, error: "No repository is open." };
+      if (session.stashFailed) {
+        return {
+          ok: false as const,
+          error:
+            "The stash list could not be read, so popping it would target the wrong entry.",
+        };
+      }
+      const top = session.stashEntries[0];
+      if (!top) return { ok: false as const, error: "Nothing is stashed." };
+      return runMutating("unstash", top.selector, (path) =>
+        invokeFn("cmd_stash_action", {
+          repoPath: path,
+          action: "pop",
+          index: top.index,
+          expectedOid: top.oid,
+        }),
+      );
+    },
     setActiveTab: (tab: ViewTab) => {
       const session = activeSession();
       if (!session) return;

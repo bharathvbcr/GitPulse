@@ -60,10 +60,9 @@ fn handle_tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "repo_path": { "type": "string", "description": "Absolute path to git repository" },
-                        "task_id": { "type": "string", "description": "Task identifier" }
+                        "repo_path": { "type": "string", "description": "Absolute path to git repository" }
                     },
-                    "required": ["repo_path", "task_id"]
+                    "required": ["repo_path"]
                 }
             },
             {
@@ -142,10 +141,48 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
             let ledger_status = gitpulse_lib::ledger::status(repo);
             let codeintel_status = gitpulse_lib::codeintel::status(repo);
+            // The advertised description names worktrees. Omitting the key
+            // would make an agent read "no worktrees" from a tool that never
+            // looked — the same lie the Work view exists to prevent.
+            const WORKTREE_CAP: usize = 64;
+            let worktrees = match gitpulse_lib::engine::worktree::list_worktrees(repo) {
+                Ok(list) => {
+                    let total = list.len();
+                    let truncated = total > WORKTREE_CAP;
+                    let items: Vec<Value> = list
+                        .into_iter()
+                        .take(WORKTREE_CAP)
+                        .map(|w| {
+                            json!({
+                                "path": w.path,
+                                "name": w.name,
+                                "branch": w.branch,
+                                "is_main": w.is_main,
+                                "is_bare": w.is_bare,
+                                "dirty_files": w.dirty_files,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "ok": true,
+                        "count": total,
+                        "truncated": truncated,
+                        "items": items,
+                    })
+                }
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error,
+                    "count": 0,
+                    "truncated": false,
+                    "items": [],
+                }),
+            };
             Ok(json!({
                 "repo_path": repo,
                 "ledger": ledger_status,
                 "codeintel": codeintel_status,
+                "worktrees": worktrees,
             }))
         }
         "gitpulse_ledger_events" => {
@@ -330,6 +367,67 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitpulse_status_always_reports_a_worktrees_facet() {
+        // The tool is advertised as inspecting worktrees. A payload without
+        // the key, or a key that is missing on failure, would let an agent
+        // treat "we did not look" as "there are none".
+        let description = handle_tools_list()["tools"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["name"] == "gitpulse_status")
+            .expect("advertised")["description"]
+            .as_str()
+            .expect("text")
+            .to_string();
+        assert!(
+            description.to_lowercase().contains("worktree"),
+            "gitpulse_status is advertised without mentioning worktrees: {description}"
+        );
+
+        let payload = handle_tool_call("gitpulse_status", &json!({ "repo_path": "/no/such/repo" }))
+            .expect("the tool itself answers; inner failures are facets");
+        assert!(payload["worktrees"].is_object(), "{payload}");
+        assert_eq!(payload["worktrees"]["ok"], false);
+        assert!(
+            payload["worktrees"]["error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "a failed listing must say why, got {payload}"
+        );
+        assert_eq!(payload["worktrees"]["items"], json!([]));
+    }
+
+    #[test]
+    fn gitpulse_task_view_required_args_match_the_handler() {
+        // The handler only reads `repo_path`. Advertising `task_id` as
+        // required made a correct call look incomplete, and a call that sent
+        // task_id look like it scoped the result when it did not.
+        let listed = handle_tools_list();
+        let tool = listed["tools"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["name"] == "gitpulse_task_view")
+            .expect("advertised");
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("required");
+        let names: Vec<&str> = required.iter().map(|v| v.as_str().expect("name")).collect();
+        assert_eq!(names, vec!["repo_path"]);
+        assert!(
+            tool["inputSchema"]["properties"]["task_id"].is_null(),
+            "task_id is not an argument this handler reads: {tool}"
+        );
+        let payload = handle_tool_call(
+            "gitpulse_task_view",
+            &json!({ "repo_path": "/no/such/repo" }),
+        )
+        .expect("repo_path alone is enough");
+        assert!(payload.is_object(), "{payload}");
+    }
 
     #[test]
     fn tools_list_contains_expected_tools() {

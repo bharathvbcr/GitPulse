@@ -127,3 +127,55 @@ export function mergeListedAndStatusPaths(
   if (extra.length === 0) return [...listed];
   return listed.concat(extra);
 }
+
+/**
+ * Canonical badge styling for working-tree change kinds.
+ * Centralized so FileTreePanel, FileViewer, and LivePulseDashboard cannot drift.
+ */
+export function statusBadgeClass(kind: FileChangeKind): string {
+  switch (kind) {
+    case "conflict":
+      return "bg-rose-500/20 text-rose-300 border border-rose-500/40";
+    case "staged":
+      return "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
+    case "untracked":
+      return "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40";
+    case "unstaged":
+      return "bg-amber-500/20 text-amber-300 border border-amber-500/40";
+    default:
+      return "";
+  }
+}
+
+/**
+ * Short (single character / code) or full label for working-tree change kinds.
+ */
+export function statusBadgeLabel(kind: FileChangeKind, full = false): string {
+  if (full) {
+    switch (kind) {
+      case "conflict":
+        return "CONFLICT";
+      case "staged":
+        return "STAGED";
+      case "untracked":
+        return "UNTRACKED";
+      case "unstaged":
+        return "MODIFIED";
+      default:
+        return "";
+    }
+  }
+  switch (kind) {
+    case "conflict":
+      return "!C";
+    case "staged":
+      return "S";
+    case "untracked":
+      return "U";
+    case "unstaged":
+      return "M";
+    default:
+      return "";
+  }
+}
+

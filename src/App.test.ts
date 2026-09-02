@@ -44,6 +44,26 @@ describe("App overlay wiring", () => {
     expect(imported.has("PromptModal")).toBe(true);
   });
 
+  it("does not present the commit-search bar as if it filters Work", () => {
+    const filterIdx = source.indexOf("<FilterBar");
+    expect(filterIdx).toBeGreaterThan(-1);
+    expect(source.slice(Math.max(0, filterIdx - 120), filterIdx)).toContain(
+      "showsCommitFilter($repoStore.activeTab)",
+    );
+  });
+
+  it("switches to Graph before focusing commit search when the bar is unmounted", () => {
+    const fn = source.slice(
+      source.indexOf("async function focusCommitSearch"),
+      source.indexOf("onMount(() => {"),
+    );
+    expect(fn).toContain("tabForCommitSearch");
+    expect(fn).toContain("repoStore.setActiveTab(target)");
+    expect(fn).toContain("FOCUS_COMMIT_SEARCH_EVENT");
+    expect(source).toContain("ownsCommitSearchChord($repoStore.activeTab)");
+    expect(source).toContain("focusFilter: () => void focusCommitSearch()");
+  });
+
   it("keeps PromptModal and DiagnosticsModal in separate crash boundaries", () => {
     const promptIdx = source.indexOf("<PromptModal");
     const diagIdx = source.indexOf("<DiagnosticsModal");

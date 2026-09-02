@@ -8,7 +8,6 @@
     GitCommit,
     User,
     Calendar,
-    FileCode,
     Plus,
     Minus,
     ShieldCheck,
@@ -20,6 +19,8 @@
     Check,
   } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
+  import LanguageLogo from "./LanguageLogo.svelte";
+  import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash } from "../format";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
@@ -307,6 +308,7 @@
           </div>
         {/if}
         {#each fileList as f (f.path)}
+          {@const parts = formatPathParts(f.path)}
           <button
             class="w-full px-2 py-1.5 rounded-full hover:bg-surfaceHover flex items-center justify-between text-xs text-left transition-colors"
             onclick={() => {
@@ -314,8 +316,13 @@
             }}
           >
             <div class="flex items-center gap-2 truncate">
-              <FileCode size={13} class="text-textMuted" />
-              <span class="truncate text-textPrimary">{f.path}</span>
+              <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
+              <span class="truncate font-mono text-[11px]">
+                {#if parts.dir}
+                  <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                {/if}
+                <span class="text-textPrimary font-medium">{parts.name}</span>
+              </span>
             </div>
             <div class="flex items-center gap-1.5 text-[10px] font-mono shrink-0">
               {#if f.additions > 0}

@@ -35,6 +35,8 @@
     Square,
     Terminal,
     LoaderCircle,
+    CircleDot,
+    Plus,
   } from "lucide-svelte";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import FreshnessBadge from "./FreshnessBadge.svelte";
@@ -56,6 +58,7 @@
     workflowStateLabel,
   } from "../github/runActions";
   import { formatReleaseDate } from "../ops/model";
+  import { pullRequestCreateUrl } from "../github/compareUrl";
   import { formatError } from "../ui/formatError";
   import { reportPanelError } from "../diagnostics/report";
   import EmptyState from "./EmptyState.svelte";
@@ -67,6 +70,13 @@
   // opened in the same second disagree about their age.
   let velocityNow = $state(Date.now());
   const velocity = $derived(summarizeVelocity(ctx?.pull_requests ?? [], velocityNow));
+  const prCreateUrl = $derived(
+    pullRequestCreateUrl(
+      ctx?.html_url ?? "",
+      $repoStore.defaultBranch ?? "main",
+      $repoStore.currentBranch ?? "",
+    ),
+  );
   let loading = $state(false);
   /** PR numbers with a checkout in flight; any in-flight checkout disables all. */
   const checkingOut = new SvelteSet<number>();
@@ -107,6 +117,7 @@
       prs_truncated: false,
       issues: [],
       issues_truncated: false,
+      issues_error: null,
       workflow_runs: [],
       runs_error: null,
       runs_truncated: false,
@@ -439,6 +450,19 @@
       {/if}
     </div>
     <div class="flex items-center gap-2">
+      {#if prCreateUrl}
+        <button
+          type="button"
+          class="gp-btn"
+          onclick={() => prCreateUrl && openExternal(prCreateUrl)}
+          title="Open GitHub's new-pull-request form for {$repoStore.currentBranch} onto {$repoStore.defaultBranch ?? "main"}"
+        >
+          <span class="inline-flex items-center gap-1.5">
+            <Plus size={13} />
+            New pull request
+          </span>
+        </button>
+      {/if}
       {#if ctx?.html_url}
         <button type="button" class="gp-btn" onclick={() => ctx && openExternal(`${ctx.html_url}/actions`)}>
           Actions
@@ -624,6 +648,50 @@
           </div>
           {#if ctx.prs_truncated}
             <div class="mt-2 text-amber-400 text-[11px]">Showing {ctx.pull_requests.length} pull requests; more open PRs exist. This is not complete coverage.</div>
+          {/if}
+        {/if}
+      </section>
+
+      <section>
+        <h3 class="text-[11px] uppercase tracking-wider text-textMuted mb-2">Open issues</h3>
+        {#if ctx.issues_error}
+          <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs">
+            Issue listing unavailable: {ctx.issues_error}
+          </div>
+        {:else if ctx.issues.length === 0 && !ctx.issues_truncated}
+          <EmptyState icon={CircleDot} title="No open issues" compact />
+        {:else if ctx.issues.length === 0}
+          <EmptyState icon={CircleDot} title="No open issues shown" compact />
+        {:else}
+          <div class="space-y-2">
+            {#each ctx.issues as issue (issue.number)}
+              <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
+                    <CircleDot size={14} class="text-accent shrink-0" />
+                    <span class="truncate">#{issue.number} {issue.title}</span>
+                  </div>
+                  <div class="mt-1 text-[11px] text-textMuted font-mono">
+                    {issue.author || "unknown author"}
+                    {#if issue.labels.length > 0}
+                      · {issue.labels.slice(0, 4).join(", ")}
+                    {/if}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onclick={() => openExternal(issue.url)}
+                  class="gp-icon-btn shrink-0"
+                  title="Open on GitHub"
+                  aria-label={`Open issue #${issue.number} on GitHub`}
+                >
+                  <ExternalLink size={14} />
+                </button>
+              </div>
+            {/each}
+          </div>
+          {#if ctx.issues_truncated}
+            <div class="mt-2 text-amber-400 text-[11px]">Showing {ctx.issues.length} issues; more open issues exist. This is not complete coverage.</div>
           {/if}
         {/if}
       </section>

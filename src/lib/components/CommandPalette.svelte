@@ -41,6 +41,8 @@
     FileCode,
     Keyboard,
   } from "lucide-svelte";
+  import LanguageLogo from "./LanguageLogo.svelte";
+  import { highlightMatches } from "../branches/groupBranches";
   import { searchSymbols } from "../codeintel/client";
   import type { CodeintelSymbolHit } from "../codeintel/types";
 
@@ -222,6 +224,7 @@
     id: string;
     label: string;
     icon: any;
+    filePath?: string;
     shortcut?: string;
     category?: string;
     action: () => void;
@@ -273,6 +276,7 @@
         id: `symbol:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`,
         label: `${hit.symbol_name} (${hit.kind}) — ${hit.file_path}:${hit.span_start_line}`,
         icon: FileCode,
+        filePath: hit.file_path,
         category: "Code Intelligence",
         action: () => {
           repoStore.selectFilePath(hit.file_path);
@@ -422,18 +426,6 @@
     };
   });
 
-  function highlightMatches(text: string, search: string): { text: string; match: boolean }[] {
-    if (!search) return [{ text, match: false }];
-    const idx = text.toLowerCase().indexOf(search.toLowerCase());
-    if (idx === -1) return [{ text, match: false }];
-    const parts: { text: string; match: boolean }[] = [];
-    if (idx > 0) parts.push({ text: text.slice(0, idx), match: false });
-    parts.push({ text: text.slice(idx, idx + search.length), match: true });
-    if (idx + search.length < text.length) {
-      parts.push({ text: text.slice(idx + search.length), match: false });
-    }
-    return parts;
-  }
 </script>
 
 {#if isOpen}
@@ -498,11 +490,15 @@
           >
             <div class="flex items-center gap-2.5 min-w-0 flex-1">
               <span class="flex items-center justify-center w-6 h-6 rounded-lg bg-background/80 shrink-0 {i === highlighted ? 'text-accent' : 'text-textMuted'}">
-                <cmd.icon size={14} />
+                {#if cmd.filePath}
+                  <LanguageLogo filePath={cmd.filePath} size={14} class="shrink-0" />
+                {:else}
+                  <cmd.icon size={14} />
+                {/if}
               </span>
               <span class="truncate">
                 {#each parts as part}
-                  {#if part.match}
+                  {#if part.matched}
                     <b class="text-accent font-semibold">{part.text}</b>
                   {:else}
                     <span>{part.text}</span>

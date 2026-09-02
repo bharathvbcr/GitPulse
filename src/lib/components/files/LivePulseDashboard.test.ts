@@ -40,4 +40,10 @@ describe("LivePulseDashboard", () => {
     expect(source).toContain("statusLiveKey");
     expect(source).toContain("lastRefreshed");
   });
+
+  it("renders LanguageLogo for modified files and in the file inspector", () => {
+    expect(source).toContain("LanguageLogo");
+    expect(source).toContain("language={detectedLang.name}");
+    expect(source).toContain("filePath={s.path}");
+  });
 });

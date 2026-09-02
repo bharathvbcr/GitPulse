@@ -92,6 +92,27 @@ describe("WorkView", () => {
     // A row you cannot open is a report. The whole value of showing that a
     // worktree is stuck is being one click from the view that unsticks it.
     expect(source).toContain("openWorktree");
+    expect(source).toContain("openPathFor");
     expect(source).toContain("repoStore.openRepo");
+  });
+
+  it("names the agent from the directory, not a hard-coded product", () => {
+    expect(source).toContain("agentKindsOn");
+    expect(source).not.toContain("isAgentWorktree");
+    expect(source).toContain("{kind}");
+  });
+
+  it("does not print a ledger column to a reader with no ledger", () => {
+    expect(source).toContain("projection.sources.ledger.present");
+  });
+
+  it("opens the stuck worktree, not the first one on the row", () => {
+    expect(source).toContain("openPathFor(row)");
+    expect(source).toContain('binding.operation ? "conflict" : "diff"');
+  });
+
+  it("refreshes when repository status generation changes", () => {
+    expect(source).toContain("$repoStore.generation");
+    expect(source).toContain("previousGeneration");
   });
 });

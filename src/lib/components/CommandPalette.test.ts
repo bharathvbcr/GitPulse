@@ -29,4 +29,9 @@ describe("CommandPalette", () => {
     expect(source).toContain("readFrecency");
     expect(source).toContain("recordFrecency");
   });
+
+  it("renders LanguageLogo for symbol and file hits", () => {
+    expect(source).toContain("LanguageLogo");
+    expect(source).toContain("filePath={cmd.filePath}");
+  });
 });

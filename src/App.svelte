@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { RepoChangedPayload } from "./lib/repos/events";
   import type { LedgerAppended } from "./lib/ledger/types";
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
   import { graphStore } from "./lib/stores/graphStore";
@@ -37,6 +37,14 @@
   import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
+  import {
+    FOCUS_COMMIT_SEARCH_EVENT,
+    isCommitSearchChord,
+    ownsCommitSearchChord,
+    showsCommitFilter,
+    tabForCommitSearch,
+  } from "./lib/views/commitFilter";
+  import { isImeComposition } from "./lib/keyboard/imeGuard";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import Tooltip from "./lib/components/Tooltip.svelte";
   import RebaseModal from "./lib/components/RebaseModal.svelte";
@@ -150,6 +158,21 @@
     await repoStore.openRepo(path);
   }
 
+  /**
+   * Native "Search Commits" and ⌘F (except Files, which owns in-file search).
+   * Switching first is what makes the chord work on Work: FilterBar is not
+   * mounted there, so dispatching the focus event alone was a silent no-op.
+   */
+  async function focusCommitSearch() {
+    const tab = $repoStore.activeTab;
+    const target = tabForCommitSearch(tab);
+    if (target !== tab) {
+      repoStore.setActiveTab(target);
+      await tick();
+    }
+    window.dispatchEvent(new CustomEvent(FOCUS_COMMIT_SEARCH_EVENT));
+  }
+
   onMount(() => {
     applyPlatformClass();
     const unsubs: Array<() => void> = [];
@@ -200,6 +223,11 @@
         isShortcutsOpen = true;
         return;
       }
+      if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab)) {
+        e.preventDefault();
+        void focusCommitSearch();
+        return;
+      }
       if (!isInput && e.key === "?" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         isShortcutsOpen = true;
@@ -235,20 +263,24 @@
       stash: () => {
         repoStore.stashSave().then(() => {
           toastStore.action("Stashed uncommitted changes", "Pop", () => {
-            void repoStore.stashPop();
+            void repoStore.stashPop().then((outcome) => {
+              if (!outcome.ok) toastStore.error(outcome.error ?? "Pop failed");
+            });
           });
         });
       },
       stashPop: () => {
-        repoStore.stashPop().then(() => toastStore.success("Popped latest stash"));
+        repoStore.stashPop().then((outcome) => {
+          if (outcome.ok) toastStore.success("Popped latest stash");
+          else toastStore.error(outcome.error ?? "Pop failed");
+        });
       },
       rebase: () => {
         isRebaseModalOpen = true;
       },
       quickCommit: () => void promptQuickCommit(),
       palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
-      focusFilter: () =>
-        window.dispatchEvent(new CustomEvent("gitpulse:focus-filter")),
+      focusFilter: () => void focusCommitSearch(),
       openRecent: (path) => void openFromExternal(path),
       openRepo: (path) => void openFromExternal(path),
       closeRepoTab: () => void repoStore.closeActiveTab(),
@@ -545,7 +577,9 @@
       {#if $interfaceStore.showLanguageBar}
         <LanguageBar />
       {/if}
-      <FilterBar />
+      {#if showsCommitFilter($repoStore.activeTab)}
+        <FilterBar />
+      {/if}
       <div class="flex-1 flex overflow-hidden">
         <svelte:boundary failed={paneFailed}>
           <Sidebar />

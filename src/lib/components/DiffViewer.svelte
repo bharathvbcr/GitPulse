@@ -31,6 +31,7 @@
   } from "lucide-svelte";
   import ImageDiffViewer from "./ImageDiffViewer.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import LanguageLogo from "./LanguageLogo.svelte";
   import VirtualList from "./VirtualList.svelte";
   import {
     annotateRange,
@@ -515,7 +516,11 @@
   <!-- Toolbar -->
   <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-2 truncate">
-      <FileCode size={16} class="text-accent shrink-0" />
+      {#if $repoStore.selectedFilePath}
+        <LanguageLogo filePath={$repoStore.selectedFilePath} size={16} class="shrink-0" />
+      {:else}
+        <FileCode size={16} class="text-accent shrink-0" />
+      {/if}
       <span class="font-medium text-textPrimary truncate">{ $repoStore.selectedFilePath || $repoStore.selectedCommitId || "Diff View" }</span>
       {#if contentLineCount > 0}
         <span class="text-[10px] text-textMuted shrink-0">{contentLineCount.toLocaleString()} lines</span>

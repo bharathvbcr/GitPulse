@@ -4,6 +4,8 @@
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
   import WorktreesPanel from "./WorktreesPanel.svelte";
+  import LanguageLogo from "./LanguageLogo.svelte";
+  import { formatPathParts } from "../files/formatPath";
   import {
     layoutStore,
     loadSections,
@@ -395,14 +397,19 @@
           {:else}
             <div class="space-y-0.5">
               {#each visibleStaged as f (f.path)}
-                <div class="px-2 py-1.5 rounded-full flex items-center gap-1 hover:bg-surfaceHover group transition-colors">
+                {@const parts = formatPathParts(f.path)}
+                <div class="px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
+                  <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
                     class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, true)}
                     title={f.path}
                   >
-                    {f.path}
+                    {#if parts.dir}
+                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                    {/if}
+                    <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
                   <button
                     type="button"
@@ -472,14 +479,19 @@
           {:else}
             <div class="space-y-0.5">
               {#each visibleUnstaged as f (f.path + "-" + f.status_code)}
-                <div class="px-2 py-1.5 rounded-full flex items-center gap-1 hover:bg-surfaceHover group transition-colors">
+                {@const parts = formatPathParts(f.path)}
+                <div class="px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
+                  <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
                     class="flex-1 min-w-0 truncate text-left font-mono text-[11px] {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, false)}
                     title={f.path}
                   >
-                    {f.path}
+                    {#if parts.dir}
+                      <span class="text-textMuted/60 text-[10px]">{parts.dir}</span>
+                    {/if}
+                    <span class="text-textPrimary font-medium">{parts.name}</span>
                   </button>
                   <button
                     type="button"

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   blockedInitializeReason,
+  canDeinit,
   canInitialize,
+  canSync,
   describeSubmodules,
   initializableSubmodules,
   isDestructiveSubmoduleChange,
   needsAttention,
+  parseSubmoduleList,
   sortSubmodules,
   submoduleChangeConsequence,
   submoduleStateExplanation,
@@ -83,6 +86,21 @@ describe("canInitialize", () => {
     expect(canInitialize(sub({ state: "UpToDate" }))).toBe(false);
     expect(canInitialize(sub({ state: "CommitDiffers" }))).toBe(false);
     expect(blockedInitializeReason(sub({ state: "UpToDate" }))).toBeNull();
+  });
+});
+
+describe("canDeinit and canSync", () => {
+  it("offers deinit only where there is a working copy to remove", () => {
+    expect(canDeinit(sub({ state: "UpToDate" }))).toBe(true);
+    expect(canDeinit(sub({ state: "CommitDiffers" }))).toBe(true);
+    expect(canDeinit(sub({ state: "Conflicted" }))).toBe(true);
+    expect(canDeinit(sub({ state: "Uninitialized" }))).toBe(false);
+  });
+
+  it("offers sync only when .gitmodules still names a URL", () => {
+    expect(canSync(sub())).toBe(true);
+    expect(canSync(sub({ url: null }))).toBe(false);
+    expect(canSync(sub({ orphaned: true }))).toBe(false);
   });
 });
 
@@ -188,5 +206,44 @@ describe("sortSubmodules", () => {
     const before = list.map((s) => s.path);
     sortSubmodules(list);
     expect(list.map((s) => s.path)).toEqual(before);
+  });
+});
+
+describe("parseSubmoduleList", () => {
+  it("unwraps a complete listing", () => {
+    const parsed = parseSubmoduleList({
+      submodules: [sub()],
+      truncated: false,
+    });
+    expect(parsed.failed).toBe(false);
+    expect(parsed.truncated).toBe(false);
+    expect(parsed.submodules).toHaveLength(1);
+    expect(parsed.submodules[0].path).toBe("vendor/lib");
+  });
+
+  it("treats a bare array as a failed read, not an empty submodule list", () => {
+    const parsed = parseSubmoduleList([]);
+    expect(parsed.failed).toBe(true);
+    expect(parsed.submodules).toEqual([]);
+  });
+
+  it("fails closed when truncated is missing or a state is unknown", () => {
+    expect(parseSubmoduleList({ submodules: [sub()] }).failed).toBe(true);
+    expect(
+      parseSubmoduleList({
+        submodules: [
+          {
+            name: "x",
+            path: "x",
+            url: null,
+            oid: null,
+            described: null,
+            state: "Nope",
+            orphaned: false,
+          },
+        ],
+        truncated: false,
+      }).failed,
+    ).toBe(true);
   });
 });

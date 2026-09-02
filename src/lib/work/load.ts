@@ -46,6 +46,22 @@ function failed(e: unknown): WorkSources[keyof WorkSources] {
 }
 
 /**
+ * Records a second failure on a source that may already be degraded.
+ *
+ * Overwriting the first reason with the second would hide the one the
+ * reader has not yet been told about; concatenating keeps both.
+ */
+function noteFailure(
+  source: WorkSources[keyof WorkSources],
+  detail: string,
+): WorkSources[keyof WorkSources] {
+  if (!source.ok && source.detail) {
+    return { ok: false, present: true, detail: `${source.detail}; ${detail}` };
+  }
+  return { ok: false, present: true, detail };
+}
+
+/**
  * Loads and joins everything the Work view shows for one repository.
  *
  * Never rejects: a failure anywhere becomes a degraded source in the result.
@@ -129,22 +145,45 @@ export async function loadWork(
     // worktree's own git dir — so this is the only way to learn that the
     // worktree in the NEXT window is stuck mid-rebase.
     //
-    // A probe that fails is recorded as "no operation" for that worktree
-    // rather than failing the screen, but it does not silently claim the
-    // worktree is clean: `operations` simply has no entry, and the row shows
-    // nothing where it would otherwise show a banner.
-    const probes = worktrees.v.slice(0, MAX_OPERATION_PROBES).filter((w) => !w.is_bare);
+    // Filter before slicing: a bare entry at the front used to consume a
+    // probe slot, so a later non-bare worktree past the cap was never asked
+    // and never reported as unasked. A probe that throws is a degraded
+    // source, not an idle worktree — showing nothing because the check
+    // itself broke is the failure mode that strands a user mid-rebase with
+    // a UI insisting everything is fine.
+    const candidates = worktrees.v.filter((w) => !w.is_bare);
+    const probes = candidates.slice(0, MAX_OPERATION_PROBES);
+    if (candidates.length > probes.length) {
+      sources.worktrees = noteFailure(
+        sources.worktrees,
+        `only the first ${MAX_OPERATION_PROBES} of ${candidates.length} worktrees were probed for parked operations`,
+      );
+    }
     const parked = await Promise.all(
       probes.map((w) =>
         call<RepoOperation | null>("cmd_repo_operation", { repoPath: w.path }).then(
-          (v) => [w.path, v] as const,
-          () => [w.path, null] as const,
+          (v) => ({ path: w.path, operation: v, ok: true as const }),
+          (e) => ({ path: w.path, operation: null, ok: false as const, detail: formatError(e) }),
         ),
       ),
     );
     const operations: Record<string, RepoOperation | null> = {};
-    for (const [path, operation] of parked) {
-      if (operation) operations[path] = operation;
+    let probeFailures = 0;
+    let probeFailureDetail = "";
+    for (const result of parked) {
+      if (!result.ok) {
+        probeFailures += 1;
+        if (!probeFailureDetail) probeFailureDetail = result.detail;
+        continue;
+      }
+      if (result.operation) operations[result.path] = result.operation;
+    }
+    if (probeFailures > 0) {
+      const why = probeFailureDetail ? ` (${probeFailureDetail})` : "";
+      sources.worktrees = noteFailure(
+        sources.worktrees,
+        `could not read parked operations for ${probeFailures} worktree${probeFailures === 1 ? "" : "s"}${why}`,
+      );
     }
     input.operations = operations;
   }
@@ -208,13 +247,11 @@ export async function loadWork(
     );
     input.bindings = bindings;
     if (input.worktrees.length > looked.length) {
-      sources.worktrees = {
-        ok: false,
-        present: true,
-        detail:
-          `only the first ${MAX_BINDING_LOOKUPS} of ${input.worktrees.length} worktrees ` +
+      sources.worktrees = noteFailure(
+        sources.worktrees,
+        `only the first ${MAX_BINDING_LOOKUPS} of ${input.worktrees.length} worktrees ` +
           `had their task binding resolved`,
-      };
+      );
     }
   }
 

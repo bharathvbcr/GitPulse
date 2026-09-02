@@ -34,10 +34,12 @@
     degradedSummary,
     dirtyCount,
     noteworthyStatuses,
+    openPathFor,
     type WorkRow,
+    type WorktreeBinding,
   } from "../work/projection";
   import { headline, kindTitle } from "../repos/operation";
-  import { isAgentWorktree } from "../work/agentWorktree";
+  import { agentKind, agentKindsOn, agentSessionSlug } from "../work/agentWorktree";
   import type { PolicyStatus } from "../stores/harnessStore";
 
   let projection = $state<WorkProjection | null>(null);
@@ -75,11 +77,20 @@
   }
 
   let previousRepo: string | null = null;
+  let previousGeneration: number | null = null;
   $effect(() => {
     const repo = $repoStore.currentPath;
-    if (repo === previousRepo) return;
+    const generation = $repoStore.generation;
+    if (repo === previousRepo && generation === previousGeneration) return;
+    const repoChanged = repo !== previousRepo;
     previousRepo = repo;
-    projection = repo ? (workCache.get(repo) ?? null) : null;
+    previousGeneration = generation;
+    // A repo switch hydrates from cache so the last join is on screen
+    // immediately; a generation bump (status poll, mutation, watcher)
+    // refreshes in place so "clean" cannot outlive the working tree.
+    if (repoChanged) {
+      projection = repo ? (workCache.get(repo) ?? null) : null;
+    }
     if (repo) void refresh(repo);
   });
 
@@ -106,12 +117,31 @@
    * the first — the one the row is keyed on in worktree mode.
    */
   async function openWorktree(row: WorkRow): Promise<void> {
-    const path = row.worktrees[0]?.worktree.path;
+    const path = openPathFor(row);
     if (!path) return;
     await repoStore.openRepo(path);
     // A parked operation is resolved in the Resolve view; anything else is
-    // most usefully seen as its working-tree diff.
+    // most usefully seen as its working-tree diff. openPathFor already picked
+    // the stuck worktree when a task row holds several.
     repoStore.setActiveTab(row.operation ? "conflict" : "diff");
+  }
+
+  function agentsOn(row: WorkRow): string[] {
+    return agentKindsOn(row.worktrees.map((binding) => binding.worktree.path));
+  }
+
+  function agentChipTitle(row: WorkRow, kind: string): string {
+    const slugs = row.worktrees
+      .filter((binding) => agentKind(binding.worktree.path) === kind)
+      .map((binding) => agentSessionSlug(binding.worktree.path))
+      .filter(Boolean);
+    const sessions = slugs.length > 0 ? ` (${slugs.join(", ")})` : "";
+    return `A worktree ${kind} created for a session${sessions}`;
+  }
+
+  async function openBinding(binding: WorktreeBinding): Promise<void> {
+    await repoStore.openRepo(binding.worktree.path);
+    repoStore.setActiveTab(binding.operation ? "conflict" : "diff");
   }
 
   const degraded = $derived(projection ? degradedSummary(projection.sources) : "");
@@ -194,21 +224,33 @@
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
               <div class="flex items-center gap-2 flex-wrap font-medium">
-                <span class="truncate">{rowTitle(row)}</span>
+                {#if row.worktrees.length > 0}
+                  <button
+                    type="button"
+                    class="truncate text-left hover:text-accent"
+                    title="Open {openPathFor(row)}"
+                    onclick={() => void openWorktree(row)}
+                  >
+                    {rowTitle(row)}
+                  </button>
+                {:else}
+                  <span class="truncate">{rowTitle(row)}</span>
+                {/if}
                 {#if row.taskId}
                   <span class="font-mono text-[10px] text-textMuted">{row.taskId}</span>
                 {/if}
                 <!-- An agent worktree and a hand-made one want opposite
                      remedies — merge or resume, versus prune — so they are
-                     never labelled the same. -->
-                {#if row.worktrees.some((b) => isAgentWorktree(b.worktree.path))}
+                     never labelled the same. The chip names the agent from
+                     the directory layout, not a hard-coded product. -->
+                {#each agentsOn(row) as kind (kind)}
                   <span
                     class="inline-flex items-center gap-1 rounded-full bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent"
-                    title="A worktree Claude Code created for a session"
+                    title={agentChipTitle(row, kind)}
                   >
-                    <Bot size={10} />agent
+                    <Bot size={10} />{kind}
                   </span>
-                {/if}
+                {/each}
                 {#if row.worktrees.some((b) => b.worktree.is_main)}
                   <span class="rounded-full bg-surfaceHover px-1.5 py-0.5 text-[10px] text-textMuted">
                     main worktree
@@ -267,9 +309,11 @@
                     clean
                   </span>
                 {/if}
-                <span class="font-mono" title="Ledger events attributed to this row">
-                  {row.verdicts.events} events
-                </span>
+                {#if projection.sources.ledger.present}
+                  <span class="font-mono" title="Ledger events attributed to this row">
+                    {row.verdicts.events} events
+                  </span>
+                {/if}
               </div>
             </div>
 
@@ -315,9 +359,9 @@
             </button>
           {/if}
 
-          {#if row.worktrees.length > 0 || row.pullRequests.length > 0}
+          {#if (row.kind !== "worktree" && row.worktrees.length > 0) || row.pullRequests.length > 0}
             <div class="mt-2.5 grid gap-2 border-t border-border/50 pt-2.5 md:grid-cols-2">
-              {#if row.worktrees.length > 0}
+              {#if row.kind !== "worktree" && row.worktrees.length > 0}
                 <ul class="space-y-1">
                   {#each row.worktrees as binding (binding.worktree.path)}
                     <li>
@@ -325,7 +369,7 @@
                         type="button"
                         class="flex w-full items-center gap-1.5 rounded font-mono text-[10px] text-textMuted hover:text-accent"
                         title="Open {binding.worktree.path}"
-                        onclick={() => void repoStore.openRepo(binding.worktree.path)}
+                        onclick={() => void openBinding(binding)}
                       >
                         <GitBranch size={11} class="shrink-0" />
                         <span class="truncate">{binding.worktree.branch ?? "(detached)"}</span>

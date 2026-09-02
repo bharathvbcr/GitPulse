@@ -4,6 +4,8 @@ import {
   degradedSummary,
   emptyTally,
   noteworthyStatuses,
+  openPathFor,
+  parkedWorktree,
   projectWork,
   UNBOUND_ROW_ID,
   dirtyCount,
@@ -511,6 +513,65 @@ describe("worktree rows, when there is no task store", () => {
     expect(p.rows.map((r) => r.key)).toEqual(["TASK-1"]);
     expect(p.rows[0].kind).toBe("task");
     expect(p.rows[0].taskId).toBe("TASK-1");
+  });
+});
+
+describe("parked operations belong to the worktree, not the row kind", () => {
+  function op(kind = "Rebase" as const) {
+    return {
+      kind,
+      current_step: 2,
+      total_steps: 7,
+      head_ref: "feature",
+      incoming_ref: null,
+      conflicted_paths: ["a.ts"],
+      conflicted_total: 1,
+      available: ["abort" as const],
+      warnings: [],
+    };
+  }
+
+  it("attaches a parked operation in task mode too", () => {
+    // Task mode used to skip this assignment, so a DevCouncil repository
+    // mid-rebase rendered as idle.
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        worktrees: [worktree("/wt/alpha", "a"), worktree("/wt/beta", "b")],
+        bindings: { "/wt/alpha": "TASK-1", "/wt/beta": "TASK-1" },
+        operations: { "/wt/beta": op() },
+      }),
+    );
+    expect(p.rows).toHaveLength(1);
+    expect(p.rows[0].kind).toBe("task");
+    expect(p.rows[0].operation?.kind).toBe("Rebase");
+    expect(parkedWorktree(p.rows[0])?.worktree.path).toBe("/wt/beta");
+    expect(openPathFor(p.rows[0])).toBe("/wt/beta");
+  });
+
+  it("opens the first worktree when none is parked", () => {
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        worktrees: [worktree("/wt/alpha", "a"), worktree("/wt/beta", "b")],
+        bindings: { "/wt/alpha": "TASK-1", "/wt/beta": "TASK-1" },
+      }),
+    );
+    expect(openPathFor(p.rows[0])).toBe("/wt/alpha");
+    expect(parkedWorktree(p.rows[0])).toBeNull();
+  });
+
+  it("puts a blocked task above a busier unblocked one", () => {
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-BUSY"), lease("TASK-STUCK")],
+        worktrees: [worktree("/wt/busy", "busy"), worktree("/wt/stuck", "stuck")],
+        bindings: { "/wt/busy": "TASK-BUSY", "/wt/stuck": "TASK-STUCK" },
+        pullRequests: [pr(1, "busy"), pr(2, "busy"), pr(3, "busy")],
+        operations: { "/wt/stuck": op() },
+      }),
+    );
+    expect(p.rows[0].taskId).toBe("TASK-STUCK");
   });
 });
 

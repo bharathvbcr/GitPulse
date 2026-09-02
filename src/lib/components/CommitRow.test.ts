@@ -70,4 +70,14 @@ describe("CommitRow accessible graph context", () => {
     expect(source).toContain('e.key === "ContextMenu"');
     expect(source).toContain('e.key === "F10"');
   });
+
+  it("offers cherry-pick and revert through the same menu as checkout", () => {
+    // Both commands already exist on the store; leaving them off the menu
+    // meant a native Git client that could replay commits only from the
+    // terminal. The menu is the discoverable path.
+    expect(source).toContain("repoStore.cherryPick([row.id])");
+    expect(source).toContain("repoStore.revertCommits([row.id])");
+    expect(source).toContain("Cherry-pick onto current branch");
+    expect(source).toContain("Revert this commit");
+  });
 });

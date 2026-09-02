@@ -35,10 +35,10 @@ flowchart TD
 ### 1.0 Work (`work`)
 - **One Row Per Place Work Is Happening**: Joins linked worktrees, open pull requests, workflow runs, policy verdicts and grants into one row each. Everything else in GitPulse shows one of these; this shows how they relate.
 - **Keyed On What Exists Here**: With a DevCouncil store, the unit is the task. Without one — the ordinary case for a repository driven by Claude Code or by hand — the unit is the **worktree**, because that is where a branch, its uncommitted changes, its parked operation and its pull request actually live. Keying on task regardless collapsed the whole repository into a single row labelled "Not bound to a task".
-- **Agent Worktrees Are Named As Such**: A worktree under `.claude/worktrees/` is marked, because a stale agent session and a stale hand-made checkout want opposite remedies — resume or merge, versus prune. Detection reads the directory layout, never the branch name, so a human naming a branch `claude/…` is not mislabelled.
+- **Agent Worktrees Are Named As Such**: A worktree under `/.<agent>/worktrees/` (Claude Code, Cursor, Codex, and any other tool using that layout) is marked, because a stale agent session and a stale hand-made checkout want opposite remedies — resume or merge, versus prune. Detection reads the directory layout, never the branch name, so a human naming a branch `claude/…` is not mislabelled. Git's own `.git/worktrees/` metadata is never labelled an agent session.
 - **Blocked Worktrees Sort First**: A worktree parked mid-merge, rebase, cherry-pick or revert is the one thing on the screen that cannot progress without a person, so it outranks rows with more pull requests, and clicking it opens that worktree in the Resolve view.
 - **Uncommitted Is Counted, Unscanned Is Not Claimed**: A worktree past the scan cap shows nothing rather than `0`, which would report it as verified clean.
-- **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight.
+- **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight. Remotes can be added, renamed, re-pointed, pruned, or removed; submodules can be initialized, URL-synced, or deinitialized (never force-discarded). A remote, tag, or submodule listing cut by a cap says so, instead of looking complete.
 - **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
 - **A Branch on Two Tasks Appears on Both**: Assigning it to one would hide the work from the other with nothing on screen to say so.
 - **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
@@ -64,7 +64,9 @@ flowchart TD
 - **GPU Canvas Rendering**: High-performance commit graph capable of rendering repositories with 100,000+ commits smoothly.
 - **Topological Lane Solver**: Rust-powered lane sorting with nogap lookback guarantees to avoid visual discontinuities.
 - **Author Avatars & Badges**: Automatic display of author avatars or initials with one-click filter isolation.
-- **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags.
+- **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
+- **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter on Graph, Diff, Blame, Stack, and Reflog. From Work and other views it switches to Graph first; in Files, ⌘F still searches the open file.
+- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in the Resolve view if a conflict results.
 
 ### 1.3 Diff (`diff`)
 - **Intra-Line Word Highlighting**: Pinpoints exact character and token changes within modified lines.
@@ -136,7 +138,8 @@ flowchart TD
 - **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
 
 ### 3.3 GitHub (`github`) & Local CI
-- **PR Management**: List repository PRs with one-click checkout and branch creation.
+- **PR Management**: List repository PRs with one-click checkout, and a **New pull request** action that opens GitHub's compare form for the current branch onto the default branch.
+- **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list.
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events.
 - **CI:Local Runner**: Runs full repository CI pipeline locally before pushing commits:
   ```mermaid
@@ -171,6 +174,7 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 ### 4.2 View Switching
 | View | macOS | Windows / Linux |
 | --- | --- | --- |
+| **Work** | `F10` | `F10` |
 | **Files** | `⌘ 1` | `Ctrl+1` |
 | **Graph** | `⌘ 2` | `Ctrl+2` |
 | **Diff** | `⌘ 3` | `Ctrl+3` |

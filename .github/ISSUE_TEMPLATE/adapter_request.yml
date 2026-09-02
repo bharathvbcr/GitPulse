@@ -17,7 +17,7 @@ body:
         - Coverage runners and report parsing — `src-tauri/src/analyzer/coverage.rs`
         - MANVI runner allowlist — `src-tauri/src/harness/policy.rs`
         - Syntax highlighting — `src/lib/files/syntaxHighlight.ts`
-        - File-type icons — `src/lib/files/fileIcons.ts`
+        - File-type icons — `src/lib/language/languageLogos.ts`
 
   - type: dropdown
     id: kind

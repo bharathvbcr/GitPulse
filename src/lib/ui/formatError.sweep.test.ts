@@ -21,7 +21,6 @@ const SWEPT_FILES = [
   "../components/CodeStackViewer.svelte",
   "../components/CoverageViewer.svelte",
   "../components/BlameViewer.svelte",
-  "../components/FileExplorer.svelte",
   "../components/FileViewer.svelte",
   "../components/files/FileTreePanel.svelte",
   "../components/files/CodeViewer.svelte",

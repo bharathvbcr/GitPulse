@@ -36,9 +36,9 @@
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import { getFileIconMeta } from "../files/fileIcons";
+  import LanguageLogo from "./LanguageLogo.svelte";
   import { joinWorktreePath } from "../files/fileTree";
-  import { classifyFileChange } from "../files/fileStatus";
+  import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import {
     activateEditorTab,
     closeAllEditorTabs,
@@ -295,7 +295,6 @@
       {:else}
         {#each openTabs as tab (tab.path)}
           {@const isActive = tab.path === activeTabPath}
-          {@const iconMeta = getFileIconMeta(tab.path)}
           {@const tabKind = classifyFileChange($repoStore.statuses.find((s) => s.path === tab.path))}
           <div
             role="tab"
@@ -311,9 +310,7 @@
               : 'text-textMuted hover:bg-surfaceHover hover:text-textPrimary'} {tab.preview ? 'italic' : ''}"
             title={tab.preview ? `${tab.path} (preview — double-click to pin)` : tab.path}
           >
-            <span class="text-[9px] font-mono font-bold not-italic {iconMeta.colorClass}">
-              {iconMeta.badgeLabel}
-            </span>
+            <LanguageLogo filePath={tab.path} size={13} class="shrink-0" />
             <span class="truncate">{tab.name}</span>
             {#if tabKind !== "clean"}
               <span class="w-1.5 h-1.5 rounded-full bg-accent not-italic"></span>
@@ -382,22 +379,8 @@
         {/each}
 
         {#if activeKind !== "clean"}
-          <span
-            class="ml-2 px-1.5 py-0.2 text-[9px] font-bold rounded {activeKind === 'staged'
-              ? 'bg-emerald-500/20 text-emerald-300'
-              : activeKind === 'conflict'
-                ? 'bg-rose-500/20 text-rose-300'
-                : activeKind === 'untracked'
-                  ? 'bg-cyan-500/20 text-cyan-300'
-                  : 'bg-amber-500/20 text-amber-300'}"
-          >
-            {activeKind === "staged"
-              ? "STAGED"
-              : activeKind === "conflict"
-                ? "CONFLICT"
-                : activeKind === "untracked"
-                  ? "UNTRACKED"
-                  : "MODIFIED"}
+          <span class="ml-2 px-1.5 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(activeKind)}">
+            {statusBadgeLabel(activeKind, true)}
           </span>
         {/if}
       </div>

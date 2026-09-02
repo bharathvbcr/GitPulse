@@ -46,19 +46,30 @@ describe("WorktreesPanel agent worktree affordances", () => {
     expect(source).toContain("$repoStore.generation");
     expect(source).toContain("cmd_list_worktrees");
   });
+
+  it("names an agent worktree as such, from the directory layout", () => {
+    expect(source).toContain("isAgentWorktree");
+    expect(source).toContain("agentKind");
+    expect(source).toContain("agentSessionSlug");
+  });
 });
 
 describe("WorktreesPanel removal safety", () => {
-  it("passes --force only when the worktree scan found no changes", () => {
-    expect(source).toContain("const force = (wt.dirty_files ?? 0) === 0;");
-    // The invoke must carry the computed flag, never a literal true.
+  it("force-removes only a scanned dirty worktree after confirm, never an unscanned one", () => {
+    // dirty_files === null means the scan did not run. Coercing that to 0
+    // and passing --force is how an agent farm past the scan cap lost work.
+    expect(source).toContain(
+      "const force = typeof wt.dirty_files === \"number\" && wt.dirty_files > 0;",
+    );
+    expect(source).not.toContain("const force = (wt.dirty_files ?? 0) === 0;");
     expect(source).not.toMatch(/cmd_remove_worktree[\s\S]{0,120}?force:\s*true/);
     expect(source).toMatch(/cmd_remove_worktree[\s\S]{0,120}?force\s*\}/);
   });
 
   it("names the discard cost in the armed confirm when files would be lost", () => {
-    expect(source).toContain("`Discard ${dirty} changed files? Click again to remove`");
+    expect(source).toContain("`Discard ${wt.dirty_files} changed files? Click again to remove`");
     expect(source).toContain("`Discard ${wt.dirty_files} changed files?`");
+    expect(source).toContain("Not scanned for changes");
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {

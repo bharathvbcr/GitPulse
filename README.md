@@ -1,6 +1,7 @@
 # GitPulse
 
 <p align="center">
+  <a href="https://gitpulse.vbcr.dev/"><img src="https://img.shields.io/badge/website-gitpulse.vbcr.dev-F97316?style=flat&logo=safari&logoColor=white" alt="Website"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg" alt="Coverage"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/releases"><img src="https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver" alt="Release"></a>
@@ -11,7 +12,8 @@
 
 <p align="center">
   <strong>High-performance, local-first native Git desktop client.</strong><br>
-  Engineered with a native Rust backend and a reactive Svelte 5 frontend for instant graph rendering, universal code coverage, deep repository auditing, and safe on-device AI.
+  Engineered with a native Rust backend and a reactive Svelte 5 frontend for instant graph rendering, universal code coverage, deep repository auditing, and safe on-device AI.<br>
+  <a href="https://gitpulse.vbcr.dev/"><strong>Explore the Live Showcase &amp; Interactive Topology (gitpulse.vbcr.dev) &rarr;</strong></a>
 </p>
 
 <p align="center">
@@ -91,7 +93,7 @@ GitPulse organizes 14 purpose-built views into three intuitive functional groups
 ```mermaid
 flowchart LR
     subgraph Work["🔨 Work Views"]
-        WorkTab["<b>Work</b> (<code>work</code>)<br/>Tasks, worktrees, PRs & verdicts"]
+        WorkTab["<b>Work</b> (<code>work</code>)<br/>Worktrees, PRs, remotes & verdicts"]
         Files["<b>Files</b> (<code>files</code>)<br/>IDE file explorer & code viewer"]
         Graph["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph & lanes"]
         Diff["<b>Diff</b> (<code>diff</code>)<br/>Word-level diff & selective staging"]
@@ -104,7 +106,6 @@ flowchart LR
         Health["<b>Health</b> (<code>health</code>)<br/>Vulnerabilities & Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage & history trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization"]
-        Repo["<b>Repo</b> (<code>repo</code>)<br/>Remotes, stashes & submodules"]
     end
 
     subgraph System["⚙️ System & Ops"]

@@ -10,6 +10,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
+  import LanguageLogo from "./LanguageLogo.svelte";
   import {
     pickLanguageBarStats,
     type LanguageStat,
@@ -66,6 +67,16 @@
     if (!lang.other_languages?.length) return base;
     return `${base}\n${lang.other_languages.join(", ")}`;
   }
+
+  function handleLanguageClick(lang: LanguageStat) {
+    if (lang.language === "Other") return;
+    repoStore.setActiveTab("files");
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("gitpulse:filter-lang", { detail: { language: lang.language } }),
+      );
+    }
+  }
 </script>
 
 {#if stats.length > 0}
@@ -80,21 +91,26 @@
         {/each}
       </div>
     </div>
-    <div class="flex items-center gap-4 text-textMuted">
+    <div class="flex items-center gap-2 sm:gap-3 text-textMuted overflow-x-auto">
       {#if partialNotice}
         <span
-          class="text-[10px] text-amber-400/90"
+          class="text-[10px] text-amber-400/90 shrink-0"
           title="The scan stopped early (time budget); percentages cover only the files counted"
         >
           ⚠ {partialNotice}
         </span>
       {/if}
       {#each stats as lang}
-        <div class="flex items-center gap-1.5" title={tipFor(lang)}>
-          <span class="w-2 h-2 rounded-full shadow-sm" style="background-color: {lang.color_hex};"></span>
-          <span class="text-textPrimary/80">{lang.language}</span>
-          <span class="text-textMuted/70 tabular-nums">{lang.percentage}%</span>
-        </div>
+        <button
+          type="button"
+          onclick={() => handleLanguageClick(lang)}
+          class="flex items-center gap-1.5 px-1.5 py-0.5 rounded-md hover:bg-surfaceHover transition-colors shrink-0 {lang.language !== 'Other' ? 'cursor-pointer' : 'cursor-default'}"
+          title={tipFor(lang) + (lang.language !== "Other" ? " — Click to view files" : "")}
+        >
+          <LanguageLogo language={lang.language} size={13} class="shrink-0" />
+          <span class="text-textPrimary/90 font-medium">{lang.language}</span>
+          <span class="text-textMuted/70 tabular-nums text-[10px]">{lang.percentage}%</span>
+        </button>
       {/each}
     </div>
   </div>

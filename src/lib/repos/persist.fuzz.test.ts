@@ -140,6 +140,22 @@ const HOSTILE_CASES: HostileCase[] = [
     }),
   },
   {
+    name: "missing viewTab lands on Work",
+    raw: payload({ version: 1, tabs: [{ path: "/a" }], activePath: "/a" }),
+  },
+  {
+    name: "null viewTab lands on Work",
+    raw: payload({ version: 1, tabs: [{ path: "/a", viewTab: null }], activePath: "/a" }),
+  },
+  {
+    name: "empty viewTab lands on Work",
+    raw: payload({ version: 1, tabs: [{ path: "/a", viewTab: "" }], activePath: "/a" }),
+  },
+  {
+    name: "legacy repo viewTab lands on Work",
+    raw: payload({ version: 1, tabs: [{ path: "/a", viewTab: "repo" }], activePath: "/a" }),
+  },
+  {
     name: "unicode NFC/NFD dedupe + backslash paths",
     raw: payload({
       version: 1,
@@ -229,6 +245,24 @@ describe("loadPersistedWorkspace fuzz", () => {
       opts
     );
     expect(duped.tabs).toHaveLength(1);
+  });
+
+  it("lands missing, empty, null, and legacy repo viewTabs on Work", () => {
+    for (const viewTab of [undefined, null, "", "repo", "DROP TABLE", 12]) {
+      const tab =
+        viewTab === undefined ? { path: "/a" } : { path: "/a", viewTab };
+      const loaded = loadPersistedWorkspace(
+        memoryStorage({
+          [STORAGE_KEY_WORKSPACE]: payload({
+            version: 1,
+            tabs: [tab],
+            activePath: "/a",
+          }),
+        }),
+        opts,
+      );
+      expect(loaded.tabs[0].viewTab, String(viewTab)).toBe("work");
+    }
   });
 
   it("falls back to tabs[0] when activePath matches nothing", () => {

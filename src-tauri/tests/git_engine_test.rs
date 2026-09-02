@@ -80,8 +80,9 @@ fn test_git_workflow_lifecycle() {
     // 6. Create tags
     GitWriter::create_tag(path, "v0.1.0", None, Some("Release v0.1.0")).expect("create_tag failed");
     let tags = GitReader::list_tags(path).expect("list_tags failed");
-    assert_eq!(tags.len(), 1);
-    assert_eq!(tags[0].name, "v0.1.0");
+    assert!(!tags.truncated);
+    assert_eq!(tags.tags.len(), 1);
+    assert_eq!(tags.tags[0].name, "v0.1.0");
 
     // 7. Verify reflog
     let reflog = GitReader::get_reflog(path, 10).expect("get_reflog failed");

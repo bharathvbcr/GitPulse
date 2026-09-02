@@ -79,6 +79,15 @@ pub struct SubmoduleInfo {
     pub orphaned: bool,
 }
 
+/// `cmd_list_submodules` payload. A bare `Vec<SubmoduleInfo>` could not say
+/// when the listing cap dropped embeds, so a 501-submodule repo looked like
+/// a complete 500-submodule one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmoduleList {
+    pub submodules: Vec<SubmoduleInfo>,
+    pub truncated: bool,
+}
+
 /// Parses one `git submodule status` line.
 ///
 /// Shape: `<flag><oid> <path>` with an optional ` (<describe>)` suffix. The
@@ -146,7 +155,7 @@ fn parse_gitmodules(raw: &str) -> BTreeMap<String, (Option<String>, Option<Strin
 }
 
 /// Joins the two sources into the reported list.
-fn assemble(status_raw: &str, gitmodules_raw: &str) -> Vec<SubmoduleInfo> {
+fn assemble(status_raw: &str, gitmodules_raw: &str) -> SubmoduleList {
     let configured = parse_gitmodules(gitmodules_raw);
     // Index by path: it is the only field both sources share.
     let by_path: BTreeMap<&str, (&String, Option<&String>)> = configured
@@ -155,12 +164,14 @@ fn assemble(status_raw: &str, gitmodules_raw: &str) -> Vec<SubmoduleInfo> {
         .collect();
 
     let mut out = Vec::new();
+    let mut truncated = false;
     for line in status_raw.lines() {
-        if out.len() >= MAX_SUBMODULES {
-            break;
-        }
         if line.is_empty() {
             continue;
+        }
+        if out.len() >= MAX_SUBMODULES {
+            truncated = true;
+            break;
         }
         let Some((state, oid, path, described)) = parse_status_line(line) else {
             continue;
@@ -181,16 +192,19 @@ fn assemble(status_raw: &str, gitmodules_raw: &str) -> Vec<SubmoduleInfo> {
             state,
         });
     }
-    out
+    SubmoduleList {
+        submodules: out,
+        truncated,
+    }
 }
 
 /// Lists the superproject's submodules and their states.
-pub fn list(repo_path: &str) -> Result<Vec<SubmoduleInfo>, String> {
+pub fn list(repo_path: &str) -> Result<SubmoduleList, String> {
     let repo = validate_repo(repo_path)?;
     list_in(&repo)
 }
 
-fn list_in(repo: &Path) -> Result<Vec<SubmoduleInfo>, String> {
+fn list_in(repo: &Path) -> Result<SubmoduleList, String> {
     // Both calls fail on a repository with no submodules at all (no
     // `.gitmodules`, nothing in the index). That is an empty answer, not an
     // error worth failing a status refresh over.
@@ -320,7 +334,7 @@ where
     // than a missing submodule.
     if let Some(path) = change.target_path() {
         let known = list_in(&repo)?;
-        if !known.iter().any(|s| s.path == path) {
+        if !known.submodules.iter().any(|s| s.path == path) {
             return Err(format!("No submodule at '{path}'"));
         }
     }
@@ -407,7 +421,7 @@ mod tests {
         let status = " abc123 vendor/lib (heads/main)\n";
         let gitmodules =
             "submodule.the-lib.path\nvendor/lib\0submodule.the-lib.url\nhttps://example.test/l.git\0";
-        let out = assemble(status, gitmodules);
+        let out = assemble(status, gitmodules).submodules;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "the-lib", "the section name, not the path");
         assert_eq!(out[0].url.as_deref(), Some("https://example.test/l.git"));
@@ -419,7 +433,7 @@ mod tests {
     fn an_entry_missing_from_gitmodules_is_reported_as_orphaned() {
         // It cannot be initialized — there is no URL — and hiding it would
         // leave the user with an empty directory and no explanation.
-        let out = assemble("-abc123 vendor/ghost\n", "");
+        let out = assemble("-abc123 vendor/ghost\n", "").submodules;
         assert_eq!(out.len(), 1);
         assert!(out[0].orphaned);
         assert_eq!(out[0].url, None);
@@ -428,15 +442,21 @@ mod tests {
 
     #[test]
     fn a_repository_with_no_submodules_lists_empty() {
-        assert!(assemble("", "").is_empty());
+        assert!(assemble("", "").submodules.is_empty());
+        assert!(!assemble("", "").truncated);
     }
 
     #[test]
-    fn the_listing_is_bounded() {
+    fn the_listing_is_bounded_and_says_so() {
         let status: String = (0..MAX_SUBMODULES + 25)
             .map(|i| format!(" abc123 vendor/lib{i} (heads/main)\n"))
             .collect();
-        assert_eq!(assemble(&status, "").len(), MAX_SUBMODULES);
+        let list = assemble(&status, "");
+        assert_eq!(list.submodules.len(), MAX_SUBMODULES);
+        assert!(
+            list.truncated,
+            "a cap that hid submodules must say so, not look like the whole tree"
+        );
     }
 
     #[test]

@@ -157,7 +157,7 @@ function makeInvoke(overrides: Partial<Record<string, InvokeFn>> = {}): InvokeFn
     if (cmd === "cmd_get_status") {
       return snapshotFor(String(args?.repoPath)).statuses as never;
     }
-    if (cmd === "cmd_list_tags") return [] as never;
+    if (cmd === "cmd_list_tags") return { tags: [], truncated: false } as never;
     // Idle by default; suites that care park an operation via overrides.
     if (cmd === "cmd_repo_operation") return null as never;
     if (cmd === "cmd_stash_list") return [] as never;
@@ -185,6 +185,12 @@ function makeStore(invoke: InvokeFn = makeInvoke()) {
 }
 
 describe("repoStore tabs", () => {
+  it("opens a new repository on Work, not Graph", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    expect(get(store).activeTab).toBe("work");
+  });
+
   it("opens a second repo as a new tab without inheriting the first selection", async () => {
     const { store } = makeStore();
     await store.openRepo("/r/alpha");
@@ -199,7 +205,7 @@ describe("repoStore tabs", () => {
     expect(state.currentPath).toBe("/r/beta");
     expect(state.selectedFilePath).toBeNull();
     expect(state.selectedDiff).toBeNull();
-    expect(state.activeTab).toBe("history");
+    expect(state.activeTab).toBe("work");
     expect(state.currentBranch).toBe("/r/beta-main");
   });
 
@@ -2245,6 +2251,93 @@ describe("repoStore workspace work-in-progress", () => {
   });
 });
 
+describe("repoStore tag list honesty", () => {
+  it("records truncation from TagList instead of looking like the whole history", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_list_tags: async () =>
+          ({
+            tags: [{ name: "v400", commit_id: "abc" }],
+            truncated: true,
+          }) as never,
+      }),
+    );
+    await store.openRepo("/r/many-tags");
+    const state = get(store);
+    expect(state.tags).toEqual([{ name: "v400", commit_id: "abc", message: null }]);
+    expect(state.tagsTruncated).toBe(true);
+    expect(state.tagsFailed).toBe(false);
+  });
+
+  it("treats a thrown probe as failed, not as an empty tag list", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_list_tags: async () => {
+          throw new Error("git dir is locked");
+        },
+      }),
+    );
+    await store.openRepo("/r/locked-tags");
+    const state = get(store);
+    expect(state.tags).toEqual([]);
+    expect(state.tagsFailed).toBe(true);
+    expect(state.tagsTruncated).toBe(false);
+  });
+
+  it("treats a bare array payload as a failed read, not 'no tags'", async () => {
+    // Pre-TagList cmd_list_tags returned Vec<TagInfo>. Accepting that shape
+    // as success would revive the silent-empty path the wrapper exists to close.
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_list_tags: async () => [] as never,
+      }),
+    );
+    await store.openRepo("/r/legacy-tags");
+    const state = get(store);
+    expect(state.tags).toEqual([]);
+    expect(state.tagsFailed).toBe(true);
+  });
+});
+
+describe("repoStore tag actions", () => {
+  it("creates a tag through cmd_create_tag with the name and optional commit", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_create_tag: async (_cmd, args) => {
+          calls.push(args ?? {});
+          return { policy: null, output: null } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.createTag("v1.0.0", "abc123", "release");
+    expect(outcome.ok).toBe(true);
+    expect(calls[0]).toEqual({
+      repoPath: "/r/a",
+      tagName: "v1.0.0",
+      commitId: "abc123",
+      message: "release",
+    });
+  });
+
+  it("deletes a tag through cmd_delete_tag", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_delete_tag: async (_cmd, args) => {
+          calls.push(args ?? {});
+          return { policy: null, output: null } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.deleteTag("v1.0.0");
+    expect(outcome.ok).toBe(true);
+    expect(calls[0]).toEqual({ repoPath: "/r/a", tagName: "v1.0.0" });
+  });
+});
+
 describe("repoStore stash actions", () => {
   const entry = {
     index: 2,
@@ -2276,6 +2369,61 @@ describe("repoStore stash actions", () => {
       index: 2,
       expectedOid: "deadbeef",
     });
+  });
+
+  it("pops the listed top entry by object id, never stash@{0} sight-unseen", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_stash_list: async () =>
+          [
+            {
+              index: 0,
+              selector: "stash@{0}",
+              oid: "abc123",
+              subject: "On main: wip",
+              message: "wip",
+              branch: "main",
+              timestamp: 1,
+            },
+          ] as never,
+        cmd_stash_action: async (_cmd, args) => {
+          calls.push(args ?? {});
+          return { policy: null, output: "Dropped refs/stash@{0}" } as never;
+        },
+      }),
+    );
+    await store.openRepo("/r/stashed");
+    const outcome = await store.stashPop();
+    expect(outcome.ok).toBe(true);
+    expect(calls).toEqual([
+      { repoPath: "/r/stashed", action: "pop", index: 0, expectedOid: "abc123" },
+    ]);
+  });
+
+  it("refuses to pop when the stash list could not be read", async () => {
+    const { store } = makeStore(
+      makeInvoke({
+        cmd_stash_list: async () => {
+          throw new Error("git exploded");
+        },
+        cmd_stash_action: async () => {
+          throw new Error("should not be called");
+        },
+      }),
+    );
+    await store.openRepo("/r/a");
+    const outcome = await store.stashPop();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("could not be read");
+  });
+
+  it("refuses to pop an empty stash rather than targeting stash@{0}", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/a");
+    const outcome = await store.stashPop();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("Nothing is stashed");
   });
 
   it("surfaces the backend's stale-stack refusal instead of swallowing it", async () => {

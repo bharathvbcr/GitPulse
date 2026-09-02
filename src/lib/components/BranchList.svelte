@@ -38,6 +38,7 @@
   import { portal } from "../dom/portal";
   import ChurnBar from "./ChurnBar.svelte";
   import {
+    AlertTriangle,
     ChevronDown,
     ChevronRight,
     Cloud,
@@ -494,6 +495,32 @@
     await repoStore.mergeBranch(localNameFor(branch), ffOnly);
   }
 
+  async function runCreateTag(at?: { name: string; commitId: string }) {
+    closeMenu();
+    const name = await askText({
+      title: at ? `Create tag at ${at.name}` : "Create tag at HEAD",
+      message: at
+        ? `Tag name pointing at ${at.commitId.slice(0, 7)}:`
+        : "Tag name for the current HEAD:",
+      placeholder: "v1.0.0",
+      confirmLabel: "Create tag",
+    });
+    const trimmed = name?.trim();
+    if (!trimmed) return;
+    await repoStore.createTag(trimmed, at?.commitId);
+  }
+
+  async function runDeleteTag(tag: TagInfo) {
+    closeMenu();
+    const ok = await askConfirm({
+      title: "Delete tag",
+      message: `Delete tag ${tag.name}? The commit it points at is untouched.`,
+      confirmLabel: "Delete",
+    });
+    if (!ok) return;
+    await repoStore.deleteTag(tag.name);
+  }
+
   async function runRename(branch: BranchInfo) {
     closeMenu();
     const next = await askText({
@@ -879,8 +906,30 @@
       >
         <Plus size={12} />
       </button>
+      <button
+        type="button"
+        onclick={() => void runCreateTag()}
+        title="Create tag at HEAD"
+        aria-label="Create tag"
+        class="p-1 rounded-full hover:bg-surfaceHover hover:text-accent text-textMuted transition-colors"
+      >
+        <Tag size={12} />
+      </button>
     </div>
   </div>
+
+  {#if $repoStore.tagsFailed}
+    <!-- An unreadable tag list must not render as "no tags". -->
+    <p class="px-2 {gapBand} flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+      <AlertTriangle size={11} class="mt-0.5 shrink-0" />
+      <span>The tag list could not be read, so this may not be complete.</span>
+    </p>
+  {:else if $repoStore.tagsTruncated}
+    <p class="px-2 {gapBand} flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+      <AlertTriangle size={11} class="mt-0.5 shrink-0" />
+      <span>Showing the newest {$repoStore.tags.length} tags. Older tags exist and are not listed.</span>
+    </p>
+  {/if}
 
   <!-- Search Box -->
   <div class="px-1 {gapBand}">
@@ -1076,13 +1125,32 @@
       <button role="menuitem" class="gp-menu-item" onclick={() => void copyText(b.name)}>
         <Copy size={12} /> Copy name
       </button>
+      {#if !b.is_remote && b.tip_commit_id}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => void runCreateTag({ name: b.name, commitId: b.tip_commit_id })}
+        >
+          <Tag size={12} /> Create tag here…
+        </button>
+      {/if}
     {:else if menu.tag}
       {@const t = menu.tag}
+      <button role="menuitem" class="gp-menu-item" onclick={() => { closeMenu(); checkoutName(t.name); }}>
+        <GitBranch size={12} /> Checkout
+      </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { const name = t.name; closeMenu(); selectRef(name); }}>
         <Tag size={12} /> Filter history
       </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => void copyText(t.name)}>
         <Copy size={12} /> Copy name
+      </button>
+      <button
+        role="menuitem"
+        class="w-full px-3 py-1.5 text-left hover:bg-surfaceHover flex items-center gap-2 text-rose-400"
+        onclick={() => void runDeleteTag(t)}
+      >
+        <Trash2 size={12} /> Delete…
       </button>
     {/if}
   </div>

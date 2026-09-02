@@ -71,6 +71,31 @@ describe("BranchList create-form safety", () => {
   });
 });
 
+describe("BranchList tags", () => {
+  it("says when the tag list failed or was capped, instead of looking complete", () => {
+    expect(source).toContain("$repoStore.tagsFailed");
+    expect(source).toContain("$repoStore.tagsTruncated");
+    expect(source).toContain("The tag list could not be read, so this may not be complete.");
+    expect(source).toContain("Older tags exist and are not listed.");
+  });
+
+  it("creates and deletes tags through the store, not a missing UI", () => {
+    expect(source).toContain("repoStore.createTag");
+    expect(source).toContain("repoStore.deleteTag");
+    expect(source).toContain('aria-label="Create tag"');
+    expect(source).toContain("Checkout");
+    expect(source).toContain("Delete…");
+  });
+
+  it("confirms tag deletion before invoking it", () => {
+    const confirmIdx = source.indexOf('title: "Delete tag"');
+    const deleteIdx = source.indexOf("repoStore.deleteTag(tag.name)");
+    expect(confirmIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(confirmIdx);
+    expect(source).toContain("if (!ok) return;");
+  });
+});
+
 describe("BranchList pin persistence via branches/pins", () => {
   it("routes storage through the pure pins helpers", () => {
     expect(source).toContain('from "../branches/pins"');

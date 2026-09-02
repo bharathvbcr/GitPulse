@@ -16,6 +16,7 @@
     Sparkles,
     AlertTriangle,
   } from "lucide-svelte";
+  import { agentKind, agentSessionSlug, isAgentWorktree } from "../work/agentWorktree";
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
@@ -228,9 +229,11 @@
   /** Armed-confirm label; names the discard cost when changes would be lost. */
   function removeArmTitle(wt: WorktreeInfo): string {
     if (removingPath !== wt.path) return "Remove this worktree";
-    const dirty = wt.dirty_files ?? 0;
-    return dirty > 0
-      ? `Discard ${dirty} changed files? Click again to remove`
+    if (wt.dirty_files === null || wt.dirty_files === undefined) {
+      return "Not scanned for changes — click again to try a clean remove";
+    }
+    return wt.dirty_files > 0
+      ? `Discard ${wt.dirty_files} changed files? Click again to remove`
       : "Click again to remove";
   }
 
@@ -250,10 +253,10 @@
       return;
     }
     removingPath = null;
-    // A dirty worktree must not be silently discarded: --force only when the
-    // status scan found nothing to lose (dirty_files === null means "not
-    // scanned", treated as clean so removal stays one confirm).
-    const force = (wt.dirty_files ?? 0) === 0;
+    // --force destroys uncommitted work. An unscanned worktree (null) is
+    // not a verified-clean one: never force-remove it. A scanned dirty
+    // tree is force-removed only after the armed confirm named the cost.
+    const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
     try {
       await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force });
       if ($repoStore.currentPath !== repo) return;
@@ -289,6 +292,7 @@
       <button
         onclick={prune}
         title="Prune stale worktree metadata"
+        aria-label="Prune stale worktree metadata"
         class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
       >
         <Sparkles size={11} />
@@ -359,6 +363,12 @@
             title="{wt.path}\n{wt.branch ?? 'detached'} · {wt.dirty_files === null ? 'not scanned' : wt.dirty_files + ' change(s)'}"
           >
             <span class="truncate text-[11px] font-medium text-textPrimary">{wt.name}</span>
+            {#if isAgentWorktree(wt.path)}
+              <span
+                class="shrink-0 text-[9px] uppercase rounded-full bg-accent/10 px-1 text-accent"
+                title="Agent session {agentSessionSlug(wt.path) || agentKind(wt.path)}"
+              >{agentKind(wt.path)}</span>
+            {/if}
             {#if wt.is_bare}
               <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>
             {/if}
@@ -376,13 +386,19 @@
             {/if}
           </button>
           <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 shrink-0">
-            <button onclick={() => open(wt)} title="Open in a new tab" class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent">
+            <button
+              onclick={() => open(wt)}
+              title="Open in a new tab"
+              aria-label="Open {wt.name} in a new tab"
+              class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
+            >
               <ExternalLink size={11} />
             </button>
             {#if !wt.is_main}
               <button
                 onclick={() => void toggleLock(wt)}
                 title={wt.is_locked ? "Unlock this worktree" : "Lock this worktree"}
+                aria-label={wt.is_locked ? `Unlock ${wt.name}` : `Lock ${wt.name}`}
                 class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
               >
                 {#if wt.is_locked}
@@ -393,7 +409,11 @@
               </button>
               {#if removingPath === wt.path}
                 <span class="shrink-0 text-[9px] font-semibold text-rose-400 whitespace-nowrap">
-                  {(wt.dirty_files ?? 0) > 0 ? `Discard ${wt.dirty_files} changed files?` : "Remove?"}
+                  {typeof wt.dirty_files === "number" && wt.dirty_files > 0
+                  ? `Discard ${wt.dirty_files} changed files?`
+                  : wt.dirty_files === null
+                    ? "Not scanned — clean remove?"
+                    : "Remove?"}
                 </span>
               {/if}
               <button

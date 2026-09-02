@@ -14,12 +14,12 @@ pub use git_cli::{
 };
 pub use git_reader::{
     BlameLine, BranchInfo, BranchStatsReport, BranchStatsUpdate, CommitDetails, CommitFileChange,
-    FileStatus, GitReader, ReflogEntry, RepoLanguageStat, TagInfo,
+    FileStatus, GitReader, ReflogEntry, RepoLanguageStat, TagInfo, TagList,
 };
 pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep, ResetMode};
 pub use provenance::{ProvenanceFreshness, SessionEpisodeNote, VerificationNote};
-pub use remotes::{RemoteChange, RemoteInfo};
+pub use remotes::{RemoteChange, RemoteInfo, RemoteList};
 pub use repo_op::{OperationAction, OperationKind, RepoOperation};
 pub use stash::{StashAction, StashEntry};
-pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleState};
+pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
 pub use worktree::WorktreeInfo;

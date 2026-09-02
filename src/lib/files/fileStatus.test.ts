@@ -7,6 +7,8 @@ import {
   statusMatchesScope,
   statusLiveKey,
   statusPathKey,
+  statusBadgeClass,
+  statusBadgeLabel,
   summarizeStatuses,
   type StatusLike,
 } from "./fileStatus";
@@ -112,3 +114,25 @@ describe("dirtyAncestorSet", () => {
     expect(dirtyAncestorSet(["README.md"]).size).toBe(0);
   });
 });
+
+describe("statusBadgeClass and statusBadgeLabel", () => {
+  it("returns distinct styling and labels for each file change kind", () => {
+    expect(statusBadgeClass("conflict")).toContain("rose");
+    expect(statusBadgeClass("staged")).toContain("emerald");
+    expect(statusBadgeClass("untracked")).toContain("cyan");
+    expect(statusBadgeClass("unstaged")).toContain("amber");
+    expect(statusBadgeClass("clean")).toBe("");
+
+    expect(statusBadgeLabel("conflict")).toBe("!C");
+    expect(statusBadgeLabel("staged")).toBe("S");
+    expect(statusBadgeLabel("untracked")).toBe("U");
+    expect(statusBadgeLabel("unstaged")).toBe("M");
+    expect(statusBadgeLabel("clean")).toBe("");
+
+    expect(statusBadgeLabel("conflict", true)).toBe("CONFLICT");
+    expect(statusBadgeLabel("staged", true)).toBe("STAGED");
+    expect(statusBadgeLabel("untracked", true)).toBe("UNTRACKED");
+    expect(statusBadgeLabel("unstaged", true)).toBe("MODIFIED");
+  });
+});
+

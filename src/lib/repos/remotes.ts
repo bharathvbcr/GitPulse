@@ -29,6 +29,57 @@ export type RemoteChange =
   | { kind: "seturl"; name: string; url: string; push: boolean }
   | { kind: "prune"; name: string };
 
+/** Wire shape of `cmd_list_remotes`. A bare array could not say when the cap cut remotes. */
+export interface RemoteList {
+  remotes: RemoteInfo[];
+  truncated: boolean;
+}
+
+/**
+ * Unwraps a `cmd_list_remotes` payload.
+ *
+ * A bare array or a missing `truncated` flag is a failed read, not "no
+ * remotes". Folding those into an empty list is how a truncated config
+ * comes to look like a local-only repository.
+ */
+export function parseRemoteList(value: unknown): {
+  remotes: RemoteInfo[];
+  truncated: boolean;
+  failed: boolean;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { remotes: [], truncated: false, failed: true };
+  }
+  const rec = value as { remotes?: unknown; truncated?: unknown };
+  if (!Array.isArray(rec.remotes) || typeof rec.truncated !== "boolean") {
+    return { remotes: [], truncated: false, failed: true };
+  }
+  const remotes: RemoteInfo[] = [];
+  for (const item of rec.remotes) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { remotes: [], truncated: false, failed: true };
+    }
+    const r = item as {
+      name?: unknown;
+      fetch_url?: unknown;
+      push_url?: unknown;
+      tracking_branches?: unknown;
+      is_default?: unknown;
+    };
+    if (typeof r.name !== "string" || typeof r.tracking_branches !== "number" || typeof r.is_default !== "boolean") {
+      return { remotes: [], truncated: false, failed: true };
+    }
+    remotes.push({
+      name: r.name,
+      fetch_url: typeof r.fetch_url === "string" ? r.fetch_url : null,
+      push_url: typeof r.push_url === "string" ? r.push_url : null,
+      tracking_branches: r.tracking_branches,
+      is_default: r.is_default,
+    });
+  }
+  return { remotes, truncated: rec.truncated, failed: false };
+}
+
 /**
  * Strips userinfo from a URL for display.
  *

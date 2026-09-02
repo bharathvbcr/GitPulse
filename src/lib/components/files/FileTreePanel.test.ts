@@ -64,4 +64,20 @@ describe("FileTreePanel", () => {
     expect(source).toContain("joinWorktreePath");
     expect(source).toContain("onPinFile");
   });
+
+  it("supports zero-config store fallbacks for shared explorer selection", () => {
+    expect(source).toContain("onSelectFile?: (path: string) => void");
+    expect(source).toContain("repoStore.selectFilePath(path)");
+    expect(source).toContain("effectiveSelected = $derived(selectedFile ?? $repoStore.selectedFilePath)");
+  });
+
+  it("builds rows via pure fileTree pipeline and reveals active file ancestors", () => {
+    expect(source).toContain('from "../../files/fileTree"');
+    for (const fn of ["buildFileTree", "flattenFileTree", "ancestorsOf"]) {
+      expect(source).toContain(fn);
+    }
+    expect(source).toContain("isFiltering ? false : collapsed[dirPath] === true");
+    expect(source).toContain("ancestorsOf(selected)");
+    expect(source).toContain("if (changed) collapsed = next;");
+  });
 });

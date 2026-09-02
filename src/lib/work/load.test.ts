@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { loadWork, MAX_BINDING_LOOKUPS } from "./load";
+import { loadWork, MAX_BINDING_LOOKUPS, MAX_OPERATION_PROBES } from "./load";
 import { UNBOUND_ROW_ID } from "./projection";
 
 /** A fake IPC surface: every command answers from `answers`, or throws. */
@@ -77,6 +77,7 @@ function baseAnswers(over: Record<string, unknown> = {}) {
     cmd_ledger_tail: [],
     cmd_grants_view: OK_GRANTS,
     cmd_worktree_task: null,
+    cmd_repo_operation: null,
     cmd_task_scope: { id: "TASK-1", title: "Close the gate bypass", status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] },
     ...over,
   };
@@ -193,6 +194,81 @@ describe("loadWork", () => {
     expect(p.rows).toEqual([]);
   });
 
+  it("attaches a parked operation even when rows are keyed on tasks", async () => {
+    const invoke = fakeInvoke(
+      baseAnswers({
+        cmd_worktree_task: () => "TASK-1",
+        cmd_repo_operation: {
+          kind: "Rebase",
+          current_step: 2,
+          total_steps: 7,
+          head_ref: "feature",
+          incoming_ref: null,
+          conflicted_paths: ["a.ts"],
+          conflicted_total: 1,
+          available: ["abort"],
+          warnings: [],
+        },
+      }),
+    );
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.rows[0].operation?.kind).toBe("Rebase");
+    expect(p.rows[0].worktrees[0].operation?.kind).toBe("Rebase");
+  });
+
+  it("degrades when an operation probe throws rather than calling the worktree idle", async () => {
+    const invoke = fakeInvoke(
+      baseAnswers({ cmd_repo_operation: new Error("git dir is locked") }),
+    );
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.degraded).toBe(true);
+    expect(p.sources.worktrees.ok).toBe(false);
+    expect(p.sources.worktrees.detail).toContain("git dir is locked");
+    expect(p.rows[0]?.operation).toBeNull();
+  });
+
+  it("does not let a bare worktree steal an operation-probe slot", async () => {
+    const probed: string[] = [];
+    const many = [
+      { ...OK_WORKTREES[0], path: "/bare", name: "bare", is_bare: true, is_main: false },
+      ...Array.from({ length: MAX_OPERATION_PROBES }, (_, i) => ({
+        ...OK_WORKTREES[0],
+        path: `/wt/${i}`,
+        name: `${i}`,
+        is_main: false,
+      })),
+    ];
+    const invoke = fakeInvoke(
+      baseAnswers({
+        cmd_list_worktrees: many,
+        cmd_repo_operation: (args: { repoPath: string }) => {
+          probed.push(args.repoPath);
+          return null;
+        },
+      }),
+    );
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(probed).toHaveLength(MAX_OPERATION_PROBES);
+    expect(probed).not.toContain("/bare");
+    expect(probed).toContain(`/wt/${MAX_OPERATION_PROBES - 1}`);
+    expect(p.sources.worktrees.ok).toBe(true);
+  });
+
+  it("says so when it could not probe every worktree for a parked operation", async () => {
+    const many = Array.from({ length: MAX_OPERATION_PROBES + 4 }, (_, i) => ({
+      ...OK_WORKTREES[0],
+      path: `/wt/${i}`,
+      name: `${i}`,
+      is_main: false,
+    }));
+    const invoke = fakeInvoke(baseAnswers({ cmd_list_worktrees: many }));
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.sources.worktrees.ok).toBe(false);
+    expect(p.sources.worktrees.detail).toContain(`${MAX_OPERATION_PROBES}`);
+    expect(p.sources.worktrees.detail).toContain("parked operations");
+    expect(p.degraded).toBe(true);
+  });
+
   it("reads the ledger and the task store in one round of calls", async () => {
     const invoke = fakeInvoke(baseAnswers());
     await loadWork("/repo", { invoke: invoke as never });
@@ -203,5 +279,6 @@ describe("loadWork", () => {
     expect(commands).toContain("cmd_github_context");
     expect(commands).toContain("cmd_ledger_tail");
     expect(commands).toContain("cmd_grants_view");
+    expect(commands).toContain("cmd_repo_operation");
   });
 });

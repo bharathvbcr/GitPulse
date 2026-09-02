@@ -16,4 +16,21 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("Navigation");
     expect(body).toContain("Open Command Palette");
   });
+
+  it("documents the same Open, Clone, and Work accelerators the native menu binds", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Open Repository…");
+    expect(body).toContain("Clone Repository…");
+    expect(body).toContain("Open Work");
+    expect(body).toContain("F10");
+    // Native File menu binds CmdOrCtrl+O and CmdOrCtrl+Shift+O; the sheet
+    // used to list only ⌘T, so asking for help hid the chords the menu uses.
+    expect(body).toContain("O");
+  });
+
+  it("documents that commit search switches to Graph rather than no-opping on Work", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Search commits");
+    expect(body).toContain("switches to Graph");
+  });
 });

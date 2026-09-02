@@ -198,4 +198,10 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("saveSections(sections)");
     expect(source).toContain("loadSections(readSectionsRaw())");
   });
+
+  it("renders LanguageLogo and formatPathParts for staged and unstaged files", () => {
+    expect(source).toContain("LanguageLogo");
+    expect(source).toContain("formatPathParts");
+    expect(source).toContain("filePath={f.path}");
+  });
 });

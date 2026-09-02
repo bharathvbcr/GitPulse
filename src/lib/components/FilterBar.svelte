@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { filterStore } from "../stores/filterStore";
   import { Search, X } from "lucide-svelte";
-  import { isImeComposition } from "../keyboard/imeGuard";
+  import { FOCUS_COMMIT_SEARCH_EVENT } from "../views/commitFilter";
 
   let inputEl: HTMLInputElement | undefined = $state();
 
@@ -11,20 +11,10 @@
     inputEl?.select();
   }
 
-  function handleKeyDown(e: KeyboardEvent) {
-    if (isImeComposition(e)) return;
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-      e.preventDefault();
-      focusFilter();
-    }
-  }
-
   onMount(() => {
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("gitpulse:focus-filter", focusFilter);
+    window.addEventListener(FOCUS_COMMIT_SEARCH_EVENT, focusFilter);
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("gitpulse:focus-filter", focusFilter);
+      window.removeEventListener(FOCUS_COMMIT_SEARCH_EVENT, focusFilter);
     };
   });
 </script>

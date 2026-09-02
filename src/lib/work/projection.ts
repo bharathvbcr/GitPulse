@@ -50,6 +50,13 @@ export interface WorktreeBinding {
   worktree: WorktreeInfo;
   /** Empty when this worktree is bound to no task. */
   taskId: string;
+  /**
+   * The multi-step git operation parked in this worktree, if the probe ran
+   * and found one. Null when the probe ran and the worktree is idle; a
+   * missing probe is represented by this also being null, and by the load
+   * marking the worktrees source degraded so the two never read the same.
+   */
+  operation: RepoOperation | null;
 }
 
 /** Policy outcomes counted over the ledger window this projection saw. */
@@ -252,12 +259,16 @@ export function projectWork(input: WorkInputs): WorkProjection {
     // place work is happening.
     const key = byTask ? taskId : worktree.path;
     const row = rowFor(key, byTask ? "task" : "worktree");
-    row.worktrees.push({ worktree, taskId });
+    const parked = input.operations[worktree.path] ?? null;
+    row.worktrees.push({ worktree, taskId, operation: parked });
+    // A parked operation belongs to the worktree, not to the row kind. Task
+    // mode used to skip this assignment, so a DevCouncil repository mid-rebase
+    // rendered as idle — the exact screen the banner exists to prevent.
+    if (parked && !row.operation) row.operation = parked;
     if (!byTask) {
       // The branch is the row's name; a detached worktree keeps its directory
       // name rather than rendering as an untitled row.
       row.title = branchOf(worktree) || worktree.name;
-      row.operation = input.operations[worktree.path] ?? null;
     }
     const branch = branchOf(worktree);
     if (branch.length === 0) continue;
@@ -345,6 +356,22 @@ export function dirtyCount(row: WorkRow): number {
     total = total < 0 ? dirty : total + dirty;
   }
   return total;
+}
+
+/** The worktree on this row that is blocked, if any. */
+export function parkedWorktree(row: WorkRow): WorktreeBinding | null {
+  return row.worktrees.find((binding) => binding.operation) ?? null;
+}
+
+/**
+ * The path opening this row should land on.
+ *
+ * A parked operation is resolved in that worktree's git dir; opening the
+ * first worktree on a task that has several would send the reader to a
+ * checkout that is not the one that is stuck.
+ */
+export function openPathFor(row: WorkRow): string {
+  return parkedWorktree(row)?.worktree.path ?? row.worktrees[0]?.worktree.path ?? "";
 }
 
 function compareRows(a: WorkRow, b: WorkRow): number {

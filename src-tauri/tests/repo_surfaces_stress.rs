@@ -7,6 +7,7 @@
 //! the surface where a race does not merely fail, it destroys the wrong work.
 
 use gitpulse_lib::engine::stash::{self, StashAction};
+use gitpulse_lib::engine::submodules::{self, SubmoduleChange};
 use gitpulse_lib::engine::{remotes, RemoteChange};
 use std::collections::HashSet;
 use std::fs;
@@ -274,10 +275,11 @@ fn many_remotes_list_without_cross_contamination() {
     }
 
     let listed = remotes::list(&path).unwrap();
-    assert_eq!(listed.len(), COUNT);
-    let names: HashSet<&str> = listed.iter().map(|r| r.name.as_str()).collect();
+    assert!(!listed.truncated);
+    assert_eq!(listed.remotes.len(), COUNT);
+    let names: HashSet<&str> = listed.remotes.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names.len(), COUNT, "names collided");
-    for remote in &listed {
+    for remote in &listed.remotes {
         let index = remote.name.trim_start_matches("remote-");
         assert_eq!(
             remote.fetch_url.as_deref(),
@@ -289,7 +291,7 @@ fn many_remotes_list_without_cross_contamination() {
     }
     // With no `origin` among many, no default may be claimed.
     assert!(
-        listed.iter().all(|r| !r.is_default),
+        listed.remotes.iter().all(|r| !r.is_default),
         "a default was invented among {COUNT} equally-named remotes"
     );
 }
@@ -333,8 +335,12 @@ fn a_remote_name_that_prefixes_another_keeps_its_own_refs() {
     );
 
     let listed = remotes::list(&path).unwrap();
-    let origin = listed.iter().find(|r| r.name == "origin").unwrap();
-    let mirror = listed.iter().find(|r| r.name == "origin-mirror").unwrap();
+    let origin = listed.remotes.iter().find(|r| r.name == "origin").unwrap();
+    let mirror = listed
+        .remotes
+        .iter()
+        .find(|r| r.name == "origin-mirror")
+        .unwrap();
     assert_eq!(
         origin.tracking_branches, 2,
         "origin absorbed the mirror's ref"
@@ -373,6 +379,7 @@ fn awkward_but_legal_remote_urls_round_trip() {
     let listed = remotes::list(&path).unwrap();
     for (name, url) in cases {
         let found = listed
+            .remotes
             .iter()
             .find(|r| r.name == name)
             .unwrap_or_else(|| panic!("{name} vanished from the listing"));
@@ -382,4 +389,172 @@ fn awkward_but_legal_remote_urls_round_trip() {
             "{name} URL was mangled"
         );
     }
+}
+
+/// Renaming onto a name that already exists must refuse and leave both remotes.
+#[test]
+fn renaming_onto_an_existing_name_is_refused_and_leaves_both() {
+    let repo = init_repo();
+    let path = repo.path().to_string_lossy().into_owned();
+    remotes::apply_with(
+        &path,
+        &RemoteChange::Add {
+            name: "origin".into(),
+            url: "https://example.test/a.git".into(),
+        },
+        allow,
+    )
+    .unwrap();
+    remotes::apply_with(
+        &path,
+        &RemoteChange::Add {
+            name: "upstream".into(),
+            url: "https://example.test/b.git".into(),
+        },
+        allow,
+    )
+    .unwrap();
+
+    let err = remotes::apply_with(
+        &path,
+        &RemoteChange::Rename {
+            name: "origin".into(),
+            new_name: "upstream".into(),
+        },
+        allow,
+    )
+    .unwrap_err();
+    assert!(err.contains("already exists"), "got: {err}");
+
+    let listed = remotes::list(&path).unwrap();
+    let names: HashSet<&str> = listed.remotes.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, HashSet::from(["origin", "upstream"]));
+}
+
+/// `git remote rename` moves `refs/remotes/<old>/*` with the name. A listing
+/// that kept counting those refs against the old name would show a ghost remote.
+#[test]
+fn renaming_moves_tracking_refs_with_the_remote() {
+    let repo = init_repo();
+    let dir = repo.path();
+    let path = dir.to_string_lossy().into_owned();
+    remotes::apply_with(
+        &path,
+        &RemoteChange::Add {
+            name: "origin".into(),
+            url: "https://example.test/a.git".into(),
+        },
+        allow,
+    )
+    .unwrap();
+    let head = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    run_git(dir, &["update-ref", "refs/remotes/origin/main", &head]);
+    run_git(dir, &["update-ref", "refs/remotes/origin/dev", &head]);
+
+    remotes::apply_with(
+        &path,
+        &RemoteChange::Rename {
+            name: "origin".into(),
+            new_name: "upstream".into(),
+        },
+        allow,
+    )
+    .unwrap();
+
+    let listed = remotes::list(&path).unwrap();
+    assert_eq!(listed.remotes.len(), 1);
+    assert_eq!(listed.remotes[0].name, "upstream");
+    assert_eq!(
+        listed.remotes[0].tracking_branches, 2,
+        "tracking refs must follow the rename, not stay counted under origin"
+    );
+}
+
+fn repo_with_submodule() -> (TempDir, TempDir) {
+    let lib = init_repo();
+    fs::write(lib.path().join("l.txt"), "lib\n").unwrap();
+    run_git(lib.path(), &["add", "-A"]);
+    run_git(lib.path(), &["commit", "-m", "lib"]);
+
+    let main = init_repo();
+    run_git(
+        main.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &lib.path().to_string_lossy(),
+            "vendor/lib",
+        ],
+    );
+    run_git(main.path(), &["commit", "-m", "add submodule"]);
+    (main, lib)
+}
+
+/// Deinit without `--force` must refuse a dirty checkout rather than discard it.
+#[test]
+fn deinit_without_force_refuses_uncommitted_submodule_work() {
+    let (main, _lib) = repo_with_submodule();
+    let sub = main.path().join("vendor/lib");
+    fs::write(sub.join("l.txt"), "wip\n").unwrap();
+    let path = main.path().to_string_lossy().into_owned();
+
+    let err = submodules::apply_with(
+        &path,
+        &SubmoduleChange::Deinit {
+            path: "vendor/lib".into(),
+            force: false,
+        },
+        allow,
+    )
+    .unwrap_err();
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("local modifications") || lower.contains("dirty") || lower.contains("force"),
+        "refused deinit must name the dirty tree, got: {err}"
+    );
+    assert!(
+        fs::read_to_string(sub.join("l.txt"))
+            .unwrap()
+            .contains("wip"),
+        "uncommitted submodule work must survive a refused deinit"
+    );
+}
+
+/// Sync is local config rewriting and must succeed without a network, even
+/// when pointed at a file-transport submodule git would refuse to clone.
+#[test]
+fn sync_rewrites_urls_from_gitmodules_without_cloning() {
+    let (main, lib) = repo_with_submodule();
+    let path = main.path().to_string_lossy().into_owned();
+    let new_url = format!("{}.moved", lib.path().display());
+    fs::write(
+        main.path().join(".gitmodules"),
+        format!("[submodule \"vendor/lib\"]\n\tpath = vendor/lib\n\turl = {new_url}\n"),
+    )
+    .unwrap();
+
+    submodules::apply_with(
+        &path,
+        &SubmoduleChange::Sync {
+            path: Some("vendor/lib".into()),
+            recursive: false,
+        },
+        allow,
+    )
+    .unwrap();
+
+    let listed = submodules::list(&path).unwrap();
+    assert_eq!(listed.submodules.len(), 1);
+    assert_eq!(listed.submodules[0].url.as_deref(), Some(new_url.as_str()));
 }

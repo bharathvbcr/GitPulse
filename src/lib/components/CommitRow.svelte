@@ -14,6 +14,8 @@
     Check,
     Plus,
     Filter,
+    GitCommit,
+    Undo2,
   } from "lucide-svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
@@ -101,7 +103,7 @@
       clientX,
       clientY,
       200,
-      180,
+      280,
       window.innerWidth,
       window.innerHeight
     );
@@ -340,6 +342,22 @@
     >
       <GitBranch size={12} class="text-textMuted" />
       <span>Checkout Commit</span>
+    </button>
+    <button
+      role="menuitem"
+      class="gp-menu-item"
+      onclick={() => { closeMenu(); void repoStore.cherryPick([row.id]); }}
+    >
+      <GitCommit size={12} class="text-textMuted" />
+      <span>Cherry-pick onto current branch</span>
+    </button>
+    <button
+      role="menuitem"
+      class="gp-menu-item"
+      onclick={() => { closeMenu(); void repoStore.revertCommits([row.id]); }}
+    >
+      <Undo2 size={12} class="text-textMuted" />
+      <span>Revert this commit</span>
     </button>
     <button
       role="menuitem"

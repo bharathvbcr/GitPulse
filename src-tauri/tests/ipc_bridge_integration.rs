@@ -465,8 +465,10 @@ fn an_empty_collection_arrives_as_an_empty_array_not_null() {
         json!({ "repoPath": repo.path().to_string_lossy() }),
     )
     .expect("tags list");
-    assert!(value.is_array(), "expected [], got: {value}");
-    assert_eq!(value.as_array().expect("an array").len(), 0);
+    assert!(value.is_object(), "expected a TagList object, got: {value}");
+    let tags = value["tags"].as_array().expect("tags array");
+    assert_eq!(tags.len(), 0);
+    assert_eq!(value["truncated"], false);
     assert!(!value.is_null());
 }
 

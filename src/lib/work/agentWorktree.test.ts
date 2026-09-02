@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_WORKTREE_SEGMENT, agentSessionSlug, isAgentWorktree } from "./agentWorktree";
+import {
+  AGENT_WORKTREE_SEGMENT,
+  agentKind,
+  agentKindsOn,
+  agentSessionSlug,
+  isAgentWorktree,
+} from "./agentWorktree";
 
 describe("isAgentWorktree", () => {
   it("recognises the layout Claude Code actually creates", () => {
@@ -7,16 +13,36 @@ describe("isAgentWorktree", () => {
     expect(isAgentWorktree("/Users/me/Code/app/.claude/worktrees/x")).toBe(true);
   });
 
+  it("recognises the same layout for any agent, not only Claude", () => {
+    // Cursor, Codex and others nest sessions the same way. Hard-coding
+    // `.claude/` would label those worktrees as hand-made — the opposite
+    // remedy of the one they need.
+    expect(isAgentWorktree("/repo/.cursor/worktrees/fix-auth")).toBe(true);
+    expect(isAgentWorktree("/repo/.codex/worktrees/session-1")).toBe(true);
+    expect(agentKind("/repo/.cursor/worktrees/fix-auth")).toBe("cursor");
+    expect(agentKind("/repo/.codex/worktrees/session-1")).toBe("codex");
+  });
+
   it("recognises it on Windows separators too", () => {
     // The same repository opened on Windows reports backslashes; matching only
     // the POSIX form would label every agent worktree there as hand-made.
     expect(isAgentWorktree("C:\\Users\\me\\app\\.claude\\worktrees\\slug")).toBe(true);
+    expect(isAgentWorktree("C:\\Users\\me\\app\\.cursor\\worktrees\\slug")).toBe(true);
   });
 
   it("does not claim an ordinary worktree", () => {
     expect(isAgentWorktree("/repo")).toBe(false);
     expect(isAgentWorktree("/repo/../wt/feature")).toBe(false);
+    expect(isAgentWorktree("/repo/worktrees/feature")).toBe(false);
+  });
+
+  it("never treats git's own worktree metadata as an agent session", () => {
+    // `.git/worktrees/` is the same shape as the agent layout and is the
+    // one false positive that would put an "agent" chip on every linked
+    // worktree git creates for anyone.
     expect(isAgentWorktree("/repo/.git/worktrees/feature")).toBe(false);
+    expect(isAgentWorktree("C:\\repo\\.git\\worktrees\\feature")).toBe(false);
+    expect(agentKind("/repo/.git/worktrees/feature")).toBe("");
   });
 
   it("never guesses from a branch name", () => {
@@ -34,6 +60,24 @@ describe("isAgentWorktree", () => {
   });
 });
 
+describe("agentKind and agentKindsOn", () => {
+  it("names the hidden directory, not a hard-coded product", () => {
+    expect(agentKind("/repo/.claude/worktrees/x")).toBe("claude");
+    expect(agentKind("/repo")).toBe("");
+  });
+
+  it("deduplicates kinds while preserving first-seen order", () => {
+    expect(
+      agentKindsOn([
+        "/repo/.claude/worktrees/a",
+        "/repo/.cursor/worktrees/b",
+        "/repo/.claude/worktrees/c",
+        "/repo",
+      ]),
+    ).toEqual(["claude", "cursor"]);
+  });
+});
+
 describe("agentSessionSlug", () => {
   it("returns the whole session segment, hash included", () => {
     // The trailing hash is what distinguishes two sessions working the same
@@ -45,6 +89,7 @@ describe("agentSessionSlug", () => {
 
   it("stops at the session directory, ignoring anything nested below", () => {
     expect(agentSessionSlug("/repo/.claude/worktrees/slug/src/lib/x.ts")).toBe("slug");
+    expect(agentSessionSlug("/repo/.cursor/worktrees/slug/src")).toBe("slug");
   });
 
   it("works on Windows separators", () => {
@@ -54,6 +99,7 @@ describe("agentSessionSlug", () => {
   it("is empty for anything that is not an agent worktree", () => {
     expect(agentSessionSlug("/repo")).toBe("");
     expect(agentSessionSlug("")).toBe("");
+    expect(agentSessionSlug("/repo/.git/worktrees/feature")).toBe("");
   });
 
   it("is empty when the segment is present but names no session", () => {

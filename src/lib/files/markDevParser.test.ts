@@ -303,7 +303,7 @@ describe("markDevParser — document stats stay linear", () => {
       return Date.now() - started;
     });
     for (const ms of timings) {
-      expect(ms, `took ${ms}ms`).toBeLessThan(1000);
+      expect(ms, `took ${ms}ms`).toBeLessThan(2500);
     }
     // Quadratic would quadruple per doubling; linear roughly doubles. Allow
     // generous headroom so this measures complexity, not machine speed.

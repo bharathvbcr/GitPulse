@@ -10,7 +10,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
-  import FileExplorer from "./FileExplorer.svelte";
+  import FileTreePanel from "./files/FileTreePanel.svelte";
 
 
   // Worktree-only blame lines carry an all-zero OID from --line-porcelain;
@@ -131,7 +131,16 @@
     if (daysAgo <= 90) return "rgba(59, 130, 246, 0.12)"; // Blue (<90d)
     return "rgba(107, 114, 128, 0.08)"; // Gray (>90d)
   }
+
+  function handleWindowKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b" && !e.shiftKey) {
+      e.preventDefault();
+      explorerOpen = !explorerOpen;
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleWindowKeydown} />
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
@@ -140,7 +149,7 @@
       <button
         type="button"
         onclick={() => (explorerOpen = !explorerOpen)}
-        title={explorerOpen ? "Hide file explorer" : "Show file explorer"}
+        title="{explorerOpen ? 'Hide' : 'Show'} Explorer (⌘B)"
         class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-surfaceHover transition-colors"
       >
         {#if explorerOpen}
@@ -185,8 +194,8 @@
   <!-- Body -->
   <div class="flex-1 min-h-0 flex">
     {#if explorerOpen}
-      <div class="w-64 shrink-0 border-r border-border/60 min-h-0">
-        <FileExplorer />
+      <div class="w-72 shrink-0 h-full overflow-hidden">
+        <FileTreePanel />
       </div>
     {/if}
 

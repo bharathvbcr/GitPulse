@@ -15,11 +15,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "BlameViewer.svelte"), "utf8");
 
 describe("BlameViewer file explorer integration", () => {
-  it("mounts the explorer beside the blame pane with a toggle", () => {
-    expect(source).toContain('import FileExplorer from "./FileExplorer.svelte"');
+  it("mounts the explorer beside the blame pane with a toggle and unified w-72 styling", () => {
+    expect(source).toContain('import FileTreePanel from "./files/FileTreePanel.svelte"');
     expect(source).toContain("{#if explorerOpen}");
-    expect(source).toContain("<FileExplorer />");
+    expect(source).toContain("<FileTreePanel />");
     expect(source).toContain("explorerOpen = !explorerOpen");
+    expect(source).toContain('class="w-72 shrink-0 h-full overflow-hidden"');
+    expect(source).toContain('key.toLowerCase() === "b"');
   });
 
   it("routes manual path entry through the store's single selection site", () => {

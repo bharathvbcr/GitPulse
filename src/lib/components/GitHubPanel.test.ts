@@ -84,7 +84,22 @@ describe("GitHubPanel guarded-action contracts", () => {
     expect(source).toContain("{#if ctx.runs_error}");
     expect(source).toContain("{#if ctx.runs_truncated}");
     expect(source).toContain("{#if ctx.prs_truncated}");
+    expect(source).toContain("{#if ctx.issues_error}");
+    expect(source).toContain("{#if ctx.issues_truncated}");
     expect(source).toContain("{#if (ctx.warnings?.length ?? 0) > 0}");
+  });
+
+  it("renders the issues the context already fetched", () => {
+    // Issues were on the wire and never on the screen, so an open bug looked
+    // like a repository with none. The list is the same shape as PRs.
+    expect(source).toContain("ctx.issues");
+    expect(source).toContain("Open issues");
+  });
+
+  it("offers a new-pull-request URL rather than silently omitting the write path", () => {
+    expect(source).toContain("pullRequestCreateUrl");
+    expect(source).toContain("New pull request");
+    expect(source).not.toMatch(/window\.open\s*\(/);
   });
 
   it("opens external links through the canonical opener — no window.open fallback", () => {

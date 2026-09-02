@@ -35,11 +35,12 @@
     classifyFileChange,
     dirtyAncestorSet,
     mergeListedAndStatusPaths,
+    statusBadgeClass,
+    statusBadgeLabel,
     statusMatchesScope,
     statusPathKey,
     summarizeStatuses,
   } from "../../files/fileStatus";
-  import { getFileIconMeta } from "../../files/fileIcons";
   import { copyText } from "../../desktop/clipboard";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { askConfirm, askText } from "../../stores/modalStore";
@@ -49,13 +50,14 @@
   import { shouldDismissOverlay } from "../../ui/dismiss";
   import VirtualList from "../VirtualList.svelte";
   import EmptyState from "../EmptyState.svelte";
+  import LanguageLogo from "../LanguageLogo.svelte";
 
   let {
     onSelectFile,
     onPinFile,
     selectedFile = null,
   }: {
-    onSelectFile: (path: string) => void;
+    onSelectFile?: (path: string) => void;
     onPinFile?: (path: string) => void;
     selectedFile?: string | null;
   } = $props();
@@ -260,7 +262,11 @@
   }
 
   function chooseFile(path: string) {
-    onSelectFile(path);
+    if (typeof onSelectFile === "function") {
+      onSelectFile(path);
+    } else {
+      repoStore.selectFilePath(path);
+    }
   }
 
   function rowAction(row: FileRow) {
@@ -272,38 +278,14 @@
   }
 
   function pinFile(path: string) {
-    (onPinFile ?? onSelectFile)(path);
-  }
-
-  function rowKindClass(kind: ReturnType<typeof classifyFileChange>): string {
-    switch (kind) {
-      case "conflict":
-        return "bg-rose-500/20 text-rose-300 border border-rose-500/40";
-      case "staged":
-        return "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
-      case "untracked":
-        return "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40";
-      case "unstaged":
-        return "bg-amber-500/20 text-amber-300 border border-amber-500/40";
-      default:
-        return "";
+    if (typeof onPinFile === "function") {
+      onPinFile(path);
+    } else {
+      chooseFile(path);
     }
   }
 
-  function rowKindLabel(kind: ReturnType<typeof classifyFileChange>): string {
-    switch (kind) {
-      case "conflict":
-        return "!C";
-      case "staged":
-        return "S";
-      case "untracked":
-        return "U";
-      case "unstaged":
-        return "M";
-      default:
-        return "";
-    }
-  }
+
 
   function openContextMenu(row: FileRow, event: MouseEvent) {
     event.preventDefault();
@@ -481,9 +463,11 @@
     containerEl.scrollTo({ top: itemTop });
   }
 
+  let effectiveSelected = $derived(selectedFile ?? $repoStore.selectedFilePath);
+
   // Reveal active file in tree
   $effect(() => {
-    const selected = selectedFile;
+    const selected = effectiveSelected;
     if (!selected) return;
     locatePath = selected;
     let changed = false;
@@ -720,10 +704,9 @@
         >
           {#snippet row(r)}
             {#if r}
-              {@const isSelected = selectedFile === r.path}
+              {@const isSelected = effectiveSelected === r.path}
               {@const status = r.kind === "file" ? statusMap.get(r.path) : null}
               {@const changeKind = classifyFileChange(status)}
-              {@const iconMeta = r.kind === "file" ? getFileIconMeta(r.path) : null}
               {@const dirDirty = r.kind === "dir" && dirtyDirs.has(r.path)}
               <div
                 role="treeitem"
@@ -757,9 +740,7 @@
                     {/if}
                   {:else}
                     <span class="w-3 shrink-0"></span>
-                    <span class="text-[9px] font-mono font-bold px-1 rounded bg-surface/90 border border-border/60 shrink-0 {iconMeta?.colorClass}">
-                      {iconMeta?.badgeLabel}
-                    </span>
+                    <LanguageLogo filePath={r.path} size={14} class="shrink-0" />
                     <span class="truncate {isSelected ? 'text-accent font-semibold' : status ? 'text-textPrimary' : 'text-textPrimary/80'}">
                       {#each highlightMatches(r.name, debouncedQuery) as chunk, i (`${i}:${chunk.matched}:${chunk.text}`)}{#if chunk.matched}<mark class="bg-accent/30 text-textPrimary rounded-sm font-semibold">{chunk.text}</mark>{:else}{chunk.text}{/if}{/each}
                     </span>
@@ -769,7 +750,7 @@
                 <!-- Right: Git Status Badge & Churn -->
                 <div class="flex items-center gap-1 shrink-0">
                   {#if status && changeKind !== "clean"}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded {rowKindClass(changeKind)}">{rowKindLabel(changeKind)}</span>
+                    <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(changeKind)}">{statusBadgeLabel(changeKind)}</span>
                     {#if status.additions > 0 || status.deletions > 0}
                       {@const churnWarnings = status.warnings ?? []}
                       <!-- A count the backend flagged as possibly understated
@@ -834,7 +815,7 @@
         <span>New Folder in folder…</span>
       </button>
     {:else}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); closeContextMenu(); }}>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); if ($repoStore.activeTab !== 'files') repoStore.setActiveTab('files'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
         <span>Open in Editor</span>
       </button>

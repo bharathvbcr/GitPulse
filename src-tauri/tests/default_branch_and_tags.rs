@@ -188,6 +188,7 @@ fn tags_are_newest_first_by_creatordate() {
     }
 
     let tags = GitReader::list_tags(&repo.path_str()).expect("tags");
-    let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+    assert!(!tags.truncated);
+    let names: Vec<&str> = tags.tags.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["v3-new", "v2-mid", "v1-old"]);
 }

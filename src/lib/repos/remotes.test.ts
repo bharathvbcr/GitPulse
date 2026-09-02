@@ -5,6 +5,7 @@ import {
   effectivePushUrl,
   hasSplitUrls,
   isDestructiveRemoteChange,
+  parseRemoteList,
   redactRemoteUrl,
   remoteChangeConsequence,
   remoteHost,
@@ -180,6 +181,7 @@ describe("change consequences", () => {
     expect(isDestructiveRemoteChange({ kind: "remove", name: "o" })).toBe(true);
     expect(isDestructiveRemoteChange({ kind: "prune", name: "o" })).toBe(true);
     expect(isDestructiveRemoteChange({ kind: "add", name: "o", url: "u" })).toBe(false);
+    expect(isDestructiveRemoteChange({ kind: "rename", name: "o", new_name: "u" })).toBe(false);
   });
 
   it("reassures that removing a remote keeps local work", () => {
@@ -213,5 +215,36 @@ describe("describeRemotes", () => {
 
   it("counts several remotes", () => {
     expect(describeRemotes([remote(), remote({ name: "upstream" })])).toBe("2 remotes configured");
+  });
+});
+
+describe("parseRemoteList", () => {
+  it("unwraps a complete listing", () => {
+    const parsed = parseRemoteList({ remotes: [remote()], truncated: false });
+    expect(parsed.failed).toBe(false);
+    expect(parsed.truncated).toBe(false);
+    expect(parsed.remotes).toHaveLength(1);
+    expect(parsed.remotes[0].name).toBe("origin");
+  });
+
+  it("treats a bare array as a failed read, not an empty remote list", () => {
+    // A cap that hid remotes, or a probe that returned the old Vec shape,
+    // must not render as "this repository exists only on this machine".
+    const parsed = parseRemoteList([]);
+    expect(parsed.failed).toBe(true);
+    expect(parsed.remotes).toEqual([]);
+    expect(parsed.truncated).toBe(false);
+  });
+
+  it("fails closed when truncated is missing", () => {
+    expect(parseRemoteList({ remotes: [] }).failed).toBe(true);
+    expect(parseRemoteList({ remotes: [remote()], truncated: "yes" }).failed).toBe(true);
+    expect(parseRemoteList(null).failed).toBe(true);
+  });
+
+  it("carries the truncated flag through", () => {
+    const parsed = parseRemoteList({ remotes: [remote()], truncated: true });
+    expect(parsed.failed).toBe(false);
+    expect(parsed.truncated).toBe(true);
   });
 });

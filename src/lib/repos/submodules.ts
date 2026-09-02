@@ -32,6 +32,74 @@ export type SubmoduleChange =
   | { kind: "sync"; path: string | null; recursive: boolean }
   | { kind: "deinit"; path: string; force: boolean };
 
+/** Wire shape of `cmd_list_submodules`. A bare array could not say when the cap cut embeds. */
+export interface SubmoduleList {
+  submodules: SubmoduleInfo[];
+  truncated: boolean;
+}
+
+const SUBMODULE_STATES: ReadonlySet<string> = new Set([
+  "Uninitialized",
+  "UpToDate",
+  "CommitDiffers",
+  "Conflicted",
+]);
+
+/**
+ * Unwraps a `cmd_list_submodules` payload.
+ *
+ * A bare array or a missing `truncated` flag is a failed read, not "no
+ * submodules". Folding those into an empty list is how a truncated
+ * `.gitmodules` comes to look like a repository with nothing embedded.
+ */
+export function parseSubmoduleList(value: unknown): {
+  submodules: SubmoduleInfo[];
+  truncated: boolean;
+  failed: boolean;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { submodules: [], truncated: false, failed: true };
+  }
+  const rec = value as { submodules?: unknown; truncated?: unknown };
+  if (!Array.isArray(rec.submodules) || typeof rec.truncated !== "boolean") {
+    return { submodules: [], truncated: false, failed: true };
+  }
+  const submodules: SubmoduleInfo[] = [];
+  for (const item of rec.submodules) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { submodules: [], truncated: false, failed: true };
+    }
+    const s = item as {
+      name?: unknown;
+      path?: unknown;
+      url?: unknown;
+      oid?: unknown;
+      described?: unknown;
+      state?: unknown;
+      orphaned?: unknown;
+    };
+    if (
+      typeof s.name !== "string" ||
+      typeof s.path !== "string" ||
+      typeof s.orphaned !== "boolean" ||
+      typeof s.state !== "string" ||
+      !SUBMODULE_STATES.has(s.state)
+    ) {
+      return { submodules: [], truncated: false, failed: true };
+    }
+    submodules.push({
+      name: s.name,
+      path: s.path,
+      url: typeof s.url === "string" ? s.url : null,
+      oid: typeof s.oid === "string" ? s.oid : null,
+      described: typeof s.described === "string" ? s.described : null,
+      state: s.state as SubmoduleState,
+      orphaned: s.orphaned,
+    });
+  }
+  return { submodules, truncated: rec.truncated, failed: false };
+}
+
 /** Short state word for a badge. */
 export function submoduleStateLabel(state: SubmoduleState): string {
   switch (state) {
@@ -94,6 +162,24 @@ export function blockedInitializeReason(sub: SubmoduleInfo): string | null {
 /** True for changes that discard a checked-out submodule's contents. */
 export function isDestructiveSubmoduleChange(change: SubmoduleChange): boolean {
   return change.kind === "deinit";
+}
+
+/**
+ * Whether deinit would remove a working copy.
+ *
+ * An uninitialized submodule has no checkout to discard; offering deinit
+ * there would present a button that git treats as a no-op or an error.
+ * Force is never implied here — the caller must pass `force: false` unless
+ * the user confirmed a discard of known dirty files, and we have no dirty
+ * scan for submodules, so force stays false.
+ */
+export function canDeinit(sub: SubmoduleInfo): boolean {
+  return sub.state !== "Uninitialized";
+}
+
+/** True when `.gitmodules` has a URL this submodule can sync from. */
+export function canSync(sub: SubmoduleInfo): boolean {
+  return Boolean(sub.url) && !sub.orphaned;
 }
 
 export function submoduleChangeConsequence(change: SubmoduleChange): string {

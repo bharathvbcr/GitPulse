@@ -20,7 +20,15 @@
   import { askConfirm } from "../../stores/modalStore";
   import { promptQuickCommit } from "../../commit/quickCommit";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
-  import { classifyFileChange, statusLiveKey, summarizeStatuses } from "../../files/fileStatus";
+  import {
+    classifyFileChange,
+    statusBadgeClass,
+    statusBadgeLabel,
+    statusLiveKey,
+    summarizeStatuses,
+  } from "../../files/fileStatus";
+  import { formatPathParts } from "../../files/formatPath";
+  import LanguageLogo from "../LanguageLogo.svelte";
 
   interface FileCommit {
     id: string;
@@ -309,16 +317,9 @@
                 class="flex-1 min-w-0 text-left cursor-pointer"
               >
                 <div class="flex items-center gap-1.5 min-w-0">
-                  {#if kind === "conflict"}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded bg-rose-500/20 text-rose-300 border border-rose-500/40">!C</span>
-                  {:else if kind === "staged"}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">S</span>
-                  {:else if kind === "untracked"}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">U</span>
-                  {:else}
-                    <span class="px-1 py-0.2 text-[9px] font-bold rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">M</span>
-                  {/if}
-                  <span class="text-xs font-medium text-textPrimary truncate">{s.path.slice(s.path.lastIndexOf("/") + 1)}</span>
+                  <LanguageLogo filePath={s.path} size={12} class="shrink-0" />
+                  <span class="px-1 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(kind)}">{statusBadgeLabel(kind)}</span>
+                  <span class="text-xs font-medium text-textPrimary truncate">{formatPathParts(s.path).name}</span>
                 </div>
                 <div class="text-[10px] text-textMuted font-mono truncate max-w-[180px] pl-4">
                   {s.path}
@@ -375,10 +376,11 @@
           </div>
           {#if detectedLang}
             <span
-              class="px-1.5 py-0.5 text-[9px] font-mono font-bold rounded"
+              class="px-1.5 py-0.5 text-[9px] font-mono font-bold rounded flex items-center gap-1"
               style="background-color: {detectedLang.color_hex}25; color: {detectedLang.color_hex};"
             >
-              {detectedLang.name}
+              <LanguageLogo language={detectedLang.name} size={11} class="shrink-0" />
+              <span>{detectedLang.name}</span>
             </span>
           {/if}
         </div>

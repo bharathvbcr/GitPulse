@@ -44,6 +44,15 @@ pub struct RemoteInfo {
     pub is_default: bool,
 }
 
+/// `cmd_list_remotes` payload. A bare `Vec<RemoteInfo>` could not say when
+/// the listing cap dropped remotes, so a corrupt config with 201 entries
+/// looked like a complete 200-remote repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteList {
+    pub remotes: Vec<RemoteInfo>,
+    pub truncated: bool,
+}
+
 /// Parses `git config --get-regexp -z` output.
 ///
 /// Each record is `key\nvalue` terminated by NUL — the newline separates the
@@ -77,13 +86,15 @@ fn split_remote_key(key: &str) -> Option<(String, String)> {
 ///
 /// Split out from the git calls so the assembly is directly testable against
 /// hostile shapes without a repository on disk.
-fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> Vec<RemoteInfo> {
+fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteList {
     let mut by_name: BTreeMap<String, RemoteInfo> = BTreeMap::new();
+    let mut truncated = false;
     for (key, value) in records {
         let Some((name, field)) = split_remote_key(key) else {
             continue;
         };
         if by_name.len() >= MAX_REMOTES && !by_name.contains_key(&name) {
+            truncated = true;
             continue;
         }
         let entry = by_name.entry(name.clone()).or_insert_with(|| RemoteInfo {
@@ -144,11 +155,11 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> Vec<Remot
             .cmp(&a.is_default)
             .then_with(|| a.name.cmp(&b.name))
     });
-    remotes
+    RemoteList { remotes, truncated }
 }
 
 /// Lists configured remotes with their URLs and tracking-ref counts.
-pub fn list(repo_path: &str) -> Result<Vec<RemoteInfo>, String> {
+pub fn list(repo_path: &str) -> Result<RemoteList, String> {
     let repo = validate_repo(repo_path)?;
     // A repository with no remotes makes `--get-regexp` exit non-zero; that is
     // an honest empty answer, not a failure to report.
@@ -361,7 +372,8 @@ mod tests {
                 ("remote.origin.pushurl", "ssh://git@example.test/a.git"),
             ]),
             &[],
-        );
+        )
+        .remotes;
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].fetch_url.as_deref(),
@@ -382,7 +394,8 @@ mod tests {
                 ("remote.alpha.url", "https://example.test/al.git"),
             ]),
             &[],
-        );
+        )
+        .remotes;
         assert_eq!(out[0].name, "origin");
         assert!(out[0].is_default);
         assert_eq!(out[1].name, "alpha");
@@ -395,7 +408,8 @@ mod tests {
         let out = assemble(
             &records(&[("remote.fork.url", "https://example.test/f.git")]),
             &[],
-        );
+        )
+        .remotes;
         assert!(out[0].is_default);
     }
 
@@ -409,7 +423,8 @@ mod tests {
                 ("remote.upstream.url", "https://example.test/u.git"),
             ]),
             &[],
-        );
+        )
+        .remotes;
         assert!(out.iter().all(|r| !r.is_default));
     }
 
@@ -426,7 +441,8 @@ mod tests {
                 "refs/remotes/origin/mirror/main".to_string(),
                 "refs/heads/main".to_string(),
             ],
-        );
+        )
+        .remotes;
         let origin = out.iter().find(|r| r.name == "origin").unwrap();
         let mirror = out.iter().find(|r| r.name == "origin/mirror").unwrap();
         assert_eq!(
@@ -443,7 +459,8 @@ mod tests {
         let out = assemble(
             &records(&[("remote.weird.fetch", "+refs/heads/*:refs/remotes/weird/*")]),
             &[],
-        );
+        )
+        .remotes;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "weird");
         assert_eq!(out[0].fetch_url, None);
@@ -539,5 +556,43 @@ mod tests {
             url: "https://example.test/a.git".into()
         }
         .is_network());
+    }
+
+    #[test]
+    fn assemble_caps_payload_and_sets_truncated() {
+        // Omitting the flag is how a 201-remote config looks like a complete
+        // 200-remote repository.
+        let pairs: Vec<(String, String)> = (0..MAX_REMOTES + 9)
+            .map(|i| {
+                (
+                    format!("remote.r{i:03}.url"),
+                    format!("https://example.test/{i}.git"),
+                )
+            })
+            .collect();
+        let list = assemble(&pairs, &[]);
+        assert_eq!(list.remotes.len(), MAX_REMOTES, "payload must be capped");
+        assert!(
+            list.truncated,
+            "a cap that hid remotes must say so, not look like the whole config"
+        );
+    }
+
+    #[test]
+    fn assemble_at_the_cap_is_complete() {
+        let pairs: Vec<(String, String)> = (0..MAX_REMOTES)
+            .map(|i| {
+                (
+                    format!("remote.r{i:03}.url"),
+                    format!("https://example.test/{i}.git"),
+                )
+            })
+            .collect();
+        let list = assemble(&pairs, &[]);
+        assert_eq!(list.remotes.len(), MAX_REMOTES);
+        assert!(
+            !list.truncated,
+            "an exact-fit listing is complete, not truncated"
+        );
     }
 }

@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
 
 /// Sidebar tag ceiling: newest-first via `--sort=-creatordate`, then cut here
-/// so a 10k-tag monorepo cannot ship megabytes over IPC. TagInfo carries no
-/// truncation flag (wire shape is frontend-owned); older tags beyond the cap
-/// are silently omitted until one lands.
+/// so a 10k-tag monorepo cannot ship megabytes over IPC. The payload says
+/// when it was cut (`TagList.truncated`); omitting that flag is how "the
+/// newest 400" comes to look like the whole history.
 const TAG_LIST_CAP: usize = 400;
 
 /// Commit graph ref decoration tag ceiling: newest-first, capped so massive tag histories do not bloat the graph payload.
@@ -125,6 +125,14 @@ pub struct TagInfo {
     pub name: String,
     pub commit_id: String,
     pub message: Option<String>,
+}
+
+/// `cmd_list_tags` payload. A bare `Vec<TagInfo>` could not say when the
+/// cap cut older tags, so a 10k-tag repo looked like it had exactly 400.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagList {
+    pub tags: Vec<TagInfo>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1036,7 +1044,7 @@ impl GitReader {
         })
     }
 
-    pub fn list_tags(repo_path: &str) -> Result<Vec<TagInfo>, String> {
+    pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
         let repo = validate_repo(repo_path)?;
         let stdout = git_text(
             &repo,
@@ -1061,8 +1069,9 @@ impl GitReader {
                 });
             }
         }
+        let truncated = tags.len() > TAG_LIST_CAP;
         tags.truncate(TAG_LIST_CAP);
-        Ok(tags)
+        Ok(TagList { tags, truncated })
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
@@ -2641,9 +2650,13 @@ mod tests {
         assert!(stdin_cmd.wait().unwrap().success());
         drop(stdin_cmd);
 
-        let tags = GitReader::list_tags(&dir.path().to_string_lossy()).expect("tags");
-        assert_eq!(tags.len(), TAG_LIST_CAP, "payload must be capped");
-        assert!(tags.iter().all(|t| t.name.starts_with("bulk-")));
+        let listed = GitReader::list_tags(&dir.path().to_string_lossy()).expect("tags");
+        assert_eq!(listed.tags.len(), TAG_LIST_CAP, "payload must be capped");
+        assert!(
+            listed.truncated,
+            "a cap that hid older tags must say so, not look like the whole history"
+        );
+        assert!(listed.tags.iter().all(|t| t.name.starts_with("bulk-")));
     }
 
     #[test]

@@ -23,6 +23,7 @@ describe("persist workspace", () => {
     const loaded = loadPersistedWorkspace(storage, opts);
     expect(loaded.tabs).toHaveLength(1);
     expect(loaded.tabs[0].path).toBe("/Users/acme/gitpulse");
+    expect(loaded.tabs[0].viewTab).toBe("work");
     expect(loaded.activePath).toBe("/Users/acme/gitpulse");
     expect(loaded.recents[0]).toBe("/Users/acme/gitpulse");
     expect(loaded.recents).toContain("/tmp/other");
@@ -37,6 +38,39 @@ describe("persist workspace", () => {
     const loaded = loadPersistedWorkspace(storage, opts);
     expect(loaded.tabs).toEqual([]);
     expect(loaded.activePath).toBeNull();
+  });
+
+  it("folds a persisted repo view into Work, not Graph", () => {
+    // Remotes, stash and submodules moved onto the Work screen. Unknown
+    // and missing view ids also land on Work — Graph would open a surface
+    // the user never chose.
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        tabs: [{ path: "/r/a", pinned: false, viewTab: "repo", searchQuery: "", selectedBranch: null }],
+        activePath: "/r/a",
+        recents: [],
+        lastClosed: [],
+      }),
+    });
+    const loaded = loadPersistedWorkspace(storage, opts);
+    expect(loaded.tabs).toHaveLength(1);
+    expect(loaded.tabs[0].viewTab).toBe("work");
+  });
+
+  it("lands a tab with no saved view on Work, not Graph", () => {
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: 1,
+        tabs: [{ path: "/r/a", pinned: false }],
+        activePath: "/r/a",
+        recents: [],
+        lastClosed: [],
+      }),
+    });
+    const loaded = loadPersistedWorkspace(storage, opts);
+    expect(loaded.tabs).toHaveLength(1);
+    expect(loaded.tabs[0].viewTab).toBe("work");
   });
 
   it("drops duplicate identities, invalid view tabs, and missing activePath", () => {
@@ -57,7 +91,7 @@ describe("persist workspace", () => {
     const loaded = loadPersistedWorkspace(storage, opts);
     expect(loaded.tabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
     expect(loaded.tabs[0].pinned).toBe(true);
-    expect(loaded.tabs[0].viewTab).toBe("history");
+    expect(loaded.tabs[0].viewTab).toBe("work");
     expect(loaded.tabs[1].viewTab).toBe("blame");
     expect(loaded.activePath).toBe("/r/a");
     expect(loaded.recents).toEqual(["/r/b", "/r/a"]);

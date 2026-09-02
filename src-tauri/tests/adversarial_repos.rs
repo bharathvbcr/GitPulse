@@ -247,6 +247,7 @@ fn nested_tag_peels_without_panic() {
     // rejected by design; the object id produces a true nested tag.)
     let v1 = GitReader::list_tags(path)
         .unwrap()
+        .tags
         .into_iter()
         .find(|t| t.name == "v1")
         .unwrap();
@@ -254,10 +255,11 @@ fn nested_tag_peels_without_panic() {
         .expect("nested tag creation");
 
     let tags = GitReader::list_tags(path).expect("list tags");
-    assert_eq!(tags.len(), 2);
-    let names: Vec<_> = tags.iter().map(|t| t.name.as_str()).collect();
+    assert!(!tags.truncated);
+    assert_eq!(tags.tags.len(), 2);
+    let names: Vec<_> = tags.tags.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"v1") && names.contains(&"v2"));
-    for tag in &tags {
+    for tag in &tags.tags {
         assert_eq!(tag.commit_id.len(), 40);
     }
 
@@ -291,7 +293,10 @@ fn empty_repo_reader_contract() {
         GitReader::get_file_diff(path, "seed.txt", false, false).expect("empty diff"),
         ""
     );
-    assert!(GitReader::list_tags(path).expect("no tags yet").is_empty());
+    assert!(GitReader::list_tags(path)
+        .expect("no tags yet")
+        .tags
+        .is_empty());
 
     // Everything anchored to objects/refs errors without panicking.
     assert!(GitReader::get_file_blame(path, "seed.txt").is_err());

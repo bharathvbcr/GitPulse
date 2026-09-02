@@ -48,4 +48,9 @@ describe("FileViewer", () => {
     expect(source).toContain("joinWorktreePath");
     expect(source).toContain("formatError");
   });
+
+  it("renders LanguageLogo for open editor tabs", () => {
+    expect(source).toContain("LanguageLogo");
+    expect(source).toContain("filePath={tab.path}");
+  });
 });

@@ -26,6 +26,49 @@ export interface TagInfo {
   message?: string | null;
 }
 
+/** Wire shape of `cmd_list_tags`. A bare tag array could not say when the cap cut older tags. */
+export interface TagList {
+  tags: TagInfo[];
+  truncated: boolean;
+}
+
+/**
+ * Unwraps a `cmd_list_tags` payload.
+ *
+ * A bare array, a missing `truncated` flag, or a malformed tag is a failed
+ * read — not an empty tag list. Folding those into `tags: []` is how a
+ * 10k-tag repo, or a probe that threw, comes to look like "no tags".
+ */
+export function parseTagList(value: unknown): {
+  tags: TagInfo[];
+  truncated: boolean;
+  failed: boolean;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { tags: [], truncated: false, failed: true };
+  }
+  const rec = value as { tags?: unknown; truncated?: unknown };
+  if (!Array.isArray(rec.tags) || typeof rec.truncated !== "boolean") {
+    return { tags: [], truncated: false, failed: true };
+  }
+  const tags: TagInfo[] = [];
+  for (const item of rec.tags) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { tags: [], truncated: false, failed: true };
+    }
+    const t = item as { name?: unknown; commit_id?: unknown; message?: unknown };
+    if (typeof t.name !== "string" || typeof t.commit_id !== "string") {
+      return { tags: [], truncated: false, failed: true };
+    }
+    tags.push({
+      name: t.name,
+      commit_id: t.commit_id,
+      message: typeof t.message === "string" ? t.message : null,
+    });
+  }
+  return { tags, truncated: rec.truncated, failed: false };
+}
+
 export interface BranchFolder {
   id: string;
   label: string;

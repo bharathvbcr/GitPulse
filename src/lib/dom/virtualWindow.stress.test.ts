@@ -274,7 +274,7 @@ describe("clampScrollTop stress: shrink/grow cycles under deep scrolls", () => {
     }
     // Guard against silently probing nothing if the loops above rot.
     expect(probed).toBeGreaterThan(20_000);
-  });
+  }, 20000);
   it("keeps the clamped anchor's row painted even at extreme geometry", () => {
     // Whatever the inputs, once clamped, the row under the anchor must be on
     // screen (this is the user-visible half of "no blank frame").

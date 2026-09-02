@@ -3,6 +3,8 @@
  * browse; double-click (or an explicit pin) promotes it to a permanent tab.
  */
 
+import { formatPathParts } from "./formatPath";
+
 export interface EditorTab {
   path: string;
   name: string;
@@ -14,13 +16,8 @@ export interface EditorTabState {
   active: string | null;
 }
 
-function tabName(path: string): string {
-  const slash = path.lastIndexOf("/");
-  return slash >= 0 ? path.slice(slash + 1) : path;
-}
-
 function makeTab(path: string, preview: boolean): EditorTab {
-  return { path, name: tabName(path), preview };
+  return { path, name: formatPathParts(path).name, preview };
 }
 
 export function emptyEditorTabs(): EditorTabState {

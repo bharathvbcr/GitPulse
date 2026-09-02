@@ -95,6 +95,20 @@ export function isViewTab(value: unknown): value is ViewTab {
   return typeof value === "string" && (VIEW_TABS as readonly string[]).includes(value);
 }
 
+/**
+ * Recovers a persisted view id this build no longer registers.
+ *
+ * `repo` was folded into Work: remotes, stash and submodules are the same
+ * repository, shown as a collapsed section on that screen. Unknown or missing
+ * ids also land on Work — that is where a session starts, and falling back to
+ * Graph would open a different surface than the one the user had (or never
+ * chose).
+ */
+export function migrateViewTab(value: unknown): ViewTab {
+  if (isViewTab(value)) return value;
+  return "work";
+}
+
 /** A raw, not-yet-validated persisted workspace blob. */
 type WorkspaceBlob = Record<string, unknown>;
 
@@ -173,7 +187,7 @@ export function loadPersistedWorkspace(
   const recents = sanitizePathList(readJsonValue(storage.getItem(STORAGE_KEY_RECENT)), options, MAX_RECENT_REPOS);
   const last = normalizeRepoPath(storage.getItem(STORAGE_KEY_LAST_PATH) ?? "");
   const tabs: PersistedTab[] = last
-    ? [{ path: last, pinned: false, viewTab: "history", searchQuery: "", selectedBranch: null }]
+    ? [{ path: last, pinned: false, viewTab: "work", searchQuery: "", selectedBranch: null }]
     : [];
   return {
     version: WORKSPACE_VERSION,
@@ -220,7 +234,7 @@ export function workspaceToPersisted(
       return {
         path: tab.path,
         pinned: tab.pinned,
-        viewTab: isViewTab(session?.activeTab) ? session.activeTab : "history",
+        viewTab: migrateViewTab(session?.activeTab),
         searchQuery: session?.searchQuery ?? "",
         selectedBranch: session?.selectedBranch ?? null,
       };
@@ -246,7 +260,7 @@ function sanitizePersisted(raw: Record<string, unknown>, options: PathIdentityOp
     tabs.push({
       path,
       pinned: record.pinned === true,
-      viewTab: isViewTab(record.viewTab) ? record.viewTab : "history",
+      viewTab: migrateViewTab(record.viewTab),
       searchQuery: typeof record.searchQuery === "string" ? record.searchQuery : "",
       selectedBranch: typeof record.selectedBranch === "string" ? record.selectedBranch : null,
     });

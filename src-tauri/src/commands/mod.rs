@@ -13,8 +13,8 @@ use crate::engine::git_reader::{
 use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, OperationAction, RemoteChange,
-    RemoteInfo, RepoOperation, ResetMode, StashAction, StashEntry, SubmoduleChange, SubmoduleInfo,
-    TagInfo, WorktreeInfo,
+    RemoteList, RepoOperation, ResetMode, StashAction, StashEntry, SubmoduleChange, SubmoduleList,
+    WorktreeInfo,
 };
 use crate::github::{
     checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
@@ -747,7 +747,9 @@ pub fn cmd_get_bezier_connector(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_list_tags(repo_path: String) -> Result<Vec<TagInfo>, String> {
+pub async fn cmd_list_tags(
+    repo_path: String,
+) -> Result<crate::engine::git_reader::TagList, String> {
     off_thread(move || GitReader::list_tags(&repo_path)).await
 }
 
@@ -1077,7 +1079,7 @@ pub async fn cmd_reset(
 
 /// Lists configured remotes with their fetch/push URLs. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_list_remotes(repo_path: String) -> Result<Vec<RemoteInfo>, String> {
+pub async fn cmd_list_remotes(repo_path: String) -> Result<RemoteList, String> {
     off_thread(move || crate::engine::remotes::list(&repo_path)).await
 }
 
@@ -1103,7 +1105,7 @@ pub async fn cmd_remote_change(
 
 /// Lists embedded submodules and whether each is usable. Read-only and ungated.
 #[tauri::command(async)]
-pub async fn cmd_list_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>, String> {
+pub async fn cmd_list_submodules(repo_path: String) -> Result<SubmoduleList, String> {
     off_thread(move || crate::engine::submodules::list(&repo_path)).await
 }
 

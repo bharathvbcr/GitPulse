@@ -147,4 +147,9 @@ describe("DiffViewer staging safety and stats", () => {
     expect(source).toContain("{#if lines.length === 0}");
     expect(source).toContain("<EmptyState");
   });
+
+  it("renders LanguageLogo in header when a file path is selected", () => {
+    expect(source).toContain("LanguageLogo");
+    expect(source).toContain("filePath={$repoStore.selectedFilePath}");
+  });
 });

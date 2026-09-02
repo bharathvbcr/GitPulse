@@ -299,6 +299,7 @@ fn a_repository_with_no_remotes_lists_empty_rather_than_erroring() {
     commit(repo.path(), "f.txt", "a\n", "c1");
     assert!(remotes::list(&repo.path().to_string_lossy())
         .unwrap()
+        .remotes
         .is_empty());
 }
 
@@ -320,14 +321,15 @@ fn adds_lists_renames_and_removes_a_remote() {
     .unwrap();
 
     let listed = remotes::list(&path).unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].name, "origin");
+    assert!(!listed.truncated);
+    assert_eq!(listed.remotes.len(), 1);
+    assert_eq!(listed.remotes[0].name, "origin");
     assert_eq!(
-        listed[0].fetch_url.as_deref(),
+        listed.remotes[0].fetch_url.as_deref(),
         Some("https://example.test/a.git")
     );
-    assert!(listed[0].is_default);
-    assert_eq!(listed[0].push_url, None);
+    assert!(listed.remotes[0].is_default);
+    assert_eq!(listed.remotes[0].push_url, None);
 
     remotes::apply_with(
         &path,
@@ -338,7 +340,7 @@ fn adds_lists_renames_and_removes_a_remote() {
         allow,
     )
     .unwrap();
-    assert_eq!(remotes::list(&path).unwrap()[0].name, "upstream");
+    assert_eq!(remotes::list(&path).unwrap().remotes[0].name, "upstream");
 
     remotes::apply_with(
         &path,
@@ -348,7 +350,7 @@ fn adds_lists_renames_and_removes_a_remote() {
         allow,
     )
     .unwrap();
-    assert!(remotes::list(&path).unwrap().is_empty());
+    assert!(remotes::list(&path).unwrap().remotes.is_empty());
 }
 
 #[test]
@@ -375,11 +377,11 @@ fn a_separate_push_url_is_reported_alongside_the_fetch_url() {
 
     let listed = remotes::list(&path).unwrap();
     assert_eq!(
-        listed[0].fetch_url.as_deref(),
+        listed.remotes[0].fetch_url.as_deref(),
         Some("https://example.test/a.git")
     );
     assert_eq!(
-        listed[0].push_url.as_deref(),
+        listed.remotes[0].push_url.as_deref(),
         Some("ssh://git@example.test/fork.git"),
         "a redirected push must be visible, not folded into the fetch URL"
     );
@@ -407,7 +409,9 @@ fn adding_a_remote_that_already_exists_is_refused_by_name() {
     assert!(err.contains("already exists"), "got: {err}");
     // The original URL survives the refusal.
     assert_eq!(
-        remotes::list(&path).unwrap()[0].fetch_url.as_deref(),
+        remotes::list(&path).unwrap().remotes[0]
+            .fetch_url
+            .as_deref(),
         Some("https://example.test/a.git")
     );
 }
@@ -453,7 +457,7 @@ fn a_hostile_remote_url_never_reaches_git() {
         );
     }
     assert!(!Path::new("/tmp/gitpulse-remote-pwn").exists());
-    assert!(remotes::list(&path).unwrap().is_empty());
+    assert!(remotes::list(&path).unwrap().remotes.is_empty());
 }
 
 #[test]
@@ -474,12 +478,12 @@ fn tracking_branch_counts_reflect_real_remote_refs() {
     );
 
     let listed = remotes::list(&target.to_string_lossy()).unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].name, "origin");
+    assert_eq!(listed.remotes.len(), 1);
+    assert_eq!(listed.remotes[0].name, "origin");
     assert!(
-        listed[0].tracking_branches >= 2,
+        listed.remotes[0].tracking_branches >= 2,
         "expected main and feature tracked, got {}",
-        listed[0].tracking_branches
+        listed.remotes[0].tracking_branches
     );
 }
 
@@ -514,6 +518,7 @@ fn a_repository_without_submodules_lists_empty() {
     commit(repo.path(), "f.txt", "a\n", "c1");
     assert!(submodules::list(&repo.path().to_string_lossy())
         .unwrap()
+        .submodules
         .is_empty());
 }
 
@@ -521,12 +526,12 @@ fn a_repository_without_submodules_lists_empty() {
 fn lists_a_submodule_with_its_configured_url_and_state() {
     let (main, lib) = repo_with_submodule();
     let listed = submodules::list(&main.path().to_string_lossy()).unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].path, "vendor/lib");
-    assert_eq!(listed[0].state, SubmoduleState::UpToDate);
-    assert!(!listed[0].orphaned);
+    assert_eq!(listed.submodules.len(), 1);
+    assert_eq!(listed.submodules[0].path, "vendor/lib");
+    assert_eq!(listed.submodules[0].state, SubmoduleState::UpToDate);
+    assert!(!listed.submodules[0].orphaned);
     assert_eq!(
-        listed[0].url.as_deref(),
+        listed.submodules[0].url.as_deref(),
         Some(lib.path().to_string_lossy().as_ref())
     );
 }
@@ -550,11 +555,11 @@ fn a_fresh_clone_reports_its_submodule_as_uninitialized() {
     );
 
     let listed = submodules::list(&target.to_string_lossy()).unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].state, SubmoduleState::Uninitialized);
-    assert!(listed[0].state.needs_attention());
+    assert_eq!(listed.submodules.len(), 1);
+    assert_eq!(listed.submodules[0].state, SubmoduleState::Uninitialized);
+    assert!(listed.submodules[0].state.needs_attention());
     assert!(
-        !listed[0].orphaned,
+        !listed.submodules[0].orphaned,
         "it is in .gitmodules, so it is fixable"
     );
 }
@@ -589,7 +594,7 @@ fn detection_follows_a_submodule_across_initialization() {
 
     let path = target.to_string_lossy().into_owned();
     assert_eq!(
-        submodules::list(&path).unwrap()[0].state,
+        submodules::list(&path).unwrap().submodules[0].state,
         SubmoduleState::Uninitialized
     );
 
@@ -605,8 +610,8 @@ fn detection_follows_a_submodule_across_initialization() {
     );
 
     let listed = submodules::list(&path).unwrap();
-    assert_eq!(listed[0].state, SubmoduleState::UpToDate);
-    assert!(!listed[0].state.needs_attention());
+    assert_eq!(listed.submodules[0].state, SubmoduleState::UpToDate);
+    assert!(!listed.submodules[0].state.needs_attention());
     assert!(target.join("vendor/lib/l.txt").exists());
 }
 
@@ -644,7 +649,7 @@ fn a_refused_submodule_transport_is_reported_rather_than_swallowed() {
     );
     // And the submodule is still honestly reported as uninitialized.
     assert_eq!(
-        submodules::list(&path).unwrap()[0].state,
+        submodules::list(&path).unwrap().submodules[0].state,
         SubmoduleState::Uninitialized
     );
 }
@@ -656,8 +661,8 @@ fn a_submodule_checked_out_elsewhere_reports_as_moved() {
     commit(&sub_dir, "l.txt", "moved\n", "moved");
 
     let listed = submodules::list(&main.path().to_string_lossy()).unwrap();
-    assert_eq!(listed[0].state, SubmoduleState::CommitDiffers);
-    assert!(listed[0].state.needs_attention());
+    assert_eq!(listed.submodules[0].state, SubmoduleState::CommitDiffers);
+    assert!(listed.submodules[0].state.needs_attention());
 }
 
 #[test]
