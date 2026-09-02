@@ -992,15 +992,35 @@ impl GitWriter {
             // remove it best-effort so a retry starts clean.
             let leftover = clone_path.join(".git");
             if leftover.is_dir() {
-                let _ = std::fs::remove_dir_all(&leftover);
-                return Err(format!(
-                    "clone failed ({clone_err}); removed the partial '.git' left at {}",
-                    leftover.display()
-                ));
+                let removal = std::fs::remove_dir_all(&leftover);
+                return Err(partial_clone_message(&clone_err, &leftover, removal));
             }
             return Err(clone_err);
         }
         Ok(clone_str)
+    }
+}
+
+/// Composes the user-facing error for a clone that failed and left a partial
+/// `.git` behind, reporting the cleanup that *happened*.
+///
+/// Claiming a removal that failed is worse than not attempting one: the user
+/// retries on the strength of it and the retry dies at the `.git` existence
+/// check with "Already cloned at ...", having just been told the path was
+/// clear. Taking the removal's own result as an argument is what makes the
+/// failing branch reachable from a test — in place it needs a filesystem that
+/// refuses to delete a directory git created moments earlier.
+fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Result<()>) -> String {
+    match removal {
+        Ok(()) => format!(
+            "clone failed ({clone_err}); removed the partial '.git' left at {}",
+            leftover.display()
+        ),
+        Err(rm_err) => format!(
+            "clone failed ({clone_err}); the partial '.git' at {} could not be removed \
+             ({rm_err}) and will block a retry until it is deleted",
+            leftover.display()
+        ),
     }
 }
 
@@ -2123,5 +2143,41 @@ mod tests {
             ),
             "detached HEAD wording must name the oid: {msg}"
         );
+    }
+
+    /// A cleanup that could not run must never report what a cleanup that ran
+    /// and succeeded reports: the user retries on the strength of the message
+    /// and hits "Already cloned at ..." at the existence check.
+    #[test]
+    fn a_failed_cleanup_is_never_reported_as_a_removal() {
+        let leftover = Path::new("/repos/demo/.git");
+
+        let removed = partial_clone_message("timeout", leftover, Ok(()));
+        assert!(removed.contains("removed the partial '.git'"), "{removed}");
+        assert!(removed.contains("/repos/demo/.git"), "{removed}");
+
+        let kept = partial_clone_message(
+            "timeout",
+            leftover,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )),
+        );
+        assert!(
+            !kept.contains("removed the partial"),
+            "a failed removal must not claim to have removed anything: {kept}"
+        );
+        assert!(kept.contains("could not be removed"), "{kept}");
+        assert!(kept.contains("denied"), "the reason must survive: {kept}");
+        assert!(
+            kept.contains("block a retry"),
+            "the consequence must be stated, not left to be discovered: {kept}"
+        );
+
+        // Both branches keep the primary failure; the cleanup is the footnote.
+        for message in [&removed, &kept] {
+            assert!(message.contains("clone failed (timeout)"), "{message}");
+        }
     }
 }

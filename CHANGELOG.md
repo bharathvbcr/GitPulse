@@ -115,6 +115,12 @@ before that tag is pushed.
 
 ### Fixed
 
+- A failed clone no longer claims a cleanup it did not perform. git materializes
+  `<dest>/.git` before transferring objects, so a failed clone leaves a skeleton that
+  blocks every retry; the error said it had removed that skeleton whether or not the
+  removal succeeded, sending the user into a retry that dies at the existence check
+  with "Already cloned at ..." having just been told the path was clear. The message
+  now reports the removal that happened, and names the leftover path when it could not.
 - Accessibility: the commit context menu is reachable by keyboard (ContextMenu key
   and Shift+F10), and seven modal dialogs no longer suppress a11y rules to keep an
   event-plumbing click handler. Remaining suppressions state why they are correct.
