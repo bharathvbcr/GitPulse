@@ -121,3 +121,45 @@ describe("DiffViewer wiring", () => {
     expect(source).toContain("isContentEditable");
   });
 });
+
+describe("DiffFileRail commit picker", () => {
+  it("lists recent commits so switching change needs no trip to Graph", () => {
+    const { body } = render(DiffFileRail, { props: props() });
+    expect(body).toContain("Add the parser");
+    expect(body).toContain("a1b2c3d");
+    expect(body).toContain("Ada");
+  });
+
+  it("marks the commit currently on screen", () => {
+    const { body } = render(DiffFileRail, { props: props() });
+    // Both the open commit and the open file are marked.
+    expect((body.match(/aria-current="true"/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("offers uncommitted work as a first-class entry", () => {
+    // It is the one thing a reader returns to most, and the only entry that
+    // is not in the graph at all.
+    const { body } = render(DiffFileRail, { props: props() });
+    expect(body).toContain("Uncommitted changes");
+  });
+
+  it("says a clean tree is clean rather than showing a zero", () => {
+    expect(render(DiffFileRail, { props: props({ workingTreeCount: 0 }) }).body).toContain("clean");
+  });
+
+  it("shows neither count nor 'clean' when the tree was not counted", () => {
+    // -1 is "not counted"; rendering it as clean would assert something the
+    // app does not know.
+    const { body } = render(DiffFileRail, { props: props({ workingTreeCount: -1 }) });
+    const picker = body.slice(body.indexOf("Uncommitted changes"), body.indexOf("Uncommitted changes") + 200);
+    expect(picker).not.toContain("clean");
+  });
+
+  it("names an empty commit message instead of rendering a blank row", () => {
+    expect(render(DiffFileRail, { props: props() }).body).toContain("(no commit message)");
+  });
+
+  it("marks a merge commit as one", () => {
+    expect(render(DiffFileRail, { props: props() }).body).toContain("merge");
+  });
+});
