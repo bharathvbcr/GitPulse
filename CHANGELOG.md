@@ -13,6 +13,37 @@ before that tag is pushed.
 
 ### Added
 
+- Control plane: GitPulse now records what agents do to a repository and judges it.
+  A durable WAL SQLite ledger at the Rust guard seam records every mutation with the
+  verdict it ran under, redacted before insert. Worktrees bind to DevCouncil tasks so
+  a write outside a task's plan is refused and recorded. Agent transcripts and the
+  reflog are replayed idempotently on open, and by `gitpulsed` on an interval, so the
+  history is attributed even for sessions run with the app closed.
+- Work view (`F10`): tasks, worktrees, pull requests, workflow runs, policy verdicts
+  and grants joined into one row per task. Each of its five sources reports whether
+  it could be read, and a verdict the build cannot parse is counted as unreadable
+  rather than allowed.
+- Git-native provenance. A completed `CI:local` run against a clean working tree is
+  recorded as a verification note under `refs/notes/gitpulse/`, and branches, pull
+  requests and commits carry a freshness badge that decays with distance from the
+  default branch. A commit whose notes could not be read is never shown as verified,
+  and an unverified commit at the tip is never shown as fresh.
+- Code intelligence answered in-process from DevCouncil's persisted map — impact,
+  symbol search and dead-code detection — with no daemon and no parser. The Health
+  view states whether a code graph exists at all, so three features going quiet is
+  distinguishable from a graph that looked and found nothing.
+- `gitpulse-mcp`, an MCP server exposing the control plane read-only to an agent,
+  held in step by a contract deriving both its advertised tools and its dispatch arms
+  from its own source.
+
+### Changed
+
+- GitPulse builds from a checkout of GitPulse. The eight Rust crates it links from
+  Manvi and DevCouncil are vendored under `src-tauri/vendored/` instead of reached by
+  relative path, so a lone clone no longer needs two sibling repositories present.
+  `npm run vendor:check` reports edits made here and drift from upstream, and says
+  "not compared" rather than "matches" when a sibling is absent.
+
 - Coverage floors are enforced rather than merely reported. `npm run check:coverage`
   validates both LCOV reports structurally before trusting any number and applies
   explicit floors (frontend 90% lines / 85% branches, Rust 80% lines). An unparseable
@@ -28,6 +59,12 @@ before that tag is pushed.
   auto-update and does not phone home on its own.
 - Coverage tooling: missing toolchains are installed on request, completeness
   reporting is hardened, and reports can be copied out persistently.
+- Repository recovery: GitPulse now identifies parked merge, rebase, cherry-pick,
+  revert, `am`, and bisect operations and offers the appropriate continue, abort,
+  or skip path instead of treating a conflicted repository as idle.
+- Repository surfaces: inspect and manage remotes, browse and safely act on stashes,
+  inspect and initialize submodules, and coordinate workspace-wide fetch/pull
+  actions with a work-in-progress summary.
 - Branch health verdicts in the sidebar. Each branch is classified from data already
   fetched — upstream gone, merged, diverged, stale, behind, unpublished — and only
   branches worth acting on draw an indicator, so the exceptions stay visible. The
@@ -50,6 +87,13 @@ before that tag is pushed.
 
 - Native Git mutations (`stage`, `unstage`, `fetch`, `stash save`, `stash pop`) route
   through the harness write gate and return the policy verdict alongside their output.
+- Stash actions are reverified against both the stash index and object ID under the
+  repository lock, so concurrent worktrees cannot target the wrong entry.
+- Repository refreshes surface watcher failures and perform a compensating full poll,
+  so stale state is not mistaken for a healthy watch. Git operations also use a
+  non-interactive editor to prevent repository configuration from causing hangs.
+- Dependency health parsing preserves the dependency type across the different audit
+  shapes emitted by supported npm versions.
 - The release workflow verifies draft assets against an exact per-platform manifest
   instead of matching filename patterns, and preflight runs every contract gate.
 
@@ -63,6 +107,12 @@ before that tag is pushed.
 - Terminal and diagnostics failures preserve their full context instead of truncating
   it across builds.
 - Dependency coverage is reported accurately in the health panel.
+- File-status churn warnings now remain visible in the UI with an uncertainty marker
+  and explanation instead of looking like verified counts.
+- GitHub remote credentials are stripped before URLs or CLI arguments are displayed
+  or used, while remotes containing userinfo remain discoverable without exposing it.
+- Syntax highlighting and tokenization are bounded so pathological files terminate
+  without freezing or exhausting the process.
 - The architecture diagrams no longer imply a direct Tokio dependency. Tokio reaches
   the build transitively through Tauri; `rayon` is the only direct concurrency
   dependency, and blocking work leaves the IPC thread via
@@ -76,6 +126,9 @@ before that tag is pushed.
 - The Vite build-caching question (sharing `dist/` across CI legs) was investigated and
   declined; the measurements and the reasoning are recorded above the build step in
   `ci.yml`.
+- Cross-language contract coverage now includes command registration and arguments,
+  serde variants, events, GitHub CLI fields, and repository-surface payloads, with
+  integration and stress suites exercising real repositories and child processes.
 
 ## [0.0.3] - 2026-08-28
 
