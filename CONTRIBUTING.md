@@ -129,8 +129,8 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (123 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 39 contracts (501 fields) |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (125 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 40 contracts (521 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -154,6 +154,7 @@ several were added after the drift had already happened.
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
 | `verdict-contract` | Two consumers of the shared policy contract disagreeing about what a decision means. The harness reports `action: "allow"` for five different things — a clean pass, a posture demotion, a grant, an executor-widened scope, and a decision reached with rungs that could not run — and only one of them is a clean pass. It also pins the vendored `contracts/` copy against its checksums, so a contract edited here instead of at its source fails rather than forking. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
+| `provenance-verdict-contract` | A verdict written into a git note that the freshness badge does not recognise. The badge fails closed — an unrecognised verdict is never rendered as a pass — which is the safe behaviour and also a silent one: a writer that started emitting a new word would put a permanent amber badge on every verified commit with nothing to say why. Writers are found by scanning for `VerificationNote` constructions, so a second one is covered without anyone remembering. |
 | `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
 | `wire-type-locality-contract` | A serde payload shape being declared inside a component, or inlined as an `invoke<{...}>` / `listen<{...}>` type argument, where `check:types` cannot reach it and a second copy can drift silently. Every instance found so far had already gone stale — TerminalRunResult, GitHubContext, ConflictChunk, CommitDetailsPayload, FileBlobPayload. |
 | `gh-json-fields-contract` | A `gh ... --json` list drifting from either gh's vocabulary or the struct that parses the reply. Asking for a field gh does not know fails the entire listing; asking for too few fails nothing at all, and the unrequested field deserializes to a default, so a title renders empty forever. |
@@ -187,7 +188,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 14 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (123 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (125 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, topology index, bezier geometry, folding
     ├── analyzer/         Language detection, LOC, coverage, dependency health

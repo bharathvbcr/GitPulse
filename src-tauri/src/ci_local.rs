@@ -7,13 +7,19 @@
 //! GitHub Actions' default step semantics; everything that did not run is
 //! reported as skipped rather than laundered into a pass.
 //!
-//! These are build/test commands, not git mutations, so they follow the deps
-//! scanner's precedent (`analyzer::deps`) and are not routed through the
-//! harness command gate — which fails closed on non-git commands and would
-//! make the feature unusable with a harness installed. The protections that
-//! matter here are the same ones every subprocess gets: hard per-step
-//! timeouts, capped output, no shell interpolation, and honest status
-//! accounting.
+//! Every step is judged by the harness command gate before it runs, and
+//! reaches the ledger with its verdict. The gate fails closed on non-git
+//! commands, so each step declares its own command line as the allowlist: the
+//! harness can then answer with a clean allow instead of demoting
+//! `command.not_allowed`, while the hard rungs still refuse a step that would
+//! force-push or touch a credential path. On top of that every subprocess gets
+//! hard per-step timeouts, capped output, no shell interpolation, and honest
+//! status accounting.
+//!
+//! A completed run is recorded as a git-native verification note on HEAD — but
+//! only when the working tree is clean. A dirty tree means the run exercised
+//! HEAD *plus* uncommitted changes, and a note saying HEAD passed would be a
+//! claim about a tree that was never tested.
 
 use crate::engine::git_cli::{capture_command, validate_repo, CapturedOutput};
 use serde::{Deserialize, Serialize};
@@ -47,6 +53,22 @@ pub struct CiLocalReport {
     pub failed: usize,
     pub skipped: usize,
     pub total_duration_ms: u64,
+    /// The commit this run was recorded against, empty when it was not
+    /// recorded.
+    ///
+    /// A run that produced a verification note is a durable, git-native claim
+    /// that survives a re-clone; a run that did not is a number on a screen.
+    /// The two must be distinguishable, which is why this is a sha and not a
+    /// boolean.
+    #[serde(default)]
+    pub recorded_commit: String,
+    /// Empty when the run was recorded; otherwise why it was not.
+    ///
+    /// Separate from `recorded_commit` so "recorded nothing because the tree
+    /// was dirty" never reads the same as "recorded nothing because writing
+    /// the note failed".
+    #[serde(default)]
+    pub not_recorded_reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -286,10 +308,14 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
         (outcome, duration_ms)
     });
 
-    Ok(summarize(
+    let mut report = summarize(
         results,
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-    ))
+    );
+    let (recorded_commit, not_recorded_reason) = record_verification(&repo, &report);
+    report.recorded_commit = recorded_commit;
+    report.not_recorded_reason = not_recorded_reason;
+    Ok(report)
 }
 
 /// Walk the plan, stopping at the first step that does not pass.
@@ -330,6 +356,113 @@ fn summarize(results: Vec<CiStepResult>, total_duration_ms: u64) -> CiLocalRepor
         skipped: results.iter().filter(|r| r.status == "skipped").count(),
         steps: results,
         total_duration_ms,
+        recorded_commit: String::new(),
+        not_recorded_reason: String::new(),
+    }
+}
+
+/// The verdict a completed run records.
+///
+/// Derived from the steps themselves, not from the counts. A future change to
+/// `run_plan` that introduced a fourth status would silently make a count-based
+/// verdict wrong in the direction that matters — everything not-failed reading
+/// as a pass — so "passed" here means every single step passed, and nothing
+/// else does.
+fn run_verdict(report: &CiLocalReport) -> &'static str {
+    if report.steps.iter().all(|s| s.status == "passed") {
+        "passed"
+    } else {
+        "failed"
+    }
+}
+
+/// Whether the working tree has changes git can see.
+///
+/// `Err` when the question could not be answered, which is deliberately not
+/// the same as `Ok(false)`: a note must never be written on the strength of a
+/// cleanliness check that did not run.
+fn working_tree_is_dirty(repo: &Path) -> Result<bool, String> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(repo)
+        .output()
+        .map_err(|e| format!("could not run git status: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+/// Records a completed run as a verification note on HEAD.
+///
+/// Returns the commit the note landed on, or the reason no note was written.
+/// Exactly one of the two is non-empty.
+///
+/// # Why a dirty tree is refused
+///
+/// A note attaches to a commit and says that commit's tree passed. A run
+/// against a dirty checkout exercised HEAD *plus* whatever is uncommitted, so
+/// the note would be a claim about a tree nothing ever tested — and it would
+/// survive into every clone of the repository, long after the uncommitted
+/// changes that produced it were gone. Untracked files are excluded from the
+/// check: they are not part of any tree, so they cannot make HEAD's tree a lie.
+fn record_verification(repo: &Path, report: &CiLocalReport) -> (String, String) {
+    let repo_str = repo.to_string_lossy().to_string();
+
+    match working_tree_is_dirty(repo) {
+        Err(e) => return (String::new(), e),
+        Ok(true) => {
+            return (
+                String::new(),
+                "not recorded: the working tree has uncommitted changes, so this run \
+                 did not test HEAD's tree"
+                    .to_string(),
+            )
+        }
+        Ok(false) => {}
+    }
+
+    let head = match std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+    {
+        Err(e) => return (String::new(), format!("could not resolve HEAD: {e}")),
+        Ok(out) if !out.status.success() => {
+            return (
+                String::new(),
+                format!(
+                    "could not resolve HEAD: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            )
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    };
+
+    let note = crate::engine::provenance::VerificationNote {
+        verdict: run_verdict(report).to_string(),
+        verified_at: i64::try_from(crate::ledger::ids::now_millis() / 1000).unwrap_or(i64::MAX),
+        checked_by: "ci.local".to_string(),
+        task_id: None,
+        // The step *names* and their statuses, never their output: a failure
+        // detail is a captured log tail, and git notes are pushed to remotes.
+        details: Some(
+            report
+                .steps
+                .iter()
+                .map(|s| format!("{}={}", s.name, s.status))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    };
+
+    match crate::engine::provenance::write_verification_note(&repo_str, &head, &note) {
+        Ok(()) => (head, String::new()),
+        Err(e) => (String::new(), format!("could not write the note: {e}")),
     }
 }
 
@@ -692,5 +825,195 @@ mod gate_tests {
                 row.outcome
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod verification_note_tests {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "T"]);
+        git(&["config", "user.email", "t@e.com"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "c0"]);
+        dir
+    }
+
+    fn report(statuses: &[(&str, &str)]) -> CiLocalReport {
+        let steps: Vec<CiStepResult> = statuses
+            .iter()
+            .map(|(name, status)| CiStepResult {
+                name: (*name).to_string(),
+                command: format!("npm run {name}"),
+                status: (*status).to_string(),
+                detail: if *status == "passed" {
+                    String::new()
+                } else {
+                    "assertion failed: expected 1 to be 2\nsecret-looking log tail".to_string()
+                },
+                duration_ms: 5,
+            })
+            .collect();
+        summarize(steps, 10)
+    }
+
+    fn head(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_clean_pass_is_recorded_on_head() {
+        let dir = repo();
+        let r = report(&[("Frontend unit tests", "passed"), ("Clippy", "passed")]);
+
+        let (commit, reason) = record_verification(dir.path(), &r);
+        assert_eq!(reason, "", "a clean tree has no reason to refuse");
+        assert_eq!(commit, head(dir.path()));
+
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("a note was written");
+        assert_eq!(note.verdict, "passed");
+        assert_eq!(note.checked_by, "ci.local");
+    }
+
+    /// The claim a note makes is about a *commit's tree*. A run against a
+    /// dirty checkout tested HEAD plus uncommitted work, so a note saying HEAD
+    /// passed would describe a tree that was never tested — and unlike a
+    /// number on a screen, it would be pushed to every clone.
+    #[test]
+    fn a_dirty_tree_is_refused_rather_than_recorded() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+
+        let r = report(&[("Frontend unit tests", "passed")]);
+        let (commit, reason) = record_verification(dir.path(), &r);
+
+        assert_eq!(commit, "", "nothing may be recorded");
+        assert!(
+            reason.contains("uncommitted"),
+            "the refusal must say why, got {reason:?}"
+        );
+        assert_eq!(
+            crate::engine::provenance::read_verification_note(
+                dir.path().to_str().unwrap(),
+                &head(dir.path()),
+            )
+            .expect("read"),
+            None,
+            "no note may exist for a tree that was never tested"
+        );
+    }
+
+    /// An untracked scratch file is not part of any tree, so it cannot make
+    /// HEAD's tree a lie — and refusing on it would mean a repository with one
+    /// stray file could never record a verification again.
+    #[test]
+    fn an_untracked_file_does_not_block_recording() {
+        let dir = repo();
+        std::fs::write(dir.path().join("scratch.log"), "noise\n").unwrap();
+
+        let (commit, reason) = record_verification(dir.path(), &report(&[("Tests", "passed")]));
+        assert_eq!(reason, "");
+        assert_eq!(commit, head(dir.path()));
+    }
+
+    #[test]
+    fn a_failed_run_is_recorded_as_failed_not_skipped() {
+        let dir = repo();
+        let r = report(&[("Tests", "failed"), ("Clippy", "skipped")]);
+
+        let (commit, reason) = record_verification(dir.path(), &r);
+        assert_eq!(reason, "");
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("recorded");
+        assert_eq!(
+            note.verdict, "failed",
+            "a recorded failure is worth as much as a recorded pass"
+        );
+    }
+
+    /// Notes are pushed to remotes. A failure detail is a captured log tail,
+    /// which is exactly the kind of thing that must not leave the machine
+    /// inside a git object.
+    #[test]
+    fn the_note_carries_step_names_and_statuses_never_their_output() {
+        let dir = repo();
+        let r = report(&[("Tests", "failed")]);
+        let (commit, _) = record_verification(dir.path(), &r);
+
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("recorded");
+        let details = note.details.expect("details");
+        assert_eq!(details, "Tests=failed");
+        assert!(
+            !details.contains("secret-looking log tail"),
+            "captured output must never reach a pushable git object"
+        );
+    }
+
+    /// The verdict reads every step, so a status this function has never heard
+    /// of can only ever make the run *not* a pass.
+    #[test]
+    fn only_an_all_passed_run_is_a_pass() {
+        assert_eq!(run_verdict(&report(&[("a", "passed")])), "passed");
+        assert_eq!(
+            run_verdict(&report(&[("a", "passed"), ("b", "passed")])),
+            "passed"
+        );
+        assert_eq!(
+            run_verdict(&report(&[("a", "passed"), ("b", "skipped")])),
+            "failed"
+        );
+        assert_eq!(run_verdict(&report(&[("a", "failed")])), "failed");
+        assert_eq!(
+            run_verdict(&report(&[("a", "passed"), ("b", "some-future-status")])),
+            "failed",
+            "a status this build does not recognise is not a pass"
+        );
+        assert_eq!(
+            run_verdict(&summarize(Vec::new(), 0)),
+            "passed",
+            "an empty plan cannot reach here: run_ci_local refuses it earlier"
+        );
+    }
+
+    /// A cleanliness check that could not run must not be read as "clean".
+    #[test]
+    fn an_unanswerable_cleanliness_check_refuses_to_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory, but not a repository: `git status` fails here.
+        let (commit, reason) = record_verification(dir.path(), &report(&[("Tests", "passed")]));
+        assert_eq!(commit, "");
+        assert!(!reason.is_empty(), "the failure must explain itself");
+        assert!(working_tree_is_dirty(dir.path()).is_err());
     }
 }

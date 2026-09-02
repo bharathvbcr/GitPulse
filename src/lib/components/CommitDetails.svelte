@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
   import { repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
@@ -27,6 +28,8 @@
   // well, and the CommitDetails one had silently fallen four fields behind.
   // `import type` is erased, so this pulls in no store at runtime.
   import type { CommitDetails as CommitDetailsPayload } from "../stores/graphStore";
+  import FreshnessBadge from "./FreshnessBadge.svelte";
+  import type { ProvenanceFreshness } from "../provenance/types";
 
 
   let selectedCommit = $derived(
@@ -148,6 +151,41 @@
     details = cached?.id === id ? cached : null;
   });
 
+  /**
+   * Git-native provenance for the selected commit.
+   *
+   * The single-commit measurement rather than the batch the branch and PR
+   * lists use: those badge many rows and skip measuring commits that carry no
+   * note, because a commit nobody verified has no verification whose age could
+   * decay. Here one commit is in front of the reader and "how far has the base
+   * moved since this" is a fair question whether or not anything was recorded.
+   */
+  let provenance = $state<ProvenanceFreshness | null>(null);
+  /** Monotonic: clicking through history faster than the fetch returns must
+   *  never leave an earlier commit's provenance on a later one. */
+  let provenanceToken = 0;
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const mine = ++provenanceToken;
+    provenance = null;
+    if (!repo || !id) return;
+    invoke<ProvenanceFreshness>("cmd_provenance_freshness", {
+      repoPath: repo,
+      commitSha: id,
+      baseBranch: null,
+    })
+      .then((f) => {
+        if (mine === provenanceToken) provenance = f;
+      })
+      .catch(() => {
+        // Left null, which draws nothing. The badge is an addition to this
+        // pane, not a claim about it: a failed lookup must not put an error
+        // where a verification would go.
+      });
+  });
+
   function gpgLabel(status: string): { text: string; ok: boolean } {
     if (status === "G") return { text: "Verified", ok: true };
     if (status === "N" || !status) return { text: "Unsigned", ok: false };
@@ -202,6 +240,7 @@
           {/if}
           {sig.text}
         </span>
+        <FreshnessBadge freshness={provenance} />
       </div>
     </div>
 

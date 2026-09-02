@@ -52,6 +52,22 @@ export interface CiLocalReport {
   failed: number;
   skipped: number;
   total_duration_ms: number;
+  /**
+   * The commit this run was recorded against, empty when it was not recorded.
+   *
+   * A run that produced a verification note is a durable, git-native claim
+   * that survives a re-clone; a run that did not is a number on a screen. A
+   * sha rather than a boolean so the two are never confused.
+   */
+  recorded_commit: string;
+  /**
+   * Empty when the run was recorded; otherwise why it was not.
+   *
+   * Separate from `recorded_commit` so "recorded nothing because the tree was
+   * dirty" never reads the same as "recorded nothing because writing the note
+   * failed".
+   */
+  not_recorded_reason: string;
 }
 
 export interface ReleaseInfo {

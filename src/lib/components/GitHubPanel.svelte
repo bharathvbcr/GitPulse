@@ -37,6 +37,9 @@
     LoaderCircle,
   } from "lucide-svelte";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
+  import FreshnessBadge from "./FreshnessBadge.svelte";
+  import { freshnessStore } from "../provenance/store";
+  import { prFreshness, prRevisions } from "../provenance/pullRequests";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { harnessStore, verdictLabel, type Guarded } from "../stores/harnessStore";
   import type {
@@ -171,6 +174,31 @@
       workflowsInflight?.cancel();
       ciInflight?.cancel();
     };
+  });
+
+  /**
+   * Provenance freshness for every open pull request's head, in one batched
+   * call.
+   *
+   * One base for the whole batch, so it is the repository's default branch
+   * rather than each PR's own `base_ref` — which all but a stacked PR targets
+   * anyway. The badge is claiming how far the mainline has moved past the
+   * point where the head was verified, and for a stacked PR that is still a
+   * true statement, just not the tightest one available.
+   *
+   * Each head is asked about under both `origin/<ref>` and `<ref>`; a head
+   * that resolves under neither reads as *unknown*, never as unverified.
+   */
+  const defaultBranchName = $derived(
+    $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
+  );
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const prs = ctx?.pull_requests ?? [];
+    const base = defaultBranchName;
+    if (!repo || prs.length === 0) return;
+    void freshnessStore.load(repo, prRevisions(prs), base);
   });
 
   // Reload context + workflows only when the real dependencies change (repo,
@@ -468,6 +496,20 @@
           </details>
         {/each}
       </div>
+      <!-- Whether this run became a durable, git-native claim or stayed a
+           number on a screen. Both states are stated: a run that was not
+           recorded and a run nobody looked at leave the same empty space. -->
+      <div class="mt-2 pt-2 border-t border-border/50 text-[11px] font-mono">
+        {#if ciReport.recorded_commit}
+          <span class="text-emerald-400" title="Written to refs/notes/gitpulse/verification">
+            recorded on {ciReport.recorded_commit.slice(0, 8)}
+          </span>
+        {:else}
+          <span class="text-textMuted" title={ciReport.not_recorded_reason}>
+            not recorded — {ciReport.not_recorded_reason || "no reason was given"}
+          </span>
+        {/if}
+      </div>
     </div>
   {/if}
 
@@ -536,6 +578,7 @@
                   <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                     <GitPullRequest size={14} class="text-accent shrink-0" />
                     <span class="truncate">#{pr.number} {pr.title}</span>
+                    <FreshnessBadge freshness={prFreshness($freshnessStore.byRevision, pr.head_ref)} />
                     {#if pr.is_draft}
                       <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-surfaceHover text-textMuted">draft</span>
                     {/if}

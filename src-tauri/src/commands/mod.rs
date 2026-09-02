@@ -1343,9 +1343,11 @@ pub async fn cmd_github_cancel_run(
     .await
 }
 
-/// CI:local — runs the repository's CI pipeline on this machine. Build/test
-/// commands are not git mutations, so they follow the deps-scanner precedent
-/// and skip the harness command gate; see `ci_local` for the reasoning.
+/// CI:local — runs the repository's CI pipeline on this machine.
+///
+/// Every step is judged by the harness command gate and reaches the ledger
+/// with its verdict; a completed run against a clean tree is recorded as a
+/// git-native verification note on HEAD. See `ci_local` for both.
 #[tauri::command(async)]
 pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, String> {
     off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
@@ -2565,4 +2567,56 @@ pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantVi
 #[tauri::command(async)]
 pub async fn cmd_local_scan() -> Result<crate::harness::ScanResult, String> {
     off_thread(crate::ai::scan_local_servers).await
+}
+
+// --- provenance freshness ---------------------------------------------
+
+/// Provenance freshness for one commit.
+///
+/// A verification note is a claim about a tree at a moment. This says how far
+/// the world has moved since — and, when it cannot say, says that instead. The
+/// `distance`/`confidence` pair is `null` rather than zero on every failure:
+/// zero is the strongest claim the type can make, and handing it out because
+/// git could not answer is how a stale badge comes to read as a fresh one.
+#[tauri::command(async)]
+pub async fn cmd_provenance_freshness(
+    repo_path: String,
+    commit_sha: String,
+    base_branch: Option<String>,
+) -> Result<crate::engine::ProvenanceFreshness, String> {
+    let repo = validate_repo(&repo_path)?;
+    off_thread(move || {
+        Ok(crate::engine::provenance::compute_freshness(
+            &repo.to_string_lossy(),
+            &commit_sha,
+            base_branch.as_deref(),
+        ))
+    })
+    .await
+}
+
+/// Provenance freshness for many revisions at once, in input order.
+///
+/// The branch list and the pull-request list each want a badge per row, and a
+/// per-row round trip would be a subprocess per branch. The batch resolves
+/// every revision in one `git cat-file`, reads each notes ref once, and only
+/// then measures — and only the commits that carry a note, because a commit
+/// nobody verified has no verification whose age could decay.
+///
+/// Accepts ref names as well as shas: pull requests arrive as `head_ref`.
+#[tauri::command(async)]
+pub async fn cmd_provenance_freshness_batch(
+    repo_path: String,
+    revisions: Vec<String>,
+    base_branch: Option<String>,
+) -> Result<Vec<crate::engine::ProvenanceFreshness>, String> {
+    let repo = validate_repo(&repo_path)?;
+    off_thread(move || {
+        Ok(crate::engine::provenance::freshness_batch(
+            &repo.to_string_lossy(),
+            &revisions,
+            base_branch.as_deref(),
+        ))
+    })
+    .await
 }

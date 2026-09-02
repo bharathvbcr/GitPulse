@@ -13,7 +13,7 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 35 contracts over
+ * SCOPE: see CONTRACTS below for exactly what is checked — 40 contracts over
  * 57 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
@@ -156,6 +156,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
+  { label: "provenance", rustPath: rust("engine", "provenance.rs"), tsPath: ts("provenance", "types.ts"), structs: ["VerificationNote", "SessionEpisodeNote", "ProvenanceFreshness"] },
 ]);
 
 /**

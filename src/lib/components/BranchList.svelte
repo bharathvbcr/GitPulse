@@ -27,6 +27,8 @@
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
   import BranchHealthDot from "./BranchHealthDot.svelte";
+  import FreshnessBadge from "./FreshnessBadge.svelte";
+  import { freshnessStore } from "../provenance/store";
   import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
   import { clampMenuPosition } from "../branches/menuPosition";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
@@ -261,6 +263,37 @@
     if (selectedIndex >= allRows.length) {
       selectedIndex = allRows.length > 0 ? allRows.length - 1 : -1;
     }
+  });
+
+  /**
+   * Provenance freshness for every branch tip, in one batched call.
+   *
+   * Keyed by tip sha rather than branch name so two refs at the same commit —
+   * a local branch and its remote — cost one measurement and always agree.
+   *
+   * The base is the repository's default branch, because that is what the
+   * badge is claiming: not that the verified tree changed (it cannot), but how
+   * far the mainline has moved past the point where it was checked. Without a
+   * default branch we send null and the backend measures against HEAD.
+   */
+  const branchTips = $derived([...new Set($repoStore.branches.map((b) => b.tip_commit_id))]);
+  const defaultBranchName = $derived(
+    $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
+  );
+
+  $effect(() => {
+    const path = $repoStore.currentPath;
+    const tips = branchTips;
+    const base = defaultBranchName;
+    if (!path || tips.length === 0) return;
+    void freshnessStore.load(path, tips, base);
+  });
+
+  $effect(() => {
+    // A repository switch must not leave the previous repository's
+    // verifications painted onto this one's branches.
+    void $repoStore.currentPath;
+    freshnessStore.reset();
   });
 
   function selectRef(name: string) {
@@ -692,6 +725,7 @@
         <ChurnBar additions={workAdd} deletions={workDel} />
       {/if}
       <BranchHealthDot {branch} />
+      <FreshnessBadge freshness={$freshnessStore.byRevision[branch.tip_commit_id] ?? null} compact />
       {#if branch.ahead_count > 0}
         <span class="text-[10px] font-mono font-bold px-1 py-0 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/25" title="{branch.ahead_count} ahead of upstream">↑{branch.ahead_count}</span>
       {/if}
