@@ -15,6 +15,7 @@ pub const OP_HELLO: &str = "hello";
 pub const OP_POLICY_CHECK_FILE: &str = "policy.check.file";
 pub const OP_POLICY_CHECK_COMMAND: &str = "policy.check.command";
 pub const OP_CAPABILITY_PROBE: &str = "capability.probe";
+pub const OP_LOCAL_SCAN: &str = "local.scan";
 pub const OP_CHAT_PREPARE: &str = "chat.prepare";
 pub const OP_CHAT_SETTLE: &str = "chat.settle";
 pub const OP_CHAT_FORGET: &str = "chat.forget";
@@ -188,4 +189,70 @@ pub struct SettleResult {
     pub truncated_mid_call: bool,
     #[serde(default)]
     pub retry_message: String,
+}
+
+/// One model a local server reports, from `local.scan`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScanModel {
+    #[serde(default)]
+    pub id: String,
+    /// Zero when the server reported no window. Zero is *unreported*, not
+    /// "no context"; `context_window_source` says which.
+    #[serde(default)]
+    pub context_window: i64,
+    #[serde(default)]
+    pub context_window_source: String,
+    /// A window the scanner read off the server and refused as implausible.
+    /// Non-zero only when it was, so the refusal is visible rather than silent.
+    #[serde(default)]
+    pub implausible_window: i64,
+    /// Whether the three capability flags below mean anything.
+    ///
+    /// Without this, "does not support tools" and "nobody asked" are the same
+    /// `false`, and the UI renders a capable model as incapable — or offers a
+    /// tool-calling feature on one that cannot, and the failure looks like the
+    /// user's configuration.
+    #[serde(default)]
+    pub capabilities_known: bool,
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_reasoning: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// Whether the model generates text at all. An embedding model answers the
+    /// same listing as every chat model.
+    #[serde(default)]
+    pub supports_completion: bool,
+}
+
+/// One local model server that answered a scan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScanServer {
+    #[serde(default)]
+    pub base_url: String,
+    /// How the server identified itself. `openai-compatible` means it answered
+    /// `/v1/models` and nothing else the harness knows to ask — a working
+    /// server, and more honest than naming a runtime from the port number.
+    #[serde(default)]
+    pub runtime: String,
+    /// Only Ollama reports one. Never load-bearing.
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub models: Vec<ScanModel>,
+}
+
+/// What one discovery sweep found.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScanResult {
+    #[serde(default)]
+    pub servers: Vec<ScanServer>,
+    /// How many endpoints were probed. "Nothing is running" and "we only
+    /// looked in one place" are different answers, and this is the difference.
+    #[serde(default)]
+    pub scanned: i64,
+    /// Whether per-model capabilities were asked for at all.
+    #[serde(default)]
+    pub capabilities: bool,
 }

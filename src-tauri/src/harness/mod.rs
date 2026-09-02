@@ -19,7 +19,9 @@ pub use policy::{
     check_command, check_command_allowing, check_file, render_command, HostScope, PolicyStatus,
     PolicyVerdict,
 };
-pub use protocol::{HelloResult, PrepareResult, ProbeResult, SettleResult};
+pub use protocol::{
+    HelloResult, PrepareResult, ProbeResult, ScanModel, ScanResult, ScanServer, SettleResult,
+};
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
 
 /// What the UI shows about the harness.

@@ -4,6 +4,13 @@
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "@tauri-apps/api/core";
   import type { GrantView } from "../grants/types";
+  import {
+    contextWindowLabel,
+    sweepSummary,
+    toolSupportLabel,
+    type ScanModel,
+    type ScanResult,
+  } from "../ai/scan";
   import { formatError } from "../ui/formatError";
   import {
     RefreshCw,
@@ -129,6 +136,39 @@
   function isSelected(endpointUrl: string, model: string): boolean {
     if (preferred) return preferred.base_url === endpointUrl && preferred.model === model;
     return ai?.selected?.base_url === endpointUrl && ai?.selected?.model === model;
+  }
+
+  /**
+   * What the local-server sweep found.
+   *
+   * The endpoint list above reports servers GitPulse already resolved. This
+   * answers the question it could not: what each of them actually serves, and
+   * whether those models support the features about to be offered on them.
+   */
+  let scan = $state<ScanResult | null>(null);
+  let scanning = $state(false);
+  let scanError = $state<string | null>(null);
+
+  async function runScan() {
+    scanning = true;
+    scanError = null;
+    try {
+      scan = await invoke<ScanResult>("cmd_local_scan");
+    } catch (e) {
+      // Reported, not swallowed: a sweep that failed is not a machine with no
+      // models on it.
+      scanError = formatError(e);
+      scan = null;
+    } finally {
+      scanning = false;
+    }
+  }
+
+  /** Models a chat feature can actually run on, given what the sweep asked. */
+  function usable(model: ScanModel): boolean {
+    // `capabilities_known` false means nobody asked, so nothing is excluded on
+    // the strength of a flag nobody set.
+    return !model.capabilities_known || model.supports_completion;
   }
 
   async function pick(selection: AiSelection | null) {
@@ -289,6 +329,78 @@
   <section class="gp-card p-4 space-y-2">
     <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Local model servers</h3>
     {#if ai}
+      <!--
+        Discovery. Separate from the endpoint list above, which reports servers
+        GitPulse resolved; this reports what they serve and what those models
+        can do.
+      -->
+      <div class="flex items-center justify-between gap-2">
+        <button
+          onclick={() => void runScan()}
+          disabled={scanning}
+          class="text-[10px] text-textMuted hover:text-accent underline inline-flex items-center gap-1 disabled:opacity-50"
+          title="Probe the well-known local endpoints and list what each server serves"
+        >
+          <RefreshCw size={11} class={scanning ? "animate-spin" : ""} />
+          <span>{scanning ? "Scanning…" : "Scan local servers"}</span>
+        </button>
+        {#if scan}
+          <span class="text-[10px] text-textMuted">{sweepSummary(scan)}</span>
+        {/if}
+      </div>
+
+      {#if scanError}
+        <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-2.5 text-[11px] text-amber-400">
+          The scan did not complete, so this is not a list of what is running: {scanError}
+        </div>
+      {:else if scan && scan.servers.length > 0}
+        <div class="space-y-1.5">
+          {#each scan.servers as server (server.base_url)}
+            <div class="rounded-xl border border-border/70 bg-background p-2.5 space-y-1">
+              <div class="flex items-center gap-2 text-[11px]">
+                <Server size={12} class="text-accent shrink-0" />
+                <span class="font-mono truncate">{server.base_url}</span>
+                <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1.5 text-textMuted">
+                  {server.runtime}
+                </span>
+                {#if server.version}
+                  <span class="shrink-0 text-[9px] text-textMuted">v{server.version}</span>
+                {/if}
+              </div>
+              {#each server.models as model (model.id)}
+                <button
+                  onclick={() => pick({ base_url: server.base_url, model: model.id })}
+                  class="w-full px-2 py-1 rounded-lg flex items-center gap-2 text-left text-[10px] transition-colors
+                    {isSelected(server.base_url, model.id)
+                      ? 'bg-accent/15 text-accent'
+                      : 'hover:bg-surfaceHover text-textPrimary'}
+                    {usable(model) ? '' : 'opacity-50'}"
+                  title={usable(model)
+                    ? `${contextWindowLabel(model)} · ${toolSupportLabel(model)}`
+                    : "This model does not generate text — an embedding model answers the same listing as every chat model."}
+                >
+                  <span class="font-mono truncate flex-1">{model.id}</span>
+                  <span class="shrink-0 text-textMuted">{contextWindowLabel(model)}</span>
+                  <!--
+                    Three states, not two. `capabilities_known` false means
+                    nobody asked, and rendering that as "no tools" would make a
+                    capable model look incapable.
+                  -->
+                  <span
+                    class="shrink-0 text-[9px] rounded-full px-1.5 border
+                      {!model.capabilities_known
+                        ? 'text-textMuted border-border/80'
+                        : model.supports_tools
+                          ? 'text-accent border-accent/40'
+                          : 'text-textMuted border-border/80'}"
+                  >{toolSupportLabel(model)}</span>
+                </button>
+              {/each}
+            </div>
+          {/each}
+        </div>
+      {/if}
+
       {#if ai.endpoints.filter((e) => e.reachable).length === 0}
         <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
           {ai.detail || "No local model server answered."}

@@ -2555,3 +2555,14 @@ pub async fn cmd_codeintel_trace_between(
 pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantView, String> {
     off_thread(move || Ok(crate::grants::view(&repo_path))).await
 }
+
+/// Discovers the model servers running on this machine.
+///
+/// Separate from `cmd_ai_status`, which reports the *selected* model. This
+/// answers "what could I select", which the AI settings had no way to ask: the
+/// harness's capability probe requires a base URL and a model, which is the
+/// answer rather than the question.
+#[tauri::command(async)]
+pub async fn cmd_local_scan() -> Result<crate::harness::ScanResult, String> {
+    off_thread(crate::ai::scan_local_servers).await
+}

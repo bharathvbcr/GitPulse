@@ -179,6 +179,7 @@ pub fn run() {
             cmd_worktree_task,
             cmd_catch_up,
             cmd_grants_view,
+            cmd_local_scan,
             cmd_codeintel_status,
             cmd_codeintel_search,
             cmd_codeintel_impact,

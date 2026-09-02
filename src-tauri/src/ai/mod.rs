@@ -50,6 +50,7 @@ use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::GitReader;
 use crate::harness::protocol::{
     PrepareResult, ProbeResult, SettleResult, OP_CAPABILITY_PROBE, OP_CHAT_PREPARE, OP_CHAT_SETTLE,
+    OP_LOCAL_SCAN,
 };
 use crate::harness::sidecar;
 use crate::harness::HarnessStatus;
@@ -920,6 +921,35 @@ fn append_visible_answer_retry(system: &mut String, retry: bool) {
         );
     }
 }
+
+/// Discovers the model servers running on this machine.
+///
+/// Wraps the harness's `local.scan`, whose probe identifies each runtime by
+/// asking it rather than by assuming whichever one conventionally holds the
+/// port that answered. Capabilities are requested: the extra request per model
+/// is worth it for a listing an operator reads and chooses from, and without
+/// them every model would render with its capability flags unknown.
+pub fn scan_local_servers() -> Result<crate::harness::ScanResult, String> {
+    let params = serde_json::json!({
+        "timeout_ms": LOCAL_SCAN_TIMEOUT_MS,
+        "capabilities": true,
+    });
+    sidecar::call_typed::<crate::harness::ScanResult>(
+        OP_LOCAL_SCAN,
+        params,
+        // The harness bounds each endpoint probe; this bounds the whole call,
+        // with room for the sweep plus one model listing per server.
+        Duration::from_millis(LOCAL_SCAN_TIMEOUT_MS as u64 + 6_000),
+    )
+    .map_err(|e| e.message())
+}
+
+/// Per-endpoint probe budget for a discovery sweep.
+///
+/// Well under the harness's own 30s ceiling: dispatch is serial, so this is
+/// how long a scan may hold a policy verdict behind it, and a mutation waiting
+/// on model discovery is the wrong trade.
+const LOCAL_SCAN_TIMEOUT_MS: i64 = 1_500;
 
 #[cfg(test)]
 mod tests {
