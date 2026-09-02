@@ -39,9 +39,6 @@ export const DEFAULT_SRC_DIR = path.join(REPO_ROOT, "src");
  * keeping the list honest.
  */
 export const ORPHAN_ALLOWLIST = Object.freeze({
-  // CommitDetails renders the file list from cmd_get_commit_details' payload;
-  // this dedicated endpoint is unused surplus until a view needs it alone.
-  cmd_get_commit_files: "superseded by cmd_get_commit_details payload; kept for API parity",
   // Word-diff engine exposed for future parity/perf work.
   cmd_compute_word_diff: "frontend computes word diffs client-side; Rust engine reserved",
   // Language LOC endpoint without a UI surface yet.
@@ -52,10 +49,11 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   // The canvas renderer solves connector geometry internally; endpoint kept
   // in case layout moves back to Rust.
   cmd_get_bezier_connector: "canvas draws connectors internally; geometry endpoint reserved",
-  // Tag management actions: tags are listed (cmd_list_tags) but create/delete
-  // have no UI affordance yet.
-  cmd_create_tag: "tag creation backend-complete; UI pending",
-  cmd_delete_tag: "tag deletion backend-complete; UI pending",
+
+  // Unaddressed `git stash pop` targets stash@{0} sight-unseen. The UI
+  // pops through cmd_stash_action with the listed object id so a stale
+  // stack cannot destroy an entry the user did not choose.
+  cmd_stash_pop: "unaddressed pop is a footgun; UI uses cmd_stash_action with the listed OID",
   // Direct policy verdicts flow through runMutating()'s gate; this explicit
   // per-command check is reserved for harness diagnostics surfaces.
   cmd_policy_check_command: "policy gate reached via store mutations; direct endpoint reserved",

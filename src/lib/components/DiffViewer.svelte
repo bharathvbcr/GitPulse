@@ -11,8 +11,24 @@
   import type { FileBlob } from "../files/types";
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
+  import type { CommitFileChange } from "../stores/graphStore";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import DiffFileRail from "./DiffFileRail.svelte";
+  import {
+    buildFileRail,
+    railPosition,
+    stepFile,
+    type RailEntry,
+  } from "../diff/fileRail";
   import { invoke } from "@tauri-apps/api/core";
-  import { FileCode, Check, WrapText } from "lucide-svelte";
+  import {
+    FileCode,
+    Check,
+    WrapText,
+    ChevronUp,
+    ChevronDown,
+    PanelLeftOpen,
+  } from "lucide-svelte";
   import ImageDiffViewer from "./ImageDiffViewer.svelte";
   import EmptyState from "./EmptyState.svelte";
   import VirtualList from "./VirtualList.svelte";
@@ -39,6 +55,14 @@
   const MAX_RENDER_LINES = 300_000;
 
   let viewMode = $state<"unified" | "split">("unified");
+  /**
+   * The file list travels with the diff.
+   *
+   * Before this, opening a commit's file switched to this view and left its
+   * file list behind in the Graph view that owned it — reading a second file
+   * meant going back, finding the commit again, and clicking the next row.
+   */
+  let railOpen = $state(true);
   let wordWrap = $state(false);
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
@@ -143,6 +167,117 @@
       $repoStore.statuses.some((s) => s.path === $repoStore.selectedFilePath)
   );
   let isStaged = $derived($repoStore.selectedIsStaged);
+
+  const details = $derived($graphStore.selectedCommitDetails);
+
+  /**
+   * The commit's files, fetched when the graph store does not already hold
+   * them.
+   *
+   * The rail cannot depend on the Graph view having run first. A restored
+   * session opens straight onto a persisted commit selection, and any future
+   * caller that selects a commit file without going through
+   * `graphStore.selectCommit` lands here too — in both cases the store is
+   * empty and the rail would silently render nothing, which looks exactly
+   * like a commit that touched one file.
+   */
+  let fetchedFiles = $state<{ commitId: string; files: CommitFileChange[] } | null>(null);
+  let filesGuard: AsyncGuard | null = null;
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const commitId = $repoStore.selectedCommitId;
+    // Nothing to fetch when there is no commit, or when the graph store's
+    // details already cover this one.
+    if (!repo || !commitId || details?.id === commitId) return;
+    if (fetchedFiles?.commitId === commitId) return;
+    filesGuard?.cancel();
+    const guard = createAsyncGuard();
+    filesGuard = guard;
+    void (async () => {
+      try {
+        const files = await invoke<CommitFileChange[]>("cmd_get_commit_files", {
+          repoPath: repo,
+          commitId,
+        });
+        if (!guard.isLive()) return;
+        fetchedFiles = { commitId, files };
+      } catch {
+        // The rail is an aid, not the content. A failed list leaves the diff
+        // itself untouched and simply renders no rail, rather than pushing an
+        // error banner over a file the reader can already see.
+        if (guard.isLive()) fetchedFiles = { commitId, files: [] };
+      }
+    })();
+  });
+
+  $effect(() => () => filesGuard?.cancel());
+
+  /** This commit's files from whichever source has them. */
+  const commitFiles = $derived.by<CommitFileChange[] | null>(() => {
+    const commitId = $repoStore.selectedCommitId;
+    if (!commitId) return null;
+    if (details?.id === commitId) return details.changed_files;
+    if (fetchedFiles?.commitId === commitId) return fetchedFiles.files;
+    return null;
+  });
+
+  const rail = $derived(
+    buildFileRail({
+      selectionKind: $repoStore.selectedCommitId
+        ? "commit"
+        : $repoStore.selectedFilePath
+          ? "file"
+          : "range",
+      // Only this commit's own file list may be shown: a stale one from the
+      // previously selected commit would offer files that are not in the diff
+      // on screen.
+      commitFiles,
+      commitFilesTruncated: details?.files_list_truncated === true,
+      commitFilesTotal: details?.files_total_count ?? 0,
+      statuses: $repoStore.statuses,
+    }),
+  );
+  const position = $derived(
+    railPosition(rail, $repoStore.selectedFilePath, $repoStore.selectedIsStaged),
+  );
+  const prevFile = $derived(
+    stepFile(rail, $repoStore.selectedFilePath, $repoStore.selectedIsStaged, -1),
+  );
+  const nextFile = $derived(
+    stepFile(rail, $repoStore.selectedFilePath, $repoStore.selectedIsStaged, 1),
+  );
+
+  /**
+   * Alt+Arrow steps between files.
+   *
+   * Alt is the modifier because bare arrows scroll the diff and Cmd/Ctrl+Arrow
+   * is the OS word/line jump; both are things a reader is doing inside the
+   * diff already. Typing targets are excluded so the commit-message box and
+   * the search field keep their own arrow behaviour.
+   */
+  function onWindowKeydown(event: KeyboardEvent): void {
+    if (!event.altKey || event.ctrlKey || event.metaKey) return;
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    const target = event.target as HTMLElement | null;
+    if (target?.isContentEditable) return;
+    const tag = target?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    const entry = event.key === "ArrowDown" ? nextFile : prevFile;
+    if (!entry) return;
+    event.preventDefault();
+    openRailEntry(entry);
+  }
+
+  /** Opens a rail entry through whichever command its source requires. */
+  function openRailEntry(entry: RailEntry): void {
+    const commitId = $repoStore.selectedCommitId;
+    if (rail.source === "commit" && commitId) {
+      void repoStore.selectCommitFileDiff(commitId, entry.path);
+      return;
+    }
+    void repoStore.selectFileDiff(entry.path, entry.isStaged);
+  }
 
   function lineSelectable(index: number): boolean {
     const line = lines[index];
@@ -369,6 +504,10 @@
   });
 </script>
 
+<!-- Root-level: `svelte:window` may not sit inside a block, and the
+     shortcut must work in the image-diff branch too. -->
+<svelte:window onkeydown={onWindowKeydown} />
+
 {#if showingImage}
   <ImageDiffViewer filePath={$repoStore.selectedFilePath || "image"} {oldSrc} {newSrc} />
 {:else}
@@ -392,6 +531,49 @@
     </div>
 
     <div class="flex items-center gap-3">
+      <!-- Step between the files of this commit (or of the working tree)
+           without leaving the diff. Disabled rather than wrapping at the
+           edges: silently jumping back to the first file reads as a broken
+           button, not as the end of a list. -->
+      {#if rail.entries.length > 1}
+        <div class="flex items-center gap-1">
+          <button
+            type="button"
+            class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+            disabled={!prevFile}
+            onclick={() => prevFile && openRailEntry(prevFile)}
+            title="Previous file (Alt+↑)"
+            aria-label="Previous file"
+          >
+            <ChevronUp size={13} />
+          </button>
+          <span class="text-[10px] text-textMuted tabular-nums font-sans">
+            {position.index || "–"}/{position.total}
+          </span>
+          <button
+            type="button"
+            class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+            disabled={!nextFile}
+            onclick={() => nextFile && openRailEntry(nextFile)}
+            title="Next file (Alt+↓)"
+            aria-label="Next file"
+          >
+            <ChevronDown size={13} />
+          </button>
+        </div>
+      {/if}
+      {#if !railOpen && rail.entries.length > 0}
+        <button
+          type="button"
+          class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-xs text-textMuted"
+          onclick={() => (railOpen = true)}
+          title="Show the file list"
+        >
+          <PanelLeftOpen size={13} />
+          Files
+        </button>
+      {/if}
+
       <!-- Word Wrap Toggle -->
       <button
         type="button"
@@ -460,6 +642,15 @@
     />
   {:else}
     <div class="flex-1 flex min-h-0 relative overflow-hidden">
+      {#if railOpen && rail.entries.length > 0}
+        <DiffFileRail
+          {rail}
+          currentPath={$repoStore.selectedFilePath}
+          currentIsStaged={$repoStore.selectedIsStaged}
+          onOpen={openRailEntry}
+          onCollapse={() => (railOpen = false)}
+        />
+      {/if}
       <!-- Main Virtualized Diff Surface -->
       {#if viewMode === "unified"}
         <VirtualList items={lines} rowHeight={ROW_HEIGHT} overscan={OVERSCAN} bind:scrollTop={unifiedScroll} class="flex-1 min-h-0">

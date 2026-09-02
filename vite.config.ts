@@ -9,16 +9,18 @@ import { appVersion } from "./scripts/app-version.mjs";
  * only — its job is to catch a dependency accidentally landing in the entry
  * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
  *
- * Measured at 720 KB after the Work view and provenance badges; 708 KB before
+ * Measured at 754 KB after the diff file rail; 720 KB after the Work view and
+ * provenance badges; 708 KB before
  * them; 692 KB after the control-plane Phase 4 agent launcher and grants pass;
  * 680 KB after the repository-surface pass; 656 KB before it, 648 KB before
  * the parked-operation work. Growth is first-party: across all of these the
  * vendor chunks are unchanged except `vendor-icons`, which moved 158.5 → 159.9
- * KB for two new lucide glyphs. That comparison is the check to run before
+ * KB for two new lucide glyphs. The rail added three more glyphs and left
+ * every other vendor chunk byte-identical. That comparison is the check to run before
  * raising this again — a jump with vendor chunks unchanged is app code, a jump
  * with them changed is a dependency that leaked into the entry chunk.
  */
-const MAX_PRODUCTION_CHUNK_BYTES = 740_000;
+const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.
