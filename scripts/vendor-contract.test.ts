@@ -18,17 +18,37 @@ import { check, main, MANIFEST, readToml, resolveManifest, sources, VENDOR_DIR }
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CARGO_TOML = path.join(REPO, "src-tauri", "Cargo.toml");
 
-/** Every `path = "…"` in a Cargo manifest, in source order. */
+/**
+ * Every dependency `path` in a Cargo manifest, in source order.
+ *
+ * Only inline tables — `dep = { path = "…" }` — because a bare `path = "…"`
+ * line belongs to a `[[bin]]` target and points at a source file, not a crate.
+ * Matching those too made this assert that `src/main.rs` contains a manifest.
+ */
 function pathDependencies(manifest: string): string[] {
-  return [...manifest.matchAll(/\bpath\s*=\s*"([^"]+)"/g)].map((m) => m[1]);
+  return manifest
+    .split("\n")
+    .filter((line) => line.includes("{"))
+    .flatMap((line) => [...line.matchAll(/\bpath\s*=\s*"([^"]+)"/g)].map((m) => m[1]));
 }
 
 describe("GitPulse builds standalone", () => {
   const manifest = readFileSync(CARGO_TOML, "utf8");
 
   it("has path dependencies to check", () => {
-    // A regex that matched nothing would make every assertion below vacuous.
-    expect(pathDependencies(manifest).length).toBeGreaterThan(0);
+    // A pattern that matched nothing would make every assertion below vacuous,
+    // and one that matched the wrong thing would make them wrong. Both are
+    // pinned: the four vendored crates GitPulse links are named here.
+    const deps = pathDependencies(manifest);
+    expect(deps).toEqual(
+      expect.arrayContaining([
+        "vendored/dc-verify",
+        "vendored/dc-store",
+        "vendored/devmap-query",
+        "vendored/devmap-store",
+      ]),
+    );
+    expect(deps.every((d) => !d.endsWith(".rs"))).toBe(true);
   });
 
   it("has no path dependency that leaves the repository", () => {

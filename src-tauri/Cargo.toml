@@ -11,6 +11,29 @@ repository = "https://github.com/bharathvbcr/GitPulse"
 name = "gitpulse_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Declared explicitly, and the GUI first.
+#
+# `src/bin/*.rs` is auto-discovered by cargo, so adding `gitpulsed` gave the
+# package three binaries — and the Tauri bundler stopped picking the right one.
+# It bundled the 3 MB headless daemon as GitPulse.app's executable, which
+# launches, finds no repository named on its command line, and exits: an
+# installed app that opens nothing, from a build that reported success.
+#
+# `mainBinaryName` in tauri.conf.json names the GUI for the bundler; these
+# entries are what stop cargo's target list from being order-dependent in the
+# first place.
+[[bin]]
+name = "gitpulse"
+path = "src/main.rs"
+
+[[bin]]
+name = "gitpulsed"
+path = "src/bin/gitpulsed.rs"
+
+[[bin]]
+name = "gitpulse-mcp"
+path = "src/bin/gitpulse-mcp.rs"
+
 [dependencies]
 tauri = { version = "2.0.0", features = [] }
 tauri-plugin-opener = "2.0.0"
