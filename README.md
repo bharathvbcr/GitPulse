@@ -126,7 +126,7 @@ flowchart LR
 | **Work View & Task Control Plane** | Unified dashboard (`F10`) binding DevCouncil tasks to linked worktrees, PRs, workflow runs, policy verdicts, and temporary grants. Agent activity recorded to a durable SQLite WAL ledger. |
 | **IDE File Explorer & Code Viewer** | Integrated file tree with live Git status (staged, unstaged, untracked, ignored), virtualized syntax highlighting for 60+ languages, in-file search, line jump, and multi-file tabs. |
 | **GPU-Accelerated Graph** | Ultra-smooth canvas commit graph with avatar rendering, lane smoothing, nogap lookback bounds, branch folding, and ref decorations solved natively in Rust. |
-| **Precision Diff Viewer** | File, commit, and range diffs with word-level intra-line highlighting, image diff modes, impact edge annotations, and one-click selective hunk/line patch staging. |
+| **Precision Diff Viewer** | File, commit, and range diffs with embedded file rail, quick commit picker, intra-line word highlighting, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
 | **Language Vector Logos & Path Scannability** | Zero-dependency vector logos for 34+ programming languages, configs, and markups across the file tree, editor tabs, diff toolbar, and dashboard, with dimmed path hierarchy for scannable file lists. |

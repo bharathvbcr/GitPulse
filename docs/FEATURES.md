@@ -72,6 +72,8 @@ flowchart TD
 - **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in the Resolve view if a conflict results.
 
 ### 1.3 Diff (`diff`)
+- **Embedded File Rail & Commit Picker**: Browse changed files and move between recent commits directly within the Diff view without round-tripping back to the Graph view. Uncommitted changes are prioritized as first-class entries, history truncation is explicitly surfaced, and state uses the commits the graph already drew with zero IPC overhead.
+- **Precision Word Wrap & Normal-Flow Reflow**: Toggleable word-wrapping that gracefully disables row virtualization (`virtualize={false}`) up to `WRAP_MAX_LINES`, allowing long lines to reflow naturally without clipping, row overlap, or pushing split-view columns off-screen.
 - **Intra-Line Word Highlighting**: Pinpoints exact character and token changes within modified lines.
 - **Selective Patch Staging**: Stage or unstage individual hunks or selected line ranges directly from the diff view.
 - **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets.

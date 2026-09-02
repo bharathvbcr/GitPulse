@@ -24,6 +24,7 @@ before that tag is pushed.
 - Integrated language logos across LanguageBar, FileTreePanel, FileViewer editor tabs, Sidebar staged/unstaged changes, CommitDetails changed files list, DiffViewer toolbar, LivePulse dashboard, and CommandPalette symbol/file searches.
 - File path hierarchy formatting (`formatPathParts`) in Sidebar and CommitDetails, dimming directory paths and highlighting filenames for improved scannability.
 - Interactive LanguageBar pills that switch directly to the Files tab and dispatch custom filter events.
+- Diff view file rail and commit picker (`DiffFileRail.svelte`, `commitRail.ts`): browse changed files and move between recent commits directly within the Diff view without returning to the Graph view, with uncommitted changes prioritized, commit truncation indicators, and zero IPC overhead.
 
 - Control plane: GitPulse now records what agents do to a repository and judges it.
   A durable WAL SQLite ledger at the Rust guard seam records every mutation with the
@@ -127,6 +128,8 @@ before that tag is pushed.
 
 ### Fixed
 
+- Diff viewer word wrap: word wrap now opts out of fixed-height row windowing (`virtualize={false}` up to `WRAP_MAX_LINES`) so wrapped lines render in natural flow without clipping, line overlap, or pushing split-view columns off-screen.
+- Diff sidebar commit picker component test suite (`DiffFileRail.test.ts`).
 - A parked merge/rebase on a task-keyed Work row is shown and sorts first. Task mode previously left `operation` null, so a DevCouncil repository mid-rebase rendered as idle.
 - An operation probe that throws degrades the Work screen rather than looking like an idle worktree. Bare worktrees no longer steal probe slots from later checkouts.
 - A persisted `repo` view tab opens Work (its successor), not Graph.
