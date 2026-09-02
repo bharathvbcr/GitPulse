@@ -28,17 +28,22 @@ log = "0.4"
 # the bundled feature avoids depending on a system libsqlite3.
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# Credential redaction on the ledger write path. This is a link rather than a
-# copy on purpose: `SECRET_PATTERNS` in dc-verify is documented as the single
-# seam through which every consumer decides what counts as a credential, and a
-# second table is how a key redacted by one gate leaks out of another.
-dc-verify = { path = "../../../../../Manvi/crates/dc-verify" }
+# Vendored copies, under `vendored/`, so a lone checkout of GitPulse builds.
+# These crates are owned by Manvi and DevCouncil; nothing here edits them.
+# `npm run vendor:check` compares each copy against its upstream when that
+# repository is present, and says so plainly when it is not.
+#
+# Credential redaction on the ledger write path. `SECRET_PATTERNS` in dc-verify
+# is the single seam through which every consumer decides what counts as a
+# credential, and a second table is how a key redacted by one gate leaks out of
+# another — so this is a copy of that table, re-vendored, never a reimplementation.
+dc-verify = { path = "vendored/dc-verify" }
 
 # Read-only view of DevCouncil's task and lease store. Manvi owns the schema
 # (crates/dc-store/src/schema.rs) and the migrations; GitPulse links the crate
 # rather than reimplementing the queries, and never writes: a UI process that
 # takes a lease can strand a task when the window closes.
-dc-store = { path = "../../../../../Manvi/crates/dc-store" }
+dc-store = { path = "vendored/dc-store" }
 
 # Code-graph queries, answered in-process against DevCouncil's persisted map.
 #
@@ -51,8 +56,8 @@ dc-store = { path = "../../../../../Manvi/crates/dc-store" }
 # Linked rather than reached through the devmap daemon: the query engine is a
 # library call, and the socket, the daemon lifecycle and its 30-minute idle
 # self-retirement are all things not to have.
-devmap-query = { path = "../../../../../DevCouncil/rust-port/crates/devmap-query", default-features = false }
-devmap-store = { path = "../../../../../DevCouncil/rust-port/crates/devmap-store", default-features = false }
+devmap-query = { path = "vendored/devmap-query", default-features = false }
+devmap-store = { path = "vendored/devmap-store", default-features = false }
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }

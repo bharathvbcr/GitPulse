@@ -1,0 +1,18 @@
+[package]
+name = "devmap-analyze"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+devmap-extract = { path = "../devmap-extract", default-features = false }
+devmap-resolve = { path = "../devmap-resolve", default-features = false }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0" }
+anyhow = { version = "1.0" }
+
+[features]
+default = ["parse"]
+# Forwards the parsing frontend. Off, this crate builds without tree-sitter
+# and answers questions about a persisted map rather than building one.
+parse = ["devmap-extract/parse", "devmap-resolve/parse"]

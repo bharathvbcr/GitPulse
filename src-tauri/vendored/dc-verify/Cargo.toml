@@ -1,0 +1,15 @@
+[package]
+name = "dc-verify"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Deterministic verifier core: diff parsing and planned-scope classification"
+
+[dependencies]
+dc-glob = { path = "../dc-glob" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

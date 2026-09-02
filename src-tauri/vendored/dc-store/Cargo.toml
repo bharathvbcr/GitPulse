@@ -1,0 +1,18 @@
+[package]
+name = "dc-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "DevCouncil state store: tasks and the lease that makes concurrent building safe"
+
+[dependencies]
+# Pinned to the same line as DevCouncil's rust-port so the two Rust codebases
+# do not carry two SQLite builds between them. "bundled" compiles SQLite from
+# source, which keeps the store independent of whatever libsqlite3 the host has.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

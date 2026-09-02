@@ -5,6 +5,7 @@ import * as checkReleaseVersion from "./check-release-version.mjs";
 import * as checkReleaseAssets from "./check-release-assets.mjs";
 import * as checkCoverageFloor from "./check-coverage-floor.mjs";
 import * as releaseNotes from "./release-notes.mjs";
+import * as vendorCrates from "./vendor-crates.mjs";
 
 /**
  * Backlog A2. Every script entry point must answer `--help` with usage and
@@ -18,6 +19,7 @@ const ENTRY_POINTS: Array<[string, { main: (argv: string[]) => number }]> = [
   ["check-release-assets", checkReleaseAssets],
   ["check-coverage-floor", checkCoverageFloor],
   ["release-notes", releaseNotes],
+  ["vendor-crates", vendorCrates],
 ];
 
 function captureLog(run: () => number): { code: number; text: string } {

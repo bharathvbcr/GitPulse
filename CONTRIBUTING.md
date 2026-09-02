@@ -130,6 +130,7 @@ flowchart TD
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (123 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
 | `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 40 contracts (521 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
@@ -154,6 +155,7 @@ several were added after the drift had already happened.
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
 | `verdict-contract` | Two consumers of the shared policy contract disagreeing about what a decision means. The harness reports `action: "allow"` for five different things — a clean pass, a posture demotion, a grant, an executor-widened scope, and a decision reached with rungs that could not run — and only one of them is a clean pass. It also pins the vendored `contracts/` copy against its checksums, so a contract edited here instead of at its source fails rather than forking. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
+| `vendor-contract` | A path dependency that leaves the repository, which makes a lone checkout stop building — and nothing else notices until a fresh clone or a CI runner without the sibling repos fails. Also pins the distinction the vendor check exists for: an upstream that is not checked out is reported *unavailable*, never *matches*. |
 | `provenance-verdict-contract` | A verdict written into a git note that the freshness badge does not recognise. The badge fails closed — an unrecognised verdict is never rendered as a pass — which is the safe behaviour and also a silent one: a writer that started emitting a new word would put a permanent amber badge on every verified commit with nothing to say why. Writers are found by scanning for `VerificationNote` constructions, so a second one is covered without anyone remembering. |
 | `pr-timing-contract` | `gh` being asked for a field it does not know, which fails the whole PR listing; and "not reviewed yet" collapsing into "reviewed instantly". Field parity moved to `check:types` once the interface left the component. |
 | `wire-type-locality-contract` | A serde payload shape being declared inside a component, or inlined as an `invoke<{...}>` / `listen<{...}>` type argument, where `check:types` cannot reach it and a second copy can drift silently. Every instance found so far had already gone stale — TerminalRunResult, GitHubContext, ConflictChunk, CommitDetailsPayload, FileBlobPayload. |
@@ -197,6 +199,7 @@ GitPulse/
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
     ├── bin/              Headless entry points (see below)
+    ├── vendored/         Copies of the Manvi and DevCouncil crates (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
 ```
 
@@ -225,6 +228,50 @@ Interruption is safe by construction rather than by signal handling: each
 append is one transaction against a WAL database, and catch-up is idempotent
 against a watermark read back out of the ledger, so the next cycle re-does
 whatever an interrupted one did not finish and writes it exactly once.
+
+### Vendored crates
+
+GitPulse links eight Rust crates it does not own — `dc-verify`, `dc-store` and
+`dc-glob` from Manvi, and five `devmap-*` crates from DevCouncil. They used to
+be reached by relative path (`../../../../../Manvi/crates/…`), which meant a
+checkout of GitPulse alone did not build: it needed two unrelated repositories
+present, at the right depth, on every machine and every CI runner.
+
+They are copied into `src-tauri/vendored/` instead, with
+`src-tauri/vendored/VENDOR.json` recording, per crate, where it came from, the
+upstream commit, every manifest rewrite, and a hash of every file.
+
+```bash
+npm run vendor:check
+```
+
+**Do not edit these copies.** A fix belongs upstream, followed by:
+
+```bash
+npm run vendor
+```
+
+Three things the tooling is careful about, each of which was a way to get this
+subtly wrong:
+
+* **Inheritance is resolved, not carried.** Both upstreams use workspace
+  inheritance, and they disagree — Manvi is edition 2024 / resolver 3,
+  DevCouncil's rust-port is 2021 / resolver 2 — so a single workspace here
+  could not serve both. Each vendored manifest gets the concrete values its own
+  upstream would have supplied, every substitution is listed in `VENDOR.json`,
+  and an inheritance form the script does not recognise is a hard failure
+  rather than something passed through to fail later as a confusing cargo
+  error.
+* **`tests/` and `[dev-dependencies]` are not vendored.** GitPulse has never
+  run these crates' tests — as path dependencies outside its workspace, cargo
+  does not build them — and `devmap-store` dev-depends on `devmap-serve`, which
+  is outside this closure. The omission is recorded per crate rather than left
+  to be inferred from an absence.
+* **An upstream that is not checked out is reported `unavailable`, never
+  `matches`.** `vendor:check` verifies two different things: that no copy has
+  been edited here, which always runs; and that each copy still matches
+  upstream, which needs the sibling repository. When it is missing the run says
+  so and states that it is not a clean bill of health.
 
 ### The layers, and what each one owns
 
