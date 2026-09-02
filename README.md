@@ -272,7 +272,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 14 application views and keyboard shortcuts.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 15 application views and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.

@@ -220,6 +220,13 @@ pub fn build_native_menu<R: Runtime>(
                 VIEW_TAB_BINDINGS[8].1,
                 Some(VIEW_TAB_BINDINGS[8].2),
             )?,
+            // Work is the projection of everything else — tasks, worktrees,
+            // pull requests, runs and verdicts on one screen. It sits above
+            // Terminal because it is where a session starts, and takes F10
+            // rather than a digit: CmdOrCtrl+1..9 are already spoken for, and
+            // renumbering nine existing shortcuts to make room would break
+            // muscle memory for the sake of ordering.
+            &item(app, actions::TAB_WORK, "Work", Some("F10"))?,
             &item(app, actions::TAB_TERMINAL, "Terminal", None)?,
             &item(app, actions::TAB_MANVI, "MANVI", None)?,
             // Storage and Reflog are registered views with a menu group, but

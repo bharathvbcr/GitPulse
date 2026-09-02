@@ -45,6 +45,8 @@
       icon: Search,
       shortcuts: [
         { keys: ["⌘", "K"], description: "Open Command Palette" },
+        { keys: ["⌘", "1–9"], description: "Jump to view: Files, Graph, Diff, Resolve, Blame, Stack, GitHub, Coverage, Health" },
+        { keys: ["F10"], description: "Open Work — tasks, worktrees, PRs, runs and verdicts" },
         { keys: ["⌘", "F"], description: "Focus commit search / filter bar" },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
         { keys: ["⌘", "+"], description: "Zoom in UI font scale" },

@@ -9,14 +9,16 @@ import { appVersion } from "./scripts/app-version.mjs";
  * only — its job is to catch a dependency accidentally landing in the entry
  * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
  *
- * Measured at 692 KB after the control-plane Phase 4 agent launcher and grants
- * pass; 680 KB after the repository-surface pass; 656 KB before it, 648 KB before
- * the parked-operation work. Growth is first-party: the vendor chunks below
- * are unchanged across all four, which is the check to run before raising
- * this again — a jump with vendor chunks unchanged is app code, a jump with
- * them changed is a dependency that leaked into the entry chunk.
+ * Measured at 720 KB after the Work view and provenance badges; 708 KB before
+ * them; 692 KB after the control-plane Phase 4 agent launcher and grants pass;
+ * 680 KB after the repository-surface pass; 656 KB before it, 648 KB before
+ * the parked-operation work. Growth is first-party: across all of these the
+ * vendor chunks are unchanged except `vendor-icons`, which moved 158.5 → 159.9
+ * KB for two new lucide glyphs. That comparison is the check to run before
+ * raising this again — a jump with vendor chunks unchanged is app code, a jump
+ * with them changed is a dependency that leaked into the entry chunk.
  */
-const MAX_PRODUCTION_CHUNK_BYTES = 710_000;
+const MAX_PRODUCTION_CHUNK_BYTES = 740_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.

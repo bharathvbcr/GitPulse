@@ -50,6 +50,7 @@
   import GitHubPanel from "./lib/components/GitHubPanel.svelte";
   import ManviOpsPanel from "./lib/components/ManviOpsPanel.svelte";
   import ReflogViewer from "./lib/components/ReflogViewer.svelte";
+  import WorkView from "./lib/components/WorkView.svelte";
   import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -557,7 +558,9 @@
                  entrance fade — a full-screen flicker per tab. The {#if}
                  chain alone swaps panes; state lives in stores. -->
             <div class="gp-view flex-1 flex flex-col min-h-0">
-              {#if $repoStore.activeTab === "history"}
+              {#if $repoStore.activeTab === "work"}
+                <WorkView />
+              {:else if $repoStore.activeTab === "history"}
                 <div class="flex-1 flex flex-col min-h-0">
                   <CommitTable />
                   <CommitDetails />

@@ -20,14 +20,19 @@ describe("viewNav", () => {
   it("keeps daily work as tabs and folds the rest into menus", () => {
     const work = VIEW_NAV.find((group) => group.id === "work");
     expect(work?.kind).toBe("tabs");
-    expect(work?.items.map((item) => item.id)).toEqual(["files", "history", "diff", "conflict"]);
+    expect(work?.items.map((item) => item.id)).toEqual(["work", "files", "history", "diff", "conflict"]);
 
     const menus = VIEW_NAV.filter((group) => group.kind === "menu");
     expect(menus.length).toBeGreaterThanOrEqual(1);
     const tabCount = VIEW_NAV.filter((group) => group.kind === "tabs").flatMap((group) => group.items)
       .length;
     expect(tabCount).toBeLessThan(VIEW_TABS.length);
-    expect(tabCount).toBeLessThanOrEqual(4);
+    // The bound exists so the title bar cannot grow a button per panel, not
+    // to pin the count at whatever it was the day it was written. It moved
+    // from 4 to 5 when Work joined — the projection of tasks, worktrees, PRs,
+    // runs and verdicts is where a session starts, so burying it in a menu
+    // would defeat it. Anything further needs the same argument made again.
+    expect(tabCount).toBeLessThanOrEqual(5);
   });
 
   it("resolves group and item metadata for each tab", () => {

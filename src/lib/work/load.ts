@@ -1,0 +1,208 @@
+import { invoke } from "@tauri-apps/api/core";
+import { formatError } from "../ui/formatError";
+import type { GitHubContext } from "../github/types";
+import type { GrantView, Grant } from "../grants/types";
+import type { LedgerEvent } from "../ledger/types";
+import type { TaskScope, TaskView } from "../tasks/types";
+import type { WorktreeInfo } from "../branches/types";
+import { projectWork, type WorkInputs, type WorkProjection, type WorkSources } from "./projection";
+
+/**
+ * Gathering the five sources the Work view joins.
+ *
+ * Each is fetched independently and each failure is recorded rather than
+ * thrown: one source being down must degrade the screen, not blank it. What
+ * the projection then renders is "here is what we could see, and here is what
+ * we could not" — which is the only honest thing a joined view can say.
+ */
+
+/** Ledger rows read for the verdict tally. */
+export const LEDGER_WINDOW = 500;
+
+/** Worktrees whose task binding is resolved. Each costs one IPC round trip. */
+export const MAX_BINDING_LOOKUPS = 64;
+
+/** Task scopes fetched for their titles. */
+export const MAX_TITLE_LOOKUPS = 32;
+
+export interface WorkLoadDeps {
+  invoke?: typeof invoke;
+}
+
+const ABSENT = { ok: true, present: false, detail: "" } as const;
+const READ = { ok: true, present: true, detail: "" } as const;
+
+function failed(e: unknown): WorkSources[keyof WorkSources] {
+  return { ok: false, present: true, detail: formatError(e) };
+}
+
+/**
+ * Loads and joins everything the Work view shows for one repository.
+ *
+ * Never rejects: a failure anywhere becomes a degraded source in the result.
+ * The caller renders a projection either way, because a screen that vanishes
+ * on one bad source tells the reader less than one that says which source.
+ */
+export async function loadWork(
+  repoPath: string,
+  deps: WorkLoadDeps = {},
+): Promise<WorkProjection> {
+  const call = deps.invoke ?? invoke;
+
+  const sources: WorkSources = {
+    tasks: { ...ABSENT },
+    worktrees: { ...ABSENT },
+    github: { ...ABSENT },
+    ledger: { ...ABSENT },
+    grants: { ...ABSENT },
+  };
+
+  const input: WorkInputs = {
+    leases: null,
+    titles: {},
+    worktrees: null,
+    bindings: {},
+    pullRequests: null,
+    runs: null,
+    events: null,
+    grants: null,
+    sources,
+  };
+
+  // Fetched together: they do not depend on each other, and the view is not
+  // worth five sequential round trips.
+  const [tasks, worktrees, github, ledger, grants] = await Promise.all([
+    call<TaskView>("cmd_task_view", { repoPath }).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+    call<WorktreeInfo[]>("cmd_list_worktrees", { repoPath }).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+    call<GitHubContext>("cmd_github_context", { repoPath }).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+    call<LedgerEvent[]>("cmd_ledger_tail", { repoPath, cursor: 0, limit: LEDGER_WINDOW }).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+    call<GrantView>("cmd_grants_view", { repoPath }).then(
+      (v) => ({ ok: true as const, v }),
+      (e) => ({ ok: false as const, e }),
+    ),
+  ]);
+
+  if (!tasks.ok) {
+    sources.tasks = failed(tasks.e);
+  } else if (!tasks.v.available) {
+    // No DevCouncil store here. Ordinary, and not a failure — but the leases
+    // list stays null so the projection never reports "no tasks" for a
+    // repository that has no task model at all.
+    sources.tasks = { ...ABSENT };
+  } else if (tasks.v.error) {
+    sources.tasks = { ok: false, present: true, detail: tasks.v.error };
+  } else {
+    sources.tasks = { ...READ };
+    input.leases = tasks.v.leases;
+  }
+
+  if (!worktrees.ok) {
+    sources.worktrees = failed(worktrees.e);
+  } else {
+    sources.worktrees = { ...READ };
+    input.worktrees = worktrees.v;
+  }
+
+  if (!github.ok) {
+    sources.github = failed(github.e);
+  } else if (!github.v.available) {
+    sources.github = { ...ABSENT };
+  } else if (github.v.error) {
+    sources.github = { ok: false, present: true, detail: github.v.error };
+  } else {
+    // A section that failed inside an otherwise usable context degrades this
+    // source too: the runs list being empty because `gh` choked is not the
+    // same fact as there being no runs.
+    const sectionError = github.v.runs_error ?? "";
+    sources.github = sectionError
+      ? { ok: false, present: true, detail: sectionError }
+      : { ...READ };
+    input.pullRequests = github.v.pull_requests;
+    input.runs = github.v.workflow_runs;
+  }
+
+  if (!ledger.ok) {
+    sources.ledger = failed(ledger.e);
+  } else {
+    sources.ledger = { ...READ };
+    input.events = ledger.v;
+  }
+
+  if (!grants.ok) {
+    sources.grants = failed(grants.e);
+  } else if (!grants.v.available) {
+    sources.grants = { ...ABSENT };
+  } else if (grants.v.error) {
+    sources.grants = { ok: false, present: true, detail: grants.v.error };
+  } else {
+    sources.grants = { ...READ };
+    input.grants = grants.v.grants as Grant[];
+  }
+
+  // Worktree → task bindings. One call each, so it is capped; a worktree past
+  // the cap lands in the unbound bucket, and `worktrees` is marked degraded so
+  // that never silently reads as "bound to nothing".
+  if (input.worktrees && input.worktrees.length > 0) {
+    const looked = input.worktrees.slice(0, MAX_BINDING_LOOKUPS);
+    const bindings: Record<string, string> = {};
+    await Promise.all(
+      looked.map(async (worktree) => {
+        try {
+          const taskId = await call<string | null>("cmd_worktree_task", {
+            repoPath,
+            worktreePath: worktree.path,
+          });
+          if (taskId) bindings[worktree.path] = taskId;
+        } catch {
+          // One unreadable binding is not a reason to lose the other rows;
+          // the worktree simply appears unbound, which the degraded flag below
+          // covers when it was the cap rather than the data.
+        }
+      }),
+    );
+    input.bindings = bindings;
+    if (input.worktrees.length > looked.length) {
+      sources.worktrees = {
+        ok: false,
+        present: true,
+        detail:
+          `only the first ${MAX_BINDING_LOOKUPS} of ${input.worktrees.length} worktrees ` +
+          `had their task binding resolved`,
+      };
+    }
+  }
+
+  // Titles for the tasks that ended up on screen.
+  const taskIds = [...new Set((input.leases ?? []).map((l) => l.task_id))].slice(
+    0,
+    MAX_TITLE_LOOKUPS,
+  );
+  if (taskIds.length > 0) {
+    const titles: Record<string, string> = {};
+    await Promise.all(
+      taskIds.map(async (taskId) => {
+        try {
+          const scope = await call<TaskScope | null>("cmd_task_scope", { repoPath, taskId });
+          if (scope?.title) titles[taskId] = scope.title;
+        } catch {
+          // A missing title is cosmetic: the row is identified by its id.
+        }
+      }),
+    );
+    input.titles = titles;
+  }
+
+  return projectWork(input);
+}

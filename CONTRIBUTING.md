@@ -185,7 +185,7 @@ GitPulse/
 │   ├── lib/stores/       Reactive state (repo, graph, filter, theme, toasts, modals)
 │   ├── lib/components/   UI components; one .svelte + one .test.ts each
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
-│   ├── lib/views/        View registry + navigation (routerless, 14 views)
+│   ├── lib/views/        View registry + navigation (routerless, 15 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
     ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (125 handlers)

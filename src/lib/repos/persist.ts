@@ -15,6 +15,7 @@ export const STORAGE_KEY_LAST_PATH = "gitpulse_last_repo";
 export const WORKSPACE_VERSION = 1 as const;
 
 export type ViewTab =
+  | "work"
   | "files"
   | "history"
   | "diff"
@@ -31,6 +32,7 @@ export type ViewTab =
   | "reflog";
 
 export const VIEW_TABS: readonly ViewTab[] = [
+  "work",
   "files",
   "history",
   "diff",

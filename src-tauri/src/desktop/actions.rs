@@ -8,6 +8,7 @@ pub const TOGGLE_THEME: &str = "toggle-theme";
 pub const THEME_SYSTEM: &str = "theme-system";
 pub const THEME_LIGHT: &str = "theme-light";
 pub const THEME_DARK: &str = "theme-dark";
+pub const TAB_WORK: &str = "tab-work";
 pub const TAB_HISTORY: &str = "tab-history";
 pub const TAB_FILES: &str = "tab-files";
 pub const TAB_DIFF: &str = "tab-diff";
@@ -49,6 +50,7 @@ pub enum NativeAction {
     ThemeSystem,
     ThemeLight,
     ThemeDark,
+    TabWork,
     TabHistory,
     TabFiles,
     TabDiff,
@@ -96,6 +98,7 @@ impl NativeAction {
             THEME_SYSTEM => Self::ThemeSystem,
             THEME_LIGHT => Self::ThemeLight,
             THEME_DARK => Self::ThemeDark,
+            TAB_WORK => Self::TabWork,
             TAB_HISTORY => Self::TabHistory,
             TAB_FILES => Self::TabFiles,
             TAB_DIFF => Self::TabDiff,
@@ -138,6 +141,7 @@ impl NativeAction {
             Self::ThemeSystem => THEME_SYSTEM,
             Self::ThemeLight => THEME_LIGHT,
             Self::ThemeDark => THEME_DARK,
+            Self::TabWork => TAB_WORK,
             Self::TabHistory => TAB_HISTORY,
             Self::TabFiles => TAB_FILES,
             Self::TabDiff => TAB_DIFF,
@@ -208,6 +212,7 @@ mod tests {
             NativeAction::parse(REOPEN_REPO_TAB),
             Some(NativeAction::ReopenRepoTab)
         );
+        assert_eq!(NativeAction::parse(TAB_WORK), Some(NativeAction::TabWork));
         assert_eq!(NativeAction::parse(TAB_FILES), Some(NativeAction::TabFiles));
         assert_eq!(
             NativeAction::parse(TAB_COVERAGE),

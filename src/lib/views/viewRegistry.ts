@@ -32,6 +32,12 @@ export interface ViewRegistration {
  * record ordered the way the header should read.
  */
 export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
+  work: {
+    id: "work",
+    label: "Work",
+    menuGroup: "work",
+    paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
+  },
   files: { id: "files", label: "Files", menuGroup: "work", paletteCommand: "Open File Viewer & Explorer" },
   history: { id: "history", label: "Graph", menuGroup: "work" },
   diff: { id: "diff", label: "Diff", menuGroup: "work" },

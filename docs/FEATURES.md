@@ -5,6 +5,7 @@ GitPulse provides 13 specialized views categorized into **Work**, **Inspect**, a
 ```mermaid
 flowchart TD
     subgraph WorkGroup["Work Views (Core Git Flow)"]
+        Work["<b>Work</b> (<code>work</code>)<br/>Tasks × worktrees × PRs × runs × verdicts, joined into one screen"]
         Files["<b>Files</b> (<code>files</code>)<br/>IDE file explorer, syntax code viewer, live pulse, media preview"]
         History["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph, branch lanes, author avatars, ref badges"]
         Diff["<b>Diff</b> (<code>diff</code>)<br/>Intra-line word diffs, image diffs, selective hunk/line staging"]
@@ -30,6 +31,15 @@ flowchart TD
 ---
 
 ## 1. Work Views
+
+### 1.0 Work (`work`)
+- **One Screen Per Task**: Joins DevCouncil task leases, linked worktrees, open pull requests, workflow runs, policy verdicts and grants into a single row per task. Everything else in GitPulse shows one of these; this shows how they relate.
+- **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
+- **A Branch on Two Tasks Appears on Both**: Assigning it to one would hide the work from the other with nothing on screen to say so.
+- **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
+- **Unreadable Is Its Own State**: A verdict this build cannot parse is counted as `unreadable`, never as `allowed` — a check that could not be read must never render as one that ran and passed.
+- **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem).
+- **Shortcut**: `F10`.
 
 ### 1.1 Files (`files`)
 - **IDE File Explorer**: Recursive directory tree navigation with real-time Git status markers (staged, unstaged, untracked, ignored).
