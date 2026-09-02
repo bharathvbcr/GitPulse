@@ -194,6 +194,8 @@ describe("isHostRuntimeNoise", () => {
       "[hmr] Failed to reload /src/lib/components/SettingsModal.svelte. This could be due to syntax errors or importing non-existent modules. (see errors above)",
       "Importing a module script failed.",
       "undefined is not an object (evaluating 'module.default')",
+      "ResizeObserver loop completed with undelivered notifications.",
+      "ResizeObserver loop limit exceeded",
     ];
     for (const message of fromDump) {
       expect(isHostRuntimeNoise(message), message).toBe(true);

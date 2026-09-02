@@ -180,6 +180,8 @@ export function isHostRuntimeNoise(message: string): boolean {
     return true;
   }
   if (text.includes("(evaluating 'module.default')")) return true;
+  if (text.includes("ResizeObserver loop completed with undelivered notifications")) return true;
+  if (text.includes("ResizeObserver loop limit exceeded")) return true;
   return false;
 }
 

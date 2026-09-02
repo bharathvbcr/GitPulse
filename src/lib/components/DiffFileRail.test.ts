@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 import DiffFileRail from "./DiffFileRail.svelte";
 import { buildFileRail, type RailInput } from "../diff/fileRail";
+import { buildCommitRail } from "../diff/commitRail";
 
 function rail(over: Partial<RailInput> = {}) {
   return buildFileRail({
@@ -18,11 +19,21 @@ function rail(over: Partial<RailInput> = {}) {
   });
 }
 
+const commitRows = [
+  { id: "a1b2c3d4e5f6", summary: "Add the parser", author_name: "Ada", timestamp: 1_700_000_000, is_merge: false },
+  { id: "b2c3d4e5f6a1", summary: "", author_name: "Bob", timestamp: 1_699_900_000, is_merge: true },
+];
+
 const props = (over = {}) => ({
   rail: rail(),
+  commits: buildCommitRail(commitRows),
   currentPath: "src/a.ts",
   currentIsStaged: false,
+  selectedCommitId: "a1b2c3d4e5f6",
+  workingTreeCount: 3,
   onOpen: () => {},
+  onPickCommit: () => {},
+  onPickWorkingTree: () => {},
   onCollapse: () => {},
   ...over,
 });

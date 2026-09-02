@@ -26,4 +26,10 @@ describe("LanguageBar", () => {
     expect(source).toContain('repoStore.setActiveTab("files")');
     expect(source).toContain("gitpulse:filter-lang");
   });
+
+  it("guards against in-flight request cancellation on store emissions", () => {
+    expect(source).toContain("activeRequestId");
+    expect(source).toContain("currentActivePath");
+    expect(source).not.toContain("cancelled = true");
+  });
 });

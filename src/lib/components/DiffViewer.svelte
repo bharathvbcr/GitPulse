@@ -20,6 +20,7 @@
     stepFile,
     type RailEntry,
   } from "../diff/fileRail";
+  import { buildCommitRail, type CommitEntry } from "../diff/commitRail";
   import { invoke } from "@tauri-apps/api/core";
   import {
     FileCode,
@@ -268,6 +269,55 @@
     if (!entry) return;
     event.preventDefault();
     openRailEntry(entry);
+  }
+
+  /** Recent commits, straight from the rows the graph already drew. */
+  const commitRail = $derived(buildCommitRail($graphStore.rows));
+
+  /**
+   * Switches the diff to another commit, and opens one of its files.
+   *
+   * Selecting the commit alone would leave the pane showing the previous
+   * commit's file, so the first changed file is opened with it — the reader
+   * asked to look at this change, not to be told it is selected.
+   */
+  async function pickCommit(entry: CommitEntry): Promise<void> {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    let files = fetchedFiles?.commitId === entry.id ? fetchedFiles.files : null;
+    if (!files) {
+      try {
+        files = await invoke<CommitFileChange[]>("cmd_get_commit_files", {
+          repoPath: repo,
+          commitId: entry.id,
+        });
+        fetchedFiles = { commitId: entry.id, files };
+      } catch {
+        files = [];
+      }
+    }
+    const first = files[0];
+    if (!first) {
+      // A commit that changed nothing (an empty or a merge with no diff) has
+      // no file to open; show the whole commit rather than nothing at all.
+      void repoStore.selectCommitDiff(entry.id);
+      return;
+    }
+    void repoStore.selectCommitFileDiff(entry.id, first.path);
+  }
+
+  /**
+   * Returns to uncommitted work, opening its first changed file.
+   *
+   * A clean tree has nothing to open, so the button does nothing rather than
+   * clearing the diff on screen — leaving the reader looking at a blank pane
+   * they did not ask for is worse than leaving them where they were. The
+   * entry's own "clean" badge already says why.
+   */
+  function pickWorkingTree(): void {
+    const first = $repoStore.statuses[0];
+    if (!first) return;
+    void repoStore.selectFileDiff(first.path, first.is_staged);
   }
 
   /** Opens a rail entry through whichever command its source requires. */
@@ -567,7 +617,7 @@
           </button>
         </div>
       {/if}
-      {#if !railOpen && rail.entries.length > 0}
+      {#if !railOpen && (rail.entries.length > 0 || commitRail.entries.length > 0)}
         <button
           type="button"
           class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-xs text-textMuted"
@@ -647,12 +697,17 @@
     />
   {:else}
     <div class="flex-1 flex min-h-0 relative overflow-hidden">
-      {#if railOpen && rail.entries.length > 0}
+      {#if railOpen && (rail.entries.length > 0 || commitRail.entries.length > 0)}
         <DiffFileRail
           {rail}
+          commits={commitRail}
           currentPath={$repoStore.selectedFilePath}
           currentIsStaged={$repoStore.selectedIsStaged}
+          selectedCommitId={$repoStore.selectedCommitId}
+          workingTreeCount={$repoStore.statuses.length}
           onOpen={openRailEntry}
+          onPickCommit={pickCommit}
+          onPickWorkingTree={pickWorkingTree}
           onCollapse={() => (railOpen = false)}
         />
       {/if}
