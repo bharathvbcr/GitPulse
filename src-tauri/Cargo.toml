@@ -40,10 +40,19 @@ dc-verify = { path = "../../../../../Manvi/crates/dc-verify" }
 # takes a lease can strand a task when the window closes.
 dc-store = { path = "../../../../../Manvi/crates/dc-store" }
 
-# Phase 5 devmap integration. In-process code intelligence queries
-# over DevCouncil's .devcouncil/codeintel/devmap.sqlite database.
-devmap-query = { path = "../../../../../DevCouncil/rust-port/crates/devmap-query" }
-devmap-store = { path = "../../../../../DevCouncil/rust-port/crates/devmap-store" }
+# Code-graph queries, answered in-process against DevCouncil's persisted map.
+#
+# `default-features = false` turns off devmap's parsing frontend: GitPulse
+# reads a map DevCouncil built and never indexes anything itself, so it needs
+# the model types and the SQLite store but none of the 32 tree-sitter grammars.
+# With the frontend on, this dependency cost 49 extra crates and 63 tree-sitter
+# packages; without it, none.
+#
+# Linked rather than reached through the devmap daemon: the query engine is a
+# library call, and the socket, the daemon lifecycle and its 30-minute idle
+# self-retirement are all things not to have.
+devmap-query = { path = "../../../../../DevCouncil/rust-port/crates/devmap-query", default-features = false }
+devmap-store = { path = "../../../../../DevCouncil/rust-port/crates/devmap-store", default-features = false }
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
