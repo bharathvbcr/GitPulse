@@ -171,16 +171,20 @@ before that tag is pushed.
 ### Fixed
 
 - Python coverage could not run on Windows: GitPulse refused every real
-  project virtualenv there. `python -m venv` symlinks the interpreter out
-  to the host toolchain on Unix but COPIES `python.exe` in on Windows, and
-  the trust rule refused any interpreter resolving inside the repository.
-  A repository-resident copy is now admitted, but only when it is
-  byte-for-byte a host interpreter — the one on PATH, or the one named by
-  `pyvenv.cfg`, which is itself required to resolve outside the repository
-  and be named like a Python before it is believed. `resolve_on_path` also
-  never matched on Windows, where the file is `python3.exe` and a bare name
-  was joined; it now tries the `.exe` spelling (only `.exe`, so this cannot
-  resolve a `.bat`/`.cmd` shim).
+  project virtualenv there. Two causes. `resolve_on_path` joined a bare
+  program name, so it never matched `python3.exe` and the PATH-identity check
+  could not succeed on Windows at all; it now also tries the `.exe` spelling
+  (only `.exe`, so it cannot resolve a `.bat`/`.cmd` shim). And the trust rule
+  refused any interpreter resolving inside the repository — which on Windows is
+  every virtualenv, because `venv` does not symlink the interpreter out as it
+  does on Unix. Measured on CPython 3.12.10: it installs a 274,424-byte
+  launcher where the base interpreter is 104,952, byte-identical to
+  `<install>\Lib\venv\scripts\nt\python.exe`. A repository-resident
+  interpreter is now admitted, but only when its bytes equal the host
+  interpreter or a launcher that host installation ships, found by scanning
+  that directory rather than assuming a file name. `pyvenv.cfg` must exist as
+  the virtualenv marker but is never read: it is repository content, and
+  nothing a repository writes should nominate the bytes GitPulse executes.
 - Submodule pathspec validation was fail-open on Windows. The rooted-path
   refusal was built on `Path::is_absolute`, which is false for
   `/absolute/path` there (no drive), so a pathspec refused on Unix reached

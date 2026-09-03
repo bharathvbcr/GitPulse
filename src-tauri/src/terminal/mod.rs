@@ -735,32 +735,32 @@ fn same_program_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
-/// The interpreter a virtualenv records as the one it was built from.
+/// Whether `target` is an unmodified copy of a virtualenv launcher shipped by
+/// the Python installation that `host` belongs to.
 ///
-/// `pyvenv.cfg` is repository content, so this only LOCATES a candidate. The
-/// caller then holds that candidate to exactly the rules a symlink target is
-/// held to — resolving outside the repository, named like a Python — before
-/// comparing bytes. Naming a file here cannot by itself make GitPulse trust
-/// it.
-fn recorded_base_interpreter(cfg: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let text = std::fs::read_to_string(cfg).ok()?;
-    let mut home: Option<std::path::PathBuf> = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim().to_ascii_lowercase().as_str() {
-            // Python 3.11+ records the exact executable it was built from.
-            "base-executable" => return Some(std::path::PathBuf::from(value)),
-            "home" => home = Some(std::path::PathBuf::from(value)),
-            _ => {}
-        }
-    }
-    home.map(|dir| dir.join(name))
+/// Windows `python -m venv` does not copy the interpreter into the virtualenv.
+/// It copies a launcher, which reads `pyvenv.cfg` at run time and re-executes
+/// the real interpreter. Measured on CPython 3.12.10: the base install's
+/// `python.exe` is 104,952 bytes, the virtualenv's is 274,424, and the latter
+/// is byte-identical to `<install>\Lib\venv\scripts\nt\python.exe`.
+///
+/// The directory is scanned rather than a file name assumed: the launcher is
+/// named `python.exe` there in 3.12 and `venvlauncher.exe` in older releases,
+/// and a name list would silently stop matching on the next rename. Scanning
+/// admits nothing extra — the bytes still have to equal a file the trusted
+/// installation ships.
+fn is_shipped_venv_launcher(host: &std::path::Path, target: &std::path::Path) -> bool {
+    let Some(install) = host.parent() else {
+        return false;
+    };
+    let launchers = install.join("Lib").join("venv").join("scripts").join("nt");
+    let Ok(entries) = std::fs::read_dir(launchers) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_file())
+            && same_program_bytes(&entry.path(), target)
+    })
 }
 
 /// True when `name` is a Python interpreter's file name (`python`, `python3`,
@@ -801,12 +801,15 @@ fn is_python_interpreter_name(name: &str) -> bool {
 /// `.venv\Scripts\`, so the target is repository-resident and (2) refused
 /// every real virtualenv there — Python coverage could not run at all.
 ///
-/// The copy is admitted only against bytes, never against its location or its
-/// name: it must equal the Python on PATH, or the interpreter recorded in
-/// `pyvenv.cfg` — which is itself held to (2)'s rules before being believed,
-/// since the file naming it is repository content. A repository that drops a
-/// payload at the virtualenv spelling fails all three: the bytes are not any
-/// host interpreter's.
+/// Windows `venv` does not even copy the interpreter — it installs a launcher
+/// that re-executes the real one — so the comparison is against every file the
+/// trusted installation ships for that purpose, found by scanning its
+/// `Lib\venv\scripts\nt` directory. `pyvenv.cfg` is required to exist, as the
+/// marker of a real virtualenv, but is never read: it is repository content,
+/// and nothing a repository writes should be able to nominate the bytes
+/// GitPulse will execute. A repository that drops a payload at the virtualenv
+/// spelling fails every branch — the bytes are not the host interpreter's and
+/// not any launcher the host ships.
 ///
 /// SECURITY IMPACT: this is the one path on which GitPulse will execute a file
 /// that lives inside the opened repository. Byte equality with a qualifying
@@ -814,11 +817,7 @@ fn is_python_interpreter_name(name: &str) -> bool {
 /// Windows virtualenv spelling becomes an arbitrary execution primitive.
 /// Writing a hostile binary named `python3` outside the repository already
 /// requires the code execution this check exists to prevent.
-fn resolves_to_trusted_python(
-    repo: &std::path::Path,
-    interpreter: &std::path::Path,
-    venv_cfg: &std::path::Path,
-) -> bool {
+fn resolves_to_trusted_python(repo: &std::path::Path, interpreter: &std::path::Path) -> bool {
     let Ok(target) = std::fs::canonicalize(interpreter) else {
         return false;
     };
@@ -841,27 +840,14 @@ fn resolves_to_trusted_python(
     if !target.starts_with(&root) {
         return true;
     }
-    // Repository-resident: admitted only as a byte-identical copy.
-    if hosts.iter().any(|host| same_program_bytes(host, &target)) {
-        return true;
-    }
-    let Some(base) = recorded_base_interpreter(venv_cfg, name) else {
-        return false;
-    };
-    let Ok(base) = std::fs::canonicalize(&base) else {
-        return false;
-    };
-    if base.starts_with(&root) {
-        return false;
-    }
-    if !base
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(is_python_interpreter_name)
-    {
-        return false;
-    }
-    same_program_bytes(&base, &target)
+    // Repository-resident: admitted only as bytes the trusted host
+    // installation itself ships — either the interpreter, or the virtualenv
+    // launcher it installs in place of one. `pyvenv.cfg` is deliberately not
+    // consulted: it is repository content, and nothing a repository writes
+    // should be able to nominate what GitPulse will execute.
+    hosts
+        .iter()
+        .any(|host| same_program_bytes(host, &target) || is_shipped_venv_launcher(host, &target))
 }
 
 /// Validates the project virtualenv's interpreter as a program.
@@ -890,17 +876,19 @@ pub(crate) fn check_venv_interpreter(
     let Some(venv_dir) = relative.split('/').next().filter(|dir| !dir.is_empty()) else {
         return Err("has no virtualenv directory");
     };
-    let cfg = match sandbox_join_canonical(repo, &format!("{venv_dir}/pyvenv.cfg")) {
-        Ok(cfg) if cfg.is_file() => cfg,
+    // Presence only. Its CONTENTS are never read: it is repository content,
+    // and nothing a repository writes should influence what gets executed.
+    match sandbox_join_canonical(repo, &format!("{venv_dir}/pyvenv.cfg")) {
+        Ok(cfg) if cfg.is_file() => {}
         _ => return Err("is not inside a virtualenv (no pyvenv.cfg)"),
-    };
+    }
     let Ok(interpreter) = sandbox_join(repo, relative) else {
         return Err("is not a repository-relative path");
     };
     if !interpreter.is_file() {
         return Err("is not a repository file");
     }
-    if !resolves_to_trusted_python(repo, &interpreter, &cfg) {
+    if !resolves_to_trusted_python(repo, &interpreter) {
         return Err("does not resolve to a Python interpreter outside the repository");
     }
     Ok(())
@@ -1803,49 +1791,13 @@ mod tests {
                     None => format!("{name} -> <not on PATH>"),
                 })
                 .collect();
-            // Where in the base installation does this exact file ship from?
-            // Windows `venv` installs a launcher rather than copying the
-            // interpreter, so the answer decides what the trust rule can
-            // legitimately compare against.
-            let want = std::fs::read(&interpreter).ok();
-            let home = cfg
-                .lines()
-                .find_map(|line| line.strip_prefix("home = "))
-                .map(|value| std::path::PathBuf::from(value.trim()));
-            let mut origins = Vec::new();
-            if let Some(home) = home.as_ref() {
-                for dir in [home.clone(), home.join("Lib/venv/scripts/nt")] {
-                    let Ok(entries) = std::fs::read_dir(&dir) else {
-                        origins.push(format!("{} <unreadable>", dir.display()));
-                        continue;
-                    };
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let Ok(meta) = entry.metadata() else { continue };
-                        if !meta.is_file() {
-                            continue;
-                        }
-                        let same = want
-                            .as_ref()
-                            .is_some_and(|w| std::fs::read(&path).is_ok_and(|got| got == *w));
-                        origins.push(format!(
-                            "{} ({} bytes){}",
-                            path.display(),
-                            meta.len(),
-                            if same { " == INTERPRETER" } else { "" }
-                        ));
-                    }
-                }
-            }
             panic!(
                 "a virtualenv built by python -m venv must be accepted: {detail}\n\
                  interpreter: {} ({size:?} bytes)\n\
                  pyvenv.cfg:\n{cfg}\n\
-                 hosts: {}\n\
-                 base-install files:\n  {}",
+                 hosts: {}",
                 interpreter.display(),
-                hosts.join(" | "),
-                origins.join("\n  ")
+                hosts.join(" | ")
             );
         }
         let argv = vec![
