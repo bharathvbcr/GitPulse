@@ -680,10 +680,19 @@ mod tests {
         let steps = plan_ci_steps(root);
         assert_eq!(steps.len(), 6);
         assert_eq!(steps[3].name, "Rust format check");
-        // The manifest path is threaded through every cargo step.
+        // The manifest path is threaded through every cargo step. Compared in
+        // one spelling: the planner builds it with the platform separator, so
+        // a `/`-pinned suffix match holds on Unix and fails on Windows.
+        fn manifest_arg(args: &[String]) -> Option<String> {
+            args.windows(2)
+                .find(|w| w[0] == "--manifest-path")
+                .map(|w| w[1].replace('\\', "/"))
+        }
+        let manifest = manifest_arg(&steps[5].args);
         assert!(
-            steps[5].args.windows(2).any(|w| w[0] == "--manifest-path"
-                && w[1].replace('\\', "/").ends_with("src-tauri/Cargo.toml")),
+            manifest
+                .as_deref()
+                .is_some_and(|m| m.ends_with("src-tauri/Cargo.toml")),
             "cargo test step must carry --manifest-path, got {:?}",
             steps[5].args
         );
@@ -691,9 +700,14 @@ mod tests {
         // A root-level Cargo.toml wins over src-tauri's.
         std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
         let steps = plan_ci_steps(root);
-        assert!(steps[4].args.windows(2).any(|w| w[0] == "--manifest-path"
-            && w[1].ends_with("/Cargo.toml")
-            && !w[1].contains("src-tauri")));
+        let manifest = manifest_arg(&steps[4].args);
+        assert!(
+            manifest
+                .as_deref()
+                .is_some_and(|m| m.ends_with("/Cargo.toml") && !m.contains("src-tauri")),
+            "the root manifest must win over src-tauri's, got {:?}",
+            steps[4].args
+        );
     }
 
     #[test]
