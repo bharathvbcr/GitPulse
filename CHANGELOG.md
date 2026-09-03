@@ -11,41 +11,8 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Changed
 
-- Pulse export card rewritten so it can be read away from the app: each tile
-  states what its number means instead of carrying a bare label, tiles are
-  grouped by where the number comes from (commit log vs. blame and working
-  tree), and each caveat sits on the tile it applies to — `CAPPED` commit scan,
-  `PARTIAL` language or blame scan. The card also carries an accessible
-  `<title>`/`<desc>`, emits pure ASCII, namespaces its stylesheet so inlining it
-  cannot restyle the host page, and no longer depends on CSS features
-  (`text-transform`, geometry `rx`) that standalone SVG renderers ignore.
-
-### Fixed
-
-- The export card no longer renders an unmeasured metric as `0`. A failed
-  language scan, and a blame scan that has not completed, now reach the card as
-  null and render as an em dash with the reason, matching what the Pulse view
-  already said on screen.
-- The card's commit count and its active-day count now come from one
-  population. With an author filter applied it previously paired the whole
-  scan's commit total with that one author's active days.
-- Windows CI: three `scripts/*.test.ts` suites failed there only. Two used a
-  `file:` URL's `pathname` as a filesystem path, which is "/D:/a/repo/..." on
-  Windows — one threw ENOENT on a doubled drive letter, the other silently
-  scanned nothing and asserted against an empty list. The third compared a
-  `path.relative` result against a slash-separated expectation. Repo-relative
-  paths in the IPC contract report are now slash-form on every platform, and
-  `portable-paths.contract` fails the build if the `pathname` shape returns.
-- macOS CI: the grandchild-holding-pipes regression test budgeted 8s for a
-  span that is two `DRAIN_JOIN_GRACE` windows plus `spawn_gate()` queueing,
-  which parks with no timeout and is unbounded under the parallel harness. It
-  took 8.9s on the runner. The budget is now expressed in terms of the grace
-  constant plus a scheduling allowance, still far below the 30s that would
-  mean the hang it guards against had returned.
-
-## [0.0.3] - 2026-09-02
+## [0.0.3] - 2026-09-03
 
 ### Added
 
@@ -107,6 +74,15 @@ before that tag is pushed.
 - IDE-style file viewer, promoted to the primary work tab.
 
 ### Changed
+
+- Pulse export card rewritten so it can be read away from the app: each tile
+  states what its number means instead of carrying a bare label, tiles are
+  grouped by where the number comes from (commit log vs. blame and working
+  tree), and each caveat sits on the tile it applies to — `CAPPED` commit scan,
+  `PARTIAL` language or blame scan. The card also carries an accessible
+  `<title>`/`<desc>`, emits pure ASCII, namespaces its stylesheet so inlining it
+  cannot restyle the host page, and no longer depends on CSS features
+  (`text-transform`, geometry `rx`) that standalone SVG renderers ignore.
 
 - Commit graph: the default branch is one straight rail. The lane solver now
   reserves the default branch's first-parent chain (`main`, or the repository's
@@ -193,6 +169,27 @@ before that tag is pushed.
   instead of matching filename patterns, and preflight runs every contract gate.
 
 ### Fixed
+
+- The export card no longer renders an unmeasured metric as `0`. A failed
+  language scan, and a blame scan that has not completed, now reach the card as
+  null and render as an em dash with the reason, matching what the Pulse view
+  already said on screen.
+- The card's commit count and its active-day count now come from one
+  population. With an author filter applied it previously paired the whole
+  scan's commit total with that one author's active days.
+- Windows CI: three `scripts/*.test.ts` suites failed there only. Two used a
+  `file:` URL's `pathname` as a filesystem path, which is "/D:/a/repo/..." on
+  Windows — one threw ENOENT on a doubled drive letter, the other silently
+  scanned nothing and asserted against an empty list. The third compared a
+  `path.relative` result against a slash-separated expectation. Repo-relative
+  paths in the IPC contract report are now slash-form on every platform, and
+  `portable-paths.contract` fails the build if the `pathname` shape returns.
+- macOS CI: the grandchild-holding-pipes regression test budgeted 8s for a
+  span that is two `DRAIN_JOIN_GRACE` windows plus `spawn_gate()` queueing,
+  which parks with no timeout and is unbounded under the parallel harness. It
+  took 8.9s on the runner. The budget is now expressed in terms of the grace
+  constant plus a scheduling allowance, still far below the 30s that would
+  mean the hang it guards against had returned.
 
 - Resource exhaustion under multi-repository fan-out. Nothing bounded how many
   child processes the git engine kept alive at once, and a GUI launch inherits a
@@ -292,6 +289,14 @@ before that tag is pushed.
   deserialize as before.
 
 ### Internal
+
+- Dependabot groups merged: GitHub Actions (`actions/checkout` v4 → v7,
+  `actions/setup-node` v4 → v7, `actions/upload-artifact` v4 → v7,
+  `tauri-apps/tauri-action` v0 → v1) and Cargo (`rfd` 0.15 → 0.17, `base64`
+  0.22 → 0.23). The npm group is held: it raises `typescript` to 7, which no
+  released `svelte-check` accepts, and `tailwindcss` to 4, whose PostCSS
+  plugin moved to a separate package and whose theme model the 65 components
+  using `surface`/`textPrimary`/`accent` would have to migrate to.
 
 - Integration coverage for the `terminal`, `github`, `updates`, and `desktop` modules,
   which had inline tests but nothing exercising them through their public surface
