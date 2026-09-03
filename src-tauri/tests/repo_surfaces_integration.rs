@@ -22,6 +22,10 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
         .output()
         .expect("git");
     assert!(
@@ -37,6 +41,10 @@ fn try_git(cwd: &Path, args: &[&str]) {
         .current_dir(cwd)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
         .output()
         .expect("git");
 }
