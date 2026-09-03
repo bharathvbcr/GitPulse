@@ -1803,13 +1803,49 @@ mod tests {
                     None => format!("{name} -> <not on PATH>"),
                 })
                 .collect();
+            // Where in the base installation does this exact file ship from?
+            // Windows `venv` installs a launcher rather than copying the
+            // interpreter, so the answer decides what the trust rule can
+            // legitimately compare against.
+            let want = std::fs::read(&interpreter).ok();
+            let home = cfg
+                .lines()
+                .find_map(|line| line.strip_prefix("home = "))
+                .map(|value| std::path::PathBuf::from(value.trim()));
+            let mut origins = Vec::new();
+            if let Some(home) = home.as_ref() {
+                for dir in [home.clone(), home.join("Lib/venv/scripts/nt")] {
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        origins.push(format!("{} <unreadable>", dir.display()));
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let Ok(meta) = entry.metadata() else { continue };
+                        if !meta.is_file() {
+                            continue;
+                        }
+                        let same = want
+                            .as_ref()
+                            .is_some_and(|w| std::fs::read(&path).is_ok_and(|got| got == *w));
+                        origins.push(format!(
+                            "{} ({} bytes){}",
+                            path.display(),
+                            meta.len(),
+                            if same { " == INTERPRETER" } else { "" }
+                        ));
+                    }
+                }
+            }
             panic!(
                 "a virtualenv built by python -m venv must be accepted: {detail}\n\
                  interpreter: {} ({size:?} bytes)\n\
                  pyvenv.cfg:\n{cfg}\n\
-                 hosts: {}",
+                 hosts: {}\n\
+                 base-install files:\n  {}",
                 interpreter.display(),
-                hosts.join(" | ")
+                hosts.join(" | "),
+                origins.join("\n  ")
             );
         }
         let argv = vec![
