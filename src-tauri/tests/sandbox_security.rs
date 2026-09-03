@@ -1,12 +1,16 @@
 //! Integration tests for sandbox hardening: symlink escapes through
 //! `sandbox_write` and working-tree reads, plus the bounded `gh` CLI probe.
 
-use gitpulse_lib::engine::git_cli::{git_text, sandbox_write};
+use gitpulse_lib::engine::git_cli::git_text;
+#[cfg(unix)]
+use gitpulse_lib::engine::git_cli::sandbox_write;
+#[cfg(unix)]
 use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::engine::git_writer::{
     validate_clone_url, validate_oid_or_revision, validate_ref_name, GitWriter,
 };
 use std::path::Path;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// Creates a plain (no commits needed) git repo so `validate_repo` accepts it.

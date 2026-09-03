@@ -213,7 +213,7 @@ jobs:
           # nothing, so it needs neither signed update artifacts nor a manifest.
           # Flipping this to true requires adding tauri-plugin-updater AND a
           # signing keypair (TAURI_SIGNING_PRIVATE_KEY) first.
-          uploadUpdaterJson: false
+          includeUpdaterJson: false
           # A 20-to-90-minute build should not be thrown away by one flaky
           # asset upload.
           retryAttempts: 3
