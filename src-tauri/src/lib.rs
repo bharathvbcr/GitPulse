@@ -12,8 +12,11 @@ pub mod grants;
 pub mod graph;
 pub mod harness;
 pub mod ingest;
+pub mod insights;
 pub mod ledger;
+pub mod limits;
 pub mod logging;
+pub mod mcp;
 pub mod ops;
 pub mod stack;
 pub mod storage;
@@ -42,6 +45,16 @@ pub fn run() {
     logging::init();
     #[cfg(not(test))]
     logging::install_panic_hook();
+    // Before anything opens a descriptor. A GUI launch inherits launchd's soft
+    // limit of 256, which this app exhausts on a busy workspace -- and past it
+    // every git spawn fails with EMFILE until restart. Reported either way, so
+    // a limit we could not raise is visible in the log rather than assumed.
+    let limits = limits::raise_open_file_limit();
+    if limits.is_sufficient() {
+        log::info!(target: "setup", "{}", limits.describe());
+    } else {
+        log::warn!(target: "setup", "{}", limits.describe());
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(crate::watcher::WatcherState::default())
@@ -104,6 +117,11 @@ pub fn run() {
             cmd_list_tags,
             cmd_get_reflog,
             cmd_get_language_stats,
+            cmd_get_pulse_report,
+            cmd_get_knowledge_report,
+            cmd_get_dora_report,
+            cmd_record_pulse_snapshot,
+            cmd_get_pulse_snapshots,
             cmd_scan_coverage,
             cmd_get_file_coverage,
             cmd_scan_deps_health,
@@ -187,6 +205,9 @@ pub fn run() {
             cmd_codeintel_search,
             cmd_codeintel_impact,
             cmd_codeintel_dead_symbols,
+            cmd_insights_snapshot,
+            cmd_collision_risk,
+            cmd_mcp_info,
             cmd_check_app_update,
         ])
         .build(context())

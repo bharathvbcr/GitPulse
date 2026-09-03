@@ -1,5 +1,8 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
-use crate::engine::git_cli::{self, git, git_text, sandbox_join_canonical, validate_repo};
+use crate::engine::budget;
+use crate::engine::git_cli::{
+    self, git, git_text, git_text_capped, sandbox_join_canonical, validate_repo,
+};
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
 use rayon::prelude::*;
@@ -7,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
 
@@ -30,7 +33,7 @@ const CHURN_CACHE_CAPACITY: usize = 8192;
 /// ~1.33x before they cross the IPC boundary), so an unbounded read lets a
 /// multi-GB working-tree file OOM the app. Git-object reads go through
 /// `git`'s output cap; this guards the direct `fs::read` path.
-const MAX_WORKING_TREE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_WORKING_TREE_BYTES: u64 = budget::MAX_FILE_BYTES;
 
 /// Hard ceiling on [`GitReader::list_repo_files`]'s payload.
 ///
@@ -161,6 +164,18 @@ pub struct BlameLine {
     pub content: String,
 }
 
+/// Diff text plus whether it was cut at [`budget::MAX_DIFF_BYTES`].
+///
+/// A bare `String` could not say that what it carries is a prefix, so a
+/// 43 MB commit rendered as though the last hunk on screen were the last hunk
+/// in the commit. Every diff-returning command ships this instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPayload {
+    pub text: String,
+    /// True when the diff exceeded the budget and was cut at a line boundary.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitFileChange {
     pub path: String,
@@ -232,6 +247,120 @@ pub struct LanguageStatsReport {
     pub scanned_files: usize,
     /// Candidate files selected before scanning began.
     pub candidate_files: usize,
+}
+
+pub const DEFAULT_PULSE_COMMITS: usize = 5_000;
+pub const MAX_PULSE_COMMITS: usize = 25_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseCommitSummary {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub timestamp: i64,
+    pub summary: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub gpg_status: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub files_changed: usize,
+    pub is_merge: bool,
+    pub is_revert: bool,
+    /// `Co-authored-by:` trailers from the commit body. The subject (`%s`)
+    /// never contains them, so a count derived from `summary` is structurally
+    /// zero.
+    pub co_authors: Vec<String>,
+    /// Paths whose numstat line was `-\t-` (binary). They contribute no
+    /// line churn; omitting the count made a binary-only commit look empty.
+    pub binary_files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseFileChurn {
+    pub path: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub commits_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseExtensionChurn {
+    pub extension: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub files_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseReport {
+    pub commits: Vec<PulseCommitSummary>,
+    pub top_files_by_churn: Vec<PulseFileChurn>,
+    pub extensions: Vec<PulseExtensionChurn>,
+    pub has_mailmap: bool,
+    pub total_commits_scanned: usize,
+    /// True when the commit cap dropped older history, or the byte budget
+    /// cut the log stream. Either way the tiles are a prefix, not the repo.
+    pub truncated: bool,
+    /// True when stdout hit [`budget::MAX_PULSE_BYTES`]. Distinct from the
+    /// commit cap so the UI can hide "Scan Deeper" — raising `-n` makes a
+    /// byte-capped walk *more* likely to fail closed.
+    pub payload_truncated: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorOwnership {
+    pub author_name: String,
+    pub author_email: String,
+    pub lines_owned: usize,
+    pub percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanedFile {
+    pub path: String,
+    pub primary_author: String,
+    pub author_email: String,
+    pub lines_count: usize,
+    pub last_commit_timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodeAgeDistribution {
+    pub fresh_lines: usize,
+    pub recent_lines: usize,
+    pub maturing_lines: usize,
+    pub legacy_lines: usize,
+    pub ancient_lines: usize,
+    pub total_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeReport {
+    pub scanned_files: usize,
+    pub candidate_files: usize,
+    pub scanned_lines: usize,
+    pub bus_factor: usize,
+    pub primary_authors: Vec<AuthorOwnership>,
+    pub orphaned_files: Vec<OrphanedFile>,
+    pub age_distribution: CodeAgeDistribution,
+    pub half_life_days: u32,
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoraReport {
+    pub deploy_frequency_per_week: f64,
+    pub deploy_rating: String,
+    pub total_releases: usize,
+    pub median_lead_time_hours: f64,
+    pub lead_time_rating: String,
+    pub change_failure_rate_pct: f64,
+    pub is_cfr_approximation: bool,
+    pub mttr_hours: f64,
+    pub is_mttr_approximation: bool,
+    pub window_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,7 +919,21 @@ impl GitReader {
         // "weird?.txt" with no such literal file fails outright), and it
         // rejects pathspec magic entirely ("fatal: no such path
         // ':(literal)...' in HEAD"), so prefixing would break every call.
-        let stdout = git_text(&repo, &["blame", "--line-porcelain", "--", file_path])?;
+        // `--line-porcelain` emits ~10 metadata lines per source line, so a
+        // large file's blame is an order of magnitude bigger than the file
+        // itself. Capped at a line boundary: a partial porcelain record would
+        // parse into a `BlameLine` with fabricated fields, which is worse than
+        // a short list.
+        let (stdout, truncated) = git_text_capped(
+            &repo,
+            &["blame", "--line-porcelain", "--", file_path],
+            budget::MAX_BLAME_BYTES,
+        )?;
+        let stdout = if truncated {
+            budget::drop_partial_last_line(stdout)
+        } else {
+            stdout
+        };
         Ok(parse_blame_porcelain(&stdout))
     }
 
@@ -829,12 +972,22 @@ impl GitReader {
         Ok(files)
     }
 
+    /// Diff text plus whether it was cut at [`budget::MAX_DIFF_BYTES`].
+    ///
+    /// The flag is not decoration: the viewer disables hunk staging on a
+    /// truncated diff, because staging from a prefix would silently stage less
+    /// than the rows on screen imply.
+    pub fn diff_payload(text: String) -> DiffPayload {
+        let (text, truncated) = budget::truncate_at_line_boundary(text, budget::MAX_DIFF_BYTES);
+        DiffPayload { text, truncated }
+    }
+
     pub fn get_file_diff(
         repo_path: &str,
         file_path: &str,
         is_staged: bool,
         ignore_whitespace: bool,
-    ) -> Result<String, String> {
+    ) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         // Canonical join resolves existing prefixes through symlinks and keeps
         // not-yet-tracked leaves lexical (see get_file_blame).
@@ -844,7 +997,7 @@ impl GitReader {
             // blank diff pane for brand-new files. Synthesize git-shaped
             // new-file output from the worktree bytes instead.
             if let Some(synthesized) = untracked_new_file_diff(&repo, file_path)? {
-                return Ok(synthesized);
+                return Ok(Self::diff_payload(synthesized));
             }
         }
         // :(literal) stops `*?[` in a filename from widening the pathspec.
@@ -858,16 +1011,31 @@ impl GitReader {
         }
         args.push("--");
         args.push(spec.as_str());
-        git_text(&repo, &args)
+        Self::capped_diff(&repo, &args)
     }
 
-    pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<String, String> {
+    /// Every diff read funnels here so no reader can forget the budget.
+    fn capped_diff(repo: &Path, args: &[&str]) -> Result<DiffPayload, String> {
+        let (text, cut_by_engine) = git_text_capped(repo, args, budget::MAX_DIFF_BYTES)?;
+        if cut_by_engine {
+            // The drain stopped at a byte offset, so the last row is a
+            // fragment (and, past a multi-byte character, a replacement char).
+            // Drop it rather than render half a hunk line as a whole one.
+            return Ok(DiffPayload {
+                text: budget::drop_partial_last_line(text),
+                truncated: true,
+            });
+        }
+        Ok(Self::diff_payload(text))
+    }
+
+    pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         // --diff-merges=first-parent renders merge commits as ordinary hunks
         // against the first parent instead of the combined --cc format whose
         // @@@ headers the frontend cannot number (git >= 2.31).
-        git_text(
+        Self::capped_diff(
             &repo,
             &[
                 "-c",
@@ -885,12 +1053,12 @@ impl GitReader {
         repo_path: &str,
         commit_id: &str,
         file_path: &str,
-    ) -> Result<String, String> {
+    ) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         sandbox_join_canonical(&repo, file_path)?;
         let spec = literal_pathspec(file_path);
-        git_text(
+        Self::capped_diff(
             &repo,
             &[
                 "-c",
@@ -905,12 +1073,12 @@ impl GitReader {
         )
     }
 
-    pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<String, String> {
+    pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_ref_name(from)?;
         validate_ref_name(to)?;
         let spec = format!("{}...{}", from, to);
-        git_text(
+        Self::capped_diff(
             &repo,
             &["-c", "core.quotepath=off", "diff", "--unified=3", &spec],
         )
@@ -926,6 +1094,15 @@ impl GitReader {
             &repo,
             &["show", "--pretty=format:", "--numstat", "-z", commit_id],
         )?;
+        // Deliberately NOT capped here. `get_commit_details` calls this and
+        // derives three things from the full list: the churn totals, the true
+        // file count, and `files_list_truncated`. Capping at this level made
+        // all three read off an already-cut slice — the totals silently
+        // understated a huge commit's churn, and the flag's own test
+        // (`files_total > MAX_COMMIT_FILES`) became `5000 > 5000`, so the
+        // "+only first N listed" notice could never fire again. The cap
+        // belongs where the truncation can be reported, which is
+        // `get_commit_details`.
         Ok(parse_numstat_files(&stdout))
     }
 
@@ -1244,6 +1421,676 @@ impl GitReader {
             candidate_files,
         })
     }
+
+    pub fn pulse_report(
+        repo_path: &str,
+        max_commits: Option<usize>,
+    ) -> Result<PulseReport, String> {
+        let started = Instant::now();
+        let repo = validate_repo(repo_path)?;
+        let has_mailmap = repo.join(".mailmap").is_file();
+
+        let cap = max_commits
+            .unwrap_or(DEFAULT_PULSE_COMMITS)
+            .clamp(1, MAX_PULSE_COMMITS);
+        let probe_limit = cap.saturating_add(1);
+        let count_arg = format!("-n{}", probe_limit);
+
+        let args = [
+            "log",
+            count_arg.as_str(),
+            "--topo-order",
+            "--use-mailmap",
+            "--numstat",
+            // `%b` is required: Co-authored-by trailers live in the body, never
+            // in `%s`. A metric that can only ever be zero is not a metric.
+            "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%G?%x00%s%x00%aN%x00%aE%x00%b%x00",
+            "--all",
+        ];
+
+        let (stdout, payload_truncated) =
+            match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
+                Ok(out) => out,
+                Err(e) => {
+                    let msg = e.to_lowercase();
+                    if msg.contains("does not have any commits")
+                        || msg.contains("bad default revision 'head'")
+                        || msg.contains("fatal: your current branch")
+                        || msg.contains("fatal: needed a single revision")
+                    {
+                        return Ok(PulseReport {
+                            commits: Vec::new(),
+                            top_files_by_churn: Vec::new(),
+                            extensions: Vec::new(),
+                            has_mailmap,
+                            total_commits_scanned: 0,
+                            truncated: false,
+                            payload_truncated: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        });
+                    }
+                    return Err(e);
+                }
+            };
+
+        let (mut commits, top_files, extensions) = parse_pulse_stream(&stdout);
+
+        // A byte-capped stream ends mid-commit. Drop the last record so a
+        // half-parsed numstat block cannot pose as a complete commit.
+        if payload_truncated && !commits.is_empty() {
+            commits.pop();
+        }
+
+        let commit_capped = commits.len() > cap;
+        if commit_capped {
+            commits.truncate(cap);
+        }
+        let truncated = commit_capped || payload_truncated;
+        let total_commits_scanned = commits.len();
+
+        Ok(PulseReport {
+            commits,
+            top_files_by_churn: top_files,
+            extensions,
+            has_mailmap,
+            total_commits_scanned,
+            truncated,
+            payload_truncated,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    pub fn knowledge_report(
+        repo_path: &str,
+        max_files: Option<usize>,
+    ) -> Result<KnowledgeReport, String> {
+        let started = Instant::now();
+        let repo = validate_repo(repo_path)?;
+        let has_mailmap = repo.join(".mailmap").is_file();
+
+        let cap = max_files.unwrap_or(128).clamp(1, 512);
+
+        let stdout = match git_text(&repo, &["ls-files", "-z", "--cached"]) {
+            Ok(out) => out,
+            Err(e) => {
+                let msg = e.to_lowercase();
+                if msg.contains("does not have any commits")
+                    || msg.contains("bad default revision 'head'")
+                    || msg.contains("fatal: your current branch")
+                    || msg.contains("fatal: needed a single revision")
+                {
+                    return Ok(KnowledgeReport {
+                        scanned_files: 0,
+                        candidate_files: 0,
+                        scanned_lines: 0,
+                        bus_factor: 0,
+                        primary_authors: Vec::new(),
+                        orphaned_files: Vec::new(),
+                        age_distribution: CodeAgeDistribution::default(),
+                        half_life_days: 0,
+                        truncated: false,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+                return Err(e);
+            }
+        };
+
+        let mut all_candidates: Vec<String> = stdout
+            .split('\0')
+            .filter_map(|p| {
+                let p = p.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                let ext = p.rsplit('.').next().unwrap_or("");
+                if matches!(
+                    ext,
+                    "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "gif"
+                        | "svg"
+                        | "ico"
+                        | "lock"
+                        | "map"
+                        | "woff"
+                        | "woff2"
+                        | "ttf"
+                        | "eot"
+                        | "mp4"
+                        | "zip"
+                        | "tar"
+                        | "gz"
+                ) {
+                    None
+                } else {
+                    Some(p.to_string())
+                }
+            })
+            .collect();
+
+        let candidate_files = all_candidates.len();
+        let truncated = candidate_files > cap;
+        all_candidates.truncate(cap);
+        let selected_files = all_candidates;
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let deadline = started + Duration::from_secs(10);
+        let mut author_lines: HashMap<(String, String), usize> = HashMap::new();
+        let mut author_last_seen: HashMap<String, i64> = HashMap::new();
+        let mut line_ages_days: Vec<u32> = Vec::new();
+        let mut age_dist = CodeAgeDistribution::default();
+        let mut orphaned_files: Vec<OrphanedFile> = Vec::new();
+        let mut scanned_files = 0;
+        let mut scanned_lines = 0;
+
+        for file_path in selected_files {
+            if Instant::now() > deadline {
+                break;
+            }
+
+            let mut args = vec!["blame", "--line-porcelain", "-w"];
+            if has_mailmap {
+                args.push("--use-mailmap");
+            }
+            args.push("--");
+            args.push(&file_path);
+
+            let stdout = match git_text_capped(&repo, &args, budget::MAX_BLAME_BYTES) {
+                Ok((out, _)) => out,
+                Err(_) => continue,
+            };
+
+            let lines = parse_blame_porcelain(&stdout);
+            if lines.is_empty() {
+                continue;
+            }
+
+            scanned_files += 1;
+            scanned_lines += lines.len();
+
+            let mut file_author_lines: HashMap<(String, String), usize> = HashMap::new();
+            let mut file_latest_ts = 0i64;
+
+            for line in lines {
+                let author_key = (line.author_name.clone(), line.author_email.clone());
+                *author_lines.entry(author_key.clone()).or_insert(0) += 1;
+                *file_author_lines.entry(author_key).or_insert(0) += 1;
+
+                let last = author_last_seen
+                    .entry(line.author_email.clone())
+                    .or_insert(0);
+                if line.timestamp > *last {
+                    *last = line.timestamp;
+                }
+                if line.timestamp > file_latest_ts {
+                    file_latest_ts = line.timestamp;
+                }
+
+                let age_days = ((now_secs.saturating_sub(line.timestamp)).max(0) / 86400) as u32;
+                line_ages_days.push(age_days);
+
+                age_dist.total_lines += 1;
+                if age_days < 30 {
+                    age_dist.fresh_lines += 1;
+                } else if age_days < 90 {
+                    age_dist.recent_lines += 1;
+                } else if age_days < 365 {
+                    age_dist.maturing_lines += 1;
+                } else if age_days < 730 {
+                    age_dist.legacy_lines += 1;
+                } else {
+                    age_dist.ancient_lines += 1;
+                }
+            }
+
+            if let Some(((p_name, p_email), count)) =
+                file_author_lines.into_iter().max_by_key(|(_, c)| *c)
+            {
+                let days_since_commit = (now_secs.saturating_sub(file_latest_ts)) / 86400;
+                if days_since_commit >= 180 {
+                    orphaned_files.push(OrphanedFile {
+                        path: file_path,
+                        primary_author: p_name,
+                        author_email: p_email,
+                        lines_count: count,
+                        last_commit_timestamp: file_latest_ts,
+                    });
+                }
+            }
+        }
+
+        let mut primary_authors: Vec<AuthorOwnership> = author_lines
+            .into_iter()
+            .map(|((author_name, author_email), lines_owned)| {
+                let percentage = if scanned_lines > 0 {
+                    ((lines_owned as f64 / scanned_lines as f64) * 1000.0).round() / 10.0
+                } else {
+                    0.0
+                };
+                AuthorOwnership {
+                    author_name,
+                    author_email,
+                    lines_owned,
+                    percentage,
+                }
+            })
+            .collect();
+
+        primary_authors.sort_by_key(|a| std::cmp::Reverse(a.lines_owned));
+
+        let mut bus_factor = 0;
+        let mut cumulative = 0;
+        let threshold = scanned_lines.div_ceil(2);
+        for author in &primary_authors {
+            bus_factor += 1;
+            cumulative += author.lines_owned;
+            if cumulative >= threshold {
+                break;
+            }
+        }
+        if primary_authors.is_empty() {
+            bus_factor = 0;
+        }
+
+        line_ages_days.sort_unstable();
+        let half_life_days = if !line_ages_days.is_empty() {
+            line_ages_days[line_ages_days.len() / 2]
+        } else {
+            0
+        };
+
+        orphaned_files.sort_by_key(|a| std::cmp::Reverse(a.lines_count));
+        orphaned_files.truncate(50);
+
+        Ok(KnowledgeReport {
+            scanned_files,
+            candidate_files,
+            scanned_lines,
+            bus_factor,
+            primary_authors,
+            orphaned_files,
+            age_distribution: age_dist,
+            half_life_days,
+            truncated: truncated || scanned_files < candidate_files,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
+        let repo = validate_repo(repo_path)?;
+        let window = window_days.unwrap_or(90).clamp(7, 365);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let since_secs = now_secs.saturating_sub((window as i64) * 86400);
+
+        let stdout = match git_text(
+            &repo,
+            &[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname:short)%00%(objectname)%00%(creatordate:unix)",
+                "refs/tags",
+            ],
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let msg = e.to_lowercase();
+                if msg.contains("does not have any commits")
+                    || msg.contains("bad default revision 'head'")
+                    || msg.contains("fatal: your current branch")
+                    || msg.contains("fatal: needed a single revision")
+                {
+                    return Ok(DoraReport {
+                        deploy_frequency_per_week: 0.0,
+                        deploy_rating: "Low".to_string(),
+                        total_releases: 0,
+                        median_lead_time_hours: 0.0,
+                        lead_time_rating: "None".to_string(),
+                        change_failure_rate_pct: 0.0,
+                        is_cfr_approximation: true,
+                        mttr_hours: 0.0,
+                        is_mttr_approximation: true,
+                        window_days: window,
+                    });
+                }
+                return Err(e);
+            }
+        };
+
+        let mut releases_in_window = 0usize;
+        let mut release_tags: Vec<(String, String, i64)> = Vec::new();
+
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split('\0').collect();
+            if parts.len() >= 3 {
+                let tag_name = parts[0].to_string();
+                let commit_id = parts[1].to_string();
+                let tag_time: i64 = parts[2].parse().unwrap_or(0);
+                if tag_time >= since_secs {
+                    releases_in_window += 1;
+                }
+                release_tags.push((tag_name, commit_id, tag_time));
+            }
+        }
+
+        let weeks = (window as f64) / 7.0;
+        let deploy_freq = if weeks > 0.0 {
+            ((releases_in_window as f64 / weeks) * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+
+        let deploy_rating = if deploy_freq >= 7.0 {
+            "Elite".to_string()
+        } else if deploy_freq >= 1.0 {
+            "High".to_string()
+        } else if deploy_freq >= 0.25 {
+            "Medium".to_string()
+        } else {
+            "Low".to_string()
+        };
+
+        let mut lead_times_hours: Vec<f64> = Vec::new();
+        if !release_tags.is_empty() {
+            let commit_stdout =
+                git_text(&repo, &["log", "-n", "30", "--format=%H%x00%ct"]).unwrap_or_default();
+
+            for line in commit_stdout.lines() {
+                let parts: Vec<&str> = line.split('\0').collect();
+                if parts.len() >= 2 {
+                    let commit_sha = parts[0];
+                    let commit_ts: i64 = parts[1].parse().unwrap_or(0);
+
+                    if let Ok(desc) =
+                        git_text(&repo, &["describe", "--tags", "--contains", commit_sha])
+                    {
+                        let tag_ref = desc
+                            .trim()
+                            .split('~')
+                            .next()
+                            .unwrap_or("")
+                            .split('^')
+                            .next()
+                            .unwrap_or("");
+                        if let Some((_, _, tag_ts)) =
+                            release_tags.iter().find(|(t, _, _)| t == tag_ref)
+                        {
+                            if *tag_ts >= commit_ts {
+                                let diff_hours = ((*tag_ts - commit_ts) as f64) / 3600.0;
+                                lead_times_hours.push(diff_hours);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        lead_times_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_lead_time_hours = if !lead_times_hours.is_empty() {
+            (lead_times_hours[lead_times_hours.len() / 2] * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+
+        let lead_time_rating = if lead_times_hours.is_empty() {
+            "None".to_string()
+        } else if median_lead_time_hours < 24.0 {
+            "Elite".to_string()
+        } else if median_lead_time_hours < 168.0 {
+            "High".to_string()
+        } else if median_lead_time_hours < 720.0 {
+            "Medium".to_string()
+        } else {
+            "Low".to_string()
+        };
+
+        let since_arg = format!("--since={window}.days");
+        let log_stdout = git_text(
+            &repo,
+            &["log", "-n", "200", &since_arg, "--format=%s%x00%ct"],
+        )
+        .unwrap_or_default();
+
+        let mut total_commits = 0usize;
+        let mut revert_or_fix_commits = 0usize;
+        let mut restore_times_hours: Vec<f64> = Vec::new();
+        let mut prev_time: Option<i64> = None;
+
+        for line in log_stdout.lines() {
+            let parts: Vec<&str> = line.split('\0').collect();
+            if parts.len() >= 2 {
+                total_commits += 1;
+                let subject = parts[0].to_lowercase();
+                let commit_ts: i64 = parts[1].parse().unwrap_or(0);
+
+                let is_failure_remedy = subject.starts_with("revert")
+                    || subject.contains("hotfix")
+                    || subject.starts_with("fix:")
+                    || subject.starts_with("fix(");
+
+                if is_failure_remedy {
+                    revert_or_fix_commits += 1;
+                    if let Some(prev) = prev_time {
+                        let diff_h = ((prev - commit_ts).abs() as f64) / 3600.0;
+                        if diff_h > 0.0 && diff_h < 720.0 {
+                            restore_times_hours.push(diff_h);
+                        }
+                    }
+                }
+                prev_time = Some(commit_ts);
+            }
+        }
+
+        let cfr_pct = if total_commits > 0 {
+            (((revert_or_fix_commits as f64) / (total_commits as f64)) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+
+        restore_times_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mttr_hours = if !restore_times_hours.is_empty() {
+            (restore_times_hours[restore_times_hours.len() / 2] * 10.0).round() / 10.0
+        } else {
+            // A check that could not run must never report a made-up restore
+            // time. Zero plus `is_mttr_approximation` is "could not estimate".
+            0.0
+        };
+
+        Ok(DoraReport {
+            deploy_frequency_per_week: deploy_freq,
+            deploy_rating,
+            total_releases: releases_in_window,
+            median_lead_time_hours,
+            lead_time_rating,
+            change_failure_rate_pct: cfr_pct,
+            is_cfr_approximation: true,
+            mttr_hours,
+            is_mttr_approximation: true,
+            window_days: window,
+        })
+    }
+}
+
+fn is_revert_subject(summary: &str) -> bool {
+    let lower = summary.trim().to_ascii_lowercase();
+    lower.starts_with("revert ") || lower.starts_with("revert:") || lower.starts_with("revert(")
+}
+
+fn extract_target_path(raw_path: &str) -> String {
+    let trimmed = raw_path.trim();
+    if let Some((_, right)) = trimmed.split_once(" => ") {
+        if let Some((_, suffix)) = right.split_once('}') {
+            let prefix = trimmed.split('{').next().unwrap_or("");
+            return format!(
+                "{}{}{}",
+                prefix,
+                right.split('}').next().unwrap_or(""),
+                suffix
+            );
+        }
+        return right.trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn extract_extension(path: &str) -> String {
+    let clean = path.trim();
+    Path::new(clean)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| {
+            if let Some(name) = Path::new(clean).file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') && !name[1..].contains('.') {
+                    return name[1..].to_lowercase();
+                }
+                return name.to_lowercase();
+            }
+            "other".to_string()
+        })
+}
+
+pub(crate) fn parse_pulse_stream(
+    stdout: &str,
+) -> (
+    Vec<PulseCommitSummary>,
+    Vec<PulseFileChurn>,
+    Vec<PulseExtensionChurn>,
+) {
+    let mut commits = Vec::new();
+    let mut file_churn_map: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    let mut ext_churn_map: HashMap<String, (usize, usize, HashSet<String>)> = HashMap::new();
+
+    for chunk in stdout.split("__GP_PULSE__\0") {
+        let chunk = chunk.trim_matches('\n');
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let mut fields = chunk.splitn(9, '\0');
+        let sha = match fields.next().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let parents_str = fields.next().unwrap_or("");
+        let parents: Vec<String> = parents_str.split_whitespace().map(String::from).collect();
+        let timestamp = fields
+            .next()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let gpg_status = fields.next().unwrap_or("N").trim().to_string();
+        let summary = fields.next().unwrap_or("").trim().to_string();
+        let author_name = fields.next().unwrap_or("").trim().to_string();
+        let author_email = fields.next().unwrap_or("").trim().to_string();
+        let body = fields.next().unwrap_or("");
+        let numstat_body = fields.next().unwrap_or("");
+
+        let mut commit_adds = 0usize;
+        let mut commit_dels = 0usize;
+        let mut commit_files = 0usize;
+        let mut commit_binary = 0usize;
+
+        for line in numstat_body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let add_raw = parts.next().unwrap_or("");
+            let del_raw = parts.next().unwrap_or("");
+            let path_raw = parts.next().unwrap_or("");
+            if path_raw.is_empty() {
+                continue;
+            }
+
+            let is_binary = add_raw == "-" && del_raw == "-";
+            let adds = add_raw.parse::<usize>().unwrap_or(0);
+            let dels = del_raw.parse::<usize>().unwrap_or(0);
+            let target_path = extract_target_path(path_raw);
+            let ext = extract_extension(&target_path);
+
+            commit_adds = commit_adds.saturating_add(adds);
+            commit_dels = commit_dels.saturating_add(dels);
+            commit_files = commit_files.saturating_add(1);
+            if is_binary {
+                commit_binary = commit_binary.saturating_add(1);
+            }
+
+            let entry = file_churn_map
+                .entry(target_path.clone())
+                .or_insert((0, 0, 0));
+            entry.0 = entry.0.saturating_add(adds);
+            entry.1 = entry.1.saturating_add(dels);
+            entry.2 = entry.2.saturating_add(1);
+
+            let ext_entry = ext_churn_map
+                .entry(ext)
+                .or_insert_with(|| (0, 0, HashSet::new()));
+            ext_entry.0 = ext_entry.0.saturating_add(adds);
+            ext_entry.1 = ext_entry.1.saturating_add(dels);
+            ext_entry.2.insert(target_path);
+        }
+
+        let is_merge = parents.len() > 1;
+        let is_revert = is_revert_subject(&summary);
+        let co_authors = parse_co_authors(body);
+
+        commits.push(PulseCommitSummary {
+            sha,
+            parents,
+            timestamp,
+            summary,
+            author_name,
+            author_email,
+            gpg_status,
+            additions: commit_adds,
+            deletions: commit_dels,
+            files_changed: commit_files,
+            is_merge,
+            is_revert,
+            co_authors,
+            binary_files: commit_binary,
+        });
+    }
+
+    let mut top_files: Vec<PulseFileChurn> = file_churn_map
+        .into_iter()
+        .map(|(path, (adds, dels, count))| PulseFileChurn {
+            path,
+            additions: adds,
+            deletions: dels,
+            commits_count: count,
+        })
+        .collect();
+    top_files.sort_by(|a, b| {
+        (b.additions.saturating_add(b.deletions)).cmp(&(a.additions.saturating_add(a.deletions)))
+    });
+    top_files.truncate(100);
+
+    let mut extensions: Vec<PulseExtensionChurn> = ext_churn_map
+        .into_iter()
+        .map(|(extension, (adds, dels, set))| PulseExtensionChurn {
+            extension,
+            additions: adds,
+            deletions: dels,
+            files_count: set.len(),
+        })
+        .collect();
+    extensions.sort_by(|a, b| {
+        (b.additions.saturating_add(b.deletions)).cmp(&(a.additions.saturating_add(a.deletions)))
+    });
+    extensions.truncate(50);
+
+    (commits, top_files, extensions)
 }
 
 /// Resolves the remote whose HEAD marks the repository's default branch.
@@ -2216,14 +3063,22 @@ fn parse_numstat_files(stdout: &str) -> Vec<CommitFileChange> {
 }
 
 fn parse_co_authors(body: &str) -> Vec<String> {
-    body.lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("Co-authored-by:")
-                .map(|rest| rest.trim().to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
+    const PREFIX: &str = "co-authored-by:";
+    let mut authors = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() < PREFIX.len() {
+            continue;
+        }
+        if !trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+        let value = trimmed[PREFIX.len()..].trim();
+        if !value.is_empty() {
+            authors.push(value.to_string());
+        }
+    }
+    authors
 }
 
 fn record_lang(
@@ -2346,11 +3201,15 @@ mod tests {
 
     #[test]
     fn test_parse_co_authors() {
-        let body = "Implements login.\n\nCo-authored-by: Bob <bob@example.com>\n";
+        let body = "Implements login.\n\nCo-authored-by: Bob <bob@example.com>\nco-authored-by: Cara <cara@example.com>\nNot-a-trailer: Dan <d@x>\n";
         assert_eq!(
             parse_co_authors(body),
-            vec!["Bob <bob@example.com>".to_string()]
+            vec![
+                "Bob <bob@example.com>".to_string(),
+                "Cara <cara@example.com>".to_string()
+            ]
         );
+        assert!(parse_co_authors("no trailers here").is_empty());
     }
 
     /// A clean record round-trips every field positionally.
@@ -3203,7 +4062,8 @@ mod tests {
         fs::write(dir.path().join("fresh.txt"), "line one\nline two\n").unwrap();
         let diff =
             GitReader::get_file_diff(dir.path().to_str().unwrap(), "fresh.txt", false, false)
-                .expect("untracked text diff");
+                .expect("untracked text diff")
+                .text;
         assert!(
             diff.starts_with("diff --git a/fresh.txt b/fresh.txt\n"),
             "{diff}"
@@ -3219,13 +4079,15 @@ mod tests {
         fs::write(dir.path().join("partial.txt"), "no trailing").unwrap();
         let diff =
             GitReader::get_file_diff(dir.path().to_str().unwrap(), "partial.txt", false, false)
-                .expect("untracked partial diff");
+                .expect("untracked partial diff")
+                .text;
         assert!(diff.contains("+no trailing\n\\ No newline at end of file"));
 
         // Untracked BINARY collapses to git's notice shape.
         fs::write(dir.path().join("blob.bin"), [0x00, 0x01, 0x02]).unwrap();
         let diff = GitReader::get_file_diff(dir.path().to_str().unwrap(), "blob.bin", false, false)
-            .expect("untracked binary diff");
+            .expect("untracked binary diff")
+            .text;
         assert!(
             diff.contains("Binary files /dev/null and b/blob.bin differ"),
             "{diff}"
@@ -3235,7 +4097,8 @@ mod tests {
         fs::write(dir.path().join("hollow.txt"), "").unwrap();
         let diff =
             GitReader::get_file_diff(dir.path().to_str().unwrap(), "hollow.txt", false, false)
-                .expect("untracked empty diff");
+                .expect("untracked empty diff")
+                .text;
         assert!(diff.contains("@@ -0,0 +0,0 @@"), "{diff}");
         assert!(
             !diff
@@ -3249,13 +4112,15 @@ mod tests {
         fs::write(dir.path().join("tracked.txt"), "new\n").unwrap();
         let diff =
             GitReader::get_file_diff(dir.path().to_str().unwrap(), "tracked.txt", false, false)
-                .expect("tracked diff");
+                .expect("tracked diff")
+                .text;
         assert!(diff.contains("-old\n+new"), "{diff}");
 
         // A nonexistent never-tracked path keeps today's behavior: empty Ok.
         let diff =
             GitReader::get_file_diff(dir.path().to_str().unwrap(), "ghost.txt", false, false)
-                .expect("missing path stays non-fatal");
+                .expect("missing path stays non-fatal")
+                .text;
         assert!(diff.is_empty());
     }
 
@@ -3283,7 +4148,9 @@ mod tests {
         );
 
         let merge_oid = rev_parse_at(dir.path(), "HEAD");
-        let diff = GitReader::get_commit_diff(path, &merge_oid).expect("clean merge diff");
+        let diff = GitReader::get_commit_diff(path, &merge_oid)
+            .expect("clean merge diff")
+            .text;
         assert!(
             diff.contains("diff --git a/side.txt b/side.txt"),
             "first-parent diff must include the merged file: {diff}"
@@ -3319,7 +4186,9 @@ mod tests {
         let merge_oid = rev_parse_at(dir.path(), "HEAD");
         let parents = merge_parents(dir.path(), &merge_oid);
         assert_eq!(parents.len(), 2, "fixture must be a merge");
-        let diff = GitReader::get_commit_diff(path, &merge_oid).expect("conflicted merge diff");
+        let diff = GitReader::get_commit_diff(path, &merge_oid)
+            .expect("conflicted merge diff")
+            .text;
         assert!(!diff.contains("diff --cc"), "{diff}");
         assert!(!diff.contains("@@@"), "{diff}");
         assert!(diff.contains("diff --git a/main.txt b/main.txt"), "{diff}");
@@ -3357,7 +4226,9 @@ mod tests {
         // Untracked file diff (synthesized) is raw UTF-8 by construction but
         // must still round-trip through status plumbing keyed by raw path.
         std::fs::write(dir.path().join(unicode_name), "unicode\n").unwrap();
-        let diff = GitReader::get_file_diff(path, unicode_name, false, false).expect("untracked");
+        let diff = GitReader::get_file_diff(path, unicode_name, false, false)
+            .expect("untracked")
+            .text;
         assert!(
             diff.starts_with(&format!("diff --git a/{unicode_name} b/{unicode_name}\n")),
             "{diff}"
@@ -3367,13 +4238,16 @@ mod tests {
         git_in(dir.path(), &["add", "."]);
         git_in(dir.path(), &["commit", "-m", "unicode name"]);
         let oid = rev_parse_at(dir.path(), "HEAD");
-        let diff = GitReader::get_commit_diff(path, &oid).expect("commit diff");
+        let diff = GitReader::get_commit_diff(path, &oid)
+            .expect("commit diff")
+            .text;
         assert!(
             diff.contains(&format!("diff --git a/{unicode_name} b/{unicode_name}")),
             "{diff}"
         );
-        let per_file =
-            GitReader::get_commit_file_diff(path, &oid, unicode_name).expect("commit file diff");
+        let per_file = GitReader::get_commit_file_diff(path, &oid, unicode_name)
+            .expect("commit file diff")
+            .text;
         assert!(
             per_file.contains(&format!("diff --git a/{unicode_name}")),
             "{per_file}"
@@ -3384,7 +4258,9 @@ mod tests {
         std::fs::write(dir.path().join(unicode_name), "unicode v2\n").unwrap();
         git_in(dir.path(), &["add", "."]);
         git_in(dir.path(), &["commit", "-m", "unicode edit"]);
-        let range = GitReader::get_range_diff(path, "main", "feat-uni").expect("range diff");
+        let range = GitReader::get_range_diff(path, "main", "feat-uni")
+            .expect("range diff")
+            .text;
         assert!(range.contains(unicode_name), "{range}");
         assert!(!range.contains("\\303\\251"), "{range}");
     }
@@ -3598,5 +4474,173 @@ mod tests {
         // Byte-wise order, not collator order: uppercase sorts first.
         let parsed = parse_ls_files_entries("b.txt\0A.txt\0a.txt\0");
         assert_eq!(parsed, ["A.txt", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn parse_pulse_stream_extracts_commits_and_churn() {
+        let sample = "\
+__GP_PULSE__\0abc123\0def456 789012\x001700000000\0G\0feat: initial pulse\0Alice Dev\0alice@example.com\0\
+Signed-off-by: Alice Dev <alice@example.com>\n\
+Co-authored-by: Bob Coder <bob@example.com>\n\
+Co-authored-by: Cara <cara@example.com>\0\
+10\t2\tsrc/main.rs\n\
+5\t0\tREADME.md\n\
+-\t-\tlogo.png\n\
+\n\
+__GP_PULSE__\0def456\0\x001699990000\0N\0Revert \"bad commit\"\0Bob Coder\0bob@example.com\0\0\
+3\t8\tsrc/lib/util.ts\n\
+1\t1\tconfig.json => config.dist.json\n\
+\n\
+__GP_PULSE__\0aaa111\0bbb222\x001699980000\0N\0revert(api): drop the flag\0Cara\0cara@example.com\0\0\
+-\t-\tassets/icon.bin\n\
+";
+        let (commits, top_files, extensions) = parse_pulse_stream(sample);
+        assert_eq!(commits.len(), 3);
+
+        // First commit
+        let c1 = &commits[0];
+        assert_eq!(c1.sha, "abc123");
+        assert_eq!(c1.parents, vec!["def456", "789012"]);
+        assert!(c1.is_merge);
+        assert!(!c1.is_revert);
+        assert_eq!(c1.timestamp, 1700000000);
+        assert_eq!(c1.gpg_status, "G");
+        assert_eq!(c1.summary, "feat: initial pulse");
+        assert_eq!(c1.author_name, "Alice Dev");
+        assert_eq!(c1.author_email, "alice@example.com");
+        assert_eq!(c1.additions, 15);
+        assert_eq!(c1.deletions, 2);
+        assert_eq!(c1.files_changed, 3);
+        assert_eq!(c1.binary_files, 1);
+        assert_eq!(
+            c1.co_authors,
+            vec![
+                "Bob Coder <bob@example.com>".to_string(),
+                "Cara <cara@example.com>".to_string()
+            ]
+        );
+
+        // Second commit
+        let c2 = &commits[1];
+        assert_eq!(c2.sha, "def456");
+        assert!(c2.parents.is_empty());
+        assert!(!c2.is_merge);
+        assert!(c2.is_revert);
+        assert_eq!(c2.gpg_status, "N");
+        assert_eq!(c2.additions, 4);
+        assert_eq!(c2.deletions, 9);
+        assert_eq!(c2.files_changed, 2);
+        assert!(c2.co_authors.is_empty());
+        assert_eq!(c2.binary_files, 0);
+
+        let c3 = &commits[2];
+        assert!(c3.is_revert, "conventional revert(scope): must count");
+        assert_eq!(c3.binary_files, 1);
+        assert_eq!(c3.additions, 0);
+        assert_eq!(c3.deletions, 0);
+        assert_eq!(c3.files_changed, 1);
+
+        // Top files
+        assert!(top_files
+            .iter()
+            .any(|f| f.path == "src/main.rs" && f.additions == 10 && f.deletions == 2));
+        assert!(top_files
+            .iter()
+            .any(|f| f.path == "src/lib/util.ts" && f.additions == 3 && f.deletions == 8));
+        assert!(top_files
+            .iter()
+            .any(|f| f.path == "config.dist.json" && f.additions == 1 && f.deletions == 1));
+
+        // Extensions
+        assert!(extensions
+            .iter()
+            .any(|e| e.extension == "rs" && e.additions == 10));
+        assert!(extensions
+            .iter()
+            .any(|e| e.extension == "ts" && e.deletions == 8));
+        assert!(extensions
+            .iter()
+            .any(|e| e.extension == "json" && e.files_count == 1));
+    }
+
+    #[test]
+    fn extract_target_path_handles_all_three_rename_forms() {
+        assert_eq!(
+            extract_target_path("config.json => config.dist.json"),
+            "config.dist.json"
+        );
+        assert_eq!(extract_target_path("{old => new}"), "new");
+        assert_eq!(extract_target_path("dir/{a => b}/f.rs"), "dir/b/f.rs");
+        assert_eq!(extract_target_path("plain/path.rs"), "plain/path.rs");
+    }
+
+    #[test]
+    fn pulse_report_runs_on_real_repo_with_mailmap() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+
+        // Initially empty repo (1 commit created by init_repo_with_remotes)
+        let report = GitReader::pulse_report(path, Some(10)).expect("pulse_report should succeed");
+        assert_eq!(report.total_commits_scanned, 1);
+        assert!(!report.truncated);
+        assert!(!report.has_mailmap);
+
+        // Add a .mailmap file and commit
+        std::fs::write(
+            dir.path().join(".mailmap"),
+            "Canonical Contributor <canonical@example.com> <test@example.com>\n",
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", ".mailmap"]);
+        git_in(dir.path(), &["commit", "-m", "add mailmap"]);
+
+        let report2 = GitReader::pulse_report(path, Some(10)).expect("pulse_report should succeed");
+        assert_eq!(report2.total_commits_scanned, 2);
+        assert!(report2.has_mailmap);
+
+        // The latest commit author name and email should be mapped according to .mailmap
+        let head_commit = &report2.commits[0];
+        assert_eq!(head_commit.author_name, "Canonical Contributor");
+        assert_eq!(head_commit.author_email, "canonical@example.com");
+    }
+
+    #[test]
+    fn knowledge_report_calculates_ownership_and_bus_factor() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
+        git_in(dir.path(), &["add", "code.rs"]);
+        git_in(dir.path(), &["commit", "-m", "feat: add main"]);
+
+        let report =
+            GitReader::knowledge_report(path, Some(10)).expect("knowledge_report should succeed");
+        assert!(report.scanned_files >= 1);
+        assert!(report.scanned_lines >= 3);
+        assert!(report.bus_factor >= 1);
+        assert!(!report.primary_authors.is_empty());
+        assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
+    }
+
+    #[test]
+    fn dora_report_computes_release_metrics_from_tags() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release 1.0.0"]);
+
+        let report = GitReader::dora_report(path, Some(90)).expect("dora_report should succeed");
+        assert_eq!(report.total_releases, 1);
+        assert!(report.deploy_frequency_per_week > 0.0);
+        assert!(report.is_mttr_approximation);
+        assert_eq!(
+            report.mttr_hours, 0.0,
+            "no restore samples must not invent a restore time"
+        );
+        assert!(report.is_cfr_approximation);
     }
 }

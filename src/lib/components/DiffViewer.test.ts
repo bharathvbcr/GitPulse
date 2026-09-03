@@ -8,6 +8,37 @@ const source = readFileSync(
   "utf8"
 );
 
+describe("DiffViewer truncation honesty", () => {
+  /**
+   * The backend now caps what it reads, so a diff can be a prefix without the
+   * viewer being able to tell from the rows alone: the last hunk on screen
+   * looks exactly like the last hunk in the commit.
+   */
+  it("treats a backend-truncated diff as truncated, not merely a short one", () => {
+    expect(source).toContain("selectedDiffTruncated");
+    expect(source).toMatch(/cutByBackend\s*\|\|\s*cutByRenderer/);
+  });
+
+  /**
+   * The staging lockout is the part that matters for correctness: building a
+   * patch from a prefix stages less than the rows on screen imply, silently.
+   * It must key off the combined flag, never off the renderer's cut alone.
+   */
+  it("disables staging on any truncation, including the backend's", () => {
+    expect(source).toContain("disabled={truncatedSource}");
+    // The render slice is the only thing allowed to key off the renderer cut;
+    // if `lines` were sliced by the combined flag, a backend-truncated diff
+    // would render nothing at all.
+    expect(source).toMatch(/lines = \$derived\(cutByRenderer \?/);
+  });
+
+  it("tells the user which cut happened rather than one generic message", () => {
+    expect(source).toContain("{#if cutByBackend}");
+    expect(source).toMatch(/larger than GitPulse reads/i);
+    expect(source).toMatch(/Staging is disabled/i);
+  });
+});
+
 describe("DiffViewer row chrome", () => {
   it("does not draw a horizontal rule under every diff line", () => {
     expect(source).not.toContain("divide-y");

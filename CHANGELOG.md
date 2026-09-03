@@ -11,6 +11,68 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Pulse view** (`pulse`): local contribution heatmap, streaks and after-hours punch card, weekly line changes, reconstructed LOC trend, churn-by-extension, commit hygiene, churn×coverage hotspots, knowledge/bus-factor, code age, and tag-based DORA. One bounded `git log --numstat` walk plus optional blame/tag scans. Truncation, payload-budget cuts, and failed language scans are visible states, never a quiet `0`.
+- MCP 2.0 (`2026-07-28`) on `gitpulse-mcp`: mandatory `server/discover`, per-request `_meta` (protocol version + client capabilities), `resultType` on results, cacheable `tools/list` (`ttlMs` / `cacheScope`). Dual-era: legacy `initialize` still answers 2024-11-05 / 2025-11-25 clients.
+- Agent Plugins 1.0 package at `plugin/` (`plugin.json`, `mcp.json`, skills). Settings copies the manifests; Work view surfaces agent-session counts and overlapping dirty files.
+- Read-only insight tools: `gitpulse_insights`, `gitpulse_active_changes`, `gitpulse_collision_risk`, `gitpulse_change_context`, `gitpulse_codeintel_dead_symbols`.
+- Work view insight strip and collision banner. Health view states a failed dead-code check separately from “no unreferenced symbols”.
+
+### Fixed
+
+- Resource exhaustion under multi-repository fan-out. Nothing bounded how many
+  child processes the git engine kept alive at once, and a GUI launch inherits a
+  soft `RLIMIT_NOFILE` of 256 from launchd. A workspace-wide fetch refreshed up
+  to 64 repositories with a plain `Promise.all`, each refresh issuing five
+  git-spawning commands, so hundreds of `git` processes and their pipe
+  descriptors, drain threads and output buffers existed simultaneously. The
+  process ran out of descriptors and every later spawn failed with
+  `Too many open files (os error 24)` — a state it never recovered from, because
+  the UI retried into the same wall. Three changes close it: `engine::git_cli`
+  now admits at most `2 x cores` (4-16) concurrent children through a spawn gate;
+  startup raises the soft descriptor limit toward 16384 and says plainly in the
+  log when it could not; and every IPC fan-out goes through one bounded pool
+  (`lib/async/pool.ts`) instead of `Promise.all`.
+- `ci_local`'s working-tree and HEAD probes spawned `git` directly, bypassing the
+  engine's timeout, output cap, environment hardening, and the new spawn gate.
+- Unbudgeted IPC payloads. `MAX_OUTPUT_BYTES` is a 64 MiB backstop against a
+  runaway process, and the diff, blame and file-content readers were treating it
+  as a payload size. Measured on one real commit that rewrote a 400k-line file:
+  a 43.7 MB diff cost 144 MB of RSS in the backend (bytes, lossy `String` copy,
+  then JSON) and 346 MB in the webview (string plus 533k parsed row objects) —
+  ~490 MB for one click, on a viewer that renders at most 300k rows of it. The
+  new `engine::budget` module gives every content-driven payload a budget taken
+  from what its surface can render (diffs 8 MiB, blame 16 MiB, file content
+  8 MiB), cut on a line boundary so no half-row parses as a whole one. The same
+  commit now costs 37 MB and 136 MB. Diffs carry a `truncated` flag end to end:
+  the viewer says which cut happened and disables hunk staging, because staging
+  from a prefix stages less than the rows on screen imply.
+- `stash show -p` was the one diff read still crossing IPC unbudgeted.
+- Startup bundle. The plugin/MCP, insights and Work-view pass pushed the entry
+  chunk to 853 KB, past the 780 KB ceiling the `gitpulse-bundle-budget` plugin
+  enforces. The comparison that ceiling's own comment prescribes — vendor chunks
+  unchanged means app code, changed means a leaked dependency — said app code,
+  so the fix was to stop shipping views nobody has opened rather than to raise
+  the number. Eleven tab views (Coverage, Health, Storage, Terminal, Code stack,
+  GitHub, Manvi ops, Reflog, Blame, Conflict editor, Pulse) now load as their own
+  chunks through a new `LazyView`, which caches each resolved view so only the
+  first visit shows a pending state, and names the view if its chunk fails
+  instead of leaving a blank pane. Work stays eager: it is the default tab, so
+  deferring it would only add a round trip to launch. Entry chunk 853 → 543 KB,
+  and because `TerminalPanel` went with them the 334 KB xterm runtime left
+  startup entirely — 204 KB transferred on launch, down from ~590 KB. The split
+  is pinned by `src/App.test.ts` so a plain import cannot quietly undo it.
+- A latent race in the test suite. The harness sidecar is one process-global
+  slot, so a test that installs a recording or refusing fake installs it for
+  every thread — and only one of the six tests that reach it serialized. The
+  observed failure was a scope assertion reading another test's request frame,
+  but the same race passes just as easily: an "allow everything" fake makes a
+  gating assertion succeed while proving nothing. Serialization now happens at
+  the consumer funnel (`call_policy`) rather than being each test's to remember,
+  through a reentrant guard that `set_test_binary` takes by reference, so
+  installing a fake without holding it does not compile.
+
 ## [0.0.3] - 2026-09-02
 
 ### Added

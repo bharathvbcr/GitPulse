@@ -772,7 +772,12 @@ pub fn explain_commit(
     selection: Option<AiSelection>,
 ) -> Result<AiGeneration, String> {
     let details = GitReader::get_commit_details(repo_path, commit_id)?;
+    // `.text` only: the AI budget already trims the diff to the model's
+    // context, and a truncation notice inside the prompt would read as commit
+    // content. The generation's own warnings carry the fact instead.
     let diff = GitReader::get_commit_diff(repo_path, commit_id)?;
+    let diff_truncated = diff.truncated;
+    let diff = diff.text;
     let subject = details.summary.clone();
     let author = format!("{} <{}>", details.author_name, details.author_email);
     let date = details.author_date.clone();
@@ -789,6 +794,15 @@ pub fn explain_commit(
     generation.text = prompt::strip_think_tags(&generation.text);
     if generation.text.is_empty() {
         return Err("The model returned an empty explanation.".into());
+    }
+    if diff_truncated {
+        // An explanation written from a prefix must not read as one written
+        // from the whole commit.
+        generation.warnings.push(
+            "This commit's diff exceeded the read budget and was truncated; the explanation \
+             covers only the part that was read."
+                .to_string(),
+        );
     }
     Ok(generation)
 }

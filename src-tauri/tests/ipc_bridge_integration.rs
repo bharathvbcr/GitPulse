@@ -351,8 +351,24 @@ fn a_boolean_argument_round_trips_rather_than_being_coerced() {
         }),
     )
     .expect("an unstaged diff");
-    assert!(unstaged.is_string(), "a raw diff is a string: {unstaged}");
-    assert!(unstaged.as_str().unwrap_or_default().contains("changed"));
+    // A diff crosses as `{ text, truncated }`, never a bare string: the flag
+    // is what stops a payload cut at the read budget from rendering as a whole
+    // diff, so the bridge must carry both fields.
+    assert!(
+        unstaged.is_object(),
+        "a diff crosses as an object: {unstaged}"
+    );
+    assert!(
+        unstaged["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed"),
+        "the diff text must survive the bridge: {unstaged}"
+    );
+    assert_eq!(
+        unstaged["truncated"], false,
+        "a small diff must not claim to be truncated: {unstaged}"
+    );
 
     // isStaged=true is a different question with a different answer, so the
     // flag is genuinely being read rather than defaulted.

@@ -44,7 +44,7 @@ GitPulse operates completely locally on your machine with strict IPC boundaries 
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        Views["14 Specialized Views<br/>(Work, Files, Graph, Diff, Coverage, Health...)"]
+        Views["15 Specialized Views<br/>(Work, Files, Graph, Diff, Coverage, Health...)"]
         Stores["Reactive Svelte 5 Stores & Runes"]
         CanvasEngine["GPU-Accelerated HTML5 Canvas"]
         AsyncGuards["Async Cancellation Guards"]
@@ -56,7 +56,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(124 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(132 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -88,7 +88,7 @@ flowchart TB
 
 ## View Catalog & Workflows
 
-GitPulse organizes 14 purpose-built views into three intuitive functional groups:
+GitPulse organizes 15 purpose-built views into three intuitive functional groups:
 
 ```mermaid
 flowchart LR
@@ -106,6 +106,7 @@ flowchart LR
         Health["<b>Health</b> (<code>health</code>)<br/>Vulnerabilities & Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage & history trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization"]
+        Pulse["<b>Pulse</b> (<code>pulse</code>)<br/>Cadence, heatmap, rhythm & hygiene"]
     end
 
     subgraph System["⚙️ System & Ops"]
@@ -141,6 +142,7 @@ flowchart LR
 | **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
 | **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
 | **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
+| **MCP 2.0 + Agent Plugins 1.0** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. Packaged as an [Agent Plugins 1.0](https://agent-plugins.org/specification) directory at `plugin/` (`plugin.json`, `mcp.json`, skills). Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
 
 ### 🤖 Local AI & Policy Safety Gate
 | Feature | Description |
@@ -261,7 +263,7 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 124 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 132 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
@@ -280,7 +282,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 14 application views and keyboard shortcuts.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 15 application views and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.

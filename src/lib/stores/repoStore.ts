@@ -57,6 +57,7 @@ import {
   type RepoTarget,
   type RunOptions,
 } from "../repos/workspaceOps";
+import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import {
   summarizeWorkspace,
   bulkSkipReason,
@@ -162,6 +163,17 @@ export interface OpenRepoTab {
   conflictedCount: number;
 }
 
+/**
+ * Wire shape of every diff-returning command.
+ *
+ * `truncated` is not optional: a payload that forgot it would default to
+ * "complete", which is the exact failure the flag exists to prevent.
+ */
+export interface DiffPayload {
+  text: string;
+  truncated: boolean;
+}
+
 export interface RepoSession {
   id: string;
   path: string;
@@ -186,6 +198,15 @@ export interface RepoSession {
    */
   selectionKind: SelectionKind;
   selectedDiff: string | null;
+  /**
+   * True when the backend cut this diff at its read budget.
+   *
+   * A prefix rendered as a whole diff is a lie the viewer cannot detect on
+   * its own: the last hunk on screen looks like the last hunk in the commit.
+   * The flag drives both the notice and the staging lockout, because staging
+   * a hunk from a prefix stages less than the rows imply.
+   */
+  selectedDiffTruncated: boolean;
   activeTab: ViewTab;
   searchQuery: string;
   selectedBranch: string | null;
@@ -248,6 +269,15 @@ export interface RepoState {
   selectedIsStaged: boolean;
   selectedIgnoreWhitespace: boolean;
   selectedDiff: string | null;
+  /**
+   * True when the backend cut this diff at its read budget.
+   *
+   * A prefix rendered as a whole diff is a lie the viewer cannot detect on
+   * its own: the last hunk on screen looks like the last hunk in the commit.
+   * The flag drives both the notice and the staging lockout, because staging
+   * a hunk from a prefix stages less than the rows imply.
+   */
+  selectedDiffTruncated: boolean;
   activeTab: ViewTab;
   isLoading: boolean;
   error: string | null;
@@ -369,6 +399,7 @@ function emptyProjected(): RepoState {
     selectedIsStaged: false,
     selectedIgnoreWhitespace: false,
     selectedDiff: null,
+    selectedDiffTruncated: false,
     activeTab: "work",
     isLoading: false,
     error: null,
@@ -408,6 +439,7 @@ function createSession(
     selectedIgnoreWhitespace: extras.selectedIgnoreWhitespace ?? false,
     selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
+    selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
     activeTab: extras.activeTab ?? "work",
     searchQuery: extras.searchQuery ?? "",
     selectedBranch: extras.selectedBranch ?? null,
@@ -471,6 +503,7 @@ function project(internal: InternalState): RepoState {
     selectedIsStaged: active?.selectedIsStaged ?? false,
     selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
     selectedDiff: active?.selectedDiff ?? null,
+    selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
     activeTab: active?.activeTab ?? "work",
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
@@ -1615,7 +1648,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const ignoreWhitespace = session.selectedIgnoreWhitespace;
       const token = selectionGeneration.next();
       try {
-        const diff = await invokeFn<string>("cmd_get_file_diff", {
+        const diff = await invokeFn<DiffPayload>("cmd_get_file_diff", {
           repoPath: session.path,
           filePath,
           isStaged,
@@ -1625,7 +1658,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         applyToSession(session.id, generation, {
           selectedFilePath: filePath,
           selectedCommitId: null,
-          selectedDiff: diff,
+          selectedDiff: diff.text,
+          selectedDiffTruncated: diff.truncated,
           selectedIsStaged: isStaged,
           selectedIgnoreWhitespace: ignoreWhitespace,
           selectionKind: "file",
@@ -1676,7 +1710,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const generation = session.generation;
       const token = selectionGeneration.next();
       try {
-        const diff = await invokeFn<string>("cmd_get_commit_diff", {
+        const diff = await invokeFn<DiffPayload>("cmd_get_commit_diff", {
           repoPath: session.path,
           commitId,
         });
@@ -1684,7 +1718,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         applyToSession(session.id, generation, {
           selectedCommitId: commitId,
           selectedFilePath: null,
-          selectedDiff: diff,
+          selectedDiff: diff.text,
+          selectedDiffTruncated: diff.truncated,
           selectedIsStaged: false,
           selectionKind: "commit",
         });
@@ -1702,7 +1737,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const generation = session.generation;
       const token = selectionGeneration.next();
       try {
-        const fileDiff = await invokeFn<string>("cmd_get_commit_file_diff", {
+        const fileDiff = await invokeFn<DiffPayload>("cmd_get_commit_file_diff", {
           repoPath: session.path,
           commitId,
           filePath,
@@ -1711,7 +1746,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         applyToSession(session.id, generation, {
           selectedCommitId: commitId,
           selectedFilePath: filePath,
-          selectedDiff: fileDiff,
+          selectedDiff: fileDiff.text,
+          selectedDiffTruncated: fileDiff.truncated,
           selectedIsStaged: false,
           selectionKind: "commit",
           activeTab: "diff",
@@ -1727,7 +1763,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const generation = session.generation;
       const token = selectionGeneration.next();
       try {
-        const diff = await invokeFn<string>("cmd_get_range_diff", {
+        const diff = await invokeFn<DiffPayload>("cmd_get_range_diff", {
           repoPath: session.path,
           from,
           to,
@@ -1736,7 +1772,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         applyToSession(session.id, generation, {
           selectedFilePath: `${from}...${to}`,
           selectedCommitId: null,
-          selectedDiff: diff,
+          selectedDiff: diff.text,
+          selectedDiffTruncated: diff.truncated,
           selectedIsStaged: false,
           selectionKind: "range",
           activeTab: "diff",
@@ -2009,10 +2046,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       );
       // Refresh only what actually ran: re-hydrating a skipped repository would
       // cost a full snapshot for a repository nothing happened to.
-      await Promise.all(
-        report.results
-          .filter((result) => result.status === "ok")
-          .map((result) => store.refresh(result.path)),
+      //
+      // Bounded, not `Promise.all`. Each refresh is itself five concurrent
+      // commands, so fanning out over all 64 possible repositories issued
+      // ~320 git-spawning calls in one instant and exhausted the process's
+      // file descriptors — every later spawn failing with "Too many open
+      // files" until restart.
+      await mapItems(
+        report.results.filter((result) => result.status === "ok"),
+        DEFAULT_FAN_OUT,
+        (result) => store.refresh(result.path),
       );
       return report;
     },
@@ -2110,6 +2153,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedCommitId: commitId,
         selectedFilePath: null,
         selectedDiff: null,
+        selectedDiffTruncated: false,
         selectedIsStaged: false,
         selectionKind: "commit",
         activeTab: "history",

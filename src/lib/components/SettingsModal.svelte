@@ -11,7 +11,10 @@
   } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck, CircleUserRound, RefreshCw } from "lucide-svelte";
+  import { Settings, Monitor, Sun, Moon, Rows3, Languages, ShieldCheck, CircleUserRound, RefreshCw, Plug, Copy, Check, AlertTriangle } from "lucide-svelte";
+  import { getMcpInfo } from "../insights/client";
+  import type { McpInfo } from "../insights/types";
+  import { copyText } from "../desktop/clipboard";
   import {
     checkForAppUpdate,
     describeUpdateCheck,
@@ -39,6 +42,38 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateUrl = $state("");
   let checkingUpdate = $state(false);
+  let mcpInfo = $state<McpInfo | null>(null);
+  let mcpError = $state<string | null>(null);
+  let mcpCopied = $state("");
+  let mcpCopyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    if (!isOpen) return;
+    void loadMcpInfo();
+  });
+
+  $effect(() => () => {
+    if (mcpCopyTimer) clearTimeout(mcpCopyTimer);
+  });
+
+  async function loadMcpInfo() {
+    try {
+      mcpInfo = await getMcpInfo();
+      mcpError = null;
+    } catch (error) {
+      mcpInfo = null;
+      mcpError = formatError(error);
+    }
+  }
+
+  async function copyMcp(key: string, text: string) {
+    if (!text) return;
+    if (await copyText(text)) {
+      mcpCopied = key;
+      if (mcpCopyTimer) clearTimeout(mcpCopyTimer);
+      mcpCopyTimer = setTimeout(() => (mcpCopied = ""), 1500);
+    }
+  }
 
   async function runManualUpdateCheck() {
     if (checkingUpdate) return;
@@ -96,7 +131,7 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
+      class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">
         <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
@@ -360,6 +395,81 @@
               ></span>
             </button>
           </div>
+        </section>
+
+        <section>
+          <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Agents (MCP 2.0)</h2>
+          <p class="text-textMuted text-[10px] leading-snug mb-2">
+            Agents connect through the Agent Plugins 1.0 package (`plugin.json` + `mcp.json`)
+            and speak MCP 2026-07-28. The surface is read-only: it never checks out a branch
+            or writes a file.
+          </p>
+          {#if mcpError}
+            <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mb-2">
+              <AlertTriangle size={12} class="shrink-0 mt-px" />
+              <span>{mcpError}</span>
+            </div>
+          {:else if mcpInfo}
+            <div class="space-y-1.5 rounded-xl border border-border/70 bg-surfaceHover/40 p-2.5">
+              <div class="flex items-start gap-2">
+                <Plug size={13} class="text-accent shrink-0 mt-0.5" />
+                <div class="min-w-0">
+                  <div class="text-textPrimary text-[11px] font-medium">
+                    {mcpInfo.server_name} · MCP {mcpInfo.protocol_version}
+                  </div>
+                  <div class="text-textMuted text-[10px] font-mono break-all">
+                    {#if mcpInfo.binary_found}
+                      {mcpInfo.binary_path}
+                    {:else}
+                      {mcpInfo.binary_error}
+                    {/if}
+                  </div>
+                  <div class="text-textMuted text-[10px] mt-1">
+                    {#if mcpInfo.plugin_found}
+                      Plugin: {mcpInfo.plugin_path}
+                    {:else}
+                      {mcpInfo.plugin_error}
+                    {/if}
+                  </div>
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-1.5 pt-1">
+                <button
+                  type="button"
+                  class="gp-btn !py-0.5 !px-2 text-[10px] inline-flex items-center gap-1"
+                  disabled={!mcpInfo.plugin_manifest_json}
+                  onclick={() => void copyMcp("plugin", mcpInfo?.plugin_manifest_json ?? "")}
+                >
+                  {#if mcpCopied === "plugin"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                  plugin.json
+                </button>
+                <button
+                  type="button"
+                  class="gp-btn !py-0.5 !px-2 text-[10px] inline-flex items-center gap-1"
+                  disabled={!mcpInfo.plugin_mcp_json}
+                  onclick={() => void copyMcp("mcp", mcpInfo?.plugin_mcp_json ?? "")}
+                >
+                  {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                  mcp.json
+                </button>
+              </div>
+              {#if mcpInfo.tools.length > 0}
+                <details class="pt-1">
+                  <summary class="cursor-pointer text-[10px] text-textMuted">
+                    {mcpInfo.tools.length} tools (start with gitpulse_insights)
+                  </summary>
+                  <ul class="mt-1 space-y-0.5 max-h-32 overflow-y-auto">
+                    {#each mcpInfo.tools as tool (tool.name)}
+                      <li class="font-mono text-[10px] text-textPrimary">
+                        {tool.name}
+                        <span class="text-textMuted font-sans"> — {tool.title}</span>
+                      </li>
+                    {/each}
+                  </ul>
+                </details>
+              {/if}
+            </div>
+          {/if}
         </section>
 
         <section>

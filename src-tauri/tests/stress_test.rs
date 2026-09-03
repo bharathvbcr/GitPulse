@@ -603,7 +603,9 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
     .trim()
     .to_string();
     let path = dir.path().to_string_lossy().into_owned();
-    let scoped = GitReader::get_commit_file_diff(&path, &head, "bulk/f0.txt").expect("scoped");
+    let scoped = GitReader::get_commit_file_diff(&path, &head, "bulk/f0.txt")
+        .expect("scoped")
+        .text;
     assert!(
         scoped.contains("v1-target"),
         "must contain the requested file: {scoped}"

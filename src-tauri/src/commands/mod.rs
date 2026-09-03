@@ -8,7 +8,8 @@ use crate::diff::{
 };
 use crate::engine::git_cli::{git_text, resolve_repo, sandbox_write, validate_repo, ResolvedRepo};
 use crate::engine::git_reader::{
-    BlameLine, CommitDetails, CommitFileChange, FileBlob, LanguageStatsReport, ReflogEntry,
+    BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
+    LanguageStatsReport, PulseReport, ReflogEntry,
 };
 use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
 use crate::engine::{
@@ -240,7 +241,7 @@ pub async fn cmd_get_file_diff(
     file_path: String,
     is_staged: bool,
     ignore_whitespace: Option<bool>,
-) -> Result<String, String> {
+) -> Result<DiffPayload, String> {
     off_thread(move || {
         GitReader::get_file_diff(
             &repo_path,
@@ -253,7 +254,10 @@ pub async fn cmd_get_file_diff(
 }
 
 #[tauri::command(async)]
-pub async fn cmd_get_commit_diff(repo_path: String, commit_id: String) -> Result<String, String> {
+pub async fn cmd_get_commit_diff(
+    repo_path: String,
+    commit_id: String,
+) -> Result<DiffPayload, String> {
     off_thread(move || GitReader::get_commit_diff(&repo_path, &commit_id)).await
 }
 
@@ -262,7 +266,7 @@ pub async fn cmd_get_commit_file_diff(
     repo_path: String,
     commit_id: String,
     file_path: String,
-) -> Result<String, String> {
+) -> Result<DiffPayload, String> {
     off_thread(move || GitReader::get_commit_file_diff(&repo_path, &commit_id, &file_path)).await
 }
 
@@ -271,7 +275,7 @@ pub async fn cmd_get_range_diff(
     repo_path: String,
     from: String,
     to: String,
-) -> Result<String, String> {
+) -> Result<DiffPayload, String> {
     off_thread(move || GitReader::get_range_diff(&repo_path, &from, &to)).await
 }
 
@@ -764,6 +768,52 @@ pub async fn cmd_get_reflog(
 #[tauri::command(async)]
 pub async fn cmd_get_language_stats(repo_path: String) -> Result<LanguageStatsReport, String> {
     off_thread(move || GitReader::get_repo_language_stats(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_get_pulse_report(
+    repo_path: String,
+    max_commits: Option<usize>,
+) -> Result<PulseReport, String> {
+    off_thread(move || GitReader::pulse_report(&repo_path, max_commits)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_get_knowledge_report(
+    repo_path: String,
+    max_files: Option<usize>,
+) -> Result<KnowledgeReport, String> {
+    off_thread(move || GitReader::knowledge_report(&repo_path, max_files)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_get_dora_report(
+    repo_path: String,
+    window_days: Option<u32>,
+) -> Result<DoraReport, String> {
+    off_thread(move || GitReader::dora_report(&repo_path, window_days)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_record_pulse_snapshot(
+    repo_path: String,
+    snapshot: crate::ledger::PulseSnapshotInput,
+) -> Result<(), String> {
+    off_thread(move || {
+        crate::ledger::save_pulse_snapshot(&repo_path, &snapshot).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_get_pulse_snapshots(
+    repo_path: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::ledger::PulseSnapshotEntry>, String> {
+    off_thread(move || {
+        crate::ledger::get_pulse_snapshots(&repo_path, limit).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -2511,6 +2561,28 @@ pub async fn cmd_codeintel_dead_symbols(
     token_budget: Option<u32>,
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, String> {
     off_thread(move || Ok(crate::codeintel::dead_symbols(&repo_path, token_budget))).await
+}
+
+/// One-shot Work-view snapshot: worktrees, agent sessions, collisions, ledger, code graph.
+#[tauri::command(async)]
+pub async fn cmd_insights_snapshot(
+    repo_path: String,
+) -> Result<crate::insights::InsightsSnapshot, String> {
+    off_thread(move || Ok(crate::insights::snapshot(&repo_path))).await
+}
+
+/// Files with uncommitted changes in more than one worktree.
+#[tauri::command(async)]
+pub async fn cmd_collision_risk(
+    repo_path: String,
+) -> Result<crate::insights::CollisionRisk, String> {
+    off_thread(move || Ok(crate::insights::collision_risk(&repo_path))).await
+}
+
+/// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.
+#[tauri::command]
+pub fn cmd_mcp_info() -> crate::insights::McpInfo {
+    crate::insights::mcp_info()
 }
 
 /// The harness's grant ledger for this repository.

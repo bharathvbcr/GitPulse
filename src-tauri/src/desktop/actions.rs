@@ -22,6 +22,7 @@ pub const TAB_TERMINAL: &str = "tab-terminal";
 pub const TAB_MANVI: &str = "tab-manvi";
 pub const TAB_REFLOG: &str = "tab-reflog";
 pub const TAB_STORAGE: &str = "tab-storage";
+pub const TAB_PULSE: &str = "tab-pulse";
 pub const FETCH: &str = "fetch";
 pub const PULL: &str = "pull";
 pub const PUSH: &str = "push";
@@ -63,6 +64,7 @@ pub enum NativeAction {
     TabManvi,
     TabReflog,
     TabStorage,
+    TabPulse,
     Fetch,
     Pull,
     Push,
@@ -110,6 +112,7 @@ impl NativeAction {
             TAB_MANVI => Self::TabManvi,
             TAB_REFLOG => Self::TabReflog,
             TAB_STORAGE => Self::TabStorage,
+            TAB_PULSE => Self::TabPulse,
             FETCH => Self::Fetch,
             PULL => Self::Pull,
             PUSH => Self::Push,
@@ -152,6 +155,7 @@ impl NativeAction {
             Self::TabManvi => TAB_MANVI,
             Self::TabReflog => TAB_REFLOG,
             Self::TabStorage => TAB_STORAGE,
+            Self::TabPulse => TAB_PULSE,
             Self::Fetch => FETCH,
             Self::Pull => PULL,
             Self::Push => PUSH,
@@ -223,6 +227,7 @@ mod tests {
             Some(NativeAction::TabTerminal)
         );
         assert_eq!(NativeAction::parse(TAB_MANVI), Some(NativeAction::TabManvi));
+        assert_eq!(NativeAction::parse(TAB_PULSE), Some(NativeAction::TabPulse));
         assert_eq!(NativeAction::parse("nope"), None);
         assert_eq!(NativeAction::parse(RECENT_EMPTY), None);
         assert_eq!(NativeAction::parse(RECENT_PREFIX), None);

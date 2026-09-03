@@ -19,6 +19,16 @@ import { appVersion } from "./scripts/app-version.mjs";
  * every other vendor chunk byte-identical. That comparison is the check to run before
  * raising this again — a jump with vendor chunks unchanged is app code, a jump
  * with them changed is a dependency that leaked into the entry chunk.
+ *
+ * The plugin/MCP, insights and Work-view pass then took it to 853 KB, past
+ * this ceiling. Running the comparison above said app code, not a leaked
+ * dependency — so the answer was to stop shipping views nobody has opened yet
+ * rather than to raise the number. Eleven tab views now load as their own
+ * chunks (`LazyView`, pinned by `src/App.test.ts`), which put the entry chunk
+ * at 543 KB and — because `TerminalPanel` went with them — took the 334 KB
+ * xterm runtime out of startup entirely: 204 KB transferred on launch against
+ * roughly 590 KB before. Prefer that move to raising this again; the ceiling
+ * is only useful while it is lower than what the app would otherwise grow to.
  */
 const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
 

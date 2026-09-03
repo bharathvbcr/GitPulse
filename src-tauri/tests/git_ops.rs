@@ -434,7 +434,9 @@ fn test_branch_line_changes_rename_and_revision_history() {
     let all_history = GitReader::read_commit_history(&path, 20, None).expect("all history");
     assert!(all_history.iter().any(|c| c.summary.contains("main only")));
 
-    let range = GitReader::get_range_diff(&path, "main", "feat/renamed").expect("range diff");
+    let range = GitReader::get_range_diff(&path, "main", "feat/renamed")
+        .expect("range diff")
+        .text;
     assert!(range.contains("two") || range.contains("three") || range.contains("app.txt"));
 }
 
@@ -813,7 +815,9 @@ fn test_glob_shaped_paths_match_literally() {
         "pathspec must stay literal: {touching:?}"
     );
 
-    let diff = GitReader::get_file_diff(&path, "weird*.txt", false, false).expect("diff");
+    let diff = GitReader::get_file_diff(&path, "weird*.txt", false, false)
+        .expect("diff")
+        .text;
     assert!(
         diff.contains("edited"),
         "must diff the literal file: {diff}"
@@ -1150,7 +1154,8 @@ fn get_commit_file_diff_returns_only_the_requested_path() {
 
     let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
     let one = GitReader::get_commit_file_diff(&repo.path_str(), &head, "keep.txt")
-        .expect("path-scoped commit diff");
+        .expect("path-scoped commit diff")
+        .text;
     assert!(one.contains("keep-new") || one.contains("+keep-new"));
     assert!(
         !one.contains("other-new") && !one.contains("other-old"),

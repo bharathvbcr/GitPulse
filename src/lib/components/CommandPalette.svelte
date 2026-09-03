@@ -40,6 +40,8 @@
     CircleUserRound,
     FileCode,
     Keyboard,
+    Settings,
+    Plug,
   } from "lucide-svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { highlightMatches } from "../branches/groupBranches";
@@ -193,6 +195,20 @@
       icon: Bug,
       shortcut: undefined,
       action: () => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics")),
+    },
+    {
+      id: "settings",
+      label: "Open Settings",
+      icon: Settings,
+      shortcut: "⌘,",
+      action: () => window.dispatchEvent(new CustomEvent("gitpulse:settings")),
+    },
+    {
+      id: "mcp_setup",
+      label: "Connect an agent (MCP 2.0 / Agent Plugins)",
+      icon: Plug,
+      shortcut: undefined,
+      action: () => window.dispatchEvent(new CustomEvent("gitpulse:settings")),
     },
   ];
 

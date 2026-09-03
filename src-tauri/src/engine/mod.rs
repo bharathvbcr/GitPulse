@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
@@ -13,8 +14,10 @@ pub use git_cli::{
     ResolvedRepo,
 };
 pub use git_reader::{
-    BlameLine, BranchInfo, BranchStatsReport, BranchStatsUpdate, CommitDetails, CommitFileChange,
-    FileStatus, GitReader, ReflogEntry, RepoLanguageStat, TagInfo, TagList,
+    AuthorOwnership, BlameLine, BranchInfo, BranchStatsReport, BranchStatsUpdate,
+    CodeAgeDistribution, CommitDetails, CommitFileChange, DoraReport, FileStatus, GitReader,
+    KnowledgeReport, OrphanedFile, PulseCommitSummary, PulseExtensionChurn, PulseFileChurn,
+    PulseReport, ReflogEntry, RepoLanguageStat, TagInfo, TagList,
 };
 pub use git_writer::{GitWriter, RebaseActionKind, RebaseStep, ResetMode};
 pub use provenance::{ProvenanceFreshness, SessionEpisodeNote, VerificationNote};
@@ -22,4 +25,4 @@ pub use remotes::{RemoteChange, RemoteInfo, RemoteList};
 pub use repo_op::{OperationAction, OperationKind, RepoOperation};
 pub use stash::{StashAction, StashEntry};
 pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
-pub use worktree::WorktreeInfo;
+pub use worktree::{agent_kind, agent_session_slug, WorktreeInfo};

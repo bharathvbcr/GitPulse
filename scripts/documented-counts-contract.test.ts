@@ -13,7 +13,7 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
  * Each count is taken from the canonical implementation rather than recounted
  * here, so this cannot drift from what the checkers actually measure.
  */
-const DOCS = ["README.md", "CONTRIBUTING.md", "docs/ARCHITECTURE.md"] as const;
+const DOCS = ["README.md", "CONTRIBUTING.md", "docs/ARCHITECTURE.md", "docs/FEATURES.md"] as const;
 
 function read(relative: string): string {
   return readFileSync(new URL(`../${relative}`, import.meta.url), "utf8");
@@ -54,7 +54,11 @@ describe("documented counts match the code", () => {
   });
 
   it("states the real number of registered views", () => {
-    expectAllClaim(/(\d+)\s+(?:application )?views/g, REGISTERED_VIEWS.length, "view");
+    expectAllClaim(
+      /(\d+)\s+(?:application |specialized |purpose-built )?views/g,
+      REGISTERED_VIEWS.length,
+      "view",
+    );
   });
 
   it("states the real number of type-checked fields", () => {

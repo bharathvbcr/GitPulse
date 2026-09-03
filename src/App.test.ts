@@ -35,6 +35,66 @@ function usedComponents(template: string): string[] {
   return [...new Set([...template.matchAll(/<([A-Z][A-Za-z0-9]*)\b/g)].map((match) => match[1]))];
 }
 
+/**
+ * Views the app does not need in order to start. Each is fetched as its own
+ * chunk on first use, which is what keeps the entry chunk under the budget the
+ * `gitpulse-bundle-budget` Vite plugin enforces — and, through TerminalPanel,
+ * keeps the 334 KB xterm runtime out of startup entirely.
+ *
+ * A plain `import Foo from "./lib/components/Foo.svelte"` anywhere in App.svelte
+ * pulls the view straight back into the entry chunk. That is invisible in
+ * review and shows up only as a build that fails weeks later on an unrelated
+ * change, so it is pinned here.
+ */
+const DEFERRED_VIEWS = [
+  "CoverageViewer",
+  "HealthPanel",
+  "StoragePanel",
+  "TerminalPanel",
+  "CodeStackViewer",
+  "GitHubPanel",
+  "ManviOpsPanel",
+  "ReflogViewer",
+  "BlameViewer",
+  "ConflictEditor",
+  "PulseView",
+];
+
+describe("App view code splitting", () => {
+  const { script, template } = scriptAndTemplate(source);
+
+  it.each(DEFERRED_VIEWS)("loads %s lazily rather than at startup", (view) => {
+    expect(
+      script,
+      `${view} is statically imported, which puts it back in the entry chunk`,
+    ).not.toMatch(new RegExp(`import\\s+${view}\\s+from`));
+    expect(script, `${view} has no dynamic loader`).toContain(
+      `const load${view} = () => import(`,
+    );
+    expect(template, `load${view} is declared but never rendered`).toContain(
+      `load={load${view}}`,
+    );
+  });
+
+  /**
+   * The default tab. Deferring it would trade a smaller entry chunk for a
+   * round trip on every launch, which is the opposite of the point.
+   */
+  it("keeps the default Work view eager", () => {
+    expect(script).toMatch(/import\s+WorkView\s+from/);
+    expect(template).toContain("<WorkView />");
+  });
+
+  /**
+   * LazyView keys its cache on the loader's identity, so an inline arrow would
+   * be a fresh function on every render: cache miss, refetch, and a remount of
+   * the view under the user on every parent update.
+   */
+  it("passes only stable module-scope loaders, never inline arrows", () => {
+    expect(template).not.toMatch(/load=\{\s*\(\)\s*=>/);
+  });
+});
+
 describe("App overlay wiring", () => {
   it("imports every PascalCase component the template instantiates", () => {
     const { script, template } = scriptAndTemplate(source);

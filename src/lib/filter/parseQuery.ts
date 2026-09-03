@@ -3,6 +3,8 @@ export interface ParsedFilterQuery {
   path?: string;
   sha?: string;
   commitType?: string;
+  /** Local calendar day `YYYY-MM-DD`. Matching uses the row's author timestamp. */
+  date?: string;
   text: string;
 }
 
@@ -41,6 +43,12 @@ export function parseFilterQuery(query: string): ParsedFilterQuery {
       const value = token.slice("type:".length).toLowerCase();
       if (value) parsed.commitType = value;
       else free.push(token);
+    } else if (token.startsWith("date:")) {
+      // Consumed even when the value is malformed, so `date:2026-09-02`
+      // cannot fall through to free-text and match nothing. Matching is
+      // local-calendar and lives in matchesCommit.
+      const value = token.slice("date:".length);
+      if (value) parsed.date = value;
     } else if (token.endsWith(":")) {
       const kind = token.slice(0, -1).toLowerCase();
       if (CONVENTIONAL_TYPES.has(kind)) {
@@ -70,13 +78,32 @@ export function queryNeedsServerFetch(query: string): boolean {
     .some((token) => token.startsWith("path:"));
 }
 
+function localDayKeyFromEpochSeconds(timestampSec: number): string | null {
+  if (!Number.isFinite(timestampSec) || timestampSec <= 0) return null;
+  const d = new Date(timestampSec * 1000);
+  const month = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
+
 export function matchesCommit(
-  row: { id: string; summary: string; author_name: string; author_email: string },
+  row: {
+    id: string;
+    summary: string;
+    author_name: string;
+    author_email: string;
+    timestamp?: number;
+  },
   query: ParsedFilterQuery
 ): boolean {
   if (query.author) {
     const hay = `${row.author_name} ${row.author_email}`.toLowerCase();
     if (!hay.includes(query.author)) return false;
+  }
+  if (query.date) {
+    // Fail closed: a date: predicate without a timestamp is not a match.
+    const key = localDayKeyFromEpochSeconds(row.timestamp ?? 0);
+    if (key !== query.date) return false;
   }
   if (query.sha && !row.id.toLowerCase().startsWith(query.sha)) return false;
   if (query.commitType) {

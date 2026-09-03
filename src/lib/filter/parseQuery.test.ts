@@ -135,6 +135,24 @@ describe("parseFilterQuery", () => {
     }
   );
 
+  it("parses date: as a predicate, never as free text", () => {
+    const parsed = parseFilterQuery("date:2026-09-02");
+    expect(parsed.date).toBe("2026-09-02");
+    expect(parsed.text).toBe("");
+
+    const noon = Math.floor(new Date(2026, 8, 2, 12, 0, 0).getTime() / 1000);
+    const row = {
+      id: "aaa111",
+      summary: "feat: add login",
+      author_name: "Alice",
+      author_email: "alice@example.com",
+      timestamp: noon,
+    };
+    expect(matchesCommit(row, parsed)).toBe(true);
+    expect(matchesCommit({ ...row, timestamp: noon - 86400 }, parsed)).toBe(false);
+    expect(matchesCommit({ ...row, timestamp: undefined }, parsed)).toBe(false);
+  });
+
   it("type: accepts any value, matching the backend filter exactly", () => {
     // Parity contract (analyzer/filter.rs): CommitFilter::parse takes any
     // non-empty type: value. The old client-only conventional-set gate made
@@ -173,5 +191,6 @@ describe("queryNeedsServerFetch", () => {
     expect(queryNeedsServerFetch("")).toBe(false);
     expect(queryNeedsServerFetch("oauth token")).toBe(false);
     expect(queryNeedsServerFetch("author:ada sha:abc feat:")).toBe(false);
+    expect(queryNeedsServerFetch("date:2026-09-02")).toBe(false);
   });
 });

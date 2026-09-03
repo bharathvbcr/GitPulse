@@ -235,6 +235,7 @@ pub fn build_native_menu<R: Runtime>(
             // the command palette.
             &item(app, actions::TAB_STORAGE, "Storage", None)?,
             &item(app, actions::TAB_REFLOG, "Reflog", None)?,
+            &item(app, actions::TAB_PULSE, "Pulse", None)?,
             &PredefinedMenuItem::separator(app)?,
             &item(
                 app,

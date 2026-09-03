@@ -3,6 +3,7 @@ import {
   ALL_STATUSES,
   degradedSummary,
   emptyTally,
+  insightSummary,
   noteworthyStatuses,
   openPathFor,
   parkedWorktree,
@@ -593,5 +594,38 @@ describe("dirtyCount", () => {
       inputs({ leases: null, worktrees: [{ ...worktree("/wt/a", "a"), dirty_files: null }] }),
     );
     expect(dirtyCount(p.rows[0])).toBe(-1);
+  });
+});
+
+describe("insightSummary", () => {
+  it("counts agent sessions from directory layout, not branch names", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [
+          { ...worktree("/repo", "main"), is_main: true, dirty_files: 0 },
+          { ...worktree("/repo/.claude/worktrees/s1", "claude/s1"), dirty_files: 2 },
+          { ...worktree("/repo/wt/claude/handmade", "claude/handmade"), dirty_files: 1 },
+        ],
+      }),
+    );
+    const summary = insightSummary(p);
+    expect(summary.worktrees).toBe(3);
+    expect(summary.agentSessions).toBe(1);
+    expect(summary.agentKinds).toEqual(["claude"]);
+    expect(summary.dirtyWorktrees).toBe(2);
+    expect(summary.unscannedDirty).toBe(0);
+  });
+
+  it("does not treat an unscanned dirty count as clean", () => {
+    const p = projectWork(
+      inputs({
+        leases: null,
+        worktrees: [{ ...worktree("/wt/a", "a"), dirty_files: null }],
+      }),
+    );
+    const summary = insightSummary(p);
+    expect(summary.dirtyWorktrees).toBe(0);
+    expect(summary.unscannedDirty).toBe(1);
   });
 });

@@ -181,6 +181,124 @@ fn display_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// Slash-normalised path with a leading `/`, matching the frontend detector.
+///
+/// Agent worktrees are recognised from directory layout, never from a branch
+/// name. The same repository opened on Windows reports backslashes, so both
+/// sides normalise before matching; a POSIX-only match would label every
+/// agent session there as hand-made.
+fn normalised_worktree_path(path: &str) -> String {
+    let mut out = String::from("/");
+    out.push_str(&path.replace('\\', "/"));
+    while out.contains("//") {
+        out = out.replace("//", "/");
+    }
+    out
+}
+
+/// The agent that created this worktree (`claude`, `cursor`, `codex`, …).
+///
+/// `None` when the path is not an agent worktree. Coding agents isolate a
+/// task under `<repo>/.<agent>/worktrees/<slug>`. Git's own
+/// `.git/worktrees/` metadata is the same shape and is excluded: that path
+/// is not a checkout. Detection does not guess from the branch name — a
+/// human can name a branch `claude/…`.
+pub fn agent_kind(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let normalised = normalised_worktree_path(path);
+    if normalised.to_ascii_lowercase().contains("/.git/worktrees/") {
+        return None;
+    }
+    let parts: Vec<&str> = normalised.split('/').filter(|p| !p.is_empty()).collect();
+    for i in 0..parts.len().saturating_sub(1) {
+        let part = parts[i];
+        if let Some(kind) = part.strip_prefix('.') {
+            if kind != "git" && parts[i + 1] == "worktrees" && !kind.is_empty() {
+                return Some(kind.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The session slug when `path` is an agent worktree.
+///
+/// Claude Code appends a short hash so concurrent sessions on the same task
+/// stay distinct. The whole segment is returned rather than a prettified
+/// prefix — trimming it would merge two sessions in the reader's eye.
+pub fn agent_session_slug(path: &str) -> Option<String> {
+    agent_kind(path)?;
+    let normalised = normalised_worktree_path(path);
+    let marker = "/worktrees/";
+    let at = normalised.find(marker)?;
+    normalised[at + marker.len()..]
+        .split('/')
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Ceiling on paths returned by [`changed_paths`]. Collision detection only
+/// needs identity, and a worktree that dirtied tens of thousands of files
+/// must not turn one insights call into an unbounded allocation.
+pub const MAX_CHANGED_PATHS: usize = 256;
+
+/// Repo-relative paths with uncommitted changes in this worktree.
+///
+/// Porcelain only — no numstat — so collision scans stay cheap enough to run
+/// across many worktrees. Past [`MAX_CHANGED_PATHS`] the vector is cut and
+/// the caller sees `truncated`.
+pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String> {
+    let repo = validate_repo(worktree_path)?;
+    if !repo.is_dir() {
+        return Err(format!(
+            "worktree path is not a directory: {}",
+            repo.display()
+        ));
+    }
+    let stdout = git_text(&repo, &["status", "--porcelain", "-z"])?;
+    let mut paths = status_paths(stdout.as_bytes());
+    let truncated = paths.len() > MAX_CHANGED_PATHS;
+    if truncated {
+        paths.truncate(MAX_CHANGED_PATHS);
+    }
+    Ok((paths, truncated))
+}
+
+/// Paths from `git status --porcelain -z`, including the origin of a rename.
+fn status_paths(bytes: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        let x = bytes[i] as char;
+        let y = bytes[i + 1] as char;
+        i += 3;
+        let end = match bytes[i..].iter().position(|&b| b == 0) {
+            Some(n) => i + n,
+            None => break,
+        };
+        let path = String::from_utf8_lossy(&bytes[i..end]).into_owned();
+        i = end + 1;
+        if !path.is_empty() {
+            paths.push(path);
+        }
+        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            match bytes[i..].iter().position(|&b| b == 0) {
+                Some(n) => {
+                    let origin = String::from_utf8_lossy(&bytes[i..i + n]).into_owned();
+                    i += n + 1;
+                    if !origin.is_empty() {
+                        paths.push(origin);
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+    paths
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts for the worktrees closest to the front of the list.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
@@ -669,5 +787,67 @@ some-future-field whatever
     fn test_list_worktrees_rejects_non_repo() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(list_worktrees(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn agent_kind_matches_the_layout_agents_actually_create() {
+        assert_eq!(
+            agent_kind("/repo/.claude/worktrees/add-parser-8540d4").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_kind("/repo/.cursor/worktrees/fix-auth").as_deref(),
+            Some("cursor")
+        );
+        assert_eq!(
+            agent_kind("/repo/.codex/worktrees/session-1").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_kind("C:\\Users\\me\\app\\.claude\\worktrees\\slug").as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn agent_kind_never_labels_git_metadata_or_a_branch_name() {
+        // `.git/worktrees/` is the same shape and is the one false positive
+        // that would put an "agent" chip on every linked worktree git creates.
+        assert_eq!(agent_kind("/repo/.git/worktrees/feature"), None);
+        assert_eq!(agent_kind("C:\\repo\\.git\\worktrees\\feature"), None);
+        assert_eq!(agent_kind("/repo"), None);
+        assert_eq!(agent_kind("/repo/worktrees/feature"), None);
+        assert_eq!(agent_kind("/repo/wt/claude/my-own-branch"), None);
+        assert_eq!(agent_kind("/home/claude/projects/app"), None);
+        assert_eq!(agent_kind(""), None);
+    }
+
+    #[test]
+    fn agent_session_slug_keeps_the_whole_segment() {
+        assert_eq!(
+            agent_session_slug("/repo/.claude/worktrees/agentic-git-repo-8540d4").as_deref(),
+            Some("agentic-git-repo-8540d4")
+        );
+        assert_eq!(
+            agent_session_slug("/repo/.claude/worktrees/slug/src/lib/x.ts").as_deref(),
+            Some("slug")
+        );
+        assert_eq!(
+            agent_session_slug("C:\\app\\.claude\\worktrees\\slug\\src").as_deref(),
+            Some("slug")
+        );
+        assert_eq!(agent_session_slug("/repo"), None);
+        assert_eq!(agent_session_slug("/repo/.git/worktrees/feature"), None);
+        assert_eq!(agent_session_slug("/repo/.claude/worktrees/"), None);
+    }
+
+    #[test]
+    fn status_paths_reads_porcelain_and_rename_pairs() {
+        assert!(status_paths(b"").is_empty());
+        assert_eq!(status_paths(b" M src/lib.rs\0"), vec!["src/lib.rs"]);
+        assert_eq!(
+            status_paths(b"R  new.rs\0old.rs\0"),
+            vec!["new.rs", "old.rs"]
+        );
     }
 }

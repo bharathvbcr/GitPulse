@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS pulse_snapshots (
+  id             INTEGER PRIMARY KEY,
+  day            TEXT NOT NULL,
+  repo_path      TEXT NOT NULL,
+  total_commits  INTEGER NOT NULL,
+  total_loc      INTEGER NOT NULL,
+  bus_factor     INTEGER NOT NULL,
+  coverage_pct   REAL,
+  snapshot_json  TEXT NOT NULL,
+  UNIQUE(day, repo_path)
+);
+CREATE INDEX IF NOT EXISTS idx_pulse_snapshots_repo_day ON pulse_snapshots(repo_path, day);
 "#;
 
 /// This build's event schema version, written into every row.
@@ -545,6 +557,94 @@ pub fn status(repo_path: &str) -> LedgerStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseSnapshotInput {
+    pub day: String,
+    pub total_commits: usize,
+    pub total_loc: usize,
+    pub bus_factor: usize,
+    pub coverage_pct: Option<f64>,
+    pub snapshot_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseSnapshotEntry {
+    pub id: i64,
+    pub day: String,
+    pub repo_path: String,
+    pub total_commits: usize,
+    pub total_loc: usize,
+    pub bus_factor: usize,
+    pub coverage_pct: Option<f64>,
+    pub snapshot_json: String,
+}
+
+pub fn save_pulse_snapshot(repo_path: &str, input: &PulseSnapshotInput) -> Result<(), LedgerError> {
+    with_conn(repo_path, |conn| {
+        conn.execute(
+            r#"
+            INSERT INTO pulse_snapshots (day, repo_path, total_commits, total_loc, bus_factor, coverage_pct, snapshot_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(day, repo_path) DO UPDATE SET
+                total_commits = excluded.total_commits,
+                total_loc = excluded.total_loc,
+                bus_factor = excluded.bus_factor,
+                coverage_pct = excluded.coverage_pct,
+                snapshot_json = excluded.snapshot_json
+            "#,
+            params![
+                input.day,
+                repo_path,
+                input.total_commits as i64,
+                input.total_loc as i64,
+                input.bus_factor as i64,
+                input.coverage_pct,
+                input.snapshot_json,
+            ],
+        )
+        .map_err(|e| LedgerError::new("insert_snapshot_failed", e.to_string()))?;
+        Ok(())
+    })
+}
+
+pub fn get_pulse_snapshots(
+    repo_path: &str,
+    limit: Option<usize>,
+) -> Result<Vec<PulseSnapshotEntry>, LedgerError> {
+    let lim = limit.unwrap_or(90).clamp(1, 365) as i64;
+    with_conn(repo_path, |conn| {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, day, repo_path, total_commits, total_loc, bus_factor, coverage_pct, snapshot_json
+                FROM pulse_snapshots
+                WHERE repo_path = ?1
+                ORDER BY day DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|e| LedgerError::new("query_snapshots_failed", e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![repo_path, lim], |row| {
+                Ok(PulseSnapshotEntry {
+                    id: row.get(0)?,
+                    day: row.get(1)?,
+                    repo_path: row.get(2)?,
+                    total_commits: row.get::<_, i64>(3)? as usize,
+                    total_loc: row.get::<_, i64>(4)? as usize,
+                    bus_factor: row.get::<_, i64>(5)? as usize,
+                    coverage_pct: row.get(6)?,
+                    snapshot_json: row.get(7)?,
+                })
+            })
+            .map_err(|e| LedgerError::new("query_snapshots_failed", e.to_string()))?;
+
+        let entries = rows.flatten().collect();
+        Ok(entries)
+    })
+}
+
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -817,5 +917,30 @@ mod identity_tests {
         let p = ledger_path("/definitely/not/here");
         assert!(p.ends_with("ledger.sqlite"));
         assert_eq!(ledger_path("/definitely/not/here/"), p);
+    }
+
+    #[test]
+    fn pulse_snapshots_persist_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        let input = PulseSnapshotInput {
+            day: "2026-09-02".to_string(),
+            total_commits: 42,
+            total_loc: 1337,
+            bus_factor: 2,
+            coverage_pct: Some(88.5),
+            snapshot_json: "{\"test\":true}".to_string(),
+        };
+
+        save_pulse_snapshot(path, &input).expect("save snapshot");
+
+        let snapshots = get_pulse_snapshots(path, Some(10)).expect("get snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].day, "2026-09-02");
+        assert_eq!(snapshots[0].total_commits, 42);
+        assert_eq!(snapshots[0].total_loc, 1337);
+        assert_eq!(snapshots[0].bus_factor, 2);
+        assert_eq!(snapshots[0].coverage_pct, Some(88.5));
     }
 }

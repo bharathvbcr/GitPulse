@@ -128,11 +128,16 @@ export const CONTRACTS = Object.freeze([
   { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
   { label: "refs", rustPath: rust("graph", "refs.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["RefDecoration"] },
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
-  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport"] },
+  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo"] },
+  { label: "insights", rustPath: rust("insights", "mod.rs"), tsPath: ts("insights", "types.ts"), structs: [
+    "WorktreeSummary", "AgentKindCount", "AgentSummary", "WorktreeFacet", "ChangesFacet",
+    "CollisionParty", "CollisionItem", "CollisionRisk", "InsightsSnapshot",
+    "ChangedFile", "ActiveChanges", "ChangeContext", "McpToolInfo", "McpInfo",
+  ] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
   { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
@@ -143,6 +148,8 @@ export const CONTRACTS = Object.freeze([
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
+  { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
+  { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },
   { label: "updates", rustPath: rust("updates", "mod.rs"), tsPath: ts("updates", "updateCheck.ts"), structs: ["UpdateCheck"] },
   // The repository-surface payloads. Each has a hand-written TypeScript mirror
   // the UI branches on, so they are checked rather than excused: a renamed

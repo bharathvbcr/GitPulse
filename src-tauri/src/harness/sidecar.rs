@@ -500,10 +500,99 @@ static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static SLOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Proof that the holder has serialized against every other sidecar-touching
+/// test. Obtained only from [`test_serial`].
+///
+/// The sidecar is one process-global slot: a test that installs a recording or
+/// refusing fake installs it for *every* thread. Two failure modes follow, and
+/// this crate has seen both:
+///
+/// - the fake's canned verdict answers an unrelated test's real request, so
+///   that test asserts against a response nobody meant it to get;
+/// - the unrelated test's request lands first in the fake's recording file, so
+///   the installing test parses the wrong frame and reads absent fields as
+///   "the feature did not work".
+///
+/// The second one merely fails. The first can just as easily *pass* — an
+/// "allow everything" fake makes a gating assertion succeed while proving
+/// nothing — which is the failure this type exists to make unrepresentable.
+/// Reentrant on the owning thread. It has to be: [`call_policy`] takes this
+/// same guard on every test-build call, so a test that holds it across an
+/// install-then-request sequence would otherwise deadlock against its own
+/// request. `std::sync::ReentrantLock` is still unstable, so the depth count
+/// below is the reentrancy.
+#[cfg(test)]
+pub(crate) struct SidecarTestGuard {
+    /// `None` for a re-entry: the outermost guard on this thread owns the
+    /// mutex and is what will release it.
+    #[allow(dead_code)]
+    outer: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+static SLOT_TEST_OWNER: Mutex<Option<(std::thread::ThreadId, usize)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn slot_test_owner() -> std::sync::MutexGuard<'static, Option<(std::thread::ThreadId, usize)>> {
+    SLOT_TEST_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The one way to touch the sidecar from a test.
+///
+/// Poison-tolerant: a panicking test must not wedge every later one, and the
+/// data behind this lock is the emptiness of `()`.
+#[cfg(test)]
+pub(crate) fn test_serial() -> SidecarTestGuard {
+    let me = std::thread::current().id();
+    {
+        let mut owner = slot_test_owner();
+        if let Some((thread, depth)) = owner.as_mut() {
+            if *thread == me {
+                *depth += 1;
+                return SidecarTestGuard { outer: None };
+            }
+        }
+    }
+    // Not the owner: block for the real lock, then claim it. Ownership is
+    // recorded only after acquisition, so no other thread can mistake itself
+    // for the owner in the window between the two.
+    let guard = SLOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot_test_owner() = Some((me, 1));
+    SidecarTestGuard { outer: Some(guard) }
+}
+
+#[cfg(test)]
+impl Drop for SidecarTestGuard {
+    fn drop(&mut self) {
+        let mut owner = slot_test_owner();
+        if let Some((_, depth)) = owner.as_mut() {
+            *depth -= 1;
+            if *depth == 0 {
+                *owner = None;
+            }
+        }
+        // Ownership is cleared while the mutex is still held, so the next
+        // thread in cannot observe a stale owner: `self.outer` releases the
+        // mutex after this scope ends.
+        drop(owner);
+    }
+}
+
+/// Installs a fake sidecar binary for the whole process.
+///
+/// Takes the guard by reference rather than merely documenting that one is
+/// required: without it, "I forgot to serialize" is a silent race, and with it
+/// the same mistake does not compile.
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn set_test_binary(path: Option<String>) {
-    let mut current = TEST_BINARY.lock().expect("test binary registry");
+pub(crate) fn set_test_binary(_serial: &SidecarTestGuard, path: Option<String>) {
+    let mut current = TEST_BINARY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *current = path;
 }
 
@@ -872,6 +961,16 @@ pub fn call_policy<T: serde::de::DeserializeOwned>(
     params: impl Serialize,
     timeout: Duration,
 ) -> Result<T, HarnessError> {
+    // Every request to the one process-global sidecar serializes against the
+    // tests that install a fake into it. Taken here, at the funnel, rather
+    // than left to each test to remember: the consumers are every code path
+    // that gates a command or a file write, which is not a list anyone can
+    // keep current, and a test that forgets does not fail loudly — it asserts
+    // against another test's canned verdict, which can just as easily pass.
+    // Reentrant, so a test holding the guard across install-then-request does
+    // not block against itself.
+    #[cfg(test)]
+    let _serial = test_serial();
     let params = serde_json::to_value(params)
         .map_err(|e| HarnessError::Protocol(format!("could not encode {} params: {}", op, e)))?;
     match call_typed::<T>(op, Some(params.clone()), timeout) {
@@ -1050,9 +1149,7 @@ mod tests {
         // Share the slot tests' serialization: the poisoned-slot fixture
         // holds a transiently poisoned mutex, and this test's plain `lock`
         // must never observe that window.
-        let _serial = SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = test_serial();
         // Held for the caller's whole budget: `Busy` is honest, but only
         // after the wait. Going through `super::call` keeps the real seam —
         // the one that renders an unchecked verdict — under test.
@@ -1268,9 +1365,7 @@ mod tests {
     /// must complete promptly rather than hang or re-raise the poison.
     #[test]
     fn poisoned_slot_recovery_drops_the_corrupt_session() {
-        let _serial = SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = test_serial();
 
         {
             let mut guard = slot().lock().expect("seed the slot");
@@ -1353,6 +1448,54 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// Reentrancy is load-bearing, not a convenience: [`call_policy`] takes
+    /// this guard on every test-build call, so a test that holds it across an
+    /// install-then-request sequence acquires it twice on one thread. Without
+    /// reentrancy that is a hard deadlock, and the suite would hang rather
+    /// than fail.
+    #[test]
+    fn the_sidecar_test_guard_is_reentrant_on_one_thread() {
+        let outer = test_serial();
+        let middle = test_serial();
+        let inner = test_serial();
+        // Reaching here at all is the assertion: a non-reentrant lock would
+        // never have returned from the second call.
+        drop(inner);
+        drop(middle);
+        drop(outer);
+
+        // And the lock is genuinely free again afterwards, from another
+        // thread — a depth counter that failed to unwind would strand it.
+        let taken = std::thread::spawn(|| {
+            let _guard = test_serial();
+            true
+        })
+        .join()
+        .expect("a released guard must be retakeable");
+        assert!(taken);
+    }
+
+    /// The other half: a different thread must actually be excluded, or the
+    /// serialization is decorative and a fake sidecar still leaks across tests.
+    #[test]
+    fn the_sidecar_test_guard_excludes_other_threads() {
+        let held = test_serial();
+        let (tx, rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            let _guard = test_serial();
+            let _ = tx.send(());
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a second thread must not acquire the guard while it is held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("releasing the guard must let the waiting thread in");
+        contender.join().expect("contender thread");
+    }
+
     /// Regression (one policy timeout kills the gate): a single timed-out
     /// verdict used to drop the sidecar and arm the 30s respawn backoff, so
     /// every mutation in that window proceeded unchecked. `call_policy` must
@@ -1361,9 +1504,7 @@ done
     #[cfg(unix)]
     #[test]
     fn policy_verdict_retries_once_on_a_fresh_connection() {
-        let _serial = SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = test_serial();
 
         let dir = tempfile::tempdir().expect("tempdir for fake-manvi");
         let count_file = dir.path().join("connections");
@@ -1377,14 +1518,17 @@ done
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("make fake-manvi executable");
 
-        set_test_binary(Some(script_path.to_string_lossy().into_owned()));
-        struct ClearBinary;
-        impl Drop for ClearBinary {
+        set_test_binary(&_serial, Some(script_path.to_string_lossy().into_owned()));
+        // Carries the guard the test already holds. Re-acquiring it here would
+        // deadlock on unwind: `SLOT_TEST_LOCK` is a plain `std::sync::Mutex`
+        // and is not reentrant.
+        struct ClearBinary<'a>(&'a SidecarTestGuard);
+        impl Drop for ClearBinary<'_> {
             fn drop(&mut self) {
-                set_test_binary(None);
+                set_test_binary(self.0, None);
             }
         }
-        let _clear_on_unwind = ClearBinary;
+        let _clear_on_unwind = ClearBinary(&_serial);
 
         // Tests share the process-wide slot: an earlier test may have left a
         // live sidecar (spawned from the real manvi) sitting in it, which

@@ -1,6 +1,6 @@
 # GitPulse Features & View Catalog
 
-GitPulse provides 14 specialized views categorized into **Work**, **Inspect**, and **System/Ops** groups.
+GitPulse provides 15 application views categorized into **Work**, **Inspect**, and **System/Ops** groups.
 
 ```mermaid
 flowchart TD
@@ -18,6 +18,7 @@ flowchart TD
         Health["<b>Health</b> (<code>health</code>)<br/>Multi-ecosystem vulnerability & staleness audits, Dependabot"]
         Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage breakdown, unignored caches, snapshot trends"]
         Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization & rebase workflow manager"]
+        Pulse["<b>Pulse</b> (<code>pulse</code>)<br/>Heatmap, streaks, churn, hotspots, knowledge, local DORA"]
     end
 
     subgraph SystemGroup["System & Ops Views (Terminal & Automation)"]
@@ -126,6 +127,17 @@ flowchart TD
 - **Stacked Branch Management**: Visualizes branch chains and dependencies.
 - **Interactive Rebase Helper**: Smooth workflow for updating and rebasing stacked PR branches.
 
+### 2.6 Pulse (`pulse`)
+- **Contribution heatmap**: 53-week calendar of local-day activity, toggling commit count vs churn. Includes unpushed and all-branch commits. Click a day to filter Graph with `date:YYYY-MM-DD`.
+- **Rhythm**: current streak, longest run and longest gap in the last 90 days, plus active-day rate. A bounded history is labelled as such; a gap is never an artifact of where the scan stopped.
+- **Punch card**: hour-of-week grid with after-hours share. Defaults to every author on every local and remote branch; an author filter is required before reading it as personal.
+- **Line changes and LOC**: weekly additions vs deletions, reconstructed LOC trend from today's language-scan total walking numstat backwards, and churn-by-extension from the same walk. A partial or failed language scan is not shown as `0` LOC.
+- **Commit hygiene**: conventional-commit rate (same type set the backend parser accepts), median non-merge churn, signed-commit rate, merge rate, co-author rate from `Co-authored-by:` trailers in the commit body.
+- **Hotspot risk**: files ranked by churn × coverage. Unscanned coverage is "unknown", not "untested".
+- **Knowledge and age**: blame-bounded bus factor, orphaned files, line-age distribution. Truncation is visible.
+- **Local DORA**: deploy frequency and lead time from tags and `git describe --contains`. Change-failure rate and restore time are labelled approximations; a missing estimate is "—" not a invented number.
+- **Honesty**: payload-budget truncation is data, not an error. Scan Deeper raises the commit cap only when the byte budget was not the limiter. No `.mailmap` is announced, because per-author tiles are otherwise split across emails.
+
 ---
 
 ## 3. System & Ops Views
@@ -135,6 +147,13 @@ flowchart TD
 - **Strict Isolation**: AI agents and sidecars have zero access to the user terminal PTY or keystrokes.
 - **Diagnostic Preservation**: Preserves command output, exit status, and failure context across builds.
 - **Lifecycle Supervision**: Clean process lifecycle teardown when closing tabs or switching repositories.
+
+### 3.1a Agents (MCP 2.0 / Agent Plugins 1.0)
+- **Protocol**: `gitpulse-mcp` implements [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — `server/discover`, per-request `_meta`, `resultType` on results, cacheable tool lists. Dual-era: legacy `initialize` (2024-11-05 / 2025-11-25) still works.
+- **Package**: Agent Plugins 1.0 at `plugin/` — closed `plugin.json`, `mcp.json` with explicit `type: "stdio"` and a single-token `command`, plus skills under `skills/`.
+- **Tools**: `gitpulse_insights`, `gitpulse_collision_risk`, `gitpulse_change_context`, `gitpulse_active_changes`, plus ledger, tasks, codeintel, provenance. Read-only.
+- **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
+- **Settings**: copies `plugin.json` / `mcp.json` and names the binary path, or why it could not be found.
 
 ### 3.2 MANVI View (`manvi`)
 - **Policy Monitor**: Displays real-time status of the MANVI command and file write gates.

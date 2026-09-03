@@ -80,7 +80,9 @@ fn no_trailing_newline_commit_round_trips_cleanly() {
     let two = GitReader::head_id(path).expect("head_id");
 
     // The raw patch keeps the marker and never panics the parser seam.
-    let diff = GitReader::get_commit_diff(path, &two).expect("commit diff");
+    let diff = GitReader::get_commit_diff(path, &two)
+        .expect("commit diff")
+        .text;
     assert!(diff.contains("\\ No newline at end of file"));
     assert!(diff.contains("+fn b() {}"));
 
@@ -91,10 +93,14 @@ fn no_trailing_newline_commit_round_trips_cleanly() {
 
     // Unstaged and staged worktree diffs over the same shape stay clean.
     std::fs::write(repo.path().join("x.rs"), "fn a() {}\nfn c() {}\n").unwrap();
-    let wt = GitReader::get_file_diff(path, "x.rs", false, false).expect("worktree diff");
+    let wt = GitReader::get_file_diff(path, "x.rs", false, false)
+        .expect("worktree diff")
+        .text;
     assert!(wt.contains("-fn b()"));
     GitWriter::stage_file(path, "x.rs").expect("stage");
-    let idx = GitReader::get_file_diff(path, "x.rs", true, false).expect("staged diff");
+    let idx = GitReader::get_file_diff(path, "x.rs", true, false)
+        .expect("staged diff")
+        .text;
     assert!(idx.contains("+fn c()"));
 
     // The shortstat grammar this project parses (loc_counter) reads real
@@ -139,7 +145,9 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     assert!(!blob.base64.unwrap().is_empty());
 
     let commit = GitReader::head_id(path).unwrap();
-    let _diff = GitReader::get_commit_diff(path, &commit).expect("diff");
+    let _diff = GitReader::get_commit_diff(path, &commit)
+        .expect("diff")
+        .text;
     let files = GitReader::get_commit_files(path, &commit).unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "bin5m.dat");
@@ -185,7 +193,9 @@ fn exotic_path_survives_status_numstat_diff_blame_end_to_end() {
     assert_eq!((entry.additions, entry.deletions), (1, 0));
     assert_eq!(entry.old_path, None);
 
-    let diff = GitReader::get_file_diff(path, rel, false, false).expect("file diff");
+    let diff = GitReader::get_file_diff(path, rel, false, false)
+        .expect("file diff")
+        .text;
     assert!(diff.contains("@@"), "diff must contain a hunk: {diff}");
 
     let blame = GitReader::get_file_blame(path, rel).expect("blame");
@@ -290,7 +300,9 @@ fn empty_repo_reader_contract() {
         .expect("status works pre-first-commit")
         .is_empty());
     assert_eq!(
-        GitReader::get_file_diff(path, "seed.txt", false, false).expect("empty diff"),
+        GitReader::get_file_diff(path, "seed.txt", false, false)
+            .expect("empty diff")
+            .text,
         ""
     );
     assert!(GitReader::list_tags(path)

@@ -21,7 +21,7 @@
 //! HEAD *plus* uncommitted changes, and a note saying HEAD passed would be a
 //! claim about a tree that was never tested.
 
-use crate::engine::git_cli::{capture_command, validate_repo, CapturedOutput};
+use crate::engine::git_cli::{capture_command, git_text, validate_repo, CapturedOutput};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -382,18 +382,14 @@ fn run_verdict(report: &CiLocalReport) -> &'static str {
 /// the same as `Ok(false)`: a note must never be written on the strength of a
 /// cleanliness check that did not run.
 fn working_tree_is_dirty(repo: &Path) -> Result<bool, String> {
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .current_dir(repo)
-        .output()
+    // Through the engine, not a bare `Command`: these two calls used to spawn
+    // git directly and so inherited none of the shared guarantees -- no
+    // timeout, no output cap, none of the GIT_CONFIG/askpass stripping every
+    // other call gets, and no place in the spawn gate that bounds how many
+    // children exist at once.
+    let out = git_text(repo, &["status", "--porcelain", "--untracked-files=no"])
         .map_err(|e| format!("could not run git status: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    Ok(!out.trim().is_empty())
 }
 
 /// Records a completed run as a verification note on HEAD.
@@ -425,22 +421,9 @@ fn record_verification(repo: &Path, report: &CiLocalReport) -> (String, String) 
         Ok(false) => {}
     }
 
-    let head = match std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-    {
+    let head = match git_text(repo, &["rev-parse", "HEAD"]) {
         Err(e) => return (String::new(), format!("could not resolve HEAD: {e}")),
-        Ok(out) if !out.status.success() => {
-            return (
-                String::new(),
-                format!(
-                    "could not resolve HEAD: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            )
-        }
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) => out.trim().to_string(),
     };
 
     let note = crate::engine::provenance::VerificationNote {

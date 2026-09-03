@@ -152,7 +152,18 @@ pub fn show(repo_path: &str, oid: &str) -> Result<String, String> {
     validate_oid(oid)?;
     // `-u` includes files the stash captured as untracked, which are otherwise
     // invisible in the preview and then appear on apply.
-    git_text(repo.as_path(), &["stash", "show", "-p", "-u", oid])
+    // Budgeted like every other diff: a stash of a large refactor is the same
+    // 40 MB payload a commit diff is, and it lands in the same viewer.
+    let (text, truncated) = crate::engine::git_cli::git_text_capped(
+        repo.as_path(),
+        &["stash", "show", "-p", "-u", oid],
+        crate::engine::budget::MAX_DIFF_BYTES,
+    )?;
+    Ok(if truncated {
+        crate::engine::budget::drop_partial_last_line(text)
+    } else {
+        text
+    })
 }
 
 /// The argv an action would execute against `selector`.

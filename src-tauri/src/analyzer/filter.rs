@@ -13,6 +13,11 @@ pub struct CommitFilter {
     pub path: Option<String>,
     pub sha: Option<String>,
     pub commit_type: Option<String>,
+    /// `date:YYYY-MM-DD` token. Consumed so it cannot fall through to free
+    /// text (which would match nothing). Matching itself is a client concern:
+    /// Pulse and the Graph filter by *local* calendar day, which this process
+    /// cannot reconstruct without the user's timezone.
+    pub date: Option<String>,
     pub text: String,
 }
 
@@ -38,6 +43,10 @@ impl CommitFilter {
             } else if let Some(value) = token.strip_prefix("type:") {
                 if !value.is_empty() {
                     filter.commit_type = Some(value.to_lowercase());
+                }
+            } else if let Some(value) = token.strip_prefix("date:") {
+                if !value.is_empty() {
+                    filter.date = Some(value.to_string());
                 }
             } else if token.ends_with(':') {
                 let kind = token.trim_end_matches(':').to_lowercase();
@@ -71,6 +80,7 @@ impl CommitFilter {
             && self.path.is_none()
             && self.sha.is_none()
             && self.commit_type.is_none()
+            && self.date.is_none()
             && self.text.is_empty()
     }
 
@@ -140,6 +150,21 @@ mod tests {
         assert_eq!(filter.commit_type.as_deref(), Some("feat"));
         assert_eq!(filter.sha.as_deref(), Some("abc123"));
         assert_eq!(filter.text, "oauth");
+    }
+
+    #[test]
+    fn date_token_is_consumed_and_never_becomes_free_text() {
+        // Heatmap click writes `date:YYYY-MM-DD`. If that token fell through
+        // to free text, every Graph row would miss because the subject does
+        // not contain the literal "date:2026-09-02".
+        let filter = CommitFilter::parse("date:2026-09-02");
+        assert_eq!(filter.date.as_deref(), Some("2026-09-02"));
+        assert!(filter.text.is_empty());
+        let row = commit("feat: add login", "Alice", "aaa111");
+        assert!(
+            filter.matches_commit(&row),
+            "date: is a client-side predicate; the backend must not reject the row"
+        );
     }
 
     #[test]

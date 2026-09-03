@@ -28,13 +28,6 @@
   import CommitDetails from "./lib/components/CommitDetails.svelte";
   import FileViewer from "./lib/components/FileViewer.svelte";
   import DiffViewer from "./lib/components/DiffViewer.svelte";
-  import ConflictEditor from "./lib/components/ConflictEditor.svelte";
-  import BlameViewer from "./lib/components/BlameViewer.svelte";
-  import CoverageViewer from "./lib/components/CoverageViewer.svelte";
-  import HealthPanel from "./lib/components/HealthPanel.svelte";
-  import StoragePanel from "./lib/components/StoragePanel.svelte";
-  import TerminalPanel from "./lib/components/TerminalPanel.svelte";
-  import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
   import {
@@ -54,10 +47,29 @@
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import GitHubPanel from "./lib/components/GitHubPanel.svelte";
-  import ManviOpsPanel from "./lib/components/ManviOpsPanel.svelte";
-  import ReflogViewer from "./lib/components/ReflogViewer.svelte";
   import WorkView from "./lib/components/WorkView.svelte";
+  import LazyView from "./lib/components/LazyView.svelte";
+
+  // Views the app does not need to start. Each becomes its own chunk, so
+  // opening a repository no longer parses the coverage, health, storage,
+  // GitHub, terminal and Manvi panes — nor, through TerminalPanel, the
+  // 334 KB xterm runtime. WorkView is deliberately NOT here: it is the
+  // default tab, so deferring it would only add a round trip to startup.
+  //
+  // Declared at module scope on purpose. LazyView keys its cache on the
+  // loader's identity, so an inline `load={() => import(...)}` would be a
+  // fresh function each render and remount the view every update.
+  const loadCoverageViewer = () => import("./lib/components/CoverageViewer.svelte");
+  const loadHealthPanel = () => import("./lib/components/HealthPanel.svelte");
+  const loadStoragePanel = () => import("./lib/components/StoragePanel.svelte");
+  const loadTerminalPanel = () => import("./lib/components/TerminalPanel.svelte");
+  const loadCodeStackViewer = () => import("./lib/components/CodeStackViewer.svelte");
+  const loadGitHubPanel = () => import("./lib/components/GitHubPanel.svelte");
+  const loadManviOpsPanel = () => import("./lib/components/ManviOpsPanel.svelte");
+  const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
+  const loadBlameViewer = () => import("./lib/components/BlameViewer.svelte");
+  const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
+  const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -196,6 +208,12 @@
     };
     window.addEventListener("gitpulse:shortcuts", openShortcuts);
     track(() => window.removeEventListener("gitpulse:shortcuts", openShortcuts));
+
+    const openSettings = () => {
+      isSettingsModalOpen = true;
+    };
+    window.addEventListener("gitpulse:settings", openSettings);
+    track(() => window.removeEventListener("gitpulse:settings", openSettings));
 
     const handleGlobalKeydown = (e: KeyboardEvent) => {
       const isInput =
@@ -603,23 +621,25 @@
               {:else if $repoStore.activeTab === "diff"}
                 <DiffViewer />
               {:else if $repoStore.activeTab === "conflict"}
-                <ConflictEditor />
+                <LazyView load={loadConflictEditor} name="the conflict editor" />
               {:else if $repoStore.activeTab === "blame"}
-                <BlameViewer />
+                <LazyView load={loadBlameViewer} name="blame" />
               {:else if $repoStore.activeTab === "coverage"}
-                <CoverageViewer />
+                <LazyView load={loadCoverageViewer} name="Coverage" />
               {:else if $repoStore.activeTab === "health"}
-                <HealthPanel />
+                <LazyView load={loadHealthPanel} name="Health" />
               {:else if $repoStore.activeTab === "storage"}
-                <StoragePanel />
+                <LazyView load={loadStoragePanel} name="Storage" />
               {:else if $repoStore.activeTab === "stack"}
-                <CodeStackViewer />
+                <LazyView load={loadCodeStackViewer} name="the code stack" />
+              {:else if $repoStore.activeTab === "pulse"}
+                <LazyView load={loadPulseView} name="Pulse" />
               {:else if $repoStore.activeTab === "github"}
-                <GitHubPanel />
+                <LazyView load={loadGitHubPanel} name="GitHub" />
               {:else if $repoStore.activeTab === "manvi"}
-                <ManviOpsPanel />
+                <LazyView load={loadManviOpsPanel} name="Manvi ops" />
               {:else if $repoStore.activeTab === "reflog"}
-                <ReflogViewer />
+                <LazyView load={loadReflogViewer} name="the reflog" />
               {/if}
             </div>
           </main>
@@ -629,7 +649,7 @@
                survives; display:none pauses rendering, not the process. -->
           <svelte:boundary failed={paneFailed}>
             <div class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={!terminalActive}>
-              <TerminalPanel />
+              <LazyView load={loadTerminalPanel} name="the terminal" />
             </div>
           </svelte:boundary>
         {/if}

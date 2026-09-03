@@ -61,6 +61,8 @@ export interface FilterableRow {
   summary: string;
   author_name: string;
   author_email: string;
+  /** Author timestamp in epoch seconds. Required for `date:` predicates. */
+  timestamp?: number;
   lane?: number;
   active_lanes?: readonly number[] | null;
   active_lane_colors?: readonly number[] | null;

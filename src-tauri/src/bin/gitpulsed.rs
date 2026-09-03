@@ -247,6 +247,10 @@ fn main() {
     // fill, and nothing anywhere that said why.
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
+    // Unattended catch-up walks every repository it was given, so it is the
+    // binary most likely to run out of descriptors and the least likely to
+    // have anyone watching when it does.
+    log::info!(target: "setup", "{}", gitpulse_lib::limits::raise_open_file_limit().describe());
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse(&argv) {
         Parsed::Help => {

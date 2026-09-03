@@ -30,6 +30,13 @@ describe("CommandPalette", () => {
     expect(source).toContain("recordFrecency");
   });
 
+  it("exposes Settings and MCP setup as commands", () => {
+    expect(source).toContain('id: "settings"');
+    expect(source).toContain('id: "mcp_setup"');
+    expect(source).toContain("gitpulse:settings");
+    expect(source).toContain("MCP 2.0");
+  });
+
   it("renders LanguageLogo for symbol and file hits", () => {
     expect(source).toContain("LanguageLogo");
     expect(source).toContain("filePath={cmd.filePath}");

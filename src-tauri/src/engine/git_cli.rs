@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -372,6 +372,18 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// scan would be worse than reading part of the listing.
 pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), String> {
     let (bytes, truncated) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+/// Runs `git` with an explicit stdout budget, returning the text plus whether
+/// the stream was cut off at the cap.
+///
+/// The seam every UI-bound payload goes through. Truncation is data, not an
+/// error: a diff too large to render is still worth showing the head of, so
+/// long as the caller says so rather than presenting a prefix as the whole
+/// thing. See [`crate::engine::budget`] for the budgets themselves.
+pub fn git_text_capped(repo: &Path, args: &[&str], cap: usize) -> Result<(String, bool), String> {
+    let (bytes, truncated) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
@@ -855,6 +867,119 @@ pub(crate) struct BoundedRun {
     pub truncated: bool,
 }
 
+/// Ceiling on how many child processes this engine keeps alive at once.
+///
+/// Every `git`, `gh` and `npm` invocation in the app funnels through
+/// [`run_bounded`], and each live one costs the parent two pipe descriptors,
+/// two drain threads, and up to `MAX_OUTPUT_BYTES + 4 MiB` of buffered output.
+/// Nothing bounded how many could be in flight at once, and three layers above
+/// this one are happy to ask for hundreds: Tauri's blocking pool admits 512
+/// concurrent tasks (tokio's default `max_blocking_threads`), `off_thread`
+/// hands every command straight to it, and a workspace-wide refresh fans out
+/// over as many as `MAX_BULK_TARGETS` repositories with five commands each.
+///
+/// The host says no long before the app does. A GUI launch inherits launchd's
+/// soft `RLIMIT_NOFILE` of 256, so a few dozen simultaneous children exhaust
+/// the descriptor table and *every* subsequent spawn fails with EMFILE —
+/// surfacing as the "Failed to spawn git ...: Too many open files (os error
+/// 24)" storm, which does not clear on its own because the UI retries into the
+/// same wall. [`crate::limits::raise_open_file_limit`] buys the headroom back;
+/// this gate is what stops the app from spending it all at once.
+///
+/// The permit spans the child's whole life, not just the spawn call, because
+/// that is how long its descriptors, threads and buffers are held.
+const SPAWN_LIMIT_FLOOR: usize = 4;
+const SPAWN_LIMIT_CEILING: usize = 16;
+
+/// A counting semaphore over live child processes.
+///
+/// Deliberately plain `std` rather than a new dependency: the only operations
+/// needed are "wait for a slot" and "give one back", and the wait happens on
+/// threads that are already blocking on a subprocess.
+struct SpawnGate {
+    limit: usize,
+    state: Mutex<GateState>,
+    released: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    in_flight: usize,
+    /// High-water mark, kept so a test can assert the ceiling actually held
+    /// rather than assert on the counter it is trying to prove bounded.
+    peak: usize,
+}
+
+impl SpawnGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new(GateState::default()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SpawnPermit<'_> {
+        // A poisoned gate must not deadlock the app: a panic inside a permit
+        // holder still ran the `Drop` below, so the count is accurate.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.in_flight >= self.limit {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.in_flight += 1;
+        state.peak = state.peak.max(state.in_flight);
+        SpawnPermit { gate: self }
+    }
+
+    #[cfg(test)]
+    fn peak(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peak
+    }
+}
+
+/// Releases its slot on drop, so an early `?` return, a timeout path and a
+/// panic all give the descriptor budget back.
+struct SpawnPermit<'a> {
+    gate: &'a SpawnGate,
+}
+
+impl Drop for SpawnPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.gate.released.notify_one();
+    }
+}
+
+/// Concurrent children allowed: twice the core count, clamped so a 2-core CI
+/// box still overlaps work and a 32-core workstation does not put 64 `git`
+/// processes and ~2 GiB of potential drain buffers on the host at once.
+fn spawn_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2))
+        .unwrap_or(SPAWN_LIMIT_FLOOR)
+        .clamp(SPAWN_LIMIT_FLOOR, SPAWN_LIMIT_CEILING)
+}
+
+fn spawn_gate() -> &'static SpawnGate {
+    static GATE: OnceLock<SpawnGate> = OnceLock::new();
+    GATE.get_or_init(|| SpawnGate::new(spawn_limit()))
+}
+
 /// Shared engine behind `git_timeout` and `capture_command`: spawns `cmd`,
 /// enforces `timeout`, and bounds stdout/stderr.
 ///
@@ -863,10 +988,28 @@ pub(crate) struct BoundedRun {
 /// piped stdin fed from a dedicated thread, so the deadline loop below stays
 /// responsive even while megabytes are still being pushed into the child.
 pub(crate) fn run_bounded(
+    cmd: Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+) -> Result<BoundedRun, String> {
+    run_bounded_capped(cmd, label, timeout, stdin_bytes, MAX_OUTPUT_BYTES)
+}
+
+/// [`run_bounded`] with an explicit stdout budget.
+///
+/// [`MAX_OUTPUT_BYTES`] is a backstop against a runaway process, not a sane
+/// payload size: 64 MiB of diff text costs ~90 MiB in this process (the bytes
+/// plus the lossy `String` copy), ~44 MiB more to serialize for IPC, and
+/// ~330 MiB once the webview holds the string and its parsed rows. Callers
+/// whose output lands in the UI pass the budget their surface can actually
+/// render, and tell the user when they hit it.
+pub(crate) fn run_bounded_capped(
     mut cmd: Command,
     label: &str,
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
@@ -874,6 +1017,11 @@ pub(crate) fn run_bounded(
         cmd.stdin(Stdio::null());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Held until this function returns, covering the child's descriptors, its
+    // two drain threads and their buffers -- see [`SpawnGate`] for why an
+    // unbounded fan-out here exhausted the process descriptor table.
+    let _permit = spawn_gate().acquire();
 
     let mut child = cmd
         .spawn()
@@ -889,7 +1037,7 @@ pub(crate) fn run_bounded(
     let (stdout_tx, stdout_rx) = mpsc::channel();
     let (stderr_tx, stderr_rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = stdout_tx.send(drain_capped(stdout_pipe, MAX_OUTPUT_BYTES));
+        let _ = stdout_tx.send(drain_capped(stdout_pipe, stdout_cap));
     });
     thread::spawn(move || {
         let _ = stderr_tx.send(drain_capped(
@@ -1036,6 +1184,16 @@ fn git_run(
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
 ) -> Result<(Vec<u8>, bool), String> {
+    git_run_capped(repo, args, timeout, stdin_bytes, MAX_OUTPUT_BYTES)
+}
+
+fn git_run_capped(
+    repo: Option<&Path>,
+    args: &[&str],
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+) -> Result<(Vec<u8>, bool), String> {
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
     let mut attempts = 0;
@@ -1043,7 +1201,7 @@ fn git_run(
 
     loop {
         let cmd = git_command(repo, args);
-        let out = run_bounded(cmd, &label, timeout, stdin_bytes)?;
+        let out = run_bounded_capped(cmd, &label, timeout, stdin_bytes, stdout_cap)?;
         if out.success {
             return Ok((out.stdout, out.truncated));
         }
@@ -2214,6 +2372,145 @@ mod tests {
             started.elapsed() < Duration::from_secs(15),
             "timeout handling must stay bounded (grace is 2s per pipe), took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// The gate's own contract, checked without racing a real process: once
+    /// `limit` permits are out, the next acquire parks until one is dropped.
+    #[test]
+    fn spawn_gate_parks_callers_once_the_limit_is_reached() {
+        let gate = std::sync::Arc::new(SpawnGate::new(2));
+        let first = gate.acquire();
+        let second = gate.acquire();
+        assert_eq!(gate.peak(), 2);
+
+        let (tx, rx) = mpsc::channel();
+        let waiter = {
+            let gate = std::sync::Arc::clone(&gate);
+            thread::spawn(move || {
+                let permit = gate.acquire();
+                let _ = tx.send(());
+                drop(permit);
+            })
+        };
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "a third caller must park while both permits are held"
+        );
+        drop(second);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("dropping a permit must wake a parked caller");
+        waiter.join().expect("waiter thread");
+        drop(first);
+        assert_eq!(
+            gate.peak(),
+            2,
+            "the high-water mark must never exceed the limit"
+        );
+    }
+
+    /// A permit released by a panicking holder must not leak its slot, or one
+    /// failed git call would shrink the budget for the rest of the session.
+    #[test]
+    fn spawn_gate_reclaims_a_permit_dropped_by_a_panic() {
+        let gate = std::sync::Arc::new(SpawnGate::new(1));
+        let poisoner = {
+            let gate = std::sync::Arc::clone(&gate);
+            thread::spawn(move || {
+                let _permit = gate.acquire();
+                panic!("holder blew up mid-run");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the holder was supposed to panic");
+
+        let (tx, rx) = mpsc::channel();
+        let gate2 = std::sync::Arc::clone(&gate);
+        thread::spawn(move || {
+            let _permit = gate2.acquire();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the panicked holder's slot must come back");
+    }
+
+    /// Regression: nothing bounded how many children `run_bounded` kept alive
+    /// at once, so a workspace-wide refresh put hundreds of `git` processes on
+    /// the host simultaneously and exhausted the descriptor table -- every
+    /// spawn past the ceiling failing with "Too many open files (os error
+    /// 24)".
+    ///
+    /// Concurrency is counted by the children themselves rather than by the
+    /// gate: each `sh` creates a marker file for as long as it runs, and a
+    /// sampler watches how many exist at once. An assertion that read the
+    /// gate's own counter could not tell a working gate from one that is
+    /// never consulted, which is exactly the bug this pins.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_never_exceeds_the_spawn_limit_under_fan_out() {
+        const CALLERS: usize = 64;
+        let limit = spawn_limit();
+        assert!(
+            CALLERS > limit,
+            "the fan-out must exceed the limit to prove anything ({CALLERS} vs {limit})"
+        );
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let live_dir = dir.path().to_path_buf();
+        let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let peak_live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = {
+            let live_dir = live_dir.clone();
+            let sampling = std::sync::Arc::clone(&sampling);
+            let peak_live = std::sync::Arc::clone(&peak_live);
+            thread::spawn(move || {
+                while sampling.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Ok(entries) = std::fs::read_dir(&live_dir) {
+                        let n = entries.count();
+                        peak_live.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(CALLERS));
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|i| {
+                let ready = std::sync::Arc::clone(&ready);
+                let marker = live_dir.join(format!("child-{i}"));
+                thread::spawn(move || {
+                    // Release every caller at once so they contend for real.
+                    ready.wait();
+                    let marker = marker.to_string_lossy().into_owned();
+                    let mut cmd = Command::new("sh");
+                    cmd.args([
+                        "-c",
+                        // Present for exactly as long as this child runs.
+                        r#": > "$1"; sleep 0.3; rm -f "$1""#,
+                        "sh",
+                        &marker,
+                    ]);
+                    run_bounded(cmd, "sh", Duration::from_secs(30), None)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let out = handle.join().expect("caller thread").expect("run");
+            assert!(out.success, "every bounded run must still complete");
+        }
+        sampling.store(false, std::sync::atomic::Ordering::SeqCst);
+        sampler.join().expect("sampler thread");
+
+        let observed = peak_live.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "the callers must genuinely have overlapped, saw {observed} at once"
+        );
+        assert!(
+            observed <= limit,
+            "at most {limit} children may be alive at once, saw {observed}"
         );
     }
 

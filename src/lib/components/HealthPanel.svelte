@@ -65,6 +65,7 @@
   let dependabot = $state<DependabotReport | null>(null);
   let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
   let deadSymbolsAvailable = $state(false);
+  let deadSymbolsReason = $state<string | null>(null);
   /**
    * Whether this repository has a devmap code graph at all.
    *
@@ -205,12 +206,16 @@
       // would refuse to rescan it after something changes.
       scanned.path = "";
     }
-    if (dead.status === "fulfilled" && dead.value.available) {
-      deadSymbols = dead.value.items;
-      deadSymbolsAvailable = true;
+    if (dead.status === "fulfilled") {
+      deadSymbolsAvailable = dead.value.available;
+      deadSymbols = dead.value.available ? dead.value.items : [];
+      deadSymbolsReason = dead.value.available
+        ? null
+        : (dead.value.reason ?? "dead-symbol query unavailable");
     } else {
       deadSymbols = [];
       deadSymbolsAvailable = false;
+      deadSymbolsReason = formatError(dead.reason);
     }
     // An IPC-level failure is folded into the same unavailable shape the
     // command itself uses, so "could not ask" never renders as "asked, and
@@ -963,18 +968,34 @@
            graph, and this is the only thing that says which kind of quiet
            it is. -->
       {#if codegraph}
-        <section class="pb-4">
+        <section class="pb-4 max-w-5xl">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted mb-1.5">
             Code graph
           </h3>
           {#if codegraph.available}
-            <p class="text-[11px] text-textMuted font-mono">
-              {codegraph.total_files ?? "?"} files · {codegraph.total_symbols ?? "?"} symbols ·
-              {codegraph.total_edges ?? "?"} edges
+            <div class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card">
+              <div class="grid grid-cols-3 gap-2 text-center">
+                <div>
+                  <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_files ?? "—"}</div>
+                  <div class="text-[10px] uppercase tracking-wider text-textMuted">files</div>
+                </div>
+                <div>
+                  <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_symbols ?? "—"}</div>
+                  <div class="text-[10px] uppercase tracking-wider text-textMuted">symbols</div>
+                </div>
+                <div>
+                  <div class="text-[15px] font-semibold text-textPrimary">{codegraph.total_edges ?? "—"}</div>
+                  <div class="text-[10px] uppercase tracking-wider text-textMuted">edges</div>
+                </div>
+              </div>
               {#if codegraph.generation_id != null}
-                <span class="opacity-70">· generation {codegraph.generation_id}</span>
+                <p class="mt-2 text-[10px] font-mono text-textMuted">generation {codegraph.generation_id}</p>
               {/if}
-            </p>
+              <p class="mt-2 text-[11px] text-textMuted">
+                Agents query this map through `gitpulse_codeintel_search`, `impact`, `trace` and
+                `dead_symbols`. A dash means that count was not stored — not that it is zero.
+              </p>
+            </div>
           {:else}
             <p class="text-[11px] text-amber-300">
               No code graph for this repository — impact edges, symbol search and dead-code
@@ -987,7 +1008,16 @@
         </section>
       {/if}
 
-      {#if deadSymbolsAvailable && deadSymbols.length > 0}
+      {#if codegraph?.available && !deadSymbolsAvailable}
+        <p class="text-[11px] text-amber-300 pb-4">
+          Dead-code check could not run{#if deadSymbolsReason}: {deadSymbolsReason}{/if}.
+          That is not the same as finding no unreferenced symbols.
+        </p>
+      {:else if deadSymbolsAvailable && deadSymbols.length === 0}
+        <p class="text-[11px] text-textMuted pb-4">
+          No unreferenced symbols in the indexed graph.
+        </p>
+      {:else if deadSymbolsAvailable && deadSymbols.length > 0}
         <section class="space-y-2 pb-4">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
             Dead code & unreferenced symbols ({deadSymbols.length})

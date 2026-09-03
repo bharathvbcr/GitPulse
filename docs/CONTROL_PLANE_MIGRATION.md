@@ -205,12 +205,12 @@ SQLite is the index; Git is the durable substrate. Provenance survives GitPulse'
 
 ## 9. Phase 6 — Headless core + MCP (only after 1–5, ~4+ weeks)
 
-Everything today originates in the webview; agents have no entry point.
+Read-only MCP 2.0 (`2026-07-28`) and the Agent Plugins 1.0 package now exist: `gitpulse_insights`, `gitpulse_change_context`, `gitpulse_active_changes`, `gitpulse_collision_risk`, plus ledger / codeintel / provenance. Mutating tools (`checkpoint_workspace`, `report_blocker`) are still out — they must go through `harness::guard_command`.
 
 1. **Extract `gitpulse-core`:** `engine/`, `harness/`, `watcher/`, `diff/`, ledger into a crate; the Tauri app links it; a thin `gitpulsed` serves it headless. Reuse the NDJSON-over-stdio transport from `manvi serve` — don't invent a new one.
-2. **MCP server exposing context, not Git wrappers:** `get_change_context`, `get_active_changes`, `checkpoint_workspace`, `report_blocker`, `get_collision_risk`, `prepare_review`.
+2. **MCP server exposing context, not Git wrappers:** `get_change_context`, `get_active_changes`, `checkpoint_workspace`, `report_blocker`, `get_collision_risk`, `prepare_review`. *(The first three read-only names shipped as `gitpulse_*`.)*
 3. **Proxy, don't duplicate:** DevCouncil already exposes ~78 MCP tools including `checkout_task` and `verify_task`. GitPulse's MCP proxies those and adds only what is uniquely its own: worktree fabric, ledger queries, diff and verification context.
-4. **F10 — Work view:** the change-centric surface from the original vision — tasks (dc-store) × worktrees × PRs × runs × verdicts in one screen. Everything above feeds it; it lands last because it is a pure projection.
+4. **F10 — Work view:** the change-centric surface from the original vision — tasks (dc-store) × worktrees × PRs × runs × verdicts in one screen. Everything above feeds it; it lands last because it is a pure projection. *(Shipped.)*
 
 **Done when:** with the desktop app closed, an agent calls `get_change_context` and receives task scope, drift, verdicts, and parallel-work warnings; opening the app later shows everything the agent did.
 

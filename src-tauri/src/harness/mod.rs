@@ -252,6 +252,10 @@ mod ledger_seam_tests {
     /// with no gate is exactly what a history must not omit.
     #[test]
     fn a_guarded_command_leaves_a_durable_row() {
+        // Serialized with every other sidecar-touching test: this reaches the
+        // one process-global slot, so a fake installed elsewhere would answer
+        // these requests instead of the real resolution path.
+        let _serial = sidecar::test_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo_buf = dir
             .path()
@@ -296,6 +300,10 @@ mod ledger_seam_tests {
     /// A file write is recorded under its own operation, not a git verb.
     #[test]
     fn a_guarded_file_write_records_its_operation() {
+        // Serialized with every other sidecar-touching test: this reaches the
+        // one process-global slot, so a fake installed elsewhere would answer
+        // these requests instead of the real resolution path.
+        let _serial = sidecar::test_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_str().expect("utf8 path");
 
@@ -312,6 +320,10 @@ mod ledger_seam_tests {
     /// own reading of an empty op — not dropped, and not guessed at.
     #[test]
     fn an_unspecified_file_operation_is_recorded_as_a_write() {
+        // Serialized with every other sidecar-touching test: this reaches the
+        // one process-global slot, so a fake installed elsewhere would answer
+        // these requests instead of the real resolution path.
+        let _serial = sidecar::test_serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().to_str().expect("utf8 path");
         let before = crate::ledger::latest_cursor(repo).expect("cursor");
@@ -322,6 +334,10 @@ mod ledger_seam_tests {
 
     #[test]
     fn a_non_git_command_is_not_filed_under_a_git_verb() {
+        // Serialized with every other sidecar-touching test: this reaches the
+        // one process-global slot, so a fake installed elsewhere would answer
+        // these requests instead of the real resolution path.
+        let _serial = sidecar::test_serial();
         // `command.run` rather than a fabricated `git.*`: a mutation this build
         // does not recognise must still be recorded, and must not claim to be
         // something it is not.
@@ -415,18 +431,16 @@ done
         std::fs::write(&script, body).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let _serial = sidecar::SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sidecar::set_test_binary(Some(script.to_string_lossy().into_owned()));
-        struct Clear;
-        impl Drop for Clear {
+        let serial = sidecar::test_serial();
+        sidecar::set_test_binary(&serial, Some(script.to_string_lossy().into_owned()));
+        struct Clear<'a>(&'a sidecar::SidecarTestGuard);
+        impl Drop for Clear<'_> {
             fn drop(&mut self) {
-                sidecar::set_test_binary(None);
+                sidecar::set_test_binary(self.0, None);
                 sidecar::reset();
             }
         }
-        let _clear = Clear;
+        let _clear = Clear(&serial);
         sidecar::reset();
 
         let before = crate::ledger::latest_cursor(repo).expect("cursor");
