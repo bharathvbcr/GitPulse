@@ -109,4 +109,8 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Rust Unit & Integration Tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+        # --no-fail-fast: without it cargo stops at the first failing test
+        # BINARY, so every later one -- the whole tests/ directory -- is
+        # skipped and the job reports one failure when there may be several.
+        # A suite that never ran must not read like a suite that passed.
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --nocapture
