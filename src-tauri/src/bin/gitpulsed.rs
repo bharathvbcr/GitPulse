@@ -428,7 +428,9 @@ mod tests {
         // Watching a silent prefix of what was asked for is the shape of every
         // bug this codebase keeps finding: a capped sample presented as
         // complete coverage.
-        let many: Vec<String> = (0..MAX_REPOS + 1).map(|i| abs(&format!("repo/{i}"))).collect();
+        let many: Vec<String> = (0..MAX_REPOS + 1)
+            .map(|i| abs(&format!("repo/{i}")))
+            .collect();
         let Parsed::Error(e) = parse(&many) else {
             panic!("expected a refusal");
         };
