@@ -5606,7 +5606,17 @@ src/main.go:4.1,4.8 1 0
             write(repo.path(), "lib/app.rb", "class App\nend\n");
             write(repo.path(), "Gemfile", "source 'https://rubygems.org'\n");
             let checked = assert_published_commands_are_runnable(&repo, "ruby");
-            assert!(checked > 0, "the ruby fixture published no commands");
+            if checked == 0 {
+                // When bundler is not installed on the host (e.g. Linux CI runners),
+                // the plan must explain the dead end rather than claim tool readiness.
+                assert_dead_end_is_explained(&repo, "ruby");
+
+                // Still assert that bundle install clears the gate, which is the invariant
+                // this test was written to protect.
+                let bundle_cmd = ["bundle".to_string(), "install".to_string()];
+                validate_manvi_action(&bundle_cmd, ManviActionKind::CoverageGenerator)
+                    .expect("bundle install must be accepted by the gate");
+            }
         }
 
         /// The vitest provider install — the only other setup step that writes
