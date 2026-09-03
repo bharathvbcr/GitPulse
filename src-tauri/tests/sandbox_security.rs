@@ -530,8 +530,11 @@ fn clone_repo_still_clones_local_file_urls() {
     )
     .expect("healthy local clone must succeed");
     assert!(Path::new(&cloned).join(".git").exists());
-    assert_eq!(
-        std::fs::read_to_string(Path::new(&cloned).join("tracked.txt")).unwrap(),
-        "base\n"
-    );
+    // The clone is a NEW repository, so it inherits the host's core.autocrlf
+    // rather than the source fixture's -- true on Windows, where git then
+    // writes the working tree with CRLF and is correct to. What this test
+    // asserts is that the tracked content arrived, not which line ending git
+    // chose for the checkout.
+    let checked_out = std::fs::read_to_string(Path::new(&cloned).join("tracked.txt")).unwrap();
+    assert_eq!(checked_out.replace("\r\n", "\n"), "base\n");
 }
