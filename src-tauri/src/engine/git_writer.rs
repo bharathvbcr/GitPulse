@@ -1083,7 +1083,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
             dest.display()
         )
     })?;
-    let parent_canonical = parent.canonicalize().map_err(|e| {
+    let parent_canonical = crate::engine::git_cli::canonicalize_plain(parent).map_err(|e| {
         format!(
             "Cannot resolve clone destination parent '{}': {}",
             parent.display(),
@@ -1099,7 +1099,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
                     dest.display()
                 ));
             }
-            let actual = dest.canonicalize().map_err(|e| {
+            let actual = crate::engine::git_cli::canonicalize_plain(dest).map_err(|e| {
                 format!(
                     "Cannot resolve clone destination '{}': {}",
                     dest.display(),

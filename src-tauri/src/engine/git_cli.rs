@@ -725,6 +725,78 @@ pub(crate) fn find_external_tool(program: &str) -> Option<String> {
     find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Windows' legacy path limit. Beyond it a path needs the `\\?\` prefix to be
+/// addressable at all, so a result that long keeps the prefix rather than
+/// becoming a spelling Windows cannot open.
+#[cfg(windows)]
+const WINDOWS_LEGACY_PATH_LIMIT: usize = 260;
+
+/// A `\\?\`-prefixed Windows path rewritten in ordinary form, or `None` when
+/// the prefix has to stay.
+///
+/// Split out as string logic so the rules can be tested on any host: the
+/// `Prefix` parse this mirrors only happens on Windows, and these are exactly
+/// the cases that were wrong in production.
+///
+/// Compiled off Windows only for those tests: production has no use for it
+/// there, and an ungated copy would be dead code under `-D warnings`.
+#[cfg(any(windows, test))]
+fn simplified_windows_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    let simplified = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        // \\?\UNC\server\share -> \\server\share
+        format!(r"\\{unc}")
+    } else {
+        // \\?\C:\dir -> C:\dir. Anything that is not a drive-letter root
+        // (a device path such as \\?\Volume{...}) has no ordinary spelling.
+        let bytes = rest.as_bytes();
+        let is_drive_root = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && bytes.get(2) == Some(&b'\\');
+        if !is_drive_root {
+            return None;
+        }
+        rest.to_string()
+    };
+    #[cfg(windows)]
+    if simplified.len() > WINDOWS_LEGACY_PATH_LIMIT {
+        return None;
+    }
+    Some(simplified)
+}
+
+/// `std::fs::canonicalize` in a spelling external tools accept.
+///
+/// On Windows `canonicalize` always answers with a verbatim `\\?\` path -- it
+/// asks the OS for the final name by handle -- and git refuses to use one as a
+/// working tree:
+///
+///   fatal: could not create work tree dir '\\?\C:\...\healthy': Invalid argument
+///
+/// The prefix also leaks into user-facing text ("Already cloned at \\?\C:\..."),
+/// so every caller that hands a resolved path to a child process or to a
+/// message wants this rather than `canonicalize`.
+///
+/// SECURITY: this does not weaken any containment check built on it. The
+/// symlink resolution has already happened inside `canonicalize`; removing the
+/// prefix does not change which file the path denotes, and callers that
+/// compare a child against a parent still compare two paths produced the same
+/// way. What it gives up is the extended-length namespace, which is why a
+/// result that no longer fits the legacy limit keeps its prefix instead of
+/// becoming a path Windows would refuse to open.
+///
+/// On every other platform this is `canonicalize`, unchanged.
+pub(crate) fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    {
+        if let Some(simplified) = canonical.to_str().and_then(simplified_windows_path) {
+            return Ok(PathBuf::from(simplified));
+        }
+    }
+    Ok(canonical)
+}
+
 /// Assembles the `capture_command` child with injectable `PATH`/home lookups,
 /// mirroring the seam [`resolve_spawn_program_with`] gives the resolver.
 ///
@@ -2249,6 +2321,73 @@ mod tests {
                 "{program} must not gain a second suffix"
             );
         }
+    }
+
+    /// git refuses a verbatim path as a working tree
+    /// ("could not create work tree dir '\\?\C:\...': Invalid argument"), and
+    /// canonicalize hands one back for every path on Windows. These are the
+    /// shapes it actually produces.
+    #[test]
+    fn a_verbatim_windows_path_is_rewritten_in_ordinary_form() {
+        assert_eq!(
+            simplified_windows_path(r"\\?\C:\Users\runneradmin\repo").as_deref(),
+            Some(r"C:\Users\runneradmin\repo")
+        );
+        assert_eq!(
+            simplified_windows_path(r"\\?\UNC\server\share\repo").as_deref(),
+            Some(r"\\server\share\repo")
+        );
+    }
+
+    /// Not every verbatim path has an ordinary spelling. Guessing one would
+    /// produce a path that names a different file, or no file at all.
+    #[test]
+    fn a_path_with_no_ordinary_spelling_keeps_its_prefix() {
+        for path in [
+            r"\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\repo",
+            r"C:\already\ordinary",
+            r"\\server\share\already\unc",
+            "/unix/style/path",
+            r"\\?\",
+            r"\\?\C:",
+        ] {
+            assert_eq!(
+                simplified_windows_path(path),
+                None,
+                "{path} has no ordinary spelling and must keep what it had"
+            );
+        }
+    }
+
+    /// The property the clone path depends on, checked against a real
+    /// canonicalize rather than a literal.
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_plain_answers_in_a_spelling_git_accepts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plain = canonicalize_plain(dir.path()).expect("temp dir canonicalizes");
+        assert!(
+            !plain.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize_plain still returned a verbatim path: {plain:?}"
+        );
+        // And it still names the same directory it resolved.
+        assert_eq!(
+            plain.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap(),
+            "the ordinary spelling must denote the same directory"
+        );
+    }
+
+    /// Off Windows there is nothing to strip, and a backslash is an ordinary
+    /// filename character -- rewriting one would rename the file.
+    #[cfg(not(windows))]
+    #[test]
+    fn canonicalize_plain_is_canonicalize_off_windows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            canonicalize_plain(dir.path()).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     /// Script-host inputs are never resolved: naming a tool must not hand
