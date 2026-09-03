@@ -23,8 +23,8 @@ use crate::github::{
     DependabotReport, GitHubContext,
 };
 use crate::graph::{
-    BezierGeometryCalculator, BranchFoldingEngine, CubicBezierCurve, FoldedBranchRun, LaneSolver,
-    VisualCommitRow,
+    mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
+    MainlineHint, RawCommitNode, RefDecoration, RefKind, VisualCommitRow,
 };
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
@@ -44,7 +44,6 @@ pub struct ReleasePublishResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitGraphPayload {
     pub rows: Vec<VisualCommitRow>,
-    pub folds: Vec<FoldedBranchRun>,
     pub head_id: Option<String>,
     /// Branches, remotes and tags pointing at rows in this graph.
     pub refs: Vec<crate::graph::RefDecoration>,
@@ -58,6 +57,118 @@ pub struct CommitGraphPayload {
     /// before this field deserializable.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The commit at the top of the pinned mainline: the straight column-0
+    /// rail the solver keeps for the default branch (see
+    /// [`crate::graph::MainlineHint`]). `None` only when the graph has no
+    /// rows. `default` keeps payloads from before the field deserializable.
+    #[serde(default)]
+    pub mainline_id: Option<String>,
+    /// The branch the mainline was anchored on — `main`, `origin/main`, or
+    /// the HEAD branch as a fallback — or `None` when no ref resolved and the
+    /// newest commit's chain was pinned instead.
+    #[serde(default)]
+    pub mainline_name: Option<String>,
+}
+
+/// The refs that anchor the straight mainline column, resolved once per
+/// graph load from the decoration list already in hand.
+pub struct ResolvedMainline {
+    pub hint: MainlineHint,
+    /// `(commit id, display name)` for every hinted branch tip, in the
+    /// hint's priority order.
+    tips: Vec<(String, String)>,
+}
+
+impl ResolvedMainline {
+    /// The label for a mainline anchored on commit `id`: the branch name for
+    /// a hinted tip, the HEAD ref (a branch name, or `HEAD` when detached)
+    /// for the fallback, and nothing when the newest commit was pinned.
+    pub fn name_for(&self, id: &str, refs: &[RefDecoration]) -> Option<String> {
+        if let Some((_, name)) = self.tips.iter().find(|(tip, _)| tip == id) {
+            return Some(name.clone());
+        }
+        if self.hint.fallback_tip.as_deref() == Some(id) {
+            return refs.iter().find(|r| r.is_head).map(|r| r.name.clone());
+        }
+        None
+    }
+}
+
+/// Conventional default-branch names, probed in this order when the
+/// repository's own default branch could not be resolved.
+const MAINLINE_NAME_FALLBACKS: [&str; 4] = ["main", "master", "trunk", "develop"];
+
+/// Decides which refs the lane solver keeps straight.
+///
+/// The repository's default branch comes first; the conventional names are
+/// probed only when that is unknown. The FIRST name with any ref supplies
+/// every tip carrying it — the local branch, then each remote-tracking copy
+/// (`origin/main`, `upstream/main`) — so the solver anchors on the user's
+/// own branch and extends the rail through a remote that is ahead of it.
+/// Falling through to a *different* name when the default branch's tips are
+/// not loaded would pin the wrong branch, so that never happens: HEAD is the
+/// only fallback, for windows (single-branch, path-filtered) that hold none
+/// of the mainline's tips.
+pub fn resolve_mainline_hint(
+    refs: &[RefDecoration],
+    default_branch: Option<&str>,
+    head_id: Option<&str>,
+) -> ResolvedMainline {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(name) = default_branch.map(str::trim).filter(|n| !n.is_empty()) {
+        names.push(name);
+    }
+    for name in MAINLINE_NAME_FALLBACKS {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    let mut tips: Vec<(String, String)> = Vec::new();
+    for name in names {
+        let locals: Vec<&RefDecoration> = refs
+            .iter()
+            .filter(|r| r.kind == RefKind::Local && r.name == name)
+            .collect();
+        // Remote-tracking names carry the remote as their first segment.
+        let remotes: Vec<&RefDecoration> = refs
+            .iter()
+            .filter(|r| {
+                r.kind == RefKind::Remote
+                    && r.name.split_once('/').map(|(_, short)| short) == Some(name)
+            })
+            .collect();
+        if locals.is_empty() && remotes.is_empty() {
+            continue;
+        }
+        // One display name per branch: the local name when the branch exists
+        // locally (a remote that is ahead still reads as "main"), else the
+        // remote-tracking ref so the label says where the rail comes from.
+        let has_local = !locals.is_empty();
+        for r in locals {
+            tips.push((r.commit_id.clone(), r.name.clone()));
+        }
+        for r in remotes {
+            let label = if has_local {
+                name.to_string()
+            } else {
+                r.name.clone()
+            };
+            tips.push((r.commit_id.clone(), label));
+        }
+        break;
+    }
+
+    ResolvedMainline {
+        hint: MainlineHint {
+            branch_tips: tips.iter().map(|(id, _)| id.clone()).collect(),
+            fallback_tip: head_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        },
+        tips,
+    }
 }
 
 #[tauri::command(async)]
@@ -105,6 +216,80 @@ pub async fn cmd_get_status(repo_path: String) -> Result<Vec<FileStatus>, String
     off_thread(move || GitReader::get_status(&repo_path)).await
 }
 
+/// Turns one page of raw history into the graph payload.
+///
+/// `raw_commits` may carry one row past `max_commits` (the has_more probe).
+/// The filter's non-path terms are applied here with git-style history
+/// simplification: dropped rows hand their lineage to their children
+/// ([`simplify_history`]), so survivors stay connected instead of ending in
+/// stubs, and the mainline hint is re-anchored on the first survivor of the
+/// chain it named — the filtered graph keeps the same branch straight as
+/// the unfiltered one. Pure (no git access) so fixtures, smoke checks and
+/// unit tests run exactly the code the command runs.
+pub fn assemble_commit_graph(
+    mut raw_commits: Vec<RawCommitNode>,
+    max_commits: usize,
+    filter: &CommitFilter,
+    refs: Vec<RefDecoration>,
+    default_branch: Option<&str>,
+    head_id: Option<String>,
+    warnings: Vec<String>,
+) -> CommitGraphPayload {
+    let has_more = raw_commits.len() > max_commits;
+    if has_more {
+        raw_commits.truncate(max_commits);
+    }
+
+    let mainline = resolve_mainline_hint(&refs, default_branch, head_id.as_deref());
+    let mut hint = mainline.hint.clone();
+    // The tip whose ref labels the rail once the filter has moved the
+    // anchor down the chain; None when nothing on the chain survived.
+    let mut label_tip: Option<String> = None;
+    if !filter.is_empty() {
+        let keep: Vec<bool> = raw_commits
+            .iter()
+            .map(|c| filter.matches_commit(c))
+            .collect();
+        if keep.iter().any(|kept| !kept) {
+            let chain = mainline_chain_ids(&raw_commits, &hint);
+            raw_commits = simplify_history(&raw_commits, &keep);
+            let kept: HashSet<&str> = raw_commits.iter().map(|c| c.id.as_str()).collect();
+            let survivor = chain.iter().find(|id| kept.contains(id.as_str())).cloned();
+            if survivor.is_some() {
+                label_tip = chain.first().cloned();
+            }
+            // A chain with no survivor leaves the hint empty on purpose: the
+            // solver then pins the newest survivor's own chain rather than
+            // an unrelated branch that happens to be loaded.
+            hint = MainlineHint {
+                branch_tips: survivor.into_iter().collect(),
+                fallback_tip: None,
+            };
+        }
+    }
+
+    let rows = LaneSolver::new(12).solve_with_mainline(&raw_commits, &hint);
+    // The solver owns which chain was pinned; the payload only reports it,
+    // so the two can never disagree.
+    let mainline_id = rows.iter().find(|r| r.is_mainline).map(|r| r.id.clone());
+    let mainline_name = mainline_id.as_deref().and_then(|id| {
+        mainline.name_for(id, &refs).or_else(|| {
+            label_tip
+                .as_deref()
+                .and_then(|tip| mainline.name_for(tip, &refs))
+        })
+    });
+    CommitGraphPayload {
+        rows,
+        head_id,
+        refs,
+        has_more,
+        warnings,
+        mainline_id,
+        mainline_name,
+    }
+}
+
 #[tauri::command(async)]
 pub async fn cmd_get_commit_graph(
     repo_path: String,
@@ -124,28 +309,43 @@ pub async fn cmd_get_commit_graph(
         let mut warnings: Vec<String> = Vec::new();
         let repo = repo_path.clone();
         let rev = revision.clone();
+        // Parsing is pure string work, so it happens BEFORE the walk: a `path:`
+        // token has to reach git itself. Narrowing a full walk afterwards left
+        // every survivor naming parents that had been filtered out, and the
+        // lane solver drew the result as disconnected stubs; git's own
+        // path-limited log rewrites those parents to the nearest surviving
+        // ancestors and keeps the history connected.
+        let filter = query
+            .as_deref()
+            .map(CommitFilter::parse)
+            .unwrap_or_default();
+        let path_filter = filter.path.clone();
         // History is the long pole; HEAD and ref decorations are independent of
         // it, so they run concurrently instead of serializing three walks behind
         // one another on a large repository.
-        let (history, head, refs) = std::thread::scope(|scope| {
+        let (history, head, refs, default_branch) = std::thread::scope(|scope| {
             let history = scope.spawn(move || {
                 GitReader::read_commit_history_paged(
                     &repo,
                     skip.unwrap_or(0),
                     fetch_limit,
                     rev.as_deref(),
+                    path_filter.as_deref(),
                 )
             });
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
             let refs = scope.spawn(move || crate::graph::list_ref_decorations(&repo3));
+            let repo4 = repo_path.clone();
+            let default_branch = scope.spawn(move || GitReader::default_branch_name(&repo4));
             (
                 history
                     .join()
                     .unwrap_or_else(|_| Err("history walker panicked".into())),
                 head.join(),
                 refs.join(),
+                default_branch.join(),
             )
         });
         // A failed HEAD or decoration probe degrades exactly one facet of an
@@ -185,46 +385,38 @@ pub async fn cmd_get_commit_graph(
                 Vec::new()
             }
         };
+        // The default-branch probe only picks WHICH branch is kept straight;
+        // losing it degrades to the conventional names, then HEAD — recorded
+        // so a mainline anchored on the wrong branch is never a silent guess.
+        let default_branch = match default_branch {
+            Ok(Ok(name)) => name,
+            Ok(Err(err)) => {
+                warnings.push(format!(
+                    "default branch unresolved ({err}); the straight mainline column is \
+                     anchored on a conventional branch name or HEAD"
+                ));
+                None
+            }
+            Err(_) => {
+                warnings.push(
+                    "background task failed (thread panic): default branch probe died; the \
+                     straight mainline column is anchored on a conventional branch name or HEAD"
+                        .into(),
+                );
+                None
+            }
+        };
 
-        let mut raw_commits = history?;
-        let has_more = raw_commits.len() > max_commits;
-        if has_more {
-            raw_commits.truncate(max_commits);
-        }
-
-        let filter = query
-            .as_deref()
-            .map(CommitFilter::parse)
-            .unwrap_or_default();
-        if let Some(ref path) = filter.path {
-            let touching: HashSet<String> = GitReader::commits_touching_path(
-                &repo_path,
-                path,
-                fetch_limit,
-                revision.as_deref(),
-            )?
-            .into_iter()
-            .collect();
-            raw_commits.retain(|c| touching.contains(&c.id));
-        }
-        if !filter.is_empty() {
-            raw_commits.retain(|c| filter.matches_commit(c));
-        }
-
-        let mut folding = BranchFoldingEngine::new();
-        folding.identify_foldable_runs(&raw_commits);
-        let folds = folding.get_foldable_runs().values().cloned().collect();
-
-        let mut solver = LaneSolver::new(12);
-        let rows = solver.solve(&raw_commits);
-        Ok(CommitGraphPayload {
-            rows,
-            folds,
-            head_id,
+        let raw_commits = history?;
+        Ok(assemble_commit_graph(
+            raw_commits,
+            max_commits,
+            &filter,
             refs,
-            has_more,
+            default_branch.as_deref(),
+            head_id,
             warnings,
-        })
+        ))
     })
     .await
 }
@@ -2285,11 +2477,12 @@ mod tests {
         let warning = "HEAD unavailable (bad object HEAD); commit graph may lack the HEAD marker";
         let payload = CommitGraphPayload {
             rows: Vec::new(),
-            folds: Vec::new(),
             head_id: None,
             refs: Vec::new(),
             has_more: false,
             warnings: vec![warning.to_string()],
+            mainline_id: Some("abc".to_string()),
+            mainline_name: Some("main".to_string()),
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(
@@ -2299,9 +2492,101 @@ mod tests {
         let back: CommitGraphPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.warnings, vec![warning]);
 
+        // `folds` was shipped (and never read) by earlier builds; a payload
+        // carrying it must still deserialize.
         let legacy = r#"{"rows":[],"folds":[],"head_id":null,"refs":[],"has_more":false}"#;
         let back: CommitGraphPayload = serde_json::from_str(legacy).unwrap();
         assert!(back.warnings.is_empty(), "absent field defaults to empty");
+        assert!(back.mainline_id.is_none() && back.mainline_name.is_none());
+    }
+
+    fn decoration(name: &str, kind: RefKind, commit_id: &str, is_head: bool) -> RefDecoration {
+        RefDecoration {
+            name: name.to_string(),
+            kind,
+            commit_id: commit_id.to_string(),
+            is_head,
+        }
+    }
+
+    /// The default branch supplies every tip carrying its name, local first,
+    /// all labelled with the local name; HEAD is the fallback anchor.
+    #[test]
+    fn mainline_hint_takes_the_default_branch_local_then_remotes() {
+        let refs = vec![
+            decoration("feature", RefKind::Local, "f1", true),
+            decoration("main", RefKind::Local, "m1", false),
+            decoration("origin/main", RefKind::Remote, "o1", false),
+            decoration("upstream/main", RefKind::Remote, "u1", false),
+            decoration("origin/feature", RefKind::Remote, "f1", false),
+            decoration("v1", RefKind::Tag, "m1", false),
+        ];
+        let resolved = resolve_mainline_hint(&refs, Some("main"), Some("f1"));
+        assert_eq!(
+            resolved.hint,
+            MainlineHint {
+                branch_tips: vec!["m1".into(), "o1".into(), "u1".into()],
+                fallback_tip: Some("f1".into()),
+            }
+        );
+        assert_eq!(resolved.name_for("m1", &refs).as_deref(), Some("main"));
+        assert_eq!(
+            resolved.name_for("o1", &refs).as_deref(),
+            Some("main"),
+            "a remote copy of a local branch is still labelled by the branch"
+        );
+        assert_eq!(
+            resolved.name_for("f1", &refs).as_deref(),
+            Some("feature"),
+            "the HEAD fallback is labelled with the checked-out branch"
+        );
+        assert_eq!(resolved.name_for("nowhere", &refs), None);
+    }
+
+    /// Without a resolved default branch the conventional names are probed
+    /// in order; a remote-only branch is labelled by its remote ref.
+    #[test]
+    fn mainline_hint_falls_back_to_conventional_names_and_remote_only_labels() {
+        let refs = vec![
+            decoration("origin/master", RefKind::Remote, "r1", false),
+            decoration("develop", RefKind::Local, "d1", false),
+        ];
+        let resolved = resolve_mainline_hint(&refs, None, None);
+        assert_eq!(resolved.hint.branch_tips, vec!["r1".to_string()]);
+        assert_eq!(resolved.hint.fallback_tip, None);
+        assert_eq!(
+            resolved.name_for("r1", &refs).as_deref(),
+            Some("origin/master")
+        );
+
+        // A default branch that has no refs at all must NOT fall through to
+        // another name: pinning `develop` when the repository's default is
+        // `release` would straighten the wrong branch.
+        let resolved = resolve_mainline_hint(&refs, Some("release"), Some("h"));
+        assert_eq!(resolved.hint.branch_tips, vec!["r1".to_string()]);
+        assert_eq!(
+            resolve_mainline_hint(&[], Some("release"), Some("h")).hint,
+            MainlineHint {
+                branch_tips: Vec::new(),
+                fallback_tip: Some("h".into()),
+            }
+        );
+    }
+
+    /// A detached HEAD is labelled `HEAD`; blank ids never become tips.
+    #[test]
+    fn mainline_hint_detached_head_and_blank_ids() {
+        let refs = vec![decoration("HEAD", RefKind::Head, "h1", true)];
+        let resolved = resolve_mainline_hint(&refs, Some(""), Some("h1"));
+        assert!(resolved.hint.branch_tips.is_empty());
+        assert_eq!(resolved.hint.fallback_tip.as_deref(), Some("h1"));
+        assert_eq!(resolved.name_for("h1", &refs).as_deref(), Some("HEAD"));
+        assert_eq!(
+            resolve_mainline_hint(&refs, None, Some("  "))
+                .hint
+                .fallback_tip,
+            None
+        );
     }
 }
 
@@ -2657,4 +2942,206 @@ pub async fn cmd_provenance_freshness_batch(
         ))
     })
     .await
+}
+
+#[cfg(test)]
+mod assemble_tests {
+    use super::*;
+    use crate::graph::{MAINLINE_COLOR, MAINLINE_COLUMN};
+
+    fn commit(id: &str, parents: &[&str], author: &str, summary: &str) -> RawCommitNode {
+        RawCommitNode {
+            id: id.to_string(),
+            parent_ids: parents.iter().map(|p| p.to_string()).collect(),
+            timestamp: 1,
+            author_name: author.to_string(),
+            author_email: format!("{}@example.com", author.to_lowercase()),
+            summary: summary.to_string(),
+        }
+    }
+
+    /// main: m0 (merge of feature f1) -> m1 -> m2 -> m3; f1 forks from m2.
+    fn history() -> Vec<RawCommitNode> {
+        vec![
+            commit("m0", &["m1", "f1"], "Ada", "feat: merge feature"),
+            commit("f1", &["m2"], "Bob", "fix: feature work"),
+            commit("m1", &["m2"], "Ada", "chore: main work"),
+            commit("m2", &["m3"], "Bob", "fix: shared base"),
+            commit("m3", &[], "Ada", "feat: root"),
+        ]
+    }
+
+    fn main_ref() -> Vec<RefDecoration> {
+        vec![RefDecoration {
+            name: "main".to_string(),
+            kind: RefKind::Local,
+            commit_id: "m0".to_string(),
+            is_head: true,
+        }]
+    }
+
+    fn assemble(query: &str) -> CommitGraphPayload {
+        assemble_commit_graph(
+            history(),
+            10,
+            &CommitFilter::parse(query),
+            main_ref(),
+            Some("main"),
+            Some("m0".to_string()),
+            Vec::new(),
+        )
+    }
+
+    fn ids(payload: &CommitGraphPayload) -> Vec<&str> {
+        payload.rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    /// Every stub in a filtered graph must point outside the payload: a
+    /// dropped parent is relinked, never left as a fading line.
+    fn assert_connected(payload: &CommitGraphPayload) {
+        let loaded: HashSet<&str> = payload.rows.iter().map(|r| r.id.as_str()).collect();
+        for row in &payload.rows {
+            for (k, conn) in row.connections.iter().enumerate() {
+                let parent = row.parent_ids.get(k).map(String::as_str).unwrap_or("");
+                assert!(
+                    !conn.is_dangling || !loaded.contains(parent),
+                    "{} -> {parent}: stub points at a loaded row",
+                    row.id
+                );
+            }
+        }
+        for row in payload.rows.iter().filter(|r| r.is_mainline) {
+            assert_eq!(
+                row.lane, MAINLINE_COLUMN,
+                "{} left the mainline column",
+                row.id
+            );
+            assert_eq!(
+                row.color_index, MAINLINE_COLOR,
+                "{} left the mainline colour",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn no_filter_keeps_the_window_and_pins_main() {
+        let payload = assemble("");
+        assert_eq!(ids(&payload), ["m0", "f1", "m1", "m2", "m3"]);
+        assert_eq!(payload.mainline_id.as_deref(), Some("m0"));
+        assert_eq!(payload.mainline_name.as_deref(), Some("main"));
+        assert!(!payload.has_more);
+        assert_connected(&payload);
+        let on_rail: Vec<&str> = payload
+            .rows
+            .iter()
+            .filter(|r| r.is_mainline)
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(on_rail, ["m0", "m1", "m2", "m3"]);
+    }
+
+    /// Pre-fix, `retain` left m0 naming f1 and m1 naming m2 — both gone —
+    /// so the filtered graph was two stubs and a root.
+    #[test]
+    fn author_filter_relinks_survivors_and_keeps_main_straight() {
+        let payload = assemble("author:ada");
+        assert_eq!(ids(&payload), ["m0", "m1", "m3"]);
+        assert_connected(&payload);
+        let m0 = &payload.rows[0];
+        assert_eq!(
+            m0.parent_ids,
+            ["m1", "m3"],
+            "f1's lineage collapses onto m3"
+        );
+        assert!(m0.connections.iter().all(|c| !c.is_dangling));
+        assert_eq!(payload.rows[1].parent_ids, ["m3"]);
+        assert!(
+            payload.rows.iter().all(|r| r.is_mainline),
+            "every survivor is on main"
+        );
+        assert_eq!(payload.mainline_name.as_deref(), Some("main"));
+    }
+
+    /// The filter drops main's tip: the rail re-anchors on the first
+    /// survivor of the ORIGINAL chain and keeps the branch's name.
+    #[test]
+    fn a_filter_that_drops_the_tip_re_anchors_on_the_chain_s_first_survivor() {
+        let payload = assemble("author:bob");
+        assert_eq!(ids(&payload), ["f1", "m2"]);
+        assert_connected(&payload);
+        assert_eq!(payload.mainline_id.as_deref(), Some("m2"));
+        assert_eq!(payload.mainline_name.as_deref(), Some("main"));
+        assert!(payload.rows[1].is_mainline && !payload.rows[0].is_mainline);
+        assert_eq!(payload.rows[0].parent_ids, ["m2"]);
+        assert!(
+            payload.rows[1].parent_ids.is_empty(),
+            "m3 dropped: m2 is the filtered root"
+        );
+        assert!(payload.rows[1].is_root);
+    }
+
+    /// Nothing on main survives: the newest survivor's own chain is pinned
+    /// and the rail is unnamed rather than mislabelled `main`.
+    #[test]
+    fn a_filter_with_no_main_survivor_pins_the_newest_survivor_unnamed() {
+        let payload = assemble("sha:f1");
+        assert_eq!(ids(&payload), ["f1"]);
+        assert_eq!(payload.mainline_id.as_deref(), Some("f1"));
+        assert_eq!(payload.mainline_name, None);
+        assert_connected(&payload);
+    }
+
+    /// Free text and conventional types go through the same path.
+    #[test]
+    fn text_and_type_filters_stay_connected() {
+        let payload = assemble("fix:");
+        assert_eq!(ids(&payload), ["f1", "m2"]);
+        assert_connected(&payload);
+        let payload = assemble("root merge");
+        assert!(
+            payload.rows.is_empty(),
+            "conjunction over words matches nothing here"
+        );
+        let payload = assemble("feat:");
+        assert_eq!(ids(&payload), ["m0", "m3"]);
+        assert_eq!(
+            payload.rows[0].parent_ids,
+            ["m3"],
+            "m1, m2 and f1 all collapse onto m3"
+        );
+        assert_connected(&payload);
+    }
+
+    /// `path:` is git's job (the walk already rewrote parents); on its own
+    /// it must not trigger a second rewrite or move the anchor.
+    #[test]
+    fn a_path_only_filter_does_not_resimplify() {
+        let payload = assemble("path:src");
+        assert_eq!(ids(&payload), ["m0", "f1", "m1", "m2", "m3"]);
+        assert_eq!(payload.rows[0].parent_ids, ["m1", "f1"]);
+        assert_eq!(payload.mainline_name.as_deref(), Some("main"));
+    }
+
+    /// The has_more probe row is dropped before filtering, so a filter can
+    /// never resurrect the row past the cap.
+    #[test]
+    fn the_probe_row_is_cut_before_the_filter_runs() {
+        let payload = assemble_commit_graph(
+            history(),
+            4,
+            &CommitFilter::parse("author:ada"),
+            main_ref(),
+            Some("main"),
+            None,
+            vec!["HEAD unavailable".to_string()],
+        );
+        assert!(payload.has_more);
+        assert_eq!(ids(&payload), ["m0", "m1"]);
+        // m3 is past the cap: the relinked edge to it is an honest stub.
+        assert_eq!(payload.rows[1].parent_ids, ["m3"]);
+        assert!(payload.rows[1].connections[0].is_dangling);
+        assert_eq!(payload.warnings, ["HEAD unavailable"]);
+        assert_connected(&payload);
+    }
 }

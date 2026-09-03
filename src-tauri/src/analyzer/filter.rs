@@ -6,10 +6,11 @@ pub struct CommitFilter {
     pub author: Option<String>,
     /// `path:` query token. Deliberately NOT consulted by
     /// [`CommitFilter::matches_commit`]: its only caller
-    /// (`cmd_get_commit_graph`) narrows rows server-side via
-    /// `GitReader::commits_touching_path` before running the filter, so the
-    /// rows reaching here are already path-filtered and a per-commit path
-    /// check would be redundant.
+    /// (`cmd_get_commit_graph`) hands it to the history walk itself
+    /// (`GitReader::read_commit_history_paged`), so git limits the log to that
+    /// path AND rewrites each survivor's parents to its nearest surviving
+    /// ancestors — connectivity a per-commit check here could never restore.
+    /// The rows reaching this filter are therefore already path-limited.
     pub path: Option<String>,
     pub sha: Option<String>,
     pub commit_type: Option<String>,

@@ -218,9 +218,15 @@ fn duplicate_id_storm_is_deterministic_and_bounded() {
             .all(|r| r.connections.iter().all(|c| c.is_dangling)),
         "self/duplicate parents must all dangle"
     );
-    // Stub padding gives each one-row segment a two-row footprint; the
-    // storm still may not grow past that overlap.
-    assert!(max_lane_used(&rows) <= 1, "duplicate storm leaked columns");
+    // Stub padding gives each one-row segment a two-row footprint, and
+    // column 0 belongs to the pinned mainline (row 0's chain) for the whole
+    // window, so the storm alternates on the two columns beside it. It
+    // still may not grow past that overlap.
+    assert!(max_lane_used(&rows) <= 2, "duplicate storm leaked columns");
+    assert!(
+        rows[1..].iter().all(|r| r.lane != 0),
+        "a storm row was drawn on the mainline column"
+    );
     let again = LaneSolver::new(12).solve(&commits);
     assert_eq!(rows, again);
 }
@@ -247,9 +253,15 @@ fn empty_parent_storm_never_allocates_columns() {
             assert_eq!(conn.to_lane, row.lane, "empty parent invented a column");
         }
     }
+    // Two-row stub footprints alternate on the two columns beside the
+    // pinned mainline column (row 0's, for the whole window).
     assert!(
-        max_lane_used(&rows) <= 1,
+        max_lane_used(&rows) <= 2,
         "empty-parent storm leaked columns"
+    );
+    assert!(
+        rows[1..].iter().all(|r| r.lane != 0),
+        "a storm row was drawn on the mainline column"
     );
 }
 

@@ -7,22 +7,9 @@ import {
   DEFAULT_MAX_COMMITS,
   nextLoadLimit,
 } from "./graphLimits";
-import { queryNeedsServerFetch } from "../graph/graphFetchScheduler";
+import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
 
 export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
-
-/**
- * Sanitizes a filter query for a direct cmd_get_commit_graph reload. The
- * backend applies ANY query server-side when invoked, but the fetch scheduler
- * treats non-path queries as client-side filtering (graphRequestKey ignores
- * them). Forwarding one launders filtered rows into the cached payload: the
- * rows stay missing after the user clears the filter, because the scheduler's
- * key then equals its last-fired key and nothing refetches. Only `path:`
- * filters genuinely need git to walk history, so everything else is blanked.
- */
-export function serverFetchableQuery(query: string): string {
-  return queryNeedsServerFetch(query) ? query : "";
-}
 
 export interface CommitFileChange {
   path: string;
@@ -133,14 +120,6 @@ export function normalizeDiffPayload(raw: unknown): DiffPayload {
   };
 }
 
-export interface FoldedBranchRun {
-  merge_commit_id: string;
-  branch_root_id: string;
-  folded_commit_ids: string[];
-  commit_count: number;
-  is_collapsed: boolean;
-}
-
 /** A branch, remote branch, tag or detached HEAD pointing at a row. */
 /**
  * Mirrors Rust's `RefKind` enum, which carries
@@ -159,7 +138,6 @@ export interface RefDecoration {
 
 export interface CommitGraphPayload {
   rows: VisualCommitRow[];
-  folds: FoldedBranchRun[];
   head_id: string | null;
   /**
    * Refs resolved by the backend in one pass over `for-each-ref`, rather than
@@ -177,12 +155,23 @@ export interface CommitGraphPayload {
    * payloads from before the field existed omit it.
    */
   warnings?: string[];
+  /**
+   * The commit at the top of the pinned mainline — the straight column-0
+   * rail the solver keeps for the default branch. Absent on payloads from
+   * before the field existed; null only when the graph has no rows.
+   */
+  mainline_id?: string | null;
+  /**
+   * The branch the mainline was anchored on (`main`, `origin/main`, the
+   * HEAD branch), or null when the newest commit's chain was pinned because
+   * no ref resolved.
+   */
+  mainline_name?: string | null;
 }
 
 export interface GraphState {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
-  folds: FoldedBranchRun[];
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
@@ -196,12 +185,15 @@ export interface GraphState {
   hasMore: boolean;
   /** Backend reads that failed this load (HEAD, ref decorations). */
   warnings: string[];
+  /** Top of the straight mainline column; null when there are no rows. */
+  mainlineId: string | null;
+  /** Ref the mainline is anchored on, for labelling; null when unnamed. */
+  mainlineName: string | null;
 }
 
 interface CachedGraph {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
-  folds: FoldedBranchRun[];
   refs: RefDecoration[];
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
@@ -211,6 +203,8 @@ interface CachedGraph {
   maxCommits: number;
   hasMore: boolean;
   warnings: string[];
+  mainlineId: string | null;
+  mainlineName: string | null;
 }
 function emptyVisible(
   path: string | null,
@@ -220,7 +214,6 @@ function emptyVisible(
   return {
     rows: [],
     commits: [],
-    folds: [],
     refs: [],
     headId: null,
     selectedCommit: null,
@@ -231,6 +224,8 @@ function emptyVisible(
     error: null,
     hasMore: false,
     warnings: [],
+    mainlineId: null,
+    mainlineName: null,
   };
 }
 
@@ -259,6 +254,7 @@ function rowSignature(row: SignatureRow): string {
     (row.connections ?? []).map(laneConnectionSignature).join(";"),
     row.is_merge ? "1" : "0",
     row.is_root ? "1" : "0",
+    row.is_mainline ? "1" : "0",
   ].join("|");
 }
 
@@ -283,22 +279,18 @@ type SignatureRow = Partial<Omit<VisualCommitRow, "id">> & Pick<VisualCommitRow,
  */
 export function graphPayloadSignature(payload: {
   rows: readonly SignatureRow[];
-  folds?: readonly FoldedBranchRun[] | null;
   head_id: string | null;
   refs?: readonly RefDecoration[] | null;
   has_more?: boolean;
+  mainline_id?: string | null;
+  mainline_name?: string | null;
 }): string {
-  const folds = (payload.folds ?? [])
-    .map(
-      (f) =>
-        `${f.merge_commit_id}>${f.branch_root_id}#${f.folded_commit_ids.join(",")}@${f.commit_count}${f.is_collapsed ? "c" : "o"}`,
-    )
-    .join(";");
   const refs = (payload.refs ?? [])
     .map((r) => `${r.name}#${r.kind}@${r.commit_id}${r.is_head ? "*" : ""}`)
     .join(";");
   const rows = payload.rows.map(rowSignature).join(";");
-  return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${folds}\u0001${refs}\u0001${rows}`;
+  const mainline = `${payload.mainline_id ?? ""}#${payload.mainline_name ?? ""}`;
+  return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${rows}`;
 }
 
 /**
@@ -311,17 +303,19 @@ export function graphPayloadSignature(payload: {
  */
 function cachedSignature(cache: {
   rows: VisualCommitRow[];
-  folds: FoldedBranchRun[];
   headId: string | null;
   refs: RefDecoration[];
   hasMore: boolean;
+  mainlineId: string | null;
+  mainlineName: string | null;
 }): string {
   return graphPayloadSignature({
     rows: cache.rows,
-    folds: cache.folds,
     head_id: cache.headId,
     refs: cache.refs,
     has_more: cache.hasMore,
+    mainline_id: cache.mainlineId,
+    mainline_name: cache.mainlineName,
   });
 }
 
@@ -428,7 +422,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           ...s,
           rows: cached.rows,
           commits: cached.commits,
-          folds: cached.folds,
           refs: cached.refs,
           headId: cached.headId,
           selectedCommit: cached.selectedCommit,
@@ -436,6 +429,8 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           maxCommits: cached.maxCommits,
           hasMore: cached.hasMore,
           warnings: cached.warnings,
+          mainlineId: cached.mainlineId,
+          mainlineName: cached.mainlineName,
           error: null,
           isLoading: false,
           visiblePath: path,
@@ -470,13 +465,18 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       opts: { forceLimit?: number } = {}
     ) => {
       if (!repoPath) return;
-      query = serverFetchableQuery(query);
+      query = normalizeGraphQuery(query);
       const token = bump(repoPath);
       const max = opts.forceLimit ?? limitFor(repoPath);
-      // Stale-while-revalidate: when cached rows are already presented, a
-      // background reload must not flash the progress bar over them. Only a
-      // blank slate (first load, no cache) shows the loading state.
-      if (!cache.get(repoPath) && visiblePath === repoPath) {
+      // Stale-while-revalidate: a background reload of the SAME view must
+      // not flash the progress bar over the cached rows. A blank slate, or
+      // rows that answer a different query or branch than the one asked
+      // for, shows the loading state: the user just typed a filter and
+      // must see it working, not a silent row swap half a second later.
+      const cached = cache.get(repoPath);
+      const refining =
+        cached !== undefined && (cached.query !== query || cached.revision !== revision);
+      if ((!cached || refining) && visiblePath === repoPath) {
         update((s) => ({ ...s, isLoading: true, error: null, visiblePath: repoPath }));
       }
       try {
@@ -524,7 +524,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
         const next: CachedGraph = {
           rows: payload.rows,
           commits: payload.rows,
-          folds: payload.folds ?? [],
           refs: payload.refs ?? [],
           headId: payload.head_id,
           selectedCommit,
@@ -534,6 +533,8 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           maxCommits: max,
           hasMore: payload.has_more === true,
           warnings: payload.warnings ?? [],
+          mainlineId: payload.mainline_id ?? null,
+          mainlineName: payload.mainline_name ?? null,
         };
         cache.set(repoPath, next);
         if (visiblePath === repoPath) {
@@ -541,7 +542,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
             ...s,
             rows: next.rows,
             commits: next.commits,
-            folds: next.folds,
             refs: next.refs,
             headId: next.headId,
             selectedCommit: next.selectedCommit,
@@ -549,6 +549,8 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
             maxCommits: max,
             hasMore: next.hasMore,
             warnings: next.warnings,
+            mainlineId: next.mainlineId,
+            mainlineName: next.mainlineName,
             error: null,
             isLoading: false,
             visiblePath: repoPath,
@@ -591,7 +593,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       const current = limitFor(repoPath);
       const next = nextLoadLimit(current);
       if (next === null || !repoPath) return false;
-      await api.loadGraph(repoPath, serverFetchableQuery(query), revision, { forceLimit: next });
+      await api.loadGraph(repoPath, query, revision, { forceLimit: next });
       return true;
     },
     selectCommit: async (commit: VisualCommitRow, repoPath?: string) => {
@@ -606,9 +608,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
         const seq = selectionSeq(path);
         await fetchDetails(path, token, commit.id, seq);
       }
-    },
-    applyClientFilter: (_query: string) => {
-      // Filtering is applied by CommitTable against the latest backend payload.
     },
   };
 

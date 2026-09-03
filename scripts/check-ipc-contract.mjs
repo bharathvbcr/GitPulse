@@ -43,9 +43,9 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   cmd_compute_word_diff: "frontend computes word diffs client-side; Rust engine reserved",
   // Language LOC endpoint without a UI surface yet.
   cmd_count_loc: "utility endpoint; no LOC display wired yet",
-  // The commit-type filter parses conventional prefixes locally
-  // (lib/filter/parseQuery.ts CONVENTIONAL_TYPES); parser endpoint unused.
-  cmd_parse_conventional_commit: "frontend parses conventional types locally",
+  // The commit-type filter is parsed inside cmd_get_commit_graph itself
+  // (analyzer/filter.rs CommitFilter::parse); this parser endpoint is unused.
+  cmd_parse_conventional_commit: "commit-type filtering happens inside cmd_get_commit_graph",
   // The canvas renderer solves connector geometry internally; endpoint kept
   // in case layout moves back to Rust.
   cmd_get_bezier_connector: "canvas draws connectors internally; geometry endpoint reserved",

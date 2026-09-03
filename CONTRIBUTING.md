@@ -131,7 +131,7 @@ flowchart TD
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (132 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 46 contracts (704 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 46 contracts (705 fields) |
 | `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
@@ -195,7 +195,7 @@ GitPulse/
 └── src-tauri/src/        Rust core
     ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (132 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
-    ├── graph/            Lane solver, topology index, bezier geometry, folding
+    ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
     ├── harness/          MANVI policy gate, sidecar protocol
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot)

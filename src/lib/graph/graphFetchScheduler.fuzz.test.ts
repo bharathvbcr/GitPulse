@@ -94,10 +94,19 @@ function fuzzIteration(seed: number): void {
 
   const PATHS = ["/repos/alpha", "/repos/beta", "/repos/gamma"] as const;
   const REVISIONS = [null, "main", "dev", "v2.1"] as const;
-  // Every entry contains a `path:` token ⇒ queryNeedsServerFetch ⇒ in the key.
-  const SERVER_QUERIES = ["path:src", "path:lib/**/*.rs", "path:x author:ada"] as const;
-  // None of these reach the key: client filtering owns them.
-  const CLIENT_QUERIES = ["", "dead beef", "author:grace", "type:fix", "sha:abc123"] as const;
+  // Every query term is a backend request and part of the key; "" is the
+  // unfiltered graph. All entries are already canonical (normalized) so ARG
+  // INTEGRITY can compare loaded and presented queries verbatim.
+  const QUERIES = [
+    "",
+    "path:src",
+    "path:lib/**/*.rs",
+    "path:x author:ada",
+    "dead beef",
+    "author:grace",
+    "type:fix",
+    "sha:abc123",
+  ] as const;
 
   let presentedExact: GraphFetchRequest[] = [];
   let latestKey: string | null = null;
@@ -226,11 +235,8 @@ function fuzzIteration(seed: number): void {
     } else if (roll < 0.78) {
       latest = { ...latest, revision: pick(REVISIONS) }; // branch switch
       doSync(latest);
-    } else if (roll < 0.89) {
-      latest = { ...latest, query: pick(SERVER_QUERIES) }; // keystroke needing a git walk
-      doSync(latest);
     } else {
-      latest = { ...latest, query: pick(CLIENT_QUERIES) }; // client-side-only edit
+      latest = { ...latest, query: pick(QUERIES) }; // filter edit
       doSync(latest);
     }
   }

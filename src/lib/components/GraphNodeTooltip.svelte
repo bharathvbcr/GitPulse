@@ -12,6 +12,7 @@
   import type { TooltipPlacement } from "../canvas/graphInteraction";
   import type { RefItem } from "./CommitRow.svelte";
   import { authorColor, authorIdentity } from "../authors/authorIdentity";
+  import { getBranchColor } from "../canvas/Palette";
   import { formatRelativeTime } from "../format";
 
   let {
@@ -22,6 +23,8 @@
     hitKind = "node",
     mergeTarget = null,
     authorCommitCount = null,
+    mainlineName = null,
+    hasMore = false,
   }: {
     row: VisualCommitRow;
     refs?: RefItem[];
@@ -34,7 +37,36 @@
     mergeTarget?: VisualCommitRow | null;
     /** This author's commit count in the loaded history, when known. */
     authorCommitCount?: number | null;
+    /**
+     * The branch the straight column-0 rail is anchored on (`main`,
+     * `origin/main`, the HEAD branch), when the payload named one. Rows on
+     * that rail get a chip so the leftmost line is never an unlabeled
+     * colour: the chip says which branch's first-parent history it is.
+     */
+    mainlineName?: string | null;
+    /**
+     * Whether older history exists to load. A stub on this row fades because
+     * its parent lies past the loaded window — the only reason a payload
+     * ever carries one, since filters run in the backend and relink
+     * survivors — and a fading line with no explanation reads as a broken
+     * branch, so the strip names the parent and, when true, how to reach it.
+     */
+    hasMore?: boolean;
   } = $props();
+
+  /** Parents this row's dangling connections point at, by the k ↔ parent_ids[k] contract. */
+  const missingParents = $derived(
+    (row.connections ?? []).flatMap((conn, k) => {
+      if (!conn?.is_dangling) return [];
+      const id = row.parent_ids?.[k];
+      return typeof id === "string" && id.length > 0 ? [id] : [];
+    }),
+  );
+
+  /** Chip text for a row on the pinned mainline. */
+  const mainlineLabel = $derived(
+    row.is_mainline === true ? `${mainlineName?.trim() || "mainline"} · first-parent line` : null,
+  );
 
   // The caller clamps the anchor inside its measured box; here it only needs
   // a finite floor so the rotated caret never renders off the left edge.
@@ -77,7 +109,10 @@
     </div>
     <div class="min-w-0 flex-1">
       <div class="text-xs font-semibold leading-4">{row.summary || "No commit message"}</div>
-      <div class="mt-1 flex items-center gap-2 font-mono text-[10px] text-textMuted">
+      <!-- Chips wrap under the id instead of sharing its line: as shrink-0
+           siblings of a break-all span they could squeeze the 40-char id to
+           a few pixels and wrap it one character per line. -->
+      <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10px] text-textMuted">
         <span class="select-all break-all">{row.id}</span>
         <span class="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-textPrimary/80">
           {row.is_merge ? "Merge commit" : row.is_root ? "Root commit" : "Commit"}
@@ -85,6 +120,17 @@
         {#if hitKind === "lane"}
           <span class="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-textMuted">
             Branch line
+          </span>
+        {/if}
+        {#if mainlineLabel}
+          <!-- The straight column-0 rail, labelled by the branch it belongs
+               to: a leftmost line with no name is just a colour. -->
+          <span
+            class="shrink-0 rounded-full border px-1.5 py-0.5 font-semibold"
+            style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
+            data-testid="mainline-chip"
+          >
+            {mainlineLabel}
           </span>
         {/if}
       </div>
@@ -106,6 +152,17 @@
       {:else}
         <span class="text-textPrimary">Merges into another branch below</span>
       {/if}
+    </div>
+  {/if}
+
+  {#if missingParents.length > 0}
+    <!-- The stub's meaning, in words: which parent is missing and why. -->
+    <div class="flex items-center gap-2 border-b border-border/40 px-3 py-2 text-[10px]" data-testid="dangling-strip">
+      <GitCommit size={11} class="shrink-0 text-textMuted" />
+      <span class="min-w-0 truncate text-textPrimary">
+        Parent <span class="font-mono text-textMuted">{missingParents[0].slice(0, 7)}</span>
+        {missingParents.length > 1 ? `and ${missingParents.length - 1} more are` : "is"} outside the loaded history{hasMore ? " · load older history to follow it" : ""}
+      </span>
     </div>
   {/if}
 

@@ -4,7 +4,7 @@ use gitpulse_lib::diff::{
     UnifiedDiffLine,
 };
 use gitpulse_lib::engine::{GitReader, GitWriter};
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode, TopologyIndex};
+use gitpulse_lib::graph::{LaneSolver, RawCommitNode};
 use std::process::Command as StdCommand;
 use std::time::Instant;
 
@@ -182,21 +182,16 @@ fn test_100k_commit_graph_stress_and_throughput() {
 
     assert_eq!(visual_rows.len(), 100_000);
 
-    let index = TopologyIndex::build(&visual_rows);
-    assert_eq!(index.len(), 100_000);
-
-    let memory_bytes = index.len() * std::mem::size_of::<gitpulse_lib::graph::CommitRowMetadata>();
-    assert_eq!(memory_bytes, 1_600_000);
+    // Viewport slicing is plain slice arithmetic on the payload rows; no
+    // side index is built or shipped.
+    assert_eq!(visual_rows[50_000..50_050].len(), 50);
+    assert!(visual_rows.iter().all(|row| !row.id.is_empty()));
 
     println!(
-        "Processed 100,000 commits in {:?} ({:.0} commits/sec), Index RAM: {:.2} MB",
+        "Processed 100,000 commits in {:?} ({:.0} commits/sec)",
         duration,
         100_000.0 / duration.as_secs_f64(),
-        memory_bytes as f64 / 1_048_576.0
     );
-
-    let slice = index.slice(50_000, 50);
-    assert_eq!(slice.len(), 50);
 }
 
 #[test]
@@ -315,15 +310,11 @@ fn test_extended_lanes_density_over_64() {
     let visual_rows = solver.solve(&commits);
     assert_eq!(visual_rows.len(), 72);
 
-    let index = TopologyIndex::build(&visual_rows);
-    assert_eq!(index.len(), 72);
-    // At row 0 (mega_merge), all 70 parents are allocated discrete lanes, triggering extended lane tracking (>64)
+    // All 70 parents of mega_merge get discrete columns: the solver has no
+    // 64-lane bitmask ceiling, so lanes past 64 are ordinary rows.
     assert!(
-        index.rows[0].has_extended_lanes == 1
-            || index
-                .extended_lanes
-                .iter()
-                .any(|(_, lanes)| lanes.iter().any(|&l| l >= 64))
+        visual_rows.iter().any(|row| row.lane >= 64),
+        "70 distinct parents must spread past column 64"
     );
 }
 
@@ -507,52 +498,6 @@ fn test_stack_tree_cyclic_ancestry_safety() {
 
     let breadcrumbs = StackTreeEngine::get_ancestry_breadcrumbs(&nodes, "feat-a");
     assert!(!breadcrumbs.breadcrumb_chain.is_empty());
-}
-
-#[test]
-fn test_topology_slice_hostile_window_requests() {
-    use gitpulse_lib::graph::VisualCommitRow;
-
-    let rows: Vec<VisualCommitRow> = (0..500)
-        .map(|i| VisualCommitRow {
-            id: format!("c{i}"),
-            parent_ids: vec![],
-            summary: "s".to_string(),
-            author_name: "Dev".to_string(),
-            author_email: "dev@example.com".to_string(),
-            timestamp: 1700000000 + i as i64,
-            lane: 0,
-            color_index: 0,
-            active_lanes: vec![0, 1],
-            active_lane_colors: vec![0, 1],
-            connections: vec![],
-            is_merge: false,
-            is_root: false,
-        })
-        .collect();
-    let index = TopologyIndex::build(&rows);
-    assert_eq!(index.len(), 500);
-
-    // Hostile viewport arguments must clamp, never panic or overflow.
-    assert!(index.slice(usize::MAX, 1).is_empty());
-    assert!(index.slice(50_000, 50).is_empty());
-    assert_eq!(index.slice(0, usize::MAX).len(), 500);
-    assert_eq!(index.slice(499, usize::MAX).len(), 1);
-    assert_eq!(index.slice(250, usize::MAX).len(), 250);
-
-    // Sweep every window boundary, including counts that would overflow
-    // `start + count` if the math were unguarded.
-    for start in 0..500 {
-        for count in [1usize, 499, 500, usize::MAX] {
-            let window = index.slice(start, count);
-            let expected = (500 - start).min(count);
-            assert_eq!(
-                window.len(),
-                expected,
-                "slice({start}, {count:#x}) clamped wrong"
-            );
-        }
-    }
 }
 
 /// Path-scoped commit diffs must stay bounded when one commit touches thousands
