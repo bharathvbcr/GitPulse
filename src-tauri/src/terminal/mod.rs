@@ -1785,8 +1785,33 @@ mod tests {
             "python reported success but produced no {rel}; a create that made \
              nothing must fail here rather than be read as a refused virtualenv"
         );
-        check_venv_interpreter(repo, rel)
-            .expect("a virtualenv built by python -m venv must be accepted");
+        // On a refusal, say what the interpreter actually IS. The Windows
+        // build of `venv` does not necessarily copy the base interpreter in,
+        // and a bare "refused" gives nothing to reason about from a CI log.
+        if let Err(detail) = check_venv_interpreter(repo, rel) {
+            let interpreter = repo.join(rel);
+            let size = std::fs::metadata(&interpreter).map(|m| m.len());
+            let cfg = std::fs::read_to_string(repo.join(".venv").join("pyvenv.cfg"))
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+            let hosts: Vec<String> = ["python3", "python"]
+                .iter()
+                .map(|name| match resolve_on_path(name) {
+                    Some(path) => {
+                        let len = std::fs::metadata(&path).map(|m| m.len());
+                        format!("{name} -> {} ({len:?} bytes)", path.display())
+                    }
+                    None => format!("{name} -> <not on PATH>"),
+                })
+                .collect();
+            panic!(
+                "a virtualenv built by python -m venv must be accepted: {detail}\n\
+                 interpreter: {} ({size:?} bytes)\n\
+                 pyvenv.cfg:\n{cfg}\n\
+                 hosts: {}",
+                interpreter.display(),
+                hosts.join(" | ")
+            );
+        }
         let argv = vec![
             rel.to_string(),
             "-m".to_string(),
