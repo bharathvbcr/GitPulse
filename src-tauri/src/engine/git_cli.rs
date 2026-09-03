@@ -548,19 +548,67 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
 ///   non-executable matches rather than failing the whole lookup, and picking
 ///   one would turn "tool found" into a PermissionDenied spawn error;
 /// - broken symlinks and directories named like the tool are skipped;
-/// - on Windows the bare name is tried before the `.exe`-suffixed one, and
-///   never double-suffixed (`npm.cmd`, `gh.exe`).
+/// - on Windows the suffixed spellings are tried BEFORE the bare name, in the
+///   order the OS itself uses, and a name that already carries one of those
+///   suffixes is never double-suffixed.
 fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    let mut names = vec![program.to_string()];
-    if cfg!(windows) && !program.to_ascii_lowercase().ends_with(".exe") {
-        names.push(format!("{program}.exe"));
-    }
+    let names = spawn_candidate_names(program);
     dirs.iter().filter(|dir| dir.is_absolute()).find_map(|dir| {
         names
             .iter()
             .map(|name| dir.join(name))
             .find(|candidate| is_executable_file(candidate))
     })
+}
+
+/// Executable suffixes tried on Windows, in the order `CreateProcess`'
+/// own `PATHEXT` walk uses them.
+///
+/// A fixed list rather than the environment's `PATHEXT`: the default value of
+/// that variable also carries `.VBS`, `.JS`, `.WSF` and friends, which are
+/// Windows Script Host inputs. Resolving a tool name to one of those would
+/// hand an interpreter a script this process never meant to run, and no tool
+/// GitPulse spawns ships as one.
+#[cfg(windows)]
+const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
+/// Names to try for `program` in one directory, most specific first.
+///
+/// On Windows the bare name is tried LAST, not first. Node installs both
+/// `npm.cmd` and an extension-less `npm` — a shell script for Git Bash — in
+/// the same directory, and `is_executable_file` counts any regular file there.
+/// Trying the bare name first therefore resolved the shell script and handed
+/// it to `CreateProcess`, which fails with "%1 is not a valid Win32
+/// application" (os error 193). The OS PATH walk would have found `npm.cmd`.
+///
+/// SECURITY: this makes `.bat`/`.cmd` resolvable, so a spawn can now reach a
+/// batch file. It does not introduce shell interpretation: `std::process`
+/// detects a batch target, routes it through `cmd.exe` itself, and quotes the
+/// arguments with cmd's own rules — returning `InvalidInput` for an argument
+/// it cannot safely escape rather than emitting a mis-quoted command line
+/// (the CVE-2024-24576 fix, present since 1.77.2). Building a `cmd /c` line
+/// here by hand is what would have added that surface.
+fn spawn_candidate_names(program: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let lower = program.to_ascii_lowercase();
+        if WINDOWS_EXECUTABLE_SUFFIXES
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+        {
+            return vec![program.to_string()];
+        }
+        let mut names: Vec<String> = WINDOWS_EXECUTABLE_SUFFIXES
+            .iter()
+            .map(|suffix| format!("{program}{suffix}"))
+            .collect();
+        names.push(program.to_string());
+        names
+    }
+    #[cfg(not(windows))]
+    {
+        vec![program.to_string()]
+    }
 }
 
 /// True when `path` is a regular, executable file (symlinks followed; broken
@@ -2164,6 +2212,56 @@ mod tests {
             "stdout: {}",
             String::from_utf8_lossy(&out.stdout)
         );
+    }
+
+    /// Node ships `npm.cmd` and an extension-less `npm` shell script side by
+    /// side. Resolving the latter hands `CreateProcess` a non-PE file, which is
+    /// where "%1 is not a valid Win32 application" came from.
+    #[test]
+    fn spawn_resolution_prefers_a_windows_executable_over_a_bare_script() {
+        let names = spawn_candidate_names("npm");
+        if cfg!(windows) {
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some("npm"),
+                "the bare name must be the LAST resort, not the first: {names:?}"
+            );
+            assert!(
+                names.iter().any(|name| name == "npm.cmd"),
+                "npm.cmd must be reachable: {names:?}"
+            );
+            let cmd = names.iter().position(|name| name == "npm.cmd");
+            let bare = names.iter().position(|name| name == "npm");
+            assert!(cmd < bare, "npm.cmd must be tried before npm: {names:?}");
+        } else {
+            assert_eq!(names, vec!["npm".to_string()]);
+        }
+    }
+
+    /// A name that already carries an executable suffix is used as written.
+    #[test]
+    fn spawn_resolution_never_double_suffixes_an_executable_name() {
+        for program in ["gh.exe", "GH.EXE", "thing.cmd"] {
+            let names = spawn_candidate_names(program);
+            assert_eq!(
+                names,
+                vec![program.to_string()],
+                "{program} must not gain a second suffix"
+            );
+        }
+    }
+
+    /// Script-host inputs are never resolved: naming a tool must not hand
+    /// `wscript` a file this process did not mean to run.
+    #[test]
+    fn spawn_resolution_never_reaches_a_script_host_input() {
+        let names = spawn_candidate_names("tool");
+        for forbidden in [".vbs", ".js", ".wsf", ".jse", ".msc", ".ps1"] {
+            assert!(
+                !names.iter().any(|name| name.ends_with(forbidden)),
+                "{forbidden} must not be a candidate: {names:?}"
+            );
+        }
     }
 
     /// Absolute paths pass through untouched, and a name found nowhere comes
