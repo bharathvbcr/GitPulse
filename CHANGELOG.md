@@ -11,6 +11,17 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-09-03
+
+### Fixed
+
+- **Storage report accuracy & hardening**:
+  - **Premature truncation resolved**: Raised per-directory entry limits inside build artifact directories from 4,000 to 100,000, preventing Cargo dependency directories (`target/debug/deps`) with > 4,000 files from prematurely tripping scan truncation.
+  - **Unix hard link deduplication**: Scoped `(st_dev, st_ino)` tracking on Unix for files with `nlink > 1`, ensuring Cargo hard links (`deps/libfoo-hash.a` to `libfoo.a`) are counted exactly once, eliminating gigabytes of phantom disk usage.
+  - **Monolithic container roll-up**: Container build directories (`target`, `node_modules`, `.venv`) roll nested build outputs (`debug/build`, `.../out`) up into the parent scope rather than fragmenting into dozens of child rows.
+  - **Source-tree false positive protection**: Paths inside `src/` no longer match generic build or cache directory names (e.g. `src/lib/coverage` remains recognized as source code rather than an unignored cache).
+  - **Single-pass worktree traversal**: Merged large-file collection directly into the worktree walker using `WorktreeWalkContext`, eliminating the redundant second walk and halving disk I/O.
+  - **Developer and agent caches classified**: Recognized `.devcouncil`, `.gitnexus`, `.claude`, `.cursor`, `.agents`, `.gemini`, and `.antigravity` under cache artifacts.
 
 ## [0.0.3] - 2026-09-03
 
@@ -356,6 +367,7 @@ before that tag is pushed.
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/bharathvbcr/GitPulse/releases/tag/v0.0.2

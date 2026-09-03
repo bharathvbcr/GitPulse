@@ -1,6 +1,6 @@
 [package]
 name = "gitpulse"
-version = "0.0.3"
+version = "0.0.4"
 description = "High-Performance Native Git Desktop Client"
 authors = ["GitPulse Team"]
 edition = "2021"

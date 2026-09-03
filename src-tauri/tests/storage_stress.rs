@@ -403,3 +403,150 @@ fn invalid_repositories_fail_loudly() {
     assert!(scan_storage(plain.to_str().unwrap()).is_err());
     assert!(scan_storage(guard.path().join("missing").to_str().unwrap()).is_err());
 }
+
+/// Hard links inside build directories (e.g. Cargo's target/debug/libfoo.a
+/// hard-linked to target/debug/deps/libfoo-hash.a) must not be double-counted.
+#[test]
+fn hardlinks_are_deduplicated_on_unix() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 100);
+    repo.commit_all("init");
+
+    let dep_path = repo.root.join("target/debug/deps/libfoo.a");
+    let top_path = repo.root.join("target/debug/libfoo.a");
+    fs::create_dir_all(dep_path.parent().unwrap()).unwrap();
+    fs::write(&dep_path, vec![b'x'; 200_000]).unwrap();
+    fs::hard_link(&dep_path, &top_path).expect("create hardlink");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(!report.scan.truncated);
+    // The target artifact should count the 200 KB physical file once, not twice.
+    let target = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == "target")
+        .expect("target found");
+    assert_eq!(
+        target.bytes, 200_000,
+        "hard links must be deduplicated in artifact totals"
+    );
+}
+
+/// Large fanout (> 4,000 files) inside a known artifact directory (like Cargo's
+/// target/debug/deps) must NOT trigger premature truncation.
+#[test]
+fn large_fanout_inside_artifact_does_not_truncate() {
+    let repo = TempRepo::new();
+    repo.write("src/lib.rs", 50);
+    repo.commit_all("init");
+
+    let deps = repo.root.join("target/debug/deps");
+    fs::create_dir_all(&deps).unwrap();
+    for i in 0..4_200 {
+        fs::write(deps.join(format!("lib{i:05}.rlib")), b"r").unwrap();
+    }
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(
+        !report.scan.truncated,
+        "large fanout in artifact dir must not truncate"
+    );
+    let target = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == "target")
+        .expect("target found");
+    assert_eq!(target.bytes, 4_200);
+}
+
+/// Known build containers (like target) must roll up nested build/ and out/
+/// directories rather than fragmenting into separate artifact rows.
+#[test]
+fn nested_build_and_out_dirs_inside_target_roll_up() {
+    let repo = TempRepo::new();
+    repo.write("src/lib.rs", 50);
+    repo.commit_all("init");
+
+    repo.write("target/debug/app", 10_000);
+    repo.write("target/debug/build/pkg-hash/out/libsqlite3.a", 25_000);
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(!report.scan.truncated);
+
+    // Target must appear as a single row containing all 35,000 bytes.
+    let target = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == "target")
+        .expect("target found");
+    assert_eq!(
+        target.bytes, 35_000,
+        "nested build/out bytes must roll up to target"
+    );
+
+    // There should be NO child artifact rows for target/debug/build or out.
+    assert!(
+        !report
+            .artifacts
+            .iter()
+            .any(|a| a.path.contains("target/debug/build")),
+        "inner build folder must not fragment into a separate artifact row"
+    );
+}
+
+/// Source directories like src/lib/coverage must not be misclassified as cache artifacts.
+#[test]
+fn source_subdirectories_are_not_classified_as_artifacts() {
+    let repo = TempRepo::new();
+    repo.write("src/lib/coverage/index.ts", 1_000);
+    repo.write("src/lib/coverage/calc.ts", 2_000);
+    repo.write("vendor/parser.c", 5_000);
+    repo.commit_all("tracked source code");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(!report.scan.truncated);
+
+    assert!(
+        !report
+            .artifacts
+            .iter()
+            .any(|a| a.path == "src/lib/coverage"),
+        "src/lib/coverage must not be treated as a cache artifact"
+    );
+    assert!(
+        !report.artifacts.iter().any(|a| a.path == "vendor"),
+        "tracked vendor source directory must not be treated as an unignored build artifact"
+    );
+}
+
+/// Developer tool / agent caches (.devcouncil, .gitnexus, .cursor, .claude)
+/// must be classified as cache artifacts.
+#[test]
+fn agent_and_tool_caches_are_classified() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 100);
+    repo.write(".devcouncil/index.sqlite", 60_000);
+    repo.write(".gitnexus/cache.bin", 40_000);
+    repo.commit_all("init");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(!report.scan.truncated);
+
+    let devcouncil = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == ".devcouncil")
+        .expect(".devcouncil must be recognized as an artifact");
+    assert_eq!(devcouncil.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+    assert_eq!(devcouncil.bytes, 60_000);
+
+    let gitnexus = report
+        .artifacts
+        .iter()
+        .find(|a| a.path == ".gitnexus")
+        .expect(".gitnexus must be recognized as an artifact");
+    assert_eq!(gitnexus.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+    assert_eq!(gitnexus.bytes, 40_000);
+
+    assert!(report.totals.cache_artifacts_bytes >= 100_000);
+}

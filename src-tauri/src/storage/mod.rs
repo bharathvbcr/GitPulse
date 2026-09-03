@@ -28,6 +28,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 /// Soft deadline for one full scan. Hitting it stops expansion and flags
 /// `scan.truncated` rather than presenting a partial total as complete.
 const SCAN_DEADLINE: Duration = Duration::from_secs(20);
@@ -36,8 +39,13 @@ const MAX_DEPTH: usize = 48;
 /// Maximum regular files visited across one whole scan (shared by all roots:
 /// worktree, git dir, and each linked worktree) before truncating.
 const MAX_FILES_PER_SCAN: usize = 250_000;
-/// Maximum directory entries enumerated per directory before truncating.
+/// Maximum directory entries enumerated per directory in normal source trees
+/// before truncating (defends against pathological flat directories).
 const MAX_ENTRIES_PER_DIR: usize = 4_000;
+/// Maximum directory entries enumerated per directory inside known build/cache
+/// artifact trees and git directories. Large compilation trees (like Cargo deps)
+/// easily exceed 4,000 files without being pathological.
+const MAX_ENTRIES_PER_ARTIFACT_DIR: usize = 100_000;
 /// Files at or above this size are large-file candidates.
 const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
 /// Report at most this many large files.
@@ -215,7 +223,6 @@ fn artifact_kind(dir_name: &str) -> Option<ArtifactKind> {
         "cmake-build-release",
         "DerivedData",
         "_build",
-        "vendor",
     ];
     const CACHE: &[&str] = &[
         "__pycache__",
@@ -244,6 +251,13 @@ fn artifact_kind(dir_name: &str) -> Option<ArtifactKind> {
         ".webpack",
         ".sass-cache",
         ".cache",
+        ".devcouncil",
+        ".gitnexus",
+        ".claude",
+        ".cursor",
+        ".agents",
+        ".gemini",
+        ".antigravity",
     ];
     if BUILD.contains(&dir_name) {
         Some(ArtifactKind::Build)
@@ -254,6 +268,52 @@ fn artifact_kind(dir_name: &str) -> Option<ArtifactKind> {
     }
 }
 
+/// Returns true if a directory path is located inside a source tree (`src/`, `*/src/`).
+fn is_inside_src(rel: &str) -> bool {
+    rel.starts_with("src/") || rel.contains("/src/")
+}
+
+/// Generic directory names that are commonly used inside source trees (e.g.
+/// `src/lib/coverage` in GitPulse, or `src/build/`), which must NOT be treated
+/// as build/cache artifacts when found inside source roots.
+fn is_generic_source_name(name: &str) -> bool {
+    matches!(
+        name,
+        "coverage" | "vendor" | "build" | "out" | "dist" | "obj" | "_build"
+    )
+}
+
+/// Known monolithic artifact containers that should NEVER open nested child
+/// artifact scopes. Everything inside them belongs entirely to this container.
+fn is_container_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        "target"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | "DerivedData"
+            | "cmake-build-debug"
+            | "cmake-build-release"
+            | ".gradle"
+            | ".dart_tool"
+            | ".pnpm-store"
+            | ".devcouncil"
+            | ".gitnexus"
+            | ".claude"
+            | ".cursor"
+            | ".agents"
+            | ".gemini"
+            | ".antigravity"
+    )
+}
+
+/// Generic build subdirectories that should never open as a new child artifact
+/// scope if already inside ANY active artifact scope.
+fn is_generic_build_subdir(name: &str) -> bool {
+    matches!(name, "build" | "out" | "dist" | "obj" | "_build")
+}
+
 /// Directories never descended into during any walk.
 fn is_special_dir(name: &str) -> bool {
     // Nested git directories (submodule working copies, vendored repos) are
@@ -262,16 +322,55 @@ fn is_special_dir(name: &str) -> bool {
     name == ".git"
 }
 
+/// Helper to collect the largest files across traversals using a bounded min-heap.
+struct LargeFileCollector {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>>,
+}
+
+impl LargeFileCollector {
+    fn new() -> Self {
+        Self {
+            heap: std::collections::BinaryHeap::with_capacity(MAX_LARGE_FILES + 1),
+        }
+    }
+
+    fn consider(&mut self, bytes: u64, rel_path: &str) {
+        if bytes >= LARGE_FILE_THRESHOLD {
+            self.heap
+                .push(std::cmp::Reverse((bytes, rel_path.to_string())));
+            if self.heap.len() > MAX_LARGE_FILES {
+                self.heap.pop();
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<LargeFile> {
+        let mut files: Vec<LargeFile> = Vec::with_capacity(self.heap.len());
+        while let Some(std::cmp::Reverse((bytes, path))) = self.heap.pop() {
+            files.push(LargeFile { path, bytes });
+        }
+        files.reverse(); // descending order: largest first
+        files
+    }
+}
+
 /// Sums the logical size of every regular file under `root`, iteratively.
 ///
 /// Symlinks are never followed (their own link size counts, targets do not).
 /// Returns the byte floor plus whether any budget cut the walk short.
 fn size_tree(root: &Path, budget: &mut WalkBudget) -> (u64, bool) {
-    let mut total = 0u64;
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    let mut local_truncated = false;
+    size_tree_scoped(root, budget, false)
+}
 
-    while let Some((dir, depth)) = stack.pop() {
+fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64, bool) {
+    let mut total = 0u64;
+    // (dir, depth, in_artifact)
+    let mut stack: Vec<(PathBuf, usize, bool)> = vec![(root.to_path_buf(), 0, is_git)];
+    let mut local_truncated = false;
+    #[cfg(unix)]
+    let mut seen_inodes = std::collections::HashSet::<(u64, u64)>::new();
+
+    while let Some((dir, depth, in_artifact)) = stack.pop() {
         if budget.exhausted() || local_truncated {
             budget.mark_exhausted();
             return (total, true);
@@ -285,10 +384,16 @@ fn size_tree(root: &Path, budget: &mut WalkBudget) -> (u64, bool) {
             Err(_) => continue,
         };
 
+        let max_entries = if in_artifact || is_git {
+            MAX_ENTRIES_PER_ARTIFACT_DIR
+        } else {
+            MAX_ENTRIES_PER_DIR
+        };
+
         let mut entries_seen = 0usize;
         for entry in read.flatten() {
             entries_seen += 1;
-            if entries_seen > MAX_ENTRIES_PER_DIR {
+            if entries_seen > max_entries {
                 local_truncated = true;
                 break;
             }
@@ -313,11 +418,26 @@ fn size_tree(root: &Path, budget: &mut WalkBudget) -> (u64, bool) {
                     local_truncated = true;
                     break;
                 }
-                stack.push((entry.path(), depth + 1));
+                let child_in_artifact = in_artifact || artifact_kind(&name).is_some();
+                stack.push((entry.path(), depth + 1, child_in_artifact));
             } else if file_type.is_file() {
                 budget.files_visited += 1;
                 match fs::metadata(entry.path()) {
-                    Ok(meta) => total += meta.len(),
+                    Ok(meta) => {
+                        let logical_len = meta.len();
+                        #[cfg(unix)]
+                        let is_dup = if meta.nlink() > 1 {
+                            !seen_inodes.insert((meta.dev(), meta.ino()))
+                        } else {
+                            false
+                        };
+                        #[cfg(not(unix))]
+                        let is_dup = false;
+
+                        if !is_dup {
+                            total += logical_len;
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                         budget.permission_denied += 1;
                     }
@@ -334,14 +454,13 @@ fn size_tree(root: &Path, budget: &mut WalkBudget) -> (u64, bool) {
 
 /// Collects regular files at or above [`LARGE_FILE_THRESHOLD`] under `root`,
 /// keeping the [`MAX_LARGE_FILES`] biggest, sorted descending by size.
+#[cfg(test)]
 fn collect_large_files(
     root: &Path,
     budget: &mut WalkBudget,
     skip_top_level: &[&str],
 ) -> Vec<LargeFile> {
-    use std::cmp::Reverse;
-    let mut heap: std::collections::BinaryHeap<Reverse<(u64, String)>> =
-        std::collections::BinaryHeap::with_capacity(MAX_LARGE_FILES + 1);
+    let mut collector = LargeFileCollector::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     let mut truncated = false;
 
@@ -384,18 +503,14 @@ fn collect_large_files(
             } else if file_type.is_file() {
                 budget.files_visited += 1;
                 let len = fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
-                if len < LARGE_FILE_THRESHOLD {
-                    continue;
-                }
-                let rel = entry
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap_or(entry.path().as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                heap.push(Reverse((len, rel)));
-                if heap.len() > MAX_LARGE_FILES {
-                    heap.pop();
+                if len >= LARGE_FILE_THRESHOLD {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap_or(entry.path().as_path())
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    collector.consider(len, &rel);
                 }
             }
             if budget.exhausted() {
@@ -407,14 +522,7 @@ fn collect_large_files(
     if truncated {
         budget.mark_exhausted();
     }
-    // `pop()` yields smallest-first on this min-heap; collecting then
-    // reversing gives descending-by-size without nightly's sorted iterator.
-    let mut files: Vec<LargeFile> = Vec::with_capacity(heap.len());
-    while let Some(Reverse((bytes, path))) = heap.pop() {
-        files.push(LargeFile { path, bytes });
-    }
-    files.reverse(); // descending: biggest first for display
-    files
+    collector.finish()
 }
 
 /// Parses `git count-objects -v` into authoritative object-store numbers:
@@ -551,8 +659,9 @@ fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> HashMap<String, u
 }
 
 /// Attributes every walked byte to its nearest enclosing artifact scope, so
-/// nested artifacts (vendored `build/` containing `node_modules/`) report
-/// both levels honestly and category totals count each byte exactly once.
+/// nested artifacts report both levels honestly and category totals count
+/// each byte exactly once. Monolithic containers (like `target`) roll up all
+/// nested compilation output (e.g. `debug/build/.../out`) without fragmentation.
 struct ArtifactCollector {
     /// (rel path, kind, abs path, bytes attributed to THIS scope only)
     found: Vec<(String, ArtifactKind, PathBuf, u64)>,
@@ -573,18 +682,40 @@ impl ArtifactCollector {
     }
 
     fn on_dir_enter(&mut self, abs: &Path, rel: &str, name: &str) {
-        if let Some(kind) = artifact_kind(name) {
-            self.found
-                .push((rel.to_string(), kind, abs.to_path_buf(), 0));
-            self.open.push(self.found.len() - 1);
+        // Protect source trees: generic names like `coverage` inside `src/` are source code.
+        if is_inside_src(rel) && is_generic_source_name(name) {
+            return;
         }
+
+        let Some(kind) = artifact_kind(name) else {
+            return;
+        };
+
+        // If already inside an artifact scope, do not open nested child scopes if:
+        // 1. The enclosing scope is a monolithic container (e.g. `target`, `node_modules`, `.venv`).
+        // 2. The child directory is a generic build output directory (e.g. `build`, `out`, `dist`).
+        if let Some(&top) = self.open.last() {
+            let enclosing_rel = &self.found[top].0;
+            let enclosing_name = enclosing_rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(enclosing_rel.as_str());
+            if is_container_artifact(enclosing_name) || is_generic_build_subdir(name) {
+                return;
+            }
+        }
+
+        self.found
+            .push((rel.to_string(), kind, abs.to_path_buf(), 0));
+        self.open.push(self.found.len() - 1);
     }
 
     fn on_file(&mut self, bytes: u64) {
-        if let Some(&top) = self.open.last() {
-            self.found[top].3 += bytes;
+        if bytes == 0 {
+            return;
         }
         if let Some(&top) = self.open.last() {
+            self.found[top].3 += bytes;
             match self.found[top].1 {
                 ArtifactKind::Build => self.build_total += bytes,
                 ArtifactKind::Cache => self.cache_total += bytes,
@@ -593,16 +724,25 @@ impl ArtifactCollector {
     }
 }
 
-/// Depth-first worktree walk attributing sizes to artifact scopes. Returns
-/// total bytes under `root` excluding the `.git` entry (measured separately
-/// and authoritatively through the resolved common git dir).
+/// Traversal context passed down during the single-pass worktree walk.
+struct WorktreeWalkContext<'a> {
+    root: &'a Path,
+    collector: &'a mut ArtifactCollector,
+    entered_depths: &'a mut Vec<(usize, usize)>,
+    #[cfg(unix)]
+    seen_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
+    large_collector: &'a mut LargeFileCollector,
+}
+
+/// Depth-first worktree walk attributing sizes to artifact scopes and collecting
+/// large files in a single pass. Returns total bytes under `root` excluding the
+/// `.git` entry (measured separately and authoritatively through the resolved
+/// common git dir).
 fn walk_worktree(
-    root: &Path,
+    ctx: &mut WorktreeWalkContext<'_>,
     dir: &Path,
     depth: usize,
     budget: &mut WalkBudget,
-    collector: &mut ArtifactCollector,
-    entered_depths: &mut Vec<(usize, usize)>,
 ) -> u64 {
     if budget.exhausted() {
         budget.mark_exhausted();
@@ -622,15 +762,22 @@ fn walk_worktree(
     let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
     let mut entries_seen = 0usize;
 
+    let in_artifact = !ctx.collector.open.is_empty();
+    let max_entries = if in_artifact {
+        MAX_ENTRIES_PER_ARTIFACT_DIR
+    } else {
+        MAX_ENTRIES_PER_DIR
+    };
+
     let rel_dir = dir
-        .strip_prefix(root)
+        .strip_prefix(ctx.root)
         .unwrap_or(Path::new(""))
         .to_string_lossy()
         .replace('\\', "/");
 
     for entry in read.flatten() {
         entries_seen += 1;
-        if entries_seen > MAX_ENTRIES_PER_DIR {
+        if entries_seen > max_entries {
             budget.mark_exhausted();
             break;
         }
@@ -650,7 +797,7 @@ fn walk_worktree(
             let bytes = fs::symlink_metadata(entry.path())
                 .map(|m| m.len())
                 .unwrap_or(0);
-            collector.on_file(bytes);
+            ctx.collector.on_file(bytes);
             total += bytes;
         } else if file_type.is_dir() {
             if is_special_dir(&name) && depth == 0 {
@@ -665,16 +812,29 @@ fn walk_worktree(
             subdirs.push((entry.path(), child_rel));
         } else if file_type.is_file() {
             budget.files_visited += 1;
-            let bytes = match fs::metadata(entry.path()) {
-                Ok(meta) => meta.len(),
+            match fs::metadata(entry.path()) {
+                Ok(meta) => {
+                    let logical_len = meta.len();
+                    #[cfg(unix)]
+                    let is_dup = if meta.nlink() > 1 {
+                        !ctx.seen_inodes.insert((meta.dev(), meta.ino()))
+                    } else {
+                        false
+                    };
+                    #[cfg(not(unix))]
+                    let is_dup = false;
+
+                    if !is_dup {
+                        ctx.collector.on_file(logical_len);
+                        total += logical_len;
+                        ctx.large_collector.consider(logical_len, &child_rel);
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     budget.permission_denied += 1;
-                    0
                 }
-                Err(_) => 0,
-            };
-            collector.on_file(bytes);
-            total += bytes;
+                Err(_) => {}
+            }
         }
     }
 
@@ -682,30 +842,25 @@ fn walk_worktree(
     for (child_path, child_rel) in subdirs {
         let child_depth = depth + 1;
         let child_name = child_rel.rsplit('/').next().unwrap_or_default().to_string();
-        let scopes_before = collector.open.len();
-        collector.on_dir_enter(&child_path, &child_rel, &child_name);
-        let opened_scope = collector.open.len() > scopes_before;
+        let scopes_before = ctx.collector.open.len();
+        ctx.collector
+            .on_dir_enter(&child_path, &child_rel, &child_name);
+        let opened_scope = ctx.collector.open.len() > scopes_before;
         if opened_scope {
-            entered_depths.push((collector.open.len() - 1, child_depth));
+            ctx.entered_depths
+                .push((ctx.collector.open.len() - 1, child_depth));
         }
-        total = total.saturating_add(walk_worktree(
-            root,
-            &child_path,
-            child_depth,
-            budget,
-            collector,
-            entered_depths,
-        ));
+        total = total.saturating_add(walk_worktree(ctx, &child_path, child_depth, budget));
         // The child's subtree is done: close ITS scope and anything deeper
         // it opened. Without this, a finished artifact scope stays open and
         // every later sibling's bytes are attributed to it.
         if opened_scope {
-            while let Some(&(_, d)) = entered_depths.last() {
+            while let Some(&(_, d)) = ctx.entered_depths.last() {
                 if d < child_depth {
                     break;
                 }
-                entered_depths.pop();
-                let closed = collector.open.pop();
+                ctx.entered_depths.pop();
+                let closed = ctx.collector.open.pop();
                 debug_assert!(closed.is_some(), "scope stack underflow");
             }
         }
@@ -801,15 +956,20 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
 
     if !resolved.is_bare {
         let mut entered_depths: Vec<(usize, usize)> = Vec::new();
-        worktree_bytes = walk_worktree(
-            &repo,
-            &repo,
-            0,
-            &mut budget,
-            &mut collector,
-            &mut entered_depths,
-        );
-        large_files = collect_large_files(&repo, &mut budget, &[".git"]);
+        let mut large_collector = LargeFileCollector::new();
+        #[cfg(unix)]
+        let mut seen_inodes = std::collections::HashSet::new();
+
+        let mut ctx = WorktreeWalkContext {
+            root: &repo,
+            collector: &mut collector,
+            entered_depths: &mut entered_depths,
+            #[cfg(unix)]
+            seen_inodes: &mut seen_inodes,
+            large_collector: &mut large_collector,
+        };
+        worktree_bytes = walk_worktree(&mut ctx, &repo, 0, &mut budget);
+        large_files = large_collector.finish();
     }
 
     // ---- Object store: authoritative counters ----------------------------
@@ -820,7 +980,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         };
 
     // ---- Git directory walk ----------------------------------------------
-    let (git_dir_bytes, git_truncated) = size_tree(&git_dir, &mut budget);
+    let (git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut budget, true);
     let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut budget);
     let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut budget);
     let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut budget);
@@ -1039,7 +1199,18 @@ mod tests {
         let mut budget = WalkBudget::new();
         let mut collector = ArtifactCollector::new();
         let mut entered = Vec::new();
-        let total = walk_worktree(root, root, 0, &mut budget, &mut collector, &mut entered);
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        let mut large = LargeFileCollector::new();
+        let mut ctx = WorktreeWalkContext {
+            root,
+            collector: &mut collector,
+            entered_depths: &mut entered,
+            #[cfg(unix)]
+            seen_inodes: &mut seen,
+            large_collector: &mut large,
+        };
+        let total = walk_worktree(&mut ctx, root, 0, &mut budget);
         assert_eq!(total, 550);
         let mut by_path: HashMap<String, (u64, ArtifactKind)> = collector
             .found
@@ -1058,6 +1229,98 @@ mod tests {
         assert!(by_path.is_empty());
         assert_eq!(collector.build_total, 500);
         assert_eq!(collector.cache_total, 50);
+    }
+
+    #[test]
+    fn container_artifacts_roll_up_inner_build_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("target/debug/app"), 100);
+        write_file(&root.join("target/debug/build/pkg/out/lib.a"), 400);
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        let mut large = LargeFileCollector::new();
+        let mut ctx = WorktreeWalkContext {
+            root,
+            collector: &mut collector,
+            entered_depths: &mut entered,
+            #[cfg(unix)]
+            seen_inodes: &mut seen,
+            large_collector: &mut large,
+        };
+        let total = walk_worktree(&mut ctx, root, 0, &mut budget);
+        assert_eq!(total, 500);
+        assert_eq!(collector.found.len(), 1);
+        assert_eq!(collector.found[0].0, "target");
+        assert_eq!(collector.found[0].3, 500);
+    }
+
+    #[test]
+    fn source_dirs_exclude_generic_cache_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("src/lib/coverage/file.ts"), 100);
+        write_file(&root.join("src/build/script.rs"), 200);
+        write_file(&root.join("coverage/report.html"), 300);
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        let mut large = LargeFileCollector::new();
+        let mut ctx = WorktreeWalkContext {
+            root,
+            collector: &mut collector,
+            entered_depths: &mut entered,
+            #[cfg(unix)]
+            seen_inodes: &mut seen,
+            large_collector: &mut large,
+        };
+        let total = walk_worktree(&mut ctx, root, 0, &mut budget);
+        assert_eq!(total, 600);
+        // Only coverage at root is an artifact, not src/lib/coverage or src/build.
+        assert_eq!(collector.found.len(), 1);
+        assert_eq!(collector.found[0].0, "coverage");
+        assert_eq!(collector.found[0].3, 300);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinks_deduplicate_in_size_tree_and_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f1 = root.join("file1.bin");
+        let f2 = root.join("file2.bin");
+        write_file(&f1, 5_000);
+        std::fs::hard_link(&f1, &f2).unwrap();
+
+        let mut budget = WalkBudget::new();
+        let (tree_size, _) = size_tree(root, &mut budget);
+        assert_eq!(
+            tree_size, 5_000,
+            "size_tree must deduplicate hard links on Unix"
+        );
+
+        let mut budget2 = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut large = LargeFileCollector::new();
+        let mut ctx = WorktreeWalkContext {
+            root,
+            collector: &mut collector,
+            entered_depths: &mut entered,
+            seen_inodes: &mut seen,
+            large_collector: &mut large,
+        };
+        let walk_size = walk_worktree(&mut ctx, root, 0, &mut budget2);
+        assert_eq!(
+            walk_size, 5_000,
+            "walk_worktree must deduplicate hard links on Unix"
+        );
     }
 
     #[test]
