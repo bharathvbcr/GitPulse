@@ -1,6 +1,7 @@
 //! Integration tests for sandbox hardening: symlink escapes through
 //! `sandbox_write` and working-tree reads, plus the bounded `gh` CLI probe.
 
+#[cfg(unix)]
 use gitpulse_lib::engine::git_cli::git_text;
 #[cfg(unix)]
 use gitpulse_lib::engine::git_cli::sandbox_write;

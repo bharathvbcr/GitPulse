@@ -3305,6 +3305,7 @@ mod tests {
         assert!(partial, "an unreadable workspace must not look complete");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_search_does_not_descend_into_symlinked_directories() {
         // A link to a real module inside the repository. Following it would
@@ -3317,6 +3318,7 @@ mod tests {
         assert_eq!(dirs, vec!["svc"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_search_cannot_reach_a_symlinked_tree_outside_the_repository() {
         // Belt and braces: the link is not descended into because it is a

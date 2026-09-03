@@ -170,6 +170,14 @@ before that tag is pushed.
 
 ### Fixed
 
+- The Windows Rust jobs had never compiled. `Rust Cargo Clippy` and
+  `Rust Unit & Integration Tests` sat behind the Vitest step that failed
+  first, so a step that never ran had been reading as a step that passed.
+  Three tests called `std::os::unix::fs::symlink` outside any `cfg(unix)`,
+  and `sandbox_security` imported `git_text` for a Unix-only caller. The
+  two symlink-only coverage tests are now Unix-gated; the pytest `--ignore`
+  confinement test keeps its absolute and `..` cases on Windows and gates
+  only the symlinked one, so the contract is still checked there.
 - The export card no longer renders an unmeasured metric as `0`. A failed
   language scan, and a blame scan that has not completed, now reach the card as
   null and render as an em dash with the reason, matching what the Pulse view

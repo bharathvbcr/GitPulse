@@ -2276,8 +2276,16 @@ mod tests {
     fn pytest_ignore_paths_are_confined_to_the_repository() {
         let dir = TempDir::new().unwrap();
         init_test_repo(dir.path());
-        let outside = TempDir::new().unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("bench-link")).unwrap();
+        // Held for the test's lifetime so the link keeps a live target. Only
+        // the symlinked case below needs it; the absolute and `..` escapes are
+        // portable, so Windows still checks those rather than skipping the
+        // whole confinement contract.
+        #[cfg(unix)]
+        let _outside = {
+            let outside = TempDir::new().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("bench-link")).unwrap();
+            outside
+        };
         let repo = validate_repo(dir.path().to_str().unwrap()).unwrap();
 
         let ok: Vec<String> = vec![
@@ -2288,11 +2296,14 @@ mod tests {
         validate_manvi_paths(&repo, &ok, ManviActionKind::CoverageGenerator)
             .expect("a repository-relative exclusion must validate");
 
-        for escaping in [
+        let mut escapes = vec![
             "--ignore=/etc/passwd".to_string(),
             "--ignore=../outside.py".to_string(),
-            "--ignore=bench-link/stress_test.py".to_string(),
-        ] {
+        ];
+        #[cfg(unix)]
+        escapes.push("--ignore=bench-link/stress_test.py".to_string());
+
+        for escaping in escapes {
             let argv: Vec<String> = vec!["pytest".into(), escaping.clone()];
             let err = validate_manvi_paths(&repo, &argv, ManviActionKind::CoverageGenerator)
                 .expect_err("an escaping exclusion must be refused");
