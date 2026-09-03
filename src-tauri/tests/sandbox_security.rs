@@ -30,6 +30,11 @@ fn init_repo(dir: &std::path::Path) {
         ("user.name", "t"),
         ("user.email", "t@t"),
         ("commit.gpgsign", "false"),
+        // Windows ships git with core.autocrlf=true in its system config, so
+        // a fixture repo inherits it and git rewrites LF to CRLF on checkout
+        // -- breaking the byte-exact comparisons these tests make on cloned
+        // content. These fixtures own their line endings.
+        ("core.autocrlf", "false"),
     ] {
         let _ = std::process::Command::new("git")
             .args(["config", k, v])

@@ -952,7 +952,7 @@ fn test_glob_shaped_paths_match_literally() {
 
     // A widened glob would match both files' history; literal matches only
     // the star-named file's single commit.
-    let touching = GitReader::read_commit_history_paged(&path, 0, 10, None, Some("weird*.txt"))
+    let touching = GitReader::read_commit_history_paged(&path, 0, 10, None, Some(globbish))
         .expect("log pathspec");
     assert_eq!(
         touching.len(),
@@ -960,7 +960,7 @@ fn test_glob_shaped_paths_match_literally() {
         "pathspec must stay literal: {touching:?}"
     );
 
-    let diff = GitReader::get_file_diff(&path, "weird*.txt", false, false)
+    let diff = GitReader::get_file_diff(&path, globbish, false, false)
         .expect("diff")
         .text;
     assert!(
@@ -971,7 +971,7 @@ fn test_glob_shaped_paths_match_literally() {
 
     // blame treats its <file> argument literally already; it must keep doing
     // so (and NOT receive pathspec magic, which git rejects there).
-    let blame = GitReader::get_file_blame(&path, "weird*.txt").expect("blame");
+    let blame = GitReader::get_file_blame(&path, globbish).expect("blame");
     assert_eq!(blame.len(), 2);
     assert!(blame
         .iter()

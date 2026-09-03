@@ -1557,10 +1557,24 @@ pub fn parse_ahead_behind(track: &str) -> (usize, usize) {
     )
 }
 
+/// The directory name a clone of `url` should land in.
+///
+/// The result is joined onto a caller-chosen destination, so it must be a
+/// single path component and nothing else. Splitting on `/` alone was not
+/// enough: a local Windows source path (`C:\src\repo` -- an ordinary thing to
+/// clone from) contains no forward slash, so the whole path survived as the
+/// "name", and the drive-colon split then handed back `\src\repo`. That
+/// spelling is ROOTED on Windows, and `Path::join` with a rooted path discards
+/// the destination entirely -- so cloning into an existing directory resolved
+/// to the source repository itself and refused with "Already cloned at
+/// C:\src\repo". Both separators are split on for that reason.
 pub fn repo_name_from_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let trimmed = url
+        .trim()
+        .trim_end_matches(['/', '\\'])
+        .trim_end_matches(".git");
     trimmed
-        .rsplit('/')
+        .rsplit(['/', '\\'])
         .next()
         .and_then(|s| s.rsplit(':').next())
         .filter(|s| !s.is_empty())
@@ -1638,6 +1652,61 @@ mod tests {
             repo_name_from_url("git@github.com:acme/gitpulse.git"),
             "gitpulse"
         );
+    }
+
+    /// A local Windows path is an ordinary clone source, and its last
+    /// component is its name like anywhere else.
+    #[test]
+    fn repo_name_from_a_windows_path_is_its_last_component() {
+        assert_eq!(
+            repo_name_from_url(r"C:\Users\me\AppData\Local\Temp\.tmpAbC"),
+            ".tmpAbC"
+        );
+        assert_eq!(repo_name_from_url(r"C:\src\gitpulse.git"), "gitpulse");
+        assert_eq!(repo_name_from_url(r"\\server\share\gitpulse"), "gitpulse");
+        assert_eq!(repo_name_from_url(r"C:\src\repo\"), "repo");
+        assert_eq!(repo_name_from_url(r"C:\src\repo\\"), "repo");
+    }
+
+    /// The property the clone destination depends on: whatever comes back is
+    /// ONE component, so joining it onto the chosen destination cannot land
+    /// anywhere else. A rooted or separator-bearing answer silently replaced
+    /// the destination, which is exactly how a clone came to resolve onto its
+    /// own source.
+    #[test]
+    fn a_derived_repo_name_can_never_redirect_the_join() {
+        let base = if cfg!(windows) {
+            PathBuf::from(r"C:\clone-base")
+        } else {
+            PathBuf::from("/clone-base")
+        };
+        for url in [
+            r"C:\Users\me\AppData\Local\Temp\.tmpAbC",
+            r"C:\src\repo",
+            r"\\server\share\repo",
+            "C:",
+            "https://github.com/acme/gitpulse.git",
+            "git@github.com:acme/gitpulse.git",
+            "/tmp/.tmpAbC",
+            "/",
+            "",
+            "   ",
+            "file:///tmp/src",
+        ] {
+            let name = repo_name_from_url(url);
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "{url:?} produced {name:?}, which is more than one component"
+            );
+            assert!(
+                !Path::new(&name).is_absolute() && !Path::new(&name).has_root(),
+                "{url:?} produced the rooted name {name:?}"
+            );
+            assert!(
+                base.join(&name).starts_with(&base),
+                "{url:?} produced {name:?}, which joins outside the destination"
+            );
+        }
     }
 
     #[test]
