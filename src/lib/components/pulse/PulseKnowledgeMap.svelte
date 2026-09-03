@@ -4,10 +4,13 @@
 
   let {
     knowledge = null,
+    error = null,
     loading = false,
     onRefresh,
   }: {
     knowledge: KnowledgeReport | null;
+    /** Why the blame scan produced nothing. Never rendered as "no data". */
+    error?: string | null;
     loading?: boolean;
     onRefresh?: () => void;
   } = $props();
@@ -54,6 +57,11 @@
     <div class="py-12 text-center text-textMuted text-xs flex flex-col items-center gap-2">
       <RefreshCw size={20} class="animate-spin text-accent" />
       <span>Running parallel blame scanner across repository files...</span>
+    </div>
+  {:else if error && !knowledge}
+    <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
+      <span class="text-rose-400 font-medium">Blame scan failed — this is not a bus factor of zero.</span>
+      <span class="font-mono text-[11px] text-textMuted break-words max-w-lg">{error}</span>
     </div>
   {:else if !knowledge || knowledge.scanned_files === 0}
     <div class="py-8 text-center text-textMuted text-xs">

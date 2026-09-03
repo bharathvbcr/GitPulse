@@ -4,9 +4,12 @@
 
   let {
     knowledge = null,
+    error = null,
     loading = false,
   }: {
     knowledge: KnowledgeReport | null;
+    /** Why the blame scan produced nothing. Never rendered as "no data". */
+    error?: string | null;
     loading?: boolean;
   } = $props();
 
@@ -55,6 +58,11 @@
   {#if loading && !knowledge}
     <div class="py-8 text-center text-textMuted text-xs">
       Calculating code age distribution...
+    </div>
+  {:else if error && !knowledge}
+    <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
+      <span class="text-rose-400 font-medium">Blame scan failed — no age distribution was measured.</span>
+      <span class="font-mono text-[11px] text-textMuted break-words max-w-lg">{error}</span>
     </div>
   {:else if !knowledge || total === 0}
     <div class="py-8 text-center text-textMuted text-xs">

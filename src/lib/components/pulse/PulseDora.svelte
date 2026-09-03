@@ -4,10 +4,13 @@
 
   let {
     dora = null,
+    error = null,
     loading = false,
     onRefresh,
   }: {
     dora: DoraReport | null;
+    /** Why the tag/ancestry walk produced nothing. Never rendered as zeroes. */
+    error?: string | null;
     loading?: boolean;
     onRefresh?: () => void;
   } = $props();
@@ -66,6 +69,11 @@
     <div class="py-12 text-center text-textMuted text-xs flex flex-col items-center gap-2">
       <RefreshCw size={20} class="animate-spin text-accent" />
       <span>Analyzing release tags and commit ancestry...</span>
+    </div>
+  {:else if error && !dora}
+    <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
+      <span class="text-rose-400 font-medium">Delivery scan failed — this is not a delivery frequency of zero.</span>
+      <span class="font-mono text-[11px] text-textMuted break-words max-w-lg">{error}</span>
     </div>
   {:else if !dora}
     <div class="py-8 text-center text-textMuted text-xs">

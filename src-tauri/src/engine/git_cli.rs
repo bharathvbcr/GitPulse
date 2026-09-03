@@ -387,6 +387,43 @@ pub fn git_text_capped(repo: &Path, args: &[&str], cap: usize) -> Result<(String
     Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
+/// Runs `git` in `repo` and hands back the finished run *whatever* its exit
+/// status, through the same spawn gate, timeout, environment scrub and output
+/// caps as [`git`].
+///
+/// For the callers where a non-zero status is an answer rather than a failure:
+/// `git notes show` exits 1 to say "this object has no note", which is data,
+/// while failing to spawn at all is not. [`git`] flattens both into one
+/// `Err(String)`, and a caller that cannot tell them apart ends up reporting a
+/// commit it could not look at as a commit it looked at and found nothing on.
+pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, String> {
+    git_captured_inner(repo, args, None)
+}
+
+/// [`git_captured`] with `stdin_bytes` fed to the child, for git's `--batch`
+/// style line protocols.
+pub(crate) fn git_captured_with_stdin(
+    repo: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+) -> Result<BoundedRun, String> {
+    git_captured_inner(repo, args, Some(stdin_bytes))
+}
+
+fn git_captured_inner(
+    repo: &Path,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> Result<BoundedRun, String> {
+    let label = format!("git {}", args.first().unwrap_or(&""));
+    run_bounded(
+        git_command(Some(repo), args),
+        &label,
+        DEFAULT_TIMEOUT,
+        stdin_bytes,
+    )
+}
+
 pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
     git_timeout(None, args, DEFAULT_TIMEOUT, None)
 }
@@ -856,6 +893,34 @@ fn is_timeout_error(program: &str, err: &str) -> bool {
     err.starts_with(program) && err.contains(TIMEOUT_MARKER)
 }
 
+/// What one pipe drain produced.
+///
+/// `error` is the field that keeps a broken read distinguishable from a short
+/// one: `bytes` may be a perfectly well-formed prefix either way, and only
+/// this says whether the rest is missing because there was no more or because
+/// we stopped being able to read it.
+#[derive(Default)]
+struct Drained {
+    bytes: Vec<u8>,
+    /// Cut off at the byte cap: the child had more to say.
+    truncated: bool,
+    /// Why the read stopped, when it was not end-of-stream.
+    stop: Option<Stop>,
+}
+
+/// The two ways a drain ends without reaching end-of-stream. They are kept
+/// apart because they deserve different answers: one is a fault, the other is
+/// a known-incomplete read of a child that did exit cleanly.
+enum Stop {
+    /// The read itself failed. What arrived is a fragment of unknown length,
+    /// and nothing downstream can tell it from a complete short output.
+    Broken(String),
+    /// The reader never handed its result over inside the grace window —
+    /// a daemonized grandchild is still holding the pipe's write end open, so
+    /// EOF will not come. The child's own status is still trustworthy.
+    Undelivered(String),
+}
+
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
 #[derive(Debug)]
 pub(crate) struct BoundedRun {
@@ -1088,14 +1153,38 @@ pub(crate) fn run_bounded_capped(
             // Normal exit: EOF is imminent unless the child daemonized a
             // grandchild that inherited the pipes; then we take whatever was
             // buffered after the grace window instead of hanging forever.
-            let (stdout, truncated) = collect_drained(&stdout_rx);
-            let (stderr, _) = collect_drained(&stderr_rx);
+            let mut stdout = collect_drained(&stdout_rx);
+            let mut stderr = collect_drained(&stderr_rx);
+            // A stdout we could not read to the end is not a shorter stdout:
+            // every caller past this point parses what it is handed as the
+            // whole answer. A broken read is a fault and fails the run; an
+            // undelivered one is the documented grandchild case, where the
+            // child's status is still good — that reports as truncation, which
+            // is the flag callers already treat as "this is a prefix".
+            match stdout.stop.take() {
+                Some(Stop::Broken(e)) => return Err(format!("Failed to read {label} output: {e}")),
+                Some(Stop::Undelivered(e)) => {
+                    stdout.truncated = true;
+                    stderr
+                        .bytes
+                        .extend_from_slice(format!("\n[stdout incomplete: {e}]").as_bytes());
+                }
+                None => {}
+            }
+            // stderr is diagnosis, not payload: losing it must not fail a
+            // command that worked, but a message built from a partial stderr
+            // has to say that is what it is.
+            if let Some(Stop::Broken(e) | Stop::Undelivered(e)) = stderr.stop.take() {
+                stderr
+                    .bytes
+                    .extend_from_slice(format!("\n[stderr incomplete: {e}]").as_bytes());
+            }
             Ok(BoundedRun {
-                stdout,
-                stderr,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
                 success: status.success(),
                 status_code: status.code().unwrap_or(-1),
-                truncated,
+                truncated: stdout.truncated,
             })
         }
         Err(e) => {
@@ -1125,16 +1214,22 @@ pub(crate) fn run_bounded_capped(
 /// timed-out command. When the grace expires, bytes read but not yet delivered
 /// (no EOF seen) are discarded — acceptable because git and the other tools
 /// routed through this engine do not fork pipe-holding descendants.
-fn collect_drained(rx: &mpsc::Receiver<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
-    rx.recv_timeout(DRAIN_JOIN_GRACE).unwrap_or_default()
+fn collect_drained(rx: &mpsc::Receiver<Drained>) -> Drained {
+    collect_drained_deadline(rx, Instant::now() + DRAIN_JOIN_GRACE)
 }
 
-fn collect_drained_deadline(
-    rx: &mpsc::Receiver<(Vec<u8>, bool)>,
-    deadline: Instant,
-) -> (Vec<u8>, bool) {
+fn collect_drained_deadline(rx: &mpsc::Receiver<Drained>, deadline: Instant) -> Drained {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    rx.recv_timeout(remaining).unwrap_or_default()
+    rx.recv_timeout(remaining).unwrap_or_else(|e| Drained {
+        // Emphatically not `Default`: an empty `Vec` with no stop reason says
+        // "the child produced nothing", which is a real and common answer. A
+        // drain that never delivered produced *unknown*, and the two must not
+        // arrive as the same value.
+        stop: Some(Stop::Undelivered(format!(
+            "output reader did not finish: {e}"
+        ))),
+        ..Drained::default()
+    })
 }
 
 /// Kills `child`, best-effort taking its whole process tree down on Windows.
@@ -1272,32 +1367,39 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
     &s[..cut]
 }
 
-fn drain_capped<R: Read>(pipe: Option<R>, max_bytes: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut truncated = false;
+fn drain_capped<R: Read>(pipe: Option<R>, max_bytes: usize) -> Drained {
+    let mut out = Drained::default();
     let Some(mut pipe) = pipe else {
-        return (buf, false);
+        return out;
     };
     let mut tmp = [0u8; 16_384];
     loop {
         match pipe.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
-                if buf.len() < max_bytes {
-                    let room = max_bytes - buf.len();
+                if out.bytes.len() < max_bytes {
+                    let room = max_bytes - out.bytes.len();
                     let take = n.min(room);
-                    buf.extend_from_slice(&tmp[..take]);
+                    out.bytes.extend_from_slice(&tmp[..take]);
                     if take < n {
-                        truncated = true;
+                        out.truncated = true;
                     }
                 } else {
-                    truncated = true;
+                    out.truncated = true;
                 }
             }
-            Err(_) => break,
+            // Not end-of-stream. Breaking here and handing back the prefix as
+            // if the child had simply said less is how a half-read `git show`
+            // reached a parser as a complete record and came back as "failed
+            // to parse commit metadata format" — a read that broke reported as
+            // a read that finished.
+            Err(e) => {
+                out.stop = Some(Stop::Broken(e.to_string()));
+                break;
+            }
         }
     }
-    (buf, truncated)
+    out
 }
 
 pub fn upstream_is_gone(track: &str) -> bool {
@@ -2355,6 +2457,18 @@ mod tests {
             "drain collection must be grace-bounded, took {:?}",
             started.elapsed()
         );
+        // The status is trustworthy; the output is not. EOF never came, so
+        // what was collected is a prefix of unknown length and must not be
+        // handed on as the child's complete output.
+        assert!(
+            out.truncated,
+            "an undelivered drain must report as a prefix, not as the whole stream"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("stdout incomplete"),
+            "and it must say why: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Regression (M3): a timed-out child whose backgrounded grandchild keeps
@@ -2373,6 +2487,103 @@ mod tests {
             "timeout handling must stay bounded (grace is 2s per pipe), took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A pipe that stops mid-stream must not read as a pipe that ended.
+    ///
+    /// The prefix is well-formed either way, so nothing downstream can tell
+    /// the difference on the bytes alone: a half-read `git show -s --format=…`
+    /// is a valid string with too few fields, which is how the parser came to
+    /// report "Failed to parse commit metadata format" about a commit that was
+    /// perfectly fine. Only this flag separates the two.
+    #[test]
+    fn a_broken_read_is_not_reported_as_the_end_of_the_stream() {
+        struct BreaksAfter(&'static [u8], bool);
+        impl Read for BreaksAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.1 {
+                    return Err(std::io::Error::other("pipe went away"));
+                }
+                self.1 = true;
+                let n = self.0.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                Ok(n)
+            }
+        }
+
+        let broken = drain_capped(Some(BreaksAfter(b"abc\0def", false)), 1024);
+        assert_eq!(broken.bytes, b"abc\0def");
+        assert!(!broken.truncated, "it did not hit the byte cap");
+        assert!(
+            matches!(broken.stop, Some(Stop::Broken(_))),
+            "a read that failed must say so, or its prefix passes for the whole output"
+        );
+
+        let clean = drain_capped(Some(std::io::Cursor::new(b"abc\0def".to_vec())), 1024);
+        assert_eq!(clean.bytes, b"abc\0def");
+        assert!(clean.stop.is_none(), "a clean read reports no stop reason");
+
+        let capped = drain_capped(Some(std::io::Cursor::new(vec![b'x'; 64])), 8);
+        assert_eq!(capped.bytes.len(), 8);
+        assert!(capped.truncated, "the cap is truncation, not failure");
+        assert!(capped.stop.is_none());
+
+        // No pipe at all is an empty stream, not a broken one.
+        let none = drain_capped(None::<std::io::Cursor<Vec<u8>>>, 8);
+        assert!(none.bytes.is_empty() && !none.truncated && none.stop.is_none());
+    }
+
+    /// A drain that never delivered produced *unknown*, and "the child printed
+    /// nothing" is a real, common answer — so the two must not arrive as the
+    /// same empty value.
+    #[test]
+    fn an_undelivered_drain_is_not_an_empty_output() {
+        let (tx, rx) = mpsc::channel::<Drained>();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let missing = collect_drained_deadline(&rx, deadline);
+        assert!(
+            matches!(missing.stop, Some(Stop::Undelivered(_))),
+            "nothing arrived, which is not the same as nothing being there"
+        );
+        assert!(missing.bytes.is_empty());
+
+        tx.send(Drained::default()).expect("send");
+        let delivered = collect_drained_deadline(&rx, Instant::now() + Duration::from_secs(1));
+        assert!(
+            delivered.stop.is_none(),
+            "a child that genuinely printed nothing reports no stop reason"
+        );
+        assert!(delivered.bytes.is_empty());
+    }
+
+    /// `git_captured` exists so a non-zero exit can reach the caller as data.
+    /// If it flattened that into `Err` like [`git`] does, the caller could not
+    /// tell "git looked and found nothing" from "git could not look" — and a
+    /// failure to spawn must never arrive as an ordinary empty answer.
+    #[test]
+    fn git_captured_reports_a_non_zero_exit_as_data_and_a_spawn_failure_as_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        assert!(git(repo, &["init", "-b", "main"]).is_ok(), "fixture repo");
+
+        // Exit 1, empty stdout: an answer.
+        let run = git_captured(repo, &["notes", "--ref=refs/notes/none", "show", "HEAD"])
+            .expect("a non-zero exit is not a failure to run");
+        assert!(!run.success, "git said no");
+        assert_ne!(run.status_code, 0);
+        assert!(!run.truncated);
+
+        // A successful run still reports success and carries stdout.
+        let ok = git_captured(repo, &["rev-parse", "--is-inside-work-tree"]).expect("ran");
+        assert!(ok.success);
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "true");
+
+        // A path that is not a repository fails to run at all, and says so.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let err = git_captured(outside.path(), &["notes", "list"])
+            .map(|r| r.success)
+            .unwrap_or(false);
+        assert!(!err, "a non-repository must not report a successful run");
     }
 
     /// The gate's own contract, checked without racing a real process: once

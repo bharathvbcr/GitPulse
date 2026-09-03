@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Universal binary lipo wrapper for Tauri macOS builds.
+#
+# Tauri CLI's universal-apple-darwin workflow invokes `lipo` to stitch
+# x86_64 and aarch64 targets into a fat binary, but only executes lipo on the
+# crate's `mainBinaryName` (`gitpulse`). Its macOS application bundler, however,
+# bundles all binaries declared under `[[bin]]` in Cargo.toml (`gitpulsed`,
+# `gitpulse-mcp`), expecting each to exist in the universal target directory.
+#
+# This wrapper executes the standard lipo command and then inspects whether
+# `gitpulse` was bundled. If so, it automatically builds universal fat binaries
+# for the auxiliary binaries if both architecture targets exist.
+set -euo pipefail
+
+REAL_LIPO=""
+for candidate in /usr/bin/lipo /Library/Developer/CommandLineTools/usr/bin/lipo; do
+  if [ -x "$candidate" ]; then
+    # Resolve physical paths to avoid infinite loops
+    cand_real=$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")
+    self_real=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+    if [ "$cand_real" != "$self_real" ]; then
+      REAL_LIPO="$candidate"
+      break
+    fi
+  fi
+done
+
+if [ -z "$REAL_LIPO" ]; then
+  echo "lipo wrapper error: could not locate system lipo executable" >&2
+  exit 1
+fi
+
+# Execute primary lipo invocation
+"$REAL_LIPO" "$@"
+
+# Check if this invocation built gitpulse
+args=("$@")
+output=""
+for ((i=0; i<${#args[@]}; i++)); do
+  if [ "${args[i]}" = "-output" ] && [ $((i+1)) -lt ${#args[@]} ]; then
+    output="${args[i+1]}"
+    break
+  fi
+done
+
+if [ -n "$output" ] && [ "$(basename "$output")" = "gitpulse" ]; then
+  parent_dir=$(dirname "$output")
+  for helper in gitpulsed gitpulse-mcp; do
+    helper_out="$parent_dir/$helper"
+    helper_args=()
+    for arg in "${args[@]}"; do
+      case "$arg" in
+        */gitpulse)
+          helper_args+=("${arg%/gitpulse}/$helper")
+          ;;
+        *)
+          helper_args+=("$arg")
+          ;;
+      esac
+    done
+
+    # Verify input binaries exist before running lipo
+    inputs_exist=true
+    for arg in "${helper_args[@]}"; do
+      if [ "$arg" != "-create" ] && [ "$arg" != "-output" ] && [ "$arg" != "$helper_out" ]; then
+        if [ ! -f "$arg" ]; then
+          inputs_exist=false
+          break
+        fi
+      fi
+    done
+
+    if [ "$inputs_exist" = true ]; then
+      echo "[gitpulse-lipo] Creating universal binary for auxiliary tool: $helper -> $helper_out"
+      "$REAL_LIPO" "${helper_args[@]}"
+    fi
+  done
+fi

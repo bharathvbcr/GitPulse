@@ -57,18 +57,33 @@ export function calendarDaysBetween(startMs: number, endMs: number): number {
   return n;
 }
 
-const CONVENTIONAL_RE =
-  /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_\-./]+\))?!?:\s*.+/i;
-
 /**
- * Checks whether a commit subject follows Conventional Commits.
+ * Mirror of the canonical header grammar in `analyzer/conventional.rs`
+ * (`ConventionalCommitParser::header_regex`).
  *
- * Case-insensitive on purpose: the canonical Rust parser
- * (`analyzer/conventional.rs`) accepts `[a-zA-Z]+` and lowercases the type, so
- * `FEAT:` counts there. A stricter frontend would drift from the backend.
+ * That parser is the single owner of what "conventional" means, and it accepts
+ * ANY alphabetic type — not a fixed vocabulary — plus any non-empty scope and
+ * an empty description. Encoding a stricter rule here made Pulse disagree with
+ * the commit badges and the `type:` filter about the same commit: a repo using
+ * `wip:` or `hotfix:` counted as conventional everywhere except this metric,
+ * and a scope containing a space (`fix(build system): x`) counted nowhere else.
+ *
+ * `scripts/conventional-grammar-contract.test.ts` re-derives this pattern from
+ * the Rust source, so the two cannot drift apart silently again.
  */
+const CONVENTIONAL_RE = /^[a-zA-Z]+(?:\([^)]+\))?!?:\s*.*$/;
+
 export function isConventionalCommit(subject: string): boolean {
-  return CONVENTIONAL_RE.test(subject.trim());
+  // The Rust parser matches its anchored pattern against `lines.next()`, so a
+  // full message with a body still parses on its header. Testing the whole
+  // string here would reject exactly the commits that carry trailers.
+  return CONVENTIONAL_RE.test(headerLine(subject));
+}
+
+/** First line, trimmed — the `raw_message.lines().next()?.trim()` of the Rust parser. */
+export function headerLine(message: string): string {
+  const newline = message.indexOf("\n");
+  return (newline === -1 ? message : message.slice(0, newline)).trim();
 }
 
 /**

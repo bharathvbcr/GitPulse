@@ -3065,13 +3065,17 @@ fn parse_co_authors(body: &str) -> Vec<String> {
     let mut authors = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.len() < PREFIX.len() {
+        // Split on a checked boundary: commit bodies are arbitrary UTF-8, and
+        // indexing a &str at PREFIX.len() panics whenever that byte lands
+        // inside a multi-byte character (an em dash near column 14, say).
+        // A short line and a mid-character split both yield None here.
+        let Some((head, value)) = trimmed.split_at_checked(PREFIX.len()) else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(PREFIX) {
             continue;
         }
-        if !trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
-            continue;
-        }
-        let value = trimmed[PREFIX.len()..].trim();
+        let value = value.trim();
         if !value.is_empty() {
             authors.push(value.to_string());
         }
@@ -3208,6 +3212,37 @@ mod tests {
             ]
         );
         assert!(parse_co_authors("no trailers here").is_empty());
+    }
+
+    /// Commit bodies are arbitrary UTF-8, so the trailer scan must not index
+    /// the line at a fixed byte offset. Sliding a multi-byte character across
+    /// every offset the prefix check touches covers each position where such
+    /// an index lands mid-character — the panic seen on a subject line whose
+    /// em dash straddled byte 15.
+    #[test]
+    fn parse_co_authors_reads_bodies_with_multibyte_text_at_any_offset() {
+        const PREFIX_LEN: usize = "co-authored-by:".len();
+        let expected = vec!["Zoë Q <zoe@example.com>".to_string()];
+        for offset in 0..=PREFIX_LEN + 2 {
+            for filler in ["—", "é", "🚀"] {
+                let subject = format!("{}{filler}{}", "x".repeat(offset), "y".repeat(PREFIX_LEN));
+                let body =
+                    format!("{subject}\n\n{subject}\nCo-authored-by: Zoë Q <zoe@example.com>\n");
+                assert_eq!(
+                    parse_co_authors(&body),
+                    expected,
+                    "offset {offset} with {filler:?}"
+                );
+            }
+        }
+    }
+
+    /// A trailer whose own prefix region is multi-byte is not a trailer, and
+    /// saying so must not cost a panic.
+    #[test]
+    fn parse_co_authors_rejects_a_lookalike_prefix_split_by_a_multibyte_char() {
+        assert!(parse_co_authors("co—authored-by: Nobody <n@x>").is_empty());
+        assert!(parse_co_authors("——————————————————: Nobody <n@x>").is_empty());
     }
 
     /// A clean record round-trips every field positionally.

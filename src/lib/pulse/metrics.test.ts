@@ -44,7 +44,6 @@ describe("isConventionalCommit", () => {
   });
 
   it("rejects non-conventional commit messages", () => {
-    expect(isConventionalCommit("WIP: working on stuff")).toBe(false);
     expect(isConventionalCommit("fixed bug in UI")).toBe(false);
     expect(isConventionalCommit("update styles")).toBe(false);
     expect(isConventionalCommit("")).toBe(false);
@@ -52,6 +51,18 @@ describe("isConventionalCommit", () => {
 
   it("accepts uppercase types, matching the backend parser", () => {
     expect(isConventionalCommit("FEAT: new feature")).toBe(true);
+  });
+
+  /**
+   * `WIP:` used to be asserted as non-conventional here, but the canonical
+   * parser (analyzer/conventional.rs) accepts any alphabetic type, so the
+   * commit badges and the `type:` filter already counted it. The old
+   * expectation encoded the frontend's drift, not the project's grammar.
+   * scripts/conventional-grammar-contract.test.ts now pins the two together.
+   */
+  it("accepts types outside the classic vocabulary, as the backend does", () => {
+    expect(isConventionalCommit("WIP: working on stuff")).toBe(true);
+    expect(isConventionalCommit("hotfix: page is down")).toBe(true);
   });
 });
 

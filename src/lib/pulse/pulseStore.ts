@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { get, writable, type Readable } from "svelte/store";
 import { createAsyncGuard, type AsyncGuard } from "../async/guard";
 import { createRepoPanelCache, type RepoPanelCache } from "../panels/repoPanelCache";
+import { reportPanelError } from "../diagnostics/report";
 import type {
   DoraReport,
   KnowledgeReport,
@@ -20,7 +21,17 @@ export interface PulseState {
   readonly loading: boolean;
   readonly knowledgeLoading: boolean;
   readonly doraLoading: boolean;
+  /** Primary walk failure. Set here alone blanks the whole view. */
   readonly error: string | null;
+  /**
+   * Secondary-source failures. These used to be swallowed, so a blame walk
+   * that errored rendered as a repository with no knowledge concentration and
+   * a DORA scorecard of zeroes — a check that could not run wearing the face
+   * of one that ran and found nothing.
+   */
+  readonly knowledgeError: string | null;
+  readonly doraError: string | null;
+  readonly snapshotsError: string | null;
   readonly currentRepoPath: string | null;
   readonly maxCommits: number;
 }
@@ -105,6 +116,9 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
     knowledgeLoading: false,
     doraLoading: false,
     error: null,
+    knowledgeError: null,
+    doraError: null,
+    snapshotsError: null,
     currentRepoPath: null,
     maxCommits: DEFAULT_PULSE_WINDOW,
   };
@@ -141,6 +155,9 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
       knowledgeLoading: false,
       doraLoading: false,
       error: null,
+      knowledgeError: null,
+      doraError: null,
+      snapshotsError: null,
     }));
 
     inflight?.cancel();
@@ -166,7 +183,11 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
       void loadSnapshots();
     } catch (err) {
       if (!guard.isLive()) return;
-      const errorStr = err instanceof Error ? err.message : String(err);
+      // The reporter formats once, records into the diagnostics ring tagged
+      // `pulse`, and hands back the banner text — so the failure is reachable
+      // from the Diagnostics modal (with the backend log tail, where a panic
+      // backtrace lands) instead of dying in this catch.
+      const errorStr = reportPanelError("pulse", err, { severity: "error" });
       update((s) => ({
         ...s,
         loading: false,
@@ -186,10 +207,12 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
         ...s,
         knowledge,
         knowledgeLoading: false,
+        knowledgeError: null,
       }));
-    } catch {
+    } catch (err) {
       if (activePath !== path) return;
-      update((s) => ({ ...s, knowledgeLoading: false }));
+      const message = reportPanelError("pulse", err);
+      update((s) => ({ ...s, knowledgeLoading: false, knowledgeError: message }));
     }
   }
 
@@ -204,10 +227,12 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
         ...s,
         dora,
         doraLoading: false,
+        doraError: null,
       }));
-    } catch {
+    } catch (err) {
       if (activePath !== path) return;
-      update((s) => ({ ...s, doraLoading: false }));
+      const message = reportPanelError("pulse", err);
+      update((s) => ({ ...s, doraLoading: false, doraError: message }));
     }
   }
 
@@ -220,9 +245,11 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
       update((s) => ({
         ...s,
         snapshots,
+        snapshotsError: null,
       }));
-    } catch {
-      // Silent degradation for ledger snapshot loading
+    } catch (err) {
+      if (activePath !== path) return;
+      update((s) => ({ ...s, snapshotsError: reportPanelError("pulse", err) }));
     }
   }
 
@@ -248,8 +275,9 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
     try {
       await snapshotSaver(path, input);
       void loadSnapshots();
-    } catch {
-      // Silent ledger write failure degradation
+    } catch (err) {
+      // A snapshot that never persisted must not look like one that did.
+      update((s) => ({ ...s, snapshotsError: reportPanelError("pulse", err) }));
     }
   }
 

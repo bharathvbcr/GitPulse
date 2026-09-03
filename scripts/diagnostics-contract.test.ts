@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -146,17 +146,33 @@ describe("every declared panel source actually reports", () => {
     return [...(union?.[1] ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
   };
 
+  /**
+   * Walks all of `src/lib`, not just the flat component directory it started
+   * as: a panel may own its fetches in a dedicated store (Pulse does) or nest
+   * its components in a subdirectory, and neither placement makes its failures
+   * any less reported. Test files are excluded on purpose — a source named
+   * only from a test would satisfy this contract while the app stayed silent.
+   */
   const used = (): Set<string> => {
-    const dir = fileURLToPath(new URL("../src/lib/components/", import.meta.url));
+    const root = fileURLToPath(new URL("../src/lib/", import.meta.url));
     const found = new Set<string>();
-    for (const name of readdirSync(dir)) {
-      if (!name.endsWith(".svelte")) continue;
-      for (const call of readFileSync(`${dir}${name}`, "utf8").matchAll(
-        /reportPanelError\(\s*"([a-z-]+)"/g,
-      )) {
-        found.add(call[1]);
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const full = `${dir}${name}`;
+        if (statSync(full).isDirectory()) {
+          if (name !== "__tests__") walk(`${full}/`);
+          continue;
+        }
+        if (name.endsWith(".test.ts") || name.endsWith(".spec.ts")) continue;
+        if (!name.endsWith(".svelte") && !name.endsWith(".ts")) continue;
+        for (const call of readFileSync(full, "utf8").matchAll(
+          /reportPanelError\(\s*"([a-z-]+)"/g,
+        )) {
+          found.add(call[1]);
+        }
       }
-    }
+    };
+    walk(root);
     return found;
   };
 

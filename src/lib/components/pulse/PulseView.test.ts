@@ -51,3 +51,21 @@ describe("PulseHeatmap click-to-filter", () => {
     expect(heatmap).not.toContain("Past 52 Weeks");
   });
 });
+
+describe("PulseView diagnostics affordance", () => {
+  const source = readFileSync(new URL("./PulseView.svelte", import.meta.url), "utf8");
+
+  it("routes the user to Diagnostics, where the backend log tail lands", () => {
+    expect(source).toContain('new CustomEvent("gitpulse:diagnostics")');
+    expect(source).toContain("Open Diagnostics");
+  });
+
+  it("shows the underlying message rather than the headline alone", () => {
+    expect(source).toContain("{error}");
+  });
+
+  it("hands each secondary failure to the panel that owns it", () => {
+    expect(source).toContain("error={knowledgeError}");
+    expect(source).toContain("error={doraError}");
+  });
+});

@@ -18,6 +18,7 @@ export type PanelSource =
   | "worktrees"
   | "coverage"
   | "storage"
+  | "pulse"
   | "github"
   | "health"
   | "ops"

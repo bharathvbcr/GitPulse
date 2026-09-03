@@ -163,6 +163,8 @@
   const knowledgeLoading = $derived($pulseStore.knowledgeLoading);
   const doraLoading = $derived($pulseStore.doraLoading);
   const error = $derived($pulseStore.error);
+  const knowledgeError = $derived($pulseStore.knowledgeError);
+  const doraError = $derived($pulseStore.doraError);
 
   const authors = $derived.by(() => {
     if (!report) return [];
@@ -321,14 +323,27 @@
       <AlertCircle size={16} class="shrink-0 mt-0.5" />
       <div class="flex-1">
         <p class="font-semibold">Unable to generate repository pulse metrics</p>
-        <p class="mt-1 font-mono text-[11px] opacity-90">{error}</p>
-        <button
-          type="button"
-          onclick={() => pulseStore.reload()}
-          class="gp-btn !py-1 !px-2.5 mt-3 text-xs"
-        >
-          Try Again
-        </button>
+        <p class="mt-1 font-mono text-[11px] opacity-90 break-words">{error}</p>
+        <p class="mt-2 text-[11px] text-textMuted">
+          Recorded under <span class="font-mono">pulse</span> in Diagnostics, which carries the
+          backend log tail — where a backend crash writes its location and backtrace.
+        </p>
+        <div class="flex items-center gap-2 mt-3">
+          <button
+            type="button"
+            onclick={() => pulseStore.reload()}
+            class="gp-btn !py-1 !px-2.5 text-xs"
+          >
+            Try Again
+          </button>
+          <button
+            type="button"
+            onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
+            class="gp-btn !py-1 !px-2.5 text-xs"
+          >
+            Open Diagnostics
+          </button>
+        </div>
       </div>
     </div>
   {:else if loading && !report}
@@ -419,17 +434,20 @@
       {:else if activeTab === "knowledge"}
         <PulseKnowledgeMap
           {knowledge}
+          error={knowledgeError}
           loading={knowledgeLoading}
           onRefresh={() => pulseStore.loadKnowledge()}
         />
         <PulseCodeAge
           {knowledge}
+          error={knowledgeError}
           loading={knowledgeLoading}
         />
 
       {:else if activeTab === "dora"}
         <PulseDora
           {dora}
+          error={doraError}
           loading={doraLoading}
           onRefresh={() => pulseStore.loadDora()}
         />

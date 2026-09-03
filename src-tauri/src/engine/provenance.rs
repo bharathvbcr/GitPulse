@@ -2,9 +2,19 @@
 //!
 //! Stores verification records and agent session episodes directly in git notes,
 //! surviving machine re-installs and syncing with git remotes.
+//!
+//! Every `git` this module runs goes through [`crate::engine::git_cli`] rather
+//! than `Command::new`. That seam owns the spawn gate, the command timeout,
+//! the stdout/stderr caps, the scrubbed environment and the GUI-launch program
+//! lookup; a second, ungated spawn path here was a way for a workspace with
+//! several repositories open to walk back into the "Too many open files" storm
+//! that [`crate::limits`] and the gate exist to prevent.
 
+use crate::engine::git_cli::{git, git_captured, git_captured_with_stdin, validate_repo};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::collections::HashSet;
+use std::path::Path;
 
 pub const VERIFICATION_NOTES_REF: &str = "refs/notes/gitpulse/verification";
 pub const SESSION_NOTES_REF: &str = "refs/notes/gitpulse/sessions";
@@ -58,59 +68,92 @@ pub struct ProvenanceFreshness {
     pub session: Option<SessionEpisodeNote>,
 }
 
+/// One `--ref=` argument, so the two note refs cannot drift into being spelled
+/// differently at different call sites.
+fn ref_arg(notes_ref: &str) -> String {
+    format!("--ref={notes_ref}")
+}
+
+/// Writes `payload` as `commit_sha`'s note on `notes_ref`, replacing any note
+/// already there.
+///
+/// Both note kinds share this: two copies of the same `git notes add` is two
+/// places for a flag or a failure check to be got wrong in only one of them.
+fn write_note(repo: &Path, notes_ref: &str, commit_sha: &str, payload: &str) -> Result<(), String> {
+    let ref_arg = ref_arg(notes_ref);
+    git(
+        repo,
+        &["notes", &ref_arg, "add", "-f", "-m", payload, commit_sha],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("git notes add failed: {e}"))
+}
+
+/// Reads and decodes `commit_sha`'s note on `notes_ref`.
+///
+/// Three outcomes, deliberately kept apart:
+///
+/// * `Ok(Some(note))` — a note is there and it decoded.
+/// * `Ok(None)` — git looked, and this object carries no note.
+/// * `Err(reason)` — we could not look, or looked and could not read what was
+///   there: a spawn that failed, a stream cut off at the output cap, a note
+///   that is not this app's JSON.
+///
+/// The third case used to be folded into the second. A commit whose note could
+/// not be read is *unexamined*, not *unverified*, and answering `None` for it
+/// puts a confident "no verification" badge on a commit that carries one.
+fn read_note<T: DeserializeOwned>(
+    repo: &Path,
+    notes_ref: &str,
+    commit_sha: &str,
+) -> Result<Option<T>, String> {
+    let ref_arg = ref_arg(notes_ref);
+    let run = git_captured(repo, &["notes", &ref_arg, "show", commit_sha])?;
+    if !run.success {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        // The one non-zero exit that means absence rather than failure. Any
+        // other one (a bad object, an unreadable ref, a broken repository) is
+        // reported, so it cannot pass for "nothing was ever recorded here".
+        if stderr.contains("no note found") {
+            return Ok(None);
+        }
+        return Err(if stderr.is_empty() {
+            format!("git notes show exited with status {}", run.status_code)
+        } else {
+            stderr
+        });
+    }
+    if run.truncated {
+        return Err(format!(
+            "the note on {notes_ref} for {commit_sha} exceeded the output cap; \
+             a prefix of it is not the note"
+        ));
+    }
+    let text = String::from_utf8_lossy(&run.stdout);
+    serde_json::from_str::<T>(text.trim())
+        .map(Some)
+        .map_err(|e| format!("the note on {notes_ref} for {commit_sha} did not decode: {e}"))
+}
+
 /// Appends or replaces a verification note for a commit.
 pub fn write_verification_note(
     repo_path: &str,
     commit_sha: &str,
     note: &VerificationNote,
 ) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
     let payload = serde_json::to_string(note).map_err(|e| e.to_string())?;
-    let status = Command::new("git")
-        .args([
-            "notes",
-            &format!("--ref={VERIFICATION_NOTES_REF}"),
-            "add",
-            "-f",
-            "-m",
-            &payload,
-            commit_sha,
-        ])
-        .current_dir(repo_path)
-        .status()
-        .map_err(|e| format!("Failed to execute git notes: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("git notes exited with code {status}"))
-    }
+    write_note(&repo, VERIFICATION_NOTES_REF, commit_sha, &payload)
 }
 
-/// Reads a verification note for a commit, if present.
+/// Reads a verification note for a commit. See [`read_note`] for what each
+/// outcome means — in particular, why a failed read is not `Ok(None)`.
 pub fn read_verification_note(
     repo_path: &str,
     commit_sha: &str,
 ) -> Result<Option<VerificationNote>, String> {
-    let output = Command::new("git")
-        .args([
-            "notes",
-            &format!("--ref={VERIFICATION_NOTES_REF}"),
-            "show",
-            commit_sha,
-        ])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to read git notes: {e}"))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<VerificationNote>(text.trim()) {
-        Ok(note) => Ok(Some(note)),
-        Err(_) => Ok(None),
-    }
+    let repo = validate_repo(repo_path)?;
+    read_note(&repo, VERIFICATION_NOTES_REF, commit_sha)
 }
 
 /// Appends or replaces a session episode note for a commit.
@@ -119,52 +162,48 @@ pub fn write_session_note(
     commit_sha: &str,
     note: &SessionEpisodeNote,
 ) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
     let payload = serde_json::to_string(note).map_err(|e| e.to_string())?;
-    let status = Command::new("git")
-        .args([
-            "notes",
-            &format!("--ref={SESSION_NOTES_REF}"),
-            "add",
-            "-f",
-            "-m",
-            &payload,
-            commit_sha,
-        ])
-        .current_dir(repo_path)
-        .status()
-        .map_err(|e| format!("Failed to execute git notes: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("git notes exited with code {status}"))
-    }
+    write_note(&repo, SESSION_NOTES_REF, commit_sha, &payload)
 }
 
-/// Reads a session episode note for a commit, if present.
+/// Reads a session episode note for a commit.
 pub fn read_session_note(
     repo_path: &str,
     commit_sha: &str,
 ) -> Result<Option<SessionEpisodeNote>, String> {
-    let output = Command::new("git")
-        .args([
-            "notes",
-            &format!("--ref={SESSION_NOTES_REF}"),
-            "show",
-            commit_sha,
-        ])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to read git notes: {e}"))?;
+    let repo = validate_repo(repo_path)?;
+    read_note(&repo, SESSION_NOTES_REF, commit_sha)
+}
 
-    if !output.status.success() {
-        return Ok(None);
+impl ProvenanceFreshness {
+    /// The answer for a commit nothing could be established about: no
+    /// distance, no confidence, not fresh, and *not* "the notes were read".
+    ///
+    /// Every failure path builds its answer here rather than writing the
+    /// struct out again, so none of them can quietly ship a `distance: 0` or
+    /// a `notes_readable: true` that the failure did not earn.
+    fn unexamined(commit_sha: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            commit_sha: commit_sha.into(),
+            distance: None,
+            confidence: None,
+            is_fresh: false,
+            unmeasured_reason: reason.into(),
+            notes_readable: false,
+            verification: None,
+            session: None,
+        }
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<SessionEpisodeNote>(text.trim()) {
-        Ok(note) => Ok(Some(note)),
-        Err(_) => Ok(None),
+    /// As [`Self::unexamined`], for the cases where the notes *were* read and
+    /// the distance simply was not measured — an unnoted commit, or one past
+    /// the batch's measurement budget.
+    fn unmeasured(commit_sha: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            notes_readable: true,
+            ..Self::unexamined(commit_sha, reason)
+        }
     }
 }
 
@@ -175,11 +214,15 @@ pub fn compute_freshness(
     base_branch: Option<&str>,
 ) -> ProvenanceFreshness {
     let base = base_branch.unwrap_or("HEAD");
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => return ProvenanceFreshness::unexamined(commit_sha, e),
+    };
 
     // Every failure yields `None` with a reason, never 0 — see
     // `measure_distance`, which owns that rule for both this and the batch
     // path so the two can never drift into disagreeing about it.
-    let (distance, unmeasured_reason) = measure_distance(repo_path, commit_sha, base);
+    let (distance, unmeasured_reason) = measure_distance(&repo, commit_sha, base);
 
     let confidence = distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32));
     let is_fresh = distance == Some(0);
@@ -188,10 +231,14 @@ pub fn compute_freshness(
     // for "the notes ref could not be read", so the read alone cannot tell the
     // two apart. Listing the refs can, and that distinction is the difference
     // between an unverified commit and an unexamined one.
-    let notes_readable = noted_commits(repo_path, VERIFICATION_NOTES_REF).is_ok()
-        && noted_commits(repo_path, SESSION_NOTES_REF).is_ok();
-    let verification = read_verification_note(repo_path, commit_sha).unwrap_or(None);
-    let session = read_session_note(repo_path, commit_sha).unwrap_or(None);
+    let listable = noted_commits(&repo, VERIFICATION_NOTES_REF).is_ok()
+        && noted_commits(&repo, SESSION_NOTES_REF).is_ok();
+    let verification = read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, commit_sha);
+    let session = read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, commit_sha);
+    // A read that failed is not an absence. Folding it into `None` while still
+    // claiming the notes were readable is precisely the lie this flag exists
+    // to prevent, so either failing read clears it.
+    let notes_readable = listable && verification.is_ok() && session.is_ok();
 
     ProvenanceFreshness {
         commit_sha: commit_sha.to_string(),
@@ -200,14 +247,15 @@ pub fn compute_freshness(
         is_fresh,
         unmeasured_reason,
         notes_readable,
-        verification,
-        session,
+        verification: verification.unwrap_or(None),
+        session: session.unwrap_or(None),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn init_git_repo() -> tempfile::TempDir {
@@ -269,6 +317,7 @@ mod tests {
 #[cfg(test)]
 mod freshness_honesty_tests {
     use super::*;
+    use std::process::Command;
 
     fn repo_with_commits(n: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -409,6 +458,45 @@ mod freshness_honesty_tests {
 /// sample must never be presented as complete coverage.
 pub const MAX_MEASURED_PER_BATCH: usize = 256;
 
+/// Upper bound on how many revisions one batch will even look up.
+///
+/// The revision list arrives from the webview and from MCP callers, so its
+/// length is whatever the caller passed. Resolution is one `git cat-file` for
+/// the whole list, but the query, the answer and the result vector all scale
+/// with it. Rows past the bound answer with a reason naming it — never as a
+/// measured zero, and never by silently shortening the caller's list.
+pub const MAX_RESOLVED_PER_BATCH: usize = 4_096;
+
+/// Longest revision this will put on the wire. Comfortably past a 40-character
+/// sha or any real ref name.
+const MAX_REVISION_BYTES: usize = 512;
+
+/// Why `rev` cannot be sent to `git cat-file`, if it cannot.
+///
+/// `--batch-check` is a line protocol: one answer per line of input. A
+/// revision carrying a newline would consume two answer lines and slide every
+/// later revision's answer up a row — one commit's provenance rendered on
+/// another commit's badge, with nothing anywhere reporting a problem. Refusing
+/// the input is the only way to keep the answer stream aligned, so a control
+/// character is rejected rather than stripped: repairing it would send a
+/// lookup for a revision the caller never asked about.
+fn unsendable_revision(rev: &str) -> Option<String> {
+    if rev.trim().is_empty() {
+        return Some("blank revision".to_string());
+    }
+    if rev.len() > MAX_REVISION_BYTES {
+        return Some(format!(
+            "{rev:.32}… is longer than the {MAX_REVISION_BYTES}-byte revision limit"
+        ));
+    }
+    if let Some(c) = rev.chars().find(|c| c.is_control()) {
+        return Some(format!(
+            "{rev:?} contains a control character ({c:?}) and was not looked up"
+        ));
+    }
+    None
+}
+
 /// Resolves revisions to commit shas in one pass.
 ///
 /// `git cat-file --batch-check` reads revisions on stdin and answers one line
@@ -416,58 +504,79 @@ pub const MAX_MEASURED_PER_BATCH: usize = 256;
 /// A revision it cannot resolve answers `<input> missing`, which is reported
 /// rather than dropped — a branch whose tip is not in this repository is a
 /// thing we could not look at, not a thing we looked at and found clean.
-fn resolve_revisions(repo_path: &str, revs: &[String]) -> Vec<Result<String, String>> {
-    use std::io::Write;
+///
+/// Answers land in input order, one per input, whether or not the revision was
+/// sendable: `sent` carries each answered line back to the row it belongs to,
+/// so a refused revision costs its own row a reason and no other row anything.
+///
+/// `limit` is a parameter rather than a constant read in place so a test can
+/// drive the cap at a size it can actually build: a bound that only engages at
+/// four thousand revisions is a bound nothing ever exercises.
+fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<String, String>> {
+    let mut answers: Vec<Result<String, String>> = Vec::with_capacity(revs.len());
+    let mut sent: Vec<usize> = Vec::new();
+    let mut query = String::new();
 
-    let mut child = match Command::new("git")
-        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
-        .current_dir(repo_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return revs
-                .iter()
-                .map(|_| Err(format!("could not run git cat-file: {e}")))
-                .collect()
+    for (row, rev) in revs.iter().enumerate() {
+        if row >= limit {
+            answers.push(Err(format!(
+                "not looked up: past this request's limit of {limit} revisions"
+            )));
+            continue;
         }
-    };
-
-    // `^{commit}` peels annotated tags and rejects trees and blobs, so what
-    // comes back is always something `rev-list` can walk from.
-    let query: String = revs
-        .iter()
-        .map(|r| format!("{r}^{{commit}}\n"))
-        .collect::<String>();
-    if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(query.as_bytes());
+        match unsendable_revision(rev) {
+            Some(reason) => answers.push(Err(reason)),
+            None => {
+                // `^{commit}` peels annotated tags and rejects trees and blobs,
+                // so what comes back is always something `rev-list` can walk.
+                query.push_str(rev);
+                query.push_str("^{commit}\n");
+                sent.push(row);
+                // Replaced below by whatever git answered. Left as the honest
+                // default so a short answer stream cannot leave a row looking
+                // resolved.
+                answers.push(Err(format!("git cat-file answered nothing for {rev:?}")));
+            }
+        }
     }
-    drop(child.stdin.take());
+    if sent.is_empty() {
+        return answers;
+    }
 
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
+    let run = match git_captured_with_stdin(
+        repo,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        query.as_bytes(),
+    ) {
+        Ok(run) => run,
         Err(e) => {
-            return revs
-                .iter()
-                .map(|_| Err(format!("git cat-file failed: {e}")))
-                .collect()
+            for row in sent {
+                answers[row] = Err(format!("could not run git cat-file: {e}"));
+            }
+            return answers;
         }
     };
+    // A cut-off answer stream is not a short one: the lines that did arrive
+    // may be complete, but there is no way to tell which row the cut fell in,
+    // so none of the sent rows may claim a resolution from it.
+    if run.truncated {
+        for row in sent {
+            answers[row] = Err("git cat-file output was truncated".to_string());
+        }
+        return answers;
+    }
 
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    revs.iter()
-        .map(|rev| match lines.next() {
-            None => Err(format!("git cat-file answered nothing for {rev:?}")),
-            Some(line) => match line.split_once(' ') {
-                Some((sha, "commit")) if sha.len() == 40 => Ok(sha.to_string()),
-                _ => Err(format!("{rev} does not name a commit in this repository")),
-            },
-        })
-        .collect()
+    let text = String::from_utf8_lossy(&run.stdout);
+    for (line, row) in text.lines().zip(sent) {
+        answers[row] = match line.split_once(' ') {
+            Some((sha, "commit")) if sha.len() == 40 => Ok(sha.to_string()),
+            _ => Err(format!(
+                "{} does not name a commit in this repository",
+                revs[row]
+            )),
+        };
+    }
+    answers
 }
 
 /// Commits carrying a note on `notes_ref`, as one set.
@@ -480,26 +589,28 @@ fn resolve_revisions(repo_path: &str, revs: &[String]) -> Vec<Result<String, Str
 /// Returns `Err` when the listing itself failed. A ref that does not exist yet
 /// is not a failure — it is a repository where nothing has been noted, and
 /// answers an empty set.
-fn noted_commits(
-    repo_path: &str,
-    notes_ref: &str,
-) -> Result<std::collections::HashSet<String>, String> {
-    let out = Command::new("git")
-        .args(["notes", &format!("--ref={notes_ref}"), "list"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("could not run git notes list: {e}"))?;
+fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String> {
+    let ref_arg = ref_arg(notes_ref);
+    let run = git_captured(repo, &["notes", &ref_arg, "list"])?;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    if !run.success {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
         // "no note found" / a missing ref is absence, not failure.
-        if stderr.contains("Cannot load notes ref") || stderr.trim().is_empty() {
-            return Ok(std::collections::HashSet::new());
+        if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
+            return Ok(HashSet::new());
         }
-        return Err(format!("git notes list failed: {}", stderr.trim()));
+        return Err(format!("git notes list failed: {stderr}"));
+    }
+    // A truncated listing would report noted commits as unnoted, which reads
+    // downstream as "this commit was never verified".
+    if run.truncated {
+        return Err(format!(
+            "git notes list output for {notes_ref} was truncated; \
+             the set of noted commits would be incomplete"
+        ));
     }
 
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&run.stdout)
         .lines()
         .filter_map(|line| {
             line.split_once(' ')
@@ -509,22 +620,19 @@ fn noted_commits(
 }
 
 /// Measures `commit_sha` against `base`, exactly as [`compute_freshness`] does.
-fn measure_distance(repo_path: &str, commit_sha: &str, base: &str) -> (Option<u32>, String) {
-    match Command::new("git")
-        .args(["rev-list", "--count", &format!("{commit_sha}..{base}")])
-        .current_dir(repo_path)
-        .output()
-    {
+fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, String) {
+    let range = format!("{commit_sha}..{base}");
+    match git_captured(repo, &["rev-list", "--count", &range]) {
         Err(e) => (None, format!("could not run git rev-list: {e}")),
-        Ok(out) if !out.status.success() => (
+        Ok(run) if !run.success => (
             None,
             format!(
-                "git rev-list {commit_sha}..{base} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                "git rev-list {range} failed: {}",
+                String::from_utf8_lossy(&run.stderr).trim()
             ),
         ),
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(run) => {
+            let text = String::from_utf8_lossy(&run.stdout).trim().to_string();
             match text.parse::<u32>() {
                 Ok(n) => (Some(n), String::new()),
                 Err(_) => (None, format!("git rev-list returned {text:?}, not a count")),
@@ -567,14 +675,23 @@ pub fn freshness_batch_within(
     budget: usize,
 ) -> Vec<ProvenanceFreshness> {
     let base = base_branch.unwrap_or("HEAD");
-    let resolved = resolve_revisions(repo_path, revisions);
+    let repo = match validate_repo(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return revisions
+                .iter()
+                .map(|rev| ProvenanceFreshness::unexamined(rev.clone(), e.clone()))
+                .collect()
+        }
+    };
+    let resolved = resolve_revisions(&repo, revisions, MAX_RESOLVED_PER_BATCH);
 
     // A failed listing is carried into every entry's reason rather than
     // silently becoming an empty set: "this repository has no verification
     // notes" and "we could not read its notes" are different facts, and only
     // the first one means the commits are genuinely unverified.
-    let verified = noted_commits(repo_path, VERIFICATION_NOTES_REF);
-    let sessioned = noted_commits(repo_path, SESSION_NOTES_REF);
+    let verified = noted_commits(&repo, VERIFICATION_NOTES_REF);
+    let sessioned = noted_commits(&repo, SESSION_NOTES_REF);
     let listing_error = match (&verified, &sessioned) {
         (Err(e), _) | (_, Err(e)) => Some(e.clone()),
         _ => None,
@@ -589,83 +706,67 @@ pub fn freshness_batch_within(
         .map(|(resolution, rev)| {
             let sha = match resolution {
                 Ok(sha) => sha,
-                Err(reason) => {
-                    return ProvenanceFreshness {
-                        commit_sha: rev.clone(),
-                        distance: None,
-                        confidence: None,
-                        is_fresh: false,
-                        unmeasured_reason: reason,
-                        notes_readable: false,
-                        verification: None,
-                        session: None,
-                    }
-                }
+                Err(reason) => return ProvenanceFreshness::unexamined(rev.clone(), reason),
             };
 
             let has_verification = verified.contains(&sha);
             let has_session = sessioned.contains(&sha);
 
             if let Some(err) = &listing_error {
-                return ProvenanceFreshness {
-                    commit_sha: sha,
-                    distance: None,
-                    confidence: None,
-                    is_fresh: false,
-                    unmeasured_reason: err.clone(),
-                    notes_readable: false,
-                    verification: None,
-                    session: None,
-                };
+                return ProvenanceFreshness::unexamined(sha, err.clone());
             }
 
             if !has_verification && !has_session {
-                return ProvenanceFreshness {
-                    commit_sha: sha,
-                    distance: None,
-                    confidence: None,
-                    is_fresh: false,
-                    unmeasured_reason: "not measured: this commit carries no provenance note"
-                        .to_string(),
-                    notes_readable: true,
-                    verification: None,
-                    session: None,
-                };
+                return ProvenanceFreshness::unmeasured(
+                    sha,
+                    "not measured: this commit carries no provenance note",
+                );
             }
 
             if measured >= budget {
-                return ProvenanceFreshness {
-                    commit_sha: sha,
-                    distance: None,
-                    confidence: None,
-                    is_fresh: false,
-                    unmeasured_reason: format!(
-                        "not measured: past this request's budget of {budget} noted commits"
-                    ),
-                    notes_readable: true,
-                    verification: None,
-                    session: None,
-                };
+                return ProvenanceFreshness::unmeasured(
+                    sha,
+                    format!("not measured: past this request's budget of {budget} noted commits"),
+                );
             }
             measured += 1;
 
-            let (distance, unmeasured_reason) = measure_distance(repo_path, &sha, base);
+            let (distance, unmeasured_reason) = measure_distance(&repo, &sha, base);
+            // The listing says these notes are there. A read that fails now is
+            // a note we could not get at, so the entry says the notes were not
+            // readable rather than handing back a `None` that reads as "this
+            // commit was never verified".
+            let verification = if has_verification {
+                read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, &sha)
+            } else {
+                Ok(None)
+            };
+            let session = if has_session {
+                read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, &sha)
+            } else {
+                Ok(None)
+            };
+            let unreadable = match (&verification, &session) {
+                (Err(e), _) | (_, Err(e)) => Some(e.clone()),
+                _ => None,
+            };
+            if let Some(reason) = unreadable {
+                return ProvenanceFreshness {
+                    distance,
+                    confidence: distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32)),
+                    is_fresh: distance == Some(0),
+                    ..ProvenanceFreshness::unexamined(sha, reason)
+                };
+            }
+
             ProvenanceFreshness {
                 distance,
                 confidence: distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32)),
                 is_fresh: distance == Some(0),
                 unmeasured_reason,
                 notes_readable: true,
-                verification: if has_verification {
-                    read_verification_note(repo_path, &sha).unwrap_or(None)
-                } else {
-                    None
-                },
-                session: if has_session {
-                    read_session_note(repo_path, &sha).unwrap_or(None)
-                } else {
-                    None
-                },
+                verification: verification.unwrap_or(None),
+                session: session.unwrap_or(None),
                 commit_sha: sha,
             }
         })
@@ -675,6 +776,7 @@ pub fn freshness_batch_within(
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use std::process::Command;
 
     struct Repo(tempfile::TempDir);
 
@@ -926,7 +1028,7 @@ mod batch_tests {
     fn a_repository_that_has_never_been_noted_reads_cleanly() {
         let repo = Repo::new(1);
         assert_eq!(
-            noted_commits(repo.as_str(), VERIFICATION_NOTES_REF),
+            noted_commits(repo.path(), VERIFICATION_NOTES_REF),
             Ok(std::collections::HashSet::new())
         );
     }
@@ -974,6 +1076,110 @@ mod batch_tests {
         );
 
         assert!(!compute_freshness(repo.as_str(), &sha, Some("main")).notes_readable);
+    }
+
+    /// `git cat-file --batch-check` answers one line per line of input, and the
+    /// batch maps those answers back onto its rows by position. A revision
+    /// carrying a newline puts two lines on the wire for one row, so every
+    /// later row reads the answer belonging to the row before it — a badge
+    /// rendering another commit's provenance, with nothing reporting a fault.
+    ///
+    /// The check is positional, not textual: it asserts the *second* row still
+    /// resolves to the revision it asked for.
+    #[test]
+    fn a_revision_carrying_a_newline_cannot_shift_another_rows_answer() {
+        let repo = Repo::new(2);
+        let tip = repo.rev("HEAD");
+        let parent = repo.rev("HEAD~1");
+        assert_ne!(tip, parent, "the fixture needs two distinct commits");
+
+        let got = freshness_batch(
+            repo.as_str(),
+            &["HEAD\nHEAD~1".to_string(), "HEAD".to_string()],
+            Some("main"),
+        );
+
+        assert_eq!(got.len(), 2, "one answer per input, always");
+        assert_eq!(
+            got[1].commit_sha, tip,
+            "the second row must answer for the revision it asked about"
+        );
+        assert_ne!(
+            got[1].commit_sha, parent,
+            "an injected newline must not slide another commit into this row"
+        );
+        assert!(
+            got[0].unmeasured_reason.contains("control character"),
+            "the refused row must say why, got {:?}",
+            got[0].unmeasured_reason
+        );
+        assert!(
+            !got[0].notes_readable,
+            "a row we never looked up is unexamined"
+        );
+    }
+
+    /// A note that is present but cannot be decoded is a note we could not
+    /// read. Reporting it as `verification: None` while still claiming the
+    /// notes were readable renders an unexamined commit as an unverified one.
+    #[test]
+    fn a_note_that_does_not_decode_is_unreadable_not_absent() {
+        let repo = Repo::new(1);
+        let sha = repo.rev("HEAD");
+        repo.git(&[
+            "notes",
+            "--ref=refs/notes/gitpulse/verification",
+            "add",
+            "-f",
+            "-m",
+            "this is not the app's JSON",
+            &sha,
+        ]);
+
+        let err = read_verification_note(repo.as_str(), &sha)
+            .expect_err("a note that does not decode is not an absent note");
+        assert!(err.contains("did not decode"), "got {err:?}");
+
+        let single = compute_freshness(repo.as_str(), &sha, Some("main"));
+        assert!(
+            !single.notes_readable,
+            "a note we could not read must not report as read"
+        );
+        assert!(single.verification.is_none());
+
+        let batched = freshness_batch(repo.as_str(), std::slice::from_ref(&sha), Some("main"))
+            .pop()
+            .expect("one");
+        assert!(
+            !batched.notes_readable,
+            "the batch must agree with the single measurement"
+        );
+        assert!(batched.verification.is_none());
+        assert!(
+            batched.unmeasured_reason.contains("did not decode"),
+            "the batch must say why, got {:?}",
+            batched.unmeasured_reason
+        );
+    }
+
+    /// The resolution cap is exercised at a size a test can build, and rows
+    /// past it say so rather than vanishing from the answer.
+    #[test]
+    fn revisions_past_the_resolution_limit_are_reported_not_dropped() {
+        let repo = Repo::new(1);
+        let tip = repo.rev("HEAD");
+        let revs = vec![tip.clone(), tip.clone(), tip.clone()];
+
+        let answers = resolve_revisions(repo.path(), &revs, 2);
+
+        assert_eq!(answers.len(), revs.len(), "one answer per input, always");
+        assert_eq!(answers[0].as_deref(), Ok(tip.as_str()));
+        assert_eq!(answers[1].as_deref(), Ok(tip.as_str()));
+        let reason = answers[2].as_ref().expect_err("past the limit");
+        assert!(
+            reason.contains("limit of 2 revisions"),
+            "the cap must name itself, got {reason:?}"
+        );
     }
 
     #[test]

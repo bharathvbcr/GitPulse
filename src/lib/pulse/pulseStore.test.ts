@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { get } from "svelte/store";
+import { diagnostics } from "../diagnostics/diagnostics";
 import { createRepoPanelCache } from "../panels/repoPanelCache";
 import { createPulseStore, DEFAULT_PULSE_WINDOW } from "./pulseStore";
 import type { PulseReport } from "./types";
@@ -230,3 +232,93 @@ describe("pulseStore", () => {
   });
 });
 
+/**
+ * Secondary Pulse sources used to swallow their errors outright, so a blame
+ * walk or a tag walk that failed rendered as a repository with a bus factor of
+ * zero and no releases. Each failure must now be both visible in state and
+ * recorded under `pulse` in the diagnostics ring the Diagnostics modal reads.
+ */
+describe("pulseStore failure reporting", () => {
+  const ok = () => Promise.resolve(createMockReport());
+
+  it("records a primary walk failure and surfaces it as the banner text", async () => {
+    diagnostics.clear();
+    const store = createPulseStore({
+      fetchReport: () => Promise.reject(new Error("backend task panicked")),
+      cache: createRepoPanelCache(),
+    });
+
+    await store.load("/repo");
+
+    expect(get(store).error).toContain("backend task panicked");
+    const entries = get(diagnostics).filter((e) => e.source === "pulse");
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.some((e) => e.message.includes("backend task panicked"))).toBe(true);
+  });
+
+  it("keeps a failed blame scan distinct from an empty one", async () => {
+    diagnostics.clear();
+    const store = createPulseStore({
+      fetchReport: ok,
+      fetchKnowledge: () => Promise.reject(new Error("blame timed out")),
+      fetchDora: () => Promise.reject(new Error("no such ref")),
+      fetchSnapshots: () => Promise.resolve([]),
+      cache: createRepoPanelCache(),
+    });
+
+    await store.load("/repo");
+    await store.loadKnowledge();
+    await store.loadDora();
+
+    const state = get(store);
+    // The primary report succeeded, so the page is not blanked...
+    expect(state.error).toBeNull();
+    expect(state.report).not.toBeNull();
+    // ...but neither secondary failure is allowed to read as "no data".
+    expect(state.knowledge).toBeNull();
+    expect(state.knowledgeError).toContain("blame timed out");
+    expect(state.dora).toBeNull();
+    expect(state.doraError).toContain("no such ref");
+    expect(get(diagnostics).filter((e) => e.source === "pulse").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("clears a stale failure once the source succeeds", async () => {
+    diagnostics.clear();
+    let fail = true;
+    const store = createPulseStore({
+      fetchReport: ok,
+      fetchKnowledge: () =>
+        fail
+          ? Promise.reject(new Error("transient"))
+          : Promise.resolve({
+              scanned_files: 1,
+              candidate_files: 1,
+              scanned_lines: 10,
+              bus_factor: 1,
+              primary_authors: [],
+              orphaned_files: [],
+              age_distribution: {
+                fresh_lines: 10,
+                recent_lines: 0,
+                maturing_lines: 0,
+                legacy_lines: 0,
+                ancient_lines: 0,
+                total_lines: 10,
+              },
+              half_life_days: 1,
+              truncated: false,
+              duration_ms: 1,
+            }),
+      cache: createRepoPanelCache(),
+    });
+
+    await store.load("/repo");
+    await store.loadKnowledge();
+    expect(get(store).knowledgeError).toContain("transient");
+
+    fail = false;
+    await store.loadKnowledge();
+    expect(get(store).knowledgeError).toBeNull();
+    expect(get(store).knowledge).not.toBeNull();
+  });
+});

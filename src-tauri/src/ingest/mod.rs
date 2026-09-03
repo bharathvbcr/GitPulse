@@ -183,7 +183,10 @@ fn iso_to_millis(iso: &str) -> u64 {
     if iso.len() < 20 || !iso.ends_with('Z') {
         return 0;
     }
-    let num = |a: usize, b: usize| iso[a..b].parse::<i64>().ok();
+    // `get` rather than `iso[a..b]`: the length check above counts bytes, so a
+    // non-ASCII string long enough to pass it would otherwise panic on a
+    // mid-character index instead of failing open with 0.
+    let num = |a: usize, b: usize| iso.get(a..b).and_then(|s| s.parse::<i64>().ok());
     let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) = (
         num(0, 4),
         num(5, 7),
@@ -534,7 +537,16 @@ mod watermark_tests {
     fn an_unparseable_timestamp_disables_the_skip() {
         // Failing open: the cost is time, and the alternative is silently not
         // reading a file that should have been read.
-        for bad in ["", "not a date", "2026-09-01", "2026-09-01T12:00:00+01:00"] {
+        // The last two are long enough in *bytes* to clear the length guard
+        // while their multi-byte characters straddle the fields it then reads.
+        for bad in [
+            "",
+            "not a date",
+            "2026-09-01",
+            "2026-09-01T12:00:00+01:00",
+            "2026\u{2014}09-01T12:00:00Z",
+            "\u{1F680}026-09-01T12:00:00Z",
+        ] {
             assert_eq!(iso_to_millis(bad), 0, "{bad:?} should not parse");
         }
     }
