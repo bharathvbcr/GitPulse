@@ -682,10 +682,8 @@ mod tests {
         assert_eq!(steps[3].name, "Rust format check");
         // The manifest path is threaded through every cargo step.
         assert!(
-            steps[5]
-                .args
-                .windows(2)
-                .any(|w| w[0] == "--manifest-path" && w[1].ends_with("src-tauri/Cargo.toml")),
+            steps[5].args.windows(2).any(|w| w[0] == "--manifest-path"
+                && w[1].replace('\\', "/").ends_with("src-tauri/Cargo.toml")),
             "cargo test step must carry --manifest-path, got {:?}",
             steps[5].args
         );

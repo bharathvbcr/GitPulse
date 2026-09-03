@@ -612,7 +612,15 @@ some-future-field whatever
 
     #[test]
     fn test_validate_target_path_rejects_flags_and_relative() {
-        assert!(validate_target_path("/tmp/wt").is_ok());
+        // Absolute in the platform's own spelling. `/tmp/wt` is absolute on
+        // Unix and merely rooted on Windows, where a worktree path with no
+        // drive is genuinely ambiguous and the refusal is correct.
+        let absolute = if cfg!(windows) {
+            "C:\\tmp\\wt"
+        } else {
+            "/tmp/wt"
+        };
+        assert!(validate_target_path(absolute).is_ok());
         assert!(validate_target_path("--force").is_err());
         assert!(validate_target_path("relative/path").is_err());
         assert!(validate_target_path("").is_err());

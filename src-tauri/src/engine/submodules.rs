@@ -293,6 +293,26 @@ impl SubmoduleChange {
 /// The path is a pathspec inside the superproject, so it is held to the same
 /// containment rules as any other file path this app passes to git: relative,
 /// no traversal, no NUL, no leading dash.
+/// Whether `path` is rooted in any spelling either platform understands.
+///
+/// `Path::is_absolute` answers a narrower, platform-dependent question, and
+/// the difference was a fail-open hole: on Windows `/absolute/path` is NOT
+/// absolute (it carries no drive), so a containment check built on it refused
+/// that pathspec on Unix and passed it through to argv on Windows. A pathspec
+/// that is rooted anywhere must be refused everywhere, so the leading
+/// separator and the drive prefix are both tested directly.
+fn is_rooted(path: &str) -> bool {
+    if Path::new(path).is_absolute() {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    if matches!(bytes.first(), Some(b'/' | b'\\')) {
+        return true;
+    }
+    // `C:\x` and the drive-relative `C:x` alike.
+    bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':')
+}
+
 fn validate_submodule_path(path: &str) -> Result<(), String> {
     if path.is_empty() || path.contains('\0') || path.chars().any(char::is_control) {
         return Err("Invalid submodule path".into());
@@ -300,10 +320,13 @@ fn validate_submodule_path(path: &str) -> Result<(), String> {
     if path.starts_with('-') {
         return Err("Submodule path must not start with '-'".into());
     }
-    if Path::new(path).is_absolute() {
+    if is_rooted(path) {
         return Err("Submodule path must be relative to the repository".into());
     }
-    for component in path.split('/') {
+    // Both separators: git submodule paths are `/`-separated, so a backslash
+    // is never a legitimate component name here, and treating it as one let
+    // `vendor\..\..\etc` past the traversal check on Unix.
+    for component in path.split(['/', '\\']) {
         if component == ".." {
             return Err("Submodule path escapes the repository".into());
         }
@@ -517,6 +540,12 @@ mod tests {
             "../escape",
             "vendor/../../etc",
             "/absolute/path",
+            // Rooted or traversing in spellings `Path::is_absolute` and a
+            // `/`-only split each miss on one platform or the other.
+            "\\absolute\\path",
+            "C:\\absolute\\path",
+            "C:relative",
+            "vendor\\..\\..\\etc",
             "",
             "with\0nul",
         ] {

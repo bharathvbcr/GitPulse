@@ -3696,15 +3696,18 @@ src/main.go:4.1,4.8 1 0
 
         write(repo.path(), "src/app.ts", "x\n");
         let abs = repo.path().join("src/app.ts");
+        // JSON-escape the separator: on Windows `abs` is `C:\Users\...`, and
+        // a raw backslash makes `\U` an invalid escape, so the fixture failed
+        // to parse before the parser under test was ever reached. Real
+        // istanbul output escapes it the same way.
+        let abs_json = abs.display().to_string().replace('\\', "\\\\");
         let istanbul = format!(
             r#"{{
-  "{}": {{
-    "path": "{}",
+  "{abs_json}": {{
+    "path": "{abs_json}",
     "l": {{ "1": 2, "2": 0 }}
   }}
-}}"#,
-            abs.display(),
-            abs.display()
+}}"#
         );
         let ist = parse_istanbul(&istanbul, repo.path(), &mut EntryBudget::new(usize::MAX))
             .expect("istanbul");

@@ -170,6 +170,22 @@ before that tag is pushed.
 
 ### Fixed
 
+- Submodule pathspec validation was fail-open on Windows. The rooted-path
+  refusal was built on `Path::is_absolute`, which is false for
+  `/absolute/path` there (no drive), so a pathspec refused on Unix reached
+  argv on Windows; the traversal check split on `/` only, so
+  `vendor\..\..\etc` passed it on both. Rooting is now tested directly
+  (leading separator, drive prefix) and both separators are split.
+- Watcher: an event naming the git directory itself now classifies as
+  noise. It says only that something under it moved, which the recursive
+  watch on that directory already reports in detail. Windows delivers that
+  event for every git-internal write via the non-recursive worktree-root
+  watch, so lockfile churn alone was reading as repository change there.
+- Eight Windows-only test failures that the newly-running Rust job exposed:
+  a Windows path embedded unescaped in a JSON fixture, `/`-pinned path
+  assertions, POSIX-only filename bytes (`*`, `"`, `?`) that the Win32
+  filename parser rejects outright, and `core.autocrlf` rewriting a fixture
+  on checkout.
 - Release asset manifest updated for `tauri-action@v1`, which versions the
   macOS updater archive (`GitPulse_0.0.3_universal.app.tar.gz`) where v0
   emitted it bare. All three build jobs were green and had uploaded a

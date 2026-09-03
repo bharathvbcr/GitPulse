@@ -4387,18 +4387,29 @@ mod tests {
     fn list_repo_files_preserves_hostile_filenames_verbatim() {
         let dir = tempfile::TempDir::new().unwrap();
         git_in(dir.path(), &["init", "-b", "main"]);
-        let names = [
-            "*.md",
+        // `*`, `"` and `?` are legal POSIX filename bytes and are rejected by
+        // the Win32 filename parser outright (os error 123), so the quoting
+        // contract is checked with them where they can exist and without them
+        // where they cannot. Chained rather than pushed into a `mut` vec: a
+        // binding mutated on only one platform is an `unused_mut` error on the
+        // other under `-D warnings`.
+        #[cfg(unix)]
+        let posix_only: &[&str] = &["*.md", "quo\"te.txt", "weird?.txt"];
+        #[cfg(not(unix))]
+        let posix_only: &[&str] = &[];
+        let names: Vec<&str> = [
             "-dash.txt",
             "[bracket].txt",
             "a/b/c/d/e/f/g.txt",
             "café.txt",
             "emoji-🚀.txt",
-            "quo\"te.txt",
-            "weird?.txt",
             "with space.txt",
-        ];
-        for name in names {
+        ]
+        .iter()
+        .copied()
+        .chain(posix_only.iter().copied())
+        .collect();
+        for name in &names {
             let path = dir.path().join(name);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -4408,7 +4419,7 @@ mod tests {
         git_in(dir.path(), &["add", "."]);
         git_in(dir.path(), &["commit", "-m", "hostile names"]);
 
-        let mut expected: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut expected: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         expected.sort();
         let files = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("listing");
         assert_eq!(files, expected);

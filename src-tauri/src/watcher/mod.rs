@@ -166,6 +166,17 @@ pub(crate) fn is_git_internal_noise(path: &Path, internal_roots: &[std::path::Pa
     if !internal_roots.iter().any(|root| path.starts_with(root)) {
         return false;
     }
+    // An event naming the git directory ITSELF, rather than something inside
+    // it, carries no information about what changed — and that same directory
+    // is watched recursively, so whatever changed delivers its own event. The
+    // worktree-root watch is non-recursive, and on Windows
+    // ReadDirectoryChangesW reports a direct child directory for any write
+    // beneath it: every `.git/index.lock` touch arrived a second time as a
+    // bare `<repo>/.git` event, which passed this filter and made pure
+    // git-internal churn read as repository change on Windows only.
+    if internal_roots.iter().any(|root| path == root) {
+        return true;
+    }
     is_noise_leaf_name(path)
 }
 
@@ -867,14 +878,50 @@ mod tests {
 
     #[test]
     fn lexical_normalizations_strip_trailing_slash_and_dot_segments() {
+        // `components()` rebuilds with the platform separator, so the
+        // normalized variant is `\tmp\repo` on Windows. That is correct — it
+        // is what the stored keys look like there — and the property under
+        // test is the stripping of trailing slashes and `.` segments, so the
+        // comparison is made separator-agnostic rather than pinned to Unix.
+        fn keys(path: &str) -> Vec<String> {
+            let mut values: Vec<String> = lexical_normalizations(path)
+                .into_iter()
+                .map(|v| v.replace('\\', "/"))
+                .collect();
+            // Windows produces a second, back-slashed spelling of an input
+            // already written with forward slashes; once both are compared in
+            // one spelling the duplicate is the same key.
+            values.dedup();
+            values
+        }
         assert_eq!(
-            lexical_normalizations("/tmp/repo/"),
+            keys("/tmp/repo/"),
             vec!["/tmp/repo/".to_string(), "/tmp/repo".to_string()]
         );
-        assert_eq!(lexical_normalizations("."), vec![".".to_string()]);
-        assert_eq!(
-            lexical_normalizations("relative/repo"),
-            vec!["relative/repo".to_string()]
+        assert_eq!(keys("."), vec![".".to_string()]);
+        assert_eq!(keys("relative/repo"), vec!["relative/repo".to_string()]);
+    }
+
+    /// An event naming the git directory itself is not a repository change.
+    ///
+    /// It says only "something under here moved", which the recursive watch on
+    /// that same directory already reports in detail. Windows delivered
+    /// exactly this event for every git-internal write, so without the rule
+    /// pure lockfile churn read as repository change there.
+    #[test]
+    fn an_event_for_the_git_directory_itself_is_noise() {
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+        let roots = internal_roots_for(tmp.path());
+
+        assert!(
+            is_git_internal_noise(&git_dir, &roots),
+            "a bare git-dir event carries no change information"
+        );
+        assert!(
+            !is_git_internal_noise(&git_dir.join("refs").join("heads"), &roots),
+            "but a ref write inside it still matters"
         );
     }
 
@@ -1284,6 +1331,13 @@ mod tests {
     /// keeps delivering remove/error events and the old loop re-emitted
     /// `repo-changed` forever while the session stayed resident. The loop
     /// must fall silent and reap its session.
+    /// Unix only, for the technique rather than the behaviour: the test has to
+    /// make a watched directory vanish, and Windows refuses to rename or
+    /// delete one while a change-notification handle is open on it — the
+    /// watcher holds handles on both the git dir (recursive) and the worktree
+    /// root. The reaping path itself is platform-independent; there is simply
+    /// no way to trigger it from outside on Windows.
+    #[cfg(unix)]
     #[test]
     fn dead_repo_watch_stops_emitting_and_reaps_session() {
         let dir = TempDir::new().unwrap();

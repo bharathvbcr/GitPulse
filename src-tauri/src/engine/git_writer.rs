@@ -1522,6 +1522,16 @@ mod tests {
             .expect("spawn git init");
         assert!(output.status.success());
         configure_identity(dir.path());
+        // Windows runners ship `core.autocrlf=true`, which rewrites the file
+        // to CRLF on checkout. That is correct git behaviour, so pin it off
+        // here rather than loosening the assertion: what this test is about is
+        // that discard restored the content, not what EOLs git converts to.
+        let output = std::process::Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn git config");
+        assert!(output.status.success());
         std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
         let output = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
