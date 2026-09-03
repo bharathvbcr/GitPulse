@@ -156,6 +156,11 @@ describe("an upstream it cannot see is not an upstream that agrees", () => {
     expect(logged.join("\n")).toContain("not a clean bill of health");
   });
 
+  it("allows upstream drift when GITPULSE_ALLOW_DRIFT=1 is set", () => {
+    const result = check({ GITPULSE_ALLOW_DRIFT: "1" });
+    expect(result.ok).toBe(true);
+  });
+
   it("emits the same verdict as JSON, and suppresses the prose", () => {
     const capture = (argv: string[]) => {
       const logged: string[] = [];

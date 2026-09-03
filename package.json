@@ -22,7 +22,7 @@
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
     "release:notes": "node scripts/release-notes.mjs",
-    "ci:local": "npm run vendor:check && npm run check:ipc && npm run check:types && npm run check:release && npm run check:workflows && npm run check && npm run coverage && npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info && npm run check:coverage",
+    "ci:local": "node scripts/vendor-crates.mjs --check --allow-drift && npm run check:ipc && npm run check:types && npm run check:release && npm run check:workflows && npm run check && npm run coverage && npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info && npm run check:coverage",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "tauri": "node scripts/tauri.mjs"

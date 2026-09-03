@@ -480,8 +480,9 @@ export function check(env = process.env) {
     crates.push(result);
   }
 
+  const allowDrift = env.GITPULSE_ALLOW_DRIFT === "1" || env.GITPULSE_ALLOW_DRIFT === "true";
   return {
-    ok: crates.every((c) => c.edited.length === 0 && c.upstream !== "drifted"),
+    ok: crates.every((c) => c.edited.length === 0 && (allowDrift || c.upstream !== "drifted")),
     comparable: crates.every((c) => c.upstream !== "unavailable"),
     crates,
   };
@@ -493,6 +494,7 @@ function usage() {
     summary: "Vendor the sibling Rust crates GitPulse links, so a lone checkout builds.",
     flags: [
       { flag: "--check", description: "Verify the vendored tree instead of rewriting it" },
+      { flag: "--allow-drift", description: "Allow upstream drift while verifying no local edits" },
       { flag: "--json", description: "Emit machine-readable output" },
       { flag: "--help, -h", description: "Show this message" },
     ],
@@ -506,13 +508,14 @@ export function main(argv = process.argv.slice(2)) {
     console.log(usage());
     return 0;
   }
-  const unknown = argv.find((a) => a !== "--check" && a !== "--json");
+  const unknown = argv.find((a) => a !== "--check" && a !== "--json" && a !== "--allow-drift");
   if (unknown) {
     console.error(`FAIL: unknown option ${JSON.stringify(unknown)}\n`);
     console.error(usage());
     return 2;
   }
   const asJson = argv.includes("--json");
+  const allowDrift = argv.includes("--allow-drift");
 
   try {
     if (!argv.includes("--check")) {
@@ -527,7 +530,8 @@ export function main(argv = process.argv.slice(2)) {
       return 0;
     }
 
-    const result = check();
+    const env = allowDrift ? { ...process.env, GITPULSE_ALLOW_DRIFT: "1" } : process.env;
+    const result = check(env);
     if (asJson) {
       console.log(JSON.stringify(result, null, 2));
       return result.ok ? 0 : 1;

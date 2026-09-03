@@ -293,6 +293,22 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// An absolute repository path for the host platform.
+    ///
+    /// `/a` is absolute on Unix but merely *drive-relative* on Windows, where
+    /// it resolves against whichever drive the process happens to be on --
+    /// exactly the working-directory dependence `parse` exists to refuse. A
+    /// fixture that needs a path `parse` will accept therefore has to name one
+    /// per platform instead of sharing a Unix literal.
+    #[cfg(windows)]
+    fn abs(tail: &str) -> String {
+        format!("C:\\{}", tail.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    fn abs(tail: &str) -> String {
+        format!("/{tail}")
+    }
+
     /// Serialises the tests that override the transcript root.
     ///
     /// The override is an environment variable, which is process-global: two
@@ -312,42 +328,45 @@ mod tests {
 
     #[test]
     fn parses_repositories_and_defaults() {
-        let Parsed::Run(c) = parse(&args(&["/a", "/b"])) else {
+        let (a, b) = (abs("a"), abs("b"));
+        let Parsed::Run(c) = parse(&args(&[&a, &b])) else {
             panic!("expected a run");
         };
-        assert_eq!(c.repos, vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(c.repos, vec![a, b]);
         assert_eq!(c.interval, DEFAULT_INTERVAL);
         assert!(!c.once);
     }
 
     #[test]
     fn accepts_once_and_an_interval_in_any_order() {
-        let Parsed::Run(c) = parse(&args(&["--once", "/a", "--interval", "60"])) else {
+        let a = abs("a");
+        let Parsed::Run(c) = parse(&args(&["--once", &a, "--interval", "60"])) else {
             panic!("expected a run");
         };
         assert!(c.once);
         assert_eq!(c.interval, Duration::from_secs(60));
-        assert_eq!(c.repos, vec!["/a".to_string()]);
+        assert_eq!(c.repos, vec![a]);
     }
 
     /// An interval quietly clamped is a daemon running at a cadence its
     /// operator did not choose and cannot see. Refusing is the honest answer.
     #[test]
     fn an_out_of_range_interval_is_refused_not_clamped() {
-        let Parsed::Error(low) = parse(&args(&["/a", "--interval", "1"])) else {
+        let a = abs("a");
+        let Parsed::Error(low) = parse(&args(&[&a, "--interval", "1"])) else {
             panic!("expected a refusal");
         };
         assert!(low.contains("floor"), "{low}");
         assert!(low.contains("15"), "{low}");
 
-        let Parsed::Error(high) = parse(&args(&["/a", "--interval", "999999999"])) else {
+        let Parsed::Error(high) = parse(&args(&[&a, "--interval", "999999999"])) else {
             panic!("expected a refusal");
         };
         assert!(high.contains("ceiling"), "{high}");
 
         // And the floor itself is accepted, so the boundary is usable.
         assert!(matches!(
-            parse(&args(&["/a", "--interval", "15"])),
+            parse(&args(&[&a, "--interval", "15"])),
             Parsed::Run(_)
         ));
     }
@@ -355,10 +374,10 @@ mod tests {
     #[test]
     fn a_missing_or_unparseable_interval_is_named() {
         assert!(matches!(
-            parse(&args(&["/a", "--interval"])),
+            parse(&args(&[&abs("a"), "--interval"])),
             Parsed::Error(_)
         ));
-        let Parsed::Error(e) = parse(&args(&["/a", "--interval", "soon"])) else {
+        let Parsed::Error(e) = parse(&args(&[&abs("a"), "--interval", "soon"])) else {
             panic!("expected a refusal");
         };
         assert!(e.contains("soon"), "{e}");
@@ -374,6 +393,28 @@ mod tests {
         assert!(e.contains("at least one repository"), "{e}");
     }
 
+    /// The fixtures above only mean what they say if `abs` really yields an
+    /// absolute path on the host running them. A Unix literal silently stops
+    /// being one on Windows, which is how four of these tests failed there
+    /// while reading as ordinary parse bugs.
+    #[test]
+    fn the_absolute_fixture_is_absolute_on_this_host() {
+        for tail in ["a", "b", "repo/0"] {
+            let path = abs(tail);
+            assert!(
+                std::path::Path::new(&path).is_absolute(),
+                "abs({tail:?}) produced {path:?}, which this platform does not \
+                 consider absolute"
+            );
+        }
+        assert_eq!(
+            std::path::Path::new("/a").is_absolute(),
+            cfg!(not(windows)),
+            "a Unix path literal is absolute only off Windows; fixtures that \
+             need `parse` to accept a path must go through abs()"
+        );
+    }
+
     #[test]
     fn a_relative_path_is_refused_because_a_daemon_has_no_cwd_worth_using() {
         let Parsed::Error(e) = parse(&args(&["./repo"])) else {
@@ -387,13 +428,13 @@ mod tests {
         // Watching a silent prefix of what was asked for is the shape of every
         // bug this codebase keeps finding: a capped sample presented as
         // complete coverage.
-        let many: Vec<String> = (0..MAX_REPOS + 1).map(|i| format!("/repo/{i}")).collect();
+        let many: Vec<String> = (0..MAX_REPOS + 1).map(|i| abs(&format!("repo/{i}"))).collect();
         let Parsed::Error(e) = parse(&many) else {
             panic!("expected a refusal");
         };
         assert!(e.contains(&format!("{MAX_REPOS}")), "{e}");
 
-        let at_limit: Vec<String> = (0..MAX_REPOS).map(|i| format!("/repo/{i}")).collect();
+        let at_limit: Vec<String> = (0..MAX_REPOS).map(|i| abs(&format!("repo/{i}"))).collect();
         assert!(matches!(parse(&at_limit), Parsed::Run(_)));
     }
 
@@ -410,7 +451,7 @@ mod tests {
     #[test]
     fn help_is_a_first_class_answer_and_documents_every_option() {
         assert_eq!(parse(&args(&["--help"])), Parsed::Help);
-        assert_eq!(parse(&args(&["/a", "-h"])), Parsed::Help);
+        assert_eq!(parse(&args(&[&abs("a"), "-h"])), Parsed::Help);
         for flag in ["--interval", "--once", "--help"] {
             assert!(USAGE.contains(flag), "usage does not document {flag}");
         }

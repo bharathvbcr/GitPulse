@@ -406,6 +406,7 @@ fn invalid_repositories_fail_loudly() {
 
 /// Hard links inside build directories (e.g. Cargo's target/debug/libfoo.a
 /// hard-linked to target/debug/deps/libfoo-hash.a) must not be double-counted.
+#[cfg(unix)]
 #[test]
 fn hardlinks_are_deduplicated_on_unix() {
     let repo = TempRepo::new();
