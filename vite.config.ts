@@ -4,11 +4,10 @@ import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
 import { appVersion } from "./scripts/app-version.mjs";
 
 /**
- * Entry-chunk ceiling. Two things are kept out of the entry chunk, so this
- * bounds the app shell plus the eager `work` views and nothing else:
- *   - vendor runtimes (svelte, xterm, lucide, tauri) via `gitpulseManualChunk`
- *   - every `inspect`/`more` view, via the dynamic imports in
- *     lib/views/viewLoaders.ts
+ * Entry-chunk ceiling. Vendor runtimes (svelte, xterm, lucide, tauri) are split
+ * out by `gitpulseManualChunk`, so this bounds FIRST-PARTY application code
+ * only — its job is to catch a dependency accidentally landing in the entry
+ * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
  *
  * Measured at 754 KB after the diff file rail; 720 KB after the Work view and
  * provenance badges; 708 KB before
