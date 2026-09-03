@@ -192,7 +192,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PATH: ${{ github.workspace }}/scripts/bin:${{ env.PATH }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
           # releaseCommitish is deliberately unset: the action only uses it to
