@@ -537,7 +537,12 @@ fn deinit_without_force_refuses_uncommitted_submodule_work() {
 fn sync_rewrites_urls_from_gitmodules_without_cloning() {
     let (main, lib) = repo_with_submodule();
     let path = main.path().to_string_lossy().into_owned();
-    let new_url = format!("{}.moved", lib.path().display());
+    // .gitmodules is git-config format, where a backslash starts an escape
+    // sequence. A raw Windows path would write `\U`, `\r`, ... -- invalid
+    // escapes that make git reject the section, so the submodule vanishes
+    // before this test's subject is reached. git accepts forward slashes on
+    // Windows, and that is what its own writer produces.
+    let new_url = format!("{}.moved", lib.path().display()).replace('\\', "/");
     fs::write(
         main.path().join(".gitmodules"),
         format!("[submodule \"vendor/lib\"]\n\tpath = vendor/lib\n\turl = {new_url}\n"),

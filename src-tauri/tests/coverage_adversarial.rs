@@ -50,6 +50,12 @@ fn artifact_row<'a>(
 
 /// A named pipe posing as an artifact must be skipped with a reason, never
 /// block the scan (open-with-no-writer would pin the thread forever).
+///
+/// Unix only: Windows has no FIFO for the scanner to meet. Git for Windows
+/// does ship an `mkfifo.exe`, so the command succeeds there and the test ran
+/// on to assert about an artifact row that was never created -- a check that
+/// could not run reporting as one that did.
+#[cfg(unix)]
 #[test]
 fn fifo_artifact_is_skipped_not_blocking() {
     let repo = git_repo();

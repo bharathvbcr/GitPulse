@@ -307,6 +307,12 @@ fn stage_and_unstage_treat_glob_paths_literally() {
     let dir = tempfile::TempDir::new().unwrap();
     init_repo(dir.path());
     commit_file(dir.path(), "tracked.txt", "base\n", "init");
+    // `?` is not a legal Windows filename character; the brackets are, and
+    // they are glob metacharacters to git all the same, so dropping just the
+    // question mark keeps the property this test exists for.
+    #[cfg(windows)]
+    let weird = "lit[eral].txt";
+    #[cfg(not(windows))]
     let weird = "lit[eral]?.txt";
     std::fs::write(dir.path().join(weird), "weird name\n").unwrap();
     let repo_str = dir.path().to_str().unwrap();
@@ -463,6 +469,14 @@ fn failed_clone_removes_partial_git_dir_and_reports_cleanup() {
             .join(".git/objects")
             .join(&oid[..2])
             .join(&oid[2..]);
+        // git writes loose objects read-only. The unix arm above clears that
+        // with a chmod; on Windows the read-only attribute has to be cleared
+        // the same way or this write is denied outright (os error 5) and the
+        // corruption this test depends on never happens.
+        let mut perms = std::fs::metadata(&obj).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&obj, perms).unwrap();
         std::fs::write(&obj, b"garbage").unwrap();
     }
 

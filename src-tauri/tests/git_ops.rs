@@ -932,12 +932,21 @@ fn test_get_file_blame_sha256_repo() {
 /// pathspec used by log/diff queries.
 #[test]
 fn test_glob_shaped_paths_match_literally() {
+    // `*` cannot appear in a Windows filename at all, so the fixture names a
+    // metacharacter that can: git reads `[X]` in a pathspec as a character
+    // class just as it reads `*`, so a widened match would still reach the
+    // sibling and the property under test is unchanged.
+    #[cfg(windows)]
+    let globbish = "weird[X].txt";
+    #[cfg(not(windows))]
+    let globbish = "weird*.txt";
+
     let repo = TestRepo::init();
-    repo.write("weird*.txt", "literal star\n");
+    repo.write(globbish, "literal star\n");
     repo.commit_all("chore: literal star file");
     repo.write("weirdX.txt", "glob sibling\n");
     repo.commit_all("chore: sibling file");
-    repo.write("weird*.txt", "literal star\nedited\n");
+    repo.write(globbish, "literal star\nedited\n");
 
     let path = repo.path_str();
 

@@ -7,6 +7,15 @@
 //! thing: render the argv, hand the string to a shell, and compare what the
 //! shell parsed back against what went in.
 
+//! Unix only, deliberately. The property is checked by handing the rendered
+//! string to a real POSIX shell, and Windows has no dependable one: `bash`
+//! there resolves to the WSL launcher rather than Git Bash and exits non-zero
+//! with no diagnostic, so the round trip would report on a shell that never
+//! parsed anything. `render_command` itself is platform-independent string
+//! logic, so exercising it on Linux and macOS covers it completely -- gating
+//! is honest here in a way that skipping would not be.
+#![cfg(unix)]
+
 use gitpulse_lib::harness::render_command;
 use std::process::Command;
 

@@ -357,10 +357,26 @@ fn parallel_repositories_never_report_each_others_operations() {
 /// Paths that break naive parsing must round-trip into the conflicted list.
 #[test]
 fn adversarial_paths_survive_the_conflicted_listing() {
+    // A tab is a control character, which Windows forbids in a filename
+    // outright -- creating it fails with os error 123 before the listing this
+    // test is about is ever reached.
+    #[cfg(unix)]
     let awkward = [
         "plain.txt",
         "with space.txt",
         "with\ttab.txt",
+        "ünïcode-ölü.txt",
+        "quote'single.txt",
+        "dollar$sign.txt",
+        "semi;colon.txt",
+        "deeply/nested/three/levels/down.txt",
+        "trailing.space .txt",
+        "-leading-dash.txt",
+    ];
+    #[cfg(windows)]
+    let awkward = [
+        "plain.txt",
+        "with space.txt",
         "ünïcode-ölü.txt",
         "quote'single.txt",
         "dollar$sign.txt",

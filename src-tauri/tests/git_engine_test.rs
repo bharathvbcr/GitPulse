@@ -170,9 +170,14 @@ fn test_status_exotic_paths_survive_parsing() {
         "one\ntwo\nthree\nfour\nfive\n",
     )
     .unwrap();
+    // `>` cannot appear in a Windows filename, so the arrow fixture and the
+    // assertion it feeds are Unix-only. The unicode name and the directory
+    // rename below are portable and stay covered on every platform.
+    #[cfg(unix)]
     std::fs::write(repo.path().join("a -> b.txt"), "arrow name\nsecond line\n").unwrap();
     std::fs::write(repo.path().join("ünïcodé.txt"), "unicode\ncontents\n").unwrap();
     GitWriter::stage_file(path, "dir/old/mod.txt").unwrap();
+    #[cfg(unix)]
     GitWriter::stage_file(path, "a -> b.txt").unwrap();
     GitWriter::stage_file(path, "ünïcodé.txt").unwrap();
     GitWriter::commit(path, "feat: exotic seeds", false).unwrap();
@@ -186,6 +191,7 @@ fn test_status_exotic_paths_survive_parsing() {
     GitWriter::stage_file(path, "dir/new/mod.txt").unwrap();
     GitWriter::stage_file(path, "dir/old/mod.txt").unwrap();
 
+    #[cfg(unix)]
     std::fs::write(repo.path().join("a -> b.txt"), "arrow name\nCHANGED\n").unwrap();
     std::fs::write(repo.path().join("ünïcodé.txt"), "unicode\nMODIFIED\n").unwrap();
 
@@ -193,18 +199,21 @@ fn test_status_exotic_paths_survive_parsing() {
     let by_path: std::collections::HashMap<_, _> =
         statuses.iter().map(|s| (s.path.as_str(), s)).collect();
 
-    let arrow = by_path
-        .get("a -> b.txt")
-        .expect("arrow-named file must parse as one plain entry");
-    assert_eq!(
-        arrow.old_path, None,
-        "an arrow in a filename is not a rename"
-    );
-    assert_eq!(
-        (arrow.additions, arrow.deletions),
-        (1, 1),
-        "numstat must key the raw name"
-    );
+    #[cfg(unix)]
+    {
+        let arrow = by_path
+            .get("a -> b.txt")
+            .expect("arrow-named file must parse as one plain entry");
+        assert_eq!(
+            arrow.old_path, None,
+            "an arrow in a filename is not a rename"
+        );
+        assert_eq!(
+            (arrow.additions, arrow.deletions),
+            (1, 1),
+            "numstat must key the raw name"
+        );
+    }
 
     let uni = by_path
         .get("ünïcodé.txt")

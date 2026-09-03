@@ -31,6 +31,12 @@ fn init_repo_with_base_file() -> tempfile::TempDir {
     git(&["config", "user.name", "t"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "commit.gpgsign", "false"]);
+    // Windows installs git with core.autocrlf=true in its system config, so a
+    // fixture repo inherits it and git rewrites LF to CRLF on checkout --
+    // silently breaking every assertion below that compares exact bytes.
+    // These tests own their line endings; pin the policy rather than
+    // inherit the host's.
+    git(&["config", "core.autocrlf", "false"]);
     std::fs::write(dir.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
     git(&["add", "--", "lib.rs"]);
     git(&["commit", "-m", "base"]);
@@ -524,6 +530,12 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
         .current_dir(dir.path())
         .status()
         .expect("git init");
+    // Windows installs git with core.autocrlf=true in its system config, so a
+    // fixture repo inherits it and git rewrites LF to CRLF on checkout --
+    // silently breaking every assertion below that compares exact bytes.
+    // These tests own their line endings; pin the policy rather than
+    // inherit the host's.
+    git(&["config", "core.autocrlf", "false"]);
     let files_dir = dir.path().join("bulk");
     std::fs::create_dir_all(&files_dir).unwrap();
     const N: usize = 5_000;

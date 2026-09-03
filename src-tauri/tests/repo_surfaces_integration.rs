@@ -64,6 +64,12 @@ fn init_repo() -> TempDir {
     run_git(dir.path(), &["config", "user.email", "t@example.com"]);
     run_git(dir.path(), &["config", "user.name", "T"]);
     run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    // Windows installs git with core.autocrlf=true in its system config, so a
+    // fixture repo inherits it and git rewrites LF to CRLF on checkout --
+    // silently breaking every assertion below that compares exact bytes.
+    // These tests own their line endings; pin the policy rather than
+    // inherit the host's.
+    run_git(dir.path(), &["config", "core.autocrlf", "false"]);
     dir
 }
 
