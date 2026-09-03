@@ -7,6 +7,7 @@
 
 import type { CoverageReport } from "../coverage/types";
 import type {
+  CommitWindow,
   HeatmapDay,
   HeatmapWeek,
   HotspotRiskItem,
@@ -673,3 +674,34 @@ export function computePeriodCompare(
   };
 }
 
+
+/**
+ * Describes the commit population a summary covers: how many commits, on how
+ * many distinct local days, between which two days.
+ *
+ * Unlike `computeRhythm`, this is bounded by the commits handed to it rather
+ * than by a trailing window, because an export card describes the scan it was
+ * built from and nothing else. Callers must take the commit count from here
+ * too: pairing this active-day count with a differently-filtered total would
+ * silently describe two different populations as one.
+ */
+export function computeCommitWindow(commits: readonly PulseCommitSummary[]): CommitWindow {
+  const days = new Set<number>();
+  let earliest: number | null = null;
+  let latest: number | null = null;
+
+  for (const commit of commits ?? []) {
+    if (!Number.isFinite(commit.timestamp) || commit.timestamp <= 0) continue;
+    const ms = commit.timestamp * 1000;
+    days.add(startOfLocalDay(ms));
+    if (earliest === null || ms < earliest) earliest = ms;
+    if (latest === null || ms > latest) latest = ms;
+  }
+
+  return {
+    commits: commits?.length ?? 0,
+    activeDays: days.size,
+    firstDay: earliest === null ? null : formatLocalDayKey(earliest),
+    lastDay: latest === null ? null : formatLocalDayKey(latest),
+  };
+}

@@ -137,6 +137,7 @@ flowchart TD
 - **Hotspot risk**: files ranked by churn × coverage. Unscanned coverage is "unknown", not "untested".
 - **Knowledge and age**: blame-bounded bus factor, orphaned files, line-age distribution. Truncation is visible.
 - **Local DORA**: deploy frequency and lead time from tags and `git describe --contains`. Change-failure rate and restore time are labelled approximations; a missing estimate is "—" not a invented number.
+- **Export card**: a standalone SVG summary of the same window, sized for a README. Every tile carries its own definition rather than a bare label, each caveat sits on the tile it applies to (`CAPPED` commit scan, `PARTIAL` language or blame scan), and a metric whose scan did not run renders as an em dash with the reason — [an unscanned card](assets/screenshot-pulse-card-unscanned.png) and [a single-commit repository](assets/screenshot-pulse-card-solo.png) show both. The commit count and its active days always come from one population, so an author filter cannot leave the card mixing two.
 - **Honesty**: payload-budget truncation is data, not an error. Scan Deeper raises the commit cap only when the byte budget was not the limiter. No `.mailmap` is announced, because per-author tiles are otherwise split across emails.
 
 ---

@@ -47,12 +47,15 @@
     aria-modal="true"
     aria-labelledby="export-modal-title"
   >
-    <div class="w-full max-w-3xl bg-surface border border-border/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+    <div class="w-full max-w-4xl bg-surface border border-border/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
       <!-- Modal Header -->
       <div class="flex items-center justify-between px-5 py-4 border-b border-border/50">
         <div>
           <h2 id="export-modal-title" class="text-base font-bold text-textPrimary">Export Pulse Summary Card</h2>
-          <p class="text-xs text-textMuted mt-0.5">Ready for GitHub READMEs, project wikis, and documentation.</p>
+          <p class="text-xs text-textMuted mt-0.5">
+            Ready for GitHub READMEs, project wikis, and documentation. Every tile carries its own
+            definition, and a scan that did not run reads as an em dash rather than a zero.
+          </p>
         </div>
         <button
           type="button"
@@ -65,8 +68,12 @@
       </div>
 
       <!-- Preview Container -->
-      <div class="p-6 bg-surfaceMuted/30 flex items-center justify-center overflow-x-auto">
-        <div class="max-w-full rounded-xl shadow-lg border border-border/60 overflow-hidden bg-surface">
+      <div class="p-6 bg-surfaceMuted/30 flex items-center justify-center">
+        <!-- The card is authored at a fixed 820px; scale it to the dialog rather than
+             forcing a horizontal scrollbar over a preview meant to be read at a glance. -->
+        <div
+          class="w-full rounded-xl shadow-lg border border-border/60 overflow-hidden bg-surface [&>svg]:block [&>svg]:w-full [&>svg]:h-auto"
+        >
           <!-- Justified: Pure SVG generated locally from repository metrics without external content -->
           {@html svgContent}
         </div>

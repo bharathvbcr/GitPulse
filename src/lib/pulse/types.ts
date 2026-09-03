@@ -230,3 +230,19 @@ export interface PeriodCompareDeltas {
   readonly activeDaysDelta: number;
 }
 
+
+/**
+ * Scope of the commit population a summary is drawn from.
+ *
+ * Anything that reports "N commits" alongside a derived per-window number must
+ * take both from the same object, or the two describe different populations.
+ */
+export interface CommitWindow {
+  readonly commits: number;
+  /** Distinct local calendar days carrying at least one commit. */
+  readonly activeDays: number;
+  /** Earliest commit day, `YYYY-MM-DD`, or null when nothing is in scope. */
+  readonly firstDay: string | null;
+  /** Latest commit day, `YYYY-MM-DD`, or null when nothing is in scope. */
+  readonly lastDay: string | null;
+}

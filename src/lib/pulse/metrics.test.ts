@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  computeCommitWindow,
   computeHeatmap,
   computeHotspotRisks,
   computeHygiene,
@@ -11,7 +12,6 @@ import {
   formatLocalDayKey,
   isConventionalCommit,
 } from "./metrics";
-import { generatePulseSvgCard } from "./exportCard";
 import type { PulseCommitSummary } from "./types";
 
 function createMockCommit(overrides: Partial<PulseCommitSummary> = {}): PulseCommitSummary {
@@ -340,26 +340,56 @@ describe("computePeriodCompare", () => {
   });
 });
 
-describe("generatePulseSvgCard", () => {
-  it("produces valid standalone SVG containing repo metrics", () => {
-    const svg = generatePulseSvgCard({
-      repoName: "my-cool-project",
-      totalCommits: 142,
-      totalLoc: 8520,
-      activeDays: 35,
-      busFactor: 3,
-      halfLifeDays: 95,
-      conventionalPct: 88,
-      signedPct: 75,
-      generatedDate: "2026-09-02",
-    });
+/** Epoch seconds for an ISO instant, so day bucketing stays explicit. */
+function secondsAt(iso: string): number {
+  return Math.floor(Date.parse(iso) / 1000);
+}
 
-    expect(svg.startsWith("<svg")).toBe(true);
-    expect(svg.endsWith("</svg>")).toBe(true);
-    expect(svg).toContain("my-cool-project");
-    expect(svg).toContain("8,520");
-    expect(svg).toContain("35 active days");
-    expect(svg).toContain("Bus Factor");
+describe("computeCommitWindow", () => {
+  it("reports the population the caller handed it, not a trailing window", () => {
+    const window = computeCommitWindow([
+      createMockCommit({ timestamp: secondsAt("2024-03-12T09:00:00Z") }),
+      createMockCommit({ timestamp: secondsAt("2024-03-12T21:00:00Z") }),
+      createMockCommit({ timestamp: secondsAt("2026-09-02T12:00:00Z") }),
+    ]);
+
+    expect(window.commits).toBe(3);
+    expect(window.activeDays).toBe(2);
+    expect(window.firstDay).toBe(formatLocalDayKey(secondsAt("2024-03-12T09:00:00Z") * 1000));
+    expect(window.lastDay).toBe(formatLocalDayKey(secondsAt("2026-09-02T12:00:00Z") * 1000));
+  });
+
+  it("counts distinct local calendar days, not distinct commits", () => {
+    const noon = secondsAt("2025-05-05T12:00:00Z");
+    const window = computeCommitWindow([
+      createMockCommit({ timestamp: noon }),
+      createMockCommit({ timestamp: noon + 60 }),
+      createMockCommit({ timestamp: noon + 120 }),
+    ]);
+
+    expect(window.commits).toBe(3);
+    expect(window.activeDays).toBe(1);
+    expect(window.firstDay).toBe(window.lastDay);
+  });
+
+  it("does not let a zero timestamp invent an active day at the epoch", () => {
+    const window = computeCommitWindow([
+      createMockCommit({ timestamp: 0 }),
+      createMockCommit({ timestamp: secondsAt("2025-05-05T12:00:00Z") }),
+    ]);
+
+    expect(window.commits).toBe(2);
+    expect(window.activeDays).toBe(1);
+    expect(window.firstDay).not.toContain("1970");
+  });
+
+  it("reports no window at all rather than a zero day for an empty scope", () => {
+    expect(computeCommitWindow([])).toEqual({
+      commits: 0,
+      activeDays: 0,
+      firstDay: null,
+      lastDay: null,
+    });
   });
 });
 

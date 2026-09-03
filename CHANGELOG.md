@@ -11,6 +11,27 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Pulse export card rewritten so it can be read away from the app: each tile
+  states what its number means instead of carrying a bare label, tiles are
+  grouped by where the number comes from (commit log vs. blame and working
+  tree), and each caveat sits on the tile it applies to — `CAPPED` commit scan,
+  `PARTIAL` language or blame scan. The card also carries an accessible
+  `<title>`/`<desc>`, emits pure ASCII, namespaces its stylesheet so inlining it
+  cannot restyle the host page, and no longer depends on CSS features
+  (`text-transform`, geometry `rx`) that standalone SVG renderers ignore.
+
+### Fixed
+
+- The export card no longer renders an unmeasured metric as `0`. A failed
+  language scan, and a blame scan that has not completed, now reach the card as
+  null and render as an em dash with the reason, matching what the Pulse view
+  already said on screen.
+- The card's commit count and its active-day count now come from one
+  population. With an author filter applied it previously paired the whole
+  scan's commit total with that one author's active days.
+
 ## [0.0.3] - 2026-09-02
 
 ### Added

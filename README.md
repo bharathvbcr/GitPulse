@@ -31,8 +31,8 @@ Captured from GitPulse running on macOS against its own repository.
 | [<img src="docs/assets/screenshot-files.png" alt="Files view: file explorer, syntax-highlighted code viewer, file inspector, and uncommitted status dashboard">](docs/assets/screenshot-files.png) | [<img src="docs/assets/screenshot-diff.png" alt="Diff view: unified commit diff with added and removed line highlighting">](docs/assets/screenshot-diff.png) |
 | **Coverage — universal scanner** | **Health — dependency & vulnerability audit** |
 | [<img src="docs/assets/screenshot-coverage.png" alt="Coverage view: per-file coverage percentages by language with line-level gutters">](docs/assets/screenshot-coverage.png) | [<img src="docs/assets/screenshot-health.png" alt="Health view: dependency audit findings with advisory identifiers and Dependabot count">](docs/assets/screenshot-health.png) |
-| **Storage — disk usage & hygiene audit** | |
-| [<img src="docs/assets/screenshot-storage.png" alt="Storage view: total and git-internal disk usage, hygiene gaps, and build cache directory breakdown">](docs/assets/screenshot-storage.png) | |
+| **Storage — disk usage & hygiene audit** | **Pulse — exportable summary card** |
+| [<img src="docs/assets/screenshot-storage.png" alt="Storage view: total and git-internal disk usage, hygiene gaps, and build cache directory breakdown">](docs/assets/screenshot-storage.png) | [<img src="docs/assets/screenshot-pulse-card.png" alt="Pulse summary card exported for this repository: commit count and active days, conventional and signed commit share, lines of code, code half-life, and bus factor, with partially scanned metrics marked">](docs/assets/screenshot-pulse-card.png) |
 
 ---
 

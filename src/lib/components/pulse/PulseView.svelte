@@ -17,7 +17,7 @@
   import EmptyState from "../EmptyState.svelte";
   import type { CoverageReport } from "../../coverage/types";
   import type { LanguageStatsReport } from "../../language/barStats";
-  import { computeHygiene } from "../../pulse/metrics";
+  import { computeCommitWindow, computeHygiene } from "../../pulse/metrics";
   import {
     Activity,
     AlertCircle,
@@ -186,6 +186,22 @@
   const locValue = $derived(locState.status === "ok" || locState.status === "partial" ? locState.value : 0);
   const locKnown = $derived(locState.status === "ok" || locState.status === "partial");
   const hygiene = $derived(computeHygiene(visibleCommits));
+
+  /**
+   * Everything the export card says, taken from one population.
+   *
+   * The card is read without the app beside it, so an unmeasured metric must
+   * reach it as null and be rendered as such — a blame scan that has not
+   * finished is not a bus factor of zero, and a failed language scan is not an
+   * empty repository.
+   */
+  const cardWindow = $derived(computeCommitWindow(visibleCommits));
+  const blameMeasured = $derived(Boolean(knowledge) && (knowledge?.scanned_files ?? 0) > 0);
+  const scopedAuthor = $derived(
+    authorFilter === "all"
+      ? null
+      : (authors.find(([email]) => email === authorFilter)?.[1] ?? authorFilter),
+  );
 
   const repoName = $derived(
     $repoStore.currentPath ? $repoStore.currentPath.split("/").pop() || "repository" : "repository",
@@ -460,13 +476,19 @@
       open={exportModalOpen}
       options={{
         repoName,
-        totalCommits: report.total_commits_scanned,
-        totalLoc: locKnown ? locValue : 0,
-        activeDays: visibleCommits.length > 0 ? new Set(visibleCommits.map((c) => new Date(c.timestamp * 1000).toDateString())).size : 0,
-        busFactor: knowledge?.bus_factor ?? 0,
-        halfLifeDays: knowledge?.half_life_days ?? 0,
-        conventionalPct: hygiene.conventionalPercentage,
-        signedPct: hygiene.signedPercentage,
+        totalCommits: cardWindow.commits,
+        activeDays: cardWindow.activeDays,
+        windowStart: cardWindow.firstDay,
+        windowEnd: cardWindow.lastDay,
+        authorScope: scopedAuthor,
+        truncated: report.truncated,
+        totalLoc: locKnown ? locValue : null,
+        locPartial: locState.status === "partial",
+        busFactor: blameMeasured ? (knowledge?.bus_factor ?? null) : null,
+        halfLifeDays: blameMeasured ? (knowledge?.half_life_days ?? null) : null,
+        blamePartial: blameMeasured && knowledge?.truncated === true,
+        conventionalPct: visibleCommits.length > 0 ? hygiene.conventionalPercentage : null,
+        signedPct: visibleCommits.length > 0 ? hygiene.signedPercentage : null,
       }}
       onClose={() => (exportModalOpen = false)}
     />

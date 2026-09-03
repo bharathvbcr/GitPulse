@@ -40,6 +40,39 @@ describe("PulseView honesty contracts", () => {
   });
 });
 
+describe("PulseView export card wiring", () => {
+  const optionsBlock = /<PulseExportModal[\s\S]*?options=\{\{([\s\S]*?)\}\}/.exec(source)?.[1];
+
+  it("hands the card an options block", () => {
+    expect(optionsBlock).toBeTruthy();
+  });
+
+  it("never collapses an unmeasured metric to zero on the exported card", () => {
+    expect(optionsBlock).not.toMatch(/\?\?\s*0/);
+    expect(optionsBlock).not.toMatch(/:\s*0\s*,/);
+    for (const field of ["totalLoc", "busFactor", "halfLifeDays", "conventionalPct", "signedPct"]) {
+      expect(optionsBlock).toMatch(new RegExp(`${field}:[^,]*null`));
+    }
+  });
+
+  it("takes the commit count and its active days from one population", () => {
+    expect(optionsBlock).toContain("totalCommits: cardWindow.commits");
+    expect(optionsBlock).toContain("activeDays: cardWindow.activeDays");
+    expect(source).toContain("computeCommitWindow(visibleCommits)");
+  });
+
+  it("tells the card which scans were capped and which author it is scoped to", () => {
+    expect(optionsBlock).toContain("truncated: report.truncated");
+    expect(optionsBlock).toContain("locPartial:");
+    expect(optionsBlock).toContain("blamePartial:");
+    expect(optionsBlock).toContain("authorScope: scopedAuthor");
+  });
+
+  it("treats a blame report that scanned nothing as unmeasured", () => {
+    expect(source).toContain("(knowledge?.scanned_files ?? 0) > 0");
+  });
+});
+
 describe("PulseHeatmap click-to-filter", () => {
   it("writes a date: prefix the Graph filter actually understands", () => {
     expect(heatmap).toContain("date:${day.date}");
