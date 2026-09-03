@@ -5,7 +5,7 @@ import { diagnostics } from "../diagnostics/diagnostics";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
-import { graphStore, serverFetchableQuery } from "./graphStore";
+import { graphStore } from "./graphStore";
 import type { InvokeFn } from "./graphStore";
 import {
   disambiguateLabels,
@@ -1515,16 +1515,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       await hydrate(session.id, session.path, generation);
       const latest = internal.sessions[session.id];
       if (latest && internal.workspace.activeId === session.id) {
-        // The backend filters ANY query server-side, but non-path queries are
-        // scheduler keys' no-ops (client-side filtering owns those rows).
-        // Forwarding one here launders filtered rows into the cached payload
-        // for good: clearing the filter reproduces the last-fired key and
-        // nothing refetches.
-        void graph.loadGraph(
-          latest.path,
-          serverFetchableQuery(latest.searchQuery),
-          latest.selectedBranch,
-        );
+        // Reload with the visible filter context: the store normalizes the
+        // query and the backend applies every term, so the cached payload
+        // always answers exactly the query the scheduler keys on.
+        void graph.loadGraph(latest.path, latest.searchQuery, latest.selectedBranch);
       }
     },
     handleRepoChanged: async (changedPath?: string | null) => {

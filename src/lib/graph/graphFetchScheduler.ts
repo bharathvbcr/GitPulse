@@ -1,13 +1,3 @@
-import { queryNeedsServerFetch } from "../filter/parseQuery";
-
-/**
- * Re-exported here because the scheduler owns the "which queries reach the
- * backend" contract: refresh()-style reloads must ask this before handing a
- * query to cmd_get_commit_graph, and importing from the scheduler seam keeps
- * that decision next to graphRequestKey instead of duplicated from parseQuery.
- */
-export { queryNeedsServerFetch };
-
 /**
  * Fetch scheduling for the commit graph pane.
  *
@@ -60,14 +50,27 @@ export interface GraphFetchSchedulerOptions {
 }
 
 /**
- * Identity of a graph request. Mirrors the historical key exactly: only
- * `path:`-style filters need git to walk history server-side, so every other
- * query edit keeps the key stable (client-side filtering owns those rows) and
- * must not re-walk the repository per keystroke.
+ * Canonical form of a filter query for the backend: tokens joined by one
+ * space. Every query term runs in `cmd_get_commit_graph` — the backend owns
+ * the filter language and rewrites history so a filtered graph stays
+ * connected — so this is the ONE place that decides when two queries are
+ * the same request. The scheduler key and the store's cache both use it,
+ * and a stray space never re-walks history.
+ */
+export function normalizeGraphQuery(query: string): string {
+  return query.trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/**
+ * Identity of a graph request: path, revision, and the normalized query.
+ * A different query is a different graph — the backend applies every term
+ * (author, sha, type, free text, path) — so each filter edit re-arms the
+ * debounce window and fires its own fetch once typing settles.
  */
 export function graphRequestKey(req: GraphFetchRequest): string {
   const base = `${req.path ?? ""}${KEY_SEP}${req.revision ?? ""}`;
-  return queryNeedsServerFetch(req.query) ? `${base}${KEY_SEP}${req.query}` : base;
+  const query = normalizeGraphQuery(req.query);
+  return query ? `${base}${KEY_SEP}${query}` : base;
 }
 
 export interface GraphFetchScheduler {
@@ -129,7 +132,7 @@ export function createGraphFetchScheduler(
       if (handle === null && key === lastFiredKey) return;
       disarm();
       armedKey = key;
-      pendingReq = { path: req.path, query: req.query, revision: req.revision };
+      pendingReq = { path: req.path, query: normalizeGraphQuery(req.query), revision: req.revision };
       handle = setTimeoutFn(fire, debounceMs);
     },
     reset() {

@@ -118,10 +118,12 @@ describe("GitHubPanel guarded-action contracts", () => {
   it("reloads the graph with the visible filter context after a PR checkout", () => {
     // A bare loadGraph(repo) reset the view to query=""/HEAD while FilterBar
     // still showed the selection, and the scheduler memo then blocked the
-    // correction. The post-mutation reload must carry the filter context,
-    // sanitized so a client-side query cannot be laundered server-side.
+    // correction. The post-mutation reload must carry the filter context;
+    // the backend applies every query term, so nothing is sanitized away.
     expect(source).toContain('from "../stores/filterStore"');
-    expect(source).toContain("serverFetchableQuery($filterStore.searchQuery)");
+    expect(source).toMatch(
+      /graphStore\.loadGraph\(\s*repo,\s*\$filterStore\.searchQuery,\s*\$filterStore\.selectedBranch,?\s*\)/,
+    );
     expect(source).not.toMatch(/graphStore\.loadGraph\(\s*repo\s*\)/);
   });
 });

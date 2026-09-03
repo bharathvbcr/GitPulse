@@ -71,7 +71,7 @@ function graphPayload(repoPath: string, tag: string, hasMore = true): CommitGrap
   payloadSeq += 1;
   void repoPath;
   const ids = [`${tag}-a`, `${tag}-b`];
-  return { rows: ids.map(row), folds: [], head_id: ids[0]!, refs: [], has_more: hasMore };
+  return { rows: ids.map(row), head_id: ids[0]!, refs: [], has_more: hasMore };
 }
 
 function detailsFor(commitId: string): CommitDetails {

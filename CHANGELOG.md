@@ -11,6 +11,41 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Commit graph: the default branch is one straight rail. The lane solver now
+  reserves the default branch's first-parent chain (`main`, or the repository's
+  own default; `origin/main` when it is ahead of the local branch; HEAD when
+  none of those is loaded) before walking any row and pins it to the leftmost
+  column in one colour for the whole loaded window. Previously whichever chain
+  reached a shared ancestor first in `--topo-order` owned it, and because git
+  lists a merged feature's commits above the main commits they forked from,
+  `main` jogged into the feature's column at every such merge. Feature chains
+  now always close into the mainline column; at a window cut the rail ends with
+  a stub instead of continuing into a merged-in branch, so rows keep their
+  columns when older history is loaded. Rows carry `is_mainline`, the payload
+  carries `mainline_id` and `mainline_name`, and the graph tooltip and the
+  keyboard-focus announcement name the rail.
+- Commit filters run in the backend and keep the graph connected. Every
+  filter term (`author:`, `sha:`, `type:` and `fix:`-style prefixes, free
+  text, and `path:`) is now applied by `cmd_get_commit_graph`. Previously only
+  `path:` reached git; the other terms removed rows in the client after lanes
+  were solved, so a filtered graph was a field of fading stubs. A dropped
+  commit now hands its lineage to its children — the parent rewriting git does
+  for `--parents` with a pathspec — so survivors connect to their nearest kept
+  ancestors, a survivor whose ancestors were all dropped becomes a root of the
+  filtered view, and the straight mainline re-anchors on the first survivor of
+  the default branch's chain and keeps its name. A filter or branch change
+  over cached rows shows the progress bar while the new view loads, and a
+  query that differs only in whitespace never re-walks history.
+
+### Removed
+
+- The unused branch-folding engine and topology index, and the client-side
+  copy of the filter language. The graph payload no longer carries `folds`
+  (nothing ever read it); older payloads that still carry the field
+  deserialize as before.
+
 ## [0.0.3] - 2026-09-02
 
 ### Added

@@ -4,7 +4,6 @@ import type { VisualCommitRow } from "../../canvas/GraphRenderer";
 import {
   createGraphStore,
   graphPayloadSignature,
-  serverFetchableQuery,
   type InvokeFn,
   type RefDecoration,
 } from "../graphStore";
@@ -40,7 +39,6 @@ function grow(id: string, overrides: Partial<VisualCommitRow> = {}): VisualCommi
 function payload(id: string) {
   return {
     rows: [{ id, summary: id, author_name: "ada", timestamp: 1, lane: 0, parent_ids: [] }],
-    folds: [],
     head_id: id,
   };
 }
@@ -235,7 +233,6 @@ describe("graphStore payload signature", () => {
       grow("a"),
       grow("b", { lane: 1, parent_ids: ["a"] }),
     ],
-    folds: [],
     head_id: "a",
     // Typed as the payload contract (RefDecoration) rather than left to local
     // inference: the "changes whenever rendered history changes" case adds a
@@ -262,6 +259,75 @@ describe("graphStore payload signature", () => {
     refAdded.refs = [...refAdded.refs, { name: "v1", kind: "tag", commit_id: "b", is_head: false } satisfies RefDecoration];
     expect(graphPayloadSignature(refAdded)).not.toBe(base);
   });
+
+  it("changes when the pinned mainline moves, is renamed, or a row joins it", () => {
+    // The straight column-0 rail is rendered state: a payload whose rows
+    // are byte-identical except for which chain is pinned must repaint.
+    const base = graphPayloadSignature(full());
+    const anchored = { ...full(), mainline_id: "a", mainline_name: "main" };
+    expect(graphPayloadSignature(anchored)).not.toBe(base);
+    expect(graphPayloadSignature({ ...anchored })).toBe(graphPayloadSignature(anchored));
+
+    const renamed = { ...anchored, mainline_name: "origin/main" };
+    expect(graphPayloadSignature(renamed)).not.toBe(graphPayloadSignature(anchored));
+
+    const moved = { ...anchored, mainline_id: "b" };
+    expect(graphPayloadSignature(moved)).not.toBe(graphPayloadSignature(anchored));
+
+    const rowJoined = full();
+    rowJoined.rows = [{ ...rowJoined.rows[0], is_mainline: true }, rowJoined.rows[1]];
+    expect(graphPayloadSignature(rowJoined)).not.toBe(base);
+
+    // Absent and null spell the same "unnamed" mainline, as legacy payloads
+    // omit the fields entirely.
+    expect(graphPayloadSignature({ ...full(), mainline_id: null, mainline_name: null })).toBe(base);
+  });
+});
+
+describe("graphStore mainline fields", () => {
+  const details = { id: "a", summary: "d", changed_files: [] };
+
+  it("carries the pinned mainline into state and back out of the cache", async () => {
+    const anchored = {
+      rows: [grow("a", { is_mainline: true }), grow("b", { lane: 1, parent_ids: ["a"] })],
+      head_id: "b",
+      refs: [],
+      has_more: false,
+      mainline_id: "a",
+      mainline_name: "main",
+    };
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") return anchored as never;
+      if (cmd === "cmd_get_commit_details") return details as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).mainlineId).toBe("a");
+    expect(get(store).mainlineName).toBe("main");
+
+    // Switching away and back serves the cached mainline, not a blank one.
+    store.showRepo(null);
+    expect(get(store).mainlineId).toBeNull();
+    store.showRepo("/r/a");
+    expect(get(store).mainlineId).toBe("a");
+    expect(get(store).mainlineName).toBe("main");
+  });
+
+  it("normalizes a legacy payload without mainline fields to an unnamed mainline", async () => {
+    const legacy = { rows: [grow("a")], head_id: "a", refs: [], has_more: false };
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") return legacy as never;
+      if (cmd === "cmd_get_commit_details") return details as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).mainlineId).toBeNull();
+    expect(get(store).mainlineName).toBeNull();
+  });
 });
 
 describe("graphStore background reload stability", () => {
@@ -270,7 +336,6 @@ describe("graphStore background reload stability", () => {
   }
   const payload = () => ({
     rows: [grow("a")],
-    folds: [],
     head_id: "a",
     refs: [{ name: "main", kind: "local" as const, commit_id: "a", is_head: true }],
     has_more: false,
@@ -321,7 +386,6 @@ describe("graphStore background reload stability", () => {
   it("a genuinely changed payload still republishes", async () => {
     const firstPayload = {
       rows: [{ id: "a", summary: "a", author_name: "ada", timestamp: 1, lane: 0, parent_ids: [] }],
-      folds: [],
       head_id: "a",
       refs: [] as Array<{ name: string; kind: "local"; commit_id: string; is_head: boolean }>,
       has_more: false,
@@ -359,7 +423,7 @@ describe("graphStore background load failure breadcrumb", () => {
       if (cmd === "cmd_get_commit_graph") {
         const path = String(args?.repoPath);
         if (failPaths.has(path)) throw new Error("index.lock held");
-        return { rows: [], folds: [], head_id: null } as never;
+        return { rows: [], head_id: null } as never;
       }
       if (cmd === "cmd_get_commit_details") {
         return { id: args?.commitId, summary: "d", changed_files: [] } as never;
@@ -408,80 +472,76 @@ describe("graphStore background load failure breadcrumb", () => {
   });
 });
 
-describe("serverFetchableQuery", () => {
-  it("lets only path-style filters through to the backend", () => {
-    expect(serverFetchableQuery("path:src")).toBe("path:src");
-    // A path token anywhere in the query makes the whole walk server-side.
-    expect(serverFetchableQuery("author:ada path:src")).toBe("author:ada path:src");
-  });
 
-  it("blanks client-side queries so they cannot launder rows into the cache", () => {
-    expect(serverFetchableQuery("author:x")).toBe("");
-    expect(serverFetchableQuery("fix(ui)")).toBe("");
-    expect(serverFetchableQuery("sha:abc123")).toBe("");
-    expect(serverFetchableQuery("")).toBe("");
-    expect(serverFetchableQuery("   ")).toBe("");
-    // Whitespace around a real path token still counts.
-    expect(serverFetchableQuery("  path:lib  ")).toBe("  path:lib  ");
-  });
-});
+describe("graphStore loadGraph query forwarding", () => {
+  const details = { id: "a", summary: "d", changed_files: [], total_additions: 0, total_deletions: 0 };
 
-describe("graphStore loadGraph query sanitization", () => {
-  it("does not forward client-only queries to cmd_get_commit_graph", async () => {
+  it("forwards every query to cmd_get_commit_graph in canonical form", async () => {
+    // The backend owns the filter language (author, sha, type, text, path)
+    // and rewrites history so filtered graphs stay connected; the client
+    // only normalizes whitespace so the cache and the scheduler key agree.
     const forwarded: unknown[] = [];
     const invoke: InvokeFn = async (cmd, args) => {
       if (cmd === "cmd_get_commit_graph") {
         forwarded.push(args?.query);
         return payload("a") as never;
       }
-      if (cmd === "cmd_get_commit_details") {
-        return { id: "a", summary: "d", changed_files: [], total_additions: 0, total_deletions: 0 } as never;
-      }
+      if (cmd === "cmd_get_commit_details") return details as never;
       throw new Error(cmd);
     };
     const store = createGraphStore({ invoke });
     store.showRepo("/r/a");
     await store.loadGraph("/r/a", "author:ada");
-    expect(forwarded).toEqual([null]);
-    await store.loadGraph("/r/a", "path:src");
-    expect(forwarded[1]).toBe("path:src");
+    expect(forwarded).toEqual(["author:ada"]);
+    await store.loadGraph("/r/a", "  path:src   fix:  ");
+    expect(forwarded[1]).toBe("path:src fix:");
+    await store.loadGraph("/r/a", "   ");
+    expect(forwarded[2]).toBeNull();
+  });
+
+  it("shows the loading state while a different query or branch loads over cached rows", async () => {
+    // Stale-while-revalidate is for reloads of the SAME view. When the rows
+    // on screen answer a different query, the user just typed a filter and
+    // must see it working; a silent row swap later reads as a broken filter.
+    const gate = deferred<void>();
+    let calls = 0;
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") {
+        calls += 1;
+        if (calls === 1) return payload("a") as never;
+        await gate.promise;
+        return payload("b") as never;
+      }
+      if (cmd === "cmd_get_commit_details") return details as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).isLoading).toBe(false);
+
+    const refine = store.loadGraph("/r/a", "author:ada");
+    expect(get(store).isLoading).toBe(true);
+    // The cached rows stay up while the filtered graph is fetched.
+    expect(get(store).rows.map((r) => r.id)).toEqual(["a"]);
+    gate.resolve();
+    await refine;
+    expect(get(store).isLoading).toBe(false);
+    expect(get(store).rows.map((r) => r.id)).toEqual(["b"]);
+
+    // A same-view background reload still never flashes the bar.
+    const again = store.loadGraph("/r/a", "author:ada");
+    expect(get(store).isLoading).toBe(false);
+    await again;
+
+    // Switching branches over cached rows is a different view too.
+    const branch = store.loadGraph("/r/a", "author:ada", "dev");
+    expect(get(store).isLoading).toBe(true);
+    await branch;
+    expect(get(store).isLoading).toBe(false);
   });
 });
 
-describe("graphStore payload signature", () => {
-  const full = () => ({
-    rows: [
-      grow("a"),
-      grow("b", { lane: 1, parent_ids: ["a"] }),
-    ],
-    folds: [],
-    head_id: "a",
-    // Typed as the payload contract (RefDecoration) rather than left to local
-    // inference: the "changes whenever rendered history changes" case adds a
-    // tag ref, which the locally-inferred "local"-only literal type rejects.
-    refs: [{ name: "main", kind: "local", commit_id: "a", is_head: true }] as RefDecoration[],
-    has_more: true,
-  });
-
-  it("is equal for structurally identical payloads with fresh identities", () => {
-    expect(graphPayloadSignature(full())).toBe(graphPayloadSignature(full()));
-  });
-
-  it("changes whenever rendered history changes", () => {
-    const base = graphPayloadSignature(full());
-    const headMoved = full();
-    headMoved.head_id = "b";
-    expect(graphPayloadSignature(headMoved)).not.toBe(base);
-
-    const grew = full();
-    grew.rows = [...grew.rows, grow("c", { parent_ids: ["b"] })];
-    expect(graphPayloadSignature(grew)).not.toBe(base);
-
-    const refAdded = full();
-    refAdded.refs = [...refAdded.refs, { name: "v1", kind: "tag", commit_id: "b", is_head: false } satisfies RefDecoration];
-    expect(graphPayloadSignature(refAdded)).not.toBe(base);
-  });
-});
 
 describe("graphStore background reload stability", () => {
   function clone<T>(value: T): T {
@@ -489,7 +549,6 @@ describe("graphStore background reload stability", () => {
   }
   const payload = () => ({
     rows: [grow("a")],
-    folds: [],
     head_id: "a",
     refs: [{ name: "main", kind: "local" as const, commit_id: "a", is_head: true }],
     has_more: false,
@@ -540,7 +599,6 @@ describe("graphStore background reload stability", () => {
   it("a genuinely changed payload still republishes", async () => {
     const firstPayload = {
       rows: [{ id: "a", summary: "a", author_name: "ada", timestamp: 1, lane: 0, parent_ids: [] }],
-      folds: [],
       head_id: "a",
       refs: [] as Array<{ name: string; kind: "local"; commit_id: string; is_head: boolean }>,
       has_more: false,
@@ -578,7 +636,7 @@ describe("graphStore background load failure breadcrumb", () => {
       if (cmd === "cmd_get_commit_graph") {
         const path = String(args?.repoPath);
         if (failPaths.has(path)) throw new Error("index.lock held");
-        return { rows: [], folds: [], head_id: null } as never;
+        return { rows: [], head_id: null } as never;
       }
       if (cmd === "cmd_get_commit_details") {
         return { id: args?.commitId, summary: "d", changed_files: [] } as never;
@@ -627,20 +685,3 @@ describe("graphStore background load failure breadcrumb", () => {
   });
 });
 
-describe("serverFetchableQuery", () => {
-  it("lets only path-style filters through to the backend", () => {
-    expect(serverFetchableQuery("path:src")).toBe("path:src");
-    // A path token anywhere in the query makes the whole walk server-side.
-    expect(serverFetchableQuery("author:ada path:src")).toBe("author:ada path:src");
-  });
-
-  it("blanks client-side queries so they cannot launder rows into the cache", () => {
-    expect(serverFetchableQuery("author:x")).toBe("");
-    expect(serverFetchableQuery("fix(ui)")).toBe("");
-    expect(serverFetchableQuery("sha:abc123")).toBe("");
-    expect(serverFetchableQuery("")).toBe("");
-    expect(serverFetchableQuery("   ")).toBe("");
-    // Whitespace around a real path token still counts.
-    expect(serverFetchableQuery("  path:lib  ")).toBe("  path:lib  ");
-  });
-});

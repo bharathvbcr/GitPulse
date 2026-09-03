@@ -65,10 +65,11 @@ flowchart TD
 
 ### 1.2 Graph (`history`)
 - **GPU Canvas Rendering**: High-performance commit graph capable of rendering repositories with 100,000+ commits smoothly.
-- **Topological Lane Solver**: Rust-powered lane sorting with nogap lookback guarantees to avoid visual discontinuities.
+- **Topological Lane Solver**: Rust-powered stable-column lane solving with nogap lookback guarantees to avoid visual discontinuities. The default branch (`main`, or the repository's own default; `origin/main` when it is ahead) is pinned to the leftmost column in one colour for the whole loaded window, so merged feature branches peel off and close back into a straight mainline instead of displacing it. Hovering the rail names the branch it belongs to.
 - **Author Avatars & Badges**: Automatic display of author avatars or initials with one-click filter isolation.
 - **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
 - **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter on Graph, Diff, Blame, Stack, and Reflog. From Work and other views it switches to Graph first; in Files, ⌘F still searches the open file.
+- **Filters That Keep The Graph Connected**: Every filter term — `author:`, `sha:`, `type:` or a `fix:`-style prefix, free text, and `path:` — is applied by the backend before lanes are solved. A commit the filter drops hands its lineage to its children, the way `git log --parents -- path` rewrites parents, so the survivors stay connected to their nearest kept ancestors, a survivor with no kept ancestors becomes a root of the filtered view, and the straight main-branch rail stays straight, anchored on the first surviving commit of the default branch's chain. A fading stub therefore always means one thing: the parent is past the loaded window, and the tooltip says so.
 - **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in the Resolve view if a conflict results.
 
 ### 1.3 Diff (`diff`)

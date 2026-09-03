@@ -30,21 +30,37 @@
 //! Hence the encoded invariant keeps only what holds in every case:
 //!
 //! - `pk != parent_ids[0]`, some earlier row mentions `pk`, → `to_lane !=
-//!   from_lane` (owned by an overlapping segment);
-//! - anything else → unconstrained relative to `from_lane`.
+//!   from_lane` (owned by an overlapping segment) — unless BOTH the merge
+//!   row and `pk` lie on the pinned mainline, whose whole chain shares
+//!   column 0 by construction (a mainline merge of its own ancestor);
+//! - anything else → unconstrained relative to `from_lane`;
+//! - always: `to_lane` is the column the parent row actually occupies.
+//!
+//! # Mainline (verified against an independent first-parent walk)
+//!
+//! One first-parent chain — the hinted branch, HEAD as fallback, row 0 by
+//! default — is pinned to column 0 in colour 0 for the whole window. Every
+//! row on that chain reports `is_mainline`, sits on column 0, and paints in
+//! colour 0; no other row ever sits on column 0, column 0 never carries any
+//! other colour, and nothing is drawn on it above the mainline's tip.
 //!
 //! # Width (verified independently from the output)
 //!
 //! Columns are reserved for a segment's whole visual lifetime — including
 //! rows where only its closing connector is still descending, and the stub
-//! row under a window-cut tail. Greedy interval allocation in birth order
-//! is optimal for interval graphs, so the graph's width must EQUAL the peak
-//! number of concurrently occupied columns, where "occupied" is
-//! reconstructed from the output alone: a node, a pass-through lane, an
-//! in-flight connector, or a dangling stub. Wider means columns leak;
-//! narrower is impossible (pigeonhole).
+//! row under a window-cut tail — and the mainline's column for the whole
+//! window. Greedy interval allocation in birth order is optimal for
+//! interval graphs, so the graph's width must EQUAL the peak number of
+//! concurrently occupied columns, where "occupied" is reconstructed from
+//! the output alone: a node, a pass-through lane, an in-flight connector,
+//! a dangling stub, or the mainline reservation on column 0. Wider means
+//! columns leak; narrower is impossible (pigeonhole).
 
-use gitpulse_lib::graph::{LaneSolver, RawCommitNode, VisualCommitRow};
+use gitpulse_lib::graph::{
+    mainline_chain_ids, simplify_history, LaneSolver, MainlineHint, RawCommitNode, VisualCommitRow,
+    MAINLINE_COLOR, MAINLINE_COLUMN, MAX_REWRITTEN_PARENTS,
+};
+use std::collections::{HashMap, HashSet};
 
 const LCG_MUL: u64 = 6364136223846793005;
 const LCG_INC: u64 = 1442695040888963407;
@@ -330,6 +346,13 @@ fn check_all_invariants(
                     pk
                 ));
             }
+            if conn.to_lane != rows[i + offset].lane {
+                fail(format!(
+                    "endpoint column violated: edge lands on column {} but the parent sits on {}",
+                    conn.to_lane,
+                    rows[i + offset].lane
+                ));
+            }
 
             if k == 0 {
                 assert_eq!(
@@ -350,7 +373,10 @@ fn check_all_invariants(
                 // Unconstrained by design: iteration 0 just placed pk on (or
                 // found pk already occupying) some column, and iteration k
                 // finds that same column again.
-            } else if mentioned_earlier && conn.to_lane == conn.from_lane {
+            } else if mentioned_earlier
+                && conn.to_lane == conn.from_lane
+                && !(row.is_mainline && rows[i + offset].is_mainline)
+            {
                 fail("pre-existing merged-in parent landed on the merge commit's own lane".into());
             }
             // Fresh second parents are first-fit: they may reuse a hole
@@ -414,6 +440,11 @@ fn assert_width_is_peak_occupancy(rows: &[VisualCommitRow], seed: u64, label: &s
             }
         }
     }
+    // The mainline's column is reserved for the whole window — above its
+    // tip, below its root, and through every hole between its commits.
+    for slot in occupied.iter_mut() {
+        slot.insert(MAINLINE_COLUMN);
+    }
     let peak = occupied.iter().map(|s| s.len()).max().unwrap_or(0) as u32;
     assert_eq!(
         high_water + 1,
@@ -422,6 +453,164 @@ fn assert_width_is_peak_occupancy(rows: &[VisualCommitRow], seed: u64, label: &s
         high_water + 1,
         peak
     );
+}
+
+/// First-occurrence row index per id, as the solver resolves endpoints.
+fn row_index(commits: &[RawCommitNode]) -> HashMap<&str, usize> {
+    let mut index = HashMap::new();
+    for (i, c) in commits.iter().enumerate() {
+        if !c.id.is_empty() {
+            index.entry(c.id.as_str()).or_insert(i);
+        }
+    }
+    index
+}
+
+/// Independent first-parent walk from `tip`: strictly descending rows,
+/// stopping at a root, an empty or unknown parent, or a parent at or above
+/// the current row.
+fn first_parent_rows(
+    commits: &[RawCommitNode],
+    index: &HashMap<&str, usize>,
+    tip: usize,
+) -> Vec<usize> {
+    let mut chain = vec![tip];
+    let mut current = tip;
+    while let Some(parent) = commits[current].parent_ids.first() {
+        match index.get(parent.as_str()) {
+            Some(&row) if !parent.is_empty() && row > current => {
+                chain.push(row);
+                current = row;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// The tip [`MainlineHint`] documents: the first loaded branch tip (else
+/// the fallback, else row 0), extended upward through any branch tip whose
+/// first-parent chain passes through it.
+fn expected_mainline_tip(commits: &[RawCommitNode], hint: &MainlineHint) -> usize {
+    let index = row_index(commits);
+    let row_for = |id: &String| -> Option<usize> {
+        if id.is_empty() {
+            None
+        } else {
+            index.get(id.as_str()).copied()
+        }
+    };
+    let anchor = hint
+        .branch_tips
+        .iter()
+        .find_map(row_for)
+        .or_else(|| hint.fallback_tip.as_ref().and_then(row_for));
+    let Some(mut tip) = anchor else {
+        return 0;
+    };
+    loop {
+        let mut moved = false;
+        for id in &hint.branch_tips {
+            if let Some(row) = row_for(id) {
+                if row < tip && first_parent_rows(commits, &index, row).contains(&tip) {
+                    tip = row;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            return tip;
+        }
+    }
+}
+
+/// The mainline contract, checked against an independent walk from
+/// `expected_tip` (see the module docs).
+fn assert_mainline_invariants(
+    commits: &[RawCommitNode],
+    rows: &[VisualCommitRow],
+    expected_tip: usize,
+    palette_size: u32,
+    seed: u64,
+    label: &str,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let index = row_index(commits);
+    let chain: HashSet<usize> = first_parent_rows(commits, &index, expected_tip)
+        .into_iter()
+        .collect();
+    let mainline_color = MAINLINE_COLOR % palette_size;
+    // Every reserved column interval holds a distinct column, so at most
+    // `width` reservations overlap anywhere — and the mainline's colour is
+    // reserved for the whole window. With more palette slots than columns a
+    // free slot therefore always exists when a segment is born, and no
+    // branch may ever take main's colour; with fewer, collisions are the
+    // documented unavoidable case and the check does not apply.
+    let width = rows
+        .iter()
+        .flat_map(|r| {
+            std::iter::once(r.lane)
+                .chain(r.active_lanes.iter().copied())
+                .chain(r.connections.iter().map(|c| c.to_lane))
+        })
+        .max()
+        .map_or(0, |max| max as usize + 1);
+    let colour_slots_suffice = palette_size as usize > width;
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.is_mainline,
+            chain.contains(&i),
+            "{label} seed={seed}: row {i} is_mainline={} but the first-parent walk from {expected_tip} says {}",
+            row.is_mainline,
+            chain.contains(&i)
+        );
+        if row.is_mainline {
+            assert_eq!(
+                row.lane, MAINLINE_COLUMN,
+                "{label} seed={seed}: mainline row {i} left column 0"
+            );
+            assert_eq!(
+                row.color_index, mainline_color,
+                "{label} seed={seed}: mainline row {i} is off-colour"
+            );
+        } else {
+            assert_ne!(
+                row.lane, MAINLINE_COLUMN,
+                "{label} seed={seed}: row {i} sits on the mainline column"
+            );
+            if colour_slots_suffice {
+                assert_ne!(
+                    row.color_index, mainline_color,
+                    "{label} seed={seed}: row {i} paints in the mainline colour with slots free"
+                );
+            }
+        }
+        for (l, &lane) in row.active_lanes.iter().enumerate() {
+            if lane != MAINLINE_COLUMN {
+                continue;
+            }
+            assert!(
+                i >= expected_tip,
+                "{label} seed={seed}: column 0 is drawn on row {i}, above the mainline tip {expected_tip}"
+            );
+            assert_eq!(
+                row.active_lane_colors[l], mainline_color,
+                "{label} seed={seed}: column 0 carries a foreign colour on row {i}"
+            );
+        }
+        for conn in &row.connections {
+            if conn.is_dangling || conn.to_lane != MAINLINE_COLUMN {
+                continue;
+            }
+            let target = i + conn.to_row_offset as usize;
+            assert!(
+                rows[target].is_mainline,
+                "{label} seed={seed}: row {i} draws an edge onto column 0 at row {target}, which is not mainline"
+            );
+        }
+    }
 }
 
 /// Solves with a fresh solver, checks every invariant, and returns the rows
@@ -435,7 +624,206 @@ fn assert_all_invariants(
 ) -> Vec<VisualCommitRow> {
     let rows = LaneSolver::new(palette_size).solve(&history.commits);
     check_all_invariants(history, palette_size, allow_dangling, seed, label, &rows);
+    assert_mainline_invariants(&history.commits, &rows, 0, palette_size, seed, label);
     rows
+}
+
+/// Hinted solves: random branch tips (some absent), a random fallback, and
+/// every invariant above plus the mainline contract against the documented
+/// resolution rule.
+#[test]
+fn hinted_mainline_invariants_hold_across_seeds() {
+    const SEEDS: u64 = 240;
+    for seed in 50_000..50_000 + SEEDS {
+        let history = generate_history(seed);
+        let n = history.commits.len() as u64;
+        let mut rng = Lcg(seed ^ 0xC0FF_EE00_1234_5678);
+        let tip_count = 1 + rng.below(3) as usize;
+        let mut branch_tips = Vec::with_capacity(tip_count);
+        for _ in 0..tip_count {
+            if rng.below(100) < 20 {
+                branch_tips.push(format!("ghost-{}", rng.below(1000)));
+            } else {
+                branch_tips.push(format!("n{}", rng.below(n)));
+            }
+        }
+        let fallback_tip = if rng.below(100) < 50 {
+            Some(format!("n{}", rng.below(n)))
+        } else {
+            None
+        };
+        let hint = MainlineHint {
+            branch_tips,
+            fallback_tip,
+        };
+        let palette = 1 + (seed % 24) as u32;
+        let rows = LaneSolver::new(palette).solve_with_mainline(&history.commits, &hint);
+        check_all_invariants(&history, palette, false, seed, "hinted", &rows);
+        assert_width_is_peak_occupancy(&rows, seed, "hinted");
+        let expected_tip = expected_mainline_tip(&history.commits, &hint);
+        assert_mainline_invariants(
+            &history.commits,
+            &rows,
+            expected_tip,
+            palette,
+            seed,
+            "hinted",
+        );
+        let again = LaneSolver::new(palette).solve_with_mainline(&history.commits, &hint);
+        assert_eq!(rows, again, "hinted solve is nondeterministic; seed={seed}");
+    }
+}
+
+/// Server-side commit filters thin the window AFTER the mainline hint is
+/// chosen, rewrite parents (`simplify_history`) and re-anchor the hint on
+/// the chain's first survivor — the `assemble_commit_graph` recipe. Under
+/// random keep masks the filtered window must (1) hold exactly the kept
+/// commits in order, (2) name only kept ancestors or the survivor's own
+/// unresolvable ids, deduplicated and capped, (3) keep first-parent lineage
+/// (the nearest kept commit on the original first-parent chain comes
+/// first), and (4) solve with every in-window parent drawn live and the
+/// mainline straight from the re-anchored tip.
+#[test]
+fn simplified_histories_stay_connected_and_keep_the_mainline_straight() {
+    const SEEDS: u64 = 240;
+    for seed in 70_000..70_000 + SEEDS {
+        let ghosts = seed % 3 == 0;
+        let history = if ghosts {
+            generate_history_with_ghost_parents(seed)
+        } else {
+            generate_history(seed)
+        };
+        let commits = &history.commits;
+        let n = commits.len();
+        if n == 0 {
+            continue;
+        }
+        let index = row_index(commits);
+        let mut rng = Lcg(seed ^ 0x5EED_F11E_0000_0001);
+        let keep_pct = 5 + rng.below(91);
+        let keep: Vec<bool> = (0..n).map(|_| rng.below(100) < keep_pct).collect();
+        let hint = MainlineHint {
+            branch_tips: vec![format!("n{}", rng.below(n as u64))],
+            fallback_tip: None,
+        };
+        let chain = mainline_chain_ids(commits, &hint);
+        let simplified = simplify_history(commits, &keep);
+
+        // (1) exactly the kept commits, in window order.
+        let kept_rows: Vec<usize> = (0..n).filter(|i| keep[*i]).collect();
+        let expected_ids: Vec<&str> = kept_rows.iter().map(|&i| commits[i].id.as_str()).collect();
+        let got_ids: Vec<&str> = simplified.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            got_ids, expected_ids,
+            "seed={seed}: kept set or order changed"
+        );
+
+        for (pos, commit) in simplified.iter().enumerate() {
+            let orig = kept_rows[pos];
+            let id = &commit.id;
+            // (2) parents: kept ancestors, ancestry past the window, or
+            // the survivor's own empty/malformed stubs — never a dropped
+            // row, never an inherited empty or malformed id.
+            assert!(
+                commit.parent_ids.len() <= MAX_REWRITTEN_PARENTS,
+                "seed={seed}: {id} has {} rewritten parents",
+                commit.parent_ids.len()
+            );
+            let distinct: HashSet<&str> = commit.parent_ids.iter().map(String::as_str).collect();
+            assert_eq!(
+                distinct.len(),
+                commit.parent_ids.len(),
+                "seed={seed}: {id} lists a parent twice"
+            );
+            for parent in &commit.parent_ids {
+                match index.get(parent.as_str()) {
+                    Some(&row) if !parent.is_empty() && row > orig => assert!(
+                        keep[row],
+                        "seed={seed}: {id} names dropped ancestor {parent}"
+                    ),
+                    None if !parent.is_empty() => {} // past the window: travels
+                    _ => assert!(
+                        commits[orig].parent_ids.iter().any(|own| own == parent),
+                        "seed={seed}: {id} inherited empty/malformed id {parent:?}"
+                    ),
+                }
+            }
+            // (3) first-parent lineage survives.
+            let walk = first_parent_rows(commits, &index, orig);
+            if let Some(&nearest) = walk[1..].iter().find(|row| keep[**row]) {
+                assert_eq!(
+                    commit.parent_ids.first().map(String::as_str),
+                    Some(commits[nearest].id.as_str()),
+                    "seed={seed}: {id}'s first parent is not the nearest kept first-parent ancestor"
+                );
+            } else if let Some(own_first) = commits[orig].parent_ids.first() {
+                let resolvable = !own_first.is_empty()
+                    && matches!(index.get(own_first.as_str()), Some(&row) if row > orig);
+                if !resolvable {
+                    assert_eq!(
+                        commit.parent_ids.first(),
+                        Some(own_first),
+                        "seed={seed}: {id}'s own stub {own_first:?} must stay first"
+                    );
+                }
+            }
+        }
+
+        // (4) the filtered window solves clean.
+        if simplified.is_empty() {
+            continue;
+        }
+        let survivor = chain
+            .iter()
+            .find(|id| got_ids.contains(&id.as_str()))
+            .cloned();
+        let re_hint = MainlineHint {
+            branch_tips: survivor.into_iter().collect(),
+            fallback_tip: None,
+        };
+        let palette = 1 + (seed % 24) as u32;
+        let rows = LaneSolver::new(palette).solve_with_mainline(&simplified, &re_hint);
+        let filtered = GeneratedHistory {
+            commits: simplified.clone(),
+            max_columns: history.max_columns,
+        };
+        check_all_invariants(&filtered, palette, ghosts, seed, "simplified", &rows);
+        assert_width_is_peak_occupancy(&rows, seed, "simplified");
+        let expected_tip = expected_mainline_tip(&simplified, &re_hint);
+        assert_mainline_invariants(
+            &simplified,
+            &rows,
+            expected_tip,
+            palette,
+            seed,
+            "simplified",
+        );
+        let sindex = row_index(&simplified);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.connections.len(),
+                row.parent_ids.len(),
+                "seed={seed}: connection per parent"
+            );
+            for (k, conn) in row.connections.iter().enumerate() {
+                let parent = row.parent_ids[k].as_str();
+                match sindex.get(parent) {
+                    Some(&target) if !parent.is_empty() && target > i => {
+                        assert!(
+                            !conn.is_dangling,
+                            "seed={seed}: {} -> {parent} is a stub although the parent is loaded",
+                            row.id
+                        );
+                        assert_eq!(conn.to_row_offset as usize, target - i, "seed={seed}");
+                    }
+                    _ => assert!(
+                        conn.is_dangling,
+                        "seed={seed}: unresolvable parent drawn live"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -568,6 +956,19 @@ fn windowed_prefix_solves_agree_on_edge_structure() {
                             "seed={seed} w={w} row={i} k={k}: edge outlived its window"
                         );
                     }
+                }
+                // The anchor (row 0) is in every prefix, and truncation can
+                // only shorten its chain: mainline membership and the
+                // pinned column survive every window size.
+                assert_eq!(
+                    row.is_mainline, full[i].is_mainline,
+                    "seed={seed} w={w} row={i}: truncation changed mainline membership"
+                );
+                if row.is_mainline {
+                    assert_eq!(
+                        row.lane, full[i].lane,
+                        "seed={seed} w={w} row={i}: mainline moved"
+                    );
                 }
             }
         }

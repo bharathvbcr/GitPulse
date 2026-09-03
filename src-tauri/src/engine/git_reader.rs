@@ -507,12 +507,25 @@ impl GitReader {
         Ok(git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string())
     }
 
+    /// Short name of the repository's default branch: the primary remote's
+    /// HEAD target when it declares one, else the first conventional name
+    /// (`main`, `master`, `trunk`, `develop`) that exists locally or on that
+    /// remote — or `None` when nothing resolves. Config and ref probes only,
+    /// no history walk, so the graph load can run it alongside the walk.
+    pub fn default_branch_name(repo_path: &str) -> Result<Option<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        let remote = resolve_default_remote(&repo);
+        let head_ref = remote_head_ref(&remote);
+        let remote_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
+        Ok(resolve_default_base_on(&repo, &remote, remote_head.as_deref()).map(|(name, _)| name))
+    }
+
     pub fn read_commit_history(
         repo_path: &str,
         max_count: usize,
         revision: Option<&str>,
     ) -> Result<Vec<RawCommitNode>, String> {
-        Self::read_commit_history_paged(repo_path, 0, max_count, revision)
+        Self::read_commit_history_paged(repo_path, 0, max_count, revision, None)
     }
 
     /// Reads one page of history, oldest-first paging via `--skip`.
@@ -522,37 +535,68 @@ impl GitReader {
     /// callers that need deeper history paginate rather than raise the cap, so
     /// a request can never ask git for an unbounded log on a monorepo-scale
     /// repository.
+    ///
+    /// `path` limits the walk to commits touching that path, and git — not the
+    /// caller — decides what survives: `--parents` makes a path-limited log
+    /// REWRITE each surviving commit's parent list to its nearest surviving
+    /// ancestors, so `%P` names commits that are actually in the page. Filtering
+    /// a full walk down to a path afterwards cannot do this: the survivors keep
+    /// naming parents that were dropped, and the lane solver renders the result
+    /// as disconnected stubs instead of a connected history.
     pub fn read_commit_history_paged(
         repo_path: &str,
         skip: usize,
         max_count: usize,
         revision: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
         let count = Self::page_count_limit(max_count).to_string();
         let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
         let count_arg = format!("-n{}", count);
         let skip_arg = format!("--skip={}", skipped);
-        let mut args = vec![
-            "log",
-            count_arg.as_str(),
-            skip_arg.as_str(),
-            "--topo-order",
-            // Subjects may legally contain any byte except NUL, so the RECORD
-            // terminator is %x00 — a hostile subject can no longer split the
-            // stream into bogus records. Fields use %x01, which a subject,
-            // author name or email may legally contain too: the risky
-            // variable-length fields therefore sit at the END of the record
-            // and parsing works from the RIGHT (see [`parse_history_record`]),
-            // so such a byte can only truncate the one field it landed in —
-            // never shift id, parents or timestamp.
-            "--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00",
-        ];
+        // Canonical join resolves existing prefixes through symlinks and keeps
+        // not-yet-tracked leaves lexical, so a symlinked directory cannot
+        // redirect the walk outside the repository; the literal pathspec stops
+        // glob characters in a real file name from widening it.
+        let spec = match path {
+            Some(file_path) => {
+                sandbox_join_canonical(&repo, file_path)?;
+                Some(literal_pathspec(file_path))
+            }
+            None => None,
+        };
+        let mut args: Vec<&str> = Vec::new();
+        if spec.is_some() {
+            // Path bytes reach us raw rather than octal-escaped, matching the
+            // pathspec we hand back to git.
+            args.extend_from_slice(&["-c", "core.quotepath=off"]);
+        }
+        args.extend_from_slice(&["log", count_arg.as_str(), skip_arg.as_str(), "--topo-order"]);
+        if spec.is_some() {
+            // Parent rewriting only. `--parents` prepends parent oids to the
+            // DEFAULT log line; with a custom `--format` it adds no fields, so
+            // the record layout below is untouched.
+            args.push("--parents");
+        }
+        // Subjects may legally contain any byte except NUL, so the RECORD
+        // terminator is %x00 — a hostile subject can no longer split the
+        // stream into bogus records. Fields use %x01, which a subject,
+        // author name or email may legally contain too: the risky
+        // variable-length fields therefore sit at the END of the record
+        // and parsing works from the RIGHT (see [`parse_history_record`]),
+        // so such a byte can only truncate the one field it landed in —
+        // never shift id, parents or timestamp.
+        args.push("--format=format:%H%x01%P%x01%ct%x01%s%x01%an%x01%ae%x00");
         if let Some(rev) = revision {
             validate_ref_name(rev)?;
             args.push(rev);
         } else {
             args.push("--all");
+        }
+        if let Some(spec) = spec.as_deref() {
+            args.push("--");
+            args.push(spec);
         }
         let stdout = git_text(&repo, &args)?;
 
@@ -627,52 +671,6 @@ impl GitReader {
             }
         }
         Ok(None)
-    }
-
-    /// Lists commits (newest-first oids) that touched `file_path`, walking
-    /// the same revisions the graph walk does: all refs when `revision` is
-    /// None, otherwise the user-selected revision.
-    ///
-    /// Revision parity is not optional polish: the graph retains only rows in
-    /// this allow-set, so a HEAD-only walk here silently dropped every
-    /// other-branch commit touching the path while `--all` kept their lanes
-    /// alive — whole branches vanished from the graph the moment a path
-    /// filter was applied.
-    pub fn commits_touching_path(
-        repo_path: &str,
-        file_path: &str,
-        max_count: usize,
-        revision: Option<&str>,
-    ) -> Result<Vec<String>, String> {
-        let repo = validate_repo(repo_path)?;
-        // Canonical join resolves existing prefixes through symlinks and keeps
-        // not-yet-tracked leaves lexical, so a symlinked directory cannot
-        // redirect the query outside the repository.
-        sandbox_join_canonical(&repo, file_path)?;
-        let count = max_count.clamp(1, 100_000).to_string();
-        let spec = literal_pathspec(file_path);
-        let count_arg = format!("-n{}", count);
-        let mut args = vec![
-            "-c",
-            "core.quotepath=off",
-            "log",
-            count_arg.as_str(),
-            "--format=%H",
-        ];
-        if let Some(rev) = revision {
-            validate_ref_name(rev)?;
-            args.push(rev);
-        } else {
-            args.push("--all");
-        }
-        args.push("--");
-        args.push(spec.as_str());
-        let stdout = git_text(&repo, &args)?;
-        Ok(stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect())
     }
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {

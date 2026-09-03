@@ -34,6 +34,13 @@ export interface VisualCommitRow {
   connections: LaneConnection[];
   is_merge: boolean;
   is_root: boolean;
+  /**
+   * True when the commit lies on the pinned mainline — the first-parent
+   * chain of the default branch, which the solver keeps on column 0 in
+   * palette colour 0 for the whole window. Optional because rows solved
+   * before the flag existed (fixtures, older payloads) omit it.
+   */
+  is_mainline?: boolean;
 }
 
 export interface GraphRenderConfig {

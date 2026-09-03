@@ -1,6 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
-  import { graphStore, serverFetchableQuery } from "../stores/graphStore";
+  import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
@@ -95,14 +95,9 @@
       await repoStore.refresh(repoPath);
       // The bare loadGraph(repoPath) form reset the view to query=""/HEAD
       // while FilterBar still showed the selected filter, and the scheduler
-      // memo then blocked the correction. Reload with the visible context,
-      // sanitized: a client-side query sent here would be filtered into the
-      // cached payload server-side and never refetched (serverFetchableQuery).
-      await graphStore.loadGraph(
-        repoPath,
-        serverFetchableQuery($filterStore.searchQuery),
-        $filterStore.selectedBranch,
-      );
+      // memo then blocked the correction. Reload with the visible context;
+      // the backend applies every query term.
+      await graphStore.loadGraph(repoPath, $filterStore.searchQuery, $filterStore.selectedBranch);
       onClose?.();
     } catch (err: unknown) {
       errorMsg = reportPanelError("rebase", err);

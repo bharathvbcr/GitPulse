@@ -3,6 +3,7 @@ import {
   GRAPH_FETCH_DEBOUNCE_MS,
   createGraphFetchScheduler,
   graphRequestKey,
+  normalizeGraphQuery,
   type GraphFetchRequest,
   type ScheduledLoad,
 } from "./graphFetchScheduler";
@@ -61,11 +62,26 @@ describe("graphRequestKey", () => {
     expect(graphRequestKey(req("/a", "", "dev"))).not.toBe(graphRequestKey(req("/a")));
   });
 
-  it("includes the query only when git must walk history for it", () => {
-    const serverQuery = "path:src/**/*.ts";
-    expect(graphRequestKey(req("/a", serverQuery))).toBe(`/a\u241f\u241f${serverQuery}`);
-    // Client-side-only text must NOT change the key: no re-walk per keystroke.
-    expect(graphRequestKey(req("/a", "dead"))).toBe(graphRequestKey(req("/a", "beef")));
+  it("includes every non-blank query, normalized: each filter edit is its own request", () => {
+    // Every term runs in the backend (author, sha, type, free text, path),
+    // so a different query is a different graph and must refetch.
+    expect(graphRequestKey(req("/a", "path:src/**/*.ts"))).toBe("/a\u241f\u241fpath:src/**/*.ts");
+    expect(graphRequestKey(req("/a", "author:ada"))).toBe("/a\u241f\u241fauthor:ada");
+    expect(graphRequestKey(req("/a", "dead"))).not.toBe(graphRequestKey(req("/a", "beef")));
+    // Whitespace is not a different request: a stray space never re-walks.
+    expect(graphRequestKey(req("/a", "  author:ada   fix:  "))).toBe(
+      graphRequestKey(req("/a", "author:ada fix:")),
+    );
+    expect(graphRequestKey(req("/a", "   "))).toBe(graphRequestKey(req("/a", "")));
+  });
+});
+
+describe("normalizeGraphQuery", () => {
+  it("collapses whitespace and keeps token order", () => {
+    expect(normalizeGraphQuery("  a   b\tc \n")).toBe("a b c");
+    expect(normalizeGraphQuery("author:ada")).toBe("author:ada");
+    expect(normalizeGraphQuery("")).toBe("");
+    expect(normalizeGraphQuery("   ")).toBe("");
   });
 });
 
@@ -159,14 +175,23 @@ describe("createGraphFetchScheduler", () => {
     expect(loads.map((l) => l.revision)).toEqual(["main", "dev", "main"]);
   });
 
-  it("re-fetches when only a client-side query changed before anything fired", () => {
-    // While ARMED, identical keys are ignored even if query text differs —
-    // client filtering owns those rows; the armed page fetch stays valid.
+  it("lets a query edit inside the window supersede the armed request, fired normalized", () => {
+    // Every filter term is a backend request: the newer query wins the
+    // window and only it fires (trailing debounce), in canonical form.
     const { clock, loads, scheduler } = harness();
     scheduler.sync(req("/repo", ""));
+    scheduler.sync(req("/repo", "  author:me  "));
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null }]);
+  });
+
+  it("does not refetch when the query only changed in whitespace", () => {
+    const { clock, loads, scheduler } = harness();
     scheduler.sync(req("/repo", "author:me"));
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
-    expect(loads).toEqual([{ path: "/repo", query: "", revision: null }]);
+    scheduler.sync(req("/repo", " author:me "));
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null }]);
   });
 });
 

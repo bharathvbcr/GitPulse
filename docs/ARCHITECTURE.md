@@ -141,7 +141,7 @@ classDiagram
 
 ### Subsystem Responsibilities
 - **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers.
-- **`graph/`**: Native commit-history lane solver with branch folding, parent-child edge layout, and nogap lookback bounds.
+- **`graph/`**: Native commit-history lane solver — stable columns by interval allocation, a pinned mainline (the default branch's first-parent chain holds column 0 for the whole window), history simplification for server-side commit filters (a dropped commit hands its lineage to its children, git-style, so a filtered graph stays connected and the mainline re-anchors on the chain's first survivor), parent-child edge layout, and nogap lookback bounds.
 - **`analyzer/`**: 
   - `language.rs`: Multi-language classifier (60+ languages), GitHub Linguist color mappings, and fast line-of-code breakdown.
   - `coverage.rs`: Universal coverage artifact scanner (LCOV, Cobertura, Go cover, Istanbul, JaCoCo, Clover), toolchain installer detection, and file-level metrics.
@@ -167,7 +167,7 @@ sequenceDiagram
     participant GPU as WebGL/Canvas2D Context
 
     Git->>Solver: Raw commit log & parents
-    Solver->>Solver: Solve topological lanes & nogap bounds
+    Solver->>Solver: Pin the default branch to column 0, solve stable lanes
     Solver->>Store: Structured GraphPayload (commits, lanes, refs)
     Store->>Canvas: Virtual window viewport (visible rows + buffer)
     Canvas->>GPU: Draw curved branch lanes & rail connectors
@@ -175,7 +175,8 @@ sequenceDiagram
     Canvas->>GPU: Paint branch/tag ref badges
 ```
 
-- **Topological Lane Solver**: Runs natively in Rust using Rayon for parallel traversal when loading large commit histories.
+- **Topological Lane Solver**: Runs natively in Rust (`graph/lane_solver.rs`), single-threaded — one linear pass over the `--topo-order` walk. History is decomposed into first-parent segments, each holding one column for its whole lifetime (in-flight connectors included) by greedy interval allocation, so the graph is exactly as wide as its peak concurrent occupancy.
+- **Pinned mainline**: The default branch's first-parent chain (`resolve_mainline_hint` in `commands/mod.rs`: the repository's default branch, local tip first, extended through a remote-tracking copy that is ahead; HEAD as the fallback; the newest commit otherwise) is reserved before any row is walked and pinned to column 0 in palette colour 0 for the entire window. Feature chains close INTO that column and can never claim a main ancestor first, so `main` is one straight rail however the walk interleaved merged branches with it; at a window cut the rail ends with a stub rather than continuing into a merged-in branch. Rows carry `is_mainline`, the payload carries `mainline_id`/`mainline_name`, and the graph tooltip names the rail.
 - **Async runtime**: `rayon` is the only direct concurrency dependency in `src-tauri/Cargo.toml`. Blocking work leaves the IPC thread through `tauri::async_runtime::spawn_blocking` (see `off_thread` in `commands/mod.rs`). Tokio is present, but transitively through Tauri — nothing here depends on it directly, so `use tokio::…` will not compile without adding the crate first.
 - **Nogap Lookback Bounds**: Prevents disconnected lane lines across virtualized scrolling regions.
 - **Author Avatars**: Fast on-canvas rendering with caching for author initials, identicons, and GitHub avatars.
@@ -190,7 +191,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `npm run check:ipc` | Verifies all 123 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 530 data fields, in 43 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 531 data fields, in 43 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` agree. |
 
 ---

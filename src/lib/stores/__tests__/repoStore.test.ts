@@ -1882,7 +1882,7 @@ describe("repoStore refresh query forwarding", () => {
     };
   }
 
-  it("forwards only server-fetchable queries to the backend on refresh", async () => {
+  it("forwards the visible query verbatim to the backend on refresh", async () => {
     const graph = makeRecordingGraph();
     const filter = makeFilter();
     const store = createRepoStore({
@@ -1894,21 +1894,21 @@ describe("repoStore refresh query forwarding", () => {
     });
     await store.openRepo("/r/launder");
 
-    // author:x is client-side filtering: the backend applies ANY query
-    // server-side, so forwarding it would permanently drop rows into the
-    // cached payload — and clearing the filter reproduces the scheduler's
-    // last-fired key, leaving the pane stuck on partial history.
+    // Every query term runs in the backend now, and the scheduler keys on
+    // the same normalized query the store caches under, so a refresh must
+    // reload exactly the view on screen — blanking the query here used to
+    // be the only way to keep filtered rows from being laundered into the
+    // cache, and that hazard is gone with the client-side filter path.
     filter.setSearch("author:x");
     await store.refresh();
     const authorLoad = graph.loads[graph.loads.length - 1];
-    expect(authorLoad).toEqual({ path: "/r/launder", query: "", revision: null });
+    expect(authorLoad).toEqual({ path: "/r/launder", query: "author:x", revision: null });
 
     filter.selectBranch("feature");
     await store.refresh();
     const branchLoad = graph.loads[graph.loads.length - 1];
     expect(branchLoad?.revision).toBe("feature");
 
-    // path: filters genuinely need git to walk history, so they pass through.
     filter.setSearch("path:src");
     await store.refresh();
     const pathLoad = graph.loads[graph.loads.length - 1];

@@ -30,7 +30,6 @@
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
-  import { createRowFilterMemo, parseFilterQueryCached } from "../filter/queryMemo";
   import { nextLoadLimit } from "../stores/graphLimits";
   import {
     clampGraphScrollLeft,
@@ -135,15 +134,21 @@
   let rowsVersion = 0;
   let versionedRows: VisualCommitRow[] | null = null;
 
-  // Identity-stable filtering: without the memo, every graphStore emission
-  // handed derivations a fresh array and bumped rowsVersion, wiping the
-  // strip cache (full re-rasterization) even when history was unchanged.
-  const rowFilter = createRowFilterMemo();
+  // The payload is the view: every filter term runs in the backend
+  // (`cmd_get_commit_graph` applies it with git-style history
+  // simplification, so survivors stay connected), and nothing is dropped
+  // here after lanes were solved. The store keeps the array identity across
+  // identical reloads (signature check), which is what keeps the strip cache
+  // alive between watcher refreshes.
+  let filteredRows = $derived($graphStore.rows);
 
-  let filtered = $derived.by(() =>
-    rowFilter.filter($graphStore.rows, parseFilterQueryCached($filterStore.searchQuery))
-  );
-  let filteredRows = $derived(filtered.rows);
+  /** Parents a row's stubs point at, so the spoken context can name them. */
+  function missingParentsOf(row: VisualCommitRow): string[] {
+    return (row.connections ?? []).flatMap((conn, k) => {
+      const id = row.parent_ids?.[k];
+      return conn?.is_dangling && typeof id === "string" && id.length > 0 ? [id] : [];
+    });
+  }
 
   /**
    * Author-avatar column (Settings → Commit Graph → "Author avatars").
@@ -255,9 +260,25 @@
       `${kind} ${row.id.slice(0, 7)}: ${row.summary || "no commit message"}.`,
       `By ${row.author_name || "unknown"}, ${formatRelativeTime(row.timestamp) || "unknown time"}.`,
     ];
+    if (row.is_mainline) {
+      // The straight column-0 rail; named so a screen reader hears which
+      // branch's first-parent history the row belongs to, as the tooltip
+      // chip shows sighted users.
+      const name = $graphStore.mainlineName?.trim() || "the mainline";
+      parts.push(`On ${name}, the first-parent line.`);
+    }
     const target = closeTargetById.get(row.id);
     if (target) {
       parts.push(`Merges into ${target.id.slice(0, 7)}: ${target.summary || "no commit message"}.`);
+    }
+    const missing = missingParentsOf(row);
+    if (missing.length > 0) {
+      const which = missing.length === 1
+        ? `Parent ${missing[0].slice(0, 7)} is`
+        : `Parent ${missing[0].slice(0, 7)} and ${missing.length - 1} more are`;
+      parts.push(
+        `${which} outside the loaded history${$graphStore.hasMore ? "; load older history to follow it" : ""}.`,
+      );
     }
     const count = authorCountFor(row);
     if (count !== null && count > 0) {
@@ -914,6 +935,8 @@
         hitKind={tooltipHitKind}
         mergeTarget={tooltipMergeTarget ?? closeTargetById.get(tooltipRow.id) ?? null}
         authorCommitCount={authorCountFor(tooltipRow)}
+        mainlineName={$graphStore.mainlineName}
+        hasMore={$graphStore.hasMore}
       />
     </div>
   {/if}

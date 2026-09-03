@@ -32,7 +32,6 @@ const WARNINGS = [
 function graphPayload(withWarnings: boolean): CommitGraphPayload {
   const base: CommitGraphPayload = {
     rows: [row("a")],
-    folds: [],
     head_id: null,
     refs: [],
     has_more: false,

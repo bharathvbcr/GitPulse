@@ -48,9 +48,48 @@ pub struct VisualCommitRow {
     pub connections: Vec<LaneConnection>, // Outgoing connections to parents
     pub is_merge: bool,
     pub is_root: bool,
+    /// True when this commit lies on the pinned mainline — the first-parent
+    /// chain the solver was asked to keep straight (see [`MainlineHint`]).
+    /// Mainline rows always sit on [`MAINLINE_COLUMN`] in
+    /// [`MAINLINE_COLOR`]. `default` keeps rows serialized before the field
+    /// existed deserializable.
+    #[serde(default)]
+    pub is_mainline: bool,
 }
 
-/// Stable-column lane solver.
+/// The column the mainline is pinned to for the whole window.
+pub const MAINLINE_COLUMN: u32 = 0;
+/// The palette slot the mainline always paints in, so `main` looks the
+/// same in every repository and on every reload.
+pub const MAINLINE_COLOR: u32 = 0;
+
+/// Which branch the solver keeps straight.
+///
+/// The solver pins ONE first-parent chain — the mainline — to column 0 for
+/// the entire window, in colour 0, so `main` reads as a single vertical rail
+/// however the history walk interleaved it with feature branches. The
+/// anchor commit is resolved in this order:
+///
+/// 1. the first of `branch_tips` present in the window (local `main` before
+///    `origin/main`, by caller convention). The chain is then extended
+///    UPWARD through any other listed tip whose first-parent chain passes
+///    through the anchor, so a remote-tracking branch that is ahead of the
+///    local one continues the same rail instead of opening a second column;
+/// 2. `fallback_tip` (HEAD, typically) when none of the branch tips is
+///    loaded — a filtered or single-branch window;
+/// 3. row 0, the newest commit in the window, when nothing was given or
+///    nothing resolved. An unhinted [`LaneSolver::solve`] pins exactly this.
+///
+/// Extension is deliberately limited to `branch_tips`: HEAD on a feature
+/// branch forked from main's tip would otherwise extend the rail through
+/// the feature's commits and paint them as main.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MainlineHint {
+    pub branch_tips: Vec<String>,
+    pub fallback_tip: Option<String>,
+}
+
+/// Stable-column lane solver with a pinned mainline.
 ///
 /// The graph is decomposed into **branch segments**: maximal first-parent
 /// chains. A segment is born at its tip row (or at the merge row that pulls
@@ -64,6 +103,23 @@ pub struct VisualCommitRow {
 /// has fully ended), which is optimal for interval graphs: the graph is
 /// exactly as wide as its peak concurrent occupancy, never wider.
 ///
+/// One segment is special. The **mainline** — the first-parent chain of the
+/// branch named by [`MainlineHint`] — is reserved BEFORE any row is walked:
+/// every commit on it is pre-claimed for segment 0, which is pinned to
+/// column 0 for the whole window and painted in colour 0. Without that
+/// reservation, ownership of a shared ancestor went to whichever child
+/// reached it first in row order, and `git log --topo-order` routinely lists
+/// a merged feature's commits above the main commits they forked from: the
+/// feature claimed main's ancestor, main's own chain "closed" into the
+/// feature's column, and the branch every reader orients by jogged sideways
+/// at each merge. Feature chains now always close INTO the mainline column,
+/// never the reverse, so main is one straight rail from its tip to the
+/// bottom of the window. The mainline follows first parents strictly: a
+/// window cut under a mainline merge ends the rail with a stub rather than
+/// continuing it into the merged-in branch, because the rail's meaning is
+/// "main's own history" and a merged branch painted in main's colour would
+/// be a lie.
+///
 /// This is what the old greedy row-by-row allocator could not guarantee:
 /// it freed a closing branch's column at the branch's own row, so a tip
 /// born one row later was drawn straight through the still-descending
@@ -75,6 +131,9 @@ pub struct VisualCommitRow {
 pub struct LaneSolver {
     palette_size: u32,
 }
+
+/// Index of the mainline segment; it is always created first.
+const MAINLINE_SEGMENT: usize = 0;
 
 /// One branch segment: a maximal first-parent chain and the column
 /// reservation that carries it.
@@ -96,6 +155,10 @@ struct Segment {
     /// protrudes into the row below; pad the reservation so a later tip
     /// cannot be drawn under the stub.
     dangling_tail: bool,
+    /// The mainline: its column is reserved for the whole window, so no
+    /// other branch is ever drawn on it — above the mainline's tip, below
+    /// its root, or in any hole between its commits.
+    pinned: bool,
     column: u32,
     color: u32,
 }
@@ -108,13 +171,18 @@ impl Segment {
             last_row,
             close_target: None,
             dangling_tail: false,
+            pinned: false,
             column: 0,
             color: 0,
         }
     }
 
-    /// Last row this segment's column reservation covers.
-    fn alloc_until(&self) -> usize {
+    /// Last row this segment's column reservation covers; `window_end` is
+    /// the window's final row index.
+    fn alloc_until(&self, window_end: usize) -> usize {
+        if self.pinned {
+            return window_end;
+        }
         let mut until = self.last_row;
         if let Some(target) = self.close_target {
             until = until.max(target);
@@ -136,6 +204,95 @@ enum ConnSpec {
     Edge { segment: usize, target_row: usize },
 }
 
+/// Rows of the first-parent chain starting at `from`, tip first, strictly
+/// descending in row order. Stops at a root, at a parent outside the window,
+/// and at a malformed parent sitting at or above the current row — the same
+/// three cases the segment pass turns into dangling stubs.
+fn first_parent_chain(
+    commits: &[RawCommitNode],
+    row_of: &HashMap<&str, usize>,
+    from: usize,
+) -> Vec<usize> {
+    let mut chain = vec![from];
+    let mut current = from;
+    while let Some(parent) = commits[current].parent_ids.first() {
+        if parent.is_empty() {
+            break;
+        }
+        match row_of.get(parent.as_str()) {
+            Some(&row) if row > current => {
+                chain.push(row);
+                current = row;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Resolves the mainline for a non-empty window per [`MainlineHint`]: the
+/// rows of the pinned chain, tip first.
+fn mainline_chain(
+    commits: &[RawCommitNode],
+    row_of: &HashMap<&str, usize>,
+    hint: &MainlineHint,
+) -> Vec<usize> {
+    debug_assert!(!commits.is_empty());
+    let row_for = |id: &str| -> Option<usize> {
+        if id.is_empty() {
+            None
+        } else {
+            row_of.get(id).copied()
+        }
+    };
+    let anchor = hint
+        .branch_tips
+        .iter()
+        .find_map(|id| row_for(id))
+        .or_else(|| hint.fallback_tip.as_deref().and_then(row_for));
+    let Some(anchor) = anchor else {
+        return first_parent_chain(commits, row_of, 0);
+    };
+    // Extend upward through same-branch tips that are ahead of the anchor:
+    // a remote-tracking branch not yet pulled continues the same rail. Each
+    // extension moves the tip strictly upward, so the loop terminates.
+    let mut tip = anchor;
+    let mut extended = true;
+    while extended {
+        extended = false;
+        for id in &hint.branch_tips {
+            let Some(row) = row_for(id) else {
+                continue;
+            };
+            if row < tip && first_parent_chain(commits, row_of, row).contains(&tip) {
+                tip = row;
+                extended = true;
+            }
+        }
+    }
+    first_parent_chain(commits, row_of, tip)
+}
+
+/// The ids of the chain [`LaneSolver::solve_with_mainline`] pins for
+/// `commits` under `hint`, tip first (empty for an empty window).
+///
+/// Callers that thin the window AFTER deciding the hint (server-side commit
+/// filters) use it to re-anchor on the chain's first survivor, so the
+/// filtered graph keeps the same branch straight as the unfiltered one.
+pub fn mainline_chain_ids(commits: &[RawCommitNode], hint: &MainlineHint) -> Vec<String> {
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let mut row_of: HashMap<&str, usize> = HashMap::with_capacity(commits.len());
+    for (i, commit) in commits.iter().enumerate() {
+        row_of.entry(commit.id.as_str()).or_insert(i);
+    }
+    mainline_chain(commits, &row_of, hint)
+        .into_iter()
+        .map(|row| commits[row].id.clone())
+        .collect()
+}
+
 impl LaneSolver {
     pub fn new(palette_size: u32) -> Self {
         Self {
@@ -143,12 +300,25 @@ impl LaneSolver {
         }
     }
 
-    /// Solves the visual DAG layout for a topologically sorted list of commits.
+    /// Solves the visual DAG layout for a topologically sorted list of
+    /// commits, pinning the newest commit's first-parent chain as the
+    /// mainline (an empty [`MainlineHint`]).
     pub fn solve(&mut self, commits: &[RawCommitNode]) -> Vec<VisualCommitRow> {
+        self.solve_with_mainline(commits, &MainlineHint::default())
+    }
+
+    /// Solves the visual DAG layout for a topologically sorted list of
+    /// commits, keeping the branch described by `hint` straight on column 0.
+    pub fn solve_with_mainline(
+        &mut self,
+        commits: &[RawCommitNode],
+        hint: &MainlineHint,
+    ) -> Vec<VisualCommitRow> {
         let n = commits.len();
         if n == 0 {
             return Vec::new();
         }
+        let window_end = n - 1;
 
         // First occurrence wins: a later duplicate id is corrupt input and
         // must not steal endpoints from the earlier row.
@@ -160,14 +330,31 @@ impl LaneSolver {
             row_of.entry(commit.id.as_str()).or_insert(idx);
         }
 
-        // ---- Pass 1: build segments and per-row connection specs. -------
+        // ---- Pass 0: reserve the mainline. ------------------------------
+        // Every commit on the pinned chain is claimed for segment 0 before
+        // any row is walked, so no feature chain reaching a main ancestor
+        // first in row order can take ownership of it.
         let mut segments: Vec<Segment> = Vec::new();
-        let mut seg_of_row: Vec<usize> = vec![0; n];
-        let mut conn_specs: Vec<Vec<ConnSpec>> = Vec::with_capacity(n);
         // Parent id -> segment that reserved it. A reservation exists only
         // for ids whose first occurrence lies strictly below the reserving
-        // row, so it is always consumed exactly at that first occurrence.
+        // row (or, for the mainline, on the pre-claimed chain itself), so it
+        // is always consumed exactly at that first occurrence.
         let mut pending: HashMap<&str, usize> = HashMap::new();
+        {
+            let chain = mainline_chain(commits, &row_of, hint);
+            let tip = chain[0];
+            let mut mainline = Segment::new(0, tip, tip);
+            mainline.pinned = true;
+            segments.push(mainline);
+            debug_assert_eq!(segments.len() - 1, MAINLINE_SEGMENT);
+            for &row in &chain {
+                pending.insert(commits[row].id.as_str(), MAINLINE_SEGMENT);
+            }
+        }
+
+        // ---- Pass 1: build segments and per-row connection specs. -------
+        let mut seg_of_row: Vec<usize> = vec![0; n];
+        let mut conn_specs: Vec<Vec<ConnSpec>> = Vec::with_capacity(n);
 
         for (i, commit) in commits.iter().enumerate() {
             let seg_id = match pending.remove(commit.id.as_str()) {
@@ -185,6 +372,8 @@ impl LaneSolver {
             // parent is dead (empty / ghost / malformed), the first unowned
             // merged-in parent inherits the column instead, so a merge whose
             // mainline left the window still draws compactly straight down.
+            // The mainline itself never inherits: its rail means "main's own
+            // first-parent history", so it ends with a stub instead.
             let mut continues_below = false;
 
             let mut specs = Vec::with_capacity(commit.parent_ids.len());
@@ -200,34 +389,46 @@ impl LaneSolver {
                 };
 
                 if k == 0 {
-                    if let Some(&owner) = pending.get(parent_id.as_str()) {
-                        // Another segment already reserved this parent: this
-                        // chain ends here and its connector descends to the
-                        // owner's row, keeping the column busy until then.
-                        specs.push(ConnSpec::Edge {
-                            segment: owner,
-                            target_row: parent_row,
-                        });
-                        let seg = &mut segments[seg_id];
-                        seg.close_target = Some(
-                            seg.close_target
-                                .map_or(parent_row, |existing: usize| existing.max(parent_row)),
-                        );
-                        continues_below = true;
-                    } else {
-                        pending.insert(parent_id.as_str(), seg_id);
-                        specs.push(ConnSpec::Edge {
-                            segment: seg_id,
-                            target_row: parent_row,
-                        });
-                        continues_below = true;
+                    match pending.get(parent_id.as_str()) {
+                        Some(&owner) if owner != seg_id => {
+                            // Another segment already reserved this parent:
+                            // this chain ends here and its connector descends
+                            // to the owner's row, keeping the column busy
+                            // until then.
+                            specs.push(ConnSpec::Edge {
+                                segment: owner,
+                                target_row: parent_row,
+                            });
+                            let seg = &mut segments[seg_id];
+                            seg.close_target =
+                                Some(seg.close_target.map_or(parent_row, |existing: usize| {
+                                    existing.max(parent_row)
+                                }));
+                        }
+                        Some(_) => {
+                            // Pre-claimed by this very segment (the mainline
+                            // chain): straight continuation, nothing to
+                            // reserve.
+                            specs.push(ConnSpec::Edge {
+                                segment: seg_id,
+                                target_row: parent_row,
+                            });
+                        }
+                        None => {
+                            pending.insert(parent_id.as_str(), seg_id);
+                            specs.push(ConnSpec::Edge {
+                                segment: seg_id,
+                                target_row: parent_row,
+                            });
+                        }
                     }
+                    continues_below = true;
                 } else if let Some(&owner) = pending.get(parent_id.as_str()) {
                     specs.push(ConnSpec::Edge {
                         segment: owner,
                         target_row: parent_row,
                     });
-                } else if !continues_below {
+                } else if !continues_below && seg_id != MAINLINE_SEGMENT {
                     // Dead first parent: this live merged-in parent continues
                     // the segment in place, straight down the same column.
                     pending.insert(parent_id.as_str(), seg_id);
@@ -268,10 +469,13 @@ impl LaneSolver {
         }
 
         // ---- Pass 2: interval column allocation + colors. ---------------
-        // Segments were created in nondecreasing `alloc_from` order (tips at
-        // their own row, spawns at their merge row), so creation order IS the
-        // sweep order. Lowest-free-column greedy over intervals is optimal:
-        // width == maximum number of concurrently reserved columns.
+        // Segments were created in nondecreasing `alloc_from` order (the
+        // mainline at row 0, tips at their own row, spawns at their merge
+        // row), so creation order IS the sweep order. Lowest-free-column
+        // greedy over intervals is optimal: width == maximum number of
+        // concurrently reserved columns, the mainline's whole-window
+        // reservation included. The mainline is swept first from row 0, so
+        // it takes column 0 and — reserved to the window's end — keeps it.
         let mut width: u32 = 0;
         {
             let mut free: BTreeSet<u32> = BTreeSet::new();
@@ -297,9 +501,10 @@ impl LaneSolver {
                     }
                 };
                 seg.column = column;
-                busy.push(Reverse((seg.alloc_until(), column)));
+                busy.push(Reverse((seg.alloc_until(window_end), column)));
             }
         }
+        debug_assert_eq!(segments[MAINLINE_SEGMENT].column, MAINLINE_COLUMN);
 
         // Colors rotate through the palette, never handing a live neighbour's
         // color to a new segment while a free one remains: two same-colored
@@ -309,7 +514,9 @@ impl LaneSolver {
         // column, same color, a row or two apart reads as ONE continuous
         // branch, which is a lie. When more segments overlap than the
         // palette has entries, the cursor's color is taken — a
-        // deterministic, unavoidable collision.
+        // deterministic, unavoidable collision. The mainline is swept first
+        // with the cursor at MAINLINE_COLOR, so it always paints in that
+        // slot and holds it for the whole window.
         {
             /// Rows between a column's previous occupant ending and its next
             /// beginning under which the two still read as one line.
@@ -317,7 +524,7 @@ impl LaneSolver {
             let palette = self.palette_size as usize;
             let mut in_use = vec![0u32; palette];
             let mut expiry: BinaryHeap<Reverse<(usize, u32)>> = BinaryHeap::new();
-            let mut cursor: usize = 0;
+            let mut cursor: usize = MAINLINE_COLOR as usize;
             // Per column: (alloc_until, color) of its latest occupant so far.
             // Allocation order is start order, so this IS the predecessor.
             let mut column_history: Vec<Option<(usize, u32)>> = vec![None; width as usize];
@@ -358,10 +565,15 @@ impl LaneSolver {
                 seg.color = chosen;
                 cursor = (chosen as usize + 1) % palette;
                 in_use[chosen as usize] += 1;
-                expiry.push(Reverse((seg.alloc_until(), chosen)));
-                column_history[seg.column as usize] = Some((seg.alloc_until(), chosen));
+                let until = seg.alloc_until(window_end);
+                expiry.push(Reverse((until, chosen)));
+                column_history[seg.column as usize] = Some((until, chosen));
             }
         }
+        debug_assert_eq!(
+            segments[MAINLINE_SEGMENT].color,
+            MAINLINE_COLOR % self.palette_size
+        );
 
         // ---- Pass 3: emit rows. ------------------------------------------
         // Sweep the visual spans so each row snapshots exactly the columns
@@ -444,6 +656,7 @@ impl LaneSolver {
                 connections,
                 is_merge: commit.parent_ids.len() > 1,
                 is_root: commit.parent_ids.is_empty(),
+                is_mainline: seg_of_row[i] == MAINLINE_SEGMENT,
             });
         }
 
@@ -804,9 +1017,9 @@ mod tests {
 
     /// An empty parent id is not a real commit. The corresponding
     /// connection is still emitted (index k still matches parent_ids[k])
-    /// but as a dangling stub on the child's own lane, and the child's
-    /// column continues straight into the first live parent instead of
-    /// widening the graph.
+    /// but as a dangling stub on the child's own lane, and an ordinary
+    /// segment's column continues straight into the first live parent
+    /// instead of widening the graph.
     #[test]
     fn test_empty_parent_id_does_not_allocate_a_column() {
         let mut solver = LaneSolver::new(12);
@@ -818,14 +1031,41 @@ mod tests {
         assert_eq!(rows[0].connections[1].to_lane, rows[0].lane);
         assert_eq!(max_lane_used(&rows), 0);
 
-        // Empty FIRST parent must not steal the first-parent column either.
+        // Empty FIRST parent on a feature segment must not steal the
+        // first-parent column either: `m` sits under a mainline tip, so it
+        // is an ordinary segment and inherits its live merged-in parent.
+        let mut solver = LaneSolver::new(12);
+        let commits = vec![
+            make_commit("tip", vec!["r"]),
+            make_commit("m", vec!["", "p"]),
+            make_commit("p", vec![]),
+            make_commit("r", vec![]),
+        ];
+        let rows = solver.solve(&commits);
+        assert!(rows[1].connections[0].is_dangling);
+        assert!(!rows[1].connections[1].is_dangling);
+        assert_eq!(rows[1].connections[0].to_lane, rows[1].lane);
+        assert_eq!(rows[2].lane, rows[1].lane, "p continues m's own column");
+        assert_eq!(max_lane_used(&rows), 1);
+    }
+
+    /// The mainline follows first parents strictly. With an empty FIRST
+    /// parent on the mainline tip, the rail ends in a stub and the live
+    /// merged-in parent opens its own column: painting it in the mainline
+    /// colour on column 0 would present a merged branch as main's history.
+    #[test]
+    fn test_mainline_does_not_inherit_a_merged_in_parent_past_an_empty_first_parent() {
         let mut solver = LaneSolver::new(12);
         let commits = vec![make_commit("m", vec!["", "p"]), make_commit("p", vec![])];
         let rows = solver.solve(&commits);
+        assert!(rows[0].is_mainline);
         assert!(rows[0].connections[0].is_dangling);
+        assert_eq!(rows[0].connections[0].to_lane, MAINLINE_COLUMN);
         assert!(!rows[0].connections[1].is_dangling);
-        assert_eq!(rows[0].connections[0].to_lane, rows[0].lane);
-        assert_eq!(max_lane_used(&rows), 0);
+        assert_eq!(rows[0].connections[1].to_lane, 1);
+        assert_eq!(rows[1].lane, 1);
+        assert!(!rows[1].is_mainline);
+        assert_ne!(rows[1].color_index, MAINLINE_COLOR);
     }
 
     /// Duplicate ids are corrupt input. Endpoint lookup must pin the FIRST
@@ -848,25 +1088,304 @@ mod tests {
         assert_eq!(rows[1].id, "dup");
     }
 
-    /// A merge whose mainline left the window continues straight down into
-    /// its first live merged-in parent instead of peeling that branch onto
-    /// a fresh column beside a stub.
+    /// A feature merge whose first parent left the window continues
+    /// straight down into its first live merged-in parent instead of
+    /// peeling that branch onto a fresh column beside a stub.
     #[test]
     fn test_window_cut_first_parent_promotes_the_next_live_parent() {
+        let mut solver = LaneSolver::new(12);
+        let commits = vec![
+            make_commit("tip", vec!["r"]),
+            make_commit("m", vec!["ghost", "p"]),
+            make_commit("p", vec![]),
+            make_commit("r", vec![]),
+        ];
+        let rows = solver.solve(&commits);
+        assert!(!rows[1].is_mainline, "precondition: m is a feature segment");
+        assert!(rows[1].connections[0].is_dangling);
+        let live = &rows[1].connections[1];
+        assert!(!live.is_dangling);
+        assert_eq!(
+            live.to_lane, rows[1].lane,
+            "the surviving parent must continue the merge's own column"
+        );
+        assert_eq!(rows[2].lane, rows[1].lane);
+        assert_eq!(max_lane_used(&rows), 1);
+    }
+
+    /// The mainline never inherits: when the window cuts main's first
+    /// parent under a merge, the rail ends with a stub and the merged-in
+    /// branch opens its own column. Continuing column 0 in main's colour
+    /// through a merged branch would present that branch as main's own
+    /// history, and the rows would jump columns on the next "load more".
+    #[test]
+    fn test_mainline_ends_with_a_stub_at_a_window_cut_instead_of_inheriting() {
         let mut solver = LaneSolver::new(12);
         let commits = vec![
             make_commit("m", vec!["ghost", "p"]),
             make_commit("p", vec![]),
         ];
         let rows = solver.solve(&commits);
+        assert!(rows[0].is_mainline);
         assert!(rows[0].connections[0].is_dangling);
         let live = &rows[0].connections[1];
         assert!(!live.is_dangling);
+        assert_eq!(live.to_lane, 1, "the merged-in branch opens its own column");
+        assert_eq!(rows[1].lane, 1);
+        assert!(!rows[1].is_mainline);
+        assert_ne!(rows[1].color_index, MAINLINE_COLOR);
+    }
+
+    fn hint(branch_tips: &[&str], fallback: Option<&str>) -> MainlineHint {
+        MainlineHint {
+            branch_tips: branch_tips.iter().map(|s| s.to_string()).collect(),
+            fallback_tip: fallback.map(String::from),
+        }
+    }
+
+    fn lane_of(rows: &[VisualCommitRow], id: &str) -> u32 {
+        rows.iter().find(|r| r.id == id).expect(id).lane
+    }
+
+    fn mainline_ids(rows: &[VisualCommitRow]) -> Vec<&str> {
+        rows.iter()
+            .filter(|r| r.is_mainline)
+            .map(|r| r.id.as_str())
+            .collect()
+    }
+
+    /// The defect the pinned mainline exists to fix: `--topo-order` lists
+    /// the merged feature `f2, f1` above the main commits `m2, m1`, so `f1`
+    /// reaches the shared ancestor `m0` first in row order. Without a
+    /// reservation, `f1` owned `m0` and main's own chain closed into the
+    /// feature's column — main jogged sideways at its own fork point.
+    #[test]
+    fn test_feature_reaching_a_main_ancestor_first_does_not_displace_main() {
+        let commits = vec![
+            make_commit("f2", vec!["f1"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("f1", vec!["m0"]),
+            make_commit("m1", vec!["m0"]),
+            make_commit("m0", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m2"], None));
+        assert_eq!(mainline_ids(&rows), vec!["m2", "m1", "m0"]);
+        for id in ["m2", "m1", "m0"] {
+            assert_eq!(
+                lane_of(&rows, id),
+                MAINLINE_COLUMN,
+                "{id} left the mainline column"
+            );
+        }
+        assert_eq!(lane_of(&rows, "f2"), 1);
+        assert_eq!(lane_of(&rows, "f1"), 1);
+        let f1 = rows.iter().find(|r| r.id == "f1").unwrap();
+        let close = &f1.connections[0];
         assert_eq!(
-            live.to_lane, rows[0].lane,
-            "the surviving parent must continue the merge's own column"
+            close.to_lane, MAINLINE_COLUMN,
+            "f1 must close INTO main, not own m0"
         );
-        assert_eq!(rows[1].lane, rows[0].lane);
+        assert_eq!(close.to_row_offset, 2);
+        // The main chain's own edges are straight verticals.
+        for id in ["m2", "m1"] {
+            let row = rows.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(row.connections[0].to_lane, MAINLINE_COLUMN);
+        }
+        assert_eq!(
+            max_lane_used(&rows),
+            1,
+            "two concurrent branches, two columns"
+        );
+    }
+
+    /// Unhinted, the newest commit's chain is the mainline — and it is
+    /// pre-reserved just the same, so even that chain can no longer be
+    /// displaced by a sibling that reaches its ancestor first.
+    #[test]
+    fn test_unhinted_solve_pins_the_newest_commits_chain() {
+        let commits = vec![
+            make_commit("a2", vec!["a1"]),
+            make_commit("b2", vec!["b1"]),
+            make_commit("b1", vec!["base"]),
+            make_commit("a1", vec!["base"]),
+            make_commit("base", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve(&commits);
+        assert_eq!(mainline_ids(&rows), vec!["a2", "a1", "base"]);
+        for id in ["a2", "a1", "base"] {
+            assert_eq!(lane_of(&rows, id), MAINLINE_COLUMN);
+        }
+        assert_eq!(lane_of(&rows, "b2"), 1);
+        assert_eq!(lane_of(&rows, "b1"), 1);
+    }
+
+    /// When feature tips are newer than main's tip, main still owns column
+    /// 0: the rows above its tip simply leave that column empty rather than
+    /// letting a feature borrow it and forcing main to start further right.
+    #[test]
+    fn test_mainline_below_newer_tips_keeps_column_zero_empty_above_it() {
+        let commits = vec![
+            make_commit("f2", vec!["f1"]),
+            make_commit("f1", vec!["m2"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m2"], None));
+        assert_eq!(mainline_ids(&rows), vec!["m2", "m1"]);
+        assert_eq!(lane_of(&rows, "m2"), 0);
+        assert_eq!(lane_of(&rows, "f2"), 1);
+        assert_eq!(lane_of(&rows, "f1"), 1);
+        for row in &rows[..2] {
+            assert!(
+                !row.active_lanes.contains(&MAINLINE_COLUMN),
+                "column 0 must stay empty above the mainline tip, row {} shows it",
+                row.id
+            );
+        }
+        assert!(rows[2].active_lanes.contains(&MAINLINE_COLUMN));
+        assert_eq!(rows[1].connections[0].to_lane, MAINLINE_COLUMN);
+        assert_eq!(rows[0].color_index, rows[1].color_index);
+        assert_ne!(rows[0].color_index, MAINLINE_COLOR);
+    }
+
+    /// A remote-tracking branch that is ahead of the local one continues
+    /// the same rail: local `main` anchors, and the chain extends upward
+    /// through `origin/main` because its first-parent chain passes through
+    /// the anchor.
+    #[test]
+    fn test_remote_tracking_tip_ahead_of_local_extends_the_mainline() {
+        let commits = vec![
+            make_commit("o2", vec!["o1"]),
+            make_commit("o1", vec!["m2"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m2", "o2"], None));
+        assert_eq!(mainline_ids(&rows), vec!["o2", "o1", "m2", "m1"]);
+        assert!(rows.iter().all(|r| r.lane == MAINLINE_COLUMN));
         assert_eq!(max_lane_used(&rows), 0);
+    }
+
+    /// A diverged remote does not extend the rail: its chain never reaches
+    /// the local tip, so it is an ordinary branch closing into main.
+    #[test]
+    fn test_diverged_remote_does_not_extend_the_mainline() {
+        let commits = vec![
+            make_commit("o1", vec!["m1"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m2", "o1"], None));
+        assert_eq!(mainline_ids(&rows), vec!["m2", "m1"]);
+        assert_eq!(lane_of(&rows, "o1"), 1);
+        assert_eq!(rows[0].connections[0].to_lane, MAINLINE_COLUMN);
+    }
+
+    /// The fallback tip anchors only when no branch tip is loaded, and is
+    /// never extended through: HEAD on a feature forked from main's tip
+    /// must not paint the feature as main.
+    #[test]
+    fn test_fallback_tip_anchors_without_extension() {
+        let commits = vec![
+            make_commit("h2", vec!["h1"]),
+            make_commit("h1", vec!["m2"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+        ];
+        // Branch tip loaded: HEAD's chain passes through it but must not
+        // extend the rail.
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m2"], Some("h2")));
+        assert_eq!(mainline_ids(&rows), vec!["m2", "m1"]);
+        assert_eq!(lane_of(&rows, "h2"), 1);
+
+        // Branch tip absent: HEAD anchors.
+        let rows =
+            LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["absent"], Some("h2")));
+        assert_eq!(mainline_ids(&rows), vec!["h2", "h1", "m2", "m1"]);
+        assert_eq!(max_lane_used(&rows), 0);
+
+        // Nothing resolves: the newest commit anchors.
+        let rows = LaneSolver::new(12)
+            .solve_with_mainline(&commits, &hint(&["absent", ""], Some("also-absent")));
+        assert_eq!(mainline_ids(&rows), vec!["h2", "h1", "m2", "m1"]);
+    }
+
+    /// The mainline always paints in palette slot 0, and no concurrent
+    /// branch takes that slot while another is free.
+    #[test]
+    fn test_mainline_paints_in_colour_zero_and_neighbours_avoid_it() {
+        let commits = vec![
+            make_commit("f", vec!["m1"]),
+            make_commit("g", vec!["m1"]),
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+        ];
+        let rows = LaneSolver::new(4).solve_with_mainline(&commits, &hint(&["m2"], None));
+        for row in &rows {
+            if row.is_mainline {
+                assert_eq!(row.color_index, MAINLINE_COLOR, "{} is off-palette", row.id);
+            } else {
+                assert_ne!(
+                    row.color_index, MAINLINE_COLOR,
+                    "{} stole main's colour",
+                    row.id
+                );
+            }
+        }
+    }
+
+    /// Column 0 belongs to the mainline for the whole window: nothing is
+    /// drawn there below main's root, however much room that leaves.
+    #[test]
+    fn test_mainline_column_is_never_recycled_below_its_root() {
+        let commits = vec![
+            make_commit("m2", vec!["m1"]),
+            make_commit("m1", vec![]),
+            make_commit("orphan", vec![]),
+            make_commit("other", vec!["other-root"]),
+            make_commit("other-root", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve(&commits);
+        assert_eq!(mainline_ids(&rows), vec!["m2", "m1"]);
+        for row in &rows[2..] {
+            assert_ne!(
+                row.lane, MAINLINE_COLUMN,
+                "{} was drawn on main's column",
+                row.id
+            );
+            assert!(!row.active_lanes.contains(&MAINLINE_COLUMN));
+        }
+    }
+
+    /// The row flags and the pinned chain agree with an independent walk of
+    /// first parents from the tip, for a merge-heavy shape.
+    #[test]
+    fn test_is_mainline_matches_the_first_parent_chain_from_the_tip() {
+        let commits = vec![
+            make_commit("m3", vec!["m2", "f2"]),
+            make_commit("f2", vec!["f1"]),
+            make_commit("m2", vec!["m1", "g1"]),
+            make_commit("g1", vec!["m1"]),
+            make_commit("f1", vec!["m1"]),
+            make_commit("m1", vec!["m0"]),
+            make_commit("m0", vec![]),
+        ];
+        let rows = LaneSolver::new(12).solve_with_mainline(&commits, &hint(&["m3"], None));
+        assert_eq!(mainline_ids(&rows), vec!["m3", "m2", "m1", "m0"]);
+        for row in &rows {
+            assert_eq!(row.is_mainline, row.lane == MAINLINE_COLUMN, "{}", row.id);
+            for conn in &row.connections {
+                if conn.is_dangling {
+                    continue;
+                }
+                let target = &rows[rows.iter().position(|r| r.id == row.id).unwrap()
+                    + conn.to_row_offset as usize];
+                assert_eq!(conn.to_lane, target.lane, "{} -> {}", row.id, target.id);
+            }
+        }
+        // Both merged-in branches peel right and close back into column 0.
+        assert_eq!(lane_of(&rows, "f2"), 1);
+        assert_eq!(lane_of(&rows, "f1"), 1);
+        assert_eq!(lane_of(&rows, "g1"), 2);
     }
 }

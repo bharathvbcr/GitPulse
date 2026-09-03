@@ -4,6 +4,8 @@ use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLi
 use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
+use gitpulse_lib::graph::LaneSolver;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -162,12 +164,12 @@ fn history_survives_0x01_byte_inside_author_name() {
     );
 }
 
-/// Regression (revision parity for path filtering): the graph walk uses
-/// `--all` or the user-selected revision, but the path filter's allow-set was
-/// built from a plain HEAD-only walk. Commits on OTHER branches touching the
-/// path were therefore retained OUT of the graph — whole lanes vanished.
+/// Regression (revision parity for path filtering): the path-limited walk must
+/// cover the same revisions the unfiltered graph walk does — `--all` by
+/// default, the user's revision when one is given. A HEAD-only path walk drops
+/// every other-branch commit touching the path and whole lanes vanish.
 #[test]
-fn commits_touching_path_honors_all_and_selected_revision() {
+fn path_walk_honors_all_and_selected_revision() {
     let repo = TestRepo::init();
     repo.write("shared.txt", "base\n");
     repo.commit_all("feat: base shared");
@@ -188,21 +190,155 @@ fn commits_touching_path_honors_all_and_selected_revision() {
 
     // Default semantics must match the graph walk (`--all`): branch commits
     // touching the path stay in the allow-set.
-    let all = GitReader::commits_touching_path(&path, "shared.txt", 10, None).expect("--all walk");
+    let all = GitReader::read_commit_history_paged(&path, 0, 10, None, Some("shared.txt"))
+        .expect("--all walk");
+    let all_ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
     assert!(
-        all.contains(&feature_edit.id),
-        "--all walk must include other-branch commits touching the path: {all:?}"
+        all_ids.contains(&feature_edit.id.as_str()),
+        "--all walk must include other-branch commits touching the path: {all_ids:?}"
     );
-    assert!(all.contains(&base_commit.id));
+    assert!(all_ids.contains(&base_commit.id.as_str()));
 
     // An explicit revision keeps HEAD-only semantics available.
     let head_only =
-        GitReader::commits_touching_path(&path, "shared.txt", 10, Some("HEAD")).expect("HEAD walk");
+        GitReader::read_commit_history_paged(&path, 0, 10, Some("HEAD"), Some("shared.txt"))
+            .expect("HEAD walk");
+    let head_ids: Vec<&str> = head_only.iter().map(|c| c.id.as_str()).collect();
     assert!(
-        !head_only.contains(&feature_edit.id),
-        "explicit HEAD must stay a HEAD-only walk: {head_only:?}"
+        !head_ids.contains(&feature_edit.id.as_str()),
+        "explicit HEAD must stay a HEAD-only walk: {head_ids:?}"
     );
-    assert!(head_only.contains(&base_commit.id));
+    assert!(head_ids.contains(&base_commit.id.as_str()));
+}
+
+/// Regression (path-filtered graphs rendered as disconnected stubs): the graph
+/// walked ALL history and then retained only the commits that touched the
+/// path, so every survivor kept naming parents that had just been filtered
+/// out — the lane solver marked those edges dangling and a path-filtered
+/// history drew as a list of stubs. A path-limited `git log --parents`
+/// rewrites each survivor's parents to its nearest surviving ancestors, so the
+/// rows stay connected.
+#[test]
+fn path_walk_rewrites_parents_to_the_nearest_surviving_ancestor() {
+    let repo = TestRepo::init();
+    let tip = || {
+        GitReader::read_commit_history(&repo.path_str(), 1, None)
+            .expect("tip")
+            .remove(0)
+            .id
+    };
+    repo.write("f.txt", "a\n");
+    repo.commit_all("feat: A touches f");
+    let a_id = tip();
+    // B sits BETWEEN the two f.txt commits and never touches f.txt: it is the
+    // parent history simplification has to rewrite away.
+    repo.write("other.txt", "b\n");
+    repo.commit_all("chore: B touches other only");
+    let b_id = tip();
+    repo.write("f.txt", "a\nc\n");
+    repo.commit_all("feat: C touches f");
+    let c_id = tip();
+
+    let path = repo.path_str();
+    let rows =
+        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt")).expect("path walk");
+    let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![c_id.as_str(), a_id.as_str()],
+        "path walk returns exactly [C, A], newest first"
+    );
+    assert!(!ids.contains(&b_id.as_str()), "B never touched f.txt");
+    assert_eq!(
+        rows[0].parent_ids,
+        vec![a_id.clone()],
+        "C's parent must be REWRITTEN from B (dropped) to A: {:?}",
+        rows[0].parent_ids
+    );
+
+    let solved = LaneSolver::new(12).solve(&rows);
+    assert_eq!(solved.len(), 2);
+    assert_eq!(
+        solved[0].connections.len(),
+        1,
+        "C draws exactly one edge: {:?}",
+        solved[0].connections
+    );
+    assert!(
+        !solved[0].connections[0].is_dangling,
+        "C -> A must be a live edge, not a stub: {:?}",
+        solved[0].connections
+    );
+    assert_eq!(
+        solved[0].connections[0].to_row_offset, 1,
+        "the live edge lands on A's row"
+    );
+}
+
+/// Regression (same root cause, across a merge): history simplification drops
+/// a merge that is TREESAME to one parent for the filtered path, so the commit
+/// below it must be re-linked to the nearest ancestor that DID touch the path.
+/// Retaining rows from a full walk left it pointing at the dropped merge.
+#[test]
+fn path_walk_relinks_across_a_simplified_merge() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "a\n");
+    repo.commit_all("feat: A touches f");
+    run_git(repo.dir.path(), &["checkout", "-q", "-b", "feature"]);
+    repo.write("f.txt", "a\nfeature\n");
+    repo.commit_all("feat: F touches f");
+    run_git(repo.dir.path(), &["checkout", "-q", "main"]);
+    repo.write("other.txt", "m\n");
+    repo.commit_all("chore: M touches other only");
+    // The merge takes feature's f.txt verbatim, so it is TREESAME to that
+    // parent for this path and git simplifies it away.
+    run_git(
+        repo.dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge: feature", "feature"],
+    );
+    repo.write("f.txt", "a\nfeature\ntail\n");
+    repo.commit_all("feat: C touches f");
+
+    let path = repo.path_str();
+    let rows =
+        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt")).expect("path walk");
+    let summaries: Vec<&str> = rows.iter().map(|c| c.summary.as_str()).collect();
+    assert_eq!(
+        summaries,
+        vec![
+            "feat: C touches f",
+            "feat: F touches f",
+            "feat: A touches f"
+        ],
+        "the merge and the other-file commit are simplified out"
+    );
+
+    // The window holds the whole simplified history, so no rewritten parent may
+    // name a commit outside the returned set.
+    let ids: HashSet<&str> = rows.iter().map(|c| c.id.as_str()).collect();
+    for commit in &rows {
+        for parent in &commit.parent_ids {
+            assert!(
+                ids.contains(parent.as_str()),
+                "{} names parent {} outside the returned set: {summaries:?}",
+                commit.summary,
+                parent
+            );
+        }
+    }
+
+    let solved = LaneSolver::new(12).solve(&rows);
+    for row in &solved {
+        if row.parent_ids.is_empty() {
+            continue;
+        }
+        assert!(
+            row.connections.iter().any(|c| !c.is_dangling),
+            "{} must keep at least one live edge: {:?}",
+            row.summary,
+            row.connections
+        );
+    }
 }
 
 #[test]
@@ -805,8 +941,8 @@ fn test_glob_shaped_paths_match_literally() {
 
     // A widened glob would match both files' history; literal matches only
     // the star-named file's single commit.
-    let touching =
-        GitReader::commits_touching_path(&path, "weird*.txt", 10, None).expect("log pathspec");
+    let touching = GitReader::read_commit_history_paged(&path, 0, 10, None, Some("weird*.txt"))
+        .expect("log pathspec");
     assert_eq!(
         touching.len(),
         1,
@@ -847,7 +983,9 @@ fn test_reader_read_paths_refuse_symlink_escape() {
     let err = GitReader::get_file_diff(&path, "leak/secret.txt", false, false)
         .expect_err("symlink escape must fail");
     assert!(err.contains("escapes the repository"), "got: {err}");
-    assert!(GitReader::commits_touching_path(&path, "leak/secret.txt", 10, None).is_err());
+    assert!(
+        GitReader::read_commit_history_paged(&path, 0, 10, None, Some("leak/secret.txt")).is_err()
+    );
     assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
 }
 

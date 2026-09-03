@@ -20,7 +20,7 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
   import { repoStore } from "../stores/repoStore";
-  import { graphStore, serverFetchableQuery } from "../stores/graphStore";
+  import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -315,16 +315,11 @@
       if ($repoStore.currentPath !== repo) return;
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
-      // Post-mutation reload keeps the visible filter context, sanitized:
-      // a bare loadGraph(repo) reset the graph to query=""/HEAD while
-      // FilterBar still showed the selection, and a client-side query sent
-      // unsanitized would be laundered into the cached payload server-side
-      // (see serverFetchableQuery).
-      await graphStore.loadGraph(
-        repo,
-        serverFetchableQuery($filterStore.searchQuery),
-        $filterStore.selectedBranch,
-      );
+      // Post-mutation reload keeps the visible filter context: a bare
+      // loadGraph(repo) reset the graph to query=""/HEAD while FilterBar
+      // still showed the selection. The backend applies every query term,
+      // so the reload answers exactly what the scheduler keys on.
+      await graphStore.loadGraph(repo, $filterStore.searchQuery, $filterStore.selectedBranch);
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) {
         repoStore.setError(formatError(err));

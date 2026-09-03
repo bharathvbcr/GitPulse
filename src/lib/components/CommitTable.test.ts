@@ -56,6 +56,28 @@ describe("CommitTable keyboard parity for graph context", () => {
     expect(source).toContain("closeTargetById");
     expect(source).toMatch(/mergeTarget=\{closeTargetById\.get\(row\.id\)/);
   });
+
+  it("names the pinned mainline and explains fading stubs in both the card and the announcement", () => {
+    // The tooltip and the live region must say the same things: which
+    // branch the straight rail is, and that a stub means the parent is past
+    // the loaded window (with the load-more hint when older history exists).
+    // Filters never cause stubs: every term runs in the backend, which
+    // relinks survivors to their nearest kept ancestors.
+    expect(source).toContain("mainlineName={$graphStore.mainlineName}");
+    expect(source).toContain("the first-parent line");
+    expect(source).toContain("hasMore={$graphStore.hasMore}");
+    expect(source).toContain("outside the loaded history");
+    expect(source).not.toContain("hidden by the current filter");
+  });
+
+  it("renders the backend's rows as-is: no client-side re-filtering", () => {
+    // A second filter implementation on the client drifted from the
+    // backend's and dropped rows AFTER lanes were solved, leaving every
+    // survivor's edges as stubs. The payload is the view.
+    expect(source).toContain("let filteredRows = $derived($graphStore.rows);");
+    expect(source).not.toMatch(/filter\/(queryMemo|parseQuery)/);
+    expect(source).not.toContain("createRowFilterMemo");
+  });
 });
 
 describe("CommitTable graph horizontal overflow", () => {
