@@ -2296,12 +2296,19 @@ mod tests {
         validate_manvi_paths(&repo, &ok, ManviActionKind::CoverageGenerator)
             .expect("a repository-relative exclusion must validate");
 
-        let mut escapes = vec![
-            "--ignore=/etc/passwd".to_string(),
-            "--ignore=../outside.py".to_string(),
-        ];
+        // Built by chaining rather than pushing under `#[cfg]`: a `mut` binding
+        // that is only mutated on one platform is an `unused_mut` error on the
+        // other, and `-D warnings` makes that a build failure.
         #[cfg(unix)]
-        escapes.push("--ignore=bench-link/stress_test.py".to_string());
+        let symlinked: &[&str] = &["--ignore=bench-link/stress_test.py"];
+        #[cfg(not(unix))]
+        let symlinked: &[&str] = &[];
+
+        let escapes: Vec<String> = ["--ignore=/etc/passwd", "--ignore=../outside.py"]
+            .iter()
+            .chain(symlinked.iter())
+            .map(|s| (*s).to_string())
+            .collect();
 
         for escaping in escapes {
             let argv: Vec<String> = vec!["pytest".into(), escaping.clone()];
