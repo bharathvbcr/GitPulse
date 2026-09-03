@@ -86,7 +86,12 @@
     </span>
   </div>
 {:else}
-  <div class="flex-1 flex items-center justify-center font-sans text-[11px] text-textMuted">
+  <div
+    class="flex-1 flex items-center justify-center font-sans text-[11px] text-textMuted"
+    role="status"
+    aria-busy="true"
+    aria-label="Loading {name}"
+  >
     Loading {name}…
   </div>
 {/if}

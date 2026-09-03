@@ -10,7 +10,7 @@ import LazyView from "./LazyView.svelte";
 describe("LazyView (server render)", () => {
   it("renders an accessible pending state before the chunk resolves", () => {
     const { body } = render(LazyView, {
-      props: { load: () => Promise.resolve({ default: (() => {}) as never }), label: "Coverage" },
+      props: { load: () => Promise.resolve({ default: (() => {}) as never }), name: "Coverage" },
     });
     expect(body).toContain('aria-label="Loading Coverage"');
     expect(body).toContain('aria-busy="true"');
@@ -18,7 +18,7 @@ describe("LazyView (server render)", () => {
 
   it("labels the pending state per view", () => {
     const { body } = render(LazyView, {
-      props: { load: () => Promise.resolve({ default: (() => {}) as never }), label: "MANVI" },
+      props: { load: () => Promise.resolve({ default: (() => {}) as never }), name: "MANVI" },
     });
     expect(body).toContain('aria-label="Loading MANVI"');
   });
