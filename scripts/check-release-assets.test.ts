@@ -97,23 +97,39 @@ describe("release asset completeness contract", () => {
   });
 
   it("accepts the real payload gh produced for v0.0.2", () => {
-    // scripts/fixtures/gh-release-view.json is `gh release view --json assets`
-    // for the only release this project has published — the exact command
-    // release.yml runs — with per-account noise (urls, ids, download counts)
-    // dropped and every other field kept verbatim.
+    // scripts/fixtures/gh-release-view-v1.json is `gh release view --json
+    // assets` for a real release — the exact command release.yml runs — with
+    // per-account noise (urls, ids, download counts) dropped and every other
+    // field kept verbatim.
     //
     // This checker runs only on a `v*` tag, so a wrong expectation here would
-    // surface at release time after the whole matrix had built. The hardcoded
-    // manifest was compared against that release: all seven names match.
+    // surface at release time after the whole matrix had built. That is exactly
+    // what happened when `tauri-apps/tauri-action` went v0 -> v1 and started
+    // versioning the macOS updater archive.
+    const payload = readFileSync(
+      new URL("./fixtures/gh-release-view-v1.json", import.meta.url),
+      "utf8",
+    );
+    const result = inspectReleaseAssets({ tag: "v0.0.3", json: payload });
+    expect(result.violations).toEqual([]);
+    expect(result.invalid).toBe(false);
+    expect(result.ok).toBe(true);
+    expect(result.actual).toEqual(expectedAssetNames("0.0.3"));
+  });
+
+  it("rejects the pre-v1 archive name, so the rename cannot silently come back", () => {
+    // The v0.0.2 payload is kept verbatim: under `tauri-action@v0` the macOS
+    // updater archive carried no version. It is a real payload that this
+    // manifest must now refuse, which is what proves the manifest tracks the
+    // action's naming rather than accepting whatever shows up.
     const payload = readFileSync(
       new URL("./fixtures/gh-release-view.json", import.meta.url),
       "utf8",
     );
     const result = inspectReleaseAssets({ tag: "v0.0.2", json: payload });
-    expect(result.violations).toEqual([]);
-    expect(result.invalid).toBe(false);
-    expect(result.ok).toBe(true);
-    expect(result.actual).toEqual(expectedAssetNames("0.0.2"));
+    expect(result.ok).toBe(false);
+    expect(result.violations).toContain("missing: GitPulse_0.0.2_universal.app.tar.gz");
+    expect(result.violations).toContain("unexpected: GitPulse_universal.app.tar.gz");
   });
 
   it("notices if a platform silently stops producing an installer", () => {

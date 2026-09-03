@@ -1,0 +1,60 @@
+{
+  "assets": [
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:25:08Z",
+      "name": "GitPulse-0.0.3-1.x86_64.rpm",
+      "size": 12206966,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:25:09Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:25:09Z",
+      "name": "GitPulse_0.0.3_amd64.AppImage",
+      "size": 88775160,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:25:13Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:25:06Z",
+      "name": "GitPulse_0.0.3_amd64.deb",
+      "size": 12207678,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:25:07Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:30:54Z",
+      "name": "GitPulse_0.0.3_universal.app.tar.gz",
+      "size": 21979582,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:30:56Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:30:53Z",
+      "name": "GitPulse_0.0.3_universal.dmg",
+      "size": 23208086,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:30:54Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:27:02Z",
+      "name": "GitPulse_0.0.3_x64-setup.exe",
+      "size": 6332919,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:27:03Z"
+    },
+    {
+      "contentType": "application/zip",
+      "createdAt": "2026-09-03T15:27:01Z",
+      "name": "GitPulse_0.0.3_x64_en-US.msi",
+      "size": 10436608,
+      "state": "uploaded",
+      "updatedAt": "2026-09-03T15:27:02Z"
+    }
+  ]
+}

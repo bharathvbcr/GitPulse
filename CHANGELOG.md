@@ -170,6 +170,10 @@ before that tag is pushed.
 
 ### Fixed
 
+- Release asset manifest updated for `tauri-action@v1`, which versions the
+  macOS updater archive (`GitPulse_0.0.3_universal.app.tar.gz`) where v0
+  emitted it bare. All three build jobs were green and had uploaded a
+  complete set, so the manifest check was the only thing that noticed.
 - The Windows Rust jobs had never compiled. `Rust Cargo Clippy` and
   `Rust Unit & Integration Tests` sat behind the Vitest step that failed
   first, so a step that never ran had been reading as a step that passed.

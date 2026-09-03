@@ -19,6 +19,12 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
  * These are the seven artifacts emitted by the current three-runner matrix:
  * macOS DMG and app archive, Linux RPM/AppImage/deb, and Windows MSI/NSIS.
  *
+ * The macOS updater archive carries the version like every other asset.
+ * `tauri-action@v0` emitted it unversioned; v1 does not, and this manifest
+ * caught the rename on the first release built with v1 — which is what it is
+ * for: the three build jobs were green and had uploaded a complete set, so
+ * nothing else would have noticed the name change.
+ *
  * @param {string} version
  * @returns {string[]}
  */
@@ -30,7 +36,7 @@ export function expectedAssetNames(version) {
     `GitPulse_${version}_universal.dmg`,
     `GitPulse_${version}_x64-setup.exe`,
     `GitPulse_${version}_x64_en-US.msi`,
-    "GitPulse_universal.app.tar.gz",
+    `GitPulse_${version}_universal.app.tar.gz`,
   ].sort();
 }
 
