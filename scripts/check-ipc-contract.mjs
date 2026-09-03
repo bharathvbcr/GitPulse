@@ -29,6 +29,20 @@ import { alignRows } from "./columns.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Repository-relative path in slash form on every platform.
+ *
+ * These paths are not used to open anything — they are the file references in
+ * the violation lines and the report, and one of them is asserted on. Left as
+ * `path.relative` output they arrive back-slashed on Windows, which changed
+ * both the report's shape and the contract test's expectation there.
+ *
+ * @param {string} target @returns {string}
+ */
+function repoRelative(target) {
+  return path.relative(REPO_ROOT, target).split(path.sep).join("/");
+}
 export const DEFAULT_LIB_RS = path.join(REPO_ROOT, "src-tauri", "src", "lib.rs");
 export const DEFAULT_SRC_DIR = path.join(REPO_ROOT, "src");
 
@@ -163,7 +177,7 @@ export function scanAnnotatedCommands(roots) {
           );
           if (match) {
             if (!found.has(match[1])) {
-              found.set(match[1], { file: path.relative(REPO_ROOT, full), line: ahead + 1 });
+              found.set(match[1], { file: repoRelative(full), line: ahead + 1 });
             }
             break;
           }
@@ -382,7 +396,7 @@ export function scanInvokeCallSites(files) {
 
   for (const file of files) {
     const content = readFileSync(file, "utf8");
-    const relFile = path.relative(REPO_ROOT, file);
+    const relFile = repoRelative(file);
     // Offset-preserving, so line numbers derived from match indexes remain
     // exact against the original file.
     const callable = blankGenericParameters(content);
@@ -490,7 +504,7 @@ export function runContractCheck({ libPath, srcDirs }) {
   for (const name of orphans) {
     const site = registered.get(name);
     violations.push(
-      `orphan: "${name}" is registered (${path.relative(REPO_ROOT, libPath)}:${site?.line}) but no frontend caller exists`,
+      `orphan: "${name}" is registered (${repoRelative(libPath)}:${site?.line}) but no frontend caller exists`,
     );
   }
   for (const name of staleAllowlist) {
@@ -655,7 +669,7 @@ export function main(argv = process.argv.slice(2)) {
   // A1: --json emits the result object the checker already built and
   // suppresses the text report. Exit codes are identical in both modes.
   if (opts.json) console.log(JSON.stringify(result, null, 2));
-  else console.log(formatReport(result, path.relative(REPO_ROOT, opts.libPath)));
+  else console.log(formatReport(result, repoRelative(opts.libPath)));
   if (!result.ok) {
     return 1;
   }

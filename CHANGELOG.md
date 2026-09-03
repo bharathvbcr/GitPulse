@@ -31,6 +31,19 @@ before that tag is pushed.
 - The card's commit count and its active-day count now come from one
   population. With an author filter applied it previously paired the whole
   scan's commit total with that one author's active days.
+- Windows CI: three `scripts/*.test.ts` suites failed there only. Two used a
+  `file:` URL's `pathname` as a filesystem path, which is "/D:/a/repo/..." on
+  Windows — one threw ENOENT on a doubled drive letter, the other silently
+  scanned nothing and asserted against an empty list. The third compared a
+  `path.relative` result against a slash-separated expectation. Repo-relative
+  paths in the IPC contract report are now slash-form on every platform, and
+  `portable-paths.contract` fails the build if the `pathname` shape returns.
+- macOS CI: the grandchild-holding-pipes regression test budgeted 8s for a
+  span that is two `DRAIN_JOIN_GRACE` windows plus `spawn_gate()` queueing,
+  which parks with no timeout and is unbounded under the parallel harness. It
+  took 8.9s on the runner. The budget is now expressed in terms of the grace
+  constant plus a scheduling allowance, still far below the 30s that would
+  mean the hang it guards against had returned.
 
 ## [0.0.3] - 2026-09-02
 

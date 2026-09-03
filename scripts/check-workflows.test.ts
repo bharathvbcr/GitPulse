@@ -1,9 +1,12 @@
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { INSTALL_HINT, interpret, workflowFiles } from "./check-workflows.mjs";
 
 describe("check:workflows", () => {
   it("finds the repository's workflow files", () => {
-    const files = workflowFiles(new URL("../.github/workflows", import.meta.url).pathname);
+    // `fileURLToPath`, never `URL.pathname`: on Windows the latter yields
+    // "/D:/a/..." and every fs call against it misses or doubles the drive.
+    const files = workflowFiles(fileURLToPath(new URL("../.github/workflows", import.meta.url)));
     expect(files).toContain("ci.yml");
     expect(files).toContain("coverage.yml");
     expect(files).toContain("release.yml");

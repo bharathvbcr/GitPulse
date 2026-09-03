@@ -2452,9 +2452,18 @@ mod tests {
         cmd.args(["-c", "sleep 30 & exit 0"]);
         let out = run_bounded(cmd, "sh", Duration::from_secs(5), None).expect("run");
         assert!(out.success);
+        // The measured span is one `DRAIN_JOIN_GRACE` per pipe (the success
+        // path gives stdout and stderr a window each) plus `spawn_gate()`
+        // queueing, which parks on a condvar with no timeout and is therefore
+        // unbounded whenever the parallel test harness has the gate saturated.
+        // On a loaded macOS runner that queueing alone pushed this past an 8s
+        // budget. What the assertion defends is that the call does not wait
+        // out the 30s grandchild, so the budget stays far below it — the same
+        // tolerance the sibling timeout test already carries.
+        let budget = DRAIN_JOIN_GRACE * 2 + Duration::from_secs(10);
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "drain collection must be grace-bounded, took {:?}",
+            started.elapsed() < budget,
+            "drain collection must be grace-bounded (budget {budget:?}), took {:?}",
             started.elapsed()
         );
         // The status is trustworthy; the output is not. EOF never came, so
@@ -2484,7 +2493,7 @@ mod tests {
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
             started.elapsed() < Duration::from_secs(15),
-            "timeout handling must stay bounded (grace is 2s per pipe), took {:?}",
+            "timeout handling must stay bounded (one shared grace window), took {:?}",
             started.elapsed()
         );
     }

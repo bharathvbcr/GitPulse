@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FAIL_VERDICTS, PASS_VERDICTS } from "../src/lib/provenance/badge";
 
@@ -20,7 +21,9 @@ import { FAIL_VERDICTS, PASS_VERDICTS } from "../src/lib/provenance/badge";
  * unreadable writer is exactly the case where a hand-maintained list would
  * quietly stop covering anything.
  */
-const RUST_ROOT = new URL("../src-tauri/src/", import.meta.url).pathname;
+// `fileURLToPath`, never `URL.pathname`: on Windows the latter yields
+// "/D:/a/..." and joining it back onto a path produces "D:\D:\a\...".
+const RUST_ROOT = fileURLToPath(new URL("../src-tauri/src/", import.meta.url));
 const KNOWN = new Set([...PASS_VERDICTS, ...FAIL_VERDICTS]);
 
 function rustFiles(dir: string): string[] {
@@ -57,7 +60,12 @@ function findWriters(): Writer[] {
       const body = match[1];
       const verdict = /(?:^|\n)\s*verdict:\s*([^,\n]+)/.exec(body);
       if (!verdict) continue;
-      writers.push({ file: file.slice(RUST_ROOT.length), expression: verdict[1].trim() });
+      // Slash-separated so writer identity — which names test cases and is
+      // asserted on below — does not change shape between platforms.
+      writers.push({
+        file: relative(RUST_ROOT, file).split(sep).join("/"),
+        expression: verdict[1].trim(),
+      });
     }
   }
   return writers;
