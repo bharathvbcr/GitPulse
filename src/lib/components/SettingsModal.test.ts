@@ -1,6 +1,14 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import SettingsModal from "./SettingsModal.svelte";
+
+const source = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "SettingsModal.svelte"),
+  "utf8",
+);
 
 describe("SettingsModal", () => {
   it("renders nothing while closed", () => {
@@ -65,5 +73,21 @@ describe("SettingsModal automatic coverage toggle", () => {
     expect(section).toContain("Off by default");
     expect(section).toContain("writes coverage artifacts into the working tree");
     expect(section).toContain("never reported as a clean result");
+  });
+});
+
+describe("SettingsModal MCP / Agent Plugins", () => {
+  it("names the MCP 2.0 and Agent Plugins 1.0 installer surface", () => {
+    const { body } = render(SettingsModal, { props: { isOpen: true } });
+    expect(body).toContain("Agents (MCP 2.0)");
+    expect(body).toContain("Agent Plugins 1.0");
+    expect(body).toContain("read-only");
+  });
+
+  it("loads installer facts through cmd_mcp_info rather than guessing a path", () => {
+    expect(source).toContain("getMcpInfo");
+    expect(source).toContain("plugin.json");
+    expect(source).toContain("mcp.json");
+    expect(source).toContain("gitpulse_insights");
   });
 });

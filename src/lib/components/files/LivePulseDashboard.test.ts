@@ -46,4 +46,8 @@ describe("LivePulseDashboard", () => {
     expect(source).toContain("language={detectedLang.name}");
     expect(source).toContain("filePath={s.path}");
   });
+
+  it("does not constrain the Active Changes list to a fixed small height window", () => {
+    expect(source).not.toContain("max-h-64");
+  });
 });

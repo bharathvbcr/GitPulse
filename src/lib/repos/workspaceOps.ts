@@ -22,6 +22,8 @@
  * counterpart rather than a second, divergent convention.
  */
 
+import { mapWithConcurrency } from "../async/pool";
+
 /** One repository a run will visit. */
 export interface RepoTarget {
   /** Absolute repository path — the identity the backend takes. */
@@ -134,66 +136,60 @@ export async function runAcrossRepos(
   const bounded = Number.isFinite(requested) ? Math.floor(requested as number) : DEFAULT_BULK_CONCURRENCY;
   const concurrency = Math.max(1, Math.min(bounded, deduped.length || 1));
 
-  let nextIndex = 0;
   let done = 0;
   let cancelled = false;
 
-  async function worker(): Promise<void> {
-    for (;;) {
-      const index = nextIndex;
-      if (index >= deduped.length) return;
-      nextIndex += 1;
-      const target = deduped[index];
+  // One canonical bounded-fan-out loop, shared with every other IPC fan-out
+  // in the app; this function keeps only the per-repository reporting.
+  await mapWithConcurrency(deduped.length, concurrency, async (index) => {
+    const target = deduped[index];
 
-      // Cancellation is checked per repository rather than mid-task: a
-      // half-finished fetch cannot be un-run, and reporting one as "skipped"
-      // would be a lie about the repository's state.
-      if (signal?.aborted) {
-        cancelled = true;
+    // Cancellation is checked per repository rather than mid-task: a
+    // half-finished fetch cannot be un-run, and reporting one as "skipped"
+    // would be a lie about the repository's state.
+    if (signal?.aborted) {
+      cancelled = true;
+      results[index] = {
+        path: target.path,
+        label: target.label,
+        status: "skipped",
+        reason: "Cancelled before this repository was reached.",
+        durationMs: 0,
+      };
+    } else {
+      const taskStart = now();
+      try {
+        const outcome = await task(target);
+        const durationMs = Math.max(0, now() - taskStart);
+        results[index] =
+          outcome && typeof outcome === "object" && "skip" in outcome
+            ? {
+                path: target.path,
+                label: target.label,
+                status: "skipped",
+                reason: outcome.skip,
+                durationMs: 0,
+              }
+            : {
+                path: target.path,
+                label: target.label,
+                status: "ok",
+                durationMs,
+              };
+      } catch (err: unknown) {
         results[index] = {
           path: target.path,
           label: target.label,
-          status: "skipped",
-          reason: "Cancelled before this repository was reached.",
-          durationMs: 0,
+          status: "failed",
+          error: messageOf(err),
+          durationMs: Math.max(0, now() - taskStart),
         };
-      } else {
-        const taskStart = now();
-        try {
-          const outcome = await task(target);
-          const durationMs = Math.max(0, now() - taskStart);
-          results[index] =
-            outcome && typeof outcome === "object" && "skip" in outcome
-              ? {
-                  path: target.path,
-                  label: target.label,
-                  status: "skipped",
-                  reason: outcome.skip,
-                  durationMs: 0,
-                }
-              : {
-                  path: target.path,
-                  label: target.label,
-                  status: "ok",
-                  durationMs,
-                };
-        } catch (err: unknown) {
-          results[index] = {
-            path: target.path,
-            label: target.label,
-            status: "failed",
-            error: messageOf(err),
-            durationMs: Math.max(0, now() - taskStart),
-          };
-        }
       }
-
-      done += 1;
-      options.onProgress?.(done, deduped.length, results[index]);
     }
-  }
 
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    done += 1;
+    options.onProgress?.(done, deduped.length, results[index]);
+  });
 
   const settled = results.filter(Boolean);
   return {

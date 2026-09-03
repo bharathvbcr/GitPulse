@@ -4,21 +4,24 @@ import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
 import { appVersion } from "./scripts/app-version.mjs";
 
 /**
- * Entry-chunk ceiling. Vendor runtimes (svelte, xterm, lucide, tauri) are split
- * out by `gitpulseManualChunk`, so this bounds FIRST-PARTY application code
- * only — its job is to catch a dependency accidentally landing in the entry
- * chunk, which shows up as a jump of tens of kilobytes, not as steady growth.
+ * Entry-chunk ceiling. Two things are kept out of the entry chunk, so this
+ * bounds the app shell plus the eager `work` views and nothing else:
+ *   - vendor runtimes (svelte, xterm, lucide, tauri) via `gitpulseManualChunk`
+ *   - every `inspect`/`more` view, via the dynamic imports in
+ *     lib/views/viewLoaders.ts
  *
- * Measured at 754 KB after the diff file rail; 720 KB after the Work view and
- * provenance badges; 708 KB before
- * them; 692 KB after the control-plane Phase 4 agent launcher and grants pass;
- * 680 KB after the repository-surface pass; 656 KB before it, 648 KB before
- * the parked-operation work. Growth is first-party: across all of these the
- * vendor chunks are unchanged except `vendor-icons`, which moved 158.5 → 159.9
- * KB for two new lucide glyphs. The rail added three more glyphs and left
- * every other vendor chunk byte-identical. That comparison is the check to run before
- * raising this again — a jump with vendor chunks unchanged is app code, a jump
- * with them changed is a dependency that leaked into the entry chunk.
+ * Measured at 558 KB with that split in place. The trajectory before it, when
+ * every view was statically imported, was 648 → 656 → 680 → 692 → 708 → 720 →
+ * 754 KB, reaching 813 KB once the Pulse view landed — which is what forced
+ * the split rather than another raise. Splitting the inspect/more groups
+ * returned 249 KB, so a view-shaped addition now costs nothing here.
+ *
+ * Before raising this, run the two checks that tell you what actually grew:
+ *   - vendor chunks unchanged ⇒ the growth is first-party app code
+ *   - vendor chunks changed  ⇒ a dependency leaked into the entry chunk
+ * If the growth is a new view, split it in viewLoaders.ts instead — the
+ * contract test in lib/views/viewLoaders.test.ts already requires that for
+ * anything outside the `work` group.
  */
 const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
 

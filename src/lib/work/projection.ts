@@ -22,6 +22,7 @@ import type { WorktreeInfo } from "../branches/types";
 import type { PullRequestInfo, WorkflowRunInfo } from "../github/types";
 import type { PolicyStatus } from "../stores/harnessStore";
 import type { RepoOperation } from "../repos/operation";
+import { agentKindsOn, isAgentWorktree } from "./agentWorktree";
 
 /** Whether one source could be consulted, and why not when it could not. */
 export interface WorkSourceState {
@@ -395,6 +396,53 @@ export function noteworthyStatuses(tally: VerdictTally): [PolicyStatus, number][
     s,
     tally.byStatus[s],
   ]);
+}
+
+/** Counts the Work view can show without another IPC round trip. */
+export interface WorkInsightSummary {
+  worktrees: number;
+  agentSessions: number;
+  agentKinds: string[];
+  dirtyWorktrees: number;
+  blocked: number;
+  pullRequests: number;
+  unscannedDirty: number;
+}
+
+/**
+ * Instant strip above the rows: derived from the join, not a second fetch.
+ *
+ * Collision files are not here — the projection only has dirty *counts* —
+ * so overlapping paths come from `cmd_collision_risk` and must not be
+ * implied from these numbers.
+ */
+export function insightSummary(projection: WorkProjection): WorkInsightSummary {
+  let worktrees = 0;
+  let dirtyWorktrees = 0;
+  let unscannedDirty = 0;
+  let blocked = 0;
+  let pullRequests = 0;
+  const paths: string[] = [];
+  for (const row of projection.rows) {
+    pullRequests += row.pullRequests.length;
+    if (row.operation) blocked += 1;
+    for (const binding of row.worktrees) {
+      worktrees += 1;
+      paths.push(binding.worktree.path);
+      const dirty = binding.worktree.dirty_files;
+      if (dirty === null || dirty === undefined) unscannedDirty += 1;
+      else if (dirty > 0) dirtyWorktrees += 1;
+    }
+  }
+  return {
+    worktrees,
+    agentSessions: paths.filter((path) => isAgentWorktree(path)).length,
+    agentKinds: agentKindsOn(paths),
+    dirtyWorktrees,
+    blocked,
+    pullRequests,
+    unscannedDirty,
+  };
 }
 
 /** One sentence naming what could not be read, or empty when all of it could. */

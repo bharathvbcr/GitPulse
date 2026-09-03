@@ -154,6 +154,12 @@ describe("HealthPanel error-state separation (regression)", () => {
     expect(source).not.toMatch(/severity === "(critical|high|medium)"/);
   });
 
+  it("does not treat a failed dead-code check as an empty clean graph", () => {
+    expect(source).toContain("Dead-code check could not run");
+    expect(source).toContain("No unreferenced symbols in the indexed graph");
+    expect(source).toContain("not stored — not that it is zero");
+  });
+
   it("discloses capped section counts instead of showing only what survived", () => {
     expect(source).toContain("observedTotal(");
     // Both bounded sections must headline the observed total, not just the

@@ -29,12 +29,6 @@
   import FileViewer from "./lib/components/FileViewer.svelte";
   import DiffViewer from "./lib/components/DiffViewer.svelte";
   import ConflictEditor from "./lib/components/ConflictEditor.svelte";
-  import BlameViewer from "./lib/components/BlameViewer.svelte";
-  import CoverageViewer from "./lib/components/CoverageViewer.svelte";
-  import HealthPanel from "./lib/components/HealthPanel.svelte";
-  import StoragePanel from "./lib/components/StoragePanel.svelte";
-  import TerminalPanel from "./lib/components/TerminalPanel.svelte";
-  import CodeStackViewer from "./lib/components/CodeStackViewer.svelte";
   import LanguageBar from "./lib/components/LanguageBar.svelte";
   import FilterBar from "./lib/components/FilterBar.svelte";
   import {
@@ -54,10 +48,9 @@
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import GitHubPanel from "./lib/components/GitHubPanel.svelte";
-  import ManviOpsPanel from "./lib/components/ManviOpsPanel.svelte";
-  import ReflogViewer from "./lib/components/ReflogViewer.svelte";
   import WorkView from "./lib/components/WorkView.svelte";
+  import LazyView from "./lib/components/LazyView.svelte";
+  import { LAZY_VIEW_LOADERS } from "./lib/views/viewLoaders";
   import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -196,6 +189,12 @@
     };
     window.addEventListener("gitpulse:shortcuts", openShortcuts);
     track(() => window.removeEventListener("gitpulse:shortcuts", openShortcuts));
+
+    const openSettings = () => {
+      isSettingsModalOpen = true;
+    };
+    window.addEventListener("gitpulse:settings", openSettings);
+    track(() => window.removeEventListener("gitpulse:settings", openSettings));
 
     const handleGlobalKeydown = (e: KeyboardEvent) => {
       const isInput =
@@ -605,21 +604,23 @@
               {:else if $repoStore.activeTab === "conflict"}
                 <ConflictEditor />
               {:else if $repoStore.activeTab === "blame"}
-                <BlameViewer />
+                <LazyView load={LAZY_VIEW_LOADERS.blame} label="Blame" />
               {:else if $repoStore.activeTab === "coverage"}
-                <CoverageViewer />
+                <LazyView load={LAZY_VIEW_LOADERS.coverage} label="Coverage" />
               {:else if $repoStore.activeTab === "health"}
-                <HealthPanel />
+                <LazyView load={LAZY_VIEW_LOADERS.health} label="Health" />
               {:else if $repoStore.activeTab === "storage"}
-                <StoragePanel />
+                <LazyView load={LAZY_VIEW_LOADERS.storage} label="Storage" />
               {:else if $repoStore.activeTab === "stack"}
-                <CodeStackViewer />
+                <LazyView load={LAZY_VIEW_LOADERS.stack} label="Stack" />
+              {:else if $repoStore.activeTab === "pulse"}
+                <LazyView load={LAZY_VIEW_LOADERS.pulse} label="Pulse" />
               {:else if $repoStore.activeTab === "github"}
-                <GitHubPanel />
+                <LazyView load={LAZY_VIEW_LOADERS.github} label="GitHub" />
               {:else if $repoStore.activeTab === "manvi"}
-                <ManviOpsPanel />
+                <LazyView load={LAZY_VIEW_LOADERS.manvi} label="MANVI" />
               {:else if $repoStore.activeTab === "reflog"}
-                <ReflogViewer />
+                <LazyView load={LAZY_VIEW_LOADERS.reflog} label="Reflog" />
               {/if}
             </div>
           </main>
@@ -629,7 +630,7 @@
                survives; display:none pauses rendering, not the process. -->
           <svelte:boundary failed={paneFailed}>
             <div class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={!terminalActive}>
-              <TerminalPanel />
+              <LazyView load={LAZY_VIEW_LOADERS.terminal} label="Terminal" />
             </div>
           </svelte:boundary>
         {/if}

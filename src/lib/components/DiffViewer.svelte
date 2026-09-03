@@ -111,8 +111,14 @@
   });
 
   let allLines = $derived(parseCache.parse($repoStore.selectedDiff));
-  let truncatedSource = $derived(allLines.length > MAX_RENDER_LINES);
-  let lines = $derived(truncatedSource ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
+  // Two independent cuts, one meaning. The backend caps what it reads at its
+  // payload budget; this view caps what it renders. Either one makes the rows
+  // on screen a prefix, and every consequence — the notice, the staging
+  // lockout — follows from that fact rather than from which cut caused it.
+  let cutByBackend = $derived($repoStore.selectedDiffTruncated);
+  let cutByRenderer = $derived(allLines.length > MAX_RENDER_LINES);
+  let truncatedSource = $derived(cutByBackend || cutByRenderer);
+  let lines = $derived(cutByRenderer ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
   // Only add/del/ctx rows are diff lines: hdr/meta/binary are chrome, so the
   // "N lines" stat means what a diff reader expects it to mean (and an empty
   // parse — no rows at all — reaches the EmptyState branch).
@@ -715,7 +721,16 @@
   {#if truncatedSource}
     <div class="mx-3 mt-2 px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-600 dark:text-amber-300 font-sans flex gap-2 {wrapping ? 'items-start' : 'items-center'} shrink-0">
       <span>⚠</span>
-      <span>Diff exceeds {MAX_RENDER_LINES.toLocaleString()} lines — showing the first {MAX_RENDER_LINES.toLocaleString()}. Use the filter bar or open specific files instead of one massive commit.</span>
+      <span>
+        {#if cutByBackend}
+          This diff is larger than GitPulse reads in one go — showing the first
+          {contentLineCount.toLocaleString()} lines. Open individual files from the
+          rail to see the rest. Staging is disabled here because a partial diff
+          would stage less than these rows show.
+        {:else}
+          Diff exceeds {MAX_RENDER_LINES.toLocaleString()} lines — showing the first {MAX_RENDER_LINES.toLocaleString()}. Use the filter bar or open specific files instead of one massive commit.
+        {/if}
+      </span>
     </div>
   {/if}
 

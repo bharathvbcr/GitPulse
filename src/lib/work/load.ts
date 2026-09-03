@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
+import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
 import type { GrantView, Grant } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
@@ -159,12 +160,13 @@ export async function loadWork(
         `only the first ${MAX_OPERATION_PROBES} of ${candidates.length} worktrees were probed for parked operations`,
       );
     }
-    const parked = await Promise.all(
-      probes.map((w) =>
-        call<RepoOperation | null>("cmd_repo_operation", { repoPath: w.path }).then(
-          (v) => ({ path: w.path, operation: v, ok: true as const }),
-          (e) => ({ path: w.path, operation: null, ok: false as const, detail: formatError(e) }),
-        ),
+    // Bounded rather than all at once: every probe spawns git, and 32 of them
+    // in the same instant is a share of the descriptor budget this view has no
+    // claim to — see `async/pool`.
+    const parked = await mapItems(probes, DEFAULT_FAN_OUT, (w) =>
+      call<RepoOperation | null>("cmd_repo_operation", { repoPath: w.path }).then(
+        (v) => ({ path: w.path, operation: v, ok: true as const }),
+        (e) => ({ path: w.path, operation: null, ok: false as const, detail: formatError(e) }),
       ),
     );
     const operations: Record<string, RepoOperation | null> = {};
@@ -230,21 +232,19 @@ export async function loadWork(
   if (input.worktrees && input.worktrees.length > 0) {
     const looked = input.worktrees.slice(0, MAX_BINDING_LOOKUPS);
     const bindings: Record<string, string> = {};
-    await Promise.all(
-      looked.map(async (worktree) => {
-        try {
-          const taskId = await call<string | null>("cmd_worktree_task", {
-            repoPath,
-            worktreePath: worktree.path,
-          });
-          if (taskId) bindings[worktree.path] = taskId;
-        } catch {
-          // One unreadable binding is not a reason to lose the other rows;
-          // the worktree simply appears unbound, which the degraded flag below
-          // covers when it was the cap rather than the data.
-        }
-      }),
-    );
+    await mapItems(looked, DEFAULT_FAN_OUT, async (worktree) => {
+      try {
+        const taskId = await call<string | null>("cmd_worktree_task", {
+          repoPath,
+          worktreePath: worktree.path,
+        });
+        if (taskId) bindings[worktree.path] = taskId;
+      } catch {
+        // One unreadable binding is not a reason to lose the other rows;
+        // the worktree simply appears unbound, which the degraded flag below
+        // covers when it was the cap rather than the data.
+      }
+    });
     input.bindings = bindings;
     if (input.worktrees.length > looked.length) {
       sources.worktrees = noteFailure(
@@ -262,16 +262,14 @@ export async function loadWork(
   );
   if (taskIds.length > 0) {
     const titles: Record<string, string> = {};
-    await Promise.all(
-      taskIds.map(async (taskId) => {
-        try {
-          const scope = await call<TaskScope | null>("cmd_task_scope", { repoPath, taskId });
-          if (scope?.title) titles[taskId] = scope.title;
-        } catch {
-          // A missing title is cosmetic: the row is identified by its id.
-        }
-      }),
-    );
+    await mapItems(taskIds, DEFAULT_FAN_OUT, async (taskId) => {
+      try {
+        const scope = await call<TaskScope | null>("cmd_task_scope", { repoPath, taskId });
+        if (scope?.title) titles[taskId] = scope.title;
+      } catch {
+        // A missing title is cosmetic: the row is identified by its id.
+      }
+    });
     input.titles = titles;
   }
 

@@ -302,7 +302,7 @@
           <span class="text-[10px] text-textMuted">No pending or uncommitted modifications</span>
         </div>
       {:else}
-        <div class="space-y-1.5 max-h-64 overflow-y-auto gp-scroll pr-0.5">
+        <div class="space-y-1.5 pr-0.5">
           {#each statuses as s}
             {@const isSelected = selectedFile === s.path}
             {@const kind = classifyFileChange(s)}

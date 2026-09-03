@@ -115,4 +115,22 @@ describe("WorkView", () => {
     expect(source).toContain("$repoStore.generation");
     expect(source).toContain("previousGeneration");
   });
+
+  it("shows an insights strip derived from the projection, not a second guess", () => {
+    expect(source).toContain("insightSummary(projection)");
+    expect(source).toContain("Agent sessions");
+    expect(source).toContain("unscanned");
+  });
+
+  it("never treats a failed collision scan as no overlap", () => {
+    expect(source).toContain("getCollisionRisk");
+    expect(source).toContain("Could not check overlapping files");
+    expect(source).toContain("Absence of a list is not");
+  });
+
+  it("offers MCP setup without sending the reader to a system they may not run", () => {
+    expect(source).toContain("gitpulse:settings");
+    expect(source).toContain("Connect an agent");
+    expect(source).toContain("gitpulse_insights");
+  });
 });

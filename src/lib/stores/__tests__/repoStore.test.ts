@@ -165,8 +165,10 @@ function makeInvoke(overrides: Partial<Record<string, InvokeFn>> = {}): InvokeFn
     if (cmd === "cmd_watch_repo") return String(args?.repoPath) as never;
     if (cmd === "cmd_unwatch_repo") return undefined as never;
     if (cmd === "cmd_set_recent_menu") return undefined as never;
-    if (cmd === "cmd_get_file_diff") return `diff ${args?.filePath}` as never;
-    if (cmd === "cmd_get_commit_diff") return `commit ${args?.commitId}` as never;
+    if (cmd === "cmd_get_file_diff")
+      return { text: `diff ${args?.filePath}`, truncated: false } as never;
+    if (cmd === "cmd_get_commit_diff")
+      return { text: `commit ${args?.commitId}`, truncated: false } as never;
     throw new Error(`unexpected command ${cmd}`);
   };
   return invokeFn;
@@ -1177,9 +1179,12 @@ describe("repoStore diff selection", () => {
     const invoke = makeInvoke({
       cmd_get_commit_file_diff: async (_cmd, args) => {
         if (args?.filePath === "src/b.ts") {
-          return "diff --git a/src/b.ts b/src/b.ts\n--- a/src/b.ts\n+++ b/src/b.ts\n@@ -1 +1 @@\n-beta\n+BETA" as never;
+          return {
+            text: "diff --git a/src/b.ts b/src/b.ts\n--- a/src/b.ts\n+++ b/src/b.ts\n@@ -1 +1 @@\n-beta\n+BETA",
+            truncated: false,
+          } as never;
         }
-        return "" as never;
+        return { text: "", truncated: false } as never;
       },
     });
     const { store } = makeStore(invoke);
@@ -1214,7 +1219,7 @@ describe("repoStore diff selection", () => {
       cmd_get_file_diff: async (_cmd, args) => {
         call += 1;
         if (String(args?.filePath) === "slow.txt") return slow.promise as never;
-        return `diff ${args?.filePath}` as never;
+        return { text: `diff ${args?.filePath}`, truncated: false } as never;
       },
     });
     void call;
@@ -1239,7 +1244,7 @@ describe("repoStore diff selection", () => {
       cmd_get_file_diff: async (_cmd, args) =>
         String(args?.filePath) === "boom.txt"
           ? (failing.promise as never)
-          : (`diff ${args?.filePath}` as never),
+          : ({ text: `diff ${args?.filePath}`, truncated: false } as never),
     });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-error");
@@ -1259,7 +1264,8 @@ describe("repoStore diff selection", () => {
     const slowCommit = deferred<string>();
     const invoke = makeInvoke({
       cmd_get_commit_diff: async () => slowCommit.promise as never,
-      cmd_get_file_diff: async (_cmd, args) => `diff ${args?.filePath}` as never,
+      cmd_get_file_diff: async (_cmd, args) =>
+        ({ text: `diff ${args?.filePath}`, truncated: false }) as never,
     });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-mixed");
@@ -1524,7 +1530,7 @@ describe("repoStore ignore-whitespace preference", () => {
     const invoke = makeInvoke({
       cmd_get_file_diff: async (_cmd, args) => {
         calls.push({ ...(args as Record<string, unknown>) });
-        return `diff ${String(args?.filePath)}` as never;
+        return { text: `diff ${String(args?.filePath)}`, truncated: false } as never;
       },
     });
     return { invoke, calls };
@@ -1603,7 +1609,7 @@ describe("repoStore post-mutation selection refetch", () => {
       cmd_stage_selective_patch: async () => undefined as never,
       cmd_get_file_diff: async (_cmd, args) => {
         diffPaths.push(String(args?.filePath));
-        return `diff ${String(args?.filePath)}` as never;
+        return { text: `diff ${String(args?.filePath)}`, truncated: false } as never;
       },
     });
     const { store } = makeStore(invoke);

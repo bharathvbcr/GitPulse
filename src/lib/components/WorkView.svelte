@@ -25,6 +25,8 @@
     FileDiff,
     GitMerge,
     ChevronRight,
+    Plug,
+    Layers,
   } from "lucide-svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -33,16 +35,22 @@
   import {
     degradedSummary,
     dirtyCount,
+    insightSummary,
     noteworthyStatuses,
     openPathFor,
     type WorkRow,
     type WorktreeBinding,
   } from "../work/projection";
+  import { getCollisionRisk } from "../insights/client";
+  import type { CollisionRisk } from "../insights/types";
+  import { formatError } from "../ui/formatError";
   import { headline, kindTitle } from "../repos/operation";
   import { agentKind, agentKindsOn, agentSessionSlug } from "../work/agentWorktree";
   import type { PolicyStatus } from "../stores/harnessStore";
 
   let projection = $state<WorkProjection | null>(null);
+  let collisions = $state<CollisionRisk | null>(null);
+  let collisionError = $state<string | null>(null);
   let loading = $state(false);
   let guard: AsyncGuard | null = null;
 
@@ -74,6 +82,19 @@
     projection = result;
     workCache.set(repo, result);
     loading = false;
+    // Collisions need per-worktree porcelain; they settle independently so a
+    // slow scan cannot blank the rows. Failure is stored, never implied as
+    // "no overlap".
+    try {
+      const risk = await getCollisionRisk(repo);
+      if (!run.isLive()) return;
+      collisions = risk;
+      collisionError = risk.ok ? null : risk.error || "collision check failed";
+    } catch (error) {
+      if (!run.isLive()) return;
+      collisions = null;
+      collisionError = formatError(error);
+    }
   }
 
   let previousRepo: string | null = null;
@@ -90,6 +111,8 @@
     // refreshes in place so "clean" cannot outlive the working tree.
     if (repoChanged) {
       projection = repo ? (workCache.get(repo) ?? null) : null;
+      collisions = null;
+      collisionError = null;
     }
     if (repo) void refresh(repo);
   });
@@ -145,6 +168,11 @@
   }
 
   const degraded = $derived(projection ? degradedSummary(projection.sources) : "");
+  const summary = $derived(projection ? insightSummary(projection) : null);
+
+  function openMcpSettings() {
+    window.dispatchEvent(new CustomEvent("gitpulse:settings"));
+  }
 
   /**
    * Remotes, submodules and the stash, folded in from what used to be a
@@ -179,6 +207,96 @@
       Refresh
     </button>
   </div>
+
+  {#if summary && $repoStore.currentPath}
+    <div class="mb-3 max-w-5xl grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+          <Layers size={11} /> Worktrees
+        </div>
+        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.worktrees}</div>
+        <div class="text-[10px] text-textMuted">
+          {summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
+            · {summary.unscannedDirty} unscanned{/if}
+        </div>
+      </div>
+      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+          <Bot size={11} /> Agent sessions
+        </div>
+        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.agentSessions}</div>
+        <div class="text-[10px] text-textMuted truncate">
+          {summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "none from directory layout"}
+        </div>
+      </div>
+      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+          <GitMerge size={11} /> Blocked
+        </div>
+        <div class="mt-0.5 text-[13px] font-semibold {summary.blocked > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-textPrimary'}">
+          {summary.blocked}
+        </div>
+        <div class="text-[10px] text-textMuted">parked merge / rebase / cherry-pick</div>
+      </div>
+      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
+          <GitPullRequest size={11} /> Pull requests
+        </div>
+        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.pullRequests}</div>
+        <div class="text-[10px] text-textMuted">joined through a worktree branch</div>
+      </div>
+    </div>
+    <div class="mb-3 max-w-5xl flex items-center justify-between gap-2">
+      <p class="text-[11px] text-textMuted">
+        Agents read this same snapshot over MCP 2.0 (`gitpulse_insights`).
+      </p>
+      <button
+        type="button"
+        class="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px]"
+        onclick={openMcpSettings}
+      >
+        <Plug size={12} class="text-accent" />
+        Connect an agent
+      </button>
+    </div>
+  {/if}
+
+  {#if collisionError}
+    <div
+      class="mb-3 max-w-5xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+    >
+      <AlertTriangle size={14} class="shrink-0 mt-px" />
+      <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
+    </div>
+  {:else if collisions && collisions.ok && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated)}
+    <div
+      class="mb-3 max-w-5xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+    >
+      <div class="flex items-start gap-2 font-medium">
+        <AlertTriangle size={14} class="shrink-0 mt-px" />
+        <span>
+          {#if collisions.overlapping_files > 0}
+            {collisions.overlapping_files} file{collisions.overlapping_files === 1 ? "" : "s"} dirty in more than one worktree
+            ({collisions.worktrees_involved} worktrees).
+          {:else}
+            Overlap scan did not finish — {collisions.unscanned_worktrees} worktree{collisions.unscanned_worktrees === 1 ? "" : "s"} not porcelain-scanned.
+          {/if}
+        </span>
+      </div>
+      {#if collisions.items.length > 0}
+        <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
+          {#each collisions.items.slice(0, 8) as item (item.path)}
+            <li>
+              {item.path}
+              <span class="text-textMuted">
+                — {item.worktrees.map((w) => w.agent_kind || w.branch || w.path).join(", ")}
+              </span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
 
   <!-- Stated before the rows, not after them. A join assembled from a source
        that could not be read looks exactly like one assembled from a source
