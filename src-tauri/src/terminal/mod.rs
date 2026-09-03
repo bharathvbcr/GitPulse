@@ -688,9 +688,79 @@ fn cargo_llvm_cov_install_allowed(args: &[String]) -> bool {
 fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
+        .flat_map(|dir| path_candidates(&dir, program))
         .filter(|candidate| candidate.is_file())
         .find_map(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
+/// Spellings of `program` to look for in one PATH directory.
+///
+/// Windows resolves a bare program name through an executable suffix: the file
+/// on disk is `python3.exe`, and joining the bare name matched nothing there,
+/// so the PATH identity check below could never succeed on Windows at all.
+/// Only `.exe` is added, deliberately — the wider `PATHEXT` set would let this
+/// resolve a `.bat`/`.cmd` shim, and the only caller is deciding which binary
+/// it is willing to execute.
+fn path_candidates(dir: &std::path::Path, program: &str) -> Vec<std::path::PathBuf> {
+    let direct = dir.join(program);
+    if cfg!(windows) && !program.contains('.') {
+        vec![dir.join(format!("{program}.exe")), direct]
+    } else {
+        vec![direct]
+    }
+}
+
+/// Upper bound on an interpreter this will read in order to compare it.
+/// CPython's launcher is well under a megabyte on every platform.
+const MAX_INTERPRETER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether two paths hold the same program, byte for byte.
+///
+/// Length is compared first, so the common mismatch costs two stats rather
+/// than two reads. A zero-length file matches nothing: an empty "interpreter"
+/// is never the program that would otherwise have run.
+fn same_program_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if !meta_a.is_file() || !meta_b.is_file() || meta_a.len() == 0 {
+        return false;
+    }
+    if meta_a.len() != meta_b.len() || meta_a.len() > MAX_INTERPRETER_BYTES {
+        return false;
+    }
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The interpreter a virtualenv records as the one it was built from.
+///
+/// `pyvenv.cfg` is repository content, so this only LOCATES a candidate. The
+/// caller then holds that candidate to exactly the rules a symlink target is
+/// held to — resolving outside the repository, named like a Python — before
+/// comparing bytes. Naming a file here cannot by itself make GitPulse trust
+/// it.
+fn recorded_base_interpreter(cfg: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(cfg).ok()?;
+    let mut home: Option<std::path::PathBuf> = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            // Python 3.11+ records the exact executable it was built from.
+            "base-executable" => return Some(std::path::PathBuf::from(value)),
+            "home" => home = Some(std::path::PathBuf::from(value)),
+            _ => {}
+        }
+    }
+    home.map(|dir| dir.join(name))
 }
 
 /// True when `name` is a Python interpreter's file name (`python`, `python3`,
@@ -709,50 +779,89 @@ fn is_python_interpreter_name(name: &str) -> bool {
 /// True when the virtualenv's interpreter resolves to a Python that GitPulse
 /// is willing to execute.
 ///
-/// Two independent ways to qualify, because one of them is not always
-/// available:
+/// Every way to qualify starts from the same property: the process GitPulse
+/// executes must be the interpreter that would have run anyway. A virtualenv
+/// changes which site-packages are imported, not which binary runs.
 ///
-/// 1. It is byte-for-byte the Python on PATH. Exact, and true whenever
-///    GitPulse runs from a shell.
-/// 2. It is *a* Python interpreter, by file name, resolving to somewhere
-///    outside the repository.
+/// The target must be named like a Python in every case. Then one of:
 ///
-/// (2) exists because (1) silently fails for an installed app. A macOS app
-/// launched from Finder inherits launchd's PATH, not the user's shell PATH —
-/// on this machine that means `/usr/bin/python3` rather than the Homebrew
-/// interpreter every project virtualenv here is built from. Anchoring only on
-/// (1) made GitPulse refuse the very virtualenv it had just created, but only
-/// once installed, which is the configuration users actually run.
+/// 1. It IS the Python on PATH — the same canonical path. Exact, and true
+///    whenever GitPulse runs from a shell.
+/// 2. It resolves somewhere outside the repository. This exists because (1)
+///    silently fails for an installed app: a macOS app launched from Finder
+///    inherits launchd's PATH, not the user's shell PATH, so anchoring only on
+///    (1) made GitPulse refuse the very virtualenv it had just created — but
+///    only once installed, which is the configuration users actually run.
+/// 3. It is byte-for-byte a host interpreter, when it resolves INSIDE the
+///    repository.
 ///
-/// (2) keeps the property that matters. The realistic attack is a repository
-/// shipping `.venv/bin/python` as a symlink to a checked-in payload, or to a
-/// shell: the first is refused because the target must resolve *outside* the
-/// repository, the second because the target must be named like a Python.
+/// (3) exists because `python -m venv` does not build the same thing on every
+/// platform. On Unix it symlinks `.venv/bin/python` out to the host toolchain,
+/// which is what (2) is about. On Windows it COPIES `python.exe` into
+/// `.venv\Scripts\`, so the target is repository-resident and (2) refused
+/// every real virtualenv there — Python coverage could not run at all.
+///
+/// The copy is admitted only against bytes, never against its location or its
+/// name: it must equal the Python on PATH, or the interpreter recorded in
+/// `pyvenv.cfg` — which is itself held to (2)'s rules before being believed,
+/// since the file naming it is repository content. A repository that drops a
+/// payload at the virtualenv spelling fails all three: the bytes are not any
+/// host interpreter's.
+///
+/// SECURITY IMPACT: this is the one path on which GitPulse will execute a file
+/// that lives inside the opened repository. Byte equality with a qualifying
+/// host interpreter is the whole of what makes that safe — weaken it and the
+/// Windows virtualenv spelling becomes an arbitrary execution primitive.
 /// Writing a hostile binary named `python3` outside the repository already
 /// requires the code execution this check exists to prevent.
-fn resolves_to_trusted_python(repo: &std::path::Path, interpreter: &std::path::Path) -> bool {
+fn resolves_to_trusted_python(
+    repo: &std::path::Path,
+    interpreter: &std::path::Path,
+    venv_cfg: &std::path::Path,
+) -> bool {
     let Ok(target) = std::fs::canonicalize(interpreter) else {
         return false;
     };
-    if ["python3", "python"]
+    let hosts: Vec<std::path::PathBuf> = ["python3", "python"]
         .iter()
-        .any(|name| resolve_on_path(name).is_some_and(|host| host == target))
-    {
+        .filter_map(|name| resolve_on_path(name))
+        .collect();
+    if hosts.contains(&target) {
         return true;
     }
-    // A target inside the repository is repository-authored content, never a
-    // system interpreter, whatever it is called.
-    if let Ok(root) = std::fs::canonicalize(repo) {
-        if target.starts_with(&root) {
-            return false;
-        }
-    } else {
+    let Ok(root) = std::fs::canonicalize(repo) else {
+        return false;
+    };
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !is_python_interpreter_name(name) {
         return false;
     }
-    target
+    if !target.starts_with(&root) {
+        return true;
+    }
+    // Repository-resident: admitted only as a byte-identical copy.
+    if hosts.iter().any(|host| same_program_bytes(host, &target)) {
+        return true;
+    }
+    let Some(base) = recorded_base_interpreter(venv_cfg, name) else {
+        return false;
+    };
+    let Ok(base) = std::fs::canonicalize(&base) else {
+        return false;
+    };
+    if base.starts_with(&root) {
+        return false;
+    }
+    if !base
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(is_python_interpreter_name)
+    {
+        return false;
+    }
+    same_program_bytes(&base, &target)
 }
 
 /// Validates the project virtualenv's interpreter as a program.
@@ -766,7 +875,8 @@ fn resolves_to_trusted_python(repo: &std::path::Path, interpreter: &std::path::P
 /// 1. the venv directory carries `pyvenv.cfg`, the marker of a real
 ///    virtualenv rather than a directory shaped like one;
 /// 2. the interpreter path exists inside the repository, lexically; and
-/// 3. it resolves to the same binary as `python3`/`python` on PATH.
+/// 3. it is the same program as `python3`/`python` on PATH — see
+///    [`resolves_to_trusted_python`] for what "same" means on each platform.
 ///
 /// (3) is the load-bearing one. It means the process GitPulse executes is the
 /// interpreter it would have executed regardless — the virtualenv changes
@@ -780,17 +890,17 @@ pub(crate) fn check_venv_interpreter(
     let Some(venv_dir) = relative.split('/').next().filter(|dir| !dir.is_empty()) else {
         return Err("has no virtualenv directory");
     };
-    match sandbox_join_canonical(repo, &format!("{venv_dir}/pyvenv.cfg")) {
-        Ok(cfg) if cfg.is_file() => {}
+    let cfg = match sandbox_join_canonical(repo, &format!("{venv_dir}/pyvenv.cfg")) {
+        Ok(cfg) if cfg.is_file() => cfg,
         _ => return Err("is not inside a virtualenv (no pyvenv.cfg)"),
-    }
+    };
     let Ok(interpreter) = sandbox_join(repo, relative) else {
         return Err("is not a repository-relative path");
     };
     if !interpreter.is_file() {
         return Err("is not a repository file");
     }
-    if !resolves_to_trusted_python(repo, &interpreter) {
+    if !resolves_to_trusted_python(repo, &interpreter, &cfg) {
         return Err("does not resolve to a Python interpreter outside the repository");
     }
     Ok(())
@@ -1667,10 +1777,18 @@ mod tests {
             Ok(status) if status.success() => {}
             _ => return, // no usable python3 on this host
         }
-        check_venv_interpreter(repo, ".venv/bin/python")
+        // Unix symlinks the interpreter out; Windows copies it in. Ask for the
+        // platform's own spelling rather than assuming the Unix one.
+        let rel = crate::coverage_toolchain::managed_venv_python();
+        assert!(
+            repo.join(rel).is_file(),
+            "python reported success but produced no {rel}; a create that made \
+             nothing must fail here rather than be read as a refused virtualenv"
+        );
+        check_venv_interpreter(repo, rel)
             .expect("a virtualenv built by python -m venv must be accepted");
         let argv = vec![
-            ".venv/bin/python".to_string(),
+            rel.to_string(),
             "-m".to_string(),
             "pytest".to_string(),
             "--cov".to_string(),
@@ -1680,6 +1798,44 @@ mod tests {
             .expect("the planned generate command must be allowed");
         validate_manvi_paths(repo, &argv, ManviActionKind::CoverageGenerator)
             .expect("and its paths must validate");
+    }
+
+    /// The copy admitted on Windows is admitted on bytes alone.
+    ///
+    /// This is the case the byte comparison exists for: a repository can place
+    /// whatever it likes at the virtualenv spelling, and naming it `python`
+    /// beside a `pyvenv.cfg` must not be enough to have it executed.
+    #[test]
+    fn a_repository_payload_at_the_venv_spelling_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        let rel = crate::coverage_toolchain::managed_venv_python();
+        let interpreter = repo.join(rel);
+        std::fs::create_dir_all(interpreter.parent().expect("venv bin dir")).expect("mkdir");
+
+        // `base-executable` names the REAL host interpreter, so every other
+        // rule is satisfied: the virtualenv marker is present, the base
+        // resolves, it lives outside the repository and is named like a
+        // Python. The only thing left to refuse on is the bytes. Without a
+        // host interpreter there is nothing to compare against and the test
+        // would prove nothing, so it says so rather than passing quietly.
+        let Some(host) = resolve_on_path("python3").or_else(|| resolve_on_path("python")) else {
+            return;
+        };
+        std::fs::write(
+            repo.join(".venv").join("pyvenv.cfg"),
+            format!(
+                "home = {}\nbase-executable = {}\n",
+                host.parent().expect("host dir").display(),
+                host.display()
+            ),
+        )
+        .expect("cfg");
+        std::fs::write(&interpreter, b"#!/bin/sh\necho payload\n").expect("payload");
+
+        let err = check_venv_interpreter(repo, rel)
+            .expect_err("a payload at the virtualenv spelling must be refused");
+        assert!(err.contains("Python interpreter"), "{err}");
     }
 
     /// The setup steps coverage generation is now allowed to run.

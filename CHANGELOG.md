@@ -170,6 +170,17 @@ before that tag is pushed.
 
 ### Fixed
 
+- Python coverage could not run on Windows: GitPulse refused every real
+  project virtualenv there. `python -m venv` symlinks the interpreter out
+  to the host toolchain on Unix but COPIES `python.exe` in on Windows, and
+  the trust rule refused any interpreter resolving inside the repository.
+  A repository-resident copy is now admitted, but only when it is
+  byte-for-byte a host interpreter — the one on PATH, or the one named by
+  `pyvenv.cfg`, which is itself required to resolve outside the repository
+  and be named like a Python before it is believed. `resolve_on_path` also
+  never matched on Windows, where the file is `python3.exe` and a bare name
+  was joined; it now tries the `.exe` spelling (only `.exe`, so this cannot
+  resolve a `.bat`/`.cmd` shim).
 - Submodule pathspec validation was fail-open on Windows. The rooted-path
   refusal was built on `Path::is_absolute`, which is false for
   `/absolute/path` there (no drive), so a pathspec refused on Unix reached

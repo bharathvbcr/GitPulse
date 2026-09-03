@@ -4318,16 +4318,26 @@ src/main.go:4.1,4.8 1 0
             _ => return, // no usable python3 on this host
         }
 
+        // Unix symlinks the interpreter out of the venv; Windows copies it in
+        // under a different name. Both are real virtualenvs, so the expectation
+        // follows the platform rather than pinning the Unix spelling.
+        let rel = managed_venv_python();
+        assert!(
+            repo.path().join(rel).is_file(),
+            "python reported success but produced no {rel}; a create that made \
+             nothing must fail here rather than be read as a refused virtualenv"
+        );
+
         let plan = python_coverage_plan(repo.path());
         assert!(!plan.tool_ready, "a venv without pytest is not ready");
         assert_eq!(
             plan.generate,
-            vec![".venv/bin/python -m pytest --cov --cov-report=xml".to_string()],
+            vec![format!("{rel} -m pytest --cov --cov-report=xml")],
             "the generate step must run the project interpreter, not a host one"
         );
         assert_eq!(
             plan.setup,
-            vec![".venv/bin/python -m pip install pytest pytest-cov".to_string()],
+            vec![format!("{rel} -m pip install pytest pytest-cov")],
             "installation must target the project virtualenv only"
         );
         assert!(plan.tool_detail.contains("pytest"));
