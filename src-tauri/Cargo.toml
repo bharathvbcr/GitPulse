@@ -1,11 +1,12 @@
 [package]
 name = "gitpulse"
-version = "0.0.4"
+version = "0.0.5"
 description = "High-Performance Native Git Desktop Client"
 authors = ["GitPulse Team"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/bharathvbcr/GitPulse"
+default-run = "gitpulse"
 
 [lib]
 name = "gitpulse_lib"

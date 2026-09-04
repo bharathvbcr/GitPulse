@@ -195,31 +195,40 @@
 
   async function create() {
     const repo = $repoStore.currentPath;
-    if (!repo || !newPath.trim()) return;
+    const targetPath = newPath.trim();
+    const branch = newBranch.trim();
+    const base = startPoint.trim();
+    if (!repo || !targetPath) return;
+    const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;
+    let createCompleted = false;
     isCreating = true;
     error = null;
     try {
       await invoke("cmd_add_worktree", {
         repoPath: repo,
-        targetPath: newPath.trim(),
-        newBranch: newBranch.trim() || null,
-        startPoint: startPoint.trim() || null,
-        detach: !newBranch.trim(),
+        targetPath,
+        newBranch: branch || null,
+        startPoint: base || null,
+        detach: !branch,
       });
-      if ($repoStore.currentPath !== repo) return;
+      createCompleted = true;
       harnessStore.recordAction({
+        repoPath: repo,
         kind: "worktree",
-        label: newBranch.trim() ? `${newBranch.trim()} → ${newPath.trim()}` : newPath.trim(),
+        label: actionLabel,
         ok: true,
       });
+      if ($repoStore.currentPath !== repo) return;
       newPath = "";
       newBranch = "";
       startPoint = "";
       showAddForm = false;
       await load();
     } catch (err: unknown) {
+      if (!createCompleted) {
+        harnessStore.recordAction({ repoPath: repo, kind: "worktree", label: actionLabel, ok: false });
+      }
       if ($repoStore.currentPath !== repo) return;
-      harnessStore.recordAction({ kind: "worktree", label: newPath.trim(), ok: false });
       error = reportPanelError("worktrees", err);
     } finally {
       isCreating = false;
@@ -240,6 +249,7 @@
   async function remove(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const targetPath = wt.path;
     // Two-step confirm: the first click arms, the second removes. No native
     // dialog, so the flow stays keyboard-reachable and testable. The arming
     // timer is tracked so destroy (effect cleanup above) can clear it.
@@ -257,22 +267,26 @@
     // not a verified-clean one: never force-remove it. A scanned dirty
     // tree is force-removed only after the armed confirm named the cost.
     const force = typeof wt.dirty_files === "number" && wt.dirty_files > 0;
+    let removeCompleted = false;
     try {
-      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath: wt.path, force });
+      await invoke("cmd_remove_worktree", { repoPath: repo, targetPath, force });
+      removeCompleted = true;
+      harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: true });
       if ($repoStore.currentPath !== repo) return;
-      harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: true });
-      if ($repoStore.currentPath === wt.path) {
+      if ($repoStore.currentPath === targetPath) {
         // T-F09: the active tab points INTO the removed directory. Close it —
         // which activates a surviving neighbor — instead of stranding the
         // workspace on a deleted path.
-        const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+        const stranded = $repoStore.openTabs.find((tab) => tab.path === targetPath);
         if (stranded) await repoStore.closeTab(stranded.id);
         return;
       }
       await load();
     } catch (err: unknown) {
+      if (!removeCompleted) {
+        harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: false });
+      }
       if ($repoStore.currentPath !== repo) return;
-      harnessStore.recordAction({ kind: "worktree-remove", label: wt.path, ok: false });
       error = reportPanelError("worktrees", err);
     }
   }

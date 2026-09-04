@@ -211,6 +211,16 @@ describe("repoStore tabs", () => {
     expect(state.currentBranch).toBe("/r/beta-main");
   });
 
+  it("clears the shared file selection when the editor closes its last tab", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    store.selectFilePath("README.md");
+    expect(get(store).selectedFilePath).toBe("README.md");
+
+    store.selectFilePath(null);
+    expect(get(store).selectedFilePath).toBeNull();
+  });
+
   it("remembers whether the selected worktree diff is the staged side", async () => {
     const { store } = makeStore();
     await store.openRepo("/r/dual");

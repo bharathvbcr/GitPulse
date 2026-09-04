@@ -10,6 +10,8 @@
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { clampMenuPosition } from "../branches/menuPosition";
+  import { copyText } from "../desktop/clipboard";
+  import { enumerateFocusables } from "../ui/focusTrap";
   import {
     ChevronDown,
     Pin,
@@ -30,8 +32,11 @@
   // Measured menu box feeds the shared clamp so the tab menu can never open
   // off-screen (the old innerWidth-200 guess overflowed on short windows).
   let menuEl: HTMLDivElement | undefined = $state();
+  let menuOpener: HTMLElement | null = null;
   let menuPos = $state({ left: 0, top: 0 });
   let recentsOpen = $state(false);
+  let recentsTriggerEl: HTMLButtonElement | undefined = $state();
+  let recentsEl: HTMLDivElement | undefined = $state();
   let dragFrom = $state<number | null>(null);
   // Where a dragged tab would land. `before` picks the left/right half of the
   // hovered tab; null means "no useful insertion point" and hides the bar.
@@ -45,9 +50,21 @@
     ),
   );
 
-  function closeMenu() {
+  function closeMenu(options?: { restoreFocus?: boolean }) {
+    const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl : null;
     menu = null;
     recentsOpen = false;
+    menuOpener = null;
+    if (options?.restoreFocus && opener?.isConnected) {
+      window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  async function copyPath(path: string) {
+    closeMenu();
+    if (!(await copyText(path))) {
+      repoStore.setError("Could not copy path to clipboard");
+    }
   }
 
   // A tab closed while its menu was open leaves zombie state that only
@@ -60,6 +77,9 @@
 
   function onContext(e: MouseEvent, id: string) {
     e.preventDefault();
+    menuOpener = e.currentTarget instanceof HTMLElement
+      ? e.currentTarget.querySelector<HTMLElement>('[role="tab"]')
+      : null;
     menu = { x: e.clientX, y: e.clientY, id };
     // First paint at the raw anchor (clamped by estimate); the effect below
     // repositions from the real measured box once it exists.
@@ -79,6 +99,80 @@
     );
   });
 
+  function focusPopup(element: HTMLElement | undefined) {
+    window.setTimeout(() => {
+      const first = element?.querySelector<HTMLElement>('[role="menuitem"]');
+      (first ?? element)?.focus();
+    }, 0);
+  }
+
+  function focusAdjacentToMenuOpener(
+    popup: HTMLElement,
+    opener: HTMLElement | null,
+    backwards: boolean,
+  ) {
+    const candidates = enumerateFocusables<HTMLElement>(document).filter(
+      (candidate) =>
+        candidate.tabIndex >= 0 &&
+        !popup.contains(candidate) &&
+        candidate.getClientRects().length > 0,
+    );
+    if (candidates.length === 0) return;
+
+    const openerIndex = opener ? candidates.indexOf(opener) : -1;
+    let target = openerIndex >= 0
+      ? candidates[openerIndex + (backwards ? -1 : 1)]
+      : undefined;
+    if (!target && opener?.isConnected) {
+      const direction = backwards
+        ? Node.DOCUMENT_POSITION_PRECEDING
+        : Node.DOCUMENT_POSITION_FOLLOWING;
+      const ordered = backwards ? [...candidates].reverse() : candidates;
+      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
+    }
+    target ??= candidates[backwards ? candidates.length - 1 : 0];
+    window.setTimeout(() => target?.focus(), 0);
+  }
+
+  $effect(() => {
+    if (menu && menuEl) focusPopup(menuEl);
+  });
+
+  $effect(() => {
+    if (recentsOpen && recentsEl) focusPopup(recentsEl);
+  });
+
+  function handlePopupKeydown(e: KeyboardEvent) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const popup = e.currentTarget;
+      if (popup instanceof HTMLElement) {
+        const opener = menu ? menuOpener : recentsOpen ? recentsTriggerEl ?? null : null;
+        focusAdjacentToMenuOpener(popup, opener, e.shiftKey);
+      }
+      closeMenu();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeMenu({ restoreFocus: true });
+      return;
+    }
+    const popup = e.currentTarget;
+    if (!(popup instanceof HTMLElement)) return;
+    const items = [...popup.querySelectorAll<HTMLElement>('[role="menuitem"]')];
+    if (items.length === 0) return;
+    const current = items.findIndex((item) => item === document.activeElement);
+    let next: number | null = null;
+    if (e.key === "ArrowDown") next = (current + 1 + items.length) % items.length;
+    else if (e.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = items.length - 1;
+    if (next === null) return;
+    e.preventDefault();
+    items[next]?.focus();
+  }
+
   function isTypingTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
     const tag = target.tagName;
@@ -91,7 +185,7 @@
     // same window-listener pattern as ViewTabBar.
     if (e.key === "Escape" && (menu || recentsOpen)) {
       e.preventDefault();
-      closeMenu();
+      closeMenu({ restoreFocus: true });
       return;
     }
     if (shouldSkipWebviewShortcut(e, isTauri())) return;
@@ -138,11 +232,12 @@
     window.addEventListener("pointerdown", handlePointerDown, true);
     // Same contract as BranchList's menu: a resized window can leave the
     // clamped position pointing at nothing useful, so close instead.
-    window.addEventListener("resize", closeMenu);
+    const handleResize = () => closeMenu();
+    window.addEventListener("resize", handleResize);
     return () => {
       window.removeEventListener("keydown", handleKey);
       window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("resize", handleResize);
     };
   });
 
@@ -168,6 +263,14 @@
     tabs[next]?.focus();
   }
 
+  async function closeTabFromKeyboard(id: string, index: number) {
+    await repoStore.closeTab(id);
+    window.setTimeout(() => {
+      const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index]") ?? [];
+      (tabs[Math.min(index, tabs.length - 1)] ?? scroller)?.focus();
+    }, 0);
+  }
+
   /**
    * Container-level dragover: one handler computes the insertion point for
    * whatever tab (or gap) is under the pointer, so the indicator can't go
@@ -177,12 +280,12 @@
   function onScrollerDragOver(e: DragEvent) {
     e.preventDefault();
     if (dragFrom === null) return;
-    const tabEl = e.target instanceof Element ? e.target.closest("[data-tab-index]") : null;
-    if (!(tabEl instanceof HTMLElement) || !tabEl.dataset.tabIndex) {
+    const tabEl = e.target instanceof Element ? e.target.closest("[data-tab-shell-index]") : null;
+    if (!(tabEl instanceof HTMLElement) || tabEl.dataset.tabShellIndex === undefined) {
       dropTarget = null;
       return;
     }
-    const index = Number(tabEl.dataset.tabIndex);
+    const index = Number(tabEl.dataset.tabShellIndex);
     if (!Number.isInteger(index)) {
       dropTarget = null;
       return;
@@ -227,7 +330,7 @@
       bind:this={scroller}
       class="flex-1 flex items-center gap-1 overflow-x-auto min-w-0 py-1"
       role="tablist"
-      tabindex="0"
+      tabindex="-1"
       aria-label="Open repositories"
       onkeydown={onTablistKeydown}
       ondragover={onScrollerDragOver}
@@ -235,36 +338,20 @@
     >
       {#each $repoStore.openTabs as tab, index (tab.id)}
         <div
-          role="tab"
-          tabindex={tab.isActive ? 0 : -1}
-          aria-selected={tab.isActive}
-          aria-keyshortcuts="Enter p"
-          data-active-repo={tab.isActive ? "true" : "false"}
-          data-tab-index={index}
+          role="presentation"
+          data-tab-shell-index={index}
           title={`${tab.path}\n←/→ move tabs · P to ${tab.pinned ? "unpin" : "pin"}`}
           draggable="true"
-          onclick={() => repoStore.activateTab(tab.id)}
-          onkeydown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              repoStore.activateTab(tab.id);
-            } else if (e.key === "p" || e.key === "P") {
-              // Keyboard twin of the double-click pin affordance.
-              e.preventDefault();
-              repoStore.pinTab(tab.id, !tab.pinned);
-            }
-          }}
           onauxclick={(e) => {
             if (e.button === 1) {
               e.preventDefault();
               void repoStore.closeTab(tab.id);
             }
           }}
-          ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
           oncontextmenu={(e) => onContext(e, tab.id)}
           ondragstart={() => (dragFrom = index)}
           ondragend={endDrag}
-          class="group relative max-w-[14rem] min-w-[7rem] pl-2.5 pr-1 flex items-center gap-1.5 rounded-full border shrink-0 transition-[color,background-color,border-color,box-shadow] duration-150 {dropTarget?.index === index ? 'border-accent/50' : ''} {tab.isActive
+          class="group relative max-w-[14rem] min-w-[7rem] pr-1 flex items-center gap-1 rounded-full border shrink-0 transition-[color,background-color,border-color,box-shadow] duration-150 {dropTarget?.index === index ? 'border-accent/50' : ''} {tab.isActive
             ? 'bg-surfaceHover border-border/80 text-textPrimary shadow-sm'
             : 'border-transparent text-textMuted hover:text-textPrimary hover:bg-surfaceHover/60'}"
         >
@@ -276,23 +363,46 @@
                 : '-right-[3px]'}"
             ></span>
           {/if}
-          {#if tab.pinned}
-            <Pin size={10} class="text-accent shrink-0" />
-          {:else}
-            <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
-          {/if}
-          <span class="truncate font-medium">{tab.label}</span>
-          {#if tab.currentBranch}
-            <span class="truncate text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
-          {/if}
-          {#if tab.isDirty}
-            <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 shadow-[0_0_6px_rgb(251_191_36/0.8)]" title="Uncommitted changes"></span>
-          {/if}
-          {#if tab.conflictedCount > 0}
-            <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
-          {/if}
           <button
             type="button"
+            role="tab"
+            tabindex={tab.isActive ? 0 : -1}
+            aria-selected={tab.isActive}
+            aria-keyshortcuts="Enter p Delete"
+            data-active-repo={tab.isActive ? "true" : "false"}
+            data-tab-index={index}
+            onclick={() => repoStore.activateTab(tab.id)}
+            onkeydown={(e) => {
+              if (e.key === "p" || e.key === "P") {
+                e.preventDefault();
+                repoStore.pinTab(tab.id, !tab.pinned);
+              } else if (e.key === "Delete") {
+                e.preventDefault();
+                void closeTabFromKeyboard(tab.id, index);
+              }
+            }}
+            ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
+            class="min-w-0 flex-1 h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/70"
+          >
+            {#if tab.pinned}
+              <Pin size={10} class="text-accent shrink-0" />
+            {:else}
+              <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
+            {/if}
+            <span class="truncate font-medium">{tab.label}</span>
+            {#if tab.currentBranch}
+              <span class="truncate text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
+            {/if}
+            {#if tab.isDirty}
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 shadow-[0_0_6px_rgb(251_191_36/0.8)]" title="Uncommitted changes"></span>
+            {/if}
+            {#if tab.conflictedCount > 0}
+              <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            tabindex="-1"
             title="Close"
             aria-label={`Close ${tab.label}`}
             onclick={(e) => {
@@ -318,15 +428,28 @@
 
     <div class="relative shrink-0" data-recents-menu>
       <button
+        bind:this={recentsTriggerEl}
         type="button"
         title="Recent repositories"
-        onclick={() => (recentsOpen = !recentsOpen)}
+        aria-haspopup="menu"
+        aria-expanded={recentsOpen}
+        aria-controls="recent-repositories-menu"
+        onclick={() => {
+          menu = null;
+          recentsOpen = !recentsOpen;
+        }}
         class="gp-icon-btn !p-1 h-full"
       >
         <ChevronDown size={13} />
       </button>
       {#if recentsOpen}
         <div
+          bind:this={recentsEl}
+          id="recent-repositories-menu"
+          role="menu"
+          aria-label="Recent repositories"
+          tabindex="-1"
+          onkeydown={handlePopupKeydown}
           class="absolute right-0 top-full mt-1.5 w-80 gp-menu gp-pop"
           style="z-index: {LAYERS.MENU}"
         >
@@ -340,6 +463,7 @@
               <div class="flex items-center gap-1 px-0.5">
                 <button
                   type="button"
+                  role="menuitem"
                   onclick={() => {
                     recentsOpen = false;
                     void repoStore.openRepo(path);
@@ -351,6 +475,8 @@
                 </button>
                 <button
                   type="button"
+                  role="menuitem"
+                  aria-label={`Remove ${displayName(path)} from recent repositories`}
                   title="Remove from recents"
                   onclick={() => repoStore.removeRecent(path)}
                   class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover"
@@ -381,25 +507,29 @@
       bind:this={menuEl}
       use:portal={"body"}
       data-repo-menu
+      role="menu"
+      aria-label={`Repository actions for ${tab.label}`}
+      tabindex="-1"
+      onkeydown={handlePopupKeydown}
       class="fixed min-w-44 gp-menu gp-pop text-[11px] text-textPrimary"
       style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU}"
     >
-      <button class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab
       </button>
-      <button class="gp-menu-item" onclick={() => { void navigator.clipboard.writeText(tab.path); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => void copyPath(tab.path)}>
         Copy path
       </button>
-      <button class="gp-menu-item" onclick={() => { void repoStore.closeTab(tab.id); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTab(tab.id); closeMenu(); }}>
         Close
       </button>
-      <button class="gp-menu-item" onclick={() => { void repoStore.closeOtherTabs(tab.id); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeOtherTabs(tab.id); closeMenu(); }}>
         Close others
       </button>
-      <button class="gp-menu-item" onclick={() => { void repoStore.closeTabsToTheRight(tab.id); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { void repoStore.closeTabsToTheRight(tab.id); closeMenu(); }}>
         Close tabs to the right
       </button>
-      <button class="gp-menu-item" onclick={() => { onOpen?.(); closeMenu(); }}>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { onOpen?.(); closeMenu(); }}>
         <FolderOpen size={11} /> Open repository…
       </button>
     </div>

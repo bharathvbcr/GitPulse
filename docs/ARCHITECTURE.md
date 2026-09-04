@@ -27,15 +27,19 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (132 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (134 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
-        subgraph Subsystems["Core Subsystems"]
+        subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
             GraphSolver["Graph Solver & Nogap Bounds<br/><code>src-tauri/src/graph/</code>"]
             Analyzers["Analyzers (LOC, Coverage, Health)<br/><code>src-tauri/src/analyzer/</code>"]
             StorageAuditor["Storage Auditor & History<br/><code>src-tauri/src/storage/</code>"]
             OpsPlanner["Ops Planner & Releases<br/><code>src-tauri/src/ops.rs</code>"]
             PtyTerminal["PTY Lifecycle & Terminal<br/><code>src-tauri/src/terminal/</code>"]
+            Grants["Policy Grants & Overrides<br/><code>src-tauri/src/grants/</code>"]
+            Ingest["Attribution Ingest<br/><code>src-tauri/src/ingest/</code>"]
+            Ledger["Event Ledger & Provenance<br/><code>src-tauri/src/ledger/</code>"]
+            MCP["MCP Read Surface<br/><code>src-tauri/src/mcp/</code>"]
         end
         
         CmdRegistry --> Subsystems
@@ -96,7 +100,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +132 Registered Handlers
+        +134 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -118,10 +122,31 @@ classDiagram
         +audit_repository()
         +track_snapshots()
     }
+    class GrantsStore {
+        +list_grants()
+        +revoke_grant()
+        +read_policy_override()
+    }
+    class IngestPipeline {
+        +replay_reflog()
+        +replay_transcripts()
+        +normalize_actor()
+    }
+    class LedgerStore {
+        +append()
+        +cursor_tail()
+        +query_range()
+        +redact_credentials()
+    }
     class OpsPlanner {
         +plan_merged_branch_cleanup()
         +review_outgoing_commits()
         +plan_release_publish()
+    }
+    class MCPServer {
+        +discover_tools()
+        +snapshot_tools()
+        +cache_capabilities()
     }
     class HarnessSidecar {
         +guard_command()
@@ -137,6 +162,10 @@ classDiagram
     CommandRegistry --> StorageAuditor
     CommandRegistry --> OpsPlanner
     CommandRegistry --> HarnessSidecar
+    CommandRegistry --> GrantsStore
+    CommandRegistry --> IngestPipeline
+    CommandRegistry --> LedgerStore
+    CommandRegistry --> MCPServer
 ```
 
 ### Subsystem Responsibilities
@@ -150,6 +179,10 @@ classDiagram
 - **`ops.rs`**: Safe, read-only MANVI operation planners for merged branch cleanups, outgoing commit review, and release publishing.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
 - **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved command diagnostics and subprocess exit status tracking.
+- **`grants/`**: Policy grant model, scoped overrides, and override lifecycle for elevated paths.
+- **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history.
+- **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
+- **`mcp/`**: Read-only MCP 2.0 + Agent Plugins 1.0 server surface, including tool caching and capability discovery.
 - **`logging.rs`**: Diagnostics for the backend. A 1,000-entry in-memory ring behind the `log` facade, a panic hook that records the payload, the location and a bounded backtrace, and a durable append-only mirror under the platform log directory (`~/Library/Logs/GitPulse` on macOS, `%LOCALAPPDATA%\\GitPulse\\logs` on Windows, `$XDG_STATE_HOME/gitpulse` otherwise; `GITPULSE_LOG_DIR` overrides all three). See [Diagnostics](#5-diagnostics) below.
 
 ---
@@ -190,8 +223,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 132 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 705 data fields, in 46 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 134 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 706 data fields, in 46 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` agree. |
 
 ---

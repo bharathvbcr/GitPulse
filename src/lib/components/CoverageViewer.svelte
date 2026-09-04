@@ -453,6 +453,7 @@
     aiError = null;
     aiGeneration = null;
     stepResults = {};
+    let generationCompleted = false;
     try {
       // The model reasons about these numbers and drafts issues from them.
       // Handing it a percentage without saying what was excluded would put
@@ -461,21 +462,26 @@
         repo,
         formatCoverageReport(current, repo, coverageExclusions),
       );
-      if (!guard.isLive()) return;
-      aiGeneration = next;
+      generationCompleted = true;
       harnessStore.recordAction({
+        repoPath: repo,
         kind: "coverage-report",
         label: "AI coverage analysis",
         ok: true,
       });
+      if (!guard.isLive()) return;
+      aiGeneration = next;
     } catch (err: unknown) {
+      if (!generationCompleted) {
+        harnessStore.recordAction({
+          repoPath: repo,
+          kind: "coverage-report",
+          label: "AI coverage analysis",
+          ok: false,
+        });
+      }
       if (!guard.isLive()) return;
       aiError = reportPanelError("coverage", err);
-      harnessStore.recordAction({
-        kind: "coverage-report",
-        label: "AI coverage analysis",
-        ok: false,
-      });
     } finally {
       if (guard.isLive()) generating = false;
     }
@@ -568,6 +574,8 @@
     stepResults[step.id] = { running: true };
 
     let passed = false;
+    let commandCompleted = false;
+    const actionLabel = step.command ?? step.text;
     try {
       const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
         repoPath,
@@ -576,9 +584,17 @@
         // Long enough for a cold install/build/test cycle; the backend clamps to [1s, 30min].
         timeoutSecs: 900,
       });
+      commandCompleted = true;
+      passed = runPassed(res);
+      harnessStore.recordAction({
+        repoPath,
+        kind: "coverage-step",
+        label: actionLabel,
+        ok: passed,
+        verdict: res.policy ?? null,
+      });
       if (!guard.isLive()) return false;
 
-      passed = runPassed(res);
       const detail = formatRunDetail(res);
       const summary = formatRunSummary(res);
       stepResults[step.id] = {
@@ -592,30 +608,26 @@
       if (!passed) {
         diagnostics.error(
           "coverage",
-          failureLogEntry(step.command ?? step.text, res.exit_code, detail),
+          failureLogEntry(actionLabel, res.exit_code, detail),
         );
       }
-
-      harnessStore.recordAction({
-        kind: "coverage-step",
-        label: step.command ?? step.text,
-        ok: passed,
-        verdict: res.policy ?? null,
-      });
     } catch (err: unknown) {
-      if (!guard.isLive()) return false;
       passed = false;
+      if (!commandCompleted) {
+        harnessStore.recordAction({
+          repoPath,
+          kind: "coverage-step",
+          label: actionLabel,
+          ok: false,
+        });
+      }
+      if (!guard.isLive()) return false;
       const detail = reportPanelError("coverage", err);
       stepResults[step.id] = {
         running: false,
         status: "failed",
         detail,
       };
-      harnessStore.recordAction({
-        kind: "coverage-step",
-        label: step.command ?? step.text,
-        ok: false,
-      });
     }
 
     if (guard.isLive()) rescan();
@@ -689,7 +701,6 @@
     detail: string;
     summary: string;
     exitCode: number | null;
-    verdict: NonNullable<TerminalRunResult["policy"]> | null;
     failedCommand: string;
   } | null> {
     const details: string[] = [];
@@ -697,7 +708,7 @@
       plan.steps.length > 1 ? `${step.command}:\n${body}` : body;
     let last: { res: TerminalRunResult; step: CoverageRecoveryStep } | null = null;
     for (const step of plan.steps) {
-      const res = await invokeCoverageCommand(step.argv, repoPath);
+      const res = await invokeCoverageCommand(step.argv, repoPath, step.command);
       if (!guard.isLive()) return null;
       details.push(label(step, formatRunDetail(res)));
       last = { res, step };
@@ -707,7 +718,6 @@
           detail: details.join("\n\n"),
           summary: formatRunSummary(res),
           exitCode: res.exit_code,
-          verdict: res.policy ?? null,
           failedCommand: step.command,
         };
       }
@@ -719,7 +729,6 @@
       detail: details.join("\n\n"),
       summary: formatRunSummary(last.res),
       exitCode: last.res.exit_code,
-      verdict: last.res.policy ?? null,
       failedCommand: last.step.command,
     };
   }
@@ -729,13 +738,35 @@
    * automatic retry go through here identically, so a retry can never reach
    * the backend under looser terms than the command it replaces.
    */
-  function invokeCoverageCommand(argv: string[], repoPath: string): Promise<TerminalRunResult> {
-    return invoke<TerminalRunResult>("cmd_manvi_run_action", {
-      repoPath,
-      args: argv,
-      actionKind: "coverage_generator",
-      timeoutSecs: 900,
-    });
+  async function invokeCoverageCommand(
+    argv: string[],
+    repoPath: string,
+    actionLabel: string,
+  ): Promise<TerminalRunResult> {
+    try {
+      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
+        repoPath,
+        args: argv,
+        actionKind: "coverage_generator",
+        timeoutSecs: 900,
+      });
+      harnessStore.recordAction({
+        repoPath,
+        kind: "coverage-script",
+        label: actionLabel,
+        ok: runPassed(res),
+        verdict: res.policy ?? null,
+      });
+      return res;
+    } catch (err: unknown) {
+      harnessStore.recordAction({
+        repoPath,
+        kind: "coverage-script",
+        label: actionLabel,
+        ok: false,
+      });
+      throw err;
+    }
   }
 
   async function runCoverageScript(
@@ -764,6 +795,7 @@
       };
       reportPanelError("coverage", `Invalid coverage command "${command}": ${tokenized.error}`);
       harnessStore.recordAction({
+        repoPath,
         kind: "coverage-script",
         label: command,
         ok: false,
@@ -780,14 +812,13 @@
 
     let passed = false;
     try {
-      const res = await invokeCoverageCommand(tokenized.argv, repoPath);
+      const res = await invokeCoverageCommand(tokenized.argv, repoPath, command);
       if (!guard.isLive()) return false;
 
       passed = runPassed(res);
       let detail = formatRunDetail(res);
       let summary = formatRunSummary(res);
       let exitCode = res.exit_code;
-      let verdict = res.policy ?? null;
       let recovery: CoverageRecovery | null = null;
 
       if (!passed && (options.recover ?? true)) {
@@ -809,7 +840,6 @@
             detail = outcome.detail;
             summary = outcome.summary;
             exitCode = outcome.exitCode;
-            verdict = outcome.verdict;
           } else {
             // Both attempts are kept. The retry's output is the evidence that
             // narrowing the run was not the whole story, and dropping it
@@ -833,15 +863,6 @@
       if (!passed) {
         diagnostics.error("coverage", failureLogEntry(command, exitCode, detail));
       }
-
-      harnessStore.recordAction({
-        kind: "coverage-script",
-        // The plan's own commands, not the one the user asked for: the
-        // journal must record what actually ran.
-        label: recovery ? recovery.steps.map((step) => step.command).join(" && ") : command,
-        ok: passed,
-        verdict,
-      });
     } catch (err: unknown) {
       if (!guard.isLive()) return false;
       const detail = reportPanelError("coverage", err);
@@ -851,11 +872,6 @@
         status: "failed",
         detail,
       };
-      harnessStore.recordAction({
-        kind: "coverage-script",
-        label: command,
-        ok: false,
-      });
     }
 
     if ((options.rescan ?? true) && guard.isLive()) rescan();

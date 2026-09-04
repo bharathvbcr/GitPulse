@@ -448,6 +448,7 @@
   <div
     role="dialog"
     aria-modal="true"
+    aria-labelledby="command-palette-title"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && (isOpen = false)}
     onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
@@ -463,6 +464,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-lg gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
     >
+      <h2 id="command-palette-title" class="sr-only">Command palette</h2>
       <div class="p-3.5 border-b border-border/60 flex items-center gap-2.5 bg-surface">
         <Search size={16} class="text-accent shrink-0" />
         <input

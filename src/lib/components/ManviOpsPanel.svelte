@@ -22,6 +22,7 @@
   import { repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
+  import { harnessPermissionMode } from "../harness/availability";
   import {
     formatReleaseDate,
     releaseTagSuggestion,
@@ -38,6 +39,16 @@
   /** One MANVI surface, two panes: guarded operations, and harness/AI controls. */
   type Pane = "ops" | "harness";
   let pane = $state<Pane>("ops");
+  let permissionMode = $derived(harnessPermissionMode($harnessStore.harness));
+  let permissionLabel = $derived(
+    permissionMode === "connected"
+      ? "policy connected"
+      : permissionMode === "unguarded"
+        ? "MANVI not installed"
+        : permissionMode === "blocked"
+          ? "mutations blocked"
+          : "checking policy",
+  );
 
   let subtitle = $derived(
     pane === "ops"
@@ -337,7 +348,7 @@
         <div class="flex items-center gap-2">
           <ShieldCheck size={19} class="text-accent" />
           <h2 class="text-base font-semibold">MANVI</h2>
-          <span class="gp-pill">{$harnessStore.harness?.available ? "policy connected" : "unchecked mode"}</span>
+          <span class="gp-pill">{permissionLabel}</span>
         </div>
         <p class="mt-1 text-textMuted">{subtitle}</p>
       </div>
@@ -347,9 +358,9 @@
             <RefreshCw size={13} class={busy ? "animate-spin" : ""} /> Refresh all
           </button>
         {/if}
-        <div class="gp-segmented">
-          <button type="button" data-active={pane === "ops" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "ops")}>Ops</button>
-          <button type="button" data-active={pane === "harness" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "harness")}>Harness &amp; AI</button>
+        <div class="gp-segmented" role="group" aria-label="MANVI view">
+          <button type="button" aria-pressed={pane === "ops"} data-active={pane === "ops" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "ops")}>Ops</button>
+          <button type="button" aria-pressed={pane === "harness"} data-active={pane === "harness" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "harness")}>Harness &amp; AI</button>
         </div>
       </div>
     </div>

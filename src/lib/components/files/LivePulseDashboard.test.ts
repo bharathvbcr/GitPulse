@@ -33,6 +33,27 @@ describe("LivePulseDashboard", () => {
     expect(source).toContain('"cmd_get_commit_graph"');
   });
 
+  it("invalidates prior file details synchronously when the async selection identity changes", () => {
+    const loader = source.slice(
+      source.indexOf("async function loadFileDetails"),
+      source.indexOf("$effect(() =>", source.indexOf("async function loadFileDetails")),
+    );
+    const firstAwait = loader.indexOf("await invoke");
+    expect(firstAwait).toBeGreaterThan(-1);
+    expect(loader.indexOf("detectedLang = null")).toBeGreaterThan(-1);
+    expect(loader.indexOf("detectedLang = null")).toBeLessThan(firstAwait);
+    expect(loader.indexOf("recentCommits = []")).toBeGreaterThan(-1);
+    expect(loader.indexOf("recentCommits = []")).toBeLessThan(firstAwait);
+
+    const selectionEffect = source.slice(
+      source.lastIndexOf("$effect(() =>"),
+      source.indexOf("</script>"),
+    );
+    expect(selectionEffect).toContain("const repo = $repoStore.currentPath;");
+    expect(selectionEffect).toContain("commitGuard?.cancel()");
+    expect(selectionEffect).toContain("isLoadingCommits = false");
+  });
+
   it("links to Diff, Blame, and Graph via inspectCommitInHistory", () => {
     expect(source).toContain("repoStore.setActiveTab('diff')");
     expect(source).toContain("repoStore.setActiveTab('blame')");

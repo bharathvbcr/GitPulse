@@ -15,7 +15,11 @@
   let {
     filePath,
     blob,
+    draftContent = null,
+    dirty = false,
     onSave,
+    onDraftChange,
+    onRequestDiscard,
   }: {
     filePath: string;
     blob: {
@@ -26,7 +30,11 @@
       text?: string | null;
       base64?: string | null;
     };
+    draftContent?: string | null;
+    dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
+    onDraftChange?: (newContent: string, sourceContent: string) => void;
+    onRequestDiscard?: () => Promise<boolean>;
   } = $props();
 
   // Image viewer state
@@ -144,7 +152,15 @@
   </div>
 {:else if isMarkdown}
   <!-- MarkDev Integrated Markdown Viewer -->
-  <MarkDevViewer {filePath} {blob} {onSave} />
+  <MarkDevViewer
+    {filePath}
+    {blob}
+    {draftContent}
+    {dirty}
+    {onSave}
+    {onDraftChange}
+    {onRequestDiscard}
+  />
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text">
@@ -188,5 +204,13 @@
   </div>
 {:else}
   <!-- Default Code Viewer -->
-  <CodeViewer {filePath} content={blob.text || ""} {onSave} />
+  <CodeViewer
+    {filePath}
+    content={blob.text || ""}
+    {draftContent}
+    {dirty}
+    {onSave}
+    {onDraftChange}
+    {onRequestDiscard}
+  />
 {/if}

@@ -8,6 +8,8 @@
   import { filterStore } from "../stores/filterStore";
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
+  import { copyText as copyToClipboard } from "../desktop/clipboard";
+  import { enumerateFocusables } from "../ui/focusTrap";
   import {
     branchLeafName,
     countFolder,
@@ -410,31 +412,31 @@
     }
   }
 
-  function trackOpener() {
-    // Capture at open time: contextmenu doesn't move focus, so activeElement
-    // is whatever the user was on before right-clicking.
-    openerEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  function trackOpener(event: MouseEvent) {
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    openerEl = event.currentTarget instanceof HTMLElement ? event.currentTarget : active;
     menuIndex = -1;
   }
 
   function openBranchMenu(e: MouseEvent, branch: BranchInfo) {
     e.preventDefault();
     e.stopPropagation();
-    trackOpener();
+    trackOpener(e);
     menu = { x: e.clientX, y: e.clientY, branch };
   }
 
   function openTagMenu(e: MouseEvent, tag: TagInfo) {
     e.preventDefault();
     e.stopPropagation();
-    trackOpener();
+    trackOpener(e);
     menu = { x: e.clientX, y: e.clientY, tag };
   }
 
   /**
    * Single close path so every dismissal also drops the opener reference.
-   * Escape/Tab pass restoreFocus to hand keyboard users back to where they
-   * came from; pointer dismissals leave focus wherever the click landed.
+   * Escape passes restoreFocus to hand keyboard users back to where they
+   * came from; Tab advances outside the menu and pointer dismissals leave
+   * focus wherever the click landed.
    */
   function closeMenu(opts: { restoreFocus?: boolean } = {}) {
     const opener = openerEl;
@@ -453,9 +455,42 @@
     return [...menuEl.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
   }
 
+  function focusAdjacentToMenuOpener(
+    popup: HTMLElement,
+    opener: HTMLElement | null,
+    backwards: boolean,
+  ) {
+    const candidates = enumerateFocusables<HTMLElement>(document).filter(
+      (candidate) =>
+        candidate.tabIndex >= 0 &&
+        !popup.contains(candidate) &&
+        candidate.getClientRects().length > 0,
+    );
+    if (candidates.length === 0) return;
+
+    const openerIndex = opener ? candidates.indexOf(opener) : -1;
+    let target = openerIndex >= 0
+      ? candidates[openerIndex + (backwards ? -1 : 1)]
+      : undefined;
+    if (!target && opener?.isConnected) {
+      const direction = backwards
+        ? Node.DOCUMENT_POSITION_PRECEDING
+        : Node.DOCUMENT_POSITION_FOLLOWING;
+      const ordered = backwards ? [...candidates].reverse() : candidates;
+      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
+    }
+    target ??= candidates[backwards ? candidates.length - 1 : 0];
+    window.setTimeout(() => target?.focus(), 0);
+  }
+
   function handleMenuKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape" || e.key === "Tab") {
-      // Tab closes a menu per WAI-ARIA rather than walking its items.
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (menuEl) focusAdjacentToMenuOpener(menuEl, openerEl, e.shiftKey);
+      closeMenu();
+      return;
+    }
+    if (e.key === "Escape") {
       e.preventDefault();
       closeMenu({ restoreFocus: true });
       return;
@@ -482,9 +517,7 @@
   }
 
   async function copyText(value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
+    if (!(await copyToClipboard(value))) {
       repoStore.setError("Could not copy to clipboard");
     }
     closeMenu();

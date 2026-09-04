@@ -86,14 +86,20 @@
   let copiedMessage = $state(false);
 
   async function copySha(id: string) {
-    await copyText(id);
+    if (!(await copyText(id))) {
+      toastStore.error("Could not copy the commit SHA");
+      return;
+    }
     copiedSha = true;
     toastStore.info(`Copied full SHA: ${id.slice(0, 8)}`, undefined, 2000);
     setTimeout(() => (copiedSha = false), 1500);
   }
 
   async function copyMessage(msg: string) {
-    await copyText(msg);
+    if (!(await copyText(msg))) {
+      toastStore.error("Could not copy the commit message");
+      return;
+    }
     copiedMessage = true;
     toastStore.info("Copied commit message", undefined, 2000);
     setTimeout(() => (copiedMessage = false), 1500);

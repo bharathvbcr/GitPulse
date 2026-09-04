@@ -10,6 +10,7 @@ import {
   installGlobalDiagnostics,
   diagnosticFingerprint,
   isHostRuntimeNoise,
+  redactDiagnosticText,
   type DiagnosticEntry,
   type DiagnosticSeverity,
 } from "./diagnostics";
@@ -27,6 +28,190 @@ function makeStore(now: number[] = [], storage = memoryStorage()) {
 }
 
 describe("createDiagnostics", () => {
+  it("redacts credentials before they reach memory, localStorage, or reports", () => {
+    const storage = memoryStorage();
+    const store = createDiagnostics({ storage, now: () => 5 });
+    const key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    store.error(
+      `auth-${key}`,
+      `git push https://user:${key}@github.com/o/r\nAuthorization: Bearer ${key}`,
+    );
+
+    const [entry] = get(store);
+    const persisted = storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "";
+    const report = formatDiagnosticReport([entry], new Date("2026-01-01T00:00:00Z"));
+    for (const surface of [entry.source, entry.message, persisted, report]) {
+      expect(surface).not.toContain(key);
+    }
+    expect(entry.source).toContain("ghp_");
+    expect(persisted).toContain("ghp_");
+    expect(report).toContain("ghp_");
+  });
+
+  it("redacts generic auth headers, cookies, URL passwords, named secrets, and private-key blocks", () => {
+    const privateKey = [
+      "-----BEGIN PRIVATE KEY-----",
+      "super-secret-base64-body",
+      "-----END PRIVATE KEY-----",
+    ].join("\n");
+    const out = redactDiagnosticText(
+      `Authorization: Basic dXNlcjpwYXNz\nAuthorization: Digest opaque-digest-secret\nCookie: session=secret\nhttps://me:p4ss@example.test/r?access_token=query-secret\npostgres://dbuser:database-secret@example.test/app\n{"Authorization":"Token json-auth-secret"}\n{"Cookie":"session=json-cookie-secret"}\n{"api_key":"json-secret"}\n${privateKey}`,
+    );
+    expect(out).toContain("Authorization: Basic <redacted>");
+    expect(out).toContain("Cookie: <redacted>");
+    expect(out).toContain("https://me:<redacted>@example.test/r");
+    expect(out).toContain("<private key redacted>");
+    expect(out).not.toContain("dXNlcjpwYXNz");
+    expect(out).not.toContain("opaque-digest-secret");
+    expect(out).not.toContain("session=secret");
+    expect(out).not.toContain("database-secret");
+    expect(out).not.toContain("json-auth-secret");
+    expect(out).not.toContain("json-cookie-secret");
+    expect(out).not.toContain("query-secret");
+    expect(out).not.toContain("json-secret");
+    expect(out).toContain("access_token=<redacted>");
+    expect(out).toContain("postgres://dbuser:<redacted>@example.test/app");
+    expect(out).toContain('{"Authorization":"<redacted>"}');
+    expect(out).toContain('{"Cookie":"<redacted>"}');
+    expect(out).toContain('{"api_key":"<redacted>"}');
+    expect(out).not.toContain("super-secret-base64-body");
+    expect(redactDiagnosticText(out)).toBe(out);
+  });
+
+  it("redacts serialized and separate-value credentials without corrupting JSON", () => {
+    const cases = [
+      [
+        '["git","-c","http.extraHeader=Authorization: Bearer opaque-auth","fetch"]',
+        '["git","-c","http.extraHeader=Authorization: Bearer <redacted>","fetch"]',
+        "opaque-auth",
+      ],
+      [
+        '["curl","-H","Cookie: session=opaque-cookie","https://example.test"]',
+        '["curl","-H","Cookie: <redacted>","https://example.test"]',
+        "opaque-cookie",
+      ],
+      [
+        '{"error":"password=opaque-password","phase":"gate"}',
+        '{"error":"password=<redacted>","phase":"gate"}',
+        "opaque-password",
+      ],
+      [
+        '["tool","Authorization: Bearer opaque-escaped\\\\nnext","tail"]',
+        '["tool","Authorization: Bearer <redacted>","tail"]',
+        "opaque-escaped",
+      ],
+      [
+        '["tool","AWS_SECRET_ACCESS_KEY=opaque-aws","next"]',
+        '["tool","AWS_SECRET_ACCESS_KEY=<redacted>","next"]',
+        "opaque-aws",
+      ],
+      [
+        '["tool","-----BEGIN PGP PRIVATE KEY BLOCK-----\\\\nopaque-pgp\\\\n-----END PGP PRIVATE KEY BLOCK-----","next"]',
+        '["tool","<private key redacted>","next"]',
+        "opaque-pgp",
+      ],
+      [
+        '["tool","-----BEGIN PRIVATE KEY-----\\\\nopaque-pem\\\\n-----END PRIVATE KEY-----","next"]',
+        '["tool","<private key redacted>","next"]',
+        "opaque-pem",
+      ],
+      [
+        '["tool","--password","opaque-cli-password","next"]',
+        '["tool","--password","<redacted>","next"]',
+        "opaque-cli-password",
+      ],
+      [
+        '["curl","--user","alice:opaque-basic-password","https://example.test"]',
+        '["curl","--user","alice:<redacted>","https://example.test"]',
+        "opaque-basic-password",
+      ],
+      [
+        'argv=["tool","--password","opaque-wrapped-password","next"]',
+        'argv=["tool","--password","<redacted>","next"]',
+        "opaque-wrapped-password",
+      ],
+      [
+        'prefix ["curl","--user","alice:opaque-wrapped-basic"] suffix',
+        'prefix ["curl","--user","alice:<redacted>"] suffix',
+        "opaque-wrapped-basic",
+      ],
+      [
+        "command=tool --access-token opaque-shell-token next",
+        "command=tool --access-token <redacted> next",
+        "opaque-shell-token",
+      ],
+      [
+        "command=curl --user alice:opaque-shell-password https://example.test",
+        "command=curl --user <redacted> https://example.test",
+        "opaque-shell-password",
+      ],
+      [
+        'phase [broken argv=["tool","--password","opaque-after-broken-bracket","next"]',
+        'phase [broken argv=["tool","--password","<redacted>","next"]',
+        "opaque-after-broken-bracket",
+      ],
+      [
+        '[unclosed prefix ["curl","--user","alice:opaque-after-unclosed","https://example.test"] suffix',
+        '[unclosed prefix ["curl","--user","alice:<redacted>","https://example.test"] suffix',
+        "opaque-after-unclosed",
+      ],
+      [
+        '{"message":"argv=[\\"tool\\",\\"--password\\",\\"opaque-nested-password\\",\\"next\\"]"}',
+        '{"message":"argv=[\\"tool\\",\\"--password\\",\\"<redacted>\\",\\"next\\"]"}',
+        "opaque-nested-password",
+      ],
+    ] as const;
+
+    for (const [input, expected, secret] of cases) {
+      const out = redactDiagnosticText(input);
+      expect(out).not.toContain(secret);
+      expect(out).toBe(expected);
+      try {
+        JSON.parse(input);
+        expect(() => JSON.parse(out)).not.toThrow();
+      } catch {
+        // Wrapper prose is intentionally not JSON; only complete JSON inputs
+        // carry a structure-preservation assertion.
+      }
+      expect(redactDiagnosticText(out)).toBe(out);
+    }
+  });
+
+  it("redacts recursively serialized strings without corrupting their outer JSON", () => {
+    const cases = [
+      ["opaque-depth-cli", JSON.stringify(["tool", "--password", "opaque-depth-cli", "next"])],
+      ["opaque-depth-auth", "Authorization: Bearer opaque-depth-auth"],
+      ["opaque-depth-cookie", "Cookie: session=opaque-depth-cookie"],
+      ["opaque-depth-key", "api_key=opaque-depth-key"],
+    ] as const;
+
+    for (const [secret, payload] of cases) {
+      const nested = JSON.stringify({ message: payload });
+      const input = JSON.stringify({ message: nested });
+      const out = redactDiagnosticText(input);
+      expect(out).not.toContain(secret);
+      const parsed = JSON.parse(out) as { message: string };
+      const parsedNested = JSON.parse(parsed.message) as { message: string };
+      if (payload.startsWith("[")) expect(() => JSON.parse(parsedNested.message)).not.toThrow();
+      expect(redactDiagnosticText(out)).toBe(out);
+    }
+  });
+
+  it("fails closed when structured JSON reaches the serialized nesting cap", () => {
+    const secret = "opaque-boundary-auth";
+    let payload: unknown = `Authorization: Bearer ${secret}`;
+    for (let depth = 0; depth < 40; depth += 1) {
+      payload = { message: payload };
+    }
+    const input = JSON.stringify(payload);
+
+    const out = redactDiagnosticText(input);
+
+    expect(out).not.toContain(secret);
+    expect(() => JSON.parse(out)).not.toThrow();
+    expect(redactDiagnosticText(out)).toBe(out);
+  });
+
   it("records errors and warnings newest-first through formatError", () => {
     const { store } = makeStore([10, 20]);
     store.error("console", new TypeError("nope"));
@@ -35,6 +220,18 @@ describe("createDiagnostics", () => {
     expect(entries.map((entry) => entry.severity)).toEqual(["warning", "error"]);
     expect(entries[1].message).toBe("nope");
     expect(entries.map((entry) => entry.id)).toEqual([2, 1]);
+  });
+
+  it("records a hostile thrown-message getter without rethrowing from diagnostics", () => {
+    const { store } = makeStore([10]);
+    const hostile = {
+      get message(): string {
+        throw new Error("getter exploded");
+      },
+    };
+
+    expect(() => store.error("unhandled-rejection", hostile)).not.toThrow();
+    expect(get(store)[0]?.message).toBe("Unknown error");
   });
 
   it("coalesces identical consecutive repeats into a counted entry", () => {

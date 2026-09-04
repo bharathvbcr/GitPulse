@@ -16,7 +16,13 @@ export interface RepoPanelCache<T> {
   readonly size: number;
 }
 
-export function createRepoPanelCache<T>(options?: { maxRepos?: number }): RepoPanelCache<T> {
+export interface RepoPanelCacheOptions<T> {
+  maxRepos?: number;
+  /** Protected values may exceed the soft bound rather than be destroyed. */
+  canEvict?: (value: T, path: string) => boolean;
+}
+
+export function createRepoPanelCache<T>(options?: RepoPanelCacheOptions<T>): RepoPanelCache<T> {
   const maxRepos = Math.max(1, options?.maxRepos ?? 8);
   // Map iterates in insertion order: re-inserting on get/set moves an entry to
   // the tail, so the head is always the least-recently-used victim.
@@ -34,9 +40,14 @@ export function createRepoPanelCache<T>(options?: { maxRepos?: number }): RepoPa
       entries.delete(path);
       entries.set(path, value);
       while (entries.size > maxRepos) {
-        const oldest = entries.keys().next();
-        if (oldest.done) break;
-        entries.delete(oldest.value);
+        let evicted = false;
+        for (const [candidatePath, candidateValue] of entries) {
+          if (options?.canEvict && !options.canEvict(candidateValue, candidatePath)) continue;
+          entries.delete(candidatePath);
+          evicted = true;
+          break;
+        }
+        if (!evicted) break;
       }
     },
     clear(): void {

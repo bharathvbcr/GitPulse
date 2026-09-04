@@ -19,6 +19,13 @@ describe("MediaViewer", () => {
     expect(source).toContain("<MarkDevViewer");
   });
 
+  it("forwards the canonical draft lifecycle to every CodeViewer surface", () => {
+    expect(source).toContain("draftContent");
+    expect(source).toContain("onDraftChange");
+    expect(source).toContain("onRequestDiscard");
+    expect(source).toContain("dirty");
+  });
+
   it("supports binary hex dump viewing", () => {
     expect(source).toContain("hexRows");
     expect(source).toContain("hexDumpRows");

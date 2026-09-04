@@ -8,6 +8,8 @@ import type { PolicyVerdict } from "../stores/harnessStore";
  * after the fact, including which actions ran with no policy gate at all.
  */
 export interface AgentActionEntry {
+  /** Stable render/dedup identity; unlike `id`, it is namespaced by source. */
+  identity: string;
   id: number;
   ts: number;
   /** Coarse verb: commit, push, rebase, stage, discard, edit, worktree… */
@@ -33,10 +35,20 @@ let nextId = 1;
 
 export function makeAgentAction(
   input: { kind: string; label: string; ok: boolean; verdict?: AgentActionEntry["verdict"] },
-  now: number = Date.now()
+  now: number = Date.now(),
+  repository: string = "",
 ): AgentActionEntry {
   const { kind, label, ok, verdict = null } = input;
-  return { id: nextId++, ts: now, kind, label, ok, verdict };
+  const id = nextId++;
+  return {
+    identity: JSON.stringify(["ephemeral", repository, id]),
+    id,
+    ts: now,
+    kind,
+    label,
+    ok,
+    verdict,
+  };
 }
 
 /** Immutable append that keeps the newest entries past the cap. */
@@ -47,6 +59,35 @@ export function appendAction(
   const next = list.length >= MAX_AGENT_ACTIONS ? list.slice(1) : list.slice();
   next.push(entry);
   return next;
+}
+
+/**
+ * Merges journal rows from different sources by their stable identity.
+ * Timestamps own cross-source ordering because SQLite and ephemeral numeric
+ * ids are independent domains.
+ */
+export function mergeActionEntries(
+  existing: AgentActionEntry[],
+  incoming: AgentActionEntry[],
+  displayCap: number = MAX_AGENT_ACTIONS,
+): AgentActionEntry[] {
+  if (incoming.length === 0) return existing;
+  const seen = new Set(existing.map((entry) => entry.identity));
+  const merged = existing.slice();
+  for (const entry of incoming) {
+    if (seen.has(entry.identity)) continue;
+    seen.add(entry.identity);
+    merged.push(entry);
+  }
+  merged.sort((a, b) => {
+    const timeOrder = a.ts - b.ts;
+    return Number.isFinite(timeOrder) && timeOrder !== 0
+      ? timeOrder
+      : a.id - b.id || a.identity.localeCompare(b.identity);
+  });
+  return merged.length > displayCap
+    ? merged.slice(merged.length - displayCap)
+    : merged;
 }
 
 /** Maps an invoked Tauri command to a journal verb. Unknown names pass as-is. */

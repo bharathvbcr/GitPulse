@@ -1664,14 +1664,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         applyToSession(session.id, generation, { error: formatError(err) });
       }
     },
-    selectFilePath: (filePath: string) => {
+    selectFilePath: (filePath: string | null) => {
       const session = activeSession();
       if (!session) return;
       // Records the shared file selection WITHOUT fetching a diff or moving
       // tabs: Coverage's file list and Blame's explorer converge on this one
       // site so the selection survives tab switches, and whichever viewer is
       // open reacts through its own effect. The diff fetch remains
-      // selectFileDiff's job.
+      // selectFileDiff's job. Null clears the selection when the final editor
+      // tab closes, preventing that closed path from reopening on remount.
       applyToSession(session.id, session.generation, {
         selectedFilePath: filePath,
         selectedCommitId: null,
@@ -2224,8 +2225,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // the mutation's own `.git` writes are about to bounce back as watcher
       // events (see WATCHER_ECHO_SUPPRESS_MS).
       mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
-      const policy = recordPolicyVerdict(result);
+      const policy = recordPolicyVerdict(result, path);
       harnessStore.recordAction({
+        repoPath: path,
         kind,
         label,
         ok: true,
@@ -2263,7 +2265,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // message it was about to commit — should not have to watch shared state
       // to find out whether its own call went through.
       applyToSession(session.id, generation, { error: formatError(err) });
-      harnessStore.recordAction({ kind, label, ok: false });
+      harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
       return { ok: false, error: formatError(err) };
     }
   }
@@ -2275,15 +2277,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
  * Files a `Guarded<T>` result's verdict with the harness store, and clears the
  * last verdict for an action that carried none.
  */
-function recordPolicyVerdict(result: unknown): PolicyVerdict | undefined {
+function recordPolicyVerdict(
+  result: unknown,
+  repoPath: string,
+): PolicyVerdict | undefined {
   if (result && typeof result === "object" && "policy" in result) {
     const policy = (result as { policy: PolicyVerdict }).policy;
     if (policy && typeof policy.status === "string") {
-      harnessStore.recordVerdict(policy);
+      harnessStore.recordVerdict(policy, repoPath);
       return policy;
     }
   }
-  harnessStore.recordVerdict(null);
+  harnessStore.recordVerdict(null, repoPath);
   return undefined;
 }
 

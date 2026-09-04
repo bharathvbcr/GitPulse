@@ -87,6 +87,46 @@ describe("CoverageViewer MANVI integration contracts", () => {
     expect(source).toContain('kind: "coverage-script"');
   });
 
+  it("journals completed report and step calls before stale-UI returns", () => {
+    for (const [start, end, awaitMarker] of [
+      ["async function generateAiReport", "async function copyGeneration", "await harnessStore.coverageReport"],
+      ["async function runStep", "async function runAllSteps", "await invoke<TerminalRunResult>"],
+    ] as const) {
+      const body = source.slice(source.indexOf(start), source.indexOf(end));
+      const settled = body.indexOf(awaitMarker);
+      const successJournal = body.indexOf("harnessStore.recordAction", settled);
+      const successGuard = body.indexOf("if (!guard.isLive()) return", settled);
+      expect(successJournal, `${start} success journal`).toBeGreaterThan(settled);
+      expect(successJournal, `${start} success before stale return`).toBeLessThan(successGuard);
+
+      const caught = body.indexOf("} catch", successGuard);
+      const failureJournal = body.indexOf("harnessStore.recordAction", caught);
+      const failureGuard = body.indexOf("if (!guard.isLive()) return", caught);
+      expect(failureJournal, `${start} failure journal`).toBeGreaterThan(caught);
+      expect(failureJournal, `${start} failure before stale return`).toBeLessThan(failureGuard);
+    }
+  });
+
+  it("journals every generator command at the shared IPC seam", () => {
+    const runner = source.slice(
+      source.indexOf("function invokeCoverageCommand"),
+      source.indexOf("async function runCoverageScript"),
+    );
+    const settled = runner.indexOf("await invoke<TerminalRunResult>");
+    const journal = runner.indexOf("harnessStore.recordAction", settled);
+    const returned = runner.indexOf("return res", settled);
+    expect(journal).toBeGreaterThan(settled);
+    expect(journal).toBeLessThan(returned);
+    const caught = runner.indexOf("} catch", returned);
+    const failureJournal = runner.indexOf("harnessStore.recordAction", caught);
+    const rethrown = runner.indexOf("throw err", caught);
+    expect(failureJournal).toBeGreaterThan(caught);
+    expect(failureJournal).toBeLessThan(rethrown);
+    expect(runner.match(/harnessStore\.recordAction/g)).toHaveLength(2);
+    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath, step.command)");
+    expect(source).toContain("invokeCoverageCommand(tokenized.argv, repoPath, command)");
+  });
+
   it("files a redacted snapshot through the canonical guarded issue owner", () => {
     const body = source.slice(
       source.indexOf("async function reportCoverageIssue"),
@@ -476,8 +516,8 @@ describe("CoverageViewer automatic recovery", () => {
     // A retry reaching the backend by a second path could reach it under
     // looser terms than the command it replaces.
     expect(source).toContain("function invokeCoverageCommand(");
-    expect(runner).toContain("invokeCoverageCommand(tokenized.argv, repoPath)");
-    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath)");
+    expect(runner).toContain("invokeCoverageCommand(tokenized.argv, repoPath, command)");
+    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath, step.command)");
     // The coverage runner itself never builds an IPC payload of its own.
     expect(runner).not.toContain('"cmd_manvi_run_action"');
   });
@@ -486,7 +526,7 @@ describe("CoverageViewer automatic recovery", () => {
     // Re-tokenizing would split an excluded path that contains a space back
     // into two arguments.
     expect(source).not.toContain("tokenizeCommand(step.command)");
-    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath)");
+    expect(source).toContain("invokeCoverageCommand(step.argv, repoPath, step.command)");
   });
 
   it("requires every step of a cumulative recovery to pass", () => {

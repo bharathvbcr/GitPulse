@@ -2,6 +2,7 @@
   import type { RepoChangedPayload } from "./lib/repos/events";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
   import { graphStore } from "./lib/stores/graphStore";
@@ -96,6 +97,12 @@
     maybeNotifyUpdate,
   } from "./lib/updates/updateCheck";
   import { openExternal } from "./lib/desktop/openExternal";
+  import { askConfirm } from "./lib/stores/modalStore";
+  import {
+    hasUnsavedEditorDrafts,
+    unsavedEditorDrafts,
+  } from "./lib/files/editorDraftRegistry";
+  import { editorFileSaveQueue } from "./lib/files/serialSave";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
@@ -185,6 +192,61 @@
     window.dispatchEvent(new CustomEvent(FOCUS_COMMIT_SEARCH_EVENT));
   }
 
+  let exitRequestPending = false;
+  let exitApproved = false;
+
+  async function answerNativeExitRequest() {
+    if (exitRequestPending) return;
+    exitRequestPending = true;
+
+    if (editorFileSaveQueue.pending > 0) {
+      const pending = editorFileSaveQueue.pending;
+      const waitForSaves = await askConfirm({
+        title: "Finish Saving Before Quit?",
+        message: `${pending} editor ${pending === 1 ? "save is" : "saves are"} still in progress. GitPulse can wait for accepted writes before quitting.`,
+        confirmLabel: "Wait and Quit",
+        cancelLabel: "Keep Editing",
+      });
+      if (!waitForSaves) {
+        exitRequestPending = false;
+        return;
+      }
+      toastStore.info("Finishing editor saves before quitting…");
+      await editorFileSaveQueue.whenIdle();
+    }
+
+    if (hasUnsavedEditorDrafts()) {
+      const drafts = unsavedEditorDrafts();
+      const fileCount = drafts.reduce((total, entry) => total + entry.paths.length, 0);
+      const preview = drafts
+        .flatMap((entry) => entry.paths.map((path) => `${displayName(entry.repo)} — ${path}`))
+        .slice(0, 5)
+        .map((path) => `• ${path}`)
+        .join("\n");
+      const omitted = Math.max(0, fileCount - 5);
+      const confirmed = await askConfirm({
+        title: "Discard Unsaved Edits and Quit?",
+        message: `${fileCount} unsaved editor ${fileCount === 1 ? "draft" : "drafts"} across ${drafts.length} ${drafts.length === 1 ? "repository" : "repositories"}:\n${preview}${omitted > 0 ? `\n…and ${omitted} more` : ""}`,
+        confirmLabel: "Discard and Quit",
+        cancelLabel: "Keep Editing",
+      });
+      if (!confirmed) {
+        exitRequestPending = false;
+        return;
+      }
+    }
+
+    exitApproved = true;
+    try {
+      await invoke("cmd_exit_app");
+    } catch (error) {
+      exitApproved = false;
+      exitRequestPending = false;
+      diagnostics.error("desktop:exit", error);
+      toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
+    }
+  }
+
   onMount(() => {
     applyPlatformClass();
     const unsubs: Array<() => void> = [];
@@ -196,6 +258,32 @@
       if (disposed) unsub();
       else unsubs.push(unsub);
     };
+
+    const guardBrowserUnload = (event: BeforeUnloadEvent) => {
+      if (exitApproved || !hasUnsavedEditorDrafts()) return;
+      event.preventDefault();
+      // Browsers intentionally ignore custom text but require a value to show
+      // their native data-loss confirmation.
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", guardBrowserUnload);
+    track(() => window.removeEventListener("beforeunload", guardBrowserUnload));
+
+    // Arm the native side only after its listener exists. This prevents a
+    // startup failure from trapping an exit request with nobody to answer it.
+    void listen<void>("gitpulse-exit-requested", () => {
+      void answerNativeExitRequest();
+    }).then(
+      (unlisten) => {
+        track(unlisten);
+        if (disposed) return;
+        void invoke("cmd_set_exit_guard_ready").catch((error) =>
+          diagnostics.warn("boot:exit-guard", error),
+        );
+      },
+      (error) => diagnostics.warn("boot:exit-listener", error),
+    );
+
     // The command palette opens Diagnostics through this window event.
     const openDiagnostics = () => {
       isDiagnosticsOpen = true;
@@ -432,8 +520,13 @@
   let lastCaughtUpPath: string | null = null;
   $effect(() => {
     const path = $repoStore.currentPath;
-    if (!path || path === lastCaughtUpPath) return;
+    // Switch the public journal projection synchronously. Durable events for
+    // other open repositories may still arrive and refresh their own buckets,
+    // but they must never become visible in this repository's journal.
+    harnessStore.activateRepository(path);
+    if (path === lastCaughtUpPath) return;
     lastCaughtUpPath = path;
+    if (!path) return;
     void harnessStore.catchUp(path);
   });
 

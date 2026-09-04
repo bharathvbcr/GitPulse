@@ -2,6 +2,7 @@ pub mod actions;
 mod menu;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -14,11 +15,13 @@ use menu::build_native_menu;
 pub const MENU_EVENT: &str = "gitpulse-menu";
 pub const OPEN_REPO_EVENT: &str = "gitpulse-open-repo";
 pub const OPEN_ERROR_EVENT: &str = "gitpulse-open-error";
+pub const EXIT_REQUESTED_EVENT: &str = "gitpulse-exit-requested";
 
 #[derive(Default)]
 pub struct DesktopState {
     recents: Mutex<Vec<String>>,
     pending_open: Mutex<Option<String>>,
+    exit_guard_ready: AtomicBool,
 }
 
 #[derive(Clone, Serialize)]
@@ -27,14 +30,15 @@ pub struct NativeEvent {
     pub path: Option<String>,
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClosePolicy {
-    ExitApp,
+fn should_guard_exit(frontend_ready: bool, programmatic_exit: bool) -> bool {
+    frontend_ready && !programmatic_exit
 }
 
-#[cfg(target_os = "macos")]
-const CLOSE_POLICY: ClosePolicy = ClosePolicy::ExitApp;
+fn request_exit_confirmation<R: Runtime>(app: &AppHandle<R>) {
+    if let Err(error) = app.emit(EXIT_REQUESTED_EVENT, ()) {
+        log::warn!(target: "desktop", "exit-request emit failed: {error}");
+    }
+}
 
 pub fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let recents = app
@@ -64,18 +68,23 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
 }
 
 pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
-    #[cfg(target_os = "macos")]
-    if let WindowEvent::CloseRequested { .. } = event {
-        match CLOSE_POLICY {
-            // macOS otherwise keeps the process alive after its last window is
-            // closed. GitPulse has no background-only mode, so close should
-            // terminate the app and let the normal exit handler reap sidecars.
-            ClosePolicy::ExitApp => window.app_handle().exit(0),
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        let app = window.app_handle();
+        let ready = app
+            .state::<DesktopState>()
+            .exit_guard_ready
+            .load(Ordering::Acquire);
+        if ready {
+            api.prevent_close();
+            request_exit_confirmation(app);
+        } else {
+            // Before the webview has installed its listener, blocking close
+            // would strand the process with nobody able to answer. macOS
+            // needs an explicit exit because closing its last window normally
+            // leaves the process alive; other platforms keep their default.
+            #[cfg(target_os = "macos")]
+            app.exit(0);
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (window, event);
     }
 }
 
@@ -110,7 +119,18 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
         // them fires depends on how the app is told to quit, and
         // `sidecar::shutdown` gives up after ~1.2s rather than stalling
         // exit behind an in-flight request.
-        RunEvent::ExitRequested { .. } => crate::harness::sidecar::shutdown(),
+        RunEvent::ExitRequested { code, api, .. } => {
+            let ready = app
+                .state::<DesktopState>()
+                .exit_guard_ready
+                .load(Ordering::Acquire);
+            if should_guard_exit(ready, code.is_some()) {
+                api.prevent_exit();
+                request_exit_confirmation(app);
+            } else {
+                crate::harness::sidecar::shutdown();
+            }
+        }
         RunEvent::Exit => crate::harness::sidecar::shutdown(),
         _ => {}
     }
@@ -206,6 +226,19 @@ pub fn cmd_resolve_git_root(path: String) -> Result<String, String> {
         .ok_or_else(|| format!("Not a Git repository: {path}"))
 }
 
+/// Arms close protection only after the frontend listener is installed.
+#[tauri::command(async)]
+pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
+    state.exit_guard_ready.store(true, Ordering::Release);
+}
+
+/// Completes a frontend-approved exit. `AppHandle::exit` supplies a code, so
+/// the run-event guard can distinguish this from an OS/user quit request.
+#[tauri::command(async)]
+pub fn cmd_exit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,9 +254,11 @@ mod tests {
         assert_eq!(state.pending_open.lock().unwrap().take(), None);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn closing_the_window_exits_the_app_instead_of_hiding_it() {
-        assert_eq!(CLOSE_POLICY, ClosePolicy::ExitApp);
+    fn exit_guard_only_intercepts_user_requests_after_frontend_is_ready() {
+        assert!(!should_guard_exit(false, false));
+        assert!(!should_guard_exit(false, true));
+        assert!(should_guard_exit(true, false));
+        assert!(!should_guard_exit(true, true));
     }
 }

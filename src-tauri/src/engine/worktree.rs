@@ -7,12 +7,111 @@
 //! removes them through the same validated, harness-gated paths as every other
 //! write.
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Canonical address of one checkout inside a linked-worktree family.
+///
+/// `anchor` is the primary worktree (the first entry in Git's porcelain
+/// listing), which owns repository-wide `.devcouncil` state. `worktree` is the
+/// actual checkout an operation targets. Keeping both prevents two opposite
+/// mistakes: splitting one repository's ledger between sibling directories,
+/// and erasing which checkout an action happened in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeFamily {
+    pub anchor: std::path::PathBuf,
+    pub worktree: std::path::PathBuf,
+    /// Every active checkout authenticated by Git for this common directory.
+    /// Callers use this to consolidate pre-family state without scanning or
+    /// trusting arbitrary sibling paths from the filesystem.
+    pub members: Vec<std::path::PathBuf>,
+}
+
+/// Resolves and authenticates a repository/worktree pair.
+///
+/// A common git directory is necessary but not sufficient: a directory with a
+/// hand-written gitfile can point at another checkout's git directory without
+/// being a registered worktree. The target must also appear in `git worktree
+/// list`, and both paths must resolve to the same common directory.
+pub fn resolve_worktree_family(
+    repo_path: &str,
+    worktree_path: &str,
+) -> Result<WorktreeFamily, String> {
+    let repo = validate_repo(repo_path)?;
+    let worktree = if Path::new(worktree_path) == repo {
+        repo.clone()
+    } else {
+        validate_repo(worktree_path)?
+    };
+
+    let repo_common = resolve_git_common_dir(&repo)?;
+    let worktree_common = if worktree == repo {
+        repo_common.clone()
+    } else {
+        resolve_git_common_dir(&worktree)?
+    };
+    if repo_common != worktree_common {
+        return Err(format!(
+            "Worktree '{}' does not belong to repository '{}'",
+            worktree.display(),
+            repo.display()
+        ));
+    }
+
+    // `-z` makes paths containing newlines unambiguous. IPC repository paths
+    // are UTF-8 strings, so an unrepresentable list entry cannot equal either
+    // validated input and is safely ignored.
+    let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut registered = Vec::new();
+    for field in raw.split('\0') {
+        let Some(path) = field.strip_prefix("worktree ") else {
+            continue;
+        };
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            // Prunable entries are history, not active authority targets.
+            continue;
+        };
+        registered.push(canonical);
+    }
+
+    let Some(anchor) = registered.first().cloned() else {
+        return Err("Git returned no active worktrees for this repository".to_string());
+    };
+    if !registered.iter().any(|path| path == &repo) {
+        return Err(format!(
+            "Repository '{}' is not a registered worktree",
+            repo.display()
+        ));
+    }
+    if !registered.iter().any(|path| path == &worktree) {
+        return Err(format!(
+            "Worktree '{}' is not registered with repository '{}'",
+            worktree.display(),
+            repo.display()
+        ));
+    }
+
+    let anchor_common = if anchor == repo {
+        repo_common.clone()
+    } else if anchor == worktree {
+        worktree_common.clone()
+    } else {
+        resolve_git_common_dir(&anchor)?
+    };
+    if anchor_common != repo_common {
+        return Err("Git's primary worktree belongs to a different repository".to_string());
+    }
+
+    Ok(WorktreeFamily {
+        anchor,
+        worktree,
+        members: registered,
+    })
+}
 
 /// How many worktrees get a dirty-file scan when listing. Worktrees number in
 /// the low dozens even under heavy agent use; this cap keeps a pathological

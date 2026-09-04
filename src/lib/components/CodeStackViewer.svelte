@@ -69,6 +69,8 @@
     const guard = createAsyncGuard();
     restackGuard = guard;
     restackingKey = node.branch_name;
+    const actionLabel = `Restack ${node.branch_name} onto ${node.parent_branch_name}`;
+    let restackCompleted = false;
     // The red banner from the previous attempt must not imply this attempt
     // already failed; clear before the await, not only on success.
     restackError = null;
@@ -80,28 +82,33 @@
         branch: node.branch_name,
         onto: node.parent_branch_name,
       });
-      if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
+      restackCompleted = true;
       // README contract: mutating verdicts are recorded centrally and surface
       // in the header badge. Restack used to bypass both.
-      harnessStore.recordVerdict(result.policy);
+      harnessStore.recordVerdict(result.policy, repoPath);
       harnessStore.recordAction({
+        repoPath,
         kind: "restack",
-        label: `Restack ${node.branch_name} onto ${node.parent_branch_name}`,
+        label: actionLabel,
         ok: true,
         verdict: result.policy,
       });
+      if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
       await repoStore.refresh();
       if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
       await loadStack(repoPath);
     } catch (err) {
+      if (!restackCompleted) {
+        harnessStore.recordAction({
+          repoPath,
+          kind: "restack",
+          label: actionLabel,
+          ok: false,
+          verdict: null,
+        });
+      }
       if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
       restackError = reportPanelError("stack", err);
-      harnessStore.recordAction({
-        kind: "restack",
-        label: `Restack ${node.branch_name} onto ${node.parent_branch_name}`,
-        ok: false,
-        verdict: null,
-      });
     } finally {
       restackingKey = null;
     }

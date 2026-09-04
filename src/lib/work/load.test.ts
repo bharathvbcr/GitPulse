@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { loadWork, MAX_BINDING_LOOKUPS, MAX_OPERATION_PROBES } from "./load";
-import { UNBOUND_ROW_ID } from "./projection";
+import { degradedSummary, UNBOUND_ROW_ID } from "./projection";
 
 /** A fake IPC surface: every command answers from `answers`, or throws. */
 function fakeInvoke(answers: Record<string, unknown | (() => unknown)>) {
@@ -174,15 +174,30 @@ describe("loadWork", () => {
     expect(p.degraded).toBe(true);
   });
 
-  it("survives a binding lookup that throws", async () => {
+  it("keeps rows but degrades the worktree source when a binding lookup throws", async () => {
     const invoke = fakeInvoke(
-      baseAnswers({ cmd_worktree_task: new Error("ledger is locked") }),
+      baseAnswers({
+        cmd_list_worktrees: [
+          OK_WORKTREES[0],
+          { ...OK_WORKTREES[0], path: "/wt/failed", name: "failed", is_main: false },
+        ],
+        cmd_worktree_task: (args: { worktreePath: string }) =>
+          args.worktreePath === "/repo" ? "TASK-1" : new Error("ledger is locked"),
+      }),
     );
     const p = await loadWork("/repo", { invoke: invoke as never });
 
-    // The worktree is simply unbound; nothing else is lost.
+    // The row stays visible, but a failed lookup is not evidence that the
+    // worktree is genuinely unbound. The warning above the rows must say the
+    // binding could not be read and preserve the backend reason.
     expect(p.rows.find((r) => r.taskId === UNBOUND_ROW_ID)!.worktrees).toHaveLength(1);
-    expect(p.sources.worktrees.ok).toBe(true);
+    expect(p.rows.find((r) => r.taskId === "TASK-1")!.worktrees).toHaveLength(1);
+    expect(p.sources.worktrees.ok).toBe(false);
+    expect(p.sources.worktrees.detail).toContain("1 worktree");
+    expect(p.sources.worktrees.detail).toContain("task binding");
+    expect(p.sources.worktrees.detail).toContain("ledger is locked");
+    expect(p.degraded).toBe(true);
+    expect(degradedSummary(p.sources)).toContain("task binding");
   });
 
   it("never rejects", async () => {

@@ -5,6 +5,63 @@
     ConflictResolutionChoice,
   } from "../diff/conflict";
 
+  export interface ConflictCustomDraft {
+    value: string;
+    /** True only while this chunk is actively using its custom resolution. */
+    active: boolean;
+  }
+
+  export type ConflictCustomDrafts = Record<string, ConflictCustomDraft>;
+
+  /** A write may finalize only if no resolution changed while it was in flight. */
+  export function canFinalizeConflictSave(savedRevision: number, currentRevision: number): boolean {
+    return savedRevision === currentRevision;
+  }
+
+  /** Repository paths and file paths cannot contain NUL, so this identity is collision-free. */
+  export function conflictDraftKey(repo: string, file: string, chunkIndex: number): string {
+    return `${repo}\u0000${file}\u0000${chunkIndex}`;
+  }
+
+  function resolutionForCustomDraft(value: string): ConflictResolutionChoice {
+    return value.trim() === "" ? "Unresolved" : { Custom: value };
+  }
+
+  /**
+   * Copy every active draft for this exact repo/file into the wire document.
+   * Save calls this synchronously before serialization, independently of the
+   * debounced preview.
+   */
+  export function flushCustomDrafts(
+    document: ConflictDocument,
+    repo: string,
+    file: string,
+    drafts: ConflictCustomDrafts,
+  ): ConflictDocument {
+    if (document.file_path !== file) return document;
+    for (const segment of document.segments) {
+      const chunk = segment.Conflict;
+      if (!chunk) continue;
+      const draft = drafts[conflictDraftKey(repo, file, chunk.chunk_index)];
+      if (draft?.active) chunk.resolution = resolutionForCustomDraft(draft.value);
+    }
+    return document;
+  }
+
+  /** Called only after the resolved file has been written successfully. */
+  export function clearCustomDraftsForDocument(
+    drafts: ConflictCustomDrafts,
+    repo: string,
+    file: string,
+    document: ConflictDocument,
+  ): void {
+    if (document.file_path !== file) return;
+    for (const segment of document.segments) {
+      const chunk = segment.Conflict;
+      if (chunk) delete drafts[conflictDraftKey(repo, file, chunk.chunk_index)];
+    }
+  }
+
   /**
    * A fresh parse lands every chunk back at Unresolved. When it belongs to
    * the file the user is already editing (e.g. they flipped files and came
@@ -59,15 +116,22 @@
   let resolvedPreview = $state<string>("");
   let isSaving = $state(false);
   let saveError = $state<string | null>(null);
-  let customDrafts = $state<Record<number, string>>({});
+  let customDrafts = $state<ConflictCustomDrafts>({});
+  let editRevision = 0;
   let loadGuard: AsyncGuard | null = null;
   let previewGuard: AsyncGuard | null = null;
   let saveGuard: AsyncGuard | null = null;
-  const customTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  const customTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   function customText(chunk: ConflictChunk): string {
+    const repo = $repoStore.currentPath;
+    const file = parsedDoc?.file_path;
+    const draft = repo && file
+      ? customDrafts[conflictDraftKey(repo, file, chunk.chunk_index)]
+      : undefined;
+    if (draft) return draft.value;
     if (typeof chunk.resolution === "object") return chunk.resolution.Custom;
-    return customDrafts[chunk.chunk_index] ?? "";
+    return "";
   }
 
   $effect(() => {
@@ -136,8 +200,10 @@
         });
         if (!guard.isLive()) return;
         loadError = null;
-        parsedDoc = adoptResolutions(doc, parsedDoc);
-        await updatePreview(parsedDoc);
+        const adopted = adoptResolutions(doc, parsedDoc);
+        flushCustomDrafts(adopted, repo, file, customDrafts);
+        parsedDoc = adopted;
+        await updatePreview(adopted);
       } catch (err) {
         if (!guard.isLive()) return;
         parsedDoc = null;
@@ -149,36 +215,79 @@
     })();
   });
 
-  function setChunkResolution(chunkIndex: number, choice: ConflictResolutionChoice) {
-    if (!parsedDoc) return;
-    for (const seg of parsedDoc.segments) {
+  function setDocumentChunkResolution(
+    document: ConflictDocument,
+    chunkIndex: number,
+    choice: ConflictResolutionChoice,
+  ) {
+    for (const seg of document.segments) {
       if (seg.Conflict && seg.Conflict.chunk_index === chunkIndex) {
         seg.Conflict.resolution = choice;
       }
     }
-    void updatePreview(parsedDoc);
+  }
+
+  function deactivateCustomDraft(repo: string, file: string, chunkIndex: number) {
+    const key = conflictDraftKey(repo, file, chunkIndex);
+    const draft = customDrafts[key];
+    if (draft) customDrafts[key] = { ...draft, active: false };
+    const timer = customTimers.get(key);
+    if (timer) clearTimeout(timer);
+    customTimers.delete(key);
+  }
+
+  function setChunkResolution(chunkIndex: number, choice: ConflictResolutionChoice) {
+    const repo = $repoStore.currentPath;
+    const document = parsedDoc;
+    if (!repo || !document) return;
+    if (typeof choice !== "object") {
+      deactivateCustomDraft(repo, document.file_path, chunkIndex);
+    }
+    setDocumentChunkResolution(document, chunkIndex, choice);
+    editRevision += 1;
+    void updatePreview(document);
   }
 
   function resolveAll(choice: ConflictResolutionChoice) {
-    if (!parsedDoc) return;
-    for (const seg of parsedDoc.segments) {
+    const repo = $repoStore.currentPath;
+    const document = parsedDoc;
+    if (!repo || !document) return;
+    for (const seg of document.segments) {
       if (seg.Conflict) {
+        if (typeof choice !== "object") {
+          deactivateCustomDraft(repo, document.file_path, seg.Conflict.chunk_index);
+        }
         seg.Conflict.resolution = choice;
       }
     }
-    void updatePreview(parsedDoc);
+    editRevision += 1;
+    void updatePreview(document);
   }
 
   function onCustomInput(chunkIndex: number, value: string) {
-    customDrafts[chunkIndex] = value;
-    const existing = customTimers.get(chunkIndex);
+    const repo = $repoStore.currentPath;
+    const document = parsedDoc;
+    if (!repo || !document || selectedFile !== document.file_path) return;
+    const file = document.file_path;
+    const key = conflictDraftKey(repo, file, chunkIndex);
+    customDrafts[key] = { value, active: true };
+    // Keep the serializable document current in the same input turn. Only the
+    // comparatively expensive preview IPC is debounced.
+    setDocumentChunkResolution(document, chunkIndex, resolutionForCustomDraft(value));
+    editRevision += 1;
+    const existing = customTimers.get(key);
     if (existing) clearTimeout(existing);
     // Typing must not storm the IPC with a resolve per keystroke; settle first.
     customTimers.set(
-      chunkIndex,
+      key,
       setTimeout(() => {
-        customTimers.delete(chunkIndex);
-        setChunkResolution(chunkIndex, value.trim() === "" ? "Unresolved" : { Custom: value });
+        customTimers.delete(key);
+        if (
+          $repoStore.currentPath !== repo ||
+          selectedFile !== file ||
+          parsedDoc !== document
+        ) return;
+        void updatePreview(document);
       }, 250)
     );
   }
@@ -212,30 +321,51 @@
   async function saveResolved() {
     const repo = $repoStore.currentPath;
     const file = selectedFile;
-    if (!file || !repo || !parsedDoc || hasUnresolved) return;
+    const document = parsedDoc;
+    if (!file || !repo || !document) return;
+    if (document.file_path !== file) return;
+    // oninput and a following click are separate browser events, but flushing
+    // here makes the persisted payload independent of preview debounce timing.
+    flushCustomDrafts(document, repo, file, customDrafts);
+    if (document.segments.some((s) => s.Conflict?.resolution === "Unresolved")) return;
+    const saveRevision = editRevision;
     saveGuard?.cancel();
     const guard = createAsyncGuard();
     saveGuard = guard;
     isSaving = true;
     saveError = null;
+    let writeCompleted = false;
     try {
-      const content = await invoke<string>("cmd_resolve_conflict", { document: parsedDoc });
+      const content = await invoke<string>("cmd_resolve_conflict", { document });
       if (!guard.isLive() || $repoStore.currentPath !== repo || selectedFile !== file) return;
       await invoke("cmd_write_file_content", {
         repoPath: repo,
         filePath: file,
         content,
       });
+      writeCompleted = true;
+      harnessStore.recordAction({ repoPath: repo, kind: "edit", label: file, ok: true });
       if (!guard.isLive() || $repoStore.currentPath !== repo || selectedFile !== file) return;
-      harnessStore.recordAction({ kind: "edit", label: file, ok: true });
+      if (!canFinalizeConflictSave(saveRevision, editRevision)) {
+        // The older snapshot did reach disk, but staging it would hide the
+        // newer in-memory resolution behind a completed conflict. Keep the
+        // repository unmerged and the newer edit available for another save.
+        saveError = "Newer resolution edits were made while saving. They remain in the editor; review the preview and save again.";
+        return;
+      }
+      // The resolution is now durable. A later staging error is reported
+      // separately, while resolve/write failures above leave the draft intact.
+      clearCustomDraftsForDocument(customDrafts, repo, file, document);
       const stageOutcome = await repoStore.stageFile(file);
       if (!guard.isLive() || $repoStore.currentPath !== repo || selectedFile !== file) return;
       const plan = planConflictSave(true, stageOutcome.ok, stageOutcome.error);
       if (!plan.complete) saveError = plan.message;
       await repoStore.refresh();
     } catch (err) {
+      if (!writeCompleted) {
+        harnessStore.recordAction({ repoPath: repo, kind: "edit", label: file, ok: false });
+      }
       if (!guard.isLive() || $repoStore.currentPath !== repo || selectedFile !== file) return;
-      harnessStore.recordAction({ kind: "edit", label: file, ok: false });
       saveError = formatError(err);
     } finally {
       if (guard.isLive()) isSaving = false;
@@ -265,6 +395,7 @@
         <ShieldAlert size={16} class="text-amber-400" />
         <select
           bind:value={selectedFile}
+          disabled={isSaving}
           class="bg-background border border-border/80 rounded-full px-3 py-1 text-xs text-textPrimary focus:outline-none focus:border-accent/60 font-mono transition-colors"
         >
           {#each conflictedFiles as f}
@@ -285,12 +416,14 @@
           <div class="flex items-center gap-1.5 ml-2">
             <button
               onclick={() => resolveAll("AcceptOurs")}
+              disabled={isSaving}
               class="px-2 py-0.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 text-[11px] font-sans transition-colors"
             >
               Accept All Current (Ours)
             </button>
             <button
               onclick={() => resolveAll("AcceptTheirs")}
+              disabled={isSaving}
               class="px-2 py-0.5 rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 text-[11px] font-sans transition-colors"
             >
               Accept All Incoming (Theirs)
@@ -301,7 +434,7 @@
 
       <button
         onclick={saveResolved}
-        disabled={hasUnresolved || isSaving || !resolvedPreview}
+        disabled={hasUnresolved || isSaving || !resolvedPreview || parsedDoc?.file_path !== selectedFile}
         class="gp-btn-success !py-1.5"
         title={hasUnresolved ? "Resolve all conflicts before saving" : "Save and stage resolved file"}
       >
@@ -337,12 +470,14 @@
                 <span class="flex items-center gap-1.5 shrink-0">
                   <button
                     onclick={() => setChunkResolution(chunk.chunk_index, "AcceptOurs")}
+                    disabled={isSaving}
                     class="px-2.5 py-1 bg-blue-500/20 hover:bg-blue-500/30 rounded-full text-[11px] text-blue-300 transition-colors"
                   >
                     Accept Ours
                   </button>
                   <button
                     onclick={() => setChunkResolution(chunk.chunk_index, "AcceptBothOursFirst")}
+                    disabled={isSaving}
                     class="px-2.5 py-1 bg-surfaceHover hover:bg-surface rounded-full text-[11px] text-textPrimary transition-colors"
                   >
                     Both (Ours First)
@@ -359,12 +494,14 @@
                 <span class="flex items-center gap-1.5 shrink-0">
                   <button
                     onclick={() => setChunkResolution(chunk.chunk_index, "AcceptTheirs")}
+                    disabled={isSaving}
                     class="px-2.5 py-1 bg-purple-500/20 hover:bg-purple-500/30 rounded-full text-[11px] text-purple-300 transition-colors"
                   >
                     Accept Theirs
                   </button>
                   <button
                     onclick={() => setChunkResolution(chunk.chunk_index, "AcceptBothTheirsFirst")}
+                    disabled={isSaving}
                     class="px-2.5 py-1 bg-surfaceHover hover:bg-surface rounded-full text-[11px] text-textPrimary transition-colors"
                   >
                     Both (Theirs First)
@@ -380,6 +517,7 @@
               <textarea
                 rows={3}
                 placeholder="Type the exact content this conflict should resolve to…"
+                disabled={isSaving}
                 class="w-full resize-y bg-background border border-border/80 rounded-lg p-2 text-xs font-mono text-textPrimary focus:outline-none focus:border-accent/60"
                 value={customText(chunk)}
                 oninput={(event) => onCustomInput(chunk.chunk_index, (event.target as HTMLTextAreaElement).value)}

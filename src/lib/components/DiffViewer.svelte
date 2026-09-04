@@ -689,9 +689,10 @@
       </label>
 
       <!-- Unified / Split View Toggle -->
-      <div class="gp-segmented">
+      <div class="gp-segmented" role="group" aria-label="Diff layout">
         <button
           onclick={() => (viewMode = "unified")}
+          aria-pressed={viewMode === "unified"}
           data-active={viewMode === "unified" ? "true" : "false"}
           class="gp-seg-btn"
         >
@@ -699,6 +700,7 @@
         </button>
         <button
           onclick={() => (viewMode = "split")}
+          aria-pressed={viewMode === "split"}
           data-active={viewMode === "split" ? "true" : "false"}
           class="gp-seg-btn"
         >

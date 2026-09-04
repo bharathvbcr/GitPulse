@@ -28,7 +28,11 @@
   let {
     filePath,
     blob,
+    draftContent = null,
+    dirty = false,
     onSave,
+    onDraftChange,
+    onRequestDiscard,
   }: {
     filePath: string;
     blob: {
@@ -39,7 +43,11 @@
       text?: string | null;
       base64?: string | null;
     };
+    draftContent?: string | null;
+    dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
+    onDraftChange?: (newContent: string, sourceContent: string) => void;
+    onRequestDiscard?: () => Promise<boolean>;
   } = $props();
 
   export type MarkDevViewMode = "rendered" | "split" | "raw";
@@ -49,7 +57,8 @@
   let wordWrap = $state(true);
   let copiedSource = $state(false);
 
-  let rawContent = $derived(blob.text || "");
+  let sourceContent = $derived(blob.text || "");
+  let rawContent = $derived(draftContent ?? sourceContent);
   let renderedHtml = $derived(renderMarkDevMarkdown(rawContent));
   let stats = $derived<DocumentStats>(calculateDocumentStats(rawContent));
   let outline = $derived<MarkdownHeading[]>(extractDocumentOutline(rawContent));
@@ -57,7 +66,10 @@
   let previewContainerEl: HTMLDivElement | undefined = $state();
 
   async function handleCopySource() {
-    await copyText(rawContent);
+    if (!(await copyText(rawContent))) {
+      repoStore.setError("Could not copy to clipboard");
+      return;
+    }
     copiedSource = true;
     setTimeout(() => (copiedSource = false), 1800);
   }
@@ -82,12 +94,16 @@
   }
 
   // Handle copy button clicks inside rendered code blocks via event delegation
-  function handlePreviewClick(e: MouseEvent) {
+  async function handlePreviewClick(e: MouseEvent) {
     const target = (e.target as HTMLElement).closest(".copy-code-btn") as HTMLButtonElement | null;
     if (target) {
       const code = target.getAttribute("data-code");
       if (code) {
-        void copyText(code);
+        if (!(await copyText(code))) {
+          repoStore.setError("Could not copy to clipboard");
+          return;
+        }
+        if (!target.isConnected) return;
         const originalText = target.innerText;
         target.innerText = "Copied ✓";
         target.classList.add("!text-emerald-400", "!border-emerald-500/50");
@@ -135,10 +151,11 @@
     </div>
 
     <!-- Center: MarkDev Tri-Mode Switcher (Rendered / Split / Raw) -->
-    <div class="gp-segmented">
+    <div class="gp-segmented" role="group" aria-label="Markdown view">
       <button
         type="button"
         onclick={() => (viewMode = "rendered")}
+        aria-pressed={viewMode === "rendered"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "rendered"}
         title="Rendered View: Formatted Markdown with rich blocks"
@@ -150,6 +167,7 @@
       <button
         type="button"
         onclick={() => (viewMode = "split")}
+        aria-pressed={viewMode === "split"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "split"}
         title="Split View: Raw source code and live preview side-by-side"
@@ -161,6 +179,7 @@
       <button
         type="button"
         onclick={() => (viewMode = "raw")}
+        aria-pressed={viewMode === "raw"}
         class="gp-seg-btn flex items-center gap-1.5"
         data-active={viewMode === "raw"}
         title="Raw View: Source code editor with line numbers and find"
@@ -263,14 +282,30 @@
     {:else if viewMode === "raw"}
       <!-- Full Raw Editor View -->
       <div class="flex-1 min-h-0 h-full">
-        <CodeViewer {filePath} content={rawContent} {onSave} />
+        <CodeViewer
+          {filePath}
+          content={sourceContent}
+          {draftContent}
+          {dirty}
+          {onSave}
+          {onDraftChange}
+          {onRequestDiscard}
+        />
       </div>
     {:else if viewMode === "split"}
       <!-- Side-by-Side Split View -->
       <div class="flex-1 flex min-h-0 h-full divide-x divide-border/70">
         <!-- Left: Raw Editor Pane -->
         <div class="flex-1 min-w-0 h-full">
-          <CodeViewer {filePath} content={rawContent} {onSave} />
+          <CodeViewer
+            {filePath}
+            content={sourceContent}
+            {draftContent}
+            {dirty}
+            {onSave}
+            {onDraftChange}
+            {onRequestDiscard}
+          />
         </div>
 
         <!-- Right: Live Rendered Preview Pane -->

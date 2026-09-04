@@ -2,13 +2,18 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 pub const MAX_LOG_ENTRIES: usize = 1000;
 const TAIL_MAX_LINES: usize = 500;
 const DEFAULT_TAIL_LINES: usize = 200;
+/// A single hostile error must not consume the whole ring, file generation,
+/// IPC response, or clipboard report. Measured in UTF-8 bytes because that is
+/// what the file and IPC payload actually pay for.
+const MAX_LOG_ENTRY_BYTES: usize = 32 * 1024;
+const LOG_TRUNCATION_MARKER: &str = " … log entry truncated … ";
 
 /// Directory override for the durable log.
 ///
@@ -119,11 +124,18 @@ impl FileSink {
 
     fn open_append(dir: &Path, path: &Path) -> Result<(File, u64), String> {
         fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        secure_directory(dir)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(path)
             .map_err(|e| format!("open {}: {e}", path.display()))?;
+        secure_file(path)?;
         let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok((file, bytes))
     }
@@ -136,11 +148,19 @@ impl FileSink {
     /// the one moment it destroys the evidence. The failure is recorded in
     /// `degraded` instead, where [`PersistedLog`] reports it.
     fn write_line(&self, line: &str) {
+        // This is repeated at the final sink boundary deliberately. Today all
+        // production callers arrive through RingLogger, but the invariant is
+        // about bytes on disk, not about remembering a particular call path.
+        let line = safe_log_line(line);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.bytes >= LOG_FILE_MAX_BYTES {
+        let projected = state
+            .bytes
+            .saturating_add(line.len() as u64)
+            .saturating_add(1);
+        if state.bytes > 0 && projected > LOG_FILE_MAX_BYTES {
             self.rotate(&mut state);
         }
-        Self::write_locked(&mut state, line);
+        Self::write_locked(&mut state, &line);
     }
 
     fn write_locked(state: &mut SinkState, line: &str) {
@@ -193,28 +213,116 @@ impl FileSink {
     /// The durable tail, oldest line first, spanning both generations.
     fn tail(&self, max_lines: usize) -> PersistedLog {
         let max_lines = max_lines.clamp(1, TAIL_MAX_LINES);
-        let degraded = {
-            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.degraded.clone()
-        };
-        let mut lines = read_lines(&self.previous);
-        lines.extend(read_lines(&self.current));
+        // Keep the sink lock across both reads. Otherwise a writer can rotate
+        // `current` into `previous` between them and make a whole generation
+        // disappear from an apparently complete response.
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = read_lines(&self.previous);
+        let current = read_lines(&self.current);
+        let mut degraded = state.degraded.clone().into_iter().collect::<Vec<_>>();
+        degraded.extend(previous.degraded);
+        degraded.extend(current.degraded);
+        let mut lines = previous.lines;
+        lines.extend(current.lines);
         let start = lines.len().saturating_sub(max_lines);
         PersistedLog {
             path: self.current.display().to_string(),
             lines: lines.split_off(start),
-            degraded,
+            degraded: (!degraded.is_empty()).then(|| degraded.join("; ")),
         }
     }
 }
 
-/// Best-effort whole-file read; an unreadable generation contributes nothing
-/// rather than failing the tail that the other generation can still answer.
-fn read_lines(path: &Path) -> Vec<String> {
-    let Ok(file) = File::open(path) else {
-        return Vec::new();
+#[cfg(unix)]
+fn secure_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("secure {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("secure {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+struct ReadLines {
+    lines: Vec<String>,
+    degraded: Vec<String>,
+}
+
+/// Read one bounded generation, preserving later diagnostics across malformed
+/// legacy bytes and applying the current redaction boundary on the way out.
+fn read_lines(path: &Path) -> ReadLines {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ReadLines {
+                lines: Vec::new(),
+                degraded: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return ReadLines {
+                lines: Vec::new(),
+                degraded: vec![format!("read {} failed: {error}", path.display())],
+            };
+        }
     };
-    BufReader::new(file).lines().map_while(Result::ok).collect()
+
+    let read_cap = LOG_FILE_MAX_BYTES + MAX_LOG_ENTRY_BYTES as u64 + 1_024;
+    let mut degraded = Vec::new();
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let clipped = length > read_cap;
+    if clipped {
+        if let Err(error) = file.seek(SeekFrom::End(-(read_cap as i64))) {
+            return ReadLines {
+                lines: Vec::new(),
+                degraded: vec![format!("seek {} failed: {error}", path.display())],
+            };
+        }
+        degraded.push(format!(
+            "{} exceeded the durable-log read bound; older bytes were omitted",
+            path.display()
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(length.min(read_cap) as usize);
+    if let Err(error) = file.take(read_cap).read_to_end(&mut bytes) {
+        return ReadLines {
+            lines: Vec::new(),
+            degraded: vec![format!("read {} failed: {error}", path.display())],
+        };
+    }
+    if clipped {
+        if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_newline);
+        }
+    }
+
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            degraded.push(format!(
+                "{} contained invalid UTF-8; replacement characters were inserted",
+                path.display()
+            ));
+            String::from_utf8_lossy(error.as_bytes()).into_owned()
+        }
+    };
+    let lines = text.lines().map(safe_log_line).collect();
+    ReadLines { lines, degraded }
 }
 
 fn parent_of(path: &Path) -> &Path {
@@ -523,12 +631,59 @@ pub(crate) fn format_utc(epoch_secs: u64) -> String {
 }
 
 fn format_entry(epoch_secs: u64, level: Level, target: &str, message: &str) -> String {
-    format!(
+    safe_log_line(&format!(
         "{} {} [{}] {}",
         format_utc(epoch_secs),
         level,
         target,
         message
+    ))
+}
+
+/// Redacts credentials, escapes physical line breaks/control characters, and
+/// retains both ends of a bounded record. This happens before the record is
+/// copied to the ring, stderr, or disk, so no later renderer has to remember
+/// to make an already-persisted secret safe.
+fn safe_log_line(value: &str) -> String {
+    // The ledger redactor is the native write-boundary owner for both vendor
+    // tokens and context-shaped secrets; logs must not grow a second table.
+    let redacted = crate::ledger::redact::text(value);
+    let mut single_line = String::with_capacity(redacted.len());
+    for ch in redacted.chars() {
+        match ch {
+            '\n' => single_line.push_str("\\n"),
+            '\r' => single_line.push_str("\\r"),
+            '\t' => single_line.push_str("\\t"),
+            c if c.is_control() => single_line.extend(c.escape_default()),
+            c => single_line.push(c),
+        }
+    }
+    bound_utf8(&single_line, MAX_LOG_ENTRY_BYTES)
+}
+
+fn bound_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= LOG_TRUNCATION_MARKER.len() {
+        return LOG_TRUNCATION_MARKER[..max_bytes].to_string();
+    }
+
+    let body = max_bytes - LOG_TRUNCATION_MARKER.len();
+    let mut head_end = body * 35 / 100;
+    while head_end > 0 && !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let tail_budget = body - head_end;
+    let mut tail_start = value.len().saturating_sub(tail_budget);
+    while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}{}{}",
+        &value[..head_end],
+        LOG_TRUNCATION_MARKER,
+        &value[tail_start..]
     )
 }
 
@@ -756,6 +911,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn entries_redact_credentials_and_cannot_forge_extra_log_lines() {
+        let logger = RingLogger::new(LevelFilter::Trace);
+        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        logger.write_entry(
+            Level::Error,
+            "auth\n2026-01-01T00:00:00Z INFO [forged]",
+            &format!("request failed\nAuthorization: Bearer {key}"),
+        );
+
+        let lines = logger.snapshot_tail(10);
+        assert_eq!(lines.len(), 1, "one record must stay one physical line");
+        assert!(
+            !lines[0].contains(key),
+            "credential reached the ring: {:?}",
+            lines
+        );
+        assert!(
+            lines[0].contains("Authorization: Bearer <redacted>"),
+            "the header and authentication scheme should remain diagnosable"
+        );
+        assert!(
+            !lines[0].contains("ghp_"),
+            "a contextual authorization header must not retain a vendor-token prefix"
+        );
+        assert!(
+            !lines[0].contains('\n'),
+            "embedded newline can forge a record"
+        );
+        assert!(
+            lines[0].contains("\\n"),
+            "escaped structure should remain visible"
+        );
+    }
+
     /// The panic hook must actually record what it observes. set_hook is
     /// global process state, so the test serializes on a mutex and restores
     /// the prior (test-harness) hook before any assertion can fail.
@@ -798,7 +988,7 @@ mod tests {
     }
 
     fn file_lines(path: &std::path::Path) -> Vec<String> {
-        read_lines(path)
+        read_lines(path).lines
     }
 
     #[test]
@@ -819,6 +1009,139 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("gitpulse start pid")),
             "the session must be marked so a relaunch is distinguishable: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn contextual_credentials_never_reach_the_durable_log() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logger = sunk(dir.path(), "gitpulse");
+        logger.write_entry(
+            Level::Error,
+            "auth",
+            "Authorization: Basic opaque-basic-secret\n\
+             Cookie: session=opaque-cookie\n\
+             https://alice:opaque-password@example.test/repo?api_key=opaque-query-secret\n\
+             -----BEGIN PRIVATE KEY-----\nopaque-key-body\n-----END PRIVATE KEY-----\n\
+             argv=[\"tool\",\"--password\",\"opaque-cli-password\",\"next\"]\n\
+             command=curl --user alice:opaque-user-password https://example.test",
+        );
+
+        let raw =
+            std::fs::read_to_string(dir.path().join("gitpulse.log")).expect("read durable log");
+        for secret in [
+            "opaque-basic-secret",
+            "opaque-cookie",
+            "opaque-password",
+            "opaque-query-secret",
+            "opaque-key-body",
+            "opaque-cli-password",
+            "opaque-user-password",
+        ] {
+            assert!(!raw.contains(secret), "secret reached durable log: {raw}");
+        }
+        assert!(
+            raw.contains("<redacted>"),
+            "redaction should be explicit: {raw}"
+        );
+        assert!(
+            raw.contains("<private key redacted>"),
+            "private-key removal should be explicit: {raw}"
+        );
+        assert!(
+            raw.contains(r#"argv=["tool","--password","<redacted>","next"]"#),
+            "serialized command shape should remain useful: {raw}"
+        );
+    }
+
+    #[test]
+    fn persisted_tail_redacts_legacy_bytes_and_reports_decode_loss_without_truncating() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logger = sunk(dir.path(), "gitpulse");
+        let path = dir.path().join("gitpulse.log");
+        let secret = "opaque-legacy-auth-secret";
+        let mut legacy = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open legacy log");
+        legacy
+            .write_all(format!("legacy Authorization: Bearer {secret}\ninvalid byte: ").as_bytes())
+            .expect("write legacy prefix");
+        legacy.write_all(&[0xff]).expect("write invalid byte");
+        legacy
+            .write_all(b"\nnewer diagnostic survives\n")
+            .expect("write legacy suffix");
+
+        let tail = logger.sink.as_ref().expect("sink").tail(500);
+        let joined = tail.lines.join("\n");
+        assert!(
+            !joined.contains(secret),
+            "legacy credential escaped: {joined}"
+        );
+        assert!(
+            joined.contains("Authorization: Bearer <redacted>"),
+            "legacy header shape should remain diagnosable: {joined}"
+        );
+        assert!(
+            joined.contains("newer diagnostic survives"),
+            "one bad byte must not hide later diagnostics: {joined}"
+        );
+        assert!(
+            tail.degraded
+                .as_deref()
+                .is_some_and(|reason| reason.contains("UTF-8")),
+            "decode loss must be explicit: {:?}",
+            tail.degraded
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_log_directory_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let dir = root.path().join("logs");
+        let logger = sunk(&dir, "gitpulse");
+        logger.write_entry(Level::Info, "privacy", "ready");
+
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("log dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("gitpulse.log"))
+                .expect("log metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+        );
+    }
+
+    #[test]
+    fn one_hostile_record_cannot_exceed_the_entry_or_generation_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logger = sunk(dir.path(), "gitpulse");
+        logger.write_entry(Level::Error, "oversized", &"💥".repeat(2_000_000));
+
+        let lines = logger.snapshot_tail(1);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].len() <= 32 * 1024,
+            "ring entry exceeded its byte budget: {}",
+            lines[0].len()
+        );
+        assert!(lines[0].contains("log entry truncated"));
+        let live = std::fs::metadata(dir.path().join("gitpulse.log")).expect("live log");
+        assert!(
+            live.len() <= LOG_FILE_MAX_BYTES,
+            "one record exceeded the file generation budget: {}",
+            live.len()
         );
     }
 
@@ -881,12 +1204,24 @@ mod tests {
         let logger = sunk(dir.path(), "gitpulse");
         let sink = logger.sink.clone().expect("sink");
 
-        sink.write_line(&"x".repeat(LOG_FILE_MAX_BYTES as usize + 1));
+        // Fill the generation with many individually bounded records. The old
+        // test used one over-limit line, which encoded the defect this test
+        // now guards against: one record was allowed to make the previous
+        // generation arbitrarily large.
+        let record = "x".repeat(MAX_LOG_ENTRY_BYTES);
+        let writes = LOG_FILE_MAX_BYTES as usize / (record.len() + 1) + 1;
+        for _ in 0..writes {
+            sink.write_line(&record);
+        }
         sink.write_line("after the rotation");
 
         let current = dir.path().join("gitpulse.log");
         let previous = dir.path().join("gitpulse.log.1");
         assert!(previous.exists(), "the full generation must be kept aside");
+        assert!(
+            std::fs::metadata(&previous).expect("previous log").len() <= LOG_FILE_MAX_BYTES,
+            "the previous generation must also stay bounded"
+        );
         assert!(
             std::fs::metadata(&current).expect("live log").len() < LOG_FILE_MAX_BYTES,
             "the live generation restarts small"

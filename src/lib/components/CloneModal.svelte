@@ -64,6 +64,7 @@
   <div
     role="dialog"
     aria-modal="true"
+    aria-labelledby="clone-modal-title"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && requestClose()}
     onkeydown={(e) => e.key === "Escape" && requestClose()}
@@ -79,10 +80,10 @@
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">
-        <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
+        <h2 id="clone-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <Download size={16} class="text-accent" />
           <span>Clone Git Repository</span>
-        </div>
+        </h2>
       </div>
 
       <div class="p-4 space-y-3">

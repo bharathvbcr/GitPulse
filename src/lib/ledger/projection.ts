@@ -1,4 +1,7 @@
-import type { AgentActionEntry } from "../agents/activity";
+import {
+  mergeActionEntries,
+  type AgentActionEntry,
+} from "../agents/activity";
 import type { PolicyVerdict } from "../stores/harnessStore";
 import type { LedgerEvent } from "./types";
 
@@ -105,6 +108,10 @@ export function labelFor(event: LedgerEvent): string {
  */
 export function eventToAction(event: LedgerEvent): AgentActionEntry {
   return {
+    // SQLite row ids are only monotonic inside one repository, and ephemeral
+    // UI rows use the same number domain. The durable ULID plus repository is
+    // the identity; the numeric id remains the paging/sort cursor.
+    identity: JSON.stringify(["ledger", event.repo_path, event.ulid, event.id]),
     id: event.id,
     ts: Date.parse(event.ts_utc),
     kind: kindForAction(event.action),
@@ -117,8 +124,10 @@ export function eventToAction(event: LedgerEvent): AgentActionEntry {
 /**
  * Merges newly-read events into the journal, newest last, without duplicates.
  *
- * Ledger ids are monotonic, so a row already present is a re-read rather than a
- * new event — which happens whenever a notification and a poll race.
+ * A durable identity is repository + ULID (+ its local cursor), so equal
+ * numeric ids in different ledgers and ephemeral rows cannot suppress one
+ * another. Re-reading the same row still collapses as expected when a
+ * notification and a poll race.
  */
 export function mergeEvents(
   existing: AgentActionEntry[],
@@ -126,16 +135,13 @@ export function mergeEvents(
   displayCap: number
 ): AgentActionEntry[] {
   if (events.length === 0) return existing;
-  const seen = new Set(existing.map((e) => e.id));
-  const merged = existing.slice();
-  for (const event of events) {
-    if (seen.has(event.id)) continue;
-    seen.add(event.id);
-    merged.push(eventToAction(event));
-  }
-  merged.sort((a, b) => a.id - b.id);
+  const merged = mergeActionEntries(
+    existing,
+    events.map(eventToAction),
+    displayCap,
+  );
   // A *display* cap, not a data cap: the rows beyond it are still on disk and
   // still reachable by paging. That is the whole difference from the ring
   // buffer this replaced.
-  return merged.length > displayCap ? merged.slice(merged.length - displayCap) : merged;
+  return merged;
 }

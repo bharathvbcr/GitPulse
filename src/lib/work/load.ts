@@ -232,20 +232,38 @@ export async function loadWork(
   if (input.worktrees && input.worktrees.length > 0) {
     const looked = input.worktrees.slice(0, MAX_BINDING_LOOKUPS);
     const bindings: Record<string, string> = {};
-    await mapItems(looked, DEFAULT_FAN_OUT, async (worktree) => {
-      try {
-        const taskId = await call<string | null>("cmd_worktree_task", {
-          repoPath,
-          worktreePath: worktree.path,
-        });
-        if (taskId) bindings[worktree.path] = taskId;
-      } catch {
-        // One unreadable binding is not a reason to lose the other rows;
-        // the worktree simply appears unbound, which the degraded flag below
-        // covers when it was the cap rather than the data.
+    const bindingReads = await mapItems(looked, DEFAULT_FAN_OUT, (worktree) =>
+      call<string | null>("cmd_worktree_task", {
+        repoPath,
+        worktreePath: worktree.path,
+      }).then(
+        (taskId) => ({ path: worktree.path, taskId, ok: true as const }),
+        (error) => ({
+          path: worktree.path,
+          taskId: null,
+          ok: false as const,
+          detail: formatError(error),
+        }),
+      ),
+    );
+    let bindingFailures = 0;
+    let bindingFailureDetail = "";
+    for (const result of bindingReads) {
+      if (!result.ok) {
+        bindingFailures += 1;
+        if (!bindingFailureDetail) bindingFailureDetail = result.detail;
+        continue;
       }
-    });
+      if (result.taskId) bindings[result.path] = result.taskId;
+    }
     input.bindings = bindings;
+    if (bindingFailures > 0) {
+      const why = bindingFailureDetail ? ` (${bindingFailureDetail})` : "";
+      sources.worktrees = noteFailure(
+        sources.worktrees,
+        `could not read task binding for ${bindingFailures} worktree${bindingFailures === 1 ? "" : "s"}${why}`,
+      );
+    }
     if (input.worktrees.length > looked.length) {
       sources.worktrees = noteFailure(
         sources.worktrees,

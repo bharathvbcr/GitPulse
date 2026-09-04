@@ -21,4 +21,13 @@ describe("CommitDetails", () => {
     expect(source).toContain("formatPathParts");
     expect(source).toContain("filePath={f.path}");
   });
+
+  it("only announces clipboard success after the shared copy seam succeeds", () => {
+    const shaCopy = source.slice(source.indexOf("async function copySha"), source.indexOf("async function copyMessage"));
+    const messageCopy = source.slice(source.indexOf("async function copyMessage"), source.indexOf("async function explainCommit"));
+    expect(shaCopy).toContain("if (!(await copyText(id)))");
+    expect(messageCopy).toContain("if (!(await copyText(msg)))");
+    expect(shaCopy).toContain("toastStore.error");
+    expect(messageCopy).toContain("toastStore.error");
+  });
 });

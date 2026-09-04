@@ -131,16 +131,16 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
+      class="w-full max-w-xl max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 flex items-center justify-between">
+      <div class="p-4 border-b border-border/60 flex items-center justify-between shrink-0">
         <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <Settings size={16} class="text-accent" />
           <span>Settings</span>
         </div>
       </div>
 
-      <div class="p-4 space-y-4">
+      <div class="p-4 space-y-4 min-h-0 flex-1 overflow-y-auto">
         <section>
           <h2 class="text-textMuted text-[11px] font-semibold uppercase tracking-wider mb-2">Appearance</h2>
           <div class="gp-segmented" role="group" aria-label="Theme appearance">
@@ -542,7 +542,7 @@
         </section>
       </div>
 
-      <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
+      <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2 shrink-0">
         <button onclick={onClose} class="gp-btn">Done</button>
       </div>
     </div>

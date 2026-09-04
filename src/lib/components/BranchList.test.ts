@@ -25,6 +25,12 @@ describe("BranchList", () => {
     expect(source).toContain("if (suggesting) return;");
     expect(source).toContain("const repo = $repoStore.currentPath;");
   });
+
+  it("routes menu copies through the shared fallback and exposes failures", () => {
+    expect(source).toContain('from "../desktop/clipboard"');
+    expect(source).toContain("if (!(await copyToClipboard(value)))");
+    expect(source).not.toContain("navigator.clipboard");
+  });
 });
 
 describe("BranchList delete escalation", () => {
@@ -213,10 +219,26 @@ describe("BranchList menu keyboard accessibility", () => {
     for (const key of ['"Escape"', '"Tab"', '"ArrowDown"', '"ArrowUp"', '"Home"', '"End"']) {
       expect(handler).toContain(key);
     }
-    // Escape and Tab restore focus to the element that opened the menu.
+    // Escape restores focus to the element that opened the menu.
     expect(handler).toContain("closeMenu({ restoreFocus: true })");
     // Arrow cycling wraps rather than dead-ending at the ends.
     expect(handler).toContain("% items.length");
+  });
+
+  it("lets Tab and Shift+Tab leave the menu in document order", () => {
+    const handler = source.slice(
+      source.indexOf("function handleMenuKeydown"),
+      source.indexOf("// A background refresh"),
+    );
+    const tabBranch = handler.slice(
+      handler.indexOf('e.key === "Tab"'),
+      handler.indexOf('e.key === "Escape"'),
+    );
+
+    expect(tabBranch).toContain("focusAdjacentToMenuOpener(");
+    expect(tabBranch).toContain("e.shiftKey");
+    expect(tabBranch).not.toContain("restoreFocus");
+    expect(source).toContain("candidate.tabIndex >= 0");
   });
 
   it("declares popup semantics on the kebab trigger", () => {

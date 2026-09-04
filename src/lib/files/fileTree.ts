@@ -225,3 +225,18 @@ export function ancestorsOf(path: string): string[] {
   }
   return ancestors;
 }
+
+/**
+ * Finds the exact visible parent directory for ARIA tree ArrowLeft behavior.
+ * Flat status/churn sorts intentionally omit directory rows; in that mode
+ * there is no selectable parent, so return -1 instead of trusting a stale
+ * depth value and jumping to an unrelated file.
+ */
+export function parentDirectoryRowIndex(rows: readonly FileRow[], index: number): number {
+  const row = rows[index];
+  if (!row) return -1;
+  const separator = row.path.lastIndexOf("/");
+  if (separator <= 0) return -1;
+  const parentPath = row.path.slice(0, separator);
+  return rows.findIndex((candidate) => candidate.kind === "dir" && candidate.path === parentPath);
+}

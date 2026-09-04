@@ -90,7 +90,10 @@
 
   async function handleCopySha(e: MouseEvent) {
     e.stopPropagation();
-    await copyText(row.id);
+    if (!(await copyText(row.id))) {
+      toastStore.error("Could not copy the commit SHA");
+      return;
+    }
     isCopied = true;
     toastStore.info(`Copied SHA ${row.id.slice(0, 7)}`, undefined, 2000);
     setTimeout(() => {
@@ -318,8 +321,11 @@
       onclick={async () => {
         closeMenu();
         if (row.summary) {
-          await copyText(row.summary);
-          toastStore.info("Copied commit message", undefined, 2000);
+          if (await copyText(row.summary)) {
+            toastStore.info("Copied commit message", undefined, 2000);
+          } else {
+            toastStore.error("Could not copy the commit message");
+          }
         }
       }}
     >

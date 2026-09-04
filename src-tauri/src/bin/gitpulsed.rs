@@ -207,22 +207,29 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
     // will never have anything to record — and then reports `recording: true`
     // for it. The daemon takes paths straight from an operator's command line,
     // so unlike the app it cannot assume they were already checked.
-    if let Err(reason) = validate_repo(repo) {
-        return CycleReport {
-            repo: repo.to_string(),
-            cycle,
-            recorded: 0,
-            transcripts: 0,
-            skipped_lines: 0,
-            reflog_entries: 0,
-            recording: false,
-            error: reason,
-            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        };
-    }
+    let address = validate_repo(repo).and_then(|canonical| {
+        gitpulse_lib::ledger::bindings::repository_address(&canonical.to_string_lossy())
+            .map_err(|error| error.to_string())
+    });
+    let address = match address {
+        Ok(address) => address,
+        Err(reason) => {
+            return CycleReport {
+                repo: repo.to_string(),
+                cycle,
+                recorded: 0,
+                transcripts: 0,
+                skipped_lines: 0,
+                reflog_entries: 0,
+                recording: false,
+                error: reason,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            };
+        }
+    };
 
-    let status = ledger::status(repo);
-    let caught = ingest::catch_up(repo);
+    let status = ledger::status(&address.anchor);
+    let caught = ingest::catch_up_into(&address.anchor, &address.worktree);
     CycleReport {
         repo: repo.to_string(),
         cycle,
@@ -526,6 +533,77 @@ mod tests {
         });
         assert_eq!(again.recorded, 0, "a second cycle must not duplicate rows");
         assert!(again.recording);
+    }
+
+    #[test]
+    fn a_daemon_cycle_consolidates_pre_family_sibling_history_once() {
+        let corpus = tempfile::tempdir().expect("transcript corpus");
+        let repo = tempfile::tempdir().expect("repository");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=GitPulse",
+                    "-c",
+                    "user.email=gitpulse@test.local",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "seed"]);
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let linked = parent.path().join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("utf8 linked path"),
+        ]);
+        let linked = linked.canonicalize().expect("canonical linked worktree");
+        gitpulse_lib::ledger::append(gitpulse_lib::ledger::Draft {
+            repo_path: linked.to_string_lossy().into_owned(),
+            worktree_path: Some(linked.to_string_lossy().into_owned()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(gitpulse_lib::ledger::ActorKind::Human),
+            outcome: Some(gitpulse_lib::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy sibling row");
+        let legacy_ulid = gitpulse_lib::ledger::tail(&linked.to_string_lossy(), 0, 10)
+            .expect("legacy ledger")
+            .remove(0)
+            .ulid;
+
+        let main = repo.path().canonicalize().expect("canonical repository");
+        let first = with_transcript_root(corpus.path(), || {
+            run_cycle(main.to_str().expect("utf8 repository"), 1)
+        });
+        assert!(first.recording, "{first:?}");
+        let second = with_transcript_root(corpus.path(), || {
+            run_cycle(main.to_str().expect("utf8 repository"), 2)
+        });
+        assert!(second.recording, "{second:?}");
+        let rows =
+            gitpulse_lib::ledger::tail(&main.to_string_lossy(), 0, 1000).expect("family ledger");
+        let imported: Vec<_> = rows
+            .iter()
+            .filter(|event| event.ulid == legacy_ulid)
+            .collect();
+        assert_eq!(
+            imported.len(),
+            1,
+            "daemon retries must not duplicate import"
+        );
+        assert_eq!(
+            imported[0].worktree_path.as_deref(),
+            Some(gitpulse_lib::ledger::redact::text(&linked.to_string_lossy()).as_str())
+        );
     }
 
     #[test]

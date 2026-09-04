@@ -1,0 +1,25 @@
+[
+  {
+    "id": "G-1",
+    "grantor": {
+      "authority": "human",
+      "id": "bharath"
+    },
+    "reason": "needed for the migration",
+    "scope": {
+      "task_id": "TASK-1",
+      "rules": [
+        "scope.unplanned",
+        "task.forbidden_change"
+      ],
+      "paths": [
+        "src/a.rs",
+        "docs/**"
+      ],
+      "once": true
+    },
+    "issued_at": "2026-09-01T12:00:00Z",
+    "expires_at": "2026-09-01T13:00:00Z",
+    "consumed": true
+  }
+]

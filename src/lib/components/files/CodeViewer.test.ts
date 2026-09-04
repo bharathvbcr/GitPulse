@@ -36,11 +36,48 @@ describe("CodeViewer", () => {
     expect(source).toContain('"cmd_write_file_content"');
   });
 
+  it("publishes every edit to the canonical parent draft owner", () => {
+    expect(source).toContain("draftContent");
+    expect(source).toContain("onDraftChange");
+    expect(source).toContain("onEditInput");
+    expect(source).toContain("onDraftChange?.(value, content)");
+    expect(source).toContain("Unsaved");
+  });
+
+  it("restores drafts by file identity during rapid prop switches", () => {
+    expect(source).toContain("previousFilePath");
+    expect(source).toContain("if (path !== previousFilePath)");
+    expect(source).toContain("editDraft = restored ?? source;");
+    expect(source).toContain("isEditing = restored !== null;");
+  });
+
+  it("keeps editing state and its draft when save rejects", () => {
+    const save = source.slice(
+      source.indexOf("async function saveChanges"),
+      source.indexOf("async function handleCopy"),
+    );
+    expect(save.indexOf("await onSave(contentToSave)")).toBeGreaterThan(-1);
+    expect(save.indexOf("isEditing = false")).toBeGreaterThan(
+      save.indexOf("await onSave(contentToSave)"),
+    );
+    const failed = save.slice(save.indexOf("} catch"), save.indexOf("} finally"));
+    expect(failed).not.toContain("isEditing = false");
+    expect(failed).not.toContain("onDraftChange");
+  });
+
+  it("requires confirmation before Cancel discards a dirty draft", () => {
+    expect(source).toContain("onRequestDiscard");
+    expect(source).toContain("await askConfirm({");
+    expect(source).toContain("Discard Unsaved Edits");
+  });
+
   it("supports word wrap, whitespace toggle, zoom, and clipboard copy", () => {
     expect(source).toContain("wordWrap");
     expect(source).toContain("showWhitespace");
     expect(source).toContain("zoomPercent");
     expect(source).toContain("handleCopy");
+    expect(source).toContain("if (!(await copyText(textToCopy)))");
+    expect(source).toContain('repoStore.setError("Could not copy file content to clipboard")');
   });
 
   it("windows the read-only view and caps oversized files", () => {

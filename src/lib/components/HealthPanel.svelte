@@ -5,11 +5,27 @@
     DependabotReport,
   } from "../health/types";
 
+  export interface DependabotFreshness {
+    iso: string;
+    label: string;
+  }
+
+  /** An unambiguous machine timestamp plus a local-time label for the UI. */
+  export function dependabotFreshness(checkedAt: number): DependabotFreshness {
+    const checked = new Date(checkedAt);
+    return {
+      iso: checked.toISOString(),
+      label: checked.toLocaleString(),
+    };
+  }
+
   // Survives the per-tab remount so revisiting the Health view renders the
   // last scan instantly; the fetch then refreshes it in place.
   const healthCache = createRepoPanelCache<{
     deps: DepsHealthReport;
-    dependabot: DependabotReport;
+    dependabot: DependabotReport | null;
+    dependabotCheckedAt: number | null;
+    dependabotRequestFailed: boolean;
   }>();
 </script>
 
@@ -63,6 +79,8 @@
 
   let report = $state<DepsHealthReport | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
+  let dependabotCheckedAt = $state<number | null>(null);
+  let dependabotRequestFailed = $state(false);
   let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
   let deadSymbolsAvailable = $state(false);
   let deadSymbolsReason = $state<string | null>(null);
@@ -77,6 +95,7 @@
    */
   let codegraph = $state<CodeintelStatus | null>(null);
   let loading = $state(false);
+  let checkingGithub = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
    * Failures of in-panel actions (opening an advisory link). Deliberately NOT
@@ -144,6 +163,9 @@
   let dependabotBadgeClass = $derived(
     dependabot?.available ? badgeClassFor(dependabot.alerts) : "",
   );
+  let displayedDependabotFreshness = $derived(
+    dependabotCheckedAt === null ? null : dependabotFreshness(dependabotCheckedAt),
+  );
   // Observed totals, not surviving-row counts: a capped table that prints only
   // what it kept reads as complete coverage. Shared with the copied report so
   // the screen and the clipboard cannot disagree.
@@ -159,6 +181,7 @@
 
   const scanned = { path: "" };
   let inflight: AsyncGuard | null = null;
+  let dependabotInflight: AsyncGuard | null = null;
   let fixInflight: AsyncGuard | null = null;
   /**
    * Guards the sequential step runner. Destroying this component does not
@@ -184,12 +207,10 @@
     loading = true;
     errorMsg = null;
     actionError = null;
-    // All sources run together so the Health page fills in as one picture,
-    // and each settles independently: a failed Dependabot fetch or codeintel
-    // query must not erase a finished local scan, or the reverse.
-    const [deps, alerts, dead, graph] = await Promise.allSettled([
+    // Automatic scans stay local. Dependabot uses the user's GitHub CLI
+    // credentials and the network, so it has a separate explicit action.
+    const [deps, dead, graph] = await Promise.allSettled([
       invoke<DepsHealthReport>("cmd_scan_deps_health", { repoPath }),
-      invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath }),
       getDeadSymbols(repoPath),
       getCodeintelStatus(repoPath),
     ]);
@@ -228,25 +249,76 @@
             db_path: "",
             reason: formatError(graph.reason),
           };
-    // The Dependabot command reports its own unavailable/error states; only
-    // an IPC-level failure is folded into that same shape here, so "could
-    // not check" never renders as a clean bill of health.
-    dependabot =
-      alerts.status === "fulfilled"
-        ? alerts.value
-        : {
-            available: false,
-            cli_present: false,
-            is_github_remote: true,
-            slug: "",
-            alerts: [],
-            truncated: false,
-            error: formatError(alerts.reason),
-          };
     if (deps.status === "fulfilled") {
-      healthCache.set(repoPath, { deps: deps.value, dependabot });
+      healthCache.set(repoPath, {
+        deps: deps.value,
+        dependabot,
+        dependabotCheckedAt,
+        dependabotRequestFailed,
+      });
     }
     if (guard.isLive()) loading = false;
+  }
+
+  /**
+   * Preserve the newest explicit GitHub outcome even when the simultaneous
+   * local rescan failed. Otherwise an older successful cache entry would
+   * reappear on the next tab mount and look newer than the failure.
+   */
+  function cacheDependabotResult(
+    repoPath: string,
+    result: DependabotReport,
+    checkedAt: number,
+    requestFailed: boolean,
+  ) {
+    const currentReport = scanned.path === repoPath ? report : null;
+    const deps = currentReport ?? healthCache.get(repoPath)?.deps;
+    if (!deps) return;
+    healthCache.set(repoPath, {
+      deps,
+      dependabot: result,
+      dependabotCheckedAt: checkedAt,
+      dependabotRequestFailed: requestFailed,
+    });
+  }
+
+  async function scanDependabot(path?: string) {
+    const repoPath = path ?? $repoStore.currentPath;
+    if (!repoPath) return;
+    dependabotInflight?.cancel();
+    const guard = createAsyncGuard();
+    dependabotInflight = guard;
+    checkingGithub = true;
+    actionError = null;
+    try {
+      const next = await invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath });
+      if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
+      const checkedAt = Date.now();
+      dependabot = next;
+      dependabotCheckedAt = checkedAt;
+      dependabotRequestFailed = false;
+      cacheDependabotResult(repoPath, next, checkedAt, false);
+    } catch (err) {
+      if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
+      const checkedAt = Date.now();
+      const failed: DependabotReport = {
+        available: false,
+        // Neutral sentinels only satisfy the wire shape. The separate failure
+        // bit prevents either from being interpreted as backend evidence.
+        cli_present: true,
+        is_github_remote: false,
+        slug: "",
+        alerts: [],
+        truncated: false,
+        error: formatError(err),
+      };
+      dependabot = failed;
+      dependabotCheckedAt = checkedAt;
+      dependabotRequestFailed = true;
+      cacheDependabotResult(repoPath, failed, checkedAt, true);
+    } finally {
+      if (guard.isLive()) checkingGithub = false;
+    }
   }
 
   /** The rendered text behind both "Copy report" and "Fix with MANVI". */
@@ -254,7 +326,9 @@
     const current = report;
     const repoPath = $repoStore.currentPath;
     if (!current || !repoPath) return null;
-    return formatHealthReport(current, repoPath, dependabot);
+    const text = formatHealthReport(current, repoPath, dependabot);
+    if (!dependabot || dependabotCheckedAt === null) return text;
+    return `${text}\nDependabot checked at: ${dependabotFreshness(dependabotCheckedAt).iso} (result may be cached)`;
   }
 
   let copyTimer: number | null = null;
@@ -299,6 +373,8 @@
   async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
+    const actionLabel = step.command ?? step.text;
+    let actionRecorded = false;
     stepResults[step.id] = { running: true };
 
     try {
@@ -309,9 +385,17 @@
         // Long enough for a cold install/build; the backend clamps to [1s, 30min].
         timeoutSecs: 600,
       });
+      const passed = runPassed(res);
+      harnessStore.recordAction({
+        repoPath,
+        kind: "remediation-step",
+        label: actionLabel,
+        ok: passed,
+        verdict: res.policy ?? null,
+      });
+      actionRecorded = true;
       if (!guard.isLive()) return false;
 
-      const passed = runPassed(res);
       stepResults[step.id] = {
         running: false,
         status: passed ? "passed" : "failed",
@@ -323,15 +407,16 @@
         duration_ms: res.duration_ms,
       };
 
-      harnessStore.recordAction({
-        kind: "remediation-step",
-        label: step.command ?? step.text,
-        ok: passed,
-        verdict: res.policy ?? null,
-      });
-
       return passed;
     } catch (err) {
+      if (!actionRecorded) {
+        harnessStore.recordAction({
+          repoPath,
+          kind: "remediation-step",
+          label: actionLabel,
+          ok: false,
+        });
+      }
       if (!guard.isLive()) return false;
       const msg = formatError(err);
       stepResults[step.id] = {
@@ -339,13 +424,6 @@
         status: "failed",
         detail: msg,
       };
-
-      harnessStore.recordAction({
-        kind: "remediation-step",
-        label: step.command ?? step.text,
-        ok: false,
-      });
-
       return false;
     }
   }
@@ -384,6 +462,7 @@
   $effect(() => {
     return () => {
       inflight?.cancel();
+      dependabotInflight?.cancel();
       fixInflight?.cancel();
       stepsInflight?.cancel();
       if (copyTimer !== null) window.clearTimeout(copyTimer);
@@ -395,26 +474,43 @@
     const path = $repoStore.currentPath;
     if (!path) {
       inflight?.cancel();
+      dependabotInflight?.cancel();
       fixInflight?.cancel();
       stepsInflight?.cancel();
       scanned.path = "";
       report = null;
       dependabot = null;
+      dependabotCheckedAt = null;
+      dependabotRequestFailed = false;
       errorMsg = null;
       actionError = null;
       loading = false;
+      checkingGithub = false;
       plan = null;
       planError = null;
       return;
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    dependabotInflight?.cancel();
+    checkingGithub = false;
     // Hydrate last-known data synchronously so a revisit renders instantly
     // (the placeholder below only fires when there is no cached report).
     const cached = healthCache.get(path);
     if (cached) {
       report = cached.deps;
       dependabot = cached.dependabot;
+      dependabotCheckedAt = cached.dependabotCheckedAt;
+      dependabotRequestFailed = cached.dependabotRequestFailed;
+    } else {
+      report = null;
+      dependabot = null;
+      dependabotCheckedAt = null;
+      dependabotRequestFailed = false;
+      deadSymbols = [];
+      deadSymbolsAvailable = false;
+      deadSymbolsReason = null;
+      codegraph = null;
     }
     void scan(path);
   });
@@ -440,16 +536,22 @@
             ? ` (${dependabot.alerts.length}${dependabot.truncated ? "+" : ""})`
             : ""}
         </h3>
-        {#if !dependabot.cli_present}
+        {#if dependabot.error}
+          <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
+            Could not fetch Dependabot alerts: {dependabot.error}
+          </div>
+          {#if !dependabotRequestFailed && !dependabot.cli_present && dependabot.is_github_remote}
+            <p class="text-textMuted max-w-2xl">
+              Install the <span class="font-mono">gh</span> CLI and run
+              <span class="font-mono">gh auth login</span> before checking again.
+            </p>
+          {/if}
+        {:else if !dependabot.cli_present}
           <p class="text-textMuted max-w-2xl">
             Install the <span class="font-mono">gh</span> CLI and run
             <span class="font-mono">gh auth login</span> to fetch Dependabot alerts for
             {dependabot.slug || "this repository"}.
           </p>
-        {:else if dependabot.error}
-          <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
-            Could not fetch Dependabot alerts: {dependabot.error}
-          </div>
         {:else if dependabot.alerts.length === 0}
           <p class="text-textMuted">No open Dependabot alerts on {dependabot.slug}.</p>
         {:else}
@@ -533,6 +635,17 @@
       {/if}
     </div>
     <div class="flex items-center gap-2">
+      <button
+        type="button"
+        aria-describedby="dependabot-permission-note"
+        onclick={() => scanDependabot()}
+        disabled={checkingGithub}
+        class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
+        title="Use the GitHub CLI, its credentials, and the network to check Dependabot alerts"
+      >
+        <ShieldAlert size={13} class={checkingGithub ? "animate-pulse" : ""} />
+        {checkingGithub ? "Checking GitHub…" : "Check GitHub alerts"}
+      </button>
       {#if report}
         <span class="text-[11px] text-textMuted font-mono">
           {report.node_version ? `node ${report.node_version}` : "node —"}
@@ -571,15 +684,29 @@
         onclick={() => scan()}
         disabled={loading}
         class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
-        title="Rescan vulnerabilities and updates"
+        title="Rescan local vulnerabilities, updates, and code health"
       >
         <RefreshCw size={13} class={loading ? "animate-spin" : ""} />
-        Scan
+        Scan local
       </button>
     </div>
   </div>
 
   <div class="flex-1 overflow-auto p-4 space-y-5">
+    <div class="rounded-xl border border-border/70 bg-surface px-3 py-2 text-[11px] text-textMuted max-w-3xl space-y-1">
+      <p id="dependabot-permission-note">
+        GitHub alerts are not checked automatically. The explicit check uses the GitHub CLI,
+        its credentials, and the network.
+      </p>
+      {#if dependabot && displayedDependabotFreshness}
+        <p role="status">
+          This result may be cached. Last checked
+          <time datetime={displayedDependabotFreshness.iso}>{displayedDependabotFreshness.label}</time>.
+        </p>
+      {:else}
+        <p>No GitHub alert result has been loaded for this repository.</p>
+      {/if}
+    </div>
     <!-- Non-fatal action failures render ahead of the state chain so they stay
          visible in every state instead of shadowing (or being shadowed by) the
          load-error branch. Same shape as GitHubPanel's actionError banner. -->
@@ -847,15 +974,17 @@
                     : ""
                 }`})
           </h3>
-          <div class="gp-segmented">
+          <div class="gp-segmented" role="group" aria-label="Vulnerability scope">
             <button
               type="button"
+              aria-pressed={filter === "all"}
               data-active={filter === "all" ? "true" : "false"}
               class="gp-seg-btn !text-[11px] !py-0.5"
               onclick={() => (filter = "all")}
             >All</button>
             <button
               type="button"
+              aria-pressed={filter === "direct"}
               data-active={filter === "direct" ? "true" : "false"}
               class="gp-seg-btn !text-[11px] !py-0.5"
               onclick={() => (filter = "direct")}

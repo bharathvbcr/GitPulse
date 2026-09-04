@@ -14,14 +14,15 @@
 /** Who issued a grant. */
 export interface Grantor {
   authority: string;
-  name: string;
+  id: string;
 }
 
 /** What a grant covers. */
 export interface GrantScope {
-  rule: string;
-  target: string;
   task_id: string;
+  rules: string[];
+  paths: string[];
+  once: boolean;
 }
 
 /** One recorded override. */

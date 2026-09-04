@@ -1,13 +1,20 @@
 import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { formatError } from "../ui/formatError";
+import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
 import type { LedgerEvent, LedgerStatus } from "../ledger/types";
 import type { CatchUp } from "../ingest/types";
 import {
+  identityKey,
+  isCaseInsensitiveFs,
+  normalizeRepoPath,
+  type PathIdentityOptions,
+} from "../repos/paths";
+import {
   appendAction,
   makeAgentAction,
   MAX_AGENT_ACTIONS,
+  mergeActionEntries,
   type AgentActionEntry,
 } from "../agents/activity";
 
@@ -145,7 +152,7 @@ export interface HarnessState {
   /** Model the user pinned, or null to let discovery choose. */
   preferred: AiSelection | null;
   isProbing: boolean;
-  /** Most recent policy decision, for the status strip. */
+  /** Most recent policy decision for the active repository, for the status strip. */
   lastVerdict: PolicyVerdict | null;
   error: string | null;
   /**
@@ -186,6 +193,55 @@ const STORAGE_KEY_MODEL = "gitpulse_ai_model";
  */
 const LEDGER_PAGE = 200;
 
+type RepositoryProjectionState = Pick<
+  HarnessState,
+  "lastVerdict" | "actions" | "ledgerCursor" | "catchUp" | "ledger"
+>;
+
+interface LedgerBucket extends RepositoryProjectionState {
+  /** Canonical path used for backend calls and ephemeral action identity. */
+  repoPath: string;
+  /** Orders verdict writes when canonical and alias buckets converge. */
+  verdictGeneration: number;
+  /** Invalidates late status/tail responses for this repository. */
+  generation: number;
+  /** Independent because catch-up writes trigger their own tail notifications. */
+  catchUpGeneration: number;
+}
+
+interface LedgerRun {
+  key: string;
+  repoPath: string;
+  generation: number;
+}
+
+const UNSCOPED_REPOSITORY = "unscoped";
+const LEDGER_PATH_SUFFIX = "/.devcouncil/ledger.sqlite";
+
+function emptyLedgerBucket(repoPath: string): LedgerBucket {
+  return {
+    repoPath,
+    verdictGeneration: 0,
+    generation: 0,
+    catchUpGeneration: 0,
+    lastVerdict: null,
+    actions: [],
+    ledgerCursor: 0,
+    catchUp: null,
+    ledger: null,
+  };
+}
+
+function ledgerProjection(bucket: LedgerBucket): RepositoryProjectionState {
+  return {
+    lastVerdict: bucket.lastVerdict,
+    actions: bucket.actions,
+    ledgerCursor: bucket.ledgerCursor,
+    catchUp: bucket.catchUp,
+    ledger: bucket.ledger,
+  };
+}
+
 /**
  * An AI status probe nests a HarnessStatus that is often empty even when the
  * preceding sidecar handshake recorded a connection error. Keep that error
@@ -197,9 +253,30 @@ function retainHarnessError(
 ): HarnessStatus {
   if (incoming.error) return incoming;
   if (current?.error) {
-    return { ...incoming, error: current.error, error_code: current.error_code };
+    return {
+      ...incoming,
+      available: false,
+      ops: [],
+      error: current.error,
+      error_code: current.error_code,
+    };
   }
   return incoming;
+}
+
+function unavailableHarness(
+  current: HarnessStatus | null,
+  detail: unknown,
+): HarnessStatus {
+  return {
+    available: false,
+    binary: current?.binary ?? "",
+    protocol: current?.protocol ?? 0,
+    posture: current?.posture ?? "",
+    ops: [],
+    error: formatDiagnosticFailure(detail),
+    error_code: "status_unavailable",
+  };
 }
 
 function loadPreferred(): AiSelection | null {
@@ -229,11 +306,24 @@ function savePreferred(selection: AiSelection | null) {
 }
 
 export interface HarnessStoreDeps {
-  invoke?: typeof invoke;
+  /** The object-argument subset of Tauri invoke used by this store. */
+  invoke?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 }
 
 export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   const invokeFn = deps.invoke ?? invoke;
+  const pathIdentityOptions: PathIdentityOptions = {
+    caseInsensitive: isCaseInsensitiveFs(),
+  };
+  const ledgerBuckets = new Map<string, LedgerBucket>();
+  const repositoryAliases = new Map<string, string>();
+  ledgerBuckets.set(UNSCOPED_REPOSITORY, emptyLedgerBucket(""));
+  let activeRepositoryKey = UNSCOPED_REPOSITORY;
+  // Globally ordered so two not-yet-resolved spellings of the same repository
+  // cannot both carry an apparently-current per-bucket token when they merge.
+  let nextLedgerGeneration = 0;
+  let nextCatchUpGeneration = 0;
+  let nextVerdictGeneration = 0;
   const { subscribe, update } = writable<HarnessState>({
     harness: null,
     ai: null,
@@ -254,6 +344,210 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
    */
   let probeToken = 0;
 
+  /**
+   * The native boundary and repoStore supply canonical paths. Normalization
+   * here collapses harmless spelling differences (separator, trailing slash,
+   * Unicode, and host filesystem case) so one canonical repository cannot
+   * acquire two frontend cursors.
+   */
+  function rawRepositoryAddress(repoPath: string): { key: string; path: string } {
+    const path = normalizeRepoPath(repoPath) ?? repoPath;
+    const identity = identityKey(path, pathIdentityOptions);
+    return { key: `repo:${identity || path}`, path };
+  }
+
+  function resolvedRepositoryKey(rawKey: string): string {
+    let key = rawKey;
+    const visited = new Set<string>();
+    while (!visited.has(key)) {
+      visited.add(key);
+      const next = repositoryAliases.get(key);
+      if (!next) break;
+      key = next;
+    }
+    return key;
+  }
+
+  function repositoryAddress(repoPath: string): { key: string; path: string } {
+    const raw = rawRepositoryAddress(repoPath);
+    const key = resolvedRepositoryKey(raw.key);
+    return { key, path: ledgerBuckets.get(key)?.repoPath ?? raw.path };
+  }
+
+  function bucketFor(repoPath: string): { key: string; bucket: LedgerBucket } {
+    const address = repositoryAddress(repoPath);
+    let bucket = ledgerBuckets.get(address.key);
+    if (!bucket) {
+      bucket = emptyLedgerBucket(address.path);
+      ledgerBuckets.set(address.key, bucket);
+    }
+    return { key: address.key, bucket };
+  }
+
+  function canonicalRepoFromStatus(status: LedgerStatus): string | null {
+    const path = normalizeRepoPath(status.path);
+    if (!path?.endsWith(LEDGER_PATH_SUFFIX)) return null;
+    const repoPath = path.slice(0, -LEDGER_PATH_SUFFIX.length);
+    return normalizeRepoPath(repoPath);
+  }
+
+  /**
+   * Native ledger storage canonicalizes repository paths, while older append
+   * notifications can carry the caller's symlink spelling. The status path is
+   * canonical and lets the frontend converge those spellings without a second
+   * filesystem authority or a lossy lexical guess.
+   */
+  function adoptCanonicalRun(
+    run: LedgerRun,
+    status: LedgerStatus,
+  ): LedgerRun | null {
+    const source = ledgerBuckets.get(run.key);
+    if (!source || source.generation !== run.generation) return null;
+    const canonicalPath = canonicalRepoFromStatus(status);
+    if (!canonicalPath) {
+      mutateBucket(
+        run.key,
+        (bucket) => ({ ...bucket, ledger: status }),
+        run.generation,
+      );
+      return run;
+    }
+
+    const canonicalRaw = rawRepositoryAddress(canonicalPath);
+    const canonicalKey = resolvedRepositoryKey(canonicalRaw.key);
+    if (canonicalKey === run.key) {
+      mutateBucket(
+        run.key,
+        (bucket) => ({ ...bucket, repoPath: canonicalPath, ledger: status }),
+        run.generation,
+      );
+      return { ...run, repoPath: canonicalPath };
+    }
+
+    const target =
+      ledgerBuckets.get(canonicalKey) ?? emptyLedgerBucket(canonicalPath);
+    const sourceLedgerIsNewer = source.generation >= target.generation;
+    const generation = Math.max(source.generation, target.generation);
+    const sourceCatchUpIsNewer =
+      source.catchUpGeneration >= target.catchUpGeneration;
+    const sourceVerdictIsNewer =
+      source.verdictGeneration >= target.verdictGeneration;
+    const merged: LedgerBucket = {
+      repoPath: canonicalPath,
+      verdictGeneration: Math.max(
+        source.verdictGeneration,
+        target.verdictGeneration,
+      ),
+      generation,
+      catchUpGeneration: Math.max(
+        source.catchUpGeneration,
+        target.catchUpGeneration,
+      ),
+      actions: mergeActionEntries(
+        target.actions,
+        source.actions,
+        MAX_AGENT_ACTIONS,
+      ),
+      ledgerCursor: Math.max(source.ledgerCursor, target.ledgerCursor),
+      catchUp: sourceCatchUpIsNewer
+        ? source.catchUp ?? target.catchUp
+        : target.catchUp ?? source.catchUp,
+      lastVerdict: sourceVerdictIsNewer
+        ? source.lastVerdict
+        : target.lastVerdict,
+      ledger: sourceLedgerIsNewer ? status : target.ledger,
+    };
+
+    repositoryAliases.set(run.key, canonicalKey);
+    for (const [alias, destination] of repositoryAliases) {
+      if (destination === run.key) repositoryAliases.set(alias, canonicalKey);
+    }
+    ledgerBuckets.delete(run.key);
+    ledgerBuckets.set(canonicalKey, merged);
+    if (activeRepositoryKey === run.key) activeRepositoryKey = canonicalKey;
+    publishBucket(canonicalKey, merged);
+    return sourceLedgerIsNewer
+      ? { key: canonicalKey, repoPath: canonicalPath, generation }
+      : null;
+  }
+
+  function publishBucket(key: string, bucket: LedgerBucket): void {
+    if (key !== activeRepositoryKey) return;
+    update((state) => ({ ...state, ...ledgerProjection(bucket) }));
+  }
+
+  function mutateBucket(
+    key: string,
+    mutate: (bucket: LedgerBucket) => LedgerBucket,
+    generation?: number,
+  ): boolean {
+    const current = ledgerBuckets.get(key);
+    if (!current || (generation !== undefined && current.generation !== generation)) {
+      return false;
+    }
+    const next = mutate(current);
+    ledgerBuckets.set(key, next);
+    publishBucket(key, next);
+    return true;
+  }
+
+  function isCurrentLedgerRun(run: LedgerRun): boolean {
+    return ledgerBuckets.get(run.key)?.generation === run.generation;
+  }
+
+  function isCurrentCatchUpRun(run: LedgerRun): boolean {
+    const key = resolvedRepositoryKey(run.key);
+    return ledgerBuckets.get(key)?.catchUpGeneration === run.generation;
+  }
+
+  function beginLedgerRun(repoPath: string): LedgerRun {
+    const { key, bucket } = bucketFor(repoPath);
+    const next = { ...bucket, generation: ++nextLedgerGeneration };
+    ledgerBuckets.set(key, next);
+    return { key, repoPath: next.repoPath, generation: next.generation };
+  }
+
+  function beginCatchUpRun(repoPath: string): LedgerRun {
+    const { key, bucket } = bucketFor(repoPath);
+    const next = {
+      ...bucket,
+      catchUpGeneration: ++nextCatchUpGeneration,
+    };
+    ledgerBuckets.set(key, next);
+    return {
+      key,
+      repoPath: next.repoPath,
+      generation: next.catchUpGeneration,
+    };
+  }
+
+  function mutateCatchUpBucket(
+    run: LedgerRun,
+    mutate: (bucket: LedgerBucket) => LedgerBucket,
+  ): boolean {
+    const key = resolvedRepositoryKey(run.key);
+    const current = ledgerBuckets.get(key);
+    if (!current || current.catchUpGeneration !== run.generation) return false;
+    const next = mutate(current);
+    ledgerBuckets.set(key, next);
+    publishBucket(key, next);
+    return true;
+  }
+
+  function activateRepository(repoPath: string | null): void {
+    if (!repoPath) {
+      activeRepositoryKey = UNSCOPED_REPOSITORY;
+      publishBucket(
+        UNSCOPED_REPOSITORY,
+        ledgerBuckets.get(UNSCOPED_REPOSITORY)!,
+      );
+      return;
+    }
+    const { key, bucket } = bucketFor(repoPath);
+    activeRepositoryKey = key;
+    publishBucket(key, bucket);
+  }
+
   function currentPreferred(): AiSelection | null {
     return get({ subscribe }).preferred;
   }
@@ -272,56 +566,110 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         ai,
         harness: retainHarnessError(s.harness, ai.harness),
         isProbing: false,
+        error: null,
       }));
       return ai;
     } catch (err: unknown) {
       if (token !== probeToken) return null;
-      update((s) => ({ ...s, isProbing: false, error: s.error ?? formatError(err) }));
+      update((s) => ({
+        ...s,
+        isProbing: false,
+        harness: unavailableHarness(s.harness, err),
+        error: formatDiagnosticFailure(err),
+      }));
       return null;
     }
   }
 
-  async function syncLedger(repoPath: string): Promise<void> {
-    if (!repoPath) return;
+  async function syncLedgerRun(run: LedgerRun): Promise<void> {
+    let currentRun = run;
     try {
-      const status = await invokeFn<LedgerStatus>("cmd_ledger_status", { repoPath });
-      update((s) => ({ ...s, ledger: status }));
-      let cursor = get({ subscribe }).ledgerCursor;
+      const status = await invokeFn<LedgerStatus>("cmd_ledger_status", {
+        repoPath: currentRun.repoPath,
+      });
+      const canonicalRun = adoptCanonicalRun(currentRun, status);
+      if (!canonicalRun) return;
+      currentRun = canonicalRun;
+      let cursor = ledgerBuckets.get(currentRun.key)!.ledgerCursor;
       // Page until drained, so opening a repo with a long history shows all
       // of it rather than only the first window.
       for (;;) {
         const events = await invokeFn<LedgerEvent[]>("cmd_ledger_tail", {
-          repoPath,
+          repoPath: currentRun.repoPath,
           cursor,
           limit: LEDGER_PAGE,
         });
+        if (!isCurrentLedgerRun(currentRun)) return;
         if (events.length === 0) break;
-        cursor = events[events.length - 1].id;
-        update((s) => ({
-          ...s,
-          actions: mergeEvents(s.actions, events, MAX_AGENT_ACTIONS),
-          ledgerCursor: Math.max(s.ledgerCursor, cursor),
-        }));
+        const nextCursor = events.reduce(
+          (highest, event) => Math.max(highest, event.id),
+          cursor,
+        );
+        // The backend query is already repository-scoped. Checking the row's
+        // stored canonical path as well means a corrupt/misrouted row cannot
+        // cross the final UI projection boundary.
+        const matching = events.filter(
+          (event) =>
+            repositoryAddress(event.repo_path).key === currentRun.key,
+        );
+        const repositoryMismatch = matching.length !== events.length;
+        if (
+          !mutateBucket(
+            currentRun.key,
+            (bucket) => ({
+              ...bucket,
+              actions: mergeEvents(bucket.actions, matching, MAX_AGENT_ACTIONS),
+              ledgerCursor: Math.max(bucket.ledgerCursor, nextCursor),
+              ledger: repositoryMismatch
+                ? {
+                    recording: false,
+                    path: bucket.ledger?.path ?? "",
+                    dropped: bucket.ledger?.dropped ?? 0,
+                    error:
+                      "The ledger returned rows for a different repository; those rows were not displayed.",
+                    error_code: "repository_mismatch",
+                  }
+                : bucket.ledger,
+            }),
+            currentRun.generation,
+          )
+        ) {
+          return;
+        }
+        if (nextCursor <= cursor) break;
+        cursor = nextCursor;
         if (events.length < LEDGER_PAGE) break;
       }
     } catch (e) {
       // A ledger read that fails must not blank the journal: the rows already
       // projected are still true. Record why, and leave them.
-      update((s) => ({
-        ...s,
-        ledger: {
-          recording: false,
-          path: s.ledger?.path ?? "",
-          dropped: s.ledger?.dropped ?? 0,
-          error: formatError(e),
-          error_code: "read_failed",
-        },
-      }));
+      mutateBucket(
+        currentRun.key,
+        (bucket) => ({
+          ...bucket,
+          ledger: {
+            recording: false,
+            path: bucket.ledger?.path ?? "",
+            dropped: bucket.ledger?.dropped ?? 0,
+            error: formatDiagnosticFailure(e),
+            error_code: "read_failed",
+          },
+        }),
+        currentRun.generation,
+      );
     }
+  }
+
+  async function syncLedger(repoPath: string): Promise<void> {
+    if (!repoPath) return;
+    await syncLedgerRun(beginLedgerRun(repoPath));
   }
 
   const store = {
     subscribe,
+
+    /** Projects only this canonical repository's ledger bucket into the UI. */
+    activateRepository,
 
     /** Handshakes the sidecar and sweeps for local model servers. */
     refresh: async () => {
@@ -329,10 +677,14 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       try {
         const harness = await invokeFn<HarnessStatus>("cmd_harness_status");
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, harness }));
+        update((s) => ({ ...s, harness, error: null }));
       } catch (err: unknown) {
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, error: formatError(err) }));
+        update((s) => ({
+          ...s,
+          harness: unavailableHarness(s.harness, err),
+          error: formatDiagnosticFailure(err),
+        }));
       }
       return probeAi(token);
     },
@@ -346,10 +698,14 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       try {
         const harness = await invokeFn<HarnessStatus>("cmd_harness_reconnect");
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, harness }));
+        update((s) => ({ ...s, harness, error: null }));
       } catch (err: unknown) {
         if (token !== probeToken) return null;
-        update((s) => ({ ...s, error: formatError(err) }));
+        update((s) => ({
+          ...s,
+          harness: unavailableHarness(s.harness, err),
+          error: formatDiagnosticFailure(err),
+        }));
       }
       return probeAi(token);
     },
@@ -360,8 +716,18 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       return probeAi(++probeToken);
     },
 
-    recordVerdict: (verdict: PolicyVerdict | null) => {
-      update((s) => ({ ...s, lastVerdict: verdict }));
+    recordVerdict: (verdict: PolicyVerdict | null, repoPath?: string) => {
+      const target = repoPath
+        ? bucketFor(repoPath)
+        : {
+            key: activeRepositoryKey,
+            bucket: ledgerBuckets.get(activeRepositoryKey)!,
+          };
+      mutateBucket(target.key, (bucket) => ({
+        ...bucket,
+        lastVerdict: verdict,
+        verdictGeneration: ++nextVerdictGeneration,
+      }));
     },
 
     /**
@@ -369,9 +735,22 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
      * callers cannot forget the timestamp or id.
      */
     recordAction: (
-      input: { kind: string; label: string; ok: boolean; verdict?: PolicyVerdict | null },
-      now?: number
+      input: {
+        /** Canonical repository that initiated an asynchronous action. */
+        repoPath?: string;
+        kind: string;
+        label: string;
+        ok: boolean;
+        verdict?: PolicyVerdict | null;
+      },
+      now?: number,
     ) => {
+      const target = input.repoPath
+        ? bucketFor(input.repoPath)
+        : {
+            key: activeRepositoryKey,
+            bucket: ledgerBuckets.get(activeRepositoryKey)!,
+          };
       const entry = makeAgentAction(
         {
           kind: input.kind,
@@ -379,16 +758,24 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
           ok: input.ok,
           verdict: input.verdict ?? null,
         },
-        now
+        now,
+        target.bucket.repoPath,
       );
-      update((s) => ({ ...s, actions: appendAction(s.actions, entry) }));
+      mutateBucket(target.key, (bucket) => ({
+        ...bucket,
+        actions: appendAction(bucket.actions, entry),
+      }));
     },
 
     clearActions: () => {
       // Clears the *view*, never the ledger. The record on disk is what makes
       // the history answerable after a crash; a UI button must not be able to
       // erase it.
-      update((s) => ({ ...s, actions: [], ledgerCursor: 0 }));
+      mutateBucket(activeRepositoryKey, (bucket) => ({
+        ...bucket,
+        actions: [],
+        generation: ++nextLedgerGeneration,
+      }));
     },
 
     /**
@@ -402,23 +789,35 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
      */
     catchUp: async (repoPath: string): Promise<CatchUp | null> => {
       if (!repoPath) return null;
+      // catchUp is the existing repo-open entry point, so activating here keeps
+      // every current consumer compatible while switching the public
+      // projection synchronously, before any backend response can arrive.
+      activateRepository(repoPath);
+      const run = beginCatchUpRun(repoPath);
       let summary: CatchUp | null = null;
       try {
-        summary = await invokeFn<CatchUp>("cmd_catch_up", { repoPath });
-        update((s) => ({ ...s, catchUp: summary }));
+        summary = await invokeFn<CatchUp>("cmd_catch_up", {
+          repoPath: run.repoPath,
+        });
+        if (!isCurrentCatchUpRun(run)) return summary;
+        mutateCatchUpBucket(run, (bucket) => ({ ...bucket, catchUp: summary }));
       } catch (e) {
-        update((s) => ({
-          ...s,
-          catchUp: {
-            recorded: 0,
-            transcripts: 0,
-            skipped_lines: 0,
-            reflog_entries: 0,
-            error: formatError(e),
-          },
-        }));
+        if (!isCurrentCatchUpRun(run)) return null;
+        mutateCatchUpBucket(
+          run,
+          (bucket) => ({
+            ...bucket,
+            catchUp: {
+              recorded: 0,
+              transcripts: 0,
+              skipped_lines: 0,
+              reflog_entries: 0,
+              error: formatDiagnosticFailure(e),
+            },
+          }),
+        );
       }
-      await syncLedger(repoPath);
+      if (isCurrentCatchUpRun(run)) await syncLedger(run.repoPath);
       return summary;
     },
 

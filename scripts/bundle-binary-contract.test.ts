@@ -31,9 +31,22 @@ function declaredBinaries(): { name: string; path: string }[] {
   );
 }
 
+/** The binary Cargo selects for a bare `cargo run`. */
+function packageDefaultRun(): string | undefined {
+  const packageSection = CARGO.match(/\[package\]([\s\S]*?)(?=\n\[|$)/)?.[1];
+  return packageSection?.match(/^\s*default-run\s*=\s*"([^"]+)"\s*$/m)?.[1];
+}
+
 describe("the bundled binary is chosen, not inherited from cargo's ordering", () => {
   it("names the main binary in tauri.conf.json", () => {
     expect(TAURI_CONF.mainBinaryName).toBe("gitpulse");
+  });
+
+  it("selects the GUI when Tauri dev invokes cargo run without --bin", () => {
+    expect(
+      packageDefaultRun(),
+      "[package].default-run must name the GUI or bare cargo run is ambiguous",
+    ).toBe(TAURI_CONF.mainBinaryName);
   });
 
   it("declares that binary explicitly, and it is the GUI entry point", () => {

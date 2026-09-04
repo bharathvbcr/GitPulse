@@ -80,4 +80,11 @@ describe("CommitRow accessible graph context", () => {
     expect(source).toContain("Cherry-pick onto current branch");
     expect(source).toContain("Revert this commit");
   });
+
+  it("does not show copied feedback when the clipboard rejects the write", () => {
+    const shaCopy = source.slice(source.indexOf("async function handleCopySha"), source.indexOf("function openContextMenu"));
+    expect(shaCopy).toContain("if (!(await copyText(row.id)))");
+    expect(shaCopy).toContain("toastStore.error");
+    expect(source).toContain("if (await copyText(row.summary))");
+  });
 });

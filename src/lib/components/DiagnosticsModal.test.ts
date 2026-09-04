@@ -3,7 +3,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import DiagnosticsModal from "./DiagnosticsModal.svelte";
+import DiagnosticsModal, {
+  classifyBackendDiagnostics,
+  isCurrentBackendLoad,
+} from "./DiagnosticsModal.svelte";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { withBackendLogSection } from "../diagnostics/report";
 
@@ -16,15 +19,25 @@ describe("DiagnosticsModal", () => {
     expect(body).not.toContain('role="dialog"');
   });
 
-  it("shows an explicit empty state while nothing is recorded", () => {
+  it("keeps crash-only backend evidence reachable when the frontend ring is empty", () => {
     diagnostics.clear();
     const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
 
     expect(body).toContain('role="dialog"');
     expect(body).toContain('aria-label="Filter by severity"');
-    expect(body).toContain("No diagnostics recorded");
-    // Copy and Clear have nothing to act on yet.
-    expect(body).toContain("disabled");
+    expect(body).toContain("No frontend diagnostics recorded");
+    expect(body).toContain("Loading backend diagnostics");
+    expect(body).toContain("Review local paths and command output before sharing");
+    expect(body).toContain("Clear frontend");
+    // The frontend can be empty immediately after a backend crash. Copy must
+    // remain available so the durable log can still be exported after relaunch.
+    expect(source).not.toContain(
+      'onclick={copyReport} disabled={$diagnostics.length === 0}',
+    );
+    const copyLabel = body.indexOf("<span>Copy Report</span>");
+    const copyButton = body.lastIndexOf("<button", copyLabel);
+    expect(copyLabel).toBeGreaterThan(copyButton);
+    expect(body.slice(copyButton, copyLabel)).not.toContain("disabled");
   });
 
   it("lists recorded errors and warnings with source, time and repeat count", () => {
@@ -44,7 +57,7 @@ describe("DiagnosticsModal", () => {
     expect(body).toContain('tracking-wider text-amber-400">warning</span>');
     // Header filter counts reflect occurrences per severity.
     expect(body).toContain('aria-label="Filter by severity"');
-    expect(body).not.toContain("No diagnostics recorded");
+    expect(body).not.toContain("No frontend diagnostics recorded");
     diagnostics.clear();
   });
 
@@ -91,25 +104,80 @@ describe("withBackendLogSection", () => {
 });
 
 describe("DiagnosticsModal backend log context", () => {
-  it("fetches cmd_diagnostic_log_tail inside a try/catch so copying survives its absence", () => {
-    const invokeIdx = source.indexOf('"cmd_diagnostic_log_tail"');
-    expect(invokeIdx).toBeGreaterThan(-1);
-    const openTry = source.lastIndexOf("try {", invokeIdx);
-    const closeCatch = source.indexOf("} catch {", invokeIdx);
-    expect(openTry).toBeGreaterThan(-1);
-    expect(closeCatch).toBeGreaterThan(invokeIdx);
+  const persisted = (
+    path: string,
+    lines: string[] = [],
+    degraded: string | null = null,
+  ) => ({ path, lines, degraded });
+
+  it("loads both backend sources together while the modal is open", () => {
+    const load = source.indexOf("async function loadBackendContext");
+    const memory = source.indexOf('"cmd_diagnostic_log_tail"', load);
+    const durable = source.indexOf('"cmd_diagnostic_persisted_log"', load);
+    const effect = source.indexOf("$effect(() =>", load);
+    const copy = source.indexOf("async function copyReport", load);
+
+    expect(load).toBeGreaterThan(-1);
+    expect(source.slice(load, effect)).toContain("Promise.allSettled");
+    expect(memory).toBeGreaterThan(load);
+    expect(durable).toBeGreaterThan(memory);
+    expect(effect).toBeGreaterThan(durable);
+    expect(source.slice(effect, copy)).toContain("void beginBackendLoad()");
   });
 
-  it("fetches the durable log too, and never drops its section on failure", () => {
-    const invokeIdx = source.indexOf('"cmd_diagnostic_persisted_log"');
-    expect(invokeIdx).toBeGreaterThan(-1);
-    const openTry = source.lastIndexOf("try {", invokeIdx);
-    const closeCatch = source.indexOf("} catch (err) {", invokeIdx);
-    expect(openTry).toBeGreaterThan(-1);
-    expect(closeCatch).toBeGreaterThan(invokeIdx);
-    // The catch must synthesize a stated-unavailable log rather than skip the
-    // section: an omitted section reads as a backend with nothing to report.
-    expect(source.slice(closeCatch, closeCatch + 200)).toContain("unreadablePersistedLog");
+  it("classifies healthy, empty, degraded and wholly unavailable reads distinctly", () => {
+    expect(classifyBackendDiagnostics(null, ["current"], persisted("/logs/app.log"))).toBe(
+      "healthy",
+    );
+    expect(classifyBackendDiagnostics(null, [], persisted("/logs/app.log"))).toBe("empty");
+    expect(
+      classifyBackendDiagnostics(null, [], persisted("/logs/app.log", [], "write failed")),
+    ).toBe("degraded");
+    expect(
+      classifyBackendDiagnostics("memory IPC failed", [], persisted("", [], "read failed")),
+    ).toBe("unavailable");
+  });
+
+  it("rejects a response from an earlier opening or a closed dialog", () => {
+    expect(isCurrentBackendLoad(4, 4, true)).toBe(true);
+    expect(isCurrentBackendLoad(3, 4, true)).toBe(false);
+    expect(isCurrentBackendLoad(4, 4, false)).toBe(false);
+    expect(source).toContain(
+      "isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)",
+    );
+  });
+
+  it("states every backend condition and keeps the durable section in copied reports", () => {
+    for (const label of [
+      "Loading backend diagnostics",
+      "Backend diagnostics healthy",
+      "Backend diagnostics degraded",
+      "Backend diagnostics unavailable",
+      "Backend diagnostics empty",
+    ]) {
+      expect(source).toContain(label);
+    }
     expect(source).toContain("withPersistedLogSection");
+    expect(source).toContain("Backend memory log — unavailable");
+  });
+
+  it("bounds the whole dialog and lets only its content region scroll", () => {
+    expect(source).toContain("max-h-[calc(100vh-2rem)] min-h-0");
+    expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
+  });
+
+  it("announces only the concise backend status instead of every log update", () => {
+    const backendSection = source.slice(
+      source.indexOf('aria-label="Backend diagnostics"'),
+      source.indexOf("Frontend diagnostics"),
+    );
+    const sectionOpeningTag = backendSection.slice(0, backendSection.indexOf(">"));
+
+    expect(sectionOpeningTag).not.toContain("aria-live=");
+    expect(backendSection).toContain('role="status"');
+    expect(backendSection).toContain('aria-live="polite"');
+    expect(backendSection.indexOf('aria-live="polite"')).toBeLessThan(
+      backendSection.indexOf("backendStatusLabel(backendStatus)"),
+    );
   });
 });

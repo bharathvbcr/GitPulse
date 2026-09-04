@@ -62,7 +62,12 @@ export function formatError(err: unknown): string {
   }
   if (typeof err !== "object") return UNKNOWN_ERROR;
 
-  const message = (err as { message?: unknown }).message;
+  let message: unknown;
+  try {
+    message = (err as { message?: unknown }).message;
+  } catch {
+    return UNKNOWN_ERROR;
+  }
   if (typeof message === "string") {
     const trimmed = message.trim();
     if (trimmed.length > 0) return trimmed;

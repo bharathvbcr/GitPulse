@@ -1,12 +1,30 @@
 <script lang="ts" module>
   import { createRepoPanelCache } from "../panels/repoPanelCache";
-  import type { EditorTabState } from "../files/editorTabs";
+  import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
+  import type { FileSidePane } from "../files/filePaneLayout";
   import type { FileBlob } from "../files/types";
+  import { recordEditorDrafts } from "../files/editorDraftRegistry";
+  import {
+    createLatestOwnerRegistry,
+    editorFileSaveQueue,
+    fileSaveKey,
+    type LatestOwnerLease,
+  } from "../files/serialSave";
 
   const tabCache = createRepoPanelCache<{
     tabs: EditorTabState;
     explorerOpen: boolean;
     dashboardOpen: boolean;
+    preferredSidePane: FileSidePane;
+  }>({
+    // A cache bound may discard clean navigation history, never unsaved work.
+    canEvict: ({ tabs }) => !hasDirtyEditorTabs(tabs),
+  });
+  // Both registries must outlive a rendered FileViewer: App remounts this
+  // component when switching views while an accepted write may still settle.
+  const fileSaveQueue = editorFileSaveQueue;
+  const viewerOwners = createLatestOwnerRegistry<{
+    completeSave(path: string, savedContent: string, tabs: EditorTabState): void;
   }>();
 </script>
 
@@ -31,6 +49,7 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
+  import { askConfirm } from "../stores/modalStore";
   import { openPath } from "@tauri-apps/plugin-opener";
   import FileTreePanel from "./files/FileTreePanel.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
@@ -39,14 +58,21 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import { joinWorktreePath } from "../files/fileTree";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
+  import { resolveFilePaneLayout } from "../files/filePaneLayout";
   import {
     activateEditorTab,
-    closeAllEditorTabs,
+    completeEditorSave,
     closeEditorTab,
-    closeOtherEditorTabs,
+    closeEditorTabs,
+    dirtyEditorTabPaths,
+    discardEditorDraft,
+    editorDraft,
     emptyEditorTabs,
+    isEditorTabDirty,
     openPinned,
     openPreview,
+    pinEditorTab,
+    updateEditorDraft,
     type EditorTabState as Tabs,
   } from "../files/editorTabs";
 
@@ -54,6 +80,10 @@
   let explorerOpen = $state(true);
   let dashboardOpen = $state(true);
   let tabState = $state<Tabs>(emptyEditorTabs());
+  let fileViewRoot: HTMLDivElement | undefined = $state();
+  let fileViewWidth = $state(0);
+  let preferredSidePane = $state<FileSidePane>("explorer");
+  let compactPane = $state<FileSidePane | null>(null);
 
   let activeBlob = $state<FileBlob | null>(null);
   let isLoadingFile = $state(false);
@@ -62,9 +92,23 @@
   let prevLoadKey = "";
   let hydratedRepo: string | null = null;
   let lastAppliedStoreFile = "";
+  let viewerLease: LatestOwnerLease | null = null;
 
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
+  let activeDraft = $derived(
+    activeTabPath ? editorDraft(tabState, activeTabPath) : undefined,
+  );
+  let activeTabDirty = $derived(
+    activeTabPath ? isEditorTabDirty(tabState, activeTabPath) : false,
+  );
+  let paneLayout = $derived(resolveFilePaneLayout({
+    containerWidth: fileViewWidth,
+    explorerRequested: explorerOpen,
+    dashboardRequested: dashboardOpen,
+    preferredPane: preferredSidePane,
+    compactPane,
+  }));
 
   let pathSegments = $derived.by(() => (activeTabPath ? activeTabPath.split("/") : []));
 
@@ -78,10 +122,16 @@
   function persistTabs(repo: string | null) {
     if (!repo) return;
     tabCache.set(repo, {
-      tabs: { tabs: tabState.tabs, active: tabState.active },
+      tabs: {
+        tabs: tabState.tabs,
+        active: tabState.active,
+        drafts: tabState.drafts,
+      },
       explorerOpen,
       dashboardOpen,
+      preferredSidePane,
     });
+    recordEditorDrafts(repo, Object.keys(tabState.drafts));
   }
 
   async function loadFileContent(path: string) {
@@ -114,61 +164,166 @@
 
   function previewFile(path: string) {
     if (!path) return;
+    compactPane = null;
     tabState = openPreview(tabState, path);
     repoStore.selectFilePath(path);
-    persistTabs($repoStore.currentPath);
+    persistTabs(hydratedRepo);
   }
 
   function pinFile(path: string) {
     if (!path) return;
+    compactPane = null;
     tabState = openPinned(tabState, path);
     repoStore.selectFilePath(path);
-    persistTabs($repoStore.currentPath);
+    persistTabs(hydratedRepo);
   }
 
   function activateTab(path: string) {
     if (!path) return;
     tabState = activateEditorTab(tabState, path);
     repoStore.selectFilePath(path);
-    persistTabs($repoStore.currentPath);
+    persistTabs(hydratedRepo);
   }
 
-  function closeTab(path: string, event?: MouseEvent) {
+  async function confirmDiscardDrafts(candidatePaths: readonly string[]): Promise<boolean> {
+    const repo = hydratedRepo;
+    if (!repo) return false;
+    // An accepted save owns the disk outcome. Let it settle before deciding
+    // what remains dirty, so “Discard” can never race a queued write that
+    // later persists the content the user explicitly chose to discard.
+    const saveKeys = [...new Set(candidatePaths)].map((path) => fileSaveKey(repo, path));
+    await fileSaveQueue.whenIdle(saveKeys);
+    if (!isCurrentViewer(repo)) return false;
+    const dirtyPaths = dirtyEditorTabPaths(tabState, candidatePaths);
+    if (dirtyPaths.length === 0) return true;
+    const names = dirtyPaths.length <= 3
+      ? dirtyPaths.map((path) => `• ${path}`).join("\n")
+      : `${dirtyPaths.length} files`;
+    return askConfirm({
+      title: "Discard Unsaved Edits?",
+      message: `These editor drafts have not been saved:\n${names}`,
+      confirmLabel: "Discard Unsaved Edits",
+      cancelLabel: "Keep Editing",
+    });
+  }
+
+  function isCurrentViewer(repo: string): boolean {
+    return hydratedRepo === repo && viewerLease?.isCurrent() === true;
+  }
+
+  function syncSelectedFilePath() {
+    lastAppliedStoreFile = tabState.active ?? "";
+    repoStore.selectFilePath(tabState.active);
+  }
+
+  async function closeTab(path: string, event?: MouseEvent) {
     event?.stopPropagation();
+    const repo = hydratedRepo;
+    if (!repo) return;
+    if (!(await confirmDiscardDrafts([path]))) return;
+    if (!isCurrentViewer(repo)) return;
     tabState = closeEditorTab(tabState, path);
-    persistTabs($repoStore.currentPath);
+    syncSelectedFilePath();
+    persistTabs(repo);
     if (!tabState.active) {
       activeBlob = null;
       prevLoadKey = "";
     }
   }
 
-  function closeAllTabs() {
-    tabState = closeAllEditorTabs();
-    activeBlob = null;
-    prevLoadKey = "";
-    persistTabs($repoStore.currentPath);
-  }
-
-  function closeOtherTabs() {
-    if (!tabState.active) return;
-    tabState = closeOtherEditorTabs(tabState, tabState.active);
-    persistTabs($repoStore.currentPath);
-  }
-
-  async function handleFileSave(newContent: string) {
-    const repo = $repoStore.currentPath;
-    const current = activeTabPath;
-    if (!repo || !current) return;
-    await invoke("cmd_write_file_content", {
-      repoPath: repo,
-      filePath: current,
-      content: newContent,
-    });
-    if (activeBlob) {
-      activeBlob = { ...activeBlob, text: newContent };
+  async function closeAllTabs() {
+    const repo = hydratedRepo;
+    if (!repo) return;
+    const pathsAtRequest = tabState.tabs.map((tab) => tab.path);
+    if (!(await confirmDiscardDrafts(pathsAtRequest))) return;
+    if (!isCurrentViewer(repo)) return;
+    tabState = closeEditorTabs(tabState, pathsAtRequest);
+    syncSelectedFilePath();
+    if (!tabState.active) {
+      activeBlob = null;
+      prevLoadKey = "";
     }
-    await repoStore.refresh();
+    persistTabs(repo);
+  }
+
+  async function closeOtherTabs() {
+    const keepPath = tabState.active;
+    if (!keepPath) return;
+    const repo = hydratedRepo;
+    if (!repo) return;
+    const pathsToClose = tabState.tabs
+      .filter((tab) => tab.path !== keepPath)
+      .map((tab) => tab.path);
+    if (!(await confirmDiscardDrafts(pathsToClose))) return;
+    if (!isCurrentViewer(repo)) return;
+    tabState = pinEditorTab(closeEditorTabs(tabState, pathsToClose), keepPath);
+    syncSelectedFilePath();
+    persistTabs(repo);
+  }
+
+  function handleDraftChange(path: string, newContent: string, sourceContent: string) {
+    tabState = updateEditorDraft(tabState, path, newContent, sourceContent);
+    persistTabs(hydratedRepo);
+  }
+
+  async function requestDiscardDraft(path: string): Promise<boolean> {
+    const repo = hydratedRepo;
+    if (!repo) return false;
+    if (!(await confirmDiscardDrafts([path]))) return false;
+    if (!isCurrentViewer(repo)) return false;
+    tabState = discardEditorDraft(tabState, path);
+    persistTabs(repo);
+    return true;
+  }
+
+  function applyCompletedSaveToCurrentViewer(
+    repo: string,
+    path: string,
+    savedContent: string,
+    tabs: Tabs,
+  ) {
+    if (!isCurrentViewer(repo)) return;
+    tabState = tabs;
+    if (activeTabPath === path && activeBlob?.path === path) {
+      activeBlob = { ...activeBlob, text: savedContent };
+    }
+  }
+
+  function completeCachedEditorSave(repo: string, path: string, savedContent: string) {
+    const cached = tabCache.get(repo);
+    if (!cached) return;
+    // The cache is synchronously updated on every keystroke. Completing
+    // against this latest state, rather than the initiating instance's state,
+    // preserves a draft typed while the backend write was in flight.
+    const tabs = completeEditorSave(cached.tabs, path, savedContent);
+    tabCache.set(repo, { ...cached, tabs });
+    recordEditorDrafts(repo, Object.keys(tabs.drafts));
+    // Dispatch through the registry rather than this initiating component:
+    // after a view remount the newest owner receives the latest cached state.
+    viewerOwners.current(repo)?.completeSave(path, savedContent, tabs);
+  }
+
+  async function handleFileSave(path: string, newContent: string) {
+    const repo = hydratedRepo;
+    if (!repo || !path) throw new Error("No active file to save");
+    if ($repoStore.currentPath !== repo) {
+      throw new Error("Repository changed before save; the editor draft was kept");
+    }
+    // Save requests can survive a view remount. The module-level queue binds
+    // every accepted operation to its canonical repository and relative path,
+    // and keeps completion/refresh order the same as disk-write order.
+    return fileSaveQueue.run(fileSaveKey(repo, path), async () => {
+      if ($repoStore.currentPath !== repo) {
+        throw new Error("Repository changed before save; the editor draft was kept");
+      }
+      await invoke("cmd_write_file_content", {
+        repoPath: repo,
+        filePath: path,
+        content: newContent,
+      });
+      completeCachedEditorSave(repo, path, newContent);
+      if ($repoStore.currentPath === repo) await repoStore.refresh();
+    });
   }
 
   function openInDefaultApp() {
@@ -182,8 +337,11 @@
     void openPath(fullPath);
   }
 
-  function copyActivePath() {
-    if (activeTabPath) void copyText(activeTabPath);
+  async function copyActivePath() {
+    if (!activeTabPath) return;
+    if (!(await copyText(activeTabPath))) {
+      repoStore.setError("Could not copy path to clipboard");
+    }
   }
 
   function inspectIn(tab: "diff" | "blame") {
@@ -192,15 +350,44 @@
     repoStore.setActiveTab(tab);
   }
 
+  function toggleSidePane(pane: FileSidePane) {
+    const requested = pane === "explorer" ? explorerOpen : dashboardOpen;
+    const visible = pane === "explorer"
+      ? paneLayout.explorerVisible
+      : paneLayout.dashboardVisible;
+    preferredSidePane = pane;
+
+    if (visible) {
+      if (paneLayout.mode === "compact") {
+        // Compact panes are transient workspaces. Closing one returns to the
+        // editor without erasing the user's wide-window pane preference.
+        compactPane = null;
+      } else if (pane === "explorer") {
+        explorerOpen = false;
+      } else {
+        dashboardOpen = false;
+      }
+      persistTabs(hydratedRepo);
+      return;
+    }
+
+    if (!requested) {
+      if (pane === "explorer") explorerOpen = true;
+      else dashboardOpen = true;
+    }
+    // Ignored when the pane fits beside the editor; used as a full-workspace
+    // fallback when it does not.
+    compactPane = pane;
+    persistTabs(hydratedRepo);
+  }
+
   function handleWindowKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b" && !e.shiftKey) {
       e.preventDefault();
-      explorerOpen = !explorerOpen;
-      persistTabs($repoStore.currentPath);
+      toggleSidePane("explorer");
     } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "d") {
       e.preventDefault();
-      dashboardOpen = !dashboardOpen;
-      persistTabs($repoStore.currentPath);
+      toggleSidePane("dashboard");
     }
   }
 
@@ -208,7 +395,15 @@
     const repo = $repoStore.currentPath;
     if (repo === hydratedRepo) return;
     if (hydratedRepo) untrack(() => persistTabs(hydratedRepo));
+    viewerLease?.release();
     hydratedRepo = repo;
+    viewerLease = repo
+      ? viewerOwners.claim(repo, {
+          completeSave: (path, savedContent, tabs) =>
+            applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs),
+        })
+      : null;
+    compactPane = null;
     lastAppliedStoreFile = "";
     if (!repo) {
       tabState = emptyEditorTabs();
@@ -221,8 +416,12 @@
       tabState = cached.tabs;
       explorerOpen = cached.explorerOpen;
       dashboardOpen = cached.dashboardOpen;
+      preferredSidePane = cached.preferredSidePane ?? "explorer";
     } else {
       tabState = emptyEditorTabs();
+      explorerOpen = true;
+      dashboardOpen = true;
+      preferredSidePane = "explorer";
     }
     prevLoadKey = "";
   });
@@ -237,7 +436,7 @@
     lastAppliedStoreFile = storeSelected;
     if (!tabState.tabs.some((t) => t.path === storeSelected)) {
       tabState = openPreview(tabState, storeSelected);
-      persistTabs($repoStore.currentPath);
+      persistTabs(hydratedRepo);
     } else {
       tabState = activateEditorTab(tabState, storeSelected);
     }
@@ -260,28 +459,54 @@
   });
 
   $effect(() => {
-    return () => inflightGuard?.cancel();
+    return () => {
+      viewerLease?.release();
+      inflightGuard?.cancel();
+    };
+  });
+
+  $effect(() => {
+    // A compact selection is a temporary replacement surface. Once the view
+    // grows enough to restore an editor split, do not resurrect it on a later
+    // resize unless the user requests it again.
+    if (paneLayout.mode !== "compact" && compactPane !== null) compactPane = null;
   });
 
   onMount(() => {
     window.addEventListener("keydown", handleWindowKeydown);
-    return () => window.removeEventListener("keydown", handleWindowKeydown);
+    const observer = new ResizeObserver((entries) => {
+      const measured = entries.find((entry) => entry.target === fileViewRoot)?.contentRect.width;
+      fileViewWidth = typeof measured === "number" && Number.isFinite(measured) && measured > 0
+        ? measured
+        : 0;
+    });
+    if (fileViewRoot) {
+      fileViewWidth = fileViewRoot.clientWidth || 0;
+      observer.observe(fileViewRoot);
+    }
+    return () => {
+      window.removeEventListener("keydown", handleWindowKeydown);
+      observer.disconnect();
+    };
   });
 </script>
 
-<div class="flex-1 flex flex-col min-h-0 bg-background overflow-hidden relative select-none">
+<div
+  bind:this={fileViewRoot}
+  class="flex-1 flex flex-col min-h-0 min-w-0 bg-background overflow-hidden relative select-none"
+  data-pane-layout={paneLayout.mode}
+>
   <div class="flex items-center justify-between px-2 bg-surface/90 border-b border-border/70 shrink-0 h-9 gap-2">
     <div class="flex items-center gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll" role="tablist" aria-label="Open files">
       <button
         type="button"
-        onclick={() => {
-          explorerOpen = !explorerOpen;
-          persistTabs($repoStore.currentPath);
-        }}
-        title="{explorerOpen ? 'Hide' : 'Show'} Explorer (⌘B)"
-        class="gp-icon-btn !p-1.5 shrink-0 text-textMuted hover:text-textPrimary"
+        onclick={() => toggleSidePane("explorer")}
+        aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
+        aria-pressed={paneLayout.explorerVisible}
+        title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer (⌘B)"
+        class="gp-icon-btn !p-1.5 shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
       >
-        {#if explorerOpen}
+        {#if paneLayout.explorerVisible}
           <PanelLeftClose size={14} />
         {:else}
           <PanelLeftOpen size={14} />
@@ -295,6 +520,7 @@
       {:else}
         {#each openTabs as tab (tab.path)}
           {@const isActive = tab.path === activeTabPath}
+          {@const tabDirty = isEditorTabDirty(tabState, tab.path)}
           {@const tabKind = classifyFileChange($repoStore.statuses.find((s) => s.path === tab.path))}
           <div
             role="tab"
@@ -308,10 +534,19 @@
             class="h-full px-2.5 flex items-center gap-1.5 border-r border-border/60 text-xs transition-colors shrink-0 max-w-[200px] group cursor-pointer {isActive
               ? 'bg-background text-textPrimary font-semibold border-b-2 border-b-accent'
               : 'text-textMuted hover:bg-surfaceHover hover:text-textPrimary'} {tab.preview ? 'italic' : ''}"
-            title={tab.preview ? `${tab.path} (preview — double-click to pin)` : tab.path}
+            title={tabDirty
+              ? `${tab.path} — Unsaved changes`
+              : tab.preview ? `${tab.path} (preview — double-click to pin)` : tab.path}
           >
             <LanguageLogo filePath={tab.path} size={13} class="shrink-0" />
             <span class="truncate">{tab.name}</span>
+            {#if tabDirty}
+              <span
+                class="w-1.5 h-1.5 rounded-full bg-amber-400 not-italic shrink-0"
+                title="Unsaved changes"
+                aria-label="Unsaved changes"
+              ></span>
+            {/if}
             {#if tabKind !== "clean"}
               <span class="w-1.5 h-1.5 rounded-full bg-accent not-italic"></span>
             {/if}
@@ -350,12 +585,10 @@
 
       <button
         type="button"
-        onclick={() => {
-          dashboardOpen = !dashboardOpen;
-          persistTabs($repoStore.currentPath);
-        }}
-        title="{dashboardOpen ? 'Hide' : 'Show'} Live Pulse Dashboard (⌘⇧D)"
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px] {dashboardOpen
+        onclick={() => toggleSidePane("dashboard")}
+        aria-pressed={paneLayout.dashboardVisible}
+        title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard (⌘⇧D)"
+        class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
           ? 'border-accent/60 bg-accent/15 text-accent font-semibold'
           : ''}"
       >
@@ -382,6 +615,9 @@
           <span class="ml-2 px-1.5 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(activeKind)}">
             {statusBadgeLabel(activeKind, true)}
           </span>
+        {/if}
+        {#if activeTabDirty}
+          <span class="ml-2 text-[10px] font-semibold text-amber-400">Unsaved</span>
         {/if}
       </div>
 
@@ -428,8 +664,8 @@
   {/if}
 
   <div class="flex-1 flex min-h-0 overflow-hidden relative">
-    {#if explorerOpen}
-      <div class="w-72 shrink-0 h-full overflow-hidden">
+    {#if paneLayout.explorerVisible}
+      <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-72 shrink-0' : 'flex-1 min-w-0'}">
         <FileTreePanel
           selectedFile={activeTabPath}
           onSelectFile={(path) => previewFile(path)}
@@ -438,30 +674,41 @@
       </div>
     {/if}
 
-    <div class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative">
-      {#if isLoadingFile}
-        <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
-          <span>Loading file contents...</span>
-        </div>
-      {:else if fileError}
-        <div class="flex-1 flex flex-col items-center justify-center text-rose-400 text-xs p-6 text-center">
-          <ShieldAlert size={28} class="mb-2 text-rose-400" />
-          <span class="font-bold text-sm text-rose-300 mb-1">Failed to read file</span>
-          <span class="max-w-md font-mono text-[11px]">{fileError}</span>
-        </div>
-      {:else if activeBlob && activeTabPath}
-        <MediaViewer filePath={activeTabPath} blob={activeBlob} onSave={handleFileSave} />
-      {:else}
-        <EmptyState
-          icon={FileText}
-          title="No file opened"
-          hint="Single-click previews a file; double-click pins it. Filter the tree with globs, /regex/, or ~fuzzy."
-        />
-      {/if}
-    </div>
+    {#if paneLayout.editorVisible}
+      <div class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative">
+        {#if isLoadingFile}
+          <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
+            <span>Loading file contents...</span>
+          </div>
+        {:else if fileError}
+          <div class="flex-1 flex flex-col items-center justify-center text-rose-400 text-xs p-6 text-center">
+            <ShieldAlert size={28} class="mb-2 text-rose-400" />
+            <span class="font-bold text-sm text-rose-300 mb-1">Failed to read file</span>
+            <span class="max-w-md font-mono text-[11px]">{fileError}</span>
+          </div>
+        {:else if activeBlob && activeTabPath}
+          <MediaViewer
+            filePath={activeTabPath}
+            blob={activeBlob}
+            draftContent={activeDraft?.content ?? null}
+            dirty={activeTabDirty}
+            onSave={(newContent) => handleFileSave(activeTabPath, newContent)}
+            onDraftChange={(newContent, sourceContent) =>
+              handleDraftChange(activeTabPath, newContent, sourceContent)}
+            onRequestDiscard={() => requestDiscardDraft(activeTabPath)}
+          />
+        {:else}
+          <EmptyState
+            icon={FileText}
+            title="No file opened"
+            hint="Single-click previews a file; double-click pins it. Filter the tree with globs, /regex/, or ~fuzzy."
+          />
+        {/if}
+      </div>
+    {/if}
 
-    {#if dashboardOpen}
-      <div class="w-80 shrink-0 h-full overflow-hidden">
+    {#if paneLayout.dashboardVisible}
+      <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-80 shrink-0' : 'flex-1 min-w-0'}">
         <LivePulseDashboard selectedFile={activeTabPath} onSelectFile={(path) => previewFile(path)} />
       </div>
     {/if}

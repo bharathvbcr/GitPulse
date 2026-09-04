@@ -8,12 +8,29 @@ import type {
   ConflictResolutionChoice,
 } from "../diff/conflict";
 import { render } from "svelte/server";
-import ConflictEditor, { adoptResolutions } from "./ConflictEditor.svelte";
+import ConflictEditor, {
+  adoptResolutions,
+  canFinalizeConflictSave,
+  clearCustomDraftsForDocument,
+  conflictDraftKey,
+  flushCustomDrafts,
+  type ConflictCustomDrafts,
+} from "./ConflictEditor.svelte";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "ConflictEditor.svelte"),
   "utf8",
 );
+
+function openingTagContaining(tagName: string, marker: string): string {
+  const markerIndex = source.indexOf(marker);
+  expect(markerIndex, `missing ${marker}`).toBeGreaterThan(-1);
+  const start = source.lastIndexOf(`<${tagName}`, markerIndex);
+  const end = source.indexOf(">", markerIndex);
+  expect(start, `missing <${tagName}> for ${marker}`).toBeGreaterThan(-1);
+  expect(end, `unterminated <${tagName}> for ${marker}`).toBeGreaterThan(start);
+  return source.slice(start, end + 1);
+}
 
 /**
  * The real wire types, not structural mirrors. The mirrors could not fail on
@@ -104,7 +121,166 @@ describe("ConflictEditor load-effect memo guard", () => {
   });
 
   it("routes a landed parse through adoptResolutions instead of assigning raw", () => {
-    expect(source).toContain("parsedDoc = adoptResolutions(doc, parsedDoc);");
+    expect(source).toContain("const adopted = adoptResolutions(doc, parsedDoc);");
+    expect(source).toContain("parsedDoc = adopted;");
+  });
+});
+
+describe("ConflictEditor journal completeness", () => {
+  it("records the completed write before stale UI checks", () => {
+    const body = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    const write = body.indexOf('await invoke("cmd_write_file_content"');
+    const successJournal = body.indexOf("harnessStore.recordAction", write);
+    const nextGuard = body.indexOf("if (!guard.isLive()", write);
+    expect(successJournal).toBeGreaterThan(write);
+    expect(successJournal).toBeLessThan(nextGuard);
+
+    const caught = body.indexOf("} catch", nextGuard);
+    const failureJournal = body.indexOf("harnessStore.recordAction", caught);
+    const failureGuard = body.indexOf("if (!guard.isLive()", caught);
+    expect(failureJournal).toBeGreaterThan(caught);
+    expect(failureJournal).toBeLessThan(failureGuard);
+  });
+});
+
+describe("ConflictEditor custom draft lifecycle", () => {
+  it("keeps chunk-zero drafts isolated when switching between files", () => {
+    const drafts: ConflictCustomDrafts = {
+      [conflictDraftKey("/repo", "a.txt", 0)]: { value: "draft for a", active: true },
+      [conflictDraftKey("/repo", "b.txt", 0)]: { value: "draft for b", active: true },
+    };
+    const first = doc("a.txt", [chunk(0, "Unresolved")]);
+    const second = doc("b.txt", [chunk(0, "Unresolved")]);
+
+    flushCustomDrafts(first, "/repo", "a.txt", drafts);
+    flushCustomDrafts(second, "/repo", "b.txt", drafts);
+
+    expect(first.segments[0].Conflict?.resolution).toEqual({ Custom: "draft for a" });
+    expect(second.segments[0].Conflict?.resolution).toEqual({ Custom: "draft for b" });
+    expect(conflictDraftKey("/repo", "a.txt", 0)).not.toBe(
+      conflictDraftKey("/repo", "b.txt", 0),
+    );
+    expect(source).toContain("const customTimers = new Map<string");
+    expect(source).toContain("flushCustomDrafts(adopted, repo, file, customDrafts);");
+  });
+
+  it("refuses to save while a newly selected file is still showing the prior parse", () => {
+    const save = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    expect(save).toContain("if (document.file_path !== file) return;");
+    expect(source).toContain("parsedDoc?.file_path !== selectedFile");
+  });
+
+  it("flushes the latest custom value before an immediate save resolves the document", () => {
+    const document = doc("a.txt", [chunk(0, { Custom: "previous value" })]);
+    const drafts: ConflictCustomDrafts = {
+      [conflictDraftKey("/repo", "a.txt", 0)]: { value: "latest keystroke", active: true },
+    };
+
+    flushCustomDrafts(document, "/repo", "a.txt", drafts);
+
+    expect(document.segments[0].Conflict?.resolution).toEqual({ Custom: "latest keystroke" });
+    const save = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    expect(save.indexOf("flushCustomDrafts(")).toBeGreaterThan(-1);
+    expect(save.indexOf("flushCustomDrafts(")).toBeLessThan(
+      save.indexOf('invoke<string>("cmd_resolve_conflict"'),
+    );
+  });
+
+  it("preserves drafts after a failed save and clears only the saved target", () => {
+    const firstKey = conflictDraftKey("/repo", "a.txt", 0);
+    const secondKey = conflictDraftKey("/repo", "b.txt", 0);
+    const drafts: ConflictCustomDrafts = {
+      [firstKey]: { value: "draft for a", active: true },
+      [secondKey]: { value: "draft for b", active: true },
+    };
+    const first = doc("a.txt", [chunk(0, { Custom: "draft for a" })]);
+
+    // Flush is the last synchronous draft operation before resolve/write. If
+    // either backend call fails, the component takes its catch path without
+    // invoking the success-only clearing helper.
+    flushCustomDrafts(first, "/repo", "a.txt", drafts);
+    expect(drafts[firstKey]).toEqual({ value: "draft for a", active: true });
+    expect(drafts[secondKey]).toEqual({ value: "draft for b", active: true });
+
+    clearCustomDraftsForDocument(drafts, "/repo", "a.txt", first);
+    expect(drafts[firstKey]).toBeUndefined();
+    expect(drafts[secondKey]).toEqual({ value: "draft for b", active: true });
+
+    const save = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    const write = save.indexOf('await invoke("cmd_write_file_content"');
+    const clear = save.indexOf("clearCustomDraftsForDocument(");
+    const failedSave = save.slice(save.indexOf("} catch (err)"), save.indexOf("} finally"));
+    expect(clear).toBeGreaterThan(write);
+    expect(failedSave).not.toContain("clearCustomDraftsForDocument(");
+  });
+
+  it("does not clear or stage a newer resolution edit after an older save returns", () => {
+    expect(canFinalizeConflictSave(7, 7)).toBe(true);
+    expect(canFinalizeConflictSave(7, 8)).toBe(false);
+
+    const save = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    const write = save.indexOf('await invoke("cmd_write_file_content"');
+    const superseded = save.indexOf("canFinalizeConflictSave(saveRevision, editRevision)");
+    const clear = save.indexOf("clearCustomDraftsForDocument(");
+    const stage = save.indexOf("repoStore.stageFile(");
+    expect(superseded).toBeGreaterThan(write);
+    expect(clear).toBeGreaterThan(superseded);
+    expect(stage).toBeGreaterThan(superseded);
+    expect(save.slice(superseded, clear)).toContain("return");
+  });
+
+  it("locks every resolution mutator until writing and staging have both settled", () => {
+    expect(openingTagContaining("select", "bind:value={selectedFile}"))
+      .toContain("disabled={isSaving}");
+    for (const label of [
+      "Accept All Current (Ours)",
+      "Accept All Incoming (Theirs)",
+      "Accept Ours",
+      "Both (Ours First)",
+      "Accept Theirs",
+      "Both (Theirs First)",
+    ]) {
+      expect(openingTagContaining("button", label), label).toContain("disabled={isSaving}");
+    }
+    expect(openingTagContaining("textarea", "Type the exact content this conflict"))
+      .toContain("disabled={isSaving}");
+
+    const save = source.slice(
+      source.indexOf("async function saveResolved"),
+      source.indexOf("</script>", source.indexOf("async function saveResolved")),
+    );
+    expect(save.indexOf("isSaving = true")).toBeLessThan(
+      save.indexOf('invoke<string>("cmd_resolve_conflict"'),
+    );
+    expect(save.indexOf("isSaving = false")).toBeGreaterThan(
+      save.indexOf("await repoStore.stageFile(file)"),
+    );
+  });
+
+  it("updates the document synchronously on input and only debounces preview work", () => {
+    const input = source.slice(
+      source.indexOf("function onCustomInput"),
+      source.indexOf("async function updatePreview"),
+    );
+    expect(input.indexOf("setDocumentChunkResolution(")).toBeGreaterThan(-1);
+    expect(input.indexOf("setDocumentChunkResolution(")).toBeLessThan(
+      input.indexOf("setTimeout("),
+    );
   });
 });
 

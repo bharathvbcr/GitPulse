@@ -31,11 +31,15 @@
 //! it — the same rule that keeps this process from taking a task lease. A
 //! second writer to the grant ledger could interleave with the harness's own
 //! `saveGrants`, which serialises its writes behind a mutex this process cannot
-//! share. Revocation belongs to Manvi, through its CLI or a future op that
-//! Manvi itself serves.
+//! share. Manvi has an internal ledger revocation method, but its current CLI
+//! and serve protocol expose no revocation command; GitPulse therefore reports
+//! that limitation and the ledger's location without offering an unsafe second
+//! write path.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Where the harness keeps its grant ledger for a repository.
 ///
@@ -57,18 +61,20 @@ pub struct Grantor {
     #[serde(default)]
     pub authority: String,
     #[serde(default)]
-    pub name: String,
+    pub id: String,
 }
 
 /// What a grant covers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct GrantScope {
     #[serde(default)]
-    pub rule: String,
-    #[serde(default)]
-    pub target: String,
-    #[serde(default)]
     pub task_id: String,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub once: bool,
 }
 
 /// One recorded override.
@@ -104,25 +110,120 @@ pub struct GrantView {
     pub error: String,
 }
 
+/// The shared verdict contract is the canonical rule/severity table for every
+/// GitPulse consumer. MANVI treats a rule absent from this table as hard, so a
+/// future or misspelled rule can never become grantable by being unknown here.
+fn rule_severities() -> Result<&'static HashMap<String, String>, String> {
+    static SEVERITIES: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
+    match SEVERITIES.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contracts/verdict.schema.json"))
+                .map_err(|error| format!("shared verdict contract is unreadable: {error}"))?;
+        let properties = schema
+            .pointer("/$defs/severityByRule/properties")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "shared verdict contract has no rule severity table".to_string())?;
+        let mut severities = HashMap::with_capacity(properties.len());
+        for (rule, descriptor) in properties {
+            let severity = descriptor
+                .get("const")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("shared verdict contract has no severity for {rule}"))?;
+            severities.insert(rule.clone(), severity.to_string());
+        }
+        Ok(severities)
+    }) {
+        Ok(severities) => Ok(severities),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// Returns why MANVI's restore boundary would refuse the policy-independent
+/// shape of this grant. Config-dependent checks (reason requirement, TTL
+/// ceilings, and optional agent command grants) stay with MANVI, which owns
+/// that live policy; these invariants hold under every configuration.
+fn semantic_refusal(grant: &Grant, severities: &HashMap<String, String>) -> Option<String> {
+    if grant.scope.rules.is_empty() {
+        return Some("names no rules; a rule-less grant covers every soft rule".to_string());
+    }
+    for rule in &grant.scope.rules {
+        match severities.get(rule).map(String::as_str) {
+            Some("hard") => {
+                return Some(format!(
+                    "carries hard rule {rule}, which no grant may clear"
+                ))
+            }
+            Some("soft" | "warn") => {}
+            Some(severity) => {
+                return Some(format!("rule {rule} has non-grantable severity {severity}"))
+            }
+            None => {
+                return Some(format!(
+                    "carries unknown rule {rule}, which is hard by default"
+                ))
+            }
+        }
+    }
+    match grant.grantor.authority.as_str() {
+        "agent" if grant.scope.task_id.trim().is_empty() => Some(
+            "is an agent grant that names no task; an agent may only grant within its own task"
+                .to_string(),
+        ),
+        "agent" | "human" => None,
+        authority => Some(format!("has unknown authority {authority:?}")),
+    }
+}
+
 /// Reads the grant ledger for a repository.
 pub fn view(repo_path: &str) -> GrantView {
     let path = grants_path(repo_path);
     let shown = path.display().to_string();
-    if !path.exists() {
-        return GrantView {
+    // A relative MANVI_STATE_DIR is repository-controlled; an absolute one is
+    // explicit operator configuration and intentionally allowed outside the
+    // checkout. Both still reject a symlink at the state directory or file.
+    let repo_root = match std::env::var_os("MANVI_STATE_DIR") {
+        Some(dir) if Path::new(&dir).is_absolute() => None,
+        _ => Some(PathBuf::from(repo_path)),
+    };
+    match crate::ledger::read_checked_state_file(&path, repo_root.as_deref()) {
+        Ok(None) => GrantView {
             available: false,
             path: shown,
             grants: Vec::new(),
             error: String::new(),
-        };
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<Vec<Grant>>(&raw) {
-            Ok(grants) => GrantView {
-                available: true,
-                path: shown,
-                grants,
-                error: String::new(),
+        },
+        Ok(Some(raw)) => match serde_json::from_str::<Vec<Grant>>(&raw) {
+            Ok(grants) => match rule_severities() {
+                Ok(severities) => {
+                    let mut accepted = Vec::with_capacity(grants.len());
+                    let mut refused = Vec::new();
+                    for grant in grants {
+                        if let Some(why) = semantic_refusal(&grant, severities) {
+                            refused.push(format!("{}: {why}", grant.id));
+                        } else {
+                            accepted.push(grant);
+                        }
+                    }
+                    GrantView {
+                        available: true,
+                        path: shown,
+                        grants: accepted,
+                        error: if refused.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "grant ledger contains refused entries: {}",
+                                refused.join("; ")
+                            )
+                        },
+                    }
+                }
+                Err(error) => GrantView {
+                    available: true,
+                    path: shown,
+                    grants: Vec::new(),
+                    error,
+                },
             },
             Err(e) => GrantView {
                 available: true,
@@ -138,7 +239,7 @@ pub fn view(repo_path: &str) -> GrantView {
             available: true,
             path: shown,
             grants: Vec::new(),
-            error: format!("{e}"),
+            error: e.to_string(),
         },
     }
 }
@@ -146,6 +247,17 @@ pub fn view(repo_path: &str) -> GrantView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn real_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init failed");
+        dir
+    }
 
     fn write_ledger(dir: &Path, body: &str) {
         let p = dir.join(".devcouncil");
@@ -163,26 +275,20 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_ledger_in_the_harness_format() {
+    fn reads_a_ledger_in_manvis_persisted_format() {
         let dir = tempfile::tempdir().unwrap();
-        write_ledger(
-            dir.path(),
-            r#"[{"id":"G-1",
-                 "grantor":{"authority":"human","name":"bharath"},
-                 "reason":"needed for the migration",
-                 "scope":{"rule":"scope.unplanned","target":"src/a.rs","task_id":"TASK-1"},
-                 "issued_at":"2026-09-01T12:00:00Z",
-                 "expires_at":"2026-09-01T13:00:00Z",
-                 "consumed":true}]"#,
-        );
+        write_ledger(dir.path(), include_str!("fixtures/manvi-ledger.json"));
         let v = view(dir.path().to_str().unwrap());
         assert!(v.available, "{}", v.error);
         assert_eq!(v.grants.len(), 1);
         let g = &v.grants[0];
         assert_eq!(g.id, "G-1");
-        assert_eq!(g.grantor.name, "bharath");
+        assert_eq!(g.grantor.id, "bharath");
         assert_eq!(g.grantor.authority, "human");
-        assert_eq!(g.scope.rule, "scope.unplanned");
+        assert_eq!(g.scope.rules, ["scope.unplanned", "task.forbidden_change"]);
+        assert_eq!(g.scope.paths, ["src/a.rs", "docs/**"]);
+        assert_eq!(g.scope.task_id, "TASK-1");
+        assert!(g.scope.once);
         assert_eq!(g.reason, "needed for the migration");
         assert!(g.consumed);
     }
@@ -215,12 +321,155 @@ mod tests {
         // GitPulse must still show the grants rather than reporting the whole
         // ledger unreadable.
         let dir = tempfile::tempdir().unwrap();
-        write_ledger(dir.path(), r#"[{"id":"G-2","future_field":42}]"#);
+        write_ledger(
+            dir.path(),
+            r#"[{"id":"G-2",
+                 "grantor":{"authority":"human","future_grantor_field":"still-compatible"},
+                 "reason":"operator reviewed",
+                 "scope":{"rules":["scope.unplanned"],"future_scope_field":{"version":2}},
+                 "future_grant_field":42}]"#,
+        );
         let v = view(dir.path().to_str().unwrap());
         assert!(v.error.is_empty(), "{}", v.error);
         assert_eq!(v.grants.len(), 1);
         assert_eq!(v.grants[0].id, "G-2");
+        assert!(v.grants[0].grantor.id.is_empty());
+        assert_eq!(v.grants[0].scope.rules, ["scope.unplanned"]);
+        assert!(v.grants[0].scope.paths.is_empty());
+        assert!(!v.grants[0].scope.once);
         assert!(!v.grants[0].consumed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_state_symlink_cannot_redirect_the_grant_view() {
+        use std::os::unix::fs::symlink;
+
+        let repo = real_repo();
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::fs::write(
+            outside.path().join("harness-grants.json"),
+            include_str!("fixtures/manvi-ledger.json"),
+        )
+        .expect("outside ledger");
+        symlink(outside.path(), repo.path().join(".devcouncil")).expect("plant state symlink");
+
+        let view = view(repo.path().to_str().unwrap());
+        assert!(view.available, "an unsafe existing ledger is not absence");
+        assert!(
+            view.grants.is_empty(),
+            "the repository redirected the reader to grants outside its boundary"
+        );
+        assert!(
+            view.error.contains("symlink") || view.error.contains("outside"),
+            "the unsafe state path was not diagnosed: {}",
+            view.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grant_file_symlink_cannot_redirect_the_view() {
+        use std::os::unix::fs::symlink;
+
+        let repo = real_repo();
+        let state = repo.path().join(".devcouncil");
+        std::fs::create_dir(&state).expect("state dir");
+        let outside = tempfile::NamedTempFile::new().expect("outside ledger");
+        std::fs::write(outside.path(), include_str!("fixtures/manvi-ledger.json"))
+            .expect("outside ledger body");
+        symlink(outside.path(), state.join("harness-grants.json")).expect("plant ledger symlink");
+
+        let view = view(repo.path().to_str().unwrap());
+        assert!(view.available, "an unsafe existing ledger is not absence");
+        assert!(view.grants.is_empty(), "a symlinked grant file was read");
+        assert!(view.error.contains("symlink"), "{}", view.error);
+    }
+
+    #[test]
+    fn semantically_invalid_grants_are_refused_like_manvi_restore() {
+        let cases = [
+            (
+                "missing authority",
+                r#"{"id":"G-1","grantor":{"id":"operator"},"reason":"r","scope":{"rules":["scope.unplanned"]}}"#,
+                "authority",
+            ),
+            (
+                "unknown authority",
+                r#"{"id":"G-2","grantor":{"authority":"root","id":"operator"},"reason":"r","scope":{"rules":["scope.unplanned"]}}"#,
+                "authority",
+            ),
+            (
+                "empty rules",
+                r#"{"id":"G-3","grantor":{"authority":"human","id":"operator"},"reason":"r","scope":{"rules":[]}}"#,
+                "no rules",
+            ),
+            (
+                "unscoped agent",
+                r#"{"id":"G-4","grantor":{"authority":"agent","id":"executor"},"reason":"r","scope":{"rules":["scope.unplanned"]}}"#,
+                "no task",
+            ),
+            (
+                "blank agent task",
+                r#"{"id":"G-4B","grantor":{"authority":"agent","id":"executor"},"reason":"r","scope":{"task_id":"   ","rules":["scope.unplanned"]}}"#,
+                "no task",
+            ),
+            (
+                "hard rule",
+                r#"{"id":"G-5","grantor":{"authority":"human","id":"operator"},"reason":"r","scope":{"rules":["path.secret"]}}"#,
+                "hard rule",
+            ),
+            (
+                "unknown rule",
+                r#"{"id":"G-6","grantor":{"authority":"human","id":"operator"},"reason":"r","scope":{"rules":["future.invented"]}}"#,
+                "unknown rule",
+            ),
+        ];
+
+        for (name, grant, diagnostic) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write_ledger(dir.path(), &format!("[{grant}]"));
+            let view = view(dir.path().to_str().unwrap());
+            assert!(view.available, "{name}: the ledger exists");
+            assert!(
+                view.grants.is_empty(),
+                "{name}: a grant MANVI would refuse was presented as valid"
+            );
+            assert!(
+                view.error.contains(diagnostic),
+                "{name}: missing diagnostic {diagnostic:?}: {}",
+                view.error
+            );
+        }
+    }
+
+    #[test]
+    fn one_refused_record_does_not_hide_valid_grant_history() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ledger(
+            dir.path(),
+            r#"[
+              {"id":"GOOD","grantor":{"authority":"agent","id":"executor"},"reason":"r",
+               "scope":{"task_id":"TASK-1","rules":["scope.unplanned"]}},
+              {"id":"BAD","grantor":{"authority":"human","id":"operator"},"reason":"r",
+               "scope":{"rules":["command.force_push"]}}
+            ]"#,
+        );
+
+        let view = view(dir.path().to_str().unwrap());
+        assert!(view.available);
+        assert_eq!(
+            view.grants.len(),
+            1,
+            "valid history was hidden: {}",
+            view.error
+        );
+        assert_eq!(view.grants[0].id, "GOOD");
+        assert!(
+            view.error.contains("BAD"),
+            "refusal was silent: {}",
+            view.error
+        );
     }
 
     #[test]

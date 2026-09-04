@@ -272,6 +272,7 @@
       }
       earlyOutput = [];
       harnessStore.recordAction({
+        repoPath,
         kind: "terminal-session",
         label: `${launcher === "shell" ? "Interactive shell" : `Agent (${launcher})`} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
         ok: true,
@@ -470,6 +471,7 @@
       );
 
       harnessStore.recordAction({
+        repoPath,
         kind: "terminal",
         label: textToRun,
         ok: !response.timed_out && response.exit_code === 0,
@@ -482,6 +484,7 @@
       );
 
       harnessStore.recordAction({
+        repoPath,
         kind: "terminal",
         label: textToRun,
         ok: false,
@@ -563,9 +566,10 @@
       </span>
     </div>
     <div class="flex items-center gap-2">
-      <div class="gp-segmented" role="tablist" aria-label="Terminal mode">
+      <div class="gp-segmented" role="group" aria-label="Terminal mode">
         <button
           type="button"
+          aria-pressed={mode === "shell"}
           data-active={mode === "shell" ? "true" : "false"}
           class="gp-seg-btn !text-[11px] !py-0.5"
           onclick={() => (mode = "shell")}
@@ -575,6 +579,7 @@
         </button>
         <button
           type="button"
+          aria-pressed={mode === "console"}
           data-active={mode === "console" ? "true" : "false"}
           class="gp-seg-btn !text-[11px] !py-0.5"
           onclick={() => (mode = "console")}

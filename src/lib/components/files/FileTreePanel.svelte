@@ -28,6 +28,7 @@
     buildFileTree,
     flattenFileTree,
     joinWorktreePath,
+    parentDirectoryRowIndex,
     type FileRow,
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
@@ -48,6 +49,8 @@
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
   import { shouldDismissOverlay } from "../../ui/dismiss";
+  import { clampMenuPosition } from "../../branches/menuPosition";
+  import { enumerateFocusables } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import EmptyState from "../EmptyState.svelte";
   import LanguageLogo from "../LanguageLogo.svelte";
@@ -85,6 +88,8 @@
 
   let contextMenuRow = $state<FileRow | null>(null);
   let menuPos = $state<{ x: number; y: number } | null>(null);
+  let menuEl: HTMLDivElement | undefined = $state();
+  let contextMenuOpener: HTMLElement | null = null;
 
   let containerEl: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
@@ -220,7 +225,11 @@
       isFiltering ? false : collapsed[dirPath] === true,
     );
     if (sortOrder === "name-asc") return flattened;
-    const fileRows = flattened.filter((row) => row.kind === "file");
+    // Non-name sorts are flat file lists. Reset hierarchy metadata along with
+    // removing directory rows so ARIA level and ArrowLeft remain truthful.
+    const fileRows = flattened
+      .filter((row) => row.kind === "file")
+      .map((row) => ({ ...row, depth: 0 }));
     if (sortOrder === "name-desc") {
       return [...fileRows].reverse();
     }
@@ -270,6 +279,7 @@
   }
 
   function rowAction(row: FileRow) {
+    selectedIndex = rows.findIndex((candidate) => candidate.key === row.key);
     if (row.kind === "dir") {
       toggle(row.path);
     } else {
@@ -287,16 +297,127 @@
 
 
 
-  function openContextMenu(row: FileRow, event: MouseEvent) {
-    event.preventDefault();
-    event.stopPropagation();
-    contextMenuRow = row;
-    menuPos = { x: event.clientX, y: event.clientY };
+  function treeItemId(row: FileRow): string {
+    return `file-tree-item-${encodeURIComponent(row.key).replaceAll("%", "_")}`;
   }
 
-  function closeContextMenu() {
+  function openContextMenu(
+    row: FileRow,
+    event: MouseEvent | KeyboardEvent,
+    keyboardAnchor?: HTMLElement | null,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    selectedIndex = rows.findIndex((candidate) => candidate.key === row.key);
+    const eventAnchor = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    const anchor = keyboardAnchor ?? eventAnchor;
+    const rect = anchor?.getBoundingClientRect();
+    const x = event instanceof MouseEvent && event.clientX > 0
+      ? event.clientX
+      : (rect?.left ?? 8) + Math.min(rect?.width ?? 0, 32);
+    const y = event instanceof MouseEvent && event.clientY > 0
+      ? event.clientY
+      : (rect?.bottom ?? 8);
+    const clamped = clampMenuPosition(x, y, 208, 360, window.innerWidth, window.innerHeight);
+    const active = document.activeElement;
+    contextMenuOpener = active instanceof HTMLElement && active !== document.body
+      ? active
+      : anchor;
+    contextMenuRow = row;
+    menuPos = { x: clamped.left, y: clamped.top };
+  }
+
+  function closeContextMenu(options?: { restoreFocus?: boolean }) {
+    const opener = contextMenuOpener;
     contextMenuRow = null;
     menuPos = null;
+    contextMenuOpener = null;
+    if (options?.restoreFocus && opener?.isConnected) {
+      window.setTimeout(() => opener.focus(), 0);
+    }
+  }
+
+  $effect(() => {
+    if (!contextMenuRow || !menuEl) return;
+    const timer = window.setTimeout(() => {
+      menuEl?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  });
+
+  function focusAdjacentToMenuOpener(
+    popup: HTMLElement,
+    opener: HTMLElement | null,
+    backwards: boolean,
+  ) {
+    const candidates = enumerateFocusables<HTMLElement>(document).filter(
+      (candidate) =>
+        candidate.tabIndex >= 0 &&
+        !popup.contains(candidate) &&
+        candidate.getClientRects().length > 0,
+    );
+    if (candidates.length === 0) return;
+
+    const openerIndex = opener ? candidates.indexOf(opener) : -1;
+    let target = openerIndex >= 0
+      ? candidates[openerIndex + (backwards ? -1 : 1)]
+      : undefined;
+    if (!target && opener?.isConnected) {
+      const direction = backwards
+        ? Node.DOCUMENT_POSITION_PRECEDING
+        : Node.DOCUMENT_POSITION_FOLLOWING;
+      const ordered = backwards ? [...candidates].reverse() : candidates;
+      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
+    }
+    target ??= candidates[backwards ? candidates.length - 1 : 0];
+    window.setTimeout(() => target?.focus(), 0);
+  }
+
+  function handleMenuKeydown(e: KeyboardEvent) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (menuEl) focusAdjacentToMenuOpener(menuEl, contextMenuOpener, e.shiftKey);
+      closeContextMenu();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeContextMenu({ restoreFocus: true });
+      return;
+    }
+    const items = menuEl
+      ? [...menuEl.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+      : [];
+    if (items.length === 0) return;
+    const current = items.findIndex((item) => item === document.activeElement);
+    let next: number | null = null;
+    if (e.key === "ArrowDown") next = (current + 1 + items.length) % items.length;
+    else if (e.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = items.length - 1;
+    if (next === null) return;
+    e.preventDefault();
+    items[next]?.focus();
+  }
+
+  function moveTreeSelection(index: number) {
+    if (rows.length === 0) {
+      selectedIndex = -1;
+      return;
+    }
+    selectedIndex = Math.max(0, Math.min(index, rows.length - 1));
+    ensureVisible(selectedIndex);
+  }
+
+  function parentRowIndex(index: number): number {
+    return parentDirectoryRowIndex(rows, index);
+  }
+
+  async function copyPath(path: string) {
+    closeContextMenu();
+    if (!(await copyText(path))) {
+      repoStore.setError("Could not copy path to clipboard");
+    }
   }
 
   // File operations
@@ -411,9 +532,20 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (
+      !(e.target instanceof HTMLInputElement) &&
+      (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) &&
+      selectedIndex >= 0 &&
+      selectedIndex < rows.length
+    ) {
+      const row = rows[selectedIndex];
+      openContextMenu(row, e, document.getElementById(treeItemId(row)));
+      return;
+    }
     if (e.key === "Escape") {
       if (contextMenuRow) {
-        closeContextMenu();
+        e.preventDefault();
+        closeContextMenu({ restoreFocus: true });
         return;
       }
       if (query) {
@@ -429,12 +561,16 @@
     }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      selectedIndex = Math.min(rows.length - 1, selectedIndex + 1);
-      ensureVisible(selectedIndex);
+      moveTreeSelection(selectedIndex + 1);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      selectedIndex = Math.max(0, selectedIndex - 1);
-      ensureVisible(selectedIndex);
+      moveTreeSelection(selectedIndex - 1);
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      moveTreeSelection(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      moveTreeSelection(rows.length - 1);
     } else if (e.key === "Enter") {
       if (selectedIndex >= 0 && selectedIndex < rows.length) {
         e.preventDefault();
@@ -443,24 +579,42 @@
     } else if (e.key === "ArrowRight") {
       if (selectedIndex >= 0 && selectedIndex < rows.length) {
         const row = rows[selectedIndex];
-        if (row.kind === "dir" && !isCollapsed(row.path)) return;
         e.preventDefault();
-        if (row.kind === "dir") toggle(row.path);
+        if (row.kind !== "dir") return;
+        if (isCollapsed(row.path)) {
+          toggle(row.path);
+          return;
+        }
+        const childIndex = selectedIndex + 1;
+        if (rows[childIndex]?.depth === row.depth + 1) moveTreeSelection(childIndex);
       }
     } else if (e.key === "ArrowLeft") {
       if (selectedIndex >= 0 && selectedIndex < rows.length) {
         const row = rows[selectedIndex];
-        if (row.kind !== "dir" || isCollapsed(row.path)) return;
         e.preventDefault();
-        toggle(row.path);
+        if (row.kind === "dir" && !isCollapsed(row.path)) {
+          toggle(row.path);
+          return;
+        }
+        const parentIndex = parentRowIndex(selectedIndex);
+        if (parentIndex >= 0) moveTreeSelection(parentIndex);
       }
     }
   }
 
   function ensureVisible(index: number) {
-    if (!containerEl || index < 0) return;
+    if (index < 0) return;
+    // VirtualList owns the actual scroll container, while this same-height
+    // wrapper gives us its viewport. Update the binding minimally so routine
+    // arrow navigation does not pin every selected row to the top.
     const itemTop = index * ROW_HEIGHT;
-    containerEl.scrollTo({ top: itemTop });
+    const itemBottom = itemTop + ROW_HEIGHT;
+    const viewportHeight = containerEl?.clientHeight ?? 0;
+    if (viewportHeight <= 0 || itemTop < scrollTop) {
+      scrollTop = itemTop;
+    } else if (itemBottom > scrollTop + viewportHeight) {
+      scrollTop = itemBottom - viewportHeight;
+    }
   }
 
   let effectiveSelected = $derived(selectedFile ?? $repoStore.selectedFilePath);
@@ -508,10 +662,11 @@
       closeContextMenu();
     };
     window.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("resize", closeContextMenu);
+    const handleResize = () => closeContextMenu();
+    window.addEventListener("resize", handleResize);
     return () => {
       window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("resize", closeContextMenu);
+      window.removeEventListener("resize", handleResize);
     };
   });
 </script>
@@ -676,7 +831,13 @@
     class="flex-1 min-h-0 relative"
     role="tree"
     aria-label="Workspace Files"
+    aria-activedescendant={selectedIndex >= 0 && selectedIndex < rows.length
+      ? treeItemId(rows[selectedIndex])
+      : undefined}
     tabindex="0"
+    onfocus={() => {
+      if (selectedIndex < 0 && rows.length > 0) selectedIndex = 0;
+    }}
     onkeydown={handleKeydown}
   >
     {#if isLoading}
@@ -709,9 +870,12 @@
               {@const changeKind = classifyFileChange(status)}
               {@const dirDirty = r.kind === "dir" && dirtyDirs.has(r.path)}
               <div
+                id={treeItemId(r)}
                 role="treeitem"
                 tabindex="-1"
                 aria-selected={isSelected}
+                aria-level={r.depth + 1}
+                aria-expanded={r.kind === "dir" ? !isCollapsed(r.path) : undefined}
                 onclick={() => rowAction(r)}
                 ondblclick={() => { if (r.kind === "file") pinFile(r.path); }}
                 onkeydown={(e) => { if (e.key === "Enter") rowAction(r); }}
@@ -770,16 +934,16 @@
                     {/if}
                   {/if}
 
-                  <span
-                    role="button"
+                  <button
+                    type="button"
                     tabindex="-1"
                     onclick={(e) => { e.stopPropagation(); openContextMenu(r, e); }}
-                    onkeydown={(e) => { if (e.key === "Enter") { e.stopPropagation(); openContextMenu(r, e as any); } }}
+                    aria-label={`Actions for ${r.path}`}
                     class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface text-textMuted hover:text-textPrimary transition-opacity"
                     title="Actions"
                   >
                     <MoreVertical size={11} />
-                  </span>
+                  </button>
                 </div>
               </div>
             {/if}
@@ -795,10 +959,14 @@
   {@const row = contextMenuRow}
   {@const status = row.kind === "file" ? statusMap.get(row.path) : null}
   <div
+    bind:this={menuEl}
     use:portal={"body"}
     data-file-tree-menu
     role="menu"
-    class="fixed min-w-52 gp-menu gp-pop text-xs text-textPrimary py-1"
+    aria-label={`File actions for ${row.path}`}
+    tabindex="-1"
+    onkeydown={handleMenuKeydown}
+    class="fixed min-w-52 max-h-[calc(100vh-1rem)] overflow-y-auto gp-menu gp-pop text-xs text-textPrimary py-1"
     style="left: {menuPos.x}px; top: {menuPos.y}px; z-index: {LAYERS.MENU}"
   >
     <div class="px-2.5 py-1 text-[10px] text-textMuted font-mono border-b border-border/60 truncate max-w-xs font-semibold">
@@ -822,12 +990,12 @@
 
       {#if status}
         {#if status.is_staged}
-          <button type="button" role="menuitem" class="gp-menu-item text-amber-300" onclick={() => stageFile(row.path)}>
+          <button type="button" role="menuitem" class="gp-menu-item text-amber-300" onclick={() => unstageFile(row.path)}>
             <Undo2 size={13} />
             <span>Unstage Changes</span>
           </button>
         {:else}
-          <button type="button" role="menuitem" class="gp-menu-item text-emerald-300" onclick={() => unstageFile(row.path)}>
+          <button type="button" role="menuitem" class="gp-menu-item text-emerald-300" onclick={() => stageFile(row.path)}>
             <Check size={13} />
             <span>Stage File</span>
           </button>
@@ -852,13 +1020,13 @@
 
     <div class="my-1 border-t border-border/60"></div>
 
-    <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { copyText(row.path); closeContextMenu(); }}>
+    <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(row.path)}>
       <Copy size={13} class="text-textMuted" />
       <span>Copy Relative Path</span>
     </button>
 
     {#if $repoStore.currentPath}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { copyText(`${$repoStore.currentPath}/${row.path}`); closeContextMenu(); }}>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(`${$repoStore.currentPath}/${row.path}`)}>
         <Copy size={13} class="text-textMuted" />
         <span>Copy Full Path</span>
       </button>

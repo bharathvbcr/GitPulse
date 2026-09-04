@@ -23,10 +23,28 @@
       <Image size={15} class="text-accent shrink-0" />
       <span class="font-medium text-textPrimary truncate">{filePath}</span>
     </div>
-    <div class="gp-segmented">
-      <button onclick={() => (mode = "2up")} data-active={mode === "2up" ? "true" : "false"} class="gp-seg-btn !py-0.5 !text-[11px]">2-Up</button>
-      <button onclick={() => (mode = "swipe")} data-active={mode === "swipe" ? "true" : "false"} class="gp-seg-btn !py-0.5 !text-[11px]">Swipe</button>
-      <button onclick={() => (mode = "onion")} data-active={mode === "onion" ? "true" : "false"} class="gp-seg-btn !py-0.5 !text-[11px]">Onion Skin</button>
+    <div class="gp-segmented" role="group" aria-label="Image comparison mode">
+      <button
+        type="button"
+        onclick={() => (mode = "2up")}
+        aria-pressed={mode === "2up"}
+        data-active={mode === "2up" ? "true" : "false"}
+        class="gp-seg-btn !py-0.5 !text-[11px]"
+      >2-Up</button>
+      <button
+        type="button"
+        onclick={() => (mode = "swipe")}
+        aria-pressed={mode === "swipe"}
+        data-active={mode === "swipe" ? "true" : "false"}
+        class="gp-seg-btn !py-0.5 !text-[11px]"
+      >Swipe</button>
+      <button
+        type="button"
+        onclick={() => (mode = "onion")}
+        aria-pressed={mode === "onion"}
+        data-active={mode === "onion" ? "true" : "false"}
+        class="gp-seg-btn !py-0.5 !text-[11px]"
+      >Onion Skin</button>
     </div>
   </div>
 
@@ -39,7 +57,7 @@
           <span class="text-textMuted text-[11px]">Before (Old)</span>
           <div class="w-64 h-64 bg-surface border border-border/70 rounded-2xl shadow-card flex items-center justify-center overflow-hidden">
             {#if oldSrc}
-              <img src={oldSrc} alt="old" class="max-w-full max-h-full object-contain" />
+              <img src={oldSrc} alt={`Before version of ${filePath}`} class="max-w-full max-h-full object-contain" />
             {:else}
               <span class="text-textMuted text-xs">Missing</span>
             {/if}
@@ -49,7 +67,7 @@
           <span class="text-textMuted text-[11px]">After (New)</span>
           <div class="w-64 h-64 bg-surface border border-accent/40 rounded-2xl shadow-card flex items-center justify-center overflow-hidden">
             {#if newSrc}
-              <img src={newSrc} alt="new" class="max-w-full max-h-full object-contain" />
+              <img src={newSrc} alt={`After version of ${filePath}`} class="max-w-full max-h-full object-contain" />
             {:else}
               <span class="text-textMuted text-xs">Missing</span>
             {/if}
@@ -60,27 +78,41 @@
       <div class="flex flex-col items-center gap-4 w-[28rem]">
         <div class="w-80 h-80 bg-surface border border-border/70 rounded-2xl shadow-card relative overflow-hidden">
           {#if newSrc}
-            <img src={newSrc} alt="new" class="absolute inset-0 w-full h-full object-contain" />
+            <img src={newSrc} alt={`After version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />
           {/if}
           <div class="absolute inset-0 overflow-hidden border-r-2 border-accent" style="width: {swipePosition}%;">
             {#if oldSrc}
-              <img src={oldSrc} alt="old" class="absolute inset-0 w-80 h-80 object-contain" />
+              <img src={oldSrc} alt={`Before version of ${filePath}`} class="absolute inset-0 w-80 h-80 object-contain" />
             {/if}
           </div>
         </div>
-        <input type="range" min="0" max="100" bind:value={swipePosition} class="w-full accent-accent" />
+        <input
+          type="range"
+          min="0"
+          max="100"
+          bind:value={swipePosition}
+          aria-label="Swipe comparison divider"
+          class="w-full accent-accent"
+        />
       </div>
     {:else}
       <div class="flex flex-col items-center gap-4 w-[28rem]">
         <div class="w-80 h-80 bg-surface border border-border/70 rounded-2xl shadow-card relative overflow-hidden">
           {#if oldSrc}
-            <img src={oldSrc} alt="old" class="absolute inset-0 w-full h-full object-contain" />
+            <img src={oldSrc} alt={`Before version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />
           {/if}
           {#if newSrc}
-            <img src={newSrc} alt="new" class="absolute inset-0 w-full h-full object-contain" style="opacity: {opacity / 100};" />
+            <img src={newSrc} alt={`After version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" style="opacity: {opacity / 100};" />
           {/if}
         </div>
-        <input type="range" min="0" max="100" bind:value={opacity} class="w-full accent-accent" />
+        <input
+          type="range"
+          min="0"
+          max="100"
+          bind:value={opacity}
+          aria-label="After-image opacity"
+          class="w-full accent-accent"
+        />
       </div>
     {/if}
   </div>

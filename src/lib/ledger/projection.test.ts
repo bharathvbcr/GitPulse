@@ -8,6 +8,7 @@ import {
   verdictOf,
 } from "./projection";
 import type { LedgerEvent } from "./types";
+import type { AgentActionEntry } from "../agents/activity";
 
 function event(overrides: Partial<LedgerEvent> = {}): LedgerEvent {
   return {
@@ -110,6 +111,21 @@ describe("eventToAction", () => {
   it("falls back to the action name when there is no object", () => {
     expect(labelFor(event({ object: null }))).toBe("git.commit");
   });
+
+  it("includes both canonical repository and ULID in durable identity", () => {
+    const base = eventToAction(
+      event({ id: 7, repo_path: "/repo/a", ulid: "01DURABLE000000000000000007" }),
+    );
+    const otherRepository = eventToAction(
+      event({ id: 7, repo_path: "/repo/b", ulid: "01DURABLE000000000000000007" }),
+    );
+    const otherUlid = eventToAction(
+      event({ id: 7, repo_path: "/repo/a", ulid: "01DURABLE000000000000000008" }),
+    );
+
+    expect(base.identity).not.toBe(otherRepository.identity);
+    expect(base.identity).not.toBe(otherUlid.identity);
+  });
 });
 
 describe("mergeEvents", () => {
@@ -143,5 +159,35 @@ describe("mergeEvents", () => {
     let list = mergeEvents([], [event({ id: 1 }), event({ id: 2 })], 3);
     list = mergeEvents(list, [event({ id: 3 }), event({ id: 4 })], 3);
     expect(list.map((e) => e.id)).toEqual([2, 3, 4]);
+  });
+
+  it("orders mixed ephemeral and durable identities by time, not unrelated numeric ids", () => {
+    const ephemeral: AgentActionEntry = {
+      identity: '["ephemeral","/repo",1]',
+      id: 1,
+      ts: Date.parse("2026-09-01T13:00:00Z"),
+      kind: "commit",
+      label: "new ephemeral action",
+      ok: true,
+      verdict: null,
+    };
+
+    const merged = mergeEvents(
+      [ephemeral],
+      [
+        event({
+          id: 100,
+          ulid: "01M1F8Q43R3S5XG2A200000100",
+          ts_utc: "2026-09-01T12:00:00Z",
+          object: "older durable action",
+        }),
+      ],
+      100,
+    );
+
+    expect(merged.map((action) => action.label)).toEqual([
+      "older durable action",
+      "new ephemeral action",
+    ]);
   });
 });

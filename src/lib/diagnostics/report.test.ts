@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import {
   createReporter,
+  formatDiagnosticFailure,
   reportPanelError,
   withBackendLogSection,
   withPersistedLogSection,
@@ -22,6 +23,18 @@ function makeSink() {
 }
 
 describe("createReporter", () => {
+  it("redacts a secret-bearing IPC rejection before it can reach UI state", () => {
+    const detail = formatDiagnosticFailure(
+      new Error(
+        "Authorization: Bearer opaque-rejection https://me:password@example.test/r",
+      ),
+    );
+    expect(detail).toContain("Authorization: Bearer <redacted>");
+    expect(detail).toContain("https://me:<redacted>@example.test/r");
+    expect(detail).not.toContain("opaque-rejection");
+    expect(detail).not.toContain("password");
+  });
+
   it("formats the error once and routes it as a source-tagged warning by default", () => {
     const sink = makeSink();
     const report = createReporter(sink);
@@ -102,6 +115,13 @@ describe("withBackendLogSection", () => {
     expect(out).toContain("Backend log (last 3)");
     expect(out.endsWith("\n  c")).toBe(true);
   });
+
+  it("redacts credentials from legacy backend lines before export", () => {
+    const key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    const out = withBackendLogSection("r", [`Authorization failed for ${key}`]);
+    expect(out).not.toContain(key);
+    expect(out).toContain("ghp_");
+  });
 });
 
 describe("withPersistedLogSection", () => {
@@ -152,5 +172,16 @@ describe("withPersistedLogSection", () => {
     const out = withPersistedLogSection("r", unreadablePersistedLog("IPC rejected"));
     expect(out).toContain("Durable backend log — unavailable");
     expect(out).toContain("could not be read: IPC rejected");
+  });
+
+  it("redacts credentials from legacy durable metadata and lines before export", () => {
+    const key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+    const out = withPersistedLogSection("r", {
+      path: `/tmp/${key}/gitpulse.log`,
+      lines: [`failed with ${key}`],
+      degraded: `write rejected for ${key}`,
+    });
+    expect(out).not.toContain(key);
+    expect(out).toContain("ghp_");
   });
 });

@@ -18,4 +18,26 @@ describe("PulseExportModal component", () => {
     expect(source).toContain('aria-labelledby="export-modal-title"');
     expect(source).toContain('aria-label="Close modal"');
   });
+
+  it("uses the shared modal focus, layering, dismissal, and viewport contracts", () => {
+    expect(source).toContain("use:trapFocus");
+    expect(source).toContain("LAYERS.MODAL");
+    expect(source).toContain('e.key === "Escape"');
+    expect(source).toContain("e.target === e.currentTarget");
+    expect(source).toContain("max-h-[calc(100vh-2rem)]");
+    expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
+  });
+
+  it("uses the resilient clipboard seam and exposes denied copy attempts", () => {
+    expect(source).toContain('from "../../desktop/clipboard"');
+    expect(source).toContain("await copyText(svgContent)");
+    expect(source).not.toContain("navigator.clipboard");
+    expect(source).toContain("Copy failed");
+    expect(source).toContain('role="status"');
+  });
+
+  it("cleans up transient copy feedback timers when it closes or unmounts", () => {
+    expect(source).toContain("copyTimer");
+    expect(source).toContain("clearTimeout(copyTimer)");
+  });
 });

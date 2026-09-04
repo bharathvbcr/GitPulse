@@ -10,7 +10,7 @@ use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
 use crate::engine::worktree::{self, agent_kind, agent_session_slug, changed_paths, WorktreeInfo};
-use crate::ledger::{self, LedgerStatus};
+use crate::ledger::LedgerStatus;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -379,6 +379,17 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
         .find(|w| w.is_main)
         .and_then(|w| w.branch.clone());
 
+    let ledger = match crate::ledger::bindings::repository_status(repo_path) {
+        Ok(status) => status,
+        Err(error) => crate::ledger::LedgerStatus {
+            recording: false,
+            path: String::new(),
+            dropped: 0,
+            error: error.to_string(),
+            error_code: error.code.to_string(),
+        },
+    };
+
     InsightsSnapshot {
         repo_path: repo_path.to_string(),
         branch,
@@ -386,7 +397,7 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
         agents,
         changes,
         collisions,
-        ledger: ledger::status(repo_path),
+        ledger,
         codeintel: codeintel::status(repo_path),
     }
 }

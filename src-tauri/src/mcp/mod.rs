@@ -315,7 +315,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_status" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let ledger_status = crate::ledger::status(repo);
+            let ledger_status = crate::ledger::bindings::repository_status(repo)
+                .map_err(|error| error.to_string())?;
             let codeintel_status = crate::codeintel::status(repo);
             const WORKTREE_CAP: usize = 64;
             let worktrees = match crate::engine::worktree::list_worktrees(repo) {
@@ -376,7 +377,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         "gitpulse_ledger_events" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
             let limit = arguments["limit"].as_u64().unwrap_or(50) as u32;
-            let events = crate::ledger::tail(repo, 0, limit).map_err(|e| e.to_string())?;
+            let address = crate::ledger::bindings::repository_address(repo)
+                .map_err(|error| error.to_string())?;
+            let events =
+                crate::ledger::tail(&address.anchor, 0, limit).map_err(|e| e.to_string())?;
             Ok(json!({
                 "events": events,
                 "total": events.len()
@@ -384,7 +388,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_task_view" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let view = crate::tasks::view(repo);
+            let address = crate::ledger::bindings::repository_address(repo)
+                .map_err(|error| error.to_string())?;
+            let view = crate::tasks::view(&address.anchor);
             Ok(json!(view))
         }
         "gitpulse_codeintel_search" => {
@@ -744,13 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn gitpulse_status_always_reports_a_worktrees_facet() {
-        let payload = handle_tool_call("gitpulse_status", &json!({ "repo_path": "/no/such/repo" }))
-            .expect("the tool itself answers");
-        assert_eq!(payload["worktrees"]["ok"], false);
-        assert!(payload["worktrees"]["error"]
-            .as_str()
-            .is_some_and(|e| !e.is_empty()));
+    fn gitpulse_status_refuses_an_invalid_repository_instead_of_creating_state() {
+        let error = handle_tool_call("gitpulse_status", &json!({ "repo_path": "/no/such/repo" }))
+            .expect_err("an MCP read must validate its repository boundary");
+        assert!(error.contains("invalid_worktree"), "{error}");
     }
 
     #[test]

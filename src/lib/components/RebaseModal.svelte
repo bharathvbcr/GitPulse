@@ -117,6 +117,7 @@
   <div
     role="dialog"
     aria-modal="true"
+    aria-labelledby="rebase-modal-title"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && requestClose()}
     onkeydown={(e) => e.key === "Escape" && requestClose()}
@@ -133,10 +134,10 @@
       class="w-full max-w-xl gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 flex items-center justify-between">
-        <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
+        <h2 id="rebase-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <GitMerge size={16} class="text-accent" />
           <span>Interactive Rebase</span>
-        </div>
+        </h2>
         <div class="flex items-center gap-2">
           <span class="text-textMuted font-mono">Onto:</span>
           <input
@@ -193,4 +194,3 @@
     </div>
   </div>
 {/if}
-

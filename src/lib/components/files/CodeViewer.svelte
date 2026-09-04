@@ -9,6 +9,7 @@
   } from "../../files/syntaxHighlight";
   import { copyText } from "../../desktop/clipboard";
   import { formatError } from "../../ui/formatError";
+  import { askConfirm } from "../../stores/modalStore";
   import {
     Search,
     ChevronUp,
@@ -26,11 +27,19 @@
   let {
     filePath,
     content,
+    draftContent = null,
+    dirty = false,
     onSave,
+    onDraftChange,
+    onRequestDiscard,
   }: {
     filePath: string;
     content: string;
+    draftContent?: string | null;
+    dirty?: boolean;
     onSave?: (newContent: string) => Promise<void>;
+    onDraftChange?: (newContent: string, sourceContent: string) => void;
+    onRequestDiscard?: () => Promise<boolean>;
   } = $props();
 
   const ROW_HEIGHT = 20;
@@ -42,6 +51,8 @@
   let isSaving = $state(false);
   let saveSuccess = $state(false);
   let copied = $state(false);
+  let previousFilePath = "";
+  let editorGeneration = 0;
 
   let wordWrap = $state(false);
   let showWhitespace = $state(false);
@@ -64,6 +75,7 @@
   let scrollTop = $state(0);
 
   let language = $derived<SupportedLanguage>(detectLanguageFromPath(filePath));
+  let hasUnsavedChanges = $derived(dirty || (isEditing && editDraft !== content));
 
   let rawLines = $derived.by(() => {
     const text = isEditing ? editDraft : content;
@@ -158,44 +170,73 @@
   }
 
   function startEdit() {
-    editDraft = content;
+    editDraft = draftContent ?? content;
     isEditing = true;
   }
 
-  function cancelEdit() {
+  async function cancelEdit() {
+    const path = filePath;
+    const generation = editorGeneration;
+    if (hasUnsavedChanges) {
+      const confirmed = onRequestDiscard
+        ? await onRequestDiscard()
+        : await askConfirm({
+            title: "Discard Unsaved Edits?",
+            message: `Discard the unsaved editor draft for ${path}?`,
+            confirmLabel: "Discard Unsaved Edits",
+            cancelLabel: "Keep Editing",
+          });
+      if (!confirmed || filePath !== path || editorGeneration !== generation) return;
+    }
     isEditing = false;
     editDraft = content;
   }
 
+  function onEditInput(event: Event) {
+    const value = (event.currentTarget as HTMLTextAreaElement).value;
+    editDraft = value;
+    onDraftChange?.(value, content);
+  }
+
   async function saveChanges() {
     if (!isEditing || isSaving) return;
+    const path = filePath;
+    const generation = editorGeneration;
+    const contentToSave = editDraft;
     isSaving = true;
     try {
       if (onSave) {
-        await onSave(editDraft);
+        await onSave(contentToSave);
       } else {
         const repo = $repoStore.currentPath;
         if (!repo) throw new Error("No active repository");
         await invoke("cmd_write_file_content", {
           repoPath: repo,
-          filePath,
-          content: editDraft,
+          filePath: path,
+          content: contentToSave,
         });
         await repoStore.refresh();
       }
+      if (filePath !== path || editorGeneration !== generation) return;
+      // A newer input should remain visibly dirty even if an older write just
+      // completed. The parent applies the same saved-content comparison.
+      if (editDraft !== contentToSave) return;
       isEditing = false;
       saveSuccess = true;
       setTimeout(() => (saveSuccess = false), 2000);
     } catch (err: unknown) {
       repoStore.setError(formatError(err));
     } finally {
-      isSaving = false;
+      if (filePath === path && editorGeneration === generation) isSaving = false;
     }
   }
 
   async function handleCopy() {
     const textToCopy = isEditing ? editDraft : content;
-    await copyText(textToCopy);
+    if (!(await copyText(textToCopy))) {
+      repoStore.setError("Could not copy file content to clipboard");
+      return;
+    }
     copied = true;
     setTimeout(() => (copied = false), 1800);
   }
@@ -233,9 +274,23 @@
   }
 
   $effect(() => {
-    content;
-    if (!isEditing) {
-      editDraft = content;
+    const path = filePath;
+    const restored = draftContent;
+    const source = content;
+    if (path !== previousFilePath) {
+      previousFilePath = path;
+      editorGeneration += 1;
+      editDraft = restored ?? source;
+      isEditing = restored !== null;
+      isSaving = false;
+      saveSuccess = false;
+      return;
+    }
+    if (restored !== null && !isEditing) {
+      editDraft = restored;
+      isEditing = true;
+    } else if (restored === null && !isEditing) {
+      editDraft = source;
     }
   });
 
@@ -273,6 +328,9 @@
       <span class="text-[11px] font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
       <span class="text-textMuted/40">•</span>
       <span class="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">{language}</span>
+      {#if hasUnsavedChanges}
+        <span class="text-[10px] font-semibold text-amber-400" role="status">Unsaved</span>
+      {/if}
 
       <button
         type="button"
@@ -356,7 +414,7 @@
         <button
           type="button"
           onclick={saveChanges}
-          disabled={isSaving}
+          disabled={isSaving || !hasUnsavedChanges}
           class="gp-btn-primary !py-1 !px-3 flex items-center gap-1 text-[11px]"
         >
           {#if isSaving}
@@ -490,7 +548,9 @@
     {#if isEditing}
       <!-- Inline Code Editor Mode -->
       <textarea
-        bind:value={editDraft}
+        value={editDraft}
+        oninput={onEditInput}
+        disabled={isSaving}
         spellcheck="false"
         class="flex-1 w-full h-full p-4 bg-background font-mono text-xs text-textPrimary leading-relaxed focus:outline-none resize-none border-none {wordWrap ? 'whitespace-pre-wrap' : 'whitespace-pre overflow-x-auto'}"
         style="font-size: {0.75 * (zoomPercent / 100)}rem;"

@@ -11,6 +11,31 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-09-04
+
+### Added
+
+- **Manvi Control Plane & Operator Panel**:
+  - `ManviHarnessPane`, `ManviOpsPanel`, and `HarnessBadge` integration for real-time agent session monitoring, task attribution, and operation gating.
+  - Dedicated harness store (`harnessStore.ts`) with lease tracking, task status synchronization, and worktree association.
+- **Durable WAL SQLite Ledger & Redaction**:
+  - Embedded WAL SQLite database for durable append-only event logging across repositories.
+  - Sensitive credential and secret redaction (`ledger/redact.rs`) before persisting mutation records.
+  - Idempotent catch-up replay of agent transcripts and reflogs for automated attribution even when the app is closed via `gitpulsed`.
+- **Diagnostics & Health Reporting**:
+  - In-app Diagnostics modal displaying real-time system metrics, IPC command performance, crash logs, open file descriptor usage, and environment context.
+  - Machine-readable and exportable diagnostics report generator for troubleshooting.
+- **Enhanced Multi-Tab File Viewer & Editing**:
+  - Multi-file editor tab management (`editorTabs.ts`) with persistent draft preservation across workspace switches (`editorDraftRegistry.ts`).
+  - Serial file saving queue (`serialSave.ts`) preventing write collisions and index locking.
+  - Interactive merge conflict editor (`ConflictEditor.svelte`) with visual diff resolution and instant staging.
+  - MarkDev viewer and rich media viewers for markdown and media asset inspection.
+- **LivePulse Analytics Dashboard**:
+  - Dynamic interactive pulse dashboard (`LivePulseDashboard.svelte`) and export modal (`PulseExportModal.svelte`).
+- **IPC & Wire-Type Safety**:
+  - Expanded IPC surface to 134 verified Rust `cmd_*` handlers with zero untracked orphans.
+  - 706 wire-type contract fields strictly synchronized between Rust Serde structs and TypeScript interfaces across 46 contracts.
+
 ## [0.0.4] - 2026-09-03
 
 ### Fixed

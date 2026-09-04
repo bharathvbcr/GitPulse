@@ -112,9 +112,14 @@ function run(id: number, head_branch: string): WorkflowRunInfo {
 function grant(id: string, task_id: string): Grant {
   return {
     id,
-    grantor: { authority: "human", name: "bharath" },
+    grantor: { authority: "human", id: "bharath" },
     reason: "needed for the migration",
-    scope: { rule: "scope.unplanned", target: "src/a.rs", task_id },
+    scope: {
+      task_id,
+      rules: ["scope.unplanned"],
+      paths: ["src/a.rs"],
+      once: false,
+    },
     issued_at: "2026-09-01T12:00:00Z",
     expires_at: "2026-09-01T13:00:00Z",
     consumed: false,

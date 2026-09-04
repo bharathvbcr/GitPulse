@@ -36,6 +36,10 @@ describe("MarkDevViewer", () => {
   it("embeds CodeViewer for raw and split modes with onSave support", () => {
     expect(source).toContain("<CodeViewer");
     expect(source).toContain("onSave");
+    expect(source).toContain("draftContent");
+    expect(source).toContain("onDraftChange");
+    expect(source).toContain("onRequestDiscard");
+    expect(source).toContain("dirty");
   });
 
   it("provides an action to open in MarkDev desktop application", () => {
@@ -48,5 +52,8 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("handlePreviewClick");
     expect(source).toContain("copy-code-btn");
     expect(source).toContain("handleCopySource");
+    expect(source).toContain("if (!(await copyText(rawContent)))");
+    expect(source).toContain("if (!(await copyText(code)))");
+    expect(source).toContain('repoStore.setError("Could not copy to clipboard")');
   });
 });

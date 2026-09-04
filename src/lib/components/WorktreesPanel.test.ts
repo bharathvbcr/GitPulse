@@ -73,7 +73,7 @@ describe("WorktreesPanel removal safety", () => {
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
-    const guardIdx = source.indexOf("$repoStore.currentPath === wt.path");
+    const guardIdx = source.indexOf("$repoStore.currentPath === targetPath");
     expect(guardIdx).toBeGreaterThan(-1);
     const closeIdx = source.indexOf("repoStore.closeTab(stranded.id)");
     expect(closeIdx).toBeGreaterThan(guardIdx);
@@ -83,6 +83,42 @@ describe("WorktreesPanel removal safety", () => {
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
     expect(fn.match(/\$repoStore\.currentPath !== repo/g)?.length).toBe(2);
     expect(fn).toContain("await load()");
+  });
+
+  it("journals settled create/remove calls before stale UI returns", () => {
+    for (const [start, end, command] of [
+      ["async function create", "function removeArmTitle", "cmd_add_worktree"],
+      ["async function remove", "function open", "cmd_remove_worktree"],
+    ] as const) {
+      const body = source.slice(source.indexOf(start), source.indexOf(end));
+      const settled = body.indexOf(command);
+      const successJournal = body.indexOf("harnessStore.recordAction", settled);
+      const successGuard = body.indexOf("$repoStore.currentPath !== repo", settled);
+      expect(successJournal, `${start} success journal`).toBeGreaterThan(settled);
+      expect(successJournal, `${start} success before stale return`).toBeLessThan(successGuard);
+
+      const caught = body.indexOf("} catch", successGuard);
+      const failureJournal = body.indexOf("harnessStore.recordAction", caught);
+      const failureGuard = body.indexOf("$repoStore.currentPath !== repo", caught);
+      expect(failureJournal, `${start} failure journal`).toBeGreaterThan(caught);
+      expect(failureJournal, `${start} failure before stale return`).toBeLessThan(failureGuard);
+    }
+  });
+
+  it("freezes worktree creation inputs before invoking the backend", () => {
+    const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
+    const invoke = body.indexOf('await invoke("cmd_add_worktree"');
+    for (const declaration of [
+      "const targetPath = newPath.trim();",
+      "const branch = newBranch.trim();",
+      "const base = startPoint.trim();",
+      "const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;",
+    ]) {
+      const index = body.indexOf(declaration);
+      expect(index, declaration).toBeGreaterThan(-1);
+      expect(index, `${declaration} before invoke`).toBeLessThan(invoke);
+    }
+    expect(body).toContain("label: actionLabel");
   });
 });
 

@@ -125,14 +125,16 @@
   }
 
   // Load commit history & language detection when selectedFile changes
-  async function loadFileDetails(path: string) {
-    const repo = $repoStore.currentPath;
-    if (!repo || !path) return;
-
+  async function loadFileDetails(repo: string, path: string) {
     commitGuard?.cancel();
     const guard = createAsyncGuard();
     commitGuard = guard;
     isLoadingCommits = true;
+    // The heading changes to the new path synchronously. Clear the previous
+    // path's payload in the same turn so its language/history can never be
+    // presented under the new identity while either command is pending.
+    detectedLang = null;
+    recentCommits = [];
 
     try {
       // 1. Language detection
@@ -180,9 +182,13 @@
   });
 
   $effect(() => {
-    if (selectedFile) {
-      void loadFileDetails(selectedFile);
+    const repo = $repoStore.currentPath;
+    if (repo && selectedFile) {
+      void loadFileDetails(repo, selectedFile);
     } else {
+      commitGuard?.cancel();
+      commitGuard = null;
+      isLoadingCommits = false;
       recentCommits = [];
       detectedLang = null;
     }

@@ -57,15 +57,30 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// The watermark is what makes a replay idempotent. It is read from the ledger
 /// rather than stored beside it, so it cannot drift from what was actually
 /// written.
-fn watermark(repo_path: &str, prefix: &str) -> String {
+fn event_belongs_to_worktree(
+    event: &crate::ledger::LedgerEvent,
+    ledger_repo: &str,
+    worktree_path: &str,
+) -> bool {
+    if ledger_repo == worktree_path {
+        event.worktree_path.is_none() || event.worktree_path.as_deref() == Some(worktree_path)
+    } else {
+        event.worktree_path.as_deref() == Some(worktree_path)
+    }
+}
+
+fn watermark(ledger_repo: &str, worktree_path: &str, prefix: &str) -> String {
     let mut cursor = 0i64;
     let mut newest = String::new();
-    while let Ok(page) = ledger::tail(repo_path, cursor, 1000) {
+    while let Ok(page) = ledger::tail(ledger_repo, cursor, 1000) {
         if page.is_empty() {
             break;
         }
         for event in &page {
-            if event.action.starts_with(prefix) && event.ts_utc > newest {
+            if event_belongs_to_worktree(event, ledger_repo, worktree_path)
+                && event.action.starts_with(prefix)
+                && event.ts_utc > newest
+            {
                 newest = event.ts_utc.clone();
             }
         }
@@ -82,6 +97,12 @@ fn watermark(repo_path: &str, prefix: &str) -> String {
 /// Only calls newer than the watermark are recorded, so opening a repository
 /// twice does not double its history.
 pub fn ingest_transcripts(repo_path: &str) -> CatchUp {
+    ingest_transcripts_into(repo_path, repo_path)
+}
+
+/// Replays transcripts observed in `worktree_path` into the repository-wide
+/// ledger at `ledger_repo`.
+pub(crate) fn ingest_transcripts_into(ledger_repo: &str, worktree_path: &str) -> CatchUp {
     let mut out = CatchUp::default();
     let Some(root) = transcript_root() else {
         out.error = "no home directory, so transcripts cannot be located".into();
@@ -93,8 +114,11 @@ pub fn ingest_transcripts(repo_path: &str) -> CatchUp {
         return out;
     }
 
-    let since = watermark(repo_path, "session.");
+    let since = watermark(ledger_repo, worktree_path, "session.");
     let since_ms = iso_to_millis(&since);
+    let task_id = crate::ledger::bindings::resolve(ledger_repo, worktree_path)
+        .ok()
+        .flatten();
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files, 0);
     for path in files {
@@ -132,7 +156,7 @@ pub fn ingest_transcripts(repo_path: &str) -> CatchUp {
                 continue;
             }
             for call in calls {
-                if !transcript::belongs_to(&call, repo_path) {
+                if !transcript::belongs_to(&call, worktree_path) {
                     continue;
                 }
                 if !since.is_empty() && call.ts_utc <= since {
@@ -146,10 +170,13 @@ pub fn ingest_transcripts(repo_path: &str) -> CatchUp {
                 })
                 .to_string();
                 if ledger::record(Draft {
-                    repo_path: repo_path.to_string(),
+                    repo_path: ledger_repo.to_string(),
+                    worktree_path: (ledger_repo != worktree_path)
+                        .then(|| worktree_path.to_string()),
                     action: call.action().to_string(),
                     object: Some(call.object()),
                     session_id: Some(call.session_id.clone()),
+                    task_id: task_id.clone(),
                     // Derived from observation, not self-reported: this row
                     // exists because a transcript recorded the call, not
                     // because an agent announced it.
@@ -269,8 +296,18 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth
 /// is what makes "the history is complete" true rather than "complete for as
 /// long as the app was open".
 pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
+    ingest_reflog_into(repo_path, repo_path, max_entries)
+}
+
+/// Replays one checkout's HEAD reflog into its repository-wide ledger.
+pub(crate) fn ingest_reflog_into(
+    ledger_repo: &str,
+    worktree_path: &str,
+    max_entries: usize,
+) -> CatchUp {
     let mut out = CatchUp::default();
-    let entries = match crate::engine::git_reader::GitReader::get_reflog(repo_path, max_entries) {
+    let entries = match crate::engine::git_reader::GitReader::get_reflog(worktree_path, max_entries)
+    {
         Ok(entries) => entries,
         Err(e) => {
             out.error = e;
@@ -281,12 +318,14 @@ pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
     // Already-recorded selectors, so a second open adds nothing.
     let mut seen = std::collections::HashSet::new();
     let mut cursor = 0i64;
-    while let Ok(page) = ledger::tail(repo_path, cursor, 1000) {
+    while let Ok(page) = ledger::tail(ledger_repo, cursor, 1000) {
         if page.is_empty() {
             break;
         }
         for event in &page {
-            if event.action.starts_with("reflog.") {
+            if event_belongs_to_worktree(event, ledger_repo, worktree_path)
+                && event.action.starts_with("reflog.")
+            {
                 if let Some(object) = &event.object {
                     seen.insert(object.clone());
                 }
@@ -299,6 +338,9 @@ pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
     }
 
     // Oldest first, so the ledger's order matches the order things happened.
+    let task_id = crate::ledger::bindings::resolve(ledger_repo, worktree_path)
+        .ok()
+        .flatten();
     for entry in entries.iter().rev() {
         // The selector (`HEAD@{3}`) is positional and shifts as the reflog
         // grows, so identity is the commit plus the message.
@@ -332,7 +374,9 @@ pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
         })
         .to_string();
         if ledger::record(Draft {
-            repo_path: repo_path.to_string(),
+            repo_path: ledger_repo.to_string(),
+            worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
+            task_id: task_id.clone(),
             action,
             object: Some(identity),
             after_ref: Some(entry.commit_id.clone()),
@@ -356,8 +400,15 @@ pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
 
 /// Runs both replays for a repository.
 pub fn catch_up(repo_path: &str) -> CatchUp {
-    let mut total = ingest_reflog(repo_path, 200);
-    let transcripts = ingest_transcripts(repo_path);
+    catch_up_into(repo_path, repo_path)
+}
+
+/// Replays one checkout into the shared repository ledger. Calling this again
+/// through either the main or linked spelling is idempotent because each
+/// source worktree has its own watermark inside that shared log.
+pub fn catch_up_into(ledger_repo: &str, worktree_path: &str) -> CatchUp {
+    let mut total = ingest_reflog_into(ledger_repo, worktree_path, 200);
+    let transcripts = ingest_transcripts_into(ledger_repo, worktree_path);
     total.recorded += transcripts.recorded;
     total.transcripts = transcripts.transcripts;
     total.skipped_lines = transcripts.skipped_lines;
@@ -370,6 +421,27 @@ pub fn catch_up(repo_path: &str) -> CatchUp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=GitPulse",
+                "-c",
+                "user.email=gitpulse@test.local",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     /// Serialises the tests that override the transcript root.
     ///
@@ -509,6 +581,54 @@ mod tests {
         assert!(
             out.skipped_lines > 0,
             "a line we could not read must be reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn linked_reflog_catch_up_is_shared_attributed_and_idempotent() {
+        let main = tempfile::tempdir().expect("main checkout");
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").expect("seed repository");
+        git_in(main.path(), &["add", "seed.txt"]);
+        git_in(main.path(), &["commit", "-m", "seed"]);
+
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let linked = parent.path().join("linked");
+        git_in(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().expect("utf8 worktree"),
+            ],
+        );
+        std::fs::write(linked.join("linked.txt"), "linked").expect("linked change");
+        git_in(&linked, &["add", "linked.txt"]);
+        git_in(&linked, &["commit", "-m", "linked change"]);
+
+        let anchor_path = main.path().canonicalize().expect("canonical main");
+        let worktree_path = linked.canonicalize().expect("canonical worktree");
+        let anchor = anchor_path.to_string_lossy();
+        let worktree = worktree_path.to_string_lossy();
+        let first = ingest_reflog_into(&anchor, &worktree, 200);
+        assert!(
+            first.recorded > 0,
+            "the linked HEAD reflog was not imported"
+        );
+        let events = ledger::tail(&anchor, 0, 1000).expect("family ledger");
+        assert_eq!(events.len() as i64, first.recorded);
+        assert!(events.iter().all(|event| event.repo_path == anchor));
+        assert!(events
+            .iter()
+            .all(|event| event.worktree_path.as_deref() == Some(worktree.as_ref())));
+
+        let second = ingest_reflog_into(&anchor, &worktree, 200);
+        assert_eq!(second.recorded, 0, "a repeated catch-up duplicated rows");
+        assert_eq!(
+            ledger::tail(&anchor, 0, 1000).expect("family ledger").len(),
+            events.len(),
+            "the second pass changed the shared ledger"
         );
     }
 }

@@ -370,15 +370,27 @@ pub fn spawn_session(
     } else {
         crate::ledger::ActorKind::Human
     };
+    let repository = repo.to_string_lossy().into_owned();
+    let address = crate::ledger::bindings::repository_address(&repository).ok();
+    let ledger_repo = address
+        .as_ref()
+        .map(|address| address.anchor.clone())
+        .unwrap_or_else(|| repository.clone());
+    let worktree_path = address
+        .as_ref()
+        .and_then(|address| (address.worktree != address.anchor).then(|| address.worktree.clone()));
+    let task_id = address.and_then(|address| {
+        crate::ledger::bindings::resolve(&address.anchor, &address.worktree)
+            .ok()
+            .flatten()
+    });
     let draft = crate::ledger::Draft {
-        repo_path: repo.to_string_lossy().into_owned(),
-        worktree_path: Some(repo.to_string_lossy().into_owned()),
+        repo_path: ledger_repo,
+        worktree_path,
         actor_kind: Some(actor_kind),
         actor_id: Some(shell.clone()),
         session_id: Some(session_id.clone()),
-        task_id: crate::ledger::bindings::resolve(repo_path, repo_path)
-            .ok()
-            .flatten(),
+        task_id,
         action: "session.spawn".to_string(),
         object: Some(shell.clone()),
         argv_json: args.as_ref().and_then(|a| serde_json::to_string(a).ok()),

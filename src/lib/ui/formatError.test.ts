@@ -64,6 +64,15 @@ describe("formatError", () => {
     expect(formatError(hostile)).toBe("Unknown error");
   });
 
+  it("survives a throwing message getter before serialization", () => {
+    const hostile = {
+      get message(): never {
+        throw new Error("message getter exploded");
+      },
+    };
+    expect(formatError(hostile)).toBe("Unknown error");
+  });
+
   it("maps undefined and null to the unknown fallback", () => {
     expect(formatError(undefined)).toBe("Unknown error");
     expect(formatError(null)).toBe("Unknown error");

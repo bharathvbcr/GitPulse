@@ -1,9 +1,241 @@
+<script module lang="ts">
+  import type { HarnessPermissionMode } from "../harness/availability";
+  import type { CatchUp } from "../ingest/types";
+  import type { LedgerStatus } from "../ledger/types";
+  import { redactDiagnosticText } from "../diagnostics/diagnostics";
+
+  export type StatusTone = "ready" | "warning" | "error" | "neutral";
+
+  export interface StatusPresentation {
+    label: string;
+    detail: string;
+    tone: StatusTone;
+    cardClass: string;
+    badgeClass: string;
+  }
+
+  export interface RefreshTimerScheduler {
+    setInterval(callback: () => void, delayMs: number): unknown;
+    clearInterval(handle: unknown): void;
+  }
+
+  export interface RepositoryRefreshTimer {
+    update(repo: string | null): void;
+    dispose(): void;
+  }
+
+  /**
+   * Keeps one interval for the active repository. Updating a store with the
+   * same repository identity is deliberately a no-op, so unrelated status
+   * publications cannot postpone expiry/ledger refresh indefinitely.
+   */
+  export function createRepositoryRefreshTimer(
+    intervalMs: number,
+    refresh: (repo: string) => void,
+    scheduler: RefreshTimerScheduler,
+  ): RepositoryRefreshTimer {
+    let activeRepo: string | null = null;
+    let handle: unknown;
+
+    function clear() {
+      if (handle === undefined) return;
+      scheduler.clearInterval(handle);
+      handle = undefined;
+    }
+
+    return {
+      update(repo) {
+        if (repo === activeRepo) return;
+        clear();
+        activeRepo = repo;
+        if (!repo) return;
+        const scheduledRepo = repo;
+        handle = scheduler.setInterval(() => {
+          if (activeRepo === scheduledRepo) refresh(scheduledRepo);
+        }, intervalMs);
+      },
+      dispose() {
+        clear();
+        activeRepo = null;
+      },
+    };
+  }
+
+  const STATUS_CLASSES: Record<
+    StatusTone,
+    Pick<StatusPresentation, "cardClass" | "badgeClass">
+  > = {
+    ready: {
+      cardClass: "border-emerald-500/25 bg-emerald-500/5",
+      badgeClass: "text-emerald-300",
+    },
+    warning: {
+      cardClass: "border-amber-500/30 bg-amber-500/5",
+      badgeClass: "text-amber-300",
+    },
+    error: {
+      cardClass: "border-rose-500/30 bg-rose-500/5",
+      badgeClass: "text-rose-300",
+    },
+    neutral: {
+      cardClass: "border-border/70 bg-background",
+      badgeClass: "text-textMuted",
+    },
+  };
+
+  function presentation(
+    label: string,
+    detail: string,
+    tone: StatusTone,
+  ): StatusPresentation {
+    return { label, detail, tone, ...STATUS_CLASSES[tone] };
+  }
+
+  /** Truthful copy for the action runner's current policy capability. */
+  export function scopedRunnerPresentation(
+    mode: HarnessPermissionMode,
+    refreshError: string | null = null,
+  ): StatusPresentation {
+    if (refreshError) {
+      return presentation(
+        "Status stale",
+        `The latest MANVI status request failed: ${redactDiagnosticText(refreshError)} No runner capability is claimed until status is checked again.`,
+        "error",
+      );
+    }
+    switch (mode) {
+      case "connected":
+        return presentation(
+          "Guarded",
+          "Health and coverage commands require a click, a purpose allowlist, direct argv execution, the MANVI policy gate, hard timeouts, bounded output, and stop-on-failure accounting.",
+          "ready",
+        );
+      case "unguarded":
+        return presentation(
+          "Not checked",
+          "User-started health and coverage commands still use a purpose allowlist, direct argv execution, hard timeouts, bounded output, and stop-on-failure accounting. MANVI is not installed, so no policy check runs.",
+          "warning",
+        );
+      case "blocked":
+        return presentation(
+          "Blocked",
+          "Guarded health and coverage commands are refused while MANVI policy checks are failing. Reconnect after the policy gate recovers.",
+          "error",
+        );
+      default:
+        return presentation(
+          "Status unknown",
+          "The MANVI policy capability has not been checked yet. User-started commands remain behind the purpose allowlist; reconnect to establish whether the policy gate can run.",
+          "neutral",
+        );
+    }
+  }
+
+  /**
+   * Separately reports UI refresh, durable recording, and external catch-up.
+   * One successful source must never hide a gap in another source.
+   */
+  export function activityHistoryPresentations(
+    refreshError: string | null,
+    ledger: LedgerStatus | null,
+    catchUp: CatchUp | null,
+  ): StatusPresentation[] {
+    const statuses: StatusPresentation[] = [];
+
+    if (refreshError) {
+      statuses.push(
+        presentation(
+          "Latest MANVI status request failed",
+          `${redactDiagnosticText(refreshError)} Displayed capability status may be stale.`,
+          "error",
+        ),
+      );
+    }
+
+    if (!ledger) {
+      statuses.push(
+        presentation(
+          "Activity history not checked",
+          "Durable recording status has not loaded for this repository.",
+          "neutral",
+        ),
+      );
+    } else if (!ledger.recording || ledger.error) {
+      const details = [
+        ledger.error
+          ? redactDiagnosticText(ledger.error)
+          : "Durable activity recording is unavailable.",
+        ledger.dropped > 0
+          ? `${ledger.dropped} ${ledger.dropped === 1 ? "event was" : "events were"} not recorded.`
+          : "",
+      ].filter(Boolean);
+      statuses.push(presentation("Activity history incomplete", details.join(" "), "error"));
+    } else if (ledger.dropped > 0) {
+      statuses.push(
+        presentation(
+          "Activity history incomplete",
+          `${ledger.dropped} ${ledger.dropped === 1 ? "event was" : "events were"} not recorded.`,
+          "warning",
+        ),
+      );
+    } else {
+      statuses.push(
+        presentation(
+          "Activity history recording",
+          ledger.path
+            ? `Durable events are recording at ${ledger.path}.`
+            : "Durable events are recording for this repository.",
+          "ready",
+        ),
+      );
+    }
+
+    if (!catchUp) {
+      statuses.push(
+        presentation(
+          "Catch-up not checked",
+          "External transcript and reflog catch-up has not completed for this repository.",
+          "neutral",
+        ),
+      );
+    } else if (catchUp.error || catchUp.skipped_lines > 0) {
+      const details = [
+        catchUp.error ? redactDiagnosticText(catchUp.error) : "",
+        catchUp.skipped_lines > 0
+          ? `${catchUp.skipped_lines} transcript ${catchUp.skipped_lines === 1 ? "line was" : "lines were"} skipped.`
+          : "",
+        catchUp.recorded > 0
+          ? `${catchUp.recorded} ${catchUp.recorded === 1 ? "event was" : "events were"} still recovered.`
+          : "",
+      ].filter(Boolean);
+      statuses.push(presentation("Catch-up incomplete", details.join(" "), "warning"));
+    } else {
+      statuses.push(
+        presentation(
+          "Catch-up complete",
+          catchUp.recorded > 0
+            ? `${catchUp.recorded} external ${catchUp.recorded === 1 ? "event was" : "events were"} recovered from ${catchUp.transcripts} ${catchUp.transcripts === 1 ? "transcript" : "transcripts"} and ${catchUp.reflog_entries} reflog ${catchUp.reflog_entries === 1 ? "entry" : "entries"}.`
+            : "No external transcript or reflog events needed to be recovered.",
+          "ready",
+        ),
+      );
+    }
+
+    return statuses;
+  }
+</script>
+
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "@tauri-apps/api/core";
   import type { GrantView } from "../grants/types";
+  import {
+    activeGrants as selectActiveGrants,
+    grantLifecycle,
+  } from "../grants/model";
   import {
     contextWindowLabel,
     sweepSummary,
@@ -12,6 +244,11 @@
     type ScanResult,
   } from "../ai/scan";
   import { formatError } from "../ui/formatError";
+  import { beginGeneration } from "../async/guard";
+  import {
+    harnessPermissionMode,
+    harnessPermissionSummary,
+  } from "../harness/availability";
   import {
     RefreshCw,
     ShieldCheck,
@@ -35,9 +272,19 @@
 
   let ai = $derived($harnessStore.ai);
   let harness = $derived($harnessStore.harness);
+  let harnessError = $derived($harnessStore.error);
+  let permissionMode = $derived(harnessPermissionMode(harness));
+  let runnerPresentation = $derived(scopedRunnerPresentation(permissionMode, harnessError));
   let preferred = $derived($harnessStore.preferred);
   // Newest first: the question the journal answers is "what just happened".
   let recentActions = $derived($harnessStore.actions.slice().reverse());
+  let activityHistory = $derived(
+    activityHistoryPresentations(
+      harnessError,
+      $harnessStore.ledger,
+      $harnessStore.catchUp,
+    ),
+  );
 
   /**
    * The harness's grant ledger.
@@ -48,31 +295,76 @@
    * anyone reading the journal.
    */
   let grants = $state<GrantView | null>(null);
+  let grantsLoading = $state(false);
+  let grantsLoadError = $state<string | null>(null);
+  let grantClock = $state(Date.now());
   let grantsRepo: string | null = null;
+  const grantRequests = beginGeneration();
+  const grantRefreshTimer = createRepositoryRefreshTimer(
+    10_000,
+    (repo) => {
+      grantClock = Date.now();
+      if ($repoStore.currentPath === repo) void refreshGrants(repo, false);
+    },
+    {
+      setInterval: (callback, delayMs) => window.setInterval(callback, delayMs),
+      clearInterval: (handle) => window.clearInterval(handle as number),
+    },
+  );
+  onDestroy(() => grantRefreshTimer.dispose());
+
+  async function refreshGrants(repo: string, showLoading: boolean) {
+    const generation = grantRequests.next();
+    if (showLoading) {
+      // Never show A's authority state under B while B's ledger is loading.
+      grants = null;
+      grantsLoadError = null;
+      grantsLoading = true;
+    }
+    try {
+      const view = await invoke<GrantView>("cmd_grants_view", { repoPath: repo });
+      if (!grantRequests.isCurrent(generation) || $repoStore.currentPath !== repo) return;
+      grants = view;
+      grantsLoadError = null;
+      grantClock = Date.now();
+    } catch (error: unknown) {
+      if (!grantRequests.isCurrent(generation) || $repoStore.currentPath !== repo) return;
+      grantsLoadError = redactDiagnosticText(formatError(error));
+      if (showLoading) grants = null;
+    } finally {
+      if (!grantRequests.isCurrent(generation) || $repoStore.currentPath !== repo) return;
+      grantsLoading = false;
+    }
+  }
+
   $effect(() => {
     const repo = $repoStore.currentPath;
     // Guarded on a genuine repo switch: this effect re-runs on every store
     // emission, and the ~6s status poll is one.
-    if (!repo || repo === grantsRepo) return;
+    if (repo === grantsRepo) return;
     grantsRepo = repo;
-    void invoke<GrantView>("cmd_grants_view", { repoPath: repo })
-      .then((v) => {
-        grants = v;
-      })
-      .catch(() => {
-        // A failed read leaves the section hidden rather than claiming there
-        // are no grants. The two are different and must not look the same.
-        grants = null;
-      });
+    if (!repo) {
+      grantRequests.next();
+      grants = null;
+      grantsLoadError = null;
+      grantsLoading = false;
+      return;
+    }
+    void refreshGrants(repo, true);
   });
 
-  /** Grants that have not expired, newest first. */
-  let activeGrants = $derived(
-    (grants?.grants ?? [])
-      .filter((g) => !g.expires_at || Date.parse(g.expires_at) > Date.now())
-      .slice()
-      .reverse(),
-  );
+  // Grant consumption and expiry can change while this pane remains mounted.
+  // Key the timer by repository rather than this effect's execution: repoStore
+  // can publish unrelated same-path status changes more frequently than the
+  // interval, and resetting on each one would starve this refresh forever.
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    grantRefreshTimer.update(repo);
+  });
+
+  /** MANVI persists oldest first; retain spent grants as reviewable history. */
+  let orderedGrants = $derived((grants?.grants ?? []).slice().reverse());
+  let activeGrantCount = $derived(selectActiveGrants(grants?.grants ?? [], grantClock).length);
 
   type CapabilityTab = "health" | "coverage" | "terminal" | "github";
 
@@ -218,7 +510,18 @@
         <span>Reconnect</span>
       </button>
     </div>
-    {#if harness?.available}
+    {#if harnessError}
+      <div class="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 space-y-1.5">
+        <div class="flex items-center gap-2 text-rose-400 font-medium">
+          <ShieldAlert size={14} />
+          <span>Latest MANVI status request failed</span>
+        </div>
+        <p class="text-textMuted leading-relaxed break-words">
+          {redactDiagnosticText(harnessError)} Any previously displayed connection state may be stale;
+          press Reconnect to check again.
+        </p>
+      </div>
+    {:else if permissionMode === "connected" && harness}
       <div class="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3 space-y-1.5">
         <div class="flex items-center gap-2 text-emerald-400 font-medium">
           <ShieldCheck size={14} />
@@ -236,19 +539,32 @@
           {/each}
         </div>
       </div>
-    {:else}
+    {:else if permissionMode === "unguarded"}
       <div class="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3 space-y-1.5">
         <div class="flex items-center gap-2 text-amber-400 font-medium">
           <ShieldAlert size={14} />
-          <span>Unavailable</span>
+          <span>MANVI is not installed</span>
         </div>
-        <div class="text-textMuted">{harness?.error ?? "Not probed yet."}</div>
         <p class="text-textMuted leading-relaxed">
-          GitPulse still works. Every action it performs without a gate is reported as
-          <span class="text-amber-400">not checked</span> — never as approved. Install MANVI,
-          or point <span class="font-mono">GITPULSE_MANVI_BIN</span> at the binary, then
-          press Reconnect.
+          {harnessPermissionSummary(harness)} Install MANVI, or point
+          <span class="font-mono">GITPULSE_MANVI_BIN</span> at the binary, then press Reconnect.
         </p>
+      </div>
+    {:else if permissionMode === "blocked"}
+      <div class="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 space-y-1.5">
+        <div class="flex items-center gap-2 text-rose-400 font-medium">
+          <ShieldAlert size={14} />
+          <span>Policy gate failed — mutations blocked</span>
+        </div>
+        <p class="text-textMuted leading-relaxed">{harnessPermissionSummary(harness)}</p>
+        <p class="text-textMuted leading-relaxed">
+          Press Reconnect after resolving the sidecar failure. GitPulse will not treat a timed-out,
+          busy, unavailable, or incompatible policy check as approval.
+        </p>
+      </div>
+    {:else}
+      <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted">
+        {harnessPermissionSummary(harness)}
       </div>
     {/if}
   </section>
@@ -276,15 +592,18 @@
           MANVI never receives the PTY handle or keystrokes. Shell commands are typed and owned by you.
         </p>
       </div>
-      <div class="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-3 space-y-1">
+      <div class="rounded-xl border p-3 space-y-1 {runnerPresentation.cardClass}">
         <div class="flex items-center gap-2 text-textPrimary font-medium">
-          <ShieldCheck size={13} class="text-emerald-400" />
+          {#if runnerPresentation.tone === "ready"}
+            <ShieldCheck size={13} class={runnerPresentation.badgeClass} />
+          {:else}
+            <ShieldAlert size={13} class={runnerPresentation.badgeClass} />
+          {/if}
           <span>Scoped action runner</span>
-          <span class="ml-auto text-[10px] uppercase text-emerald-300">Available</span>
+          <span class="ml-auto text-[10px] uppercase {runnerPresentation.badgeClass}">{runnerPresentation.label}</span>
         </div>
         <p class="text-textMuted leading-relaxed">
-          Health and coverage commands require a click, a purpose allowlist, direct argv execution,
-          the MANVI policy gate, hard timeouts, bounded output, and stop-on-failure accounting.
+          {runnerPresentation.detail}
         </p>
       </div>
     </div>
@@ -513,52 +832,79 @@
   {/if}
 
   <!-- Grant ledger: who waived which rule, and until when -->
-  {#if grants?.available}
+  {#if grantsLoading || grantsLoadError || grants?.available}
     <section class="gp-card p-4 space-y-2">
       <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted flex items-center gap-1.5">
         <ShieldAlert size={11} />
-        <span>Grants ({activeGrants.length} active of {grants.grants.length})</span>
+        <span>
+          {grants?.available
+            ? `Grants (${activeGrantCount} active of ${grants.grants.length})`
+            : "Grants"}
+        </span>
       </h3>
-      {#if grants.error}
-        <!--
-          A ledger that exists and could not be parsed must never render as a
-          repository where nothing was ever granted.
-        -->
-        <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3 text-[11px] text-amber-400 leading-relaxed">
-          The grant ledger could not be read, so this list is not the whole
-          truth: {grants.error}
-        </div>
-      {:else if grants.grants.length === 0}
-        <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
-          No rule has been waived in this repository.
+      {#if grantsLoading}
+        <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed" role="status">
+          Checking grant history…
         </div>
       {:else}
-        <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-40 overflow-y-auto">
-          {#each activeGrants as grant (grant.id)}
-            <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]">
-              <div class="flex items-center gap-1.5 min-w-0">
-                <span class="font-mono text-[10px] text-accent shrink-0">{grant.scope.rule || "policy"}</span>
-                <span class="truncate text-textPrimary">{grant.scope.target}</span>
-                {#if grant.consumed}
-                  <span class="ml-auto shrink-0 text-[9px] uppercase text-textMuted">used</span>
-                {/if}
+        {#if grantsLoadError}
+          <div class="rounded-xl border border-rose-500/40 bg-rose-500/5 p-3 text-[11px] text-rose-400 leading-relaxed" role="alert">
+            Grant history could not be refreshed. {grants
+              ? "The last verified snapshot remains below."
+              : "No authority state is inferred."} {grantsLoadError}
+          </div>
+        {/if}
+        {#if grants?.error}
+          <!--
+            Invalid entries are refused by the backend, while valid entries
+            remain visible. The warning and list must therefore be independent.
+          -->
+          <div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3 text-[11px] text-amber-400 leading-relaxed">
+            Some grant records were refused, so this list is not the whole
+            truth: {redactDiagnosticText(grants.error)}
+          </div>
+        {/if}
+        {#if grants?.grants.length === 0}
+          <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
+            {grants.error
+              ? "No valid grant record could be displayed."
+              : "No rule has been waived in this repository."}
+          </div>
+        {:else if grants && grants.grants.length > 0}
+          <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-40 overflow-y-auto">
+            {#each orderedGrants as grant (grant.id)}
+              <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <span class="font-mono text-[10px] text-accent truncate">
+                    {grant.scope.rules.length > 0 ? grant.scope.rules.join(", ") : "invalid scope: no policy rule"}
+                  </span>
+                  {#if grant.scope.once}
+                    <span class="shrink-0 text-[9px] uppercase text-textMuted">one use</span>
+                  {/if}
+                  <span class="ml-auto shrink-0 text-[9px] uppercase text-textMuted">
+                    {grantLifecycle(grant, grantClock)}
+                  </span>
+                </div>
+                <div class="text-textPrimary truncate">
+                  {grant.scope.paths.length > 0 ? grant.scope.paths.join(", ") : "any repository path"}
+                  {#if grant.scope.task_id}· task {grant.scope.task_id}{/if}
+                </div>
+                <div class="text-textMuted truncate">
+                  {grant.grantor.authority || "invalid authority"}{#if grant.grantor.id}:{grant.grantor.id}{/if}
+                  {#if grant.reason}· {grant.reason}{/if}
+                  {#if grant.expires_at}· expires {grant.expires_at}{/if}
+                  {#if !grant.expires_at}
+                    · expiry unavailable
+                  {/if}
+                </div>
               </div>
-              <div class="text-textMuted truncate">
-                {grant.grantor.name || grant.grantor.authority || "unknown"}
-                {#if grant.reason}· {grant.reason}{/if}
-                {#if grant.expires_at}· expires {grant.expires_at}{/if}
-              </div>
-            </div>
-          {/each}
-        </div>
-        <!--
-          Revocation is Manvi's to perform. GitPulse is a read-only consumer of
-          this state, and a second writer could interleave with the harness's
-          own serialised writes to the same file.
-        -->
-        <p class="text-[10px] text-textMuted">
-          Revoke with <code class="font-mono">manvi grants revoke &lt;id&gt;</code>; GitPulse only reads this ledger.
-        </p>
+            {/each}
+          </div>
+          <p class="text-[10px] text-textMuted">
+            Current MANVI CLI has no grant-revocation command. A grant stops applying after it is consumed or expires.
+            GitPulse only reads the ledger at <code class="font-mono break-all">{grants.path}</code>.
+          </p>
+        {/if}
       {/if}
     </section>
   {/if}
@@ -589,14 +935,26 @@
         {/if}
       </div>
     </div>
+    <div class="grid gap-2 md:grid-cols-2" aria-label="Activity history status">
+      {#each activityHistory as status (status.label)}
+        <div class="rounded-xl border p-3 {status.cardClass}" role="status">
+          <div class="text-[10px] font-semibold uppercase tracking-wider {status.badgeClass}">
+            {status.label}
+          </div>
+          <p class="mt-1 text-[11px] text-textMuted leading-relaxed break-words">
+            {status.detail}
+          </p>
+        </div>
+      {/each}
+    </div>
     {#if recentActions.length === 0}
       <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
-        No actions yet. Every commit, push, rebase, discard, conflict save and worktree
-        change GitPulse performs lands here — with whether a policy gate checked it.
+        No activity rows are currently available. The history status above says whether this
+        means no recorded actions or incomplete data.
       </div>
     {:else}
       <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-56 overflow-y-auto">
-        {#each recentActions as action (action.id)}
+          {#each recentActions as action (action.identity)}
           <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]" title={action.verdict?.detail ?? action.label}>
             <div class="flex items-center gap-2">
               <span class="font-mono text-[10px] text-textMuted shrink-0">{actionTime(action.ts)}</span>

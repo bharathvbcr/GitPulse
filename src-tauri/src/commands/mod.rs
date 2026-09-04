@@ -992,7 +992,11 @@ pub async fn cmd_record_pulse_snapshot(
     snapshot: crate::ledger::PulseSnapshotInput,
 ) -> Result<(), String> {
     off_thread(move || {
-        crate::ledger::save_pulse_snapshot(&repo_path, &snapshot).map_err(|e| e.to_string())
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+        crate::ledger::save_pulse_snapshot(&address.anchor, &snapshot)
+            .map_err(|error| error.to_string())
     })
     .await
 }
@@ -1003,7 +1007,11 @@ pub async fn cmd_get_pulse_snapshots(
     limit: Option<usize>,
 ) -> Result<Vec<crate::ledger::PulseSnapshotEntry>, String> {
     off_thread(move || {
-        crate::ledger::get_pulse_snapshots(&repo_path, limit).map_err(|e| e.to_string())
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+        crate::ledger::get_pulse_snapshots(&address.anchor, limit)
+            .map_err(|error| error.to_string())
     })
     .await
 }
@@ -2717,8 +2725,13 @@ pub async fn cmd_ledger_tail(
     cursor: i64,
     limit: u32,
 ) -> Result<Vec<crate::ledger::LedgerEvent>, String> {
-    off_thread(move || crate::ledger::tail(&repo_path, cursor, limit).map_err(|e| e.to_string()))
-        .await
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        crate::ledger::tail(&address.anchor, cursor, limit).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Reports whether the ledger is recording for this repository.
@@ -2729,7 +2742,12 @@ pub async fn cmd_ledger_tail(
 /// the same picture.
 #[tauri::command(async)]
 pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::LedgerStatus, String> {
-    off_thread(move || Ok(crate::ledger::status(&repo_path))).await
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        crate::ledger::bindings::repository_status(&repo.to_string_lossy())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 // --- task binding ------------------------------------------------------
@@ -2741,7 +2759,13 @@ pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::Ledge
 /// strands the task when the window closes.
 #[tauri::command(async)]
 pub async fn cmd_task_view(repo_path: String) -> Result<crate::tasks::TaskView, String> {
-    off_thread(move || Ok(crate::tasks::view(&repo_path))).await
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        Ok(crate::tasks::view(&address.anchor))
+    })
+    .await
 }
 
 /// The scope one task declares, or `null` when the store or task is absent.
@@ -2750,7 +2774,13 @@ pub async fn cmd_task_scope(
     repo_path: String,
     task_id: String,
 ) -> Result<Option<crate::tasks::TaskScope>, String> {
-    off_thread(move || crate::tasks::scope(&repo_path, &task_id)).await
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        crate::tasks::scope(&address.anchor, &task_id)
+    })
+    .await
 }
 
 /// Binds a worktree to a task, so every later mutation in it is judged against
@@ -2806,7 +2836,16 @@ pub async fn cmd_worktree_task(
 /// Both replays are idempotent, so this is safe to run on every repo open.
 #[tauri::command(async)]
 pub async fn cmd_catch_up(repo_path: String) -> Result<crate::ingest::CatchUp, String> {
-    off_thread(move || Ok(crate::ingest::catch_up(&repo_path))).await
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        Ok(crate::ingest::catch_up_into(
+            &address.anchor,
+            &address.worktree,
+        ))
+    })
+    .await
 }
 
 // --- code intelligence (devmap in-process) ----------------------------
@@ -3143,5 +3182,148 @@ mod assemble_tests {
         assert!(payload.rows[1].connections[0].is_dangling);
         assert_eq!(payload.warnings, ["HEAD unavailable"]);
         assert_connected(&payload);
+    }
+
+    /// A stale persisted repository path is untrusted input. Before this
+    /// guard, asking for its ledger status created
+    /// `<missing>/.devcouncil/ledger.sqlite`, turning a broken session restore
+    /// into an unexpected filesystem mutation outside any repository.
+    #[test]
+    fn ledger_commands_refuse_a_missing_repo_without_creating_it() {
+        let root = tempfile::tempdir().expect("temporary parent");
+        let missing = root.path().join("removed-repository");
+
+        let status_result = tauri::async_runtime::block_on(cmd_ledger_status(
+            missing.to_string_lossy().into_owned(),
+        ));
+        let tail_result = tauri::async_runtime::block_on(cmd_ledger_tail(
+            missing.to_string_lossy().into_owned(),
+            0,
+            100,
+        ));
+        let catch_up_result =
+            tauri::async_runtime::block_on(cmd_catch_up(missing.to_string_lossy().into_owned()));
+        let snapshot_result = tauri::async_runtime::block_on(cmd_record_pulse_snapshot(
+            missing.to_string_lossy().into_owned(),
+            crate::ledger::PulseSnapshotInput {
+                day: "2026-09-03".to_string(),
+                total_commits: 1,
+                total_loc: 1,
+                bus_factor: 1,
+                coverage_pct: None,
+                snapshot_json: "{}".to_string(),
+            },
+        ));
+        let snapshots_result = tauri::async_runtime::block_on(cmd_get_pulse_snapshots(
+            missing.to_string_lossy().into_owned(),
+            Some(10),
+        ));
+
+        assert!(status_result.is_err(), "ledger status must reject it");
+        assert!(tail_result.is_err(), "ledger tail must reject it");
+        assert!(catch_up_result.is_err(), "catch-up must reject it");
+        assert!(snapshot_result.is_err(), "snapshot writes must reject it");
+        assert!(snapshots_result.is_err(), "snapshot reads must reject it");
+        assert!(
+            !missing.exists(),
+            "a read must not create the missing repository or its ledger"
+        );
+    }
+
+    /// Opening a linked worktree must address the same durable journal as the
+    /// main checkout. Otherwise an append notification and a later reload use
+    /// different cursors, making sibling actions either disappear or replay.
+    #[test]
+    fn ledger_commands_resolve_a_linked_worktree_to_the_family_anchor() {
+        let main = tempfile::tempdir().expect("main checkout");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=GitPulse",
+                    "-c",
+                    "user.email=gitpulse@test.local",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(main.path())
+                .output()
+                .expect("spawn git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").expect("seed repository");
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-m", "seed"]);
+
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let linked = parent.path().join("linked");
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("utf8 worktree"),
+        ]);
+        let main_path = main.path().canonicalize().expect("main canonical");
+        let linked_path = linked.canonicalize().expect("linked canonical");
+        crate::ledger::append(crate::ledger::Draft {
+            repo_path: main_path.to_string_lossy().into_owned(),
+            worktree_path: Some(linked_path.to_string_lossy().into_owned()),
+            action: "file.modify".to_string(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("family row");
+
+        let status = tauri::async_runtime::block_on(cmd_ledger_status(
+            linked_path.to_string_lossy().into_owned(),
+        ))
+        .expect("status from linked worktree");
+        assert_eq!(
+            status.path,
+            main_path
+                .join(".devcouncil/ledger.sqlite")
+                .display()
+                .to_string()
+        );
+        let events = tauri::async_runtime::block_on(cmd_ledger_tail(
+            linked_path.to_string_lossy().into_owned(),
+            0,
+            100,
+        ))
+        .expect("tail from linked worktree");
+        assert_eq!(events.len(), 1, "the shared row must appear exactly once");
+        assert_eq!(events[0].repo_path, main_path.to_string_lossy());
+        assert_eq!(
+            events[0].worktree_path.as_deref(),
+            Some(linked_path.to_string_lossy().as_ref())
+        );
+
+        tauri::async_runtime::block_on(cmd_record_pulse_snapshot(
+            linked_path.to_string_lossy().into_owned(),
+            crate::ledger::PulseSnapshotInput {
+                day: "2026-09-03".to_string(),
+                total_commits: 7,
+                total_loc: 42,
+                bus_factor: 2,
+                coverage_pct: Some(88.5),
+                snapshot_json: r#"{"source":"linked"}"#.to_string(),
+            },
+        ))
+        .expect("record snapshot through linked worktree");
+        let snapshots = tauri::async_runtime::block_on(cmd_get_pulse_snapshots(
+            main_path.to_string_lossy().into_owned(),
+            Some(10),
+        ))
+        .expect("read shared snapshots from main checkout");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].repo_path, main_path.to_string_lossy());
+        assert_eq!(snapshots[0].total_commits, 7);
     }
 }

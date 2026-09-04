@@ -6,6 +6,7 @@ import {
   flattenFileTree,
   isValidRelativePath,
   joinWorktreePath,
+  parentDirectoryRowIndex,
   type FileRow,
 } from "./fileTree";
 
@@ -143,6 +144,24 @@ describe("ancestorsOf", () => {
     expect(ancestorsOf("root.txt")).toEqual([]);
     // A leading slash is not a repo-relative ancestor boundary.
     expect(ancestorsOf("/etc/passwd")).toEqual([]);
+  });
+});
+
+describe("parentDirectoryRowIndex", () => {
+  it("selects the exact parent directory in a hierarchical listing", () => {
+    const rows = rowsOf(["src/lib/deep.ts", "src/main.ts", "top.ts"]);
+    const child = rows.findIndex((row) => row.path === "src/lib/deep.ts");
+    expect(parentDirectoryRowIndex(rows, child)).toBe(
+      rows.findIndex((row) => row.kind === "dir" && row.path === "src/lib"),
+    );
+  });
+
+  it("does not jump to an unrelated file when flat sorting removes directory rows", () => {
+    const flatSorted: FileRow[] = [
+      { kind: "file", key: "f:a/root.ts", path: "a/root.ts", name: "root.ts", depth: 1 },
+      { kind: "file", key: "f:z/child.ts", path: "z/child.ts", name: "child.ts", depth: 1 },
+    ];
+    expect(parentDirectoryRowIndex(flatSorted, 1)).toBe(-1);
   });
 });
 

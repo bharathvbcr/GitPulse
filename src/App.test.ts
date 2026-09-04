@@ -133,4 +133,14 @@ describe("App overlay wiring", () => {
       promptIdx < diagIdx ? source.slice(promptIdx, diagIdx) : source.slice(diagIdx, promptIdx);
     expect(between).toContain("</svelte:boundary>");
   });
+
+  it("guards browser unload and native quit while editor drafts are dirty", () => {
+    expect(source).toContain('listen<void>("gitpulse-exit-requested"');
+    expect(source).toContain('invoke("cmd_set_exit_guard_ready")');
+    expect(source).toContain('invoke("cmd_exit_app")');
+    expect(source).toContain('window.addEventListener("beforeunload"');
+    expect(source).toContain("await editorFileSaveQueue.whenIdle()");
+    expect(source).toContain("hasUnsavedEditorDrafts()");
+    expect(source).toContain("Discard Unsaved Edits and Quit?");
+  });
 });

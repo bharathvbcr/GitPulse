@@ -45,8 +45,24 @@ describe("CodeStackViewer restack safety", () => {
     // README contract: mutating verdicts are recorded centrally and surface
     // in the header badge; restack used to bypass both.
     expect(source).toContain('from "../stores/harnessStore"');
-    expect(source).toMatch(/harnessStore\.recordVerdict\(result\.policy/);
+    expect(source).toContain("harnessStore.recordVerdict(result.policy, repoPath)");
+    expect(source).toMatch(/harnessStore\.recordAction\(\{\s+repoPath,/);
     expect(source).toContain('kind: "restack"');
+  });
+
+  it("journals the settled restack before returning stale UI work", () => {
+    const body = source.slice(source.indexOf("async function restack"), source.indexOf("$effect"));
+    const settled = body.indexOf('await invoke("cmd_restack"');
+    const successJournal = body.indexOf("harnessStore.recordAction", settled);
+    const successGuard = body.indexOf("if (!guard.isLive()", settled);
+    expect(successJournal).toBeGreaterThan(settled);
+    expect(successJournal).toBeLessThan(successGuard);
+
+    const caught = body.indexOf("} catch", successGuard);
+    const failureJournal = body.indexOf("harnessStore.recordAction", caught);
+    const failureGuard = body.indexOf("if (!guard.isLive()", caught);
+    expect(failureJournal).toBeGreaterThan(caught);
+    expect(failureJournal).toBeLessThan(failureGuard);
   });
 
   it("keeps every rejection routed through the diagnostics reporting seam", () => {

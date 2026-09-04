@@ -1,10 +1,14 @@
-import { formatError } from "../ui/formatError";
-import { diagnostics, type DiagnosticsStore } from "./diagnostics";
+import {
+  diagnostics,
+  formatDiagnosticFailure,
+  redactDiagnosticText,
+  type DiagnosticsStore,
+} from "./diagnostics";
 import type { PersistedLog } from "./types";
 
 /**
  * One seam between panel-level caught errors and the persistent diagnostics
- * ring: every panel catch formats once through `formatError`, feeds the ring
+ * ring: every panel catch formats once through the shared safe formatter, feeds the ring
  * tagged with its panel source, and hands back the exact banner text the
  * panel was already showing — so the UI contract is unchanged and the log
  * side-effect is purely additive.
@@ -33,6 +37,9 @@ export interface ReporterOptions {
   severity?: "error" | "warning";
 }
 
+/** Formats and redacts an arbitrary failure before it reaches component state. */
+export { formatDiagnosticFailure };
+
 /**
  * Builds a reporter against an injected sink (unit-testable, mirroring
  * `installGlobalDiagnostics`). The returned reporter records `err` and
@@ -42,14 +49,8 @@ export function createReporter(
   sink: Pick<DiagnosticsStore, "error" | "warn">,
 ): (source: PanelSource, err: unknown, opts?: ReporterOptions) => string {
   return (source, err, opts = {}) => {
-    // `formatError` is throw-resistant but not throw-proof: a hostile
-    // getter on `.message` throws before its own guards run, so wrap here.
-    let message: string;
-    try {
-      message = formatError(err);
-    } catch {
-      message = "Unknown error";
-    }
+    // One safe formatter owns hostile thrown values and credential redaction.
+    const message = formatDiagnosticFailure(err);
     if ((opts.severity ?? "warning") === "error") sink.error(source, message);
     else sink.warn(source, message);
     return message;
@@ -69,7 +70,7 @@ export function withBackendLogSection(report: string, lines: readonly string[]):
     report,
     "",
     `Backend log (last ${lines.length})`,
-    ...lines.map((line) => `  ${line}`),
+    ...lines.map((line) => `  ${redactDiagnosticText(line)}`),
   ].join("\n");
 }
 
@@ -85,8 +86,16 @@ export function withBackendLogSection(report: string, lines: readonly string[]):
  */
 export function withPersistedLogSection(report: string, log: PersistedLog): string {
   const header = log.path
-    ? `Durable backend log (${log.lines.length} line(s) from ${log.path})`
+    ? `Durable backend log (${log.lines.length} line(s) from ${redactDiagnosticText(log.path)})`
     : "Durable backend log — unavailable";
-  const note = log.degraded ? [`  ! incomplete: ${log.degraded}`] : [];
-  return [report, "", header, ...note, ...log.lines.map((line) => `  ${line}`)].join("\n");
+  const note = log.degraded
+    ? [`  ! incomplete: ${redactDiagnosticText(log.degraded)}`]
+    : [];
+  return [
+    report,
+    "",
+    header,
+    ...note,
+    ...log.lines.map((line) => `  ${redactDiagnosticText(line)}`),
+  ].join("\n");
 }

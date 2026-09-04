@@ -38,12 +38,13 @@ const SWEPT_FILES = [
 const RAW_ERROR_STRINGIFY = /\bString\(\s*(err|reason|error|e)\b/;
 
 // Panels migrated to the diagnostics seam report through `reportPanelError`,
-// which formats via formatError internally (see src/lib/diagnostics/report.ts)
-// before feeding the ring. Either spelling satisfies the contract; raw
-// String(err) satisfies neither.
+// while stores that need the same redaction-safe text use
+// `formatDiagnosticFailure` directly. Each path delegates to formatError;
+// raw String(err) satisfies none of them.
 const FORMATTER_SEAM = [
   { marker: "formatError(", importNeedle: "ui/formatError" },
   { marker: "reportPanelError(", importNeedle: "diagnostics/report" },
+  { marker: "formatDiagnosticFailure(", importNeedle: "diagnostics/diagnostics" },
 ] as const;
 
 function routesThroughFormatter(source: string): boolean {

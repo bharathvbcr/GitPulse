@@ -1,4 +1,12 @@
 import { describe, expect, it } from "vitest";
+import {
+  editorDraft,
+  emptyEditorTabs,
+  hasDirtyEditorTabs,
+  openPreview,
+  updateEditorDraft,
+  type EditorTabState,
+} from "../files/editorTabs";
 import { createRepoPanelCache } from "./repoPanelCache";
 
 describe("repoPanelCache", () => {
@@ -74,5 +82,41 @@ describe("repoPanelCache", () => {
     health.clear();
     expect(health.size).toBe(0);
     expect(storage.get("/repo/a")).toBe("storage");
+  });
+
+  it("does not evict protected entries when the soft bound is full", () => {
+    const cache = createRepoPanelCache<{ dirty: boolean }>({
+      maxRepos: 2,
+      canEvict: (value) => !value.dirty,
+    });
+    cache.set("/dirty/a", { dirty: true });
+    cache.set("/dirty/b", { dirty: true });
+    cache.set("/clean", { dirty: false });
+
+    expect(cache.get("/dirty/a")).toEqual({ dirty: true });
+    expect(cache.get("/dirty/b")).toEqual({ dirty: true });
+    expect(cache.get("/clean")).toBeUndefined();
+    expect(cache.size).toBe(2);
+  });
+
+  it("round-trips independent same-path drafts across repository switches and remounts", () => {
+    const cache = createRepoPanelCache<EditorTabState>({
+      canEvict: (state) => !hasDirtyEditorTabs(state),
+    });
+    const stateFor = (draft: string) => {
+      let state = openPreview(emptyEditorTabs(), "src/shared.ts");
+      state = updateEditorDraft(state, "src/shared.ts", draft, "disk");
+      return state;
+    };
+    cache.set("/repo/a", stateFor("repo a draft"));
+    cache.set("/repo/b", stateFor("repo b draft"));
+
+    const repoA = cache.get("/repo/a");
+    const repoB = cache.get("/repo/b");
+    expect(repoA).toBeDefined();
+    expect(repoB).toBeDefined();
+    if (!repoA || !repoB) throw new Error("draft cache entry unexpectedly missing");
+    expect(editorDraft(repoA, "src/shared.ts")?.content).toBe("repo a draft");
+    expect(editorDraft(repoB, "src/shared.ts")?.content).toBe("repo b draft");
   });
 });

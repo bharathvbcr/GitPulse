@@ -290,8 +290,8 @@
    * These actions bypass repoStore.runMutating, so without this the verdict
    * would be dropped on the floor.
    */
-  function fileVerdict(result: Guarded<string> | null) {
-    harnessStore.recordVerdict(result?.policy ?? null);
+  function fileVerdict(result: Guarded<string> | null, repoPath: string) {
+    harnessStore.recordVerdict(result?.policy ?? null, repoPath);
   }
 
   /** Builds the action notice from gh's output, with verdict context. */
@@ -311,7 +311,7 @@
         repoPath: repo,
         number,
       });
-      fileVerdict(result);
+      fileVerdict(result, repo);
       if ($repoStore.currentPath !== repo) return;
       await repoStore.refresh(repo);
       if ($repoStore.currentPath !== repo) return;
@@ -352,7 +352,7 @@
         workflow: workflow.path,
         gitRef: refName,
       });
-      fileVerdict(result);
+      fileVerdict(result, repo);
       actionNotice = actionMessage(
         result,
         `Dispatched ${workflow.name || workflow.path} at ${refName}. It may take a moment to appear.`,
@@ -376,7 +376,7 @@
         repoPath: repo,
         runId: run.id,
       });
-      fileVerdict(result);
+      fileVerdict(result, repo);
       actionNotice = actionMessage(result, `Re-running “${run.title || run.name}”.`);
       await loadFor(repo);
     } catch (err: unknown) {
@@ -397,7 +397,7 @@
         repoPath: repo,
         runId: run.id,
       });
-      fileVerdict(result);
+      fileVerdict(result, repo);
       actionNotice = actionMessage(
         result,
         `Cancellation requested for “${run.title || run.name}”.`,

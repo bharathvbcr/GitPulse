@@ -33,6 +33,11 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
     expect(source).toContain("harnessStore.recordAction({");
   });
 
+  it("attributes every terminal journal row to the repository that started it", () => {
+    const journalCalls = source.match(/harnessStore\.recordAction\(\{\s+repoPath,/g) ?? [];
+    expect(journalCalls).toHaveLength(3);
+  });
+
   it("provides copy and clear output affordances in Console mode", () => {
     expect(source).toContain("clearOutput");
     expect(source).toContain("copyOutput");

@@ -37,10 +37,28 @@ html.light {
   --c-bg: 243 244 250;
   --c-surface: 255 255 255;
   --c-surface-hover: 236 238 248;
-  --c-border: 148 156 184;
-  --c-accent: 82 104 235;
+  --c-border: 96 104 136;
+  --c-accent: 48 64 175;
   --c-text: 34 40 62;
   --c-text-muted: 99 108 134;
+
+  /* Light-theme semantic colors are deliberately darker than Tailwind's
+     dark-surface ramps so status text remains legible on every light card. */
+  --c-status-amber: 146 64 14;
+  --c-status-emerald: 6 95 70;
+  --c-status-rose: 159 18 57;
+  --c-status-red: 153 27 27;
+  --c-status-sky: 7 89 133;
+  --c-status-cyan: 21 94 117;
+  --c-status-purple: 107 33 168;
+  --c-status-green: 22 101 52;
+  --c-status-orange: 154 52 18;
+  --c-status-teal: 17 94 89;
+  --c-status-indigo: 55 48 163;
+  --c-status-blue: 29 78 216;
+  --c-status-yellow: 133 77 14;
+  --c-status-zinc: 82 82 91;
+  --c-status-slate: 71 85 105;
 
   --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
     0 12px 32px -20px rgb(38 46 76 / 0.25);
@@ -51,6 +69,78 @@ html.light {
   --brand-gradient: linear-gradient(135deg, #06b6d4 0%, #4f74e8 52%, #8b5cf6 100%);
 
   color-scheme: light;
+}
+
+/* Tailwind's opacity modifiers are tuned for the dark palette. On light
+   surfaces they can make otherwise-accessible foregrounds translucent. Keep
+   semantic text opaque in light mode and route status ramps through the
+   contrast-checked tokens above. */
+html.light :where([class~="text-textMuted/40"], [class~="text-textMuted/50"], [class~="text-textMuted/60"], [class~="text-textMuted/70"], [class~="text-textMuted/80"]) {
+  color: rgb(var(--c-text-muted));
+}
+
+html.light :where([class~="text-accent/60"], [class~="text-accent/70"], [class~="text-accent/80"]) {
+  color: rgb(var(--c-accent));
+}
+
+html.light :where([class~="text-amber-200"], [class~="text-amber-300"], [class~="text-amber-300/80"], [class~="text-amber-300/90"], [class~="text-amber-400"], [class~="text-amber-400/80"], [class~="text-amber-400/90"], [class~="text-amber-500"], [class~="text-amber-600"]) {
+  color: rgb(var(--c-status-amber));
+}
+
+html.light :where([class~="text-emerald-300"], [class~="text-emerald-400"], [class~="text-emerald-400/80"], [class~="text-emerald-400/90"], [class~="text-emerald-500"], [class~="text-emerald-500/80"], [class~="text-emerald-600"]) {
+  color: rgb(var(--c-status-emerald));
+}
+
+html.light :where([class~="text-rose-200"], [class~="text-rose-300"], [class~="text-rose-300/90"], [class~="text-rose-400"], [class~="text-rose-400/90"], [class~="text-rose-500"], [class~="text-rose-600"]) {
+  color: rgb(var(--c-status-rose));
+}
+
+html.light :where([class~="text-red-300"], [class~="text-red-400"], [class~="text-red-400/80"], [class~="text-red-600"]) {
+  color: rgb(var(--c-status-red));
+}
+
+html.light :where([class~="text-sky-300"], [class~="text-sky-400"], [class~="text-sky-600"]) {
+  color: rgb(var(--c-status-sky));
+}
+
+html.light :where([class~="text-cyan-300"], [class~="text-cyan-400"], [class~="text-cyan-400/80"]) {
+  color: rgb(var(--c-status-cyan));
+}
+
+html.light :where([class~="text-purple-200"], [class~="text-purple-300"], [class~="text-purple-300/80"], [class~="text-purple-400"], [class~="text-purple-600"]) {
+  color: rgb(var(--c-status-purple));
+}
+
+html.light :where([class~="text-green-300"], [class~="text-green-400"], [class~="text-green-400/80"]) {
+  color: rgb(var(--c-status-green));
+}
+
+html.light :where([class~="text-orange-300"], [class~="text-orange-400"], [class~="text-orange-600"]) {
+  color: rgb(var(--c-status-orange));
+}
+
+html.light :where([class~="text-teal-400"], [class~="text-teal-600"]) {
+  color: rgb(var(--c-status-teal));
+}
+
+html.light :where([class~="text-indigo-300"], [class~="text-indigo-400"], [class~="text-indigo-600"]) {
+  color: rgb(var(--c-status-indigo));
+}
+
+html.light :where([class~="text-blue-200"], [class~="text-blue-300"], [class~="text-blue-300/80"], [class~="text-blue-400"]) {
+  color: rgb(var(--c-status-blue));
+}
+
+html.light :where([class~="text-yellow-300"]) {
+  color: rgb(var(--c-status-yellow));
+}
+
+html.light :where([class~="text-zinc-400"], [class~="text-zinc-600"]) {
+  color: rgb(var(--c-status-zinc));
+}
+
+html.light :where([class~="text-slate-400"], [class~="text-slate-600"]) {
+  color: rgb(var(--c-status-slate));
 }
 
 :root {

@@ -47,6 +47,12 @@ describe("SettingsModal", () => {
     // Defaults are on, so both switches render checked.
     expect(body).toContain('aria-checked="true"');
   });
+
+  it("keeps every setting and the Done action reachable at the 900 by 600 minimum window", () => {
+    expect(source).toContain("max-h-[calc(100vh-2rem)]");
+    expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
+    expect(source).toContain("shrink-0");
+  });
 });
 
 describe("SettingsModal automatic coverage toggle", () => {

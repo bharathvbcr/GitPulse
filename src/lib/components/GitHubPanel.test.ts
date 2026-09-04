@@ -61,9 +61,11 @@ describe("GitHubPanel guarded-action contracts", () => {
     // These actions bypass repoStore.runMutating; without an explicit
     // recordVerdict the gate's decision (including "no gate present") is
     // lost to the journal.
-    const verdictCalls = source.match(/fileVerdict\(result\);/g)?.length ?? 0;
+    const verdictCalls = source.match(/fileVerdict\(result, repo\);/g)?.length ?? 0;
     expect(verdictCalls).toBeGreaterThanOrEqual(4);
-    expect(source).toContain("harnessStore.recordVerdict(result?.policy ?? null)");
+    expect(source).toContain(
+      "harnessStore.recordVerdict(result?.policy ?? null, repoPath)",
+    );
   });
 
   it("renders the action notice from result.output with a real fallback", () => {

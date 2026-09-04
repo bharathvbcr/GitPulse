@@ -9,6 +9,7 @@ import {
 
 function entry(i: number): AgentActionEntry {
   return {
+    identity: `test:${i}`,
     id: i,
     ts: 1000 + i,
     kind: "commit",
@@ -46,10 +47,11 @@ describe("appendAction", () => {
 
 describe("makeAgentAction", () => {
   it("assigns monotonically increasing ids and a timestamp", () => {
-    const a = makeAgentAction({ kind: "push", label: "origin/main", ok: true }, 42);
-    const b = makeAgentAction({ kind: "pull", label: "x", ok: false }, 43);
+    const a = makeAgentAction({ kind: "push", label: "origin/main", ok: true }, 42, "/a");
+    const b = makeAgentAction({ kind: "pull", label: "x", ok: false }, 43, "/b");
     expect(a.ts).toBe(42);
     expect(b.id).toBeGreaterThan(a.id);
+    expect(a.identity).not.toBe(b.identity);
   });
 
   it("defaults verdict to null when absent", () => {

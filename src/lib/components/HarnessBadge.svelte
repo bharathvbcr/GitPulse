@@ -2,6 +2,10 @@
   import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore, verdictDetail, verdictLabel } from "../stores/harnessStore";
+  import {
+    harnessPermissionMode,
+    harnessPermissionSummary,
+  } from "../harness/availability";
   import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles } from "lucide-svelte";
 
   onMount(() => {
@@ -13,11 +17,10 @@
   let harness = $derived($harnessStore.harness);
   let ai = $derived($harnessStore.ai);
   let verdict = $derived($harnessStore.lastVerdict);
+  let permissionMode = $derived(harnessPermissionMode(harness));
 
   let harnessTitle = $derived(
-    harness?.available
-      ? `MANVI harness connected — protocol ${harness.protocol}, posture ${harness.posture}\n${harness.binary}\nClick to open the MANVI view.`
-      : `MANVI harness unavailable — ${harness?.error ?? "not probed yet"}\nGit actions still work, and are reported as unchecked.\nClick to open the MANVI view.`
+    `${harnessPermissionSummary(harness)}${harness?.binary ? `\n${harness.binary}` : ""}\nClick to open the MANVI view.`,
   );
 
   let modelTitle = $derived(
@@ -44,12 +47,18 @@
     onclick={() => repoStore.setActiveTab("manvi")}
     title={harnessTitle}
     class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors shadow-sm
-      {harness?.available
+      {permissionMode === 'connected'
         ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
-        : 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'}"
+        : permissionMode === 'blocked'
+          ? 'border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
+          : permissionMode === 'unguarded'
+            ? 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+            : 'border-border/80 bg-surfaceHover text-textMuted hover:text-textPrimary'}"
   >
-    {#if harness?.available}
+    {#if permissionMode === "connected"}
       <ShieldCheck size={12} />
+    {:else if permissionMode === "not-probed"}
+      <ShieldQuestion size={12} />
     {:else}
       <ShieldAlert size={12} />
     {/if}

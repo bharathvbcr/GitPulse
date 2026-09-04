@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import HealthPanel from "./HealthPanel.svelte";
+import HealthPanel, { dependabotFreshness } from "./HealthPanel.svelte";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "HealthPanel.svelte"),
@@ -42,6 +42,24 @@ describe("HealthPanel source contracts & interactive remediation", () => {
     expect(source).toContain('kind: "remediation-step",');
   });
 
+  it("journals a settled step before any stale-UI return", () => {
+    const body = source.slice(
+      source.indexOf("async function runStep"),
+      source.indexOf("async function runAllSteps"),
+    );
+    const settled = body.indexOf("await invoke<TerminalRunResult>");
+    const successJournal = body.indexOf("harnessStore.recordAction", settled);
+    const successGuard = body.indexOf("if (!guard.isLive()) return false;", settled);
+    expect(successJournal).toBeGreaterThan(settled);
+    expect(successJournal).toBeLessThan(successGuard);
+
+    const caught = body.indexOf("} catch", successGuard);
+    const failureJournal = body.indexOf("harnessStore.recordAction", caught);
+    const failureGuard = body.indexOf("if (!guard.isLive()) return false;", caught);
+    expect(failureJournal).toBeGreaterThan(caught);
+    expect(failureJournal).toBeLessThan(failureGuard);
+  });
+
   it("provides single-step and sequential run-all execution", () => {
     expect(source).toContain("async function runStep");
     expect(source).toContain("async function runAllSteps");
@@ -74,6 +92,7 @@ describe("HealthPanel rendering", () => {
     const { body } = render(HealthPanel);
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
+    expect(body).toContain("GitHub alerts are not checked automatically");
   });
 
   it("feeds scanners_ran into formatAuditCounts so an unrun audit never renders as clean", () => {
@@ -83,7 +102,41 @@ describe("HealthPanel rendering", () => {
 
   it("includes Dependabot in the copied report and shows every alert severity in the header", () => {
     expect(source).toContain("formatHealthReport(current, repoPath, dependabot)");
+    expect(source).toContain("Dependabot checked at:");
     expect(source).toContain("{#if openDependabotCount > 0}");
+  });
+
+  it("keeps credentialed GitHub checks behind an explicit user action", () => {
+    const localScan = source.slice(
+      source.indexOf("async function scan("),
+      source.indexOf("async function scanDependabot"),
+    );
+    expect(localScan).not.toContain("cmd_github_dependabot_alerts");
+    expect(source).toContain("async function scanDependabot");
+    expect(source).toContain("GitHub alerts are not checked automatically");
+    expect(source).toMatch(/uses the GitHub CLI,\s+its credentials, and the network/);
+    expect(source).toContain('aria-describedby="dependabot-permission-note"');
+    expect(source).not.toContain('class="hidden xl:inline text-[10px] text-textMuted"');
+    expect(source).toContain("Check GitHub alerts");
+    expect(source).toContain("onclick={() => scanDependabot()}");
+  });
+
+  it("shows an IPC failure instead of misdiagnosing it as a missing GitHub CLI", () => {
+    const section = source.slice(
+      source.indexOf("{#snippet dependabotSection()}"),
+      source.indexOf("{/snippet}"),
+    );
+    const errorBranch = section.indexOf("{#if dependabot.error}");
+    const missingCliBranch = section.indexOf("{:else if !dependabot.cli_present}");
+    expect(errorBranch).toBeGreaterThan(-1);
+    expect(missingCliBranch).toBeGreaterThan(-1);
+    expect(errorBranch).toBeLessThan(
+      missingCliBranch,
+    );
+    const renderedError = section.slice(errorBranch, missingCliBranch);
+    expect(renderedError).toContain("!dependabotRequestFailed");
+    expect(source).toContain("dependabotRequestFailed = true;");
+    expect(source).toContain("dependabotRequestFailed = false;");
   });
 
   it("labels outdated results as npm-only and renders exact cap notices", () => {
@@ -96,9 +149,58 @@ describe("HealthPanel rendering", () => {
 describe("HealthPanel flicker contracts", () => {
   it("hydrates the cached report before rescanning so revisits render instantly", () => {
     expect(source).toContain("createRepoPanelCache<{");
-    expect(source).toContain("healthCache.set(repoPath, { deps: deps.value, dependabot })");
+    expect(source).toContain("dependabotCheckedAt: number | null");
+    expect(source).toContain(
+      "dependabotRequestFailed,",
+    );
     const effectBody = source.slice(source.indexOf("scanned.path = path;"), source.indexOf("async function openExternal"));
     expect(effectBody).toContain("healthCache.get(path)");
+    expect(effectBody).toContain("dependabotCheckedAt = cached.dependabotCheckedAt;");
+  });
+
+  it("timestamps and caches the latest successful or failed explicit GitHub check", () => {
+    const body = source.slice(
+      source.indexOf("async function scanDependabot"),
+      source.indexOf("function renderedReport"),
+    );
+    expect(body).toContain("const checkedAt = Date.now();");
+    expect(body).toContain("dependabotCheckedAt = checkedAt;");
+    expect(body).toContain("cacheDependabotResult(repoPath, next, checkedAt, false)");
+    expect(body).toContain("cacheDependabotResult(repoPath, failed, checkedAt, true)");
+  });
+
+  it("does not resurrect an older GitHub result after the local rescan fails", () => {
+    const helper = source.slice(
+      source.indexOf("function cacheDependabotResult"),
+      source.indexOf("async function scanDependabot"),
+    );
+    expect(helper).toContain(
+      "const currentReport = scanned.path === repoPath ? report : null;",
+    );
+    expect(helper).toContain("currentReport ?? healthCache.get(repoPath)?.deps");
+    expect(helper).toContain(
+      "dependabotRequestFailed: requestFailed,",
+    );
+  });
+
+  it("renders an explicit age for cached Dependabot results", () => {
+    const checkedAt = Date.UTC(2026, 8, 3, 12, 34, 56);
+    const freshness = dependabotFreshness(checkedAt);
+    expect(freshness.iso).toBe("2026-09-03T12:34:56.000Z");
+    expect(freshness.label.length).toBeGreaterThan(0);
+    expect(source).toContain("This result may be cached");
+    expect(source).toContain("dependabotFreshness(dependabotCheckedAt)");
+  });
+
+  it("never shows the previous repository's health data while an uncached repo scans", () => {
+    const effectBody = source.slice(source.indexOf("scanned.path = path;"), source.indexOf("async function openExternal"));
+    expect(effectBody).toContain("report = null;");
+    expect(effectBody).toContain("dependabot = null;");
+    expect(effectBody).toContain("dependabotCheckedAt = null;");
+    expect(effectBody).toContain("deadSymbols = [];");
+    expect(effectBody).toContain("codegraph = null;");
+    expect(effectBody).toContain("dependabotInflight?.cancel();");
+    expect(effectBody).toContain("checkingGithub = false;");
   });
 
   it("gates its loading placeholder on having no data yet", () => {
