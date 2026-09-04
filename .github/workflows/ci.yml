@@ -108,6 +108,16 @@ jobs:
       - name: Rust Cargo Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      # TEMPORARY: two Windows test binaries die at load with
+      # STATUS_ENTRYPOINT_NOT_FOUND before running a test. Identify the import.
+      - name: Diagnose Windows loader failure (temporary)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --no-run --test ipc_bridge_integration --test desktop_menu_integration --test git_ops
+          ./scripts/diagnose-windows-loader.ps1
+
       - name: Rust Unit & Integration Tests
         # --no-fail-fast: without it cargo stops at the first failing test
         # BINARY, so every later one -- the whole tests/ directory -- is
