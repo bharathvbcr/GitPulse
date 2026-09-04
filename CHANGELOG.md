@@ -23,6 +23,14 @@ before that tag is pushed.
   - **Single-pass worktree traversal**: Merged large-file collection directly into the worktree walker using `WorktreeWalkContext`, eliminating the redundant second walk and halving disk I/O.
   - **Developer and agent caches classified**: Recognized `.devcouncil`, `.gitnexus`, `.claude`, `.cursor`, `.agents`, `.gemini`, and `.antigravity` under cache artifacts.
 
+- **Windows: cloning a repository failed.** The clone destination was resolved with `canonicalize`, which on Windows always answers with a verbatim `\\?\C:\...` path. git refuses that as a working tree (`could not create work tree dir ...: Invalid argument`), and the prefix leaked into the refusal text users saw. Resolution now produces a spelling external tools accept.
+- **Windows: cloning into an existing directory resolved onto the source repository.** The clone's directory name was derived by splitting the URL on `/` alone, so a local Windows path (`C:\src\repo`) survived whole and the drive-colon split returned a *rooted* `\src\repo` — and joining a rooted path discards the destination. Both path separators are now split on, and the derived name is guaranteed to be a single component.
+- **Windows: external tools resolved to the wrong file.** Tool lookup tried the bare program name before any executable suffix, so `npm` matched Node's extension-less shell script instead of `npm.cmd` and failed with "%1 is not a valid Win32 application". Suffixed spellings are now tried first, in the order Windows itself uses.
+
+### Changed
+
+- CI runs the Rust suite with `--no-fail-fast`. It previously stopped at the first failing test binary, so a failure in the library suite silently skipped every integration suite — 43 binaries that had never run on Windows at all — while reporting a single failure. A check that could not run must not read the same as one that passed.
+
 ## [0.0.3] - 2026-09-03
 
 ### Added
