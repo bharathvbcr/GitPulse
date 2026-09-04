@@ -551,3 +551,151 @@ fn agent_and_tool_caches_are_classified() {
 
     assert!(report.totals.cache_artifacts_bytes >= 100_000);
 }
+
+/// Linked worktrees created inside the repo (e.g. .claude/worktrees/*) must NOT
+/// leak into the main working tree totals, artifacts, or largest files.
+#[test]
+fn worktrees_inside_repo_are_excluded_from_main_and_sized_individually() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 5_000);
+    repo.commit_all("base");
+
+    let wt_path = repo.root.join(".claude/worktrees/feat-nested");
+    fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    repo.git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature/claude-nested",
+        wt_path.to_str().unwrap(),
+    ]);
+
+    fs::create_dir_all(wt_path.join("node_modules/pkg")).unwrap();
+    fs::write(
+        wt_path.join("node_modules/pkg/index.js"),
+        vec![b'y'; 80_000],
+    )
+    .unwrap();
+    fs::create_dir_all(wt_path.join(".gocache")).unwrap();
+    fs::write(wt_path.join(".gocache/build.bin"), vec![b'z'; 60_000]).unwrap();
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+
+    // 1. Exactly 1 linked worktree discovered and sized.
+    assert_eq!(report.worktrees.len(), 1);
+    let wt = &report.worktrees[0];
+    assert_eq!(wt.branch.as_deref(), Some("feature/claude-nested"));
+    assert!(
+        wt.bytes >= 140_000,
+        "linked worktree should be sized: {}",
+        wt.bytes
+    );
+
+    // 2. Main worktree bytes must NOT contain the 140 KB from the nested worktree.
+    assert!(
+        report.totals.worktree_bytes < 50_000,
+        "main worktree bytes swallowed nested worktree: {}",
+        report.totals.worktree_bytes
+    );
+
+    // 3. Artifacts table for main repo must NOT contain child artifacts from inside the worktree.
+    assert!(
+        !report
+            .artifacts
+            .iter()
+            .any(|a| a.path.contains(".claude/worktrees/feat-nested")),
+        "nested worktree artifacts leaked into main artifacts table: {:?}",
+        report.artifacts
+    );
+}
+
+/// Go, temporary, and log ecosystem caches must be categorized as ArtifactKind::Cache.
+#[test]
+fn go_and_temp_and_log_caches_are_classified() {
+    let repo = TempRepo::new();
+    repo.write("src/main.go", 200);
+    repo.write(".gocache/build.o", 25_000);
+    repo.write(".gopath/pkg.a", 30_000);
+    repo.write(".gomodcache/mod.zip", 15_000);
+    repo.write("tmp/scratch.dat", 10_000);
+    repo.write("logs/test.log", 12_000);
+    repo.write(".bench-cache/run.json", 8_000);
+    repo.write(".opencode/state.db", 6_000);
+    repo.commit_all("go and tool setup");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(!report.scan.truncated);
+
+    let paths: Vec<String> = report.artifacts.iter().map(|a| a.path.clone()).collect();
+    assert!(
+        paths.contains(&".gocache".to_string()),
+        "missing .gocache: {paths:?}"
+    );
+    assert!(
+        paths.contains(&".gopath".to_string()),
+        "missing .gopath: {paths:?}"
+    );
+    assert!(
+        paths.contains(&".gomodcache".to_string()),
+        "missing .gomodcache: {paths:?}"
+    );
+    assert!(paths.contains(&"tmp".to_string()), "missing tmp: {paths:?}");
+    assert!(
+        paths.contains(&"logs".to_string()),
+        "missing logs: {paths:?}"
+    );
+    assert!(
+        paths.contains(&".bench-cache".to_string()),
+        "missing .bench-cache: {paths:?}"
+    );
+    assert!(
+        paths.contains(&".opencode".to_string()),
+        "missing .opencode: {paths:?}"
+    );
+
+    for a in &report.artifacts {
+        assert_eq!(a.kind, gitpulse_lib::storage::ArtifactKind::Cache);
+    }
+    assert!(report.totals.cache_artifacts_bytes >= 106_000);
+}
+
+/// Git data totals must never report 0 B when git objects exist.
+#[test]
+fn git_totals_never_report_zero_when_objects_exist() {
+    let repo = TempRepo::new();
+    repo.write("seed.txt", 10_000);
+    repo.commit_all("initial");
+    // Force packfile creation
+    repo.git(&["gc", "--quiet"]);
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    assert!(report.git.pack_bytes > 0, "packfile should exist");
+    assert!(
+        report.totals.git_dir_bytes >= report.git.pack_bytes,
+        "git_dir_bytes ({}) must be at least pack_bytes ({})",
+        report.totals.git_dir_bytes,
+        report.git.pack_bytes
+    );
+    assert!(report.git.total_bytes >= report.git.pack_bytes);
+}
+
+/// Runaway recursive project nesting (e.g. X/.../X/.../X) is pruned without hanging.
+#[test]
+fn runaway_recursive_project_nesting_is_pruned() {
+    let repo = TempRepo::new();
+    repo.write("src/lib.rs", 1_000);
+    let runaway = repo
+        .root
+        .join("backend/go_orchestrator/backend/go_orchestrator/backend/go_orchestrator");
+    fs::create_dir_all(&runaway).unwrap();
+    fs::write(runaway.join("stray.bin"), vec![b'x'; 20_000]).unwrap();
+    repo.commit_all("base");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).unwrap();
+    // Scan completes promptly and marks truncation
+    assert!(
+        report.scan.truncated,
+        "runaway directory cycle must trigger truncation"
+    );
+    assert!(report.totals.worktree_bytes >= 1_000);
+}

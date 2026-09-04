@@ -36,9 +36,12 @@ use std::os::unix::fs::MetadataExt;
 const SCAN_DEADLINE: Duration = Duration::from_secs(20);
 /// Maximum traversal depth below the scanned root.
 const MAX_DEPTH: usize = 48;
-/// Maximum regular files visited across one whole scan (shared by all roots:
-/// worktree, git dir, and each linked worktree) before truncating.
-const MAX_FILES_PER_SCAN: usize = 250_000;
+/// Maximum regular files visited across the main worktree walk before truncating.
+const MAX_FILES_WORKTREE: usize = 250_000;
+/// Maximum regular files visited across the git directory walk before truncating.
+const MAX_FILES_GIT: usize = 100_000;
+/// Maximum regular files visited per linked worktree walk before truncating.
+const MAX_FILES_PER_WORKTREE: usize = 100_000;
 /// Maximum directory entries enumerated per directory in normal source trees
 /// before truncating (defends against pathological flat directories).
 const MAX_ENTRIES_PER_DIR: usize = 4_000;
@@ -180,26 +183,35 @@ pub struct StorageReport {
     pub scan: ScanStats,
 }
 
-/// Mutable budget shared by every walk in one scan.
+/// Mutable budget governing one walk phase.
 struct WalkBudget {
     deadline: Instant,
     truncated: bool,
     permission_denied: u64,
     files_visited: u64,
+    max_files: usize,
 }
 
 impl WalkBudget {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_limits(Instant::now() + SCAN_DEADLINE, MAX_FILES_WORKTREE)
+    }
+
+    fn with_limits(deadline: Instant, max_files: usize) -> Self {
         Self {
-            deadline: Instant::now() + SCAN_DEADLINE,
+            deadline,
             truncated: false,
             permission_denied: 0,
             files_visited: 0,
+            max_files,
         }
     }
+
     fn exhausted(&self) -> bool {
-        Instant::now() >= self.deadline || self.files_visited >= MAX_FILES_PER_SCAN as u64
+        Instant::now() >= self.deadline || self.files_visited >= self.max_files as u64
     }
+
     fn mark_exhausted(&mut self) {
         self.truncated = true;
     }
@@ -258,6 +270,22 @@ fn artifact_kind(dir_name: &str) -> Option<ArtifactKind> {
         ".agents",
         ".gemini",
         ".antigravity",
+        // Go ecosystem compilation and module caches
+        ".gocache",
+        ".gopath",
+        ".gomodcache",
+        // Temporary, scratch, and test artifact directories
+        ".tmp",
+        "tmp",
+        "temp",
+        // Runtime and test log outputs
+        "logs",
+        "log",
+        // Benchmarking suites
+        ".bench-cache",
+        ".bench",
+        // Agent state directories
+        ".opencode",
     ];
     if BUILD.contains(&dir_name) {
         Some(ArtifactKind::Build)
@@ -279,7 +307,17 @@ fn is_inside_src(rel: &str) -> bool {
 fn is_generic_source_name(name: &str) -> bool {
     matches!(
         name,
-        "coverage" | "vendor" | "build" | "out" | "dist" | "obj" | "_build"
+        "coverage"
+            | "vendor"
+            | "build"
+            | "out"
+            | "dist"
+            | "obj"
+            | "_build"
+            | "tmp"
+            | "temp"
+            | "log"
+            | "logs"
     )
 }
 
@@ -298,13 +336,6 @@ fn is_container_artifact(name: &str) -> bool {
             | ".gradle"
             | ".dart_tool"
             | ".pnpm-store"
-            | ".devcouncil"
-            | ".gitnexus"
-            | ".claude"
-            | ".cursor"
-            | ".agents"
-            | ".gemini"
-            | ".antigravity"
     )
 }
 
@@ -369,6 +400,12 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
     let mut local_truncated = false;
     #[cfg(unix)]
     let mut seen_inodes = std::collections::HashSet::<(u64, u64)>::new();
+    #[cfg(unix)]
+    let mut seen_dir_inodes = std::collections::HashSet::<(u64, u64)>::new();
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(root) {
+        seen_dir_inodes.insert((meta.dev(), meta.ino()));
+    }
 
     while let Some((dir, depth, in_artifact)) = stack.pop() {
         if budget.exhausted() || local_truncated {
@@ -417,6 +454,12 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
                 if depth >= MAX_DEPTH {
                     local_truncated = true;
                     break;
+                }
+                #[cfg(unix)]
+                if let Ok(meta) = fs::metadata(entry.path()) {
+                    if !seen_dir_inodes.insert((meta.dev(), meta.ino())) {
+                        continue;
+                    }
                 }
                 let child_in_artifact = in_artifact || artifact_kind(&name).is_some();
                 stack.push((entry.path(), depth + 1, child_in_artifact));
@@ -732,12 +775,15 @@ struct WorktreeWalkContext<'a> {
     #[cfg(unix)]
     seen_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
     large_collector: &'a mut LargeFileCollector,
+    linked_worktrees: &'a std::collections::HashSet<PathBuf>,
+    ancestor_names: &'a mut Vec<String>,
+    #[cfg(unix)]
+    seen_dir_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
 }
 
 /// Depth-first worktree walk attributing sizes to artifact scopes and collecting
 /// large files in a single pass. Returns total bytes under `root` excluding the
-/// `.git` entry (measured separately and authoritatively through the resolved
-/// common git dir).
+/// `.git` entry and any linked worktrees (measured separately).
 fn walk_worktree(
     ctx: &mut WorktreeWalkContext<'_>,
     dir: &Path,
@@ -840,8 +886,42 @@ fn walk_worktree(
 
     // Enter subdirectories after files so scope bookkeeping stays ordered.
     for (child_path, child_rel) in subdirs {
+        // Linked worktrees (e.g. .claude/worktrees/*, .cursor/worktrees/*, or worktrees/*)
+        // or submodules with their own git pointers: skip descending. They are sized
+        // individually in collect_worktree_usage, never as part of the main worktree.
+        let is_linked_worktree = ctx.linked_worktrees.contains(&child_path)
+            || fs::canonicalize(&child_path)
+                .map(|c| ctx.linked_worktrees.contains(&c))
+                .unwrap_or(false)
+            || child_path.join(".git").exists();
+        if is_linked_worktree {
+            continue;
+        }
+
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(&child_path) {
+            if !ctx.seen_dir_inodes.insert((meta.dev(), meta.ino())) {
+                continue;
+            }
+        }
+
         let child_depth = depth + 1;
         let child_name = child_rel.rsplit('/').next().unwrap_or_default().to_string();
+
+        // Rogue nesting / recursive loop heuristic: if a directory component name
+        // appears >= 2 times in its active parent chain (e.g. backend/go_orchestrator/backend/go_orchestrator/backend),
+        // prune the runaway recursion and mark budget exhausted.
+        let repetition_count = ctx
+            .ancestor_names
+            .iter()
+            .filter(|&a| a == &child_name)
+            .count();
+        if repetition_count >= 2 {
+            budget.mark_exhausted();
+            continue;
+        }
+
+        ctx.ancestor_names.push(child_name.clone());
         let scopes_before = ctx.collector.open.len();
         ctx.collector
             .on_dir_enter(&child_path, &child_rel, &child_name);
@@ -851,6 +931,7 @@ fn walk_worktree(
                 .push((ctx.collector.open.len() - 1, child_depth));
         }
         total = total.saturating_add(walk_worktree(ctx, &child_path, child_depth, budget));
+        ctx.ancestor_names.pop();
         // The child's subtree is done: close ITS scope and anything deeper
         // it opened. Without this, a finished artifact scope stays open and
         // every later sibling's bytes are attributed to it.
@@ -870,30 +951,40 @@ fn walk_worktree(
 }
 
 /// Sizes linked worktrees (never the main one — it is the scanned tree
-/// itself). Shares the caller's budget so a pathological worktree cannot
-/// blow past the scan deadline unnoticed.
-fn collect_worktree_usage(repo: &Path, budget: &mut WalkBudget) -> Vec<WorktreeUsage> {
-    let infos = match crate::engine::worktree::list_worktrees(&repo.to_string_lossy()) {
-        Ok(list) => list,
-        Err(_) => return Vec::new(),
-    };
+/// itself). Each linked worktree receives its own file budget bounded by the
+/// global scan deadline so a large worktree cannot starve other scans.
+fn collect_worktree_usage(
+    infos: &[crate::engine::WorktreeInfo],
+    deadline: Instant,
+) -> (Vec<WorktreeUsage>, u64, u64, bool) {
     let mut out = Vec::new();
+    let mut total_files = 0u64;
+    let mut total_perms = 0u64;
+    let mut any_truncated = false;
+
     for info in infos
-        .into_iter()
+        .iter()
         .filter(|i| !i.is_main)
         .take(MAX_SIZED_WORKTREES)
     {
         let path = PathBuf::from(&info.path);
-        let (bytes, truncated) = size_tree(&path, budget);
+        let mut wt_budget = WalkBudget::with_limits(deadline, MAX_FILES_PER_WORKTREE);
+        let (bytes, truncated) = size_tree(&path, &mut wt_budget);
+        total_files = total_files.saturating_add(wt_budget.files_visited);
+        total_perms = total_perms.saturating_add(wt_budget.permission_denied);
+        let is_trunc = truncated || wt_budget.truncated;
+        if is_trunc {
+            any_truncated = true;
+        }
         out.push(WorktreeUsage {
-            path: info.path,
-            name: info.name,
-            branch: info.branch,
+            path: info.path.clone(),
+            name: info.name.clone(),
+            branch: info.branch.clone(),
             bytes,
-            truncated,
+            truncated: is_trunc,
         });
     }
-    out
+    (out, total_files, total_perms, any_truncated)
 }
 
 fn branch_summary(repo_path: &str) -> BranchStorageSummary {
@@ -947,18 +1038,38 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let resolved = crate::engine::git_cli::resolve_repo(repo_path)?;
     let git_dir = resolve_git_common_dir(&repo)?;
 
-    let mut budget = WalkBudget::new();
+    let deadline = started + SCAN_DEADLINE;
+
+    // Discover worktree layout upfront: identify any linked worktrees whose roots
+    // live inside the repository (e.g. .claude/worktrees/*, .cursor/worktrees/*, or worktrees/*).
+    let worktree_infos = crate::engine::worktree::list_worktrees(repo_path).unwrap_or_default();
+    let mut linked_worktrees = std::collections::HashSet::new();
+    for wt in worktree_infos.iter().filter(|w| !w.is_main) {
+        let p = PathBuf::from(&wt.path);
+        if let Ok(canonical) = fs::canonicalize(&p) {
+            linked_worktrees.insert(canonical);
+        }
+        linked_worktrees.insert(p);
+    }
 
     // ---- Worktree walk: totals, artifacts, large files -------------------
     let mut collector = ArtifactCollector::new();
     let mut worktree_bytes = 0u64;
     let mut large_files: Vec<LargeFile> = Vec::new();
+    let mut worktree_budget = WalkBudget::with_limits(deadline, MAX_FILES_WORKTREE);
 
     if !resolved.is_bare {
         let mut entered_depths: Vec<(usize, usize)> = Vec::new();
         let mut large_collector = LargeFileCollector::new();
+        let mut ancestor_names: Vec<String> = Vec::new();
         #[cfg(unix)]
         let mut seen_inodes = std::collections::HashSet::new();
+        #[cfg(unix)]
+        let mut seen_dir_inodes = std::collections::HashSet::new();
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(&repo) {
+            seen_dir_inodes.insert((meta.dev(), meta.ino()));
+        }
 
         let mut ctx = WorktreeWalkContext {
             root: &repo,
@@ -967,8 +1078,12 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
             #[cfg(unix)]
             seen_inodes: &mut seen_inodes,
             large_collector: &mut large_collector,
+            linked_worktrees: &linked_worktrees,
+            ancestor_names: &mut ancestor_names,
+            #[cfg(unix)]
+            seen_dir_inodes: &mut seen_dir_inodes,
         };
-        worktree_bytes = walk_worktree(&mut ctx, &repo, 0, &mut budget);
+        worktree_bytes = walk_worktree(&mut ctx, &repo, 0, &mut worktree_budget);
         large_files = large_collector.finish();
     }
 
@@ -980,27 +1095,36 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         };
 
     // ---- Git directory walk ----------------------------------------------
-    let (git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut budget, true);
-    let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut budget);
-    let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut budget);
-    let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut budget);
-    let modules_bytes = git_subdir_bytes(&git_dir, "modules", &mut budget);
-    let worktrees_admin_bytes = git_subdir_bytes(&git_dir, "worktrees", &mut budget);
+    // Dedicated budget: even if the worktree walk reached its file cap, the .git
+    // directory sizing starts with a fresh budget up to MAX_FILES_GIT.
+    let mut git_budget = WalkBudget::with_limits(deadline, MAX_FILES_GIT);
+    let (raw_git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut git_budget, true);
+    let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut git_budget);
+    let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut git_budget);
+    let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut git_budget);
+    let modules_bytes = git_subdir_bytes(&git_dir, "modules", &mut git_budget);
+    let worktrees_admin_bytes = git_subdir_bytes(&git_dir, "worktrees", &mut git_budget);
     let index_bytes = fs::symlink_metadata(git_dir.join("index"))
         .map(|m| m.len())
         .unwrap_or(0);
 
     let pack_bytes = pack_kib.saturating_mul(1024);
     let loose_bytes = loose_kib.saturating_mul(1024);
-    let accounted = refs_bytes
+    let admin_accounted = refs_bytes
         .saturating_add(reflog_bytes)
         .saturating_add(lfs_bytes)
         .saturating_add(modules_bytes)
         .saturating_add(worktrees_admin_bytes)
         .saturating_add(index_bytes);
-    // `other` absorbs accounting skew between git's KiB-rounded counters and
-    // the raw walk (pack headers, tmp objects) — saturating keeps it ≥ 0.
-    let other_bytes = git_dir_bytes.saturating_sub(accounted);
+    let total_authoritative = pack_bytes
+        .saturating_add(loose_bytes)
+        .saturating_add(admin_accounted);
+
+    // Fallback: If the git dir walk was truncated or returned fewer bytes
+    // than the authoritative objects + admin metadata, floor it so Git data
+    // never falsely reports 0 B when objects exist.
+    let git_dir_bytes = raw_git_dir_bytes.max(total_authoritative);
+    let other_bytes = git_dir_bytes.saturating_sub(total_authoritative);
 
     let git_storage = GitStorage {
         pack_bytes,
@@ -1045,7 +1169,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     }
 
     // ---- Linked worktrees + branches -------------------------------------
-    let worktrees = collect_worktree_usage(&repo, &mut budget);
+    let (worktrees, wt_files, wt_perms, wt_truncated) =
+        collect_worktree_usage(&worktree_infos, deadline);
     let branches = branch_summary(repo_path);
 
     // Category totals can exceed the walked tree only through budget skew;
@@ -1053,6 +1178,17 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let build_total = collector.build_total.min(worktree_bytes);
     let cache_total = collector.cache_total.min(worktree_bytes);
     let grand = worktree_bytes.saturating_add(git_dir_bytes);
+
+    let total_files = worktree_budget
+        .files_visited
+        .saturating_add(git_budget.files_visited)
+        .saturating_add(wt_files);
+    let total_perms = worktree_budget
+        .permission_denied
+        .saturating_add(git_budget.permission_denied)
+        .saturating_add(wt_perms);
+    let is_truncated =
+        worktree_budget.truncated || git_truncated || git_budget.truncated || wt_truncated;
 
     Ok(StorageReport {
         repo_path: repo_path.to_string(),
@@ -1075,9 +1211,9 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         branches,
         scan: ScanStats {
             elapsed_ms: started.elapsed().as_millis(),
-            files_visited: budget.files_visited,
-            permission_denied: budget.permission_denied,
-            truncated: budget.truncated || git_truncated,
+            files_visited: total_files,
+            permission_denied: total_perms,
+            truncated: is_truncated,
         },
     })
 }
@@ -1091,11 +1227,46 @@ mod tests {
         std::fs::write(path, vec![b'x'; size]).unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn test_walk_ctx<'a>(
+        root: &'a Path,
+        collector: &'a mut ArtifactCollector,
+        entered: &'a mut Vec<(usize, usize)>,
+        large: &'a mut LargeFileCollector,
+        linked: &'a std::collections::HashSet<PathBuf>,
+        ancestors: &'a mut Vec<String>,
+        #[cfg(unix)] seen_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
+        #[cfg(unix)] seen_dir_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
+    ) -> WorktreeWalkContext<'a> {
+        WorktreeWalkContext {
+            root,
+            collector,
+            entered_depths: entered,
+            #[cfg(unix)]
+            seen_inodes,
+            large_collector: large,
+            linked_worktrees: linked,
+            ancestor_names: ancestors,
+            #[cfg(unix)]
+            seen_dir_inodes,
+        }
+    }
+
     #[test]
     fn artifact_kind_classifies_known_ecosystems() {
         assert_eq!(artifact_kind("node_modules"), Some(ArtifactKind::Build));
         assert_eq!(artifact_kind("__pycache__"), Some(ArtifactKind::Cache));
         assert_eq!(artifact_kind(".next"), Some(ArtifactKind::Build));
+        assert_eq!(artifact_kind(".gocache"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind(".gopath"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind(".gomodcache"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind(".tmp"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind("tmp"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind("temp"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind("logs"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind("log"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind(".bench-cache"), Some(ArtifactKind::Cache));
+        assert_eq!(artifact_kind(".opencode"), Some(ArtifactKind::Cache));
         assert_eq!(artifact_kind("src"), None);
         assert_eq!(artifact_kind(""), None);
     }
@@ -1199,17 +1370,25 @@ mod tests {
         let mut budget = WalkBudget::new();
         let mut collector = ArtifactCollector::new();
         let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
         #[cfg(unix)]
         let mut seen = std::collections::HashSet::new();
-        let mut large = LargeFileCollector::new();
-        let mut ctx = WorktreeWalkContext {
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
             root,
-            collector: &mut collector,
-            entered_depths: &mut entered,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
             #[cfg(unix)]
-            seen_inodes: &mut seen,
-            large_collector: &mut large,
-        };
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
         let total = walk_worktree(&mut ctx, root, 0, &mut budget);
         assert_eq!(total, 550);
         let mut by_path: HashMap<String, (u64, ArtifactKind)> = collector
@@ -1240,17 +1419,25 @@ mod tests {
         let mut budget = WalkBudget::new();
         let mut collector = ArtifactCollector::new();
         let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
         #[cfg(unix)]
         let mut seen = std::collections::HashSet::new();
-        let mut large = LargeFileCollector::new();
-        let mut ctx = WorktreeWalkContext {
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
             root,
-            collector: &mut collector,
-            entered_depths: &mut entered,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
             #[cfg(unix)]
-            seen_inodes: &mut seen,
-            large_collector: &mut large,
-        };
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
         let total = walk_worktree(&mut ctx, root, 0, &mut budget);
         assert_eq!(total, 500);
         assert_eq!(collector.found.len(), 1);
@@ -1264,24 +1451,34 @@ mod tests {
         let root = tmp.path();
         write_file(&root.join("src/lib/coverage/file.ts"), 100);
         write_file(&root.join("src/build/script.rs"), 200);
+        write_file(&root.join("src/lib/log/runtime.log"), 150);
+        write_file(&root.join("src/lib/tmp/scratch.txt"), 80);
         write_file(&root.join("coverage/report.html"), 300);
         let mut budget = WalkBudget::new();
         let mut collector = ArtifactCollector::new();
         let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
         #[cfg(unix)]
         let mut seen = std::collections::HashSet::new();
-        let mut large = LargeFileCollector::new();
-        let mut ctx = WorktreeWalkContext {
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
             root,
-            collector: &mut collector,
-            entered_depths: &mut entered,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
             #[cfg(unix)]
-            seen_inodes: &mut seen,
-            large_collector: &mut large,
-        };
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
         let total = walk_worktree(&mut ctx, root, 0, &mut budget);
-        assert_eq!(total, 600);
-        // Only coverage at root is an artifact, not src/lib/coverage or src/build.
+        assert_eq!(total, 830);
+        // Only coverage at root is an artifact, not src/lib/coverage, src/build, src/lib/log, src/lib/tmp.
         assert_eq!(collector.found.len(), 1);
         assert_eq!(collector.found[0].0, "coverage");
         assert_eq!(collector.found[0].3, 300);
@@ -1308,14 +1505,20 @@ mod tests {
         let mut collector = ArtifactCollector::new();
         let mut entered = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut seen_dirs = std::collections::HashSet::new();
         let mut large = LargeFileCollector::new();
-        let mut ctx = WorktreeWalkContext {
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        let mut ctx = test_walk_ctx(
             root,
-            collector: &mut collector,
-            entered_depths: &mut entered,
-            seen_inodes: &mut seen,
-            large_collector: &mut large,
-        };
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            &mut seen,
+            &mut seen_dirs,
+        );
         let walk_size = walk_worktree(&mut ctx, root, 0, &mut budget2);
         assert_eq!(
             walk_size, 5_000,
@@ -1338,5 +1541,94 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(!truncated, "unreadable subtree is skipped, not fatal");
         }
+    }
+
+    #[test]
+    fn linked_worktrees_inside_repo_are_skipped_in_walk_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("main.rs"), 1_000);
+        write_file(&root.join(".claude/worktrees/feat/heavy.bin"), 50_000);
+        write_file(&root.join(".claude/worktrees/feat/.git"), 100);
+
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let mut linked = std::collections::HashSet::new();
+        let feat_path = root.join(".claude/worktrees/feat");
+        linked.insert(feat_path.clone());
+        if let Ok(c) = fs::canonicalize(&feat_path) {
+            linked.insert(c);
+        }
+        let mut ancestors = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
+            root,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            #[cfg(unix)]
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
+        let total = walk_worktree(&mut ctx, root, 0, &mut budget);
+        // Linked worktree feat was skipped entirely! Only main.rs was walked.
+        assert_eq!(total, 1_000);
+        assert_eq!(collector.cache_total, 0);
+        assert!(collector.found.iter().all(|(_, _, _, bytes)| *bytes == 0));
+    }
+
+    #[test]
+    fn repeated_ancestor_names_prunes_recursion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let runaway = root.join("orch/backend/orch/backend/orch/backend");
+        write_file(&runaway.join("deep.bin"), 200);
+
+        let mut budget = WalkBudget::new();
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
+            root,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            #[cfg(unix)]
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
+        let total = walk_worktree(&mut ctx, root, 0, &mut budget);
+        // The runaway loop must have been pruned before reaching deep.bin
+        assert_eq!(total, 0);
+        assert!(
+            budget.truncated,
+            "runaway recursion must mark budget exhausted"
+        );
+    }
+
+    #[test]
+    fn walk_budget_limits_and_exhaustion() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut budget = WalkBudget::with_limits(deadline, 5);
+        assert!(!budget.exhausted());
+        budget.files_visited = 5;
+        assert!(budget.exhausted());
     }
 }
