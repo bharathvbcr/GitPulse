@@ -60,6 +60,11 @@
     workspaceTabs.map((tab) => `${tab.path}\u0000${tab.name}`).join("\u001f"),
   );
 
+  /** Identifies the live workspace-LOC run. A plain `let`, never $state:
+   *  the subscription callback reads it, and a reactive read there would
+   *  recreate exactly the self-dependency this effect was fixed to avoid. */
+  let workspaceRun = 0;
+
   /** Maps a LOC metric snapshot onto this view's display state. */
   function toLocState(snap: MetricSnapshot<LanguageStatsReport>): LocState {
     if (snap.value === null) {
@@ -125,6 +130,13 @@
     // fresh-but-equal openTabs array does not re-run this.
     void workspaceKey;
     const tabs = untrack(() => workspaceTabs);
+    // Claim this run before anything can publish. freshness.publish() iterates
+    // a COPY of the listener set, so a listener can still be invoked after its
+    // own unsubscribe — a superseded run would otherwise merge into the rows
+    // of a tab set that is no longer open and publish them over the current
+    // ones. Comparing row.path to tab.path cannot catch that: both come from
+    // the same run, so that test is true by construction.
+    const run = ++workspaceRun;
     if (tabs.length < 2) {
       workspaceLoc = [];
       return;
@@ -146,8 +158,8 @@
     workspaceLoc = [...rows];
     const unsubscribes = tabs.map((tab, index) =>
       locMetric.subscribe(tab.path, (snap) => {
+        if (run !== workspaceRun) return;
         const row = rows[index];
-        if (!row || row.path !== tab.path) return;
         rows[index] = {
           ...row,
           value: snap.value ? (totalCodeLines(snap.value) ?? 0) : null,

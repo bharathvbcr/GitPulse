@@ -1,0 +1,271 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>gp-stress booting</title>
+    <style>
+      html, body { margin: 0; background: #0b0e17; color: #dfe6f5; }
+      #app { height: 900px; width: 1280px; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module">
+      // rAF never fires while the pane is hidden.
+      window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+
+      const q = new URLSearchParams(location.search);
+      const COMPONENT = q.get("c") ?? "PulseView";
+      const SCENARIO = q.get("scenario") ?? "mount";
+      const TABS = Number(q.get("tabs") ?? 4);
+      const CYCLES = Number(q.get("cycles") ?? 25);
+
+      const ALL_REPOS = [
+        "/r/DevCouncil", "/r/scholarlm", "/r/DevPrism", "/r/MLSystemsLab",
+        "/r/DevType", "/r/BINN", "/r/MarkDev", "/r/Manvi",
+      ];
+
+      // ---- fixtures ------------------------------------------------------
+      // Shaped, never blanket null: a null seam crashes component init, and the
+      // torn-down effects would HIDE a loop rather than reveal one.
+      let langCounter = 0;
+      const langStats = () => ({
+        languages: [
+          { language: "Rust", code_lines: 41000 + (langCounter % 7), percentage: 62, color_hex: "#dea584", category: "code", file_count: 300, other_languages: [] },
+          { language: "TypeScript", code_lines: 25000, percentage: 38, color_hex: "#3178c6", category: "code", file_count: 400, other_languages: [] },
+        ],
+        total_code_lines: 66000 + (langCounter++ % 7),
+        total_files: 700, truncated: false,
+        generated_at_epoch_secs: Math.floor(Date.now() / 1000),
+      });
+      // Complete CoverageReport, per src/lib/coverage/types.ts.
+      const coverageReport = () => ({
+        families: [{ family: "rust", languages: ["Rust"], color_hex: "#dea584",
+                     expected_formats: ["lcov"], expected_paths: ["lcov.info"], found: true,
+                     suggested_commands: ["cargo llvm-cov"], setup_commands: [], tool_ready: true,
+                     tool_detail: "cargo-llvm-cov 0.6" }],
+        languages: [{ language: "Rust", color_hex: "#dea584", files: 3, lines_found: 50, lines_hit: 40, percentage: 80 }],
+        artifacts: [{ path: "lcov.info", format: "lcov", family: "rust", skipped: false,
+                      skip_reason: null, totals: { lines_found: 50, lines_hit: 40, percentage: 80 } }],
+        files: [{ path: "src/a.rs", language: "Rust", color_hex: "#dea584", lines_found: 50, lines_hit: 40, percentage: 80 }],
+        overall: { lines_found: 50, lines_hit: 40, percentage: 80 },
+        truncated: false,
+        limit_notices: [],
+      });
+      // Complete StorageReport, per src/lib/storage/types.ts. `scan.truncated`
+      // was missing and StoragePanel threw on it mid-render, which tore down
+      // its effects -- a loop would have gone undetected behind that.
+      const storageReport = () => ({
+        repo_path: "/r/DevCouncil",
+        generated_at_epoch_secs: Math.floor(Date.now() / 1000),
+        is_bare: false,
+        totals: { worktree_bytes: 6e8, git_dir_bytes: 4e8, grand_bytes: 1e9,
+                  build_artifacts_bytes: 2e8, cache_artifacts_bytes: 1e8 },
+        git: { pack_bytes: 3e8, pack_file_count: 4, loose_bytes: 1e7, loose_object_count: 120,
+               refs_bytes: 4096, reflog_bytes: 8192, lfs_bytes: 0, modules_bytes: 0,
+               worktrees_admin_bytes: 2048, index_bytes: 65536, other_bytes: 1024,
+               total_bytes: 4e8, gc_recommended: true },
+        artifacts: [{ path: "target", bytes: 2e8, kind: "build", unignored: false, tracked_files: 0 },
+                    { path: "node_modules/.cache", bytes: 1e8, kind: "cache", unignored: true, tracked_files: 3 }],
+        largest_files: [{ path: "big.bin", bytes: 5e7 }],
+        worktrees: [{ path: "/r/DevCouncil", name: "DevCouncil", branch: "main", bytes: 6e8, truncated: false }],
+        branches: { local_count: 7, remote_tracking_count: 1, merged_stale_count: 2,
+                    gone_upstream_count: 0, sample_merged_stale: ["old/a"], sample_gone_upstream: [], error: null },
+        reclaim: [{ category: "build_output", label: "target", bytes: 2e8, confidence: "measured",
+                    safety: "safe", action: "delete", detail: "build output", blocked_reason: null }],
+        reclaim_summary: { reclaimable_bytes: 2e8, estimated_bytes: 0, needs_review_bytes: 1e8,
+                           item_count: 1, partial: false },
+        scan: { elapsed_ms: 120, files_visited: 5000, permission_denied: 0, truncated: false },
+      });
+      // Complete PulseReport, per src/lib/pulse/types.ts. A partial fixture let
+      // `report.total_commits_scanned.toLocaleString()` throw mid-render, and a
+      // render that throws tears down the effects below it -- which would HIDE
+      // a loop rather than reveal one.
+      const pulseReport = () => ({
+        commits: Array.from({ length: 12 }, (_, i) => ({
+          sha: `c${i}`.padEnd(40, "0"),
+          parents: i === 11 ? [] : [`c${i + 1}`.padEnd(40, "0")],
+          timestamp: Math.floor(Date.now() / 1000) - i * 7200,
+          summary: `feat: thing ${i}`,
+          author_name: i % 3 === 0 ? "Ada" : "Grace",
+          author_email: i % 3 === 0 ? "ada@example.com" : "grace@example.com",
+          gpg_status: "N",
+          additions: 10 + i,
+          deletions: 2,
+          files_changed: 1,
+          is_merge: i % 5 === 0,
+          is_revert: false,
+          co_authors: [],
+          binary_files: 0,
+        })),
+        top_files_by_churn: [{ path: "src/a.rs", additions: 40, deletions: 8, commits_count: 4 }],
+        extensions: [{ extension: "rs", additions: 80, deletions: 16, files_count: 3 }],
+        has_mailmap: true,
+        total_commits_scanned: 12,
+        truncated: false,
+        payload_truncated: false,
+        duration_ms: 42,
+      });
+
+      const FIXTURES = {
+        cmd_resolve_repo: (a) => ({ path: a?.path, name: String(a?.path ?? "").split("/").pop(), is_bare: false }),
+        cmd_get_language_stats: langStats,
+        cmd_scan_coverage: coverageReport,
+        cmd_storage_scan: storageReport,
+        cmd_get_pulse_report: pulseReport,
+        cmd_get_pulse_snapshots: () => [],
+        cmd_get_knowledge_report: () => ({ authors: [], files: [] }),
+        cmd_get_dora_report: () => null,
+        // Complete DepsHealthReport / DependabotReport, per src/lib/health/types.ts.
+        cmd_scan_deps_health: () => ({
+          node_version: "22.0.0", npm_version: "10.8.0", npm_cli_present: true,
+          cargo_audit_present: true, pip_audit_present: false, govulncheck_present: false,
+          composer_present: false, bundler_audit_present: false,
+          scanners_ran: ["npm", "cargo"], audit_complete: true,
+          manifests: [{ path: "package.json", name: "gitpulse", version: "0.0.5", private: true, license: "MIT" }],
+          ecosystems: [{ family: "node", manifests: ["package.json"], note: "npm" }],
+          issues: [], vulnerabilities: [],
+          audit: { info: 0, low: 1, moderate: 0, high: 0, critical: 0, unknown: 0, total: 1 },
+          outdated: [], truncated: false, limit_notices: [],
+        }),
+        cmd_github_dependabot_alerts: () => ({
+          available: true, cli_present: true, is_github_remote: true,
+          slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
+        }),
+        cmd_list_branches: () => [], cmd_list_tags: () => [], cmd_get_status: () => [],
+        cmd_list_remotes: () => [], cmd_list_submodules: () => [], cmd_stash_list: () => [],
+        cmd_branch_stats: () => ({}),
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null),
+        transformCallback: (cb) => cb,
+      };
+
+      // ---- loop detection -------------------------------------------------
+      const crashes = [];
+      const origError = console.error;
+      console.error = (...a) => { crashes.push(a.map(String).join(" ")); origError(...a); };
+      window.addEventListener("error", (e) => crashes.push(String(e.message ?? e)));
+      window.addEventListener("unhandledrejection", (e) => crashes.push(String(e.reason)));
+      // Published as soon as it is seen, not only in the final result: a severe
+      // loop wedges the renderer before the run can finish, so a harness that
+      // only reports at the end reports nothing at all for its worst case.
+      window.__gpDepth = 0;
+      const depthCount = () => {
+        window.__gpDepth = crashes.filter((c) => c.includes("effect_update_depth_exceeded")).length;
+        return window.__gpDepth;
+      };
+      setInterval(depthCount, 250);
+
+      const { mount, unmount } = await import("svelte");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { locMetric, coverageMetric, storageMetric } = await import("../src/lib/metrics/repoMetrics.ts");
+
+      const LOADERS = {
+        PulseView: () => import("../src/lib/components/pulse/PulseView.svelte"),
+        StoragePanel: () => import("../src/lib/components/StoragePanel.svelte"),
+        HealthPanel: () => import("../src/lib/components/HealthPanel.svelte"),
+        CoverageViewer: () => import("../src/lib/components/CoverageViewer.svelte"),
+        LoopCanary: () => import("./LoopCanary.svelte"),
+      };
+      const Component = (await LOADERS[COMPONENT]()).default;
+
+      const repos = ALL_REPOS.slice(0, Math.max(1, TABS));
+      for (const r of repos) await repoStore.openRepo(r, { activate: true });
+
+      const target = document.getElementById("app");
+      let instance = null;
+      let mountError = null;
+      try { instance = mount(Component, { target, props: {} }); }
+      catch (err) { mountError = String(err); crashes.push(mountError); }
+
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      await sleep(600);
+
+      // ---- scenarios ------------------------------------------------------
+      let cycles = 0;
+      if (SCENARIO === "churn") {
+        // Open and close repositories under the mounted pane. Every close
+        // supersedes an in-flight subscription run.
+        for (let i = 0; i < CYCLES; i++) {
+          const extra = ALL_REPOS[(i % (ALL_REPOS.length - repos.length)) + repos.length];
+          await repoStore.openRepo(extra, { activate: true });
+          await sleep(8);
+          const st = await new Promise((res) => { const off = repoStore.subscribe(res); off(); });
+          const tab = st.openTabs.find((t) => t.path === extra);
+          if (tab) await repoStore.closeTab(tab.id);
+          await sleep(8);
+          cycles++;
+        }
+      } else if (SCENARIO === "switch") {
+        // Rapid active-repository switching.
+        for (let i = 0; i < CYCLES; i++) {
+          const st = await new Promise((res) => { const off = repoStore.subscribe(res); off(); });
+          const tab = st.openTabs[i % st.openTabs.length];
+          if (tab) await repoStore.activateTab(tab.id);
+          await sleep(10);
+          cycles++;
+        }
+      } else if (SCENARIO === "storm") {
+        // Force metric republication as fast as the floor allows.
+        for (let i = 0; i < CYCLES; i++) {
+          for (const r of repos) {
+            void locMetric.refresh(r, { force: true });
+            void coverageMetric.refresh(r, { force: true });
+            void storageMetric.refresh(r, { force: true });
+          }
+          await sleep(12);
+          cycles++;
+        }
+      } else if (SCENARIO === "chaos") {
+        // Everything at once, interleaved: open/close, switch, force-refresh
+        // and remount. The point is to overlap a superseded subscription run
+        // with an in-flight publish, which is the one window the run guard
+        // exists to close.
+        for (let i = 0; i < CYCLES; i++) {
+          const extra = ALL_REPOS[(i % (ALL_REPOS.length - repos.length)) + repos.length];
+          void repoStore.openRepo(extra, { activate: true });
+          for (const r of repos) void locMetric.refresh(r, { force: true });
+          const st = await new Promise((res) => { const off = repoStore.subscribe(res); off(); });
+          const tab = st.openTabs[i % st.openTabs.length];
+          if (tab) void repoStore.activateTab(tab.id);
+          void storageMetric.refresh(repos[i % repos.length], { force: true });
+          const gone = st.openTabs.find((t) => t.path === extra);
+          if (gone) void repoStore.closeTab(gone.id);
+          if (i % 7 === 6 && instance) { await unmount(instance); instance = mount(Component, { target, props: {} }); }
+          await sleep(6);
+          cycles++;
+        }
+      } else if (SCENARIO === "remount") {
+        for (let i = 0; i < CYCLES; i++) {
+          if (instance) await unmount(instance);
+          instance = mount(Component, { target, props: {} });
+          await sleep(20);
+          cycles++;
+        }
+      }
+      await sleep(1200);
+
+      // ---- staleness oracle ----------------------------------------------
+      // After churn settles, anything the pane published must describe the
+      // tab set that is actually open — a superseded run publishing its own
+      // rows would show up here, not as a crash.
+      const finalState = await new Promise((res) => { const off = repoStore.subscribe(res); off(); });
+      const openPaths = finalState.openTabs.map((t) => t.path).sort();
+      const strip = [...target.querySelectorAll("span[title^=\"/r/\"]")].map((n) => n.getAttribute("title")).sort();
+
+      window.__gpResult = {
+        component: COMPONENT, scenario: SCENARIO, cycles,
+        tabsAtEnd: openPaths.length,
+        depthExceeded: depthCount(),
+        mountError,
+        stripPaths: strip,
+        openPaths,
+        stripMatchesTabs: strip.length === 0 ? "n/a" : JSON.stringify(strip) === JSON.stringify(openPaths),
+        otherCrashes: [...new Set(crashes.filter((c) => !c.includes("effect_update_depth_exceeded")))].slice(0, 4),
+        renderedChars: target.textContent.trim().length,
+      };
+      document.title = `gp-stress done ${COMPONENT}/${SCENARIO} depth=${depthCount()} chars=${window.__gpResult.renderedChars}`;
+    </script>
+  </body>
+</html>
