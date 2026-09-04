@@ -14,12 +14,28 @@ describe("FileTreePanel", () => {
     expect(source).toContain("guard.isLive()");
   });
 
-  it("provides status filter pills for all, modified, staged, untracked, conflicted", () => {
-    expect(source).toContain("statusFilter");
-    expect(source).toContain("'modified'");
-    expect(source).toContain("'staged'");
-    expect(source).toContain("'untracked'");
-    expect(source).toContain("'conflicted'");
+  /**
+   * The five scopes used to be five hand-written buttons, and this asserted
+   * the five string literals those buttons happened to contain — which meant
+   * it tracked quoting rather than behaviour. They are one table now, so the
+   * check is that the table and the type agree and that the table is what the
+   * markup renders: a scope added to `StatusFilter` and forgotten in
+   * `STATUS_SCOPES` is unreachable, and that is the failure worth catching.
+   */
+  it("offers every declared status scope as a filter", () => {
+    const union = source.slice(source.indexOf("type StatusFilter ="));
+    const declared = (union.slice(0, union.indexOf(";")).match(/"([a-z]+)"/g) ?? []).map((raw) =>
+      raw.replaceAll('"', ""),
+    );
+    expect(declared).toEqual(["all", "modified", "staged", "untracked", "conflicted"]);
+
+    const table = source.slice(source.indexOf("const STATUS_SCOPES"), source.indexOf("] as const"));
+    for (const scope of declared.filter((value) => value !== "all")) {
+      expect(table, `${scope} is missing from STATUS_SCOPES`).toContain(`id: "${scope}"`);
+    }
+    expect(source).toContain("{#each STATUS_SCOPES as scope");
+    expect(source).toContain('statusFilter = statusFilter === scope.id ? "all" : scope.id');
+    expect(source).toContain('onclick={() => (statusFilter = "all")}');
   });
 
   /**
@@ -159,6 +175,43 @@ describe("FileTreePanel", () => {
     expect(source).toContain("onSelectFile?: (path: string) => void");
     expect(source).toContain("repoStore.selectFilePath(path)");
     expect(source).toContain("effectiveSelected = $derived(selectedFile ?? $repoStore.selectedFilePath)");
+  });
+
+  /**
+   * The reveal effect reads and writes `collapsed`. Tracked, that made every
+   * expand and collapse re-arm `locatePath` and scroll the tree back to the
+   * open file — so opening a folder in a large repository discarded the
+   * position the user had just navigated to. Only a new selection reveals.
+   */
+  it("does not re-reveal the open file when a folder is expanded or collapsed", () => {
+    const effect = source.slice(
+      source.indexOf("$effect(() => {\n    const selected = effectiveSelected;"),
+      source.indexOf("let lastRevealNonce"),
+    );
+    expect(effect).toContain("untrack(() => {");
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("locatePath = selected"));
+    expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("{ ...collapsed }"));
+    expect(source).toContain('import { onMount, untrack } from "svelte"');
+  });
+
+  /**
+   * The breadcrumb's folder crumbs raise these. The nonce is the contract: two
+   * clicks on one crumb are two requests, and comparing paths alone would
+   * swallow the second after the user had scrolled away.
+   */
+  it("reveals a requested directory once per request, by nonce", () => {
+    expect(source).toContain("revealRequest?: { path: string; nonce: number } | null");
+    const effect = source.slice(
+      source.indexOf("let lastRevealNonce"),
+      source.indexOf("$effect(() => {\n    if (selectedIndex >= rows.length)"),
+    );
+    expect(effect).toContain("request.nonce === lastRevealNonce");
+    expect(effect).toContain("lastRevealNonce = request.nonce;");
+    // The folder itself opens too, not only the path down to it.
+    expect(effect).toContain("[...ancestorsOf(request.path), request.path]");
+    expect(effect).toContain("locatePath = request.path;");
+    // And the row lookup must accept a directory, not just a file.
+    expect(source).toContain("const idx = rows.findIndex((row) => row.path === target);");
   });
 
   it("builds rows via pure fileTree pipeline and reveals active file ancestors", () => {

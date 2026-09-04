@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyFileChange,
+  dirtyAncestorCounts,
   dirtyAncestorSet,
   isUntrackedStatusCode,
   mergeListedAndStatusPaths,
@@ -112,6 +113,26 @@ describe("dirtyAncestorSet", () => {
   it("marks every ancestor dir of a dirty file", () => {
     expect([...dirtyAncestorSet(["src/lib/a.ts"])].sort()).toEqual(["src", "src/lib"]);
     expect(dirtyAncestorSet(["README.md"]).size).toBe(0);
+  });
+});
+
+describe("dirtyAncestorCounts", () => {
+  it("counts every dirty descendant, not just the nearest one", () => {
+    const counts = dirtyAncestorCounts([
+      "src/lib/a.ts",
+      "src/lib/b.ts",
+      "src/lib/deep/c.ts",
+      "docs/readme.md",
+    ]);
+    expect(counts.get("src")).toBe(3);
+    expect(counts.get("src/lib")).toBe(3);
+    expect(counts.get("src/lib/deep")).toBe(1);
+    expect(counts.get("docs")).toBe(1);
+  });
+
+  it("agrees with the membership set it backs", () => {
+    const paths = ["a/b/c.ts", "a/d.ts", "root.md"];
+    expect(new Set(dirtyAncestorCounts(paths).keys())).toEqual(dirtyAncestorSet(paths));
   });
 });
 

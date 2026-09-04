@@ -40,11 +40,12 @@
     ExternalLink,
     ChevronRight,
     X,
-    Folder,
     Layers,
     GitCommit,
     ShieldAlert,
     Activity,
+    Columns2,
+    XCircle,
   } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
@@ -58,6 +59,7 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import { joinWorktreePath } from "../files/fileTree";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
+  import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
   import { resolveFilePaneLayout } from "../files/filePaneLayout";
   import {
     activateEditorTab,
@@ -84,6 +86,7 @@
   let fileViewWidth = $state(0);
   let preferredSidePane = $state<FileSidePane>("explorer");
   let compactPane = $state<FileSidePane | null>(null);
+  let revealRequest = $state<{ path: string; nonce: number }>({ path: "", nonce: 0 });
 
   let activeBlob = $state<FileBlob | null>(null);
   let isLoadingFile = $state(false);
@@ -359,6 +362,17 @@
     else repoStore.setViewSection("code", "blame");
   }
 
+  /**
+   * Ask the Explorer to show a directory. A nonce rather than the bare path,
+   * because clicking the same crumb twice is a repeat request, not a no-op —
+   * the tree may have been scrolled away in between.
+   */
+  function revealDirectory(dir: string) {
+    if (!dir) return;
+    if (!paneLayout.explorerVisible) toggleSidePane("explorer");
+    revealRequest = { path: dir, nonce: revealRequest.nonce + 1 };
+  }
+
   function toggleSidePane(pane: FileSidePane) {
     const requested = pane === "explorer" ? explorerOpen : dashboardOpen;
     const visible = pane === "explorer"
@@ -388,6 +402,21 @@
     // fallback when it does not.
     compactPane = pane;
     persistTabs(hydratedRepo);
+  }
+
+  /**
+   * Arrow keys walk the tab strip, as `role="tab"` implies. Focus follows the
+   * key rather than activating on arrival: moving across tabs should not load
+   * six files on the way to the seventh.
+   */
+  function handleTabStripKeydown(e: KeyboardEvent) {
+    const strip = e.currentTarget as HTMLElement;
+    const tabs = [...strip.querySelectorAll<HTMLElement>('[role="tab"]')];
+    const current = tabs.findIndex((tab) => tab.contains(e.target as Node));
+    const next = nextRovingIndex(current, tabs.length, e.key as RovingKey);
+    if (next === null) return;
+    e.preventDefault();
+    tabs[next]?.focus();
   }
 
   function handleWindowKeydown(e: KeyboardEvent) {
@@ -505,43 +534,67 @@
   class="flex-1 flex flex-col min-h-0 min-w-0 bg-background overflow-hidden relative select-none"
   data-pane-layout={paneLayout.mode}
 >
-  <div class="flex items-center justify-between px-2 bg-surface/90 border-b border-border/70 shrink-0 h-9 gap-2">
-    <div class="flex items-center gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll" role="tablist" aria-label="Open files">
-      <button
-        type="button"
-        onclick={() => toggleSidePane("explorer")}
-        aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
-        aria-pressed={paneLayout.explorerVisible}
-        title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer (⌘B)"
-        class="gp-icon-btn !p-1.5 shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
-      >
-        {#if paneLayout.explorerVisible}
-          <PanelLeftClose size={14} />
-        {:else}
-          <PanelLeftOpen size={14} />
-        {/if}
-      </button>
+  <!--
+    Tab strip.
 
-      <div class="h-4 w-px bg-border/70 mx-1 shrink-0"></div>
+    `role="tablist"` used to wrap the Explorer toggle, a decorative divider and
+    the tabs alike, so assistive tech counted three tabs where there was one
+    file open. The toggle now sits outside the list, which is also why the tab
+    strip finally gets the full width between the two control clusters.
 
-      {#if openTabs.length === 0}
-        <span class="text-xs text-textMuted/60 italic pl-1">No open files</span>
+    Tabs are one tab stop, not one per file: `tabindex` roves to the active tab
+    and Left/Right/Home/End move between them, which is what `role="tab"`
+    already promised a keyboard user.
+  -->
+  <div class="flex items-center px-1.5 bg-surface/90 border-b border-border/70 shrink-0 h-9 gap-1.5">
+    <button
+      type="button"
+      onclick={() => toggleSidePane("explorer")}
+      aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
+      aria-pressed={paneLayout.explorerVisible}
+      title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer (⌘B)"
+      class="gp-icon-btn !p-1.5 shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+    >
+      {#if paneLayout.explorerVisible}
+        <PanelLeftClose size={14} />
       {:else}
+        <PanelLeftOpen size={14} />
+      {/if}
+    </button>
+
+    <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
+
+    {#if openTabs.length === 0}
+      <span class="text-xs text-textMuted/60 italic pl-1 flex-1">No open files</span>
+    {:else}
+      <!-- The strip listens for the arrow keys but is not itself a tab stop:
+           the roving tabindex on the tabs is what the user lands on. -->
+      <div
+        class="flex items-stretch gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll py-1"
+        role="tablist"
+        aria-label="Open files"
+        tabindex="-1"
+        onkeydown={handleTabStripKeydown}
+      >
         {#each openTabs as tab (tab.path)}
           {@const isActive = tab.path === activeTabPath}
           {@const tabDirty = isEditorTabDirty(tabState, tab.path)}
           {@const tabKind = classifyFileChange($repoStore.statuses.find((s) => s.path === tab.path))}
           <div
             role="tab"
-            tabindex="0"
+            data-editor-tab={tab.path}
+            tabindex={isActive ? 0 : -1}
             aria-selected={isActive}
             onclick={() => activateTab(tab.path)}
             ondblclick={() => pinFile(tab.path)}
             onkeydown={(e) => {
-              if (e.key === "Enter") activateTab(tab.path);
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                activateTab(tab.path);
+              }
             }}
-            class="h-full px-2.5 flex items-center gap-1.5 border-r border-border/60 text-xs transition-colors shrink-0 max-w-[200px] group cursor-pointer {isActive
-              ? 'bg-background text-textPrimary font-semibold border-b-2 border-b-accent'
+            class="px-2 flex items-center gap-1.5 rounded-lg text-xs transition-colors shrink-0 max-w-[190px] group cursor-pointer {isActive
+              ? 'bg-background text-textPrimary font-semibold shadow-card'
               : 'text-textMuted hover:bg-surfaceHover hover:text-textPrimary'} {tab.preview ? 'italic' : ''}"
             title={tabDirty
               ? `${tab.path} — Unsaved changes`
@@ -555,47 +608,58 @@
                 title="Unsaved changes"
                 aria-label="Unsaved changes"
               ></span>
-            {/if}
-            {#if tabKind !== "clean"}
-              <span class="w-1.5 h-1.5 rounded-full bg-accent not-italic"></span>
+            {:else if tabKind !== "clean"}
+              <span
+                class="w-1.5 h-1.5 rounded-full bg-accent not-italic shrink-0"
+                title={statusBadgeLabel(tabKind, true)}
+                aria-label={statusBadgeLabel(tabKind, true)}
+              ></span>
             {/if}
             <button
               type="button"
+              tabindex="-1"
               onclick={(e) => closeTab(tab.path, e)}
-              class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface text-textMuted hover:text-rose-400 transition-opacity"
+              class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400 transition-opacity shrink-0"
+              aria-label={`Close ${tab.name}`}
               title="Close tab"
             >
               <X size={11} />
             </button>
           </div>
         {/each}
-      {/if}
-    </div>
+      </div>
+    {/if}
 
     <div class="flex items-center gap-1 shrink-0">
       {#if openTabs.length > 1}
+        <!-- Two word-buttons used to sit here eating roughly 130px of the tab
+             strip on every repository with more than one file open. -->
         <button
           type="button"
           onclick={closeOtherTabs}
+          aria-label="Close other tabs"
           title="Close Other Tabs"
-          class="px-2 py-0.5 text-[10px] text-textMuted hover:text-textPrimary font-mono rounded hover:bg-surface transition-colors"
+          class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
         >
-          Close Others
+          <Columns2 size={13} />
         </button>
         <button
           type="button"
           onclick={closeAllTabs}
+          aria-label="Close all tabs"
           title="Close All Tabs"
-          class="px-2 py-0.5 text-[10px] text-textMuted hover:text-rose-400 font-mono rounded hover:bg-surface transition-colors"
+          class="gp-icon-btn !p-1 text-textMuted hover:text-rose-400"
         >
-          Close All
+          <XCircle size={13} />
         </button>
+        <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
       {/if}
 
       <button
         type="button"
         onclick={() => toggleSidePane("dashboard")}
         aria-pressed={paneLayout.dashboardVisible}
+        aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
         title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard (⌘⇧D)"
         class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
           ? 'border-accent/60 bg-accent/15 text-accent font-semibold'
@@ -608,33 +672,51 @@
   </div>
 
   {#if activeTabPath}
-    <div class="flex items-center justify-between px-3 py-1 bg-surface/40 border-b border-border/50 shrink-0 text-xs select-none">
-      <div class="flex items-center gap-1 text-[11px] min-w-0 flex-1 truncate text-textMuted font-mono">
-        <Folder size={12} class="shrink-0 text-amber-400" />
+    <!--
+      Subject line. The breadcrumb was decoration: it printed the same segments
+      the tab already named and did nothing when clicked. Each folder segment
+      is now a control that reveals that folder in the Explorer, which is the
+      question a breadcrumb exists to answer — "where is this?" — and the
+      answer used to require scrolling the tree by hand.
+    -->
+    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 border-b border-border/50 shrink-0 text-xs">
+      <nav
+        class="flex items-center gap-0.5 text-[11px] min-w-0 flex-1 text-textMuted font-mono"
+        aria-label="Path to the open file"
+      >
         {#each pathSegments as seg, idx}
           {#if idx > 0}
-            <ChevronRight size={10} class="shrink-0 text-textMuted/40" />
+            <ChevronRight size={10} class="shrink-0 text-textMuted/40" aria-hidden="true" />
           {/if}
-          <span class="{idx === pathSegments.length - 1 ? 'text-textPrimary font-semibold' : 'text-textMuted'} truncate">
-            {seg}
-          </span>
+          {#if idx === pathSegments.length - 1}
+            <span class="text-textPrimary font-semibold truncate select-text">{seg}</span>
+          {:else}
+            {@const dir = pathSegments.slice(0, idx + 1).join("/")}
+            <button
+              type="button"
+              onclick={() => revealDirectory(dir)}
+              title="Reveal {dir}/ in the Explorer"
+              class="shrink-0 max-w-[14ch] truncate rounded px-1 py-0.5 hover:bg-surfaceHover hover:text-textPrimary transition-colors"
+            >{seg}</button>
+          {/if}
         {/each}
 
         {#if activeKind !== "clean"}
-          <span class="ml-2 px-1.5 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(activeKind)}">
+          <span class="ml-1.5 shrink-0 px-1.5 py-0.2 text-[9px] font-bold rounded {statusBadgeClass(activeKind)}">
             {statusBadgeLabel(activeKind, true)}
           </span>
         {/if}
         {#if activeTabDirty}
-          <span class="ml-2 text-[10px] font-semibold text-amber-400">Unsaved</span>
+          <span class="ml-1.5 shrink-0 text-[10px] font-semibold text-amber-400">Unsaved</span>
         {/if}
-      </div>
+      </nav>
 
-      <div class="flex items-center gap-1.5 shrink-0">
+      <div class="flex items-center gap-1 shrink-0">
         <button
           type="button"
           onclick={copyActivePath}
           class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          aria-label="Copy relative path"
           title="Copy Relative Path"
         >
           <Copy size={12} />
@@ -644,10 +726,13 @@
           type="button"
           onclick={openInDefaultApp}
           class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          aria-label="Open in default application"
           title="Open in Default Application"
         >
           <ExternalLink size={12} />
         </button>
+
+        <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
 
         <button
           type="button"
@@ -677,6 +762,7 @@
       <div class="h-full overflow-hidden {paneLayout.editorVisible ? 'w-72 shrink-0' : 'flex-1 min-w-0'}">
         <FileTreePanel
           selectedFile={activeTabPath}
+          {revealRequest}
           onSelectFile={(path) => previewFile(path)}
           onPinFile={(path) => pinFile(path)}
         />

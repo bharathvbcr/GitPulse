@@ -298,6 +298,37 @@ html.dark {
     @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border border-border/70 px-2 py-0.5 text-[11px] leading-none;
   }
 
+  /*
+   * Native <select>, wearing the app's own chrome. The platform widget drew a
+   * grey system box with a system arrow inside a soft-bubble panel; keeping
+   * the element (and its free keyboard handling, its screen-reader role, its
+   * native popup) while replacing only the painting is strictly better than
+   * rebuilding a listbox. `appearance: none` drops the arrow, so one is drawn
+   * back as a background chevron and room is reserved for it on the right.
+   */
+  .gp-select {
+    @apply cursor-pointer truncate rounded-lg border border-border/70 bg-background py-0.5 pl-2 pr-6 text-textPrimary;
+    appearance: none;
+    background-image: linear-gradient(45deg, transparent 50%, rgb(var(--c-text-muted)) 50%),
+      linear-gradient(135deg, rgb(var(--c-text-muted)) 50%, transparent 50%);
+    background-position:
+      right 11px center,
+      right 7px center;
+    background-size:
+      4px 4px,
+      4px 4px;
+    background-repeat: no-repeat;
+  }
+
+  .gp-select:hover {
+    @apply border-border;
+  }
+
+  .gp-select:focus-visible {
+    @apply border-accent/70 outline-none;
+    box-shadow: var(--ring-focus);
+  }
+
   /* Keycap hint. */
   .gp-keycap {
     @apply inline-flex items-center rounded-md border border-border/80 bg-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-textMuted;

@@ -103,13 +103,25 @@ export function statusPathKey(statuses: readonly Pick<StatusLike, "path">[]): st
   return paths.join("\n");
 }
 
+/**
+ * How many dirty descendants each directory holds. Walking the ancestors is
+ * the same pass the membership set needed, so counting is free and lets a
+ * collapsed directory say how much it is hiding instead of only that it hides
+ * something.
+ */
+export function dirtyAncestorCounts(statusPaths: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const path of statusPaths) {
+    for (const ancestor of ancestorsOf(path)) {
+      counts.set(ancestor, (counts.get(ancestor) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
 /** Directories that contain at least one dirty descendant. */
 export function dirtyAncestorSet(statusPaths: readonly string[]): Set<string> {
-  const dirs = new Set<string>();
-  for (const path of statusPaths) {
-    for (const ancestor of ancestorsOf(path)) dirs.add(ancestor);
-  }
-  return dirs;
+  return new Set(dirtyAncestorCounts(statusPaths).keys());
 }
 
 export function mergeListedAndStatusPaths(
