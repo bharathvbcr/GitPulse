@@ -1526,12 +1526,53 @@ pub fn upstream_is_gone(track: &str) -> bool {
     track.contains("gone")
 }
 
+/// Parses a leading run of ASCII digits, saturating instead of falling back
+/// to zero.
+///
+/// The shape this replaces is `raw.parse::<usize>().unwrap_or(0)`, which
+/// collapses two very different readings into one: text that is not a number,
+/// and a number too large for the type. The second is the dangerous one — a
+/// count that overflows reads as *nothing happened*, which no caller can tell
+/// apart from a genuinely empty result. `git diff --shortstat` had exactly
+/// this bug, and these were its siblings.
+///
+/// Returns `None` when there are no digits at all, so callers keep whatever
+/// zero-ish meaning that case already had — `git diff --numstat` writes `-`
+/// for a binary file, and there zero really is the right answer.
+pub fn parse_count_saturating(text: &str) -> Option<usize> {
+    let digits: String = text
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(digits.parse::<usize>().unwrap_or(usize::MAX))
+}
+
+/// [`parse_count_saturating`] for the 64-bit counters `git count-objects -v`
+/// reports.
+pub fn parse_u64_saturating(text: &str) -> Option<u64> {
+    let digits: String = text
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(digits.parse::<u64>().unwrap_or(u64::MAX))
+}
+
 /// Parses `git rev-list --left-right --count A...B` (`behind\\tahead`).
 pub fn parse_left_right_count(raw: &str) -> (usize, usize) {
     let line = raw.trim();
     let mut parts = line.split(['\t', ' ']).filter(|s| !s.is_empty());
-    let left = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let right = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    // Saturating: an ahead/behind count too large for `usize` reading as 0
+    // renders a wildly diverged branch as "in sync".
+    let left = parts.next().and_then(parse_count_saturating).unwrap_or(0);
+    let right = parts.next().and_then(parse_count_saturating).unwrap_or(0);
     (left, right)
 }
 
@@ -3160,5 +3201,48 @@ mod tests {
             .output()
             .expect("spawn git init");
         assert!(output.status.success());
+    }
+
+    /// THE CLASS: a count too large for its type used to read as zero, which a
+    /// caller cannot tell apart from a genuinely empty result. Every one of
+    /// these parsed git's own output, so the input is not hypothetical — it is
+    /// whatever a big enough repository produces.
+    #[test]
+    fn oversized_counts_saturate_instead_of_reading_as_zero() {
+        let huge = "9".repeat(40);
+        assert_eq!(parse_count_saturating(&huge), Some(usize::MAX));
+        assert_eq!(parse_u64_saturating(&huge), Some(u64::MAX));
+
+        // Ahead/behind: zero here renders a wildly diverged branch "in sync".
+        let (behind, ahead) = parse_left_right_count(&format!("{huge}\t{huge}"));
+        assert_eq!(behind, usize::MAX);
+        assert_eq!(ahead, usize::MAX);
+    }
+
+    /// The other half of the rule: text that is not a number keeps whatever
+    /// zero-ish meaning it already had. `git diff --numstat` writes `-` for a
+    /// binary file, and there zero is the correct answer — saturating that to
+    /// `usize::MAX` would turn every binary file into the largest diff in the
+    /// repository.
+    #[test]
+    fn non_numeric_counts_stay_absent_rather_than_saturating() {
+        assert_eq!(parse_count_saturating("-"), None);
+        assert_eq!(parse_count_saturating(""), None);
+        assert_eq!(parse_count_saturating("   "), None);
+        assert_eq!(parse_count_saturating("abc"), None);
+        assert_eq!(parse_u64_saturating("-"), None);
+
+        // A missing side of the ahead/behind pair is still zero, not MAX.
+        assert_eq!(parse_left_right_count(""), (0, 0));
+        assert_eq!(parse_left_right_count("-\t-"), (0, 0));
+    }
+
+    #[test]
+    fn ordinary_counts_are_unchanged() {
+        assert_eq!(parse_count_saturating("42"), Some(42));
+        assert_eq!(parse_count_saturating(" 7 "), Some(7));
+        assert_eq!(parse_u64_saturating("1024"), Some(1024));
+        assert_eq!(parse_left_right_count("3\t9"), (3, 9));
+        assert_eq!(parse_left_right_count("3 9"), (3, 9));
     }
 }

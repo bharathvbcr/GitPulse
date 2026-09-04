@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { formatError } from "../ui/formatError";
@@ -31,14 +31,23 @@
     type CommitReviewReport,
   } from "../ops/model";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
+  import {
+    MANVI_FOCUS_TARGETS,
+    MANVI_PANE_LIST,
+    MANVI_PANES,
+    manviFocusRequest,
+    manviSectionId,
+    takeManviFocus,
+    type ManviFocusId,
+    type ManviPane,
+  } from "../ui/manviFocus";
   import type { WorkflowRunInfo, GitHubContext } from "../github/types";
 
 
   const ISSUE_REFRESH_MS = 60_000;
 
   /** One MANVI surface, two panes: guarded operations, and harness/AI controls. */
-  type Pane = "ops" | "harness";
-  let pane = $state<Pane>("ops");
+  let pane = $state<ManviPane>("ops");
   let permissionMode = $derived(harnessPermissionMode($harnessStore.harness));
   let permissionLabel = $derived(
     permissionMode === "connected"
@@ -50,11 +59,7 @@
           : "checking policy",
   );
 
-  let subtitle = $derived(
-    pane === "ops"
-      ? "Guarded repository operations, release readiness, and issue monitoring in one place."
-      : "Harness connection, local model servers, branch naming, and the agent activity journal.",
-  );
+  let subtitle = $derived(MANVI_PANES[pane].summary);
 
   let cleanup = $state<BranchCleanupPlan | null>(null);
   let selectedBranches = $state<string[]>([]);
@@ -307,6 +312,92 @@
     return run.conclusion || run.status || "unknown";
   }
 
+  /**
+   * A deep link from elsewhere in the app (the header chips, the storage
+   * panel) names a section, not just this view. Switching the pane is only
+   * half the answer: the section still has to be brought on screen and marked,
+   * or the reader lands mid-page with no idea which card answered their click.
+   */
+  let flashTimer: number | null = null;
+  let flashed: HTMLElement | null = null;
+  let realignTimers: number[] = [];
+
+  function clearFlash() {
+    if (flashTimer !== null) {
+      window.clearTimeout(flashTimer);
+      flashTimer = null;
+    }
+    // The marked section lives in this panel or in ManviHarnessPane, so the
+    // class is applied to the node rather than bound in one component's markup.
+    flashed?.classList.remove("gp-focus-flash");
+    flashed = null;
+  }
+
+  function clearRealign() {
+    for (const timer of realignTimers) window.clearTimeout(timer);
+    realignTimers = [];
+  }
+
+  /**
+   * Cards above the target keep settling for a moment after the view mounts —
+   * a status probe resolves, the grant list arrives — and every height change
+   * slides the section the reader was sent to, typically far enough to push its
+   * heading off the top. Two bounded re-alignments cover the settle; a scroll
+   * gesture cancels them, because yanking a reader back is worse than drift.
+   */
+  const REALIGN_DELAYS_MS = [0, 250];
+
+  function keepAligned(section: HTMLElement) {
+    clearRealign();
+    for (const delay of REALIGN_DELAYS_MS) {
+      realignTimers.push(
+        window.setTimeout(() => section.scrollIntoView({ block: "start" }), delay),
+      );
+    }
+    for (const event of ["wheel", "touchstart", "keydown"] as const) {
+      window.addEventListener(event, clearRealign, { once: true, passive: true });
+    }
+  }
+
+  async function revealFocus(id: ManviFocusId) {
+    const target = MANVI_FOCUS_TARGETS[id];
+    pane = target.pane;
+    await tick();
+    const section = document.getElementById(manviSectionId(id));
+    if (!section) return;
+    // Instant, like every other scroll-into-view in the app: a deep link should
+    // land deterministically, and a smooth 2000px glide is both a lot of motion
+    // and, in a webview that is not compositing, no scroll at all.
+    section.scrollIntoView({ block: "start" });
+    keepAligned(section);
+    // Sections carry tabindex="-1": keyboard and screen-reader users land on
+    // the same card the scroll brought into view, not back at the page top.
+    section.focus({ preventScroll: true });
+    clearFlash();
+    section.classList.add("gp-focus-flash");
+    flashed = section;
+    flashTimer = window.setTimeout(() => clearFlash(), 1600);
+  }
+
+  // Runs on mount (the view mounts lazily, after the click) and again whenever
+  // a request arrives while the view is already open.
+  $effect(() => {
+    const requested = $manviFocusRequest;
+    if (!requested) return;
+    takeManviFocus();
+    void revealFocus(requested);
+  });
+
+  $effect(() => {
+    return () => {
+      clearFlash();
+      clearRealign();
+      for (const event of ["wheel", "touchstart", "keydown"] as const) {
+        window.removeEventListener(event, clearRealign);
+      }
+    };
+  });
+
   onMount(() => {
     const timer = window.setInterval(() => {
       // Only poll while the ops pane is visible: the harness pane renders
@@ -359,8 +450,9 @@
           </button>
         {/if}
         <div class="gp-segmented" role="group" aria-label="MANVI view">
-          <button type="button" aria-pressed={pane === "ops"} data-active={pane === "ops" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "ops")}>Ops</button>
-          <button type="button" aria-pressed={pane === "harness"} data-active={pane === "harness" ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = "harness")}>Harness &amp; AI</button>
+          {#each MANVI_PANE_LIST as entry (entry.id)}
+            <button type="button" aria-pressed={pane === entry.id} data-active={pane === entry.id ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = entry.id)}>{entry.label}</button>
+          {/each}
         </div>
       </div>
     </div>
@@ -398,7 +490,7 @@
     </section>
 
     <div class="grid gap-4 xl:grid-cols-2">
-      <section class="gp-card p-4">
+      <section id={manviSectionId("cleanup")} tabindex="-1" class="gp-card p-4">
         <div class="mb-3 flex items-center justify-between">
           <div>
             <h3 class="font-semibold">Branch cleanup</h3>

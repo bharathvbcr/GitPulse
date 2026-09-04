@@ -212,6 +212,8 @@ pub fn run() {
             cmd_codeintel_dead_symbols,
             cmd_insights_snapshot,
             cmd_collision_risk,
+            cmd_fleet_snapshot,
+            cmd_fleet_record_metrics,
             cmd_mcp_info,
             cmd_check_app_update,
         ])

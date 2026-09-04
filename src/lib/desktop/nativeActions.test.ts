@@ -16,6 +16,8 @@ function handlers(): NativeMenuHandlers & { calls: string[] } {
     themeLight: () => calls.push("themeLight"),
     themeDark: () => calls.push("themeDark"),
     setTab: (tab) => calls.push(`tab:${tab}`),
+    fleet: () => calls.push("fleet"),
+    terminalDock: () => calls.push("terminalDock"),
     fetch: () => calls.push("fetch"),
     pull: () => calls.push("pull"),
     push: () => calls.push("push"),
@@ -54,28 +56,39 @@ describe("dispatchNativeMenu", () => {
 
   it("maps view tabs and appearance", () => {
     const h = handlers();
-    dispatchNativeMenu({ id: "tab-diff" }, h);
-    dispatchNativeMenu({ id: "tab-github" }, h);
-    dispatchNativeMenu({ id: "tab-coverage" }, h);
-    dispatchNativeMenu({ id: "tab-health" }, h);
+    dispatchNativeMenu({ id: "tab-history" }, h);
+    dispatchNativeMenu({ id: "tab-work" }, h);
+    dispatchNativeMenu({ id: "tab-insights" }, h);
+    dispatchNativeMenu({ id: "tab-code" }, h);
     dispatchNativeMenu({ id: "theme-system" }, h);
     expect(h.calls).toEqual([
-      "tab:diff",
-      "tab:github",
-      "tab:coverage",
-      "tab:health",
+      "tab:history",
+      "tab:work",
+      "tab:insights",
+      "tab:code",
       "themeSystem",
     ]);
   });
 
-  it("routes every registered view tab, including manvi (regression)", () => {
+  it("routes every registered view tab", () => {
     const h = handlers();
     for (const view of REGISTERED_VIEWS) {
       expect(dispatchNativeMenu({ id: `tab-${view.id}` }, h)).toBe(true);
       expect(h.calls.at(-1)).toBe(`tab:${view.id}`);
     }
-    expect(h.calls.some((call) => call === "tab:manvi")).toBe(true);
-    expect(h.calls.some((call) => call === "tab:terminal")).toBe(true);
+    // Guarded, so an empty registry could not pass this as a clean sweep.
+    expect(h.calls).toHaveLength(REGISTERED_VIEWS.length);
+    expect(REGISTERED_VIEWS.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("does not route the retired terminal view id", () => {
+    // The terminal became a dock. `tab-terminal` must fall through as
+    // unhandled rather than resolving to a pane that no longer exists —
+    // an old menu build sending it would otherwise park the session on a
+    // view id nothing renders.
+    const h = handlers();
+    expect(dispatchNativeMenu({ id: "tab-terminal" }, h)).toBe(false);
+    expect(h.calls).toEqual([]);
   });
 
   it("opens a recent path and ignores empty recent", () => {
@@ -138,6 +151,12 @@ describe("dispatchNativeMenu — every id reaches its own handler", () => {
     ["quick-commit", "quickCommit", "quickCommit"],
     ["palette", "palette", "palette"],
     ["focus-filter", "focusFilter", "focusFilter"],
+    // Workspace-scoped, so it is its own id rather than a `tab-*` one; this
+    // route also proves it never reaches setTab.
+    ["fleet", "fleet", "fleet"],
+    // A dock rather than a view, so it likewise has its own id; this route
+    // also proves it never reaches setTab.
+    ["terminal-dock", "terminalDock", "terminalDock"],
     ["close-tab", "closeRepoTab", "closeTab"],
     ["next-repo-tab", "nextRepoTab", "nextTab"],
     ["prev-repo-tab", "prevRepoTab", "prevTab"],

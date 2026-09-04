@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { MANVI_PANE_IDS } from "../ui/manviFocus";
 
 const components = new URL("./", import.meta.url);
 const source = (path: string) => readFileSync(join(components.pathname, path), "utf8");
@@ -10,6 +11,7 @@ describe("modal accessible-name contract", () => {
     ["CloneModal.svelte", "clone-modal-title"],
     ["RebaseModal.svelte", "rebase-modal-title"],
     ["CommandPalette.svelte", "command-palette-title"],
+    ["SettingsModal.svelte", "settings-modal-title"],
   ])("gives %s a title referenced by its dialog", (file, titleId) => {
     const text = source(file);
     expect(text).toContain(`aria-labelledby="${titleId}"`);
@@ -35,8 +37,12 @@ describe("segmented-control semantics", () => {
   it("announces MANVI and Markdown modes as pressed-button groups", () => {
     const manvi = source("ManviOpsPanel.svelte");
     expect(manvi).toContain('class="gp-segmented" role="group" aria-label="MANVI view"');
-    expect(manvi).toContain('aria-pressed={pane === "ops"}');
-    expect(manvi).toContain('aria-pressed={pane === "harness"}');
+    // The panes render from one catalog, so the pressed state is declared once
+    // for every option instead of per hand-written button: a pane added to the
+    // catalog cannot reach the header without it.
+    expect(MANVI_PANE_IDS.length).toBeGreaterThanOrEqual(2);
+    expect(manvi).toContain("{#each MANVI_PANE_LIST as entry (entry.id)}");
+    expect(manvi).toContain("aria-pressed={pane === entry.id}");
 
     const markdev = source("files/MarkDevViewer.svelte");
     expect(markdev).toContain('class="gp-segmented" role="group" aria-label="Markdown view"');

@@ -63,18 +63,22 @@
     }
   }
 
-  function loadBlame() {
+  /**
+   * Reload the selected file after a failure.
+   *
+   * Retry used to mean re-typing the path into Blame's own box and pressing
+   * Enter — the box was the only way back, and it existed only because Blame
+   * was a destination you could arrive at with nothing selected. Code's
+   * Explorer section owns picking a file now, so what is left here is the one
+   * thing a selection cannot express: asking for the same file again. The
+   * store does not notify for an unchanged value, so this calls the loader
+   * directly.
+   */
+  function retryBlame() {
     const repo = $repoStore.currentPath;
-    const path = filePath.trim();
+    const path = $repoStore.selectedFilePath;
     if (!repo || !path) return;
-    if ($repoStore.selectedFilePath === path) {
-      // Explicit resubmit of the loaded file (retry after error): the store
-      // will not notify for an unchanged value, so reload directly. New
-      // values go through selectFilePath so exactly one site loads.
-      void loadBlameFor(repo, path);
-      return;
-    }
-    repoStore.selectFilePath(path);
+    void loadBlameFor(repo, path);
   }
 
   $effect(() => {
@@ -159,19 +163,12 @@
         {/if}
       </button>
       <FileCode size={16} class="text-accent" />
-      <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-3 py-1 focus-within:border-accent/60 transition-colors">
-        <input
-          type="text"
-          bind:value={filePath}
-          onkeydown={(e) => e.key === "Enter" && loadBlame()}
-          placeholder="Path to file in repo..."
-          spellcheck="false"
-          class="w-64 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none font-mono"
-        />
-        <button onclick={loadBlame} class="p-1 rounded-full hover:text-accent hover:bg-surfaceHover">
-          <Search size={13} />
-        </button>
-      </div>
+      <!-- The file, named rather than typed. Blame reads the selection Code's
+           Explorer section sets, so a second path box here would be a second
+           way to say the same thing — and the one that could disagree. -->
+      <span class="truncate font-mono text-xs text-textPrimary" title={filePath || undefined}>
+        {filePath || "No file selected"}
+      </span>
     </div>
 
     <!-- Legend -->
@@ -206,8 +203,11 @@
           Loading blame for {filePath}...
         </div>
       {:else if errorMsg}
-        <div class="h-full flex items-center justify-center text-rose-400 font-sans text-xs p-4">
-          {errorMsg}
+        <div class="h-full flex flex-col items-center justify-center gap-3 text-rose-400 font-sans text-xs p-4 text-center">
+          <span class="max-w-md">{errorMsg}</span>
+          <button type="button" onclick={retryBlame} class="gp-btn !py-1 !px-3 text-[11px]">
+            Retry
+          </button>
         </div>
       {:else if blameLines.length > 0}
         <VirtualList items={blameLines} rowHeight={24} overscan={15} class="h-full px-1.5 py-1">
@@ -244,8 +244,8 @@
           icon={Search}
           title="No blame loaded"
           hint={explorerOpen
-            ? "Pick a file in the explorer or enter a path above."
-            : "Enter a file path above to view git blame heatmaps."}
+            ? "Pick a file in the explorer to see line authorship and code age."
+            : "Open the explorer (⌘B), or pick a file in Code → Explorer."}
         />
       {/if}
     </div>

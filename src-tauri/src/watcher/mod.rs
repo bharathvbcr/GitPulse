@@ -1039,7 +1039,20 @@ mod tests {
     /// Overall ceiling for priming the watcher pipeline in tests: generous
     /// enough for a machine shared with cargo builds and other suites, yet
     /// bounded so a genuinely broken backend fails fast instead of hanging.
-    const PRIME_DEADLINE: Duration = Duration::from_secs(12);
+    ///
+    /// Matched to the ceiling `watch_loop_emits_under_continuous_churn_within_max_wait`
+    /// already argued for: FSEvents delivery plus the 400 ms debounce stretches
+    /// far past its idle latency when the whole workspace suite runs at once.
+    /// Raising it costs nothing on a passing run — every user is a
+    /// `while now < deadline` loop that breaks on success — and only lengthens
+    /// how long a genuinely broken backend takes to be declared broken.
+    ///
+    /// `panicking_on_change_cannot_leak_the_watch_slot` failed exactly once
+    /// here under `cargo test --workspace`, at a hardcoded 8 s that bypassed
+    /// this constant, and passed 3/3 in isolation. Two tests had their own
+    /// budget; both now use this one, so the next machine that is slower still
+    /// gets one place to change.
+    const PRIME_DEADLINE: Duration = Duration::from_secs(20);
 
     /// Consumes callbacks until a silent stretch longer than [`DEBOUNCE_MAX_WAIT`]
     /// passes. Every delivered event is guaranteed to produce an emission
@@ -1304,7 +1317,7 @@ mod tests {
         // Poke the worktree until the debounce pipeline delivers to the
         // panicking callback (single writes race stream installation; see
         // prime_watcher for why retries are required).
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + PRIME_DEADLINE;
         let mut n = 0u32;
         loop {
             std::fs::write(dir.path().join(format!("panic-probe-{n}.txt")), "x").unwrap();
@@ -1314,7 +1327,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "panicking on_change must lead to session reaping ({n} probes)"
+                "panicking on_change must lead to session reaping \
+                 ({n} probes within {PRIME_DEADLINE:?})"
             );
             thread::sleep(Duration::from_millis(200));
         }
@@ -1358,7 +1372,7 @@ mod tests {
         // single write races watch installation, especially when other tests
         // in this process also hold FSEvents/inotify watches.
         let git_dir = dir.path().join(".git");
-        let prime_deadline = Instant::now() + Duration::from_secs(8);
+        let prime_deadline = Instant::now() + PRIME_DEADLINE;
         let mut primed = false;
         let mut n = 0u32;
         while Instant::now() < prime_deadline {

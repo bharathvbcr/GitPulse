@@ -418,6 +418,20 @@ html.macos ::-webkit-scrollbar {
   contain: layout paint;
 }
 
+/* Landing cue for a deep link: the section a header chip pointed at wears a
+   ring for a moment so the eye finds it without a scroll hunt. The ring is a
+   plain box-shadow rather than an animation, so reduced-motion drops the fade
+   and keeps the cue instead of removing it. */
+.gp-focus-flash {
+  box-shadow: var(--ring-focus);
+  transition: box-shadow 200ms ease-out;
+}
+
+.gp-focus-flash:focus,
+.gp-focus-flash:focus-visible {
+  outline: none;
+}
+
 /* Branch list rows skip layout/paint while offscreen (windowing aid for the
    sidebar's single shared scroller). Supported in WKWebView and WebKitGTK
    2.40+; engines without content-visibility ignore the rule and simply pay

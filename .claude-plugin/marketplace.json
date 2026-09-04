@@ -1,0 +1,29 @@
+{
+  "name": "gitpulse",
+  "description": "GitPulse control-plane plugins: read-only repository, worktree, collision, ledger, and code-intelligence tools for agents.",
+  "owner": {
+    "name": "GitPulse Team",
+    "url": "https://gitpulse.vbcr.dev"
+  },
+  "plugins": [
+    {
+      "name": "gitpulse",
+      "source": "./plugins/gitpulse",
+      "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
+      "category": "development",
+      "author": {
+        "name": "GitPulse Team",
+        "url": "https://gitpulse.vbcr.dev"
+      },
+      "homepage": "https://gitpulse.vbcr.dev",
+      "license": "MIT",
+      "keywords": [
+        "git",
+        "mcp",
+        "worktrees",
+        "code-intelligence",
+        "insights"
+      ]
+    }
+  ]
+}

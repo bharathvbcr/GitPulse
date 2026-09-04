@@ -1,15 +1,6 @@
-<script module lang="ts">
-  import { createRepoPanelCache } from "../panels/repoPanelCache";
-  import type { StorageReport } from "../storage/types";
-
-  // Survives the per-tab remount so revisiting the Storage view renders the
-  // last scan instantly; the fetch then refreshes it in place.
-  const storageReportCache = createRepoPanelCache<StorageReport>();
-</script>
-
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
-  import { invoke } from "@tauri-apps/api/core";
+  import { requestManviFocus } from "../ui/manviFocus";
   import {
     HardDrive,
     RefreshCw,
@@ -22,9 +13,10 @@
     Sparkles,
     FolderTree,
   } from "lucide-svelte";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import type { StorageReport } from "../storage/types";
+  import { storageMetric } from "../metrics/repoMetrics";
+  import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
   import { copyText } from "../desktop/clipboard";
-  import { reportPanelError } from "../diagnostics/report";
   import Skeleton from "./Skeleton.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
@@ -52,11 +44,14 @@
   let report = $state<StorageReport | null>(null);
   let loading = $state(false);
   let errorMsg = $state<string | null>(null);
+  let staleNote = $state<string | null>(null);
   let copied = $state(false);
   let historyVersion = $state(0);
 
-  const scanned = { path: "" };
-  let inflight: AsyncGuard | null = null;
+  // The last measurement whose snapshot was written to usage history. Keyed on
+  // the measurement time so re-renders of the same scan do not append a
+  // duplicate point to the sparkline.
+  let recordedAt: number | null = null;
   let copyTimer: number | null = null;
 
   /** Injected for tests; the app uses localStorage when available. */
@@ -79,30 +74,41 @@
     return loadHistory(persistentStorage());
   }
 
+  /**
+   * Rescan on demand.
+   *
+   * Forced, so it always does something: the metric's cost floor exists to stop
+   * a file-watcher storm from pinning a 20-second tree walk, not to ignore the
+   * user.
+   */
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
-    inflight?.cancel();
-    const guard = createAsyncGuard();
-    inflight = guard;
-    loading = true;
-    errorMsg = null;
-    try {
-      const next = await invoke<StorageReport>("cmd_storage_scan", { repoPath });
-      if (!guard.isLive()) return;
-      report = next;
-      storageReportCache.set(repoPath, next);
-      // Record the snapshot so the usage history grows with real scans.
-      const map = recordSnapshot(readHistory(), repoKey(repoPath), toSnapshot(next));
+    await storageMetric.refresh(repoPath, { force: true });
+  }
+
+  /**
+   * Mirrors one metric snapshot into local view state.
+   *
+   * `value` and `stale` are read together on purpose: a failed refresh keeps
+   * the last report so the panel does not blank out, and `staleNote` is what
+   * stops that retained report from reading as a current measurement.
+   */
+  function applySnapshot(repoPath: string, snap: MetricSnapshot<StorageReport>) {
+    report = snap.value;
+    loading = snap.state === "loading";
+    errorMsg = snap.state === "failed" && snap.value === null ? snap.error : null;
+    staleNote = describeStaleness(snap, Date.now());
+    if (snap.state === "failed" && snap.value !== null && snap.error) {
+      // A refresh failed but a previous report survives: report the failure as
+      // staleness rather than replacing the panel with an error page.
+      staleNote = snap.error;
+    }
+    if (snap.value && snap.measuredAt !== null && snap.measuredAt !== recordedAt) {
+      recordedAt = snap.measuredAt;
+      const map = recordSnapshot(readHistory(), repoKey(repoPath), toSnapshot(snap.value));
       saveHistory(persistentStorage(), map);
       historyVersion += 1;
-    } catch (err) {
-      if (!guard.isLive()) return;
-      errorMsg = reportPanelError("storage", err);
-      report = null;
-      scanned.path = "";
-    } finally {
-      if (guard.isLive()) loading = false;
     }
   }
 
@@ -277,33 +283,35 @@
   }
 
   function openManviCleanup() {
-    repoStore.setActiveTab("manvi");
+    // Names the section, not just the view: MANVI opens on its Ops pane and
+    // branch cleanup is one card among several down the page.
+    requestManviFocus("cleanup");
+    repoStore.setActiveTab("work", "policy");
   }
 
   $effect(() => {
     return () => {
-      inflight?.cancel();
       if (copyTimer !== null) window.clearTimeout(copyTimer);
     };
   });
 
+  // One subscription per repository. The metric measures once however many
+  // panels are watching, revalidates when the watcher reports a change, and
+  // hands back the last known report immediately on a remount.
   $effect(() => {
     const path = $repoStore.currentPath;
     if (!path) {
-      inflight?.cancel();
-      scanned.path = "";
       report = null;
       errorMsg = null;
+      staleNote = null;
       loading = false;
+      recordedAt = null;
       return;
     }
-    if (path === scanned.path) return;
-    scanned.path = path;
-    // Hydrate last-known data synchronously so a revisit renders instantly
-    // (the placeholder below only fires when there is no cached report).
-    report = storageReportCache.get(path) ?? null;
-    void scan(path);
+    recordedAt = null;
+    return storageMetric.subscribe(path, (snap) => applySnapshot(path, snap));
   });
+
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
@@ -320,6 +328,18 @@
         {#if report.scan.truncated}
           <span class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold">
             partial scan
+          </span>
+        {/if}
+        {#if staleNote && !report.scan.truncated}
+          <!--
+            A retained report from before the last change must not read as a
+            current measurement. This badge is the difference between the two.
+          -->
+          <span
+            class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold"
+            title={staleNote}
+          >
+            {loading ? "rescanning" : "out of date"}
           </span>
         {/if}
       {/if}
@@ -503,6 +523,76 @@
           </table>
         </div>
       </section>
+
+      <!--
+        Reclaim audit.
+
+        The sections below this one report sizes; this one reports decisions.
+        Its headline deliberately counts only bytes that were MEASURED and are
+        SAFE to delete: estimates (a repack's saving depends on the content)
+        and items needing a human (committed output, the reflog, a large file
+        that may be someone's dataset) are carried as separate figures rather
+        than folded into a number the repository cannot actually deliver.
+      -->
+      {#if report.reclaim.length > 0}
+        <section class="space-y-2 max-w-4xl">
+          <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
+            <Trash2 size={11} />
+            Reclaim audit ({report.reclaim_summary.item_count})
+          </h3>
+          <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
+            <span class="text-textPrimary font-semibold">
+              {humanBytes(report.reclaim_summary.reclaimable_bytes)} safely recoverable
+            </span>
+            {#if report.reclaim_summary.estimated_bytes > 0}
+              <span class="text-textMuted">
+                up to {humanBytes(report.reclaim_summary.estimated_bytes)} more, estimated
+              </span>
+            {/if}
+            {#if report.reclaim_summary.needs_review_bytes > 0}
+              <span class="text-textMuted">
+                {humanBytes(report.reclaim_summary.needs_review_bytes)} needs review
+              </span>
+            {/if}
+            {#if report.reclaim_summary.partial}
+              <span class="text-amber-300">
+                scan was cut short — this is a floor, not a total
+              </span>
+            {/if}
+          </div>
+          <div class="space-y-1">
+            {#each report.reclaim as item (item.category + item.label)}
+              <div class="rounded border border-border/60 bg-surface/40 px-3 py-2 space-y-1">
+                <div class="flex items-baseline justify-between gap-3">
+                  <span class="font-mono text-textPrimary truncate" title={item.label}>
+                    {item.label}
+                  </span>
+                  <span class="shrink-0 text-textMuted">
+                    {item.bytes > 0 ? humanBytes(item.bytes) : "—"}
+                    {#if item.confidence === "estimated"}
+                      <span class="text-[10px] uppercase">est.</span>
+                    {/if}
+                  </span>
+                </div>
+                <div class="text-textMuted">{item.detail}</div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <code class="text-[11px] text-accent">{item.action}</code>
+                  {#if item.safety === "needs_review"}
+                    <span
+                      class="px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] uppercase font-semibold"
+                    >
+                      needs review
+                    </span>
+                  {/if}
+                </div>
+                {#if item.blocked_reason}
+                  <div class="text-amber-300">{item.blocked_reason}</div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
 
       <!-- Build & cache dirs -->
       {#if report.artifacts.length > 0}

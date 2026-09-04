@@ -9,24 +9,17 @@ import {
 } from "./commitFilter";
 
 describe("showsCommitFilter", () => {
-  it("is on for views the commit search actually filters", () => {
+  it("is on for History, the one view it filters", () => {
+    // It used to be true for five views. Three of those are sections of
+    // History now, and the bar moved into History's section bar, where it
+    // filters the single walk all three sections are drawn from.
     expect(showsCommitFilter("history")).toBe(true);
-    expect(showsCommitFilter("diff")).toBe(true);
-    expect(showsCommitFilter("blame")).toBe(true);
-    expect(showsCommitFilter("stack")).toBe(true);
-    expect(showsCommitFilter("reflog")).toBe(true);
   });
 
-  it("is off for Work and every other non-history surface", () => {
+  it("is off for Work and every other surface", () => {
     expect(showsCommitFilter("work")).toBe(false);
-    expect(showsCommitFilter("files")).toBe(false);
-    expect(showsCommitFilter("conflict")).toBe(false);
-    expect(showsCommitFilter("coverage")).toBe(false);
-    expect(showsCommitFilter("health")).toBe(false);
-    expect(showsCommitFilter("storage")).toBe(false);
-    expect(showsCommitFilter("terminal")).toBe(false);
-    expect(showsCommitFilter("github")).toBe(false);
-    expect(showsCommitFilter("manvi")).toBe(false);
+    expect(showsCommitFilter("code")).toBe(false);
+    expect(showsCommitFilter("insights")).toBe(false);
   });
 
   it("decides every registered view, so a new tab cannot inherit the bar silently", () => {
@@ -45,21 +38,24 @@ describe("commit-search chord", () => {
     expect(isCommitSearchChord({ key: "f" })).toBe(false);
   });
 
-  it("leaves Files to the in-file search, and takes every other view", () => {
-    expect(ownsCommitSearchChord("files")).toBe(false);
+  it("leaves Code to the in-file search, and takes every other view", () => {
+    // Per view, not per section: Blame is a section of Code and its lines are
+    // the same file's lines, so ⌘F must not mean one thing on a file and
+    // something else on that same file one click later.
+    expect(ownsCommitSearchChord("code")).toBe(false);
     for (const tab of VIEW_TABS) {
-      if (tab === "files") continue;
+      if (tab === "code") continue;
       expect(ownsCommitSearchChord(tab), tab).toBe(true);
     }
   });
 
-  it("switches Work (and any other non-filter view) onto Graph so the bar exists", () => {
+  it("switches Work (and any other non-filter view) onto History so the bar exists", () => {
     // The failure this prevents: ⌘F on Work dispatched a focus event no
     // listener heard, because FilterBar is unmounted there.
     expect(tabForCommitSearch("work")).toBe("history");
-    expect(tabForCommitSearch("github")).toBe("history");
+    expect(tabForCommitSearch("insights")).toBe("history");
     expect(tabForCommitSearch("history")).toBe("history");
-    expect(tabForCommitSearch("diff")).toBe("diff");
+    expect(tabForCommitSearch("code")).toBe("history");
     expect(FOCUS_COMMIT_SEARCH_EVENT).toBe("gitpulse:focus-filter");
   });
 });

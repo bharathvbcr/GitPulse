@@ -129,10 +129,12 @@ flowchart TD
 | --- | --- |
 | `npm run check` | Runs `svelte-check` and `tsc` type validation |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (134 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (136 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 46 contracts (706 fields) |
-| `npm run check:release` | Asserts all version manifests (`package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`) are in sync |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 48 contracts (762 fields) |
+| `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
+| `npm run mcp:install` | Installs `gitpulse-mcp` onto PATH via `cargo install`, so the binary agent clients spawn is tracked and refreshable rather than a hand-placed copy |
+| `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asserts it reports this tree's version. Distinguishes *absent*, *unresponsive*, and *stale* from *matching* — a missing server must never read the same as a current one. Not in `ci:local`: CI does not install the server, and a check that cannot run must not look like one that passed |
 | `npm run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
 | `npm run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
 | `npm run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
@@ -155,6 +157,8 @@ several were added after the drift had already happened.
 | `policy-status-contract` | A gate verdict the frontend does not know, which renders as the fallback — a refusal shown as something milder. |
 | `verdict-contract` | Two consumers of the shared policy contract disagreeing about what a decision means. The harness reports `action: "allow"` for five different things — a clean pass, a posture demotion, a grant, an executor-widened scope, and a decision reached with rungs that could not run — and only one of them is a clean pass. It also pins the vendored `contracts/` copy against its checksums, so a contract edited here instead of at its source fails rather than forking. |
 | `command-policy-contract` | A native mutation that reaches Git without passing the write gate. |
+| `command-gate-fidelity-contract` | A guarded command describing gentler arguments than the `GitWriter` call it actually executes. The test follows private helpers transitively and compares every literal flag on both sides of the gate. |
+| `file-gate-fidelity-contract` | A command that may delete a file declaring a fixed `modify`, `write`, or `create` operation to the file gate and ledger. |
 | `vendor-contract` | A path dependency that leaves the repository, which makes a lone checkout stop building — and nothing else notices until a fresh clone or a CI runner without the sibling repos fails. Also pins the distinction the vendor check exists for: an upstream that is not checked out is reported *unavailable*, never *matches*. |
 | `provenance-verdict-contract` | A verdict written into a git note that the freshness badge does not recognise. The badge fails closed — an unrecognised verdict is never rendered as a pass — which is the safe behaviour and also a silent one: a writer that started emitting a new word would put a permanent amber badge on every verified commit with nothing to say why. Writers are found by scanning for `VerificationNote` constructions, so a second one is covered without anyone remembering. |
 | `bundle-binary-contract` | The Tauri bundler choosing the wrong binary. `src/bin/*.rs` is auto-discovered, so adding `gitpulsed` gave the package three binaries and `GitPulse.app` shipped the headless daemon as its executable — an installed app that opens nothing. Every other gate passed, because each binary was individually fine; only the choice of which to bundle was wrong, and no test runs the bundler. |
@@ -168,7 +172,9 @@ several were added after the drift had already happened.
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
 | `diagnostics-contract` | The crash log going quiet. The panic hook captures its logger at install time, so installing it before `logging::init()` binds nothing and every later panic is recorded where no one can read it — a hook that looks installed and is inert. It also pins the reverse gap: a new `[[bin]]` inherits neither the logger nor the hook and is absent from `LOGGED_BINARIES`, so it writes no durable log, and nothing about a silent binary looks wrong. Both lists are derived from Cargo.toml rather than restated here. |
 | `plugin-contract` | The Agent Plugins 1.0 package drifting from the published schemas. A extra top-level field, a mismatched `$schema` version between `plugin.json` and `mcp.json`, or a `command` that is a shell string rather than one token, and a conformant client rejects or skips the package while Settings still copies it. |
+| `codex-plugin-contract` | The native Codex manifest, repo marketplace entry, or Tauri resource map disappearing or pointing at a second package root. It also pins the portable `.mcp.json` and shared skill paths. |
 | `portable-paths.contract` | A `file:` URL's `pathname` used as a filesystem path. It is a real path on macOS and Linux and "/D:/a/repo/…" on Windows, so it passes review and every local run, then fails only on the Windows runner — and fails silently in the worse half of the cases: fed to a directory scan it returns `[]`, and the assertions built on it pass while checking nothing. Two of the three Windows CI failures on 2026-09-03 were this. |
+| `fleet-surface-contract` | The workspace-wide Fleet dashboard becoming unreachable. Every repository view is kept reachable by `view-menu-contract`, which walks the view registry — but Fleet is deliberately not a `ViewTab` (a ViewTab is stored on the active repository's session and its pane lives inside `{#key currentPath}`), so none of that machinery covers it. This pins its three entry points, the Rust/TypeScript agreement on its action id, and the rule that it is swapped by hiding rather than unmounting: an `{#if}`/`{:else}` swap would destroy the repository subtree on every toggle and kill the live terminal PTY inside it. |
 | `documented-counts-contract` | A count in the docs drifting from the code. The Rust test total was understated fourfold before this existed. |
 | `conventional-grammar-contract` | The frontend and `analyzer/conventional.rs` disagreeing about what counts as a Conventional Commit. Pulse's hygiene metric carried its own regex with a fixed 11-type vocabulary, so `wip:` and `fix(build system): x` counted for the commit badges and the `type:` filter but not for the metric. The pattern is re-derived from the Rust source rather than restated. |
 | `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
@@ -192,10 +198,10 @@ GitPulse/
 │   ├── lib/stores/       Reactive state (repo, graph, filter, theme, toasts, modals)
 │   ├── lib/components/   UI components; one .svelte + one .test.ts each
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
-│   ├── lib/views/        View registry + navigation (routerless, 15 views)
+│   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (134 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (136 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
@@ -217,7 +223,7 @@ app enforces:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
-| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged as Agent Plugins 1.0 under `plugin/`. |
+| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
 | `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
 
 `gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and

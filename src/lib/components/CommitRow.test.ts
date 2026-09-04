@@ -88,3 +88,52 @@ describe("CommitRow accessible graph context", () => {
     expect(source).toContain("if (await copyText(row.summary))");
   });
 });
+
+/**
+ * The all-refs scope puts machine-written ref paths on rows. A real one in
+ * this repository is 209 characters; drawn whole it stretches the row until
+ * the commit summary is off-screen, so the chip folds it and keeps the whole
+ * path in the title where nothing is lost.
+ */
+describe("CommitRow ref chips", () => {
+  const longRef =
+    "codex/turn-diffs/checkpoints/" +
+    "146c832dd582d2f371d2d7f79aa5f0467658b5e962c28a281f2b46a1529f5c46/" +
+    "3c0bd968060e6a19a71608ee26cc63d973b8dc4a8c31e9f95be0c2b68c219178/" +
+    "1788535046539/ca796ac6-5927-4170-9a4b-ccadae440ddb";
+
+  it("folds an enormous non-branch ref instead of drawing it whole", () => {
+    const { body } = render(CommitRow, {
+      props: { row, refs: [{ name: longRef, kind: "other" as const }] },
+    });
+    // The visible chip text is the folded form...
+    expect(body).toContain("codex/turn-diffs/checkpoints/…</span>");
+    // ...and the full path appears exactly once, inside the title, where it
+    // costs no layout. Folded in the chip, complete on hover: nothing is
+    // hidden, only wrapped up.
+    expect(body.split(longRef)).toHaveLength(2);
+    expect(body).toContain(`title="refs/${longRef} — outside`);
+  });
+
+  it("draws a non-branch ref as its own kind, never as a branch", () => {
+    const { body } = render(CommitRow, {
+      props: { row, refs: [{ name: "cmux/last-turn/abc", kind: "other" as const }] },
+    });
+    expect(body).toContain("outside branches, remotes and tags");
+  });
+
+  it("leaves ordinary branch and tag names whole", () => {
+    const { body } = render(CommitRow, {
+      props: {
+        row,
+        refs: [
+          { name: "main", kind: "current-branch" as const },
+          { name: "v1.2.0", kind: "tag" as const },
+        ],
+      },
+    });
+    expect(body).toContain("main");
+    expect(body).toContain("v1.2.0");
+    expect(body).not.toContain("…");
+  });
+});

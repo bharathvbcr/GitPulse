@@ -4,7 +4,7 @@ use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLi
 use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
-use gitpulse_lib::graph::LaneSolver;
+use gitpulse_lib::graph::{LaneSolver, RefScope};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -190,8 +190,15 @@ fn path_walk_honors_all_and_selected_revision() {
 
     // Default semantics must match the graph walk (`--all`): branch commits
     // touching the path stay in the allow-set.
-    let all = GitReader::read_commit_history_paged(&path, 0, 10, None, Some("shared.txt"))
-        .expect("--all walk");
+    let all = GitReader::read_commit_history_paged(
+        &path,
+        0,
+        10,
+        None,
+        Some("shared.txt"),
+        RefScope::Named,
+    )
+    .expect("--all walk");
     let all_ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
     assert!(
         all_ids.contains(&feature_edit.id.as_str()),
@@ -200,9 +207,15 @@ fn path_walk_honors_all_and_selected_revision() {
     assert!(all_ids.contains(&base_commit.id.as_str()));
 
     // An explicit revision keeps HEAD-only semantics available.
-    let head_only =
-        GitReader::read_commit_history_paged(&path, 0, 10, Some("HEAD"), Some("shared.txt"))
-            .expect("HEAD walk");
+    let head_only = GitReader::read_commit_history_paged(
+        &path,
+        0,
+        10,
+        Some("HEAD"),
+        Some("shared.txt"),
+        RefScope::Named,
+    )
+    .expect("HEAD walk");
     let head_ids: Vec<&str> = head_only.iter().map(|c| c.id.as_str()).collect();
     assert!(
         !head_ids.contains(&feature_edit.id.as_str()),
@@ -241,7 +254,8 @@ fn path_walk_rewrites_parents_to_the_nearest_surviving_ancestor() {
 
     let path = repo.path_str();
     let rows =
-        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt")).expect("path walk");
+        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt"), RefScope::Named)
+            .expect("path walk");
     let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -301,7 +315,8 @@ fn path_walk_relinks_across_a_simplified_merge() {
 
     let path = repo.path_str();
     let rows =
-        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt")).expect("path walk");
+        GitReader::read_commit_history_paged(&path, 0, 50, None, Some("f.txt"), RefScope::Named)
+            .expect("path walk");
     let summaries: Vec<&str> = rows.iter().map(|c| c.summary.as_str()).collect();
     assert_eq!(
         summaries,
@@ -952,8 +967,9 @@ fn test_glob_shaped_paths_match_literally() {
 
     // A widened glob would match both files' history; literal matches only
     // the star-named file's single commit.
-    let touching = GitReader::read_commit_history_paged(&path, 0, 10, None, Some(globbish))
-        .expect("log pathspec");
+    let touching =
+        GitReader::read_commit_history_paged(&path, 0, 10, None, Some(globbish), RefScope::Named)
+            .expect("log pathspec");
     assert_eq!(
         touching.len(),
         1,
@@ -996,9 +1012,15 @@ fn test_reader_read_paths_refuse_symlink_escape() {
     let err = GitReader::get_file_diff(&path, "leak/secret.txt", false, false)
         .expect_err("symlink escape must fail");
     assert!(err.contains("escapes the repository"), "got: {err}");
-    assert!(
-        GitReader::read_commit_history_paged(&path, 0, 10, None, Some("leak/secret.txt")).is_err()
-    );
+    assert!(GitReader::read_commit_history_paged(
+        &path,
+        0,
+        10,
+        None,
+        Some("leak/secret.txt"),
+        RefScope::Named
+    )
+    .is_err());
     assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
 }
 

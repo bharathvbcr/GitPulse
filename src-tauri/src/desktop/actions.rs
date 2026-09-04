@@ -10,19 +10,16 @@ pub const THEME_LIGHT: &str = "theme-light";
 pub const THEME_DARK: &str = "theme-dark";
 pub const TAB_WORK: &str = "tab-work";
 pub const TAB_HISTORY: &str = "tab-history";
-pub const TAB_FILES: &str = "tab-files";
-pub const TAB_DIFF: &str = "tab-diff";
-pub const TAB_CONFLICT: &str = "tab-conflict";
-pub const TAB_BLAME: &str = "tab-blame";
-pub const TAB_STACK: &str = "tab-stack";
-pub const TAB_GITHUB: &str = "tab-github";
-pub const TAB_COVERAGE: &str = "tab-coverage";
-pub const TAB_HEALTH: &str = "tab-health";
-pub const TAB_TERMINAL: &str = "tab-terminal";
-pub const TAB_MANVI: &str = "tab-manvi";
-pub const TAB_REFLOG: &str = "tab-reflog";
-pub const TAB_STORAGE: &str = "tab-storage";
-pub const TAB_PULSE: &str = "tab-pulse";
+pub const TAB_CODE: &str = "tab-code";
+pub const TAB_INSIGHTS: &str = "tab-insights";
+/// Fleet is workspace-scoped, not a repository view, so it is deliberately
+/// NOT a `tab-*` id: those are parsed back into a `ViewTab` and stored on the
+/// active repository's session, which is exactly what Fleet must not be.
+pub const FLEET: &str = "fleet";
+/// The terminal dock, for the same reason it is not a `tab-*` id: the terminal
+/// is no longer a view. It renders beneath whichever view is on screen, so
+/// parsing it into a `ViewTab` would store a destination that does not exist.
+pub const TERMINAL_DOCK: &str = "terminal-dock";
 pub const FETCH: &str = "fetch";
 pub const PULL: &str = "pull";
 pub const PUSH: &str = "push";
@@ -52,19 +49,10 @@ pub enum NativeAction {
     ThemeDark,
     TabWork,
     TabHistory,
-    TabFiles,
-    TabDiff,
-    TabConflict,
-    TabBlame,
-    TabStack,
-    TabGitHub,
-    TabCoverage,
-    TabHealth,
-    TabTerminal,
-    TabManvi,
-    TabReflog,
-    TabStorage,
-    TabPulse,
+    TabCode,
+    TabInsights,
+    Fleet,
+    TerminalDock,
     Fetch,
     Pull,
     Push,
@@ -100,19 +88,10 @@ impl NativeAction {
             THEME_DARK => Self::ThemeDark,
             TAB_WORK => Self::TabWork,
             TAB_HISTORY => Self::TabHistory,
-            TAB_FILES => Self::TabFiles,
-            TAB_DIFF => Self::TabDiff,
-            TAB_CONFLICT => Self::TabConflict,
-            TAB_BLAME => Self::TabBlame,
-            TAB_STACK => Self::TabStack,
-            TAB_GITHUB => Self::TabGitHub,
-            TAB_COVERAGE => Self::TabCoverage,
-            TAB_HEALTH => Self::TabHealth,
-            TAB_TERMINAL => Self::TabTerminal,
-            TAB_MANVI => Self::TabManvi,
-            TAB_REFLOG => Self::TabReflog,
-            TAB_STORAGE => Self::TabStorage,
-            TAB_PULSE => Self::TabPulse,
+            TAB_CODE => Self::TabCode,
+            TAB_INSIGHTS => Self::TabInsights,
+            FLEET => Self::Fleet,
+            TERMINAL_DOCK => Self::TerminalDock,
             FETCH => Self::Fetch,
             PULL => Self::Pull,
             PUSH => Self::Push,
@@ -143,19 +122,10 @@ impl NativeAction {
             Self::ThemeDark => THEME_DARK,
             Self::TabWork => TAB_WORK,
             Self::TabHistory => TAB_HISTORY,
-            Self::TabFiles => TAB_FILES,
-            Self::TabDiff => TAB_DIFF,
-            Self::TabConflict => TAB_CONFLICT,
-            Self::TabBlame => TAB_BLAME,
-            Self::TabStack => TAB_STACK,
-            Self::TabGitHub => TAB_GITHUB,
-            Self::TabCoverage => TAB_COVERAGE,
-            Self::TabHealth => TAB_HEALTH,
-            Self::TabTerminal => TAB_TERMINAL,
-            Self::TabManvi => TAB_MANVI,
-            Self::TabReflog => TAB_REFLOG,
-            Self::TabStorage => TAB_STORAGE,
-            Self::TabPulse => TAB_PULSE,
+            Self::TabCode => TAB_CODE,
+            Self::TabInsights => TAB_INSIGHTS,
+            Self::Fleet => FLEET,
+            Self::TerminalDock => TERMINAL_DOCK,
             Self::Fetch => FETCH,
             Self::Pull => PULL,
             Self::Push => PUSH,
@@ -213,21 +183,34 @@ mod tests {
             Some(NativeAction::ReopenRepoTab)
         );
         assert_eq!(NativeAction::parse(TAB_WORK), Some(NativeAction::TabWork));
-        assert_eq!(NativeAction::parse(TAB_FILES), Some(NativeAction::TabFiles));
+        assert_eq!(NativeAction::parse(TAB_CODE), Some(NativeAction::TabCode));
         assert_eq!(
-            NativeAction::parse(TAB_COVERAGE),
-            Some(NativeAction::TabCoverage)
+            NativeAction::parse(TAB_INSIGHTS),
+            Some(NativeAction::TabInsights)
         );
         assert_eq!(
-            NativeAction::parse(TAB_HEALTH),
-            Some(NativeAction::TabHealth)
+            NativeAction::parse(TERMINAL_DOCK),
+            Some(NativeAction::TerminalDock)
         );
-        assert_eq!(
-            NativeAction::parse(TAB_TERMINAL),
-            Some(NativeAction::TabTerminal)
-        );
-        assert_eq!(NativeAction::parse(TAB_MANVI), Some(NativeAction::TabManvi));
-        assert_eq!(NativeAction::parse(TAB_PULSE), Some(NativeAction::TabPulse));
+        // Retired views must not resolve, or an old menu build would silently
+        // store a `ViewTab` this app has no pane for. The terminal became a
+        // dock; Diff and Reflog became sections of History.
+        assert_eq!(NativeAction::parse("tab-terminal"), None);
+        assert_eq!(NativeAction::parse("tab-diff"), None);
+        assert_eq!(NativeAction::parse("tab-reflog"), None);
+        // Pulse, Coverage, Health and Storage became sections of Insights.
+        assert_eq!(NativeAction::parse("tab-pulse"), None);
+        assert_eq!(NativeAction::parse("tab-coverage"), None);
+        assert_eq!(NativeAction::parse("tab-health"), None);
+        assert_eq!(NativeAction::parse("tab-storage"), None);
+        // GitHub, MANVI, Stack and Resolve became sections of Work.
+        assert_eq!(NativeAction::parse("tab-github"), None);
+        assert_eq!(NativeAction::parse("tab-manvi"), None);
+        assert_eq!(NativeAction::parse("tab-stack"), None);
+        assert_eq!(NativeAction::parse("tab-conflict"), None);
+        // Files and Blame became sections of Code.
+        assert_eq!(NativeAction::parse("tab-files"), None);
+        assert_eq!(NativeAction::parse("tab-blame"), None);
         assert_eq!(NativeAction::parse("nope"), None);
         assert_eq!(NativeAction::parse(RECENT_EMPTY), None);
         assert_eq!(NativeAction::parse(RECENT_PREFIX), None);

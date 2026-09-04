@@ -23,6 +23,11 @@
 
 export const GRAPH_FETCH_DEBOUNCE_MS = 200;
 
+import { isRefScope, type RefScope } from "./refScope";
+
+/** The scope a request without one asks for. */
+const DEFAULT_REF_SCOPE: RefScope = "named";
+
 /** Unit separator for composite keys — invisible, untypeable, stable. */
 const KEY_SEP = "\u241f";
 
@@ -30,12 +35,20 @@ export interface GraphFetchRequest {
   path: string | null;
   query: string;
   revision: string | null;
+  /**
+   * Which refs the backend walks. Part of the request identity, not a render
+   * option: the same repository at the same query answers with a different
+   * set of rows under each scope. Optional so a caller that does not care
+   * (and every existing test) keeps the named default.
+   */
+  refScope?: RefScope;
 }
 
 export interface ScheduledLoad {
   path: string;
   query: string;
   revision: string | null;
+  refScope: RefScope;
 }
 
 export type SetTimeoutFn = (fn: () => void, ms: number) => unknown;
@@ -62,13 +75,18 @@ export function normalizeGraphQuery(query: string): string {
 }
 
 /**
- * Identity of a graph request: path, revision, and the normalized query.
- * A different query is a different graph — the backend applies every term
- * (author, sha, type, free text, path) — so each filter edit re-arms the
- * debounce window and fires its own fetch once typing settles.
+ * Identity of a graph request: path, revision, ref scope, and the normalized
+ * query. A different query is a different graph — the backend applies every
+ * term (author, sha, type, free text, path) — so each filter edit re-arms the
+ * debounce window and fires its own fetch once typing settles. The ref scope
+ * belongs here for the same reason and no other: without it, changing which
+ * refs the graph walks left the key unchanged, the scheduler treated the
+ * request as already fired, and the setting did nothing at all until some
+ * unrelated event happened to reload the pane.
  */
 export function graphRequestKey(req: GraphFetchRequest): string {
-  const base = `${req.path ?? ""}${KEY_SEP}${req.revision ?? ""}`;
+  const scope = isRefScope(req.refScope) ? req.refScope : DEFAULT_REF_SCOPE;
+  const base = `${req.path ?? ""}${KEY_SEP}${req.revision ?? ""}${KEY_SEP}${scope}`;
   const query = normalizeGraphQuery(req.query);
   return query ? `${base}${KEY_SEP}${query}` : base;
 }
@@ -132,7 +150,14 @@ export function createGraphFetchScheduler(
       if (handle === null && key === lastFiredKey) return;
       disarm();
       armedKey = key;
-      pendingReq = { path: req.path, query: normalizeGraphQuery(req.query), revision: req.revision };
+      pendingReq = {
+        path: req.path,
+        query: normalizeGraphQuery(req.query),
+        revision: req.revision,
+        // Normalized here, once, so a scope that never reached the key can
+        // never reach the load either.
+        refScope: isRefScope(req.refScope) ? req.refScope : DEFAULT_REF_SCOPE,
+      };
       handle = setTimeoutFn(fire, debounceMs);
     },
     reset() {

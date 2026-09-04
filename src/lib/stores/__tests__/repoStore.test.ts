@@ -199,7 +199,10 @@ describe("repoStore tabs", () => {
     await store.selectFileDiff("README.md");
     expect(get(store).selectedFilePath).toBe("README.md");
     expect(get(store).selectedIsStaged).toBe(false);
-    expect(get(store).activeTab).toBe("diff");
+    // Diff is a section of History now, so "landed on the diff" is two facts:
+    // the view, and the lens it is showing.
+    expect(get(store).activeTab).toBe("history");
+    expect(get(store).viewSections.history).toBe("diff");
 
     await store.openRepo("/r/beta");
     const state = get(store);
@@ -243,7 +246,8 @@ describe("repoStore tabs", () => {
     const state = get(store);
     expect(state.currentPath).toBe("/r/alpha");
     expect(state.selectedFilePath).toBe("README.md");
-    expect(state.activeTab).toBe("diff");
+    expect(state.activeTab).toBe("history");
+    expect(state.viewSections.history).toBe("diff");
     expect(state.selectedDiff).toBe("diff README.md");
   });
 
@@ -358,7 +362,11 @@ describe("repoStore tabs", () => {
     const state = get(store);
     expect(state.openTabs.map((tab) => tab.path)).toEqual(["/r/one", "/r/two"]);
     expect(state.currentPath).toBe("/r/two");
-    expect(state.activeTab).toBe("health");
+    // `health` is a retired id: it became a section of Insights, and a
+    // restored session must land on that section rather than on the view's
+    // default pane.
+    expect(state.activeTab).toBe("insights");
+    expect(state.viewSections.insights).toBe("health");
     expect(state.openTabs.find((tab) => tab.path === "/r/two")?.pinned).toBe(true);
     expect(state.lastClosed).toEqual(["/r/old"]);
     expect(graph.shown[graph.shown.length - 1]).toBe("/r/two");
@@ -390,7 +398,12 @@ describe("repoStore tabs", () => {
     const state = get(store);
     expect(state.openTabs.map((tab) => tab.path)).toEqual(["/r/left", "/r/mid", "/r/right"]);
     expect(state.currentPath).toBe("/r/mid");
-    expect(state.activeTab).toBe("diff");
+    // The blob was written by a build that still had a Diff tab. Restoring it
+    // must land on History showing the diff — not on Work, and not on
+    // History's default Graph pane, either of which would look to the user
+    // like the app lost where they were.
+    expect(state.activeTab).toBe("history");
+    expect(state.viewSections.history).toBe("diff");
     expect(state.openTabs[2]?.pinned).toBe(true);
     expect(graph.shown[graph.shown.length - 1]).toBe("/r/mid");
   });
@@ -484,12 +497,16 @@ describe("repoStore tabs", () => {
     expect(counts.setItem).toBe(0);
     expect(counts.menu).toBe(0);
 
-    await store.setActiveTab("diff");
+    await store.setActiveTab("history", "diff");
     expect(counts.setItem).toBeGreaterThan(0);
     const persistedNow = JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
-      tabs?: Array<{ path: string; viewTab: string }>;
+      tabs?: Array<{ path: string; viewTab: string; viewSections?: Record<string, string> }>;
     };
-    expect(persistedNow.tabs?.[0]).toMatchObject({ path: "/r/persist-a", viewTab: "diff" });
+    expect(persistedNow.tabs?.[0]).toMatchObject({
+      path: "/r/persist-a",
+      viewTab: "history",
+      viewSections: { history: "diff" },
+    });
   });
 });
 
@@ -1206,7 +1223,8 @@ describe("repoStore diff selection", () => {
     expect(state.selectedFilePath).toBe("src/b.ts");
     expect(state.selectedDiff).toContain("+BETA");
     expect(state.selectedDiff).not.toContain("ALPHA");
-    expect(state.activeTab).toBe("diff");
+    expect(state.activeTab).toBe("history");
+    expect(state.viewSections.history).toBe("diff");
   });
 
   it("selectCommitFileDiff surfaces backend errors without clobbering the selection", async () => {

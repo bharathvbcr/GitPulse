@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { memoryStorage, type StorageLike } from "../repos/persist";
 import {
   MAX_PINNED_REPOS,
@@ -148,13 +149,13 @@ describe("parsePinned fuzz/stress: hostile storage payloads", () => {
     const serialized = serializePinned(parsed);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(2_000);
+    expectWithinBudget(elapsedMs, 400, "pins");
     expect(parsed).toHaveLength(40_001);
     expect(parsed[parsed.length - 1]).toBe("zz-last");
     expect(parsed[0]).toBe("branch-0");
     expect(serialized.length).toBeGreaterThan(0);
     expect(parsePinned(serialized)).toEqual(parsed);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("tolerates huge single entries (megabyte branch names)", () => {
     const big = "b".repeat(1_000_000);

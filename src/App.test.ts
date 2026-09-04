@@ -71,18 +71,34 @@ describe("App view code splitting", () => {
     expect(script, `${view} has no dynamic loader`).toContain(
       `const load${view} = () => import(`,
     );
-    expect(template, `load${view} is declared but never rendered`).toContain(
-      `load={load${view}}`,
+    // Used in the template, not necessarily as `load={…}` on a LazyView:
+    // a loader may be handed to a view that owns the section it belongs to
+    // (History takes the reflog's). What must never happen is a loader that
+    // is declared and then reaches nothing, which is a chunk nobody loads.
+    expect(template, `load${view} is declared but never rendered`).toMatch(
+      new RegExp(`=\\{load${view}\\}`),
     );
   });
 
   /**
    * The default tab. Deferring it would trade a smaller entry chunk for a
    * round trip on every launch, which is the opposite of the point.
+   *
+   * Work is a section host now, so the property has to be checked through one
+   * level of delegation: App imports the host eagerly, and the host imports
+   * the pane its default section renders eagerly. Asserting only App's own
+   * import would still pass if WorkspaceView had made Overview lazy — which
+   * is exactly the startup round trip this forbids.
    */
-  it("keeps the default Work view eager", () => {
-    expect(script).toMatch(/import\s+WorkView\s+from/);
-    expect(template).toContain("<WorkView />");
+  it("keeps the default Work view eager, through its host", () => {
+    expect(script).toMatch(/import\s+WorkspaceView\s+from/);
+    expect(template).toContain("<WorkspaceView");
+    const host = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "lib/components/WorkspaceView.svelte"),
+      "utf8",
+    );
+    expect(host).toMatch(/import\s+WorkView\s+from/);
+    expect(host).toContain("<WorkView />");
   });
 
   /**
@@ -104,12 +120,13 @@ describe("App overlay wiring", () => {
     expect(imported.has("PromptModal")).toBe(true);
   });
 
-  it("does not present the commit-search bar as if it filters Work", () => {
-    const filterIdx = source.indexOf("<FilterBar");
-    expect(filterIdx).toBeGreaterThan(-1);
-    expect(source.slice(Math.max(0, filterIdx - 120), filterIdx)).toContain(
-      "showsCommitFilter($repoStore.activeTab)",
-    );
+  it("no longer strips the commit-search bar across every view", () => {
+    // It used to be a full-width row App stacked above the sidebar whenever
+    // `showsCommitFilter` said so — one of four horizontal bands before any
+    // content. The bar lives inside History's section bar now, which is the
+    // only view it filters, so App must not mount it at all.
+    expect(source).not.toContain("<FilterBar");
+    expect(source).not.toContain("showsCommitFilter");
   });
 
   it("switches to Graph before focusing commit search when the bar is unmounted", () => {
@@ -142,5 +159,38 @@ describe("App overlay wiring", () => {
     expect(source).toContain("await editorFileSaveQueue.whenIdle()");
     expect(source).toContain("hasUnsavedEditorDrafts()");
     expect(source).toContain("Discard Unsaved Edits and Quit?");
+  });
+});
+
+
+describe("App chrome preferences", () => {
+  it("drops the header action labels without dropping their accessible name", () => {
+    // The words are decoration; the icon plus aria-label is what identifies
+    // the button, so a decluttered header stays usable by a screen reader.
+    expect(source).toContain('aria-label="Open a repository"');
+    expect(source).toContain('aria-label="Clone a repository"');
+    expect(source).toContain(
+      "{#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}",
+    );
+    expect(source).toContain(
+      "{#if $interfaceStore.showHeaderActionLabels}<span>Clone...</span>{/if}",
+    );
+  });
+
+  it("hides the repository tab strip only while a single repository is open", () => {
+    // Hiding it with several tabs open would strand the other repositories.
+    const idx = source.indexOf("<RepoTabBar");
+    expect(idx).toBeGreaterThan(-1);
+    expect(source.slice(Math.max(0, idx - 160), idx)).toContain(
+      "{#if !$interfaceStore.autoHideRepoTabs || $repoStore.openTabs.length > 1}",
+    );
+  });
+
+  it("gates the diagnostics button on the shared rule, not an inline error count", () => {
+    // showsDiagnosticsButton keys off every recorded entry, so choosing
+    // "when recorded" cannot bury warnings the error badge never counted.
+    expect(source).toContain(
+      "showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)",
+    );
   });
 });

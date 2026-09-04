@@ -16,6 +16,7 @@
     Filter,
     GitCommit,
     Undo2,
+    Hash,
   } from "lucide-svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
@@ -23,12 +24,13 @@
   import { filterStore } from "../stores/filterStore";
   import { askText } from "../stores/modalStore";
   import { clampMenuPosition } from "../branches/menuPosition";
+  import { shortRefLabel } from "../graph/refScope";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
 
   export interface RefItem {
     name: string;
-    kind: "head" | "current-branch" | "local-branch" | "remote-branch" | "tag";
+    kind: "head" | "current-branch" | "local-branch" | "remote-branch" | "tag" | "other";
   }
 
   let {
@@ -257,6 +259,21 @@
         <span class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300">
           <Tag size={10} />
           {r.name}
+        </span>
+      {:else if r.kind === "other"}
+        <!--
+          A ref outside branches, remotes and tags, drawn only under the "all
+          refs" scope. Muted and marked with its full path so it reads as
+          "some other ref" rather than as a branch: an agent-harness
+          checkpoint wearing a branch chip is exactly the mislabelling that
+          made these lanes unreadable.
+        -->
+        <span
+          class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-border/60 bg-surfaceHover/60 text-textMuted"
+          title="refs/{r.name} — outside branches, remotes and tags"
+        >
+          <Hash size={10} />
+          {shortRefLabel(r.name)}
         </span>
       {:else}
         <span

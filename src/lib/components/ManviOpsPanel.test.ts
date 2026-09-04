@@ -62,3 +62,45 @@ describe("ManviOpsPanel silent background refresh", () => {
     expect(source.match(/settleBusy\(\);/g)?.length).toBeGreaterThanOrEqual(7);
   });
 });
+
+describe("ManviOpsPanel deep-link landing", () => {
+  it("consumes the pending focus request instead of replaying it", () => {
+    // The view mounts lazily, after the click that requested the section, so
+    // the effect covers both orders; taking the request is what stops an
+    // unrelated later visit from jumping to the same card.
+    expect(source).toContain("const requested = $manviFocusRequest;");
+    expect(source).toContain("takeManviFocus();");
+    expect(source).toContain("void revealFocus(requested);");
+  });
+
+  it("switches to the pane the catalog names before looking for the section", () => {
+    const reveal = source.slice(source.indexOf("async function revealFocus"));
+    expect(reveal.indexOf("pane = target.pane;")).toBeLessThan(
+      reveal.indexOf("document.getElementById(manviSectionId(id))"),
+    );
+    expect(reveal).toContain("await tick();");
+  });
+
+  it("lands instantly and moves focus with the scroll", () => {
+    // Smooth scrolling never advances in a webview that is not compositing,
+    // which turns the whole deep link into a no-op; every other
+    // scroll-into-view in the app is instant too.
+    expect(source).not.toContain('behavior: "smooth"');
+    expect(source).toContain('section.scrollIntoView({ block: "start" });');
+    expect(source).toContain("section.focus({ preventScroll: true });");
+  });
+
+  it("re-aligns over the pane's settle, and yields to a scroll gesture", () => {
+    // Cards above the target grow as their data arrives; without the second
+    // pass the reader lands just under the heading they asked for.
+    expect(source).toContain("const REALIGN_DELAYS_MS = [0, 250];");
+    expect(source).toContain('window.addEventListener(event, clearRealign, { once: true, passive: true });');
+  });
+
+  it("drops the landing cue, its timers and its listeners on teardown", () => {
+    expect(source).toContain("flashed?.classList.remove(\"gp-focus-flash\");");
+    const teardown = source.slice(source.indexOf("return () => {\n      clearFlash();"));
+    expect(teardown).toContain("clearRealign();");
+    expect(teardown).toContain("window.removeEventListener(event, clearRealign);");
+  });
+});

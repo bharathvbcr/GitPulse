@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   branchLeafName,
   filterBranchSections,
@@ -162,7 +163,7 @@ describe("groupBranches at scale", () => {
     const elapsedMs = performance.now() - t0;
 
     // Generous bound purely to catch accidental quadratic behavior.
-    expect(elapsedMs).toBeLessThan(2000);
+    expectWithinBudget(elapsedMs, 400, "groupBranches");
 
     // Correctness spot checks: every branch lands in exactly one section.
     const totalGrouped = sections.reduce((n, s) => n + s.branchCount, 0);
@@ -185,7 +186,7 @@ describe("groupBranches at scale", () => {
       deepest = next!;
     }
     expect(deepest.branches.map((b) => b.name)).toEqual(["lvl0/lvl1/lvl2/lvl3/br19999"]);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("supports pinned branches and tab filtering", () => {
     const branches = [

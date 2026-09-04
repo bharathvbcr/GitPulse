@@ -80,11 +80,18 @@ CHANGELOG_DRAFT.md
 !.devcouncil/config.yaml
 
 # Local AI coding agents
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
 .codex/
 .aider*
 .gemini/
 .claude*
+!/.claude-plugin/
+!/.claude-plugin/marketplace.json
+!/plugins/gitpulse/.claude-plugin/
+!/plugins/gitpulse/.claude-plugin/plugin.json
 .cursor/
 .openhands/
 .opencode/

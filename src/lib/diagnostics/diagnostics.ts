@@ -101,7 +101,22 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
   { prefix: "sk-", minLength: 45, alphanumericBody: true },
 ];
 
-const SEPARATE_SECRET_FLAGS = new Set([
+/**
+ * Field names whose *value* is a credential, whatever syntax carries them.
+ *
+ * One table, three call sites: a CLI flag (`--client-secret X`), a JSON object
+ * key (`{"client_secret": "X"}`) and the contextual `name=value` regexes below
+ * must agree, because a name treated as secret in one syntax and ignored in
+ * another is precisely how a credential redacted at one gate walks out of the
+ * next. `authorization`, `cookie` and `private_key` are here because the
+ * contextual stage already treats them as secret-bearing in prose; a JSON key
+ * of the same name must not be weaker than the same name in a log line.
+ *
+ * Mirrored by `SECRET_FIELD_NAMES` in `src-tauri/src/ledger/redact.rs`, and
+ * bound to it by `scripts/diagnostics-contract.test.ts` so the two cannot
+ * drift apart unnoticed.
+ */
+export const SECRET_FIELD_NAMES: readonly string[] = [
   "password",
   "passwd",
   "api_key",
@@ -117,7 +132,73 @@ const SEPARATE_SECRET_FLAGS = new Set([
   "aws_secret_access_key",
   "aws_session_token",
   "aws_access_key_id",
-]);
+  "authorization",
+  "cookie",
+  "set_cookie",
+  "private_key",
+];
+
+/**
+ * Trailing words that make a compound name a credential name.
+ *
+ * `github_token` and `webhook_secret` are credentials for the same reason
+ * `token` and `secret` are, and enumerating every vendor prefix is the losing
+ * half of that race. Deliberately excludes the bare word `key`, which would
+ * swallow `public_key`, `cache_key` and `primary_key` and gut the diagnostic
+ * value of the report to redact nothing that is actually secret.
+ */
+export const SECRET_FIELD_SUFFIXES: readonly string[] = [
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "api_key",
+  "apikey",
+  "credential",
+  "credentials",
+];
+
+const SEPARATE_SECRET_FLAGS = new Set(SECRET_FIELD_NAMES);
+
+/**
+ * A field name in comparable form: `X-Api-Key`, `clientSecret` and
+ * `client-secret` all have to reach the table as `x_api_key`, `client_secret`
+ * and `client_secret`.
+ */
+export function normalizeFieldName(key: string): string {
+  let out = "";
+  let prevWasLowerOrDigit = false;
+  for (const character of key) {
+    if (character === "-" || character === "_" || character === "." || character === " ") {
+      if (out.length > 0 && !out.endsWith("_")) out += "_";
+      prevWasLowerOrDigit = false;
+      continue;
+    }
+    if (character >= "A" && character <= "Z") {
+      // camelCase boundary: `accessToken` must not normalize to one word.
+      if (prevWasLowerOrDigit && !out.endsWith("_")) out += "_";
+      out += character.toLowerCase();
+      prevWasLowerOrDigit = false;
+    } else {
+      out += character.toLowerCase();
+      prevWasLowerOrDigit =
+        (character >= "a" && character <= "z") || (character >= "0" && character <= "9");
+    }
+  }
+  return out.replace(/^_+/, "").replace(/_+$/, "");
+}
+
+function isSecretName(normalized: string): boolean {
+  if (SEPARATE_SECRET_FLAGS.has(normalized)) return true;
+  return SECRET_FIELD_SUFFIXES.some(
+    (suffix) => normalized.endsWith(suffix) && normalized.at(-suffix.length - 1) === "_",
+  );
+}
+
+/** Whether a JSON object key declares its value to be a credential. */
+export function isSecretFieldName(key: string): boolean {
+  return isSecretName(normalizeFieldName(key));
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -161,7 +242,8 @@ function normalizeCliFlag(value: string): string | null {
 }
 
 function isSeparateSecretFlag(value: string): boolean {
-  return SEPARATE_SECRET_FLAGS.has(normalizeCliFlag(value) ?? "");
+  const flag = normalizeCliFlag(value);
+  return flag === null ? false : isSecretName(flag);
 }
 
 function isUserinfoFlag(value: string): boolean {
@@ -227,6 +309,64 @@ interface RedactedCliJsonValue {
   changed: boolean;
 }
 
+/**
+ * Redacts credentials that appear as object *keys* rather than values.
+ *
+ * The value side of this seam was blind to its keys; the key side was blind to
+ * its own contents. A token is a token wherever it sits, and
+ * `{"ghp_…": {…}}` — a cache or rate-limit map keyed by the credential — put
+ * one in the diagnostics report in full while the identical token one
+ * character to the right was redacted.
+ *
+ * A rename that would collide with a key already present is disambiguated
+ * rather than allowed to overwrite: two distinct tokens of the same length
+ * redact to the same text, and silently dropping one entry would make the
+ * document claim there was only ever one.
+ */
+function redactObjectKeys(value: Record<string, unknown>, depth: number): boolean {
+  const keys = Object.keys(value);
+  const renames = new Map<string, string>();
+  for (const key of keys) {
+    const redacted = redactValueAtDepth(key, depth + 1);
+    if (redacted !== key) renames.set(key, redacted);
+  }
+  if (renames.size === 0) return false;
+  const rebuilt = new Map<string, unknown>();
+  // Next ordinal per colliding base name. A linear probe from 2 on every
+  // insertion is quadratic exactly when the attack is cheapest to mount: N
+  // distinct tokens of equal length all redact to the SAME text, so key n pays
+  // n probes. Measured at 20k such keys: 31s probing, 24ms with this counter.
+  const nextOrdinal = new Map<string, number>();
+  for (const key of keys) {
+    const replacement = renames.get(key) ?? key;
+    let candidate = replacement;
+    let ordinal = nextOrdinal.get(replacement) ?? 2;
+    // The counter alone can still land on a literal key already present
+    // (a document containing both `x` and `x #2`), so confirm before using it.
+    while (rebuilt.has(candidate)) {
+      candidate = `${replacement} #${ordinal}`;
+      ordinal += 1;
+    }
+    nextOrdinal.set(replacement, ordinal);
+    rebuilt.set(candidate, value[key]);
+    delete value[key];
+  }
+  for (const [key, entry] of rebuilt) {
+    // `value[key] = entry` silently loses the entry when `key` is `__proto__`:
+    // the own property was just deleted, so the assignment reaches
+    // Object.prototype's setter and sets the prototype instead of storing
+    // anything. JSON.parse creates `__proto__` as a genuine own property, so a
+    // document can carry one, and dropping it would quietly shrink the report.
+    Object.defineProperty(value, key, {
+      value: entry,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return true;
+}
+
 function redactCliJsonValue(value: unknown, depth = 0): RedactedCliJsonValue {
   if (depth >= MAX_SERIALIZED_NESTING) {
     // Reaching the work bound means the remaining subtree was not inspected.
@@ -248,8 +388,20 @@ function redactCliJsonValue(value: unknown, depth = 0): RedactedCliJsonValue {
     return { value, changed };
   }
   if (value && typeof value === "object") {
-    let changed = false;
+    let changed = redactObjectKeys(value as Record<string, unknown>, depth);
     for (const [key, valueAtKey] of Object.entries(value)) {
+      // A key that names a credential says what its value is, and it says so
+      // for every shape the value can take. Recursing instead would hand the
+      // value to the contextual stage stripped of the only context that
+      // identified it — which is how `{"access_token": "<opaque>"}`, the shape
+      // every OAuth response has, reached the diagnostics report in full.
+      if (isSecretFieldName(key)) {
+        if (valueAtKey !== "<redacted>") {
+          (value as Record<string, unknown>)[key] = "<redacted>";
+          changed = true;
+        }
+        continue;
+      }
       const nested = redactCliJsonValue(valueAtKey, depth + 1);
       if (nested.changed) {
         (value as Record<string, unknown>)[key] = nested.value;

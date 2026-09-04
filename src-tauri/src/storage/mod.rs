@@ -145,6 +145,93 @@ pub struct BranchStorageSummary {
     pub error: Option<String>,
 }
 
+/// How confident the audit is that a reclaim item's bytes are real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimConfidence {
+    /// The bytes were walked and counted. Deleting the item frees this much.
+    Measured,
+    /// The bytes are an upper bound on what the action could free — repacking
+    /// loose objects reclaims *some* of their size, never all of it.
+    Estimated,
+}
+
+/// Whether reclaiming is a decision GitPulse would make for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimSafety {
+    /// Regenerable output. Deleting it costs a rebuild and nothing else.
+    Safe,
+    /// Needs a human: the content may not be reproducible, or removing it
+    /// changes what git tracks.
+    NeedsReview,
+}
+
+/// What kind of waste an item is. The UI groups by this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimCategory {
+    BuildOutput,
+    Cache,
+    /// Loose objects a repack would compact.
+    GitObjects,
+    /// Reflog entries past their expiry.
+    Reflog,
+    /// `.git/worktrees/<name>` whose worktree no longer exists on disk.
+    OrphanedWorktreeAdmin,
+    /// Local branches already merged into the default branch.
+    MergedBranches,
+    /// Oversized files in the working tree.
+    LargeFile,
+}
+
+/// One line of the reclaim audit: a thing taking space, what it would take to
+/// get the space back, and how sure the audit is about both.
+///
+/// The report used to publish raw sizes and leave every judgement to the
+/// reader: `artifacts` said a directory was 4 GB, `gc_recommended` was a bare
+/// boolean, prunable worktree admin was not detected at all, and nothing
+/// anywhere said how many bytes were actually recoverable. A number with no
+/// action attached is not an audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimItem {
+    pub category: ReclaimCategory,
+    /// Repository-relative path, or a synthetic label for items that are not
+    /// one path (`.git objects`, `merged branches`).
+    pub label: String,
+    pub bytes: u64,
+    pub confidence: ReclaimConfidence,
+    pub safety: ReclaimSafety,
+    /// The command that reclaims it. Shown, never run: this audit reports, and
+    /// destructive git operations stay behind the user's own hand.
+    pub action: String,
+    /// Why this item is here, in one sentence.
+    pub detail: String,
+    /// Set when something prevents a straightforward reclaim — a build
+    /// directory with files committed to git, for instance.
+    pub blocked_reason: Option<String>,
+}
+
+/// The audit's bottom line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReclaimSummary {
+    /// Sum of `Measured` + `Safe` items only.
+    ///
+    /// Deliberately narrow. Adding estimates in would produce a headline the
+    /// repository cannot actually deliver, and adding `NeedsReview` items in
+    /// would promise space that only exists if the user agrees to lose
+    /// something. Both are reported separately rather than folded in.
+    pub reclaimable_bytes: u64,
+    /// Upper bound contributed by `Estimated` items.
+    pub estimated_bytes: u64,
+    /// Bytes behind items a human has to judge.
+    pub needs_review_bytes: u64,
+    pub item_count: usize,
+    /// True when the walk that fed this audit was cut short, so the ledger is
+    /// a sample and `reclaimable_bytes` is a floor.
+    pub partial: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanStats {
     pub elapsed_ms: u128,
@@ -180,6 +267,11 @@ pub struct StorageReport {
     /// already `totals.worktree_bytes`; only additional worktrees appear here.
     pub worktrees: Vec<WorktreeUsage>,
     pub branches: BranchStorageSummary,
+    /// Ranked reclaim audit, largest recoverable first.
+    #[serde(default)]
+    pub reclaim: Vec<ReclaimItem>,
+    #[serde(default)]
+    pub reclaim_summary: ReclaimSummary,
     pub scan: ScanStats,
 }
 
@@ -1032,6 +1124,212 @@ fn branch_summary(repo_path: &str) -> BranchStorageSummary {
 
 /// Full storage scan. Fails only when `repo_path` is not a readable git
 /// repository; everything else degrades into the report.
+/// Cap on reclaim rows. The audit is a to-do list, not an inventory.
+const MAX_RECLAIM_ITEMS: usize = 40;
+
+/// Loose-object weight past which repacking is worth suggesting.
+const GC_LOOSE_OBJECT_FLOOR: u64 = 10_000;
+const GC_LOOSE_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
+
+/// Reflog weight past which expiry is worth suggesting. Below this the reflog
+/// is doing its job cheaply and telling the user to prune their own safety net
+/// would be bad advice.
+const RECLAIM_REFLOG_FLOOR: u64 = 32 * 1024 * 1024;
+
+/// Linked-worktree admin directories whose worktree is gone.
+///
+/// `.git/worktrees/<name>/gitdir` holds the path of the `.git` file inside the
+/// checkout. When that path no longer exists the worktree was deleted with
+/// `rm -rf` instead of `git worktree remove`, and the admin directory — index
+/// copy, HEAD, ORIG_HEAD, per-worktree refs — is pure residue that `git
+/// worktree prune` deletes.
+///
+/// Nothing in the previous report noticed this. `worktrees_admin_bytes` counted
+/// the space and attributed it to live worktrees.
+fn orphaned_worktree_admin(git_dir: &Path, budget: &mut WalkBudget) -> Vec<(String, u64)> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(git_dir.join("worktrees")) else {
+        return found;
+    };
+    for entry in entries.flatten().take(MAX_SIZED_WORKTREES * 8) {
+        if budget.exhausted() {
+            break;
+        }
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            // No gitdir file at all: git itself treats this as prunable.
+            let (bytes, _) = size_tree(&admin, budget);
+            found.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+            continue;
+        };
+        let target = PathBuf::from(gitdir.trim());
+        if target.as_os_str().is_empty() || target.exists() {
+            continue;
+        }
+        let (bytes, _) = size_tree(&admin, budget);
+        found.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+    }
+    found
+}
+
+/// Builds the reclaim audit from measurements the scan already took.
+///
+/// Everything here is derived, not re-walked — the audit costs one extra
+/// `read_dir` of `.git/worktrees` and nothing else. An audit that doubled the
+/// scan time would not be run often enough to matter.
+fn build_reclaim(
+    artifacts: &[ArtifactDir],
+    git: &GitStorage,
+    branches: &BranchStorageSummary,
+    large_files: &[LargeFile],
+    orphaned_admin: &[(String, u64)],
+    partial: bool,
+) -> (Vec<ReclaimItem>, ReclaimSummary) {
+    let mut items: Vec<ReclaimItem> = Vec::new();
+
+    for artifact in artifacts {
+        if artifact.bytes == 0 {
+            continue;
+        }
+        let committed = artifact.tracked_files > 0;
+        let category = match artifact.kind {
+            ArtifactKind::Build => ReclaimCategory::BuildOutput,
+            ArtifactKind::Cache => ReclaimCategory::Cache,
+        };
+        items.push(ReclaimItem {
+            category,
+            label: artifact.path.clone(),
+            bytes: artifact.bytes,
+            confidence: ReclaimConfidence::Measured,
+            // Committed content is not regenerable output any more, whatever
+            // the directory is named: deleting it changes the working tree.
+            safety: if committed {
+                ReclaimSafety::NeedsReview
+            } else {
+                ReclaimSafety::Safe
+            },
+            action: format!("rm -rf {}", artifact.path),
+            detail: if committed {
+                format!(
+                    "{} file(s) inside this directory are tracked by git.",
+                    artifact.tracked_files
+                )
+            } else if artifact.unignored {
+                "Regenerable output that no ignore rule covers, so it shows up in every status listing.".into()
+            } else {
+                "Regenerable build or cache output.".into()
+            },
+            blocked_reason: committed.then(|| {
+                "Tracked in git — removing it is a commit, not a cleanup.".to_string()
+            }),
+        });
+    }
+
+    for (name, bytes) in orphaned_admin {
+        items.push(ReclaimItem {
+            category: ReclaimCategory::OrphanedWorktreeAdmin,
+            label: format!(".git/worktrees/{name}"),
+            bytes: *bytes,
+            confidence: ReclaimConfidence::Measured,
+            safety: ReclaimSafety::Safe,
+            action: "git worktree prune".into(),
+            detail: "Admin state for a linked worktree whose directory no longer exists.".into(),
+            blocked_reason: None,
+        });
+    }
+
+    if git.loose_object_count > GC_LOOSE_OBJECT_FLOOR || git.loose_bytes > GC_LOOSE_BYTES_FLOOR {
+        items.push(ReclaimItem {
+            category: ReclaimCategory::GitObjects,
+            label: ".git/objects (loose)".into(),
+            bytes: git.loose_bytes,
+            // A repack compresses and deduplicates; how much it wins depends on
+            // the content. Reporting the loose size as recoverable would be a
+            // promise the repository cannot keep.
+            confidence: ReclaimConfidence::Estimated,
+            safety: ReclaimSafety::Safe,
+            action: "git gc".into(),
+            detail: format!(
+                "{} loose object(s). Repacking compacts them; the figure is their current size, not the guaranteed saving.",
+                git.loose_object_count
+            ),
+            blocked_reason: None,
+        });
+    }
+
+    if git.reflog_bytes > RECLAIM_REFLOG_FLOOR {
+        items.push(ReclaimItem {
+            category: ReclaimCategory::Reflog,
+            label: ".git/logs".into(),
+            bytes: git.reflog_bytes,
+            confidence: ReclaimConfidence::Estimated,
+            // The reflog is the undo history for every ref. Expiring it is a
+            // real loss of recoverability, so it is never "safe" here.
+            safety: ReclaimSafety::NeedsReview,
+            action: "git reflog expire --expire=90.days --all && git gc --prune=now".into(),
+            detail: "Reflog entries accumulate without bound until expired; they are also what makes a bad reset recoverable.".into(),
+            blocked_reason: None,
+        });
+    }
+
+    if branches.merged_stale_count > 0 {
+        items.push(ReclaimItem {
+            category: ReclaimCategory::MergedBranches,
+            label: format!("{} merged branch(es)", branches.merged_stale_count),
+            // Branch refs are ~41 bytes each; the space is not the point, the
+            // clutter is. Reporting a byte figure would overstate the win.
+            bytes: 0,
+            confidence: ReclaimConfidence::Estimated,
+            safety: ReclaimSafety::NeedsReview,
+            action: "Review in MANVI cleanup".into(),
+            detail: "Local branches already merged into the default branch. They cost almost no disk, but they crowd every branch listing.".into(),
+            blocked_reason: None,
+        });
+    }
+
+    for file in large_files.iter().take(5) {
+        items.push(ReclaimItem {
+            category: ReclaimCategory::LargeFile,
+            label: file.path.clone(),
+            bytes: file.bytes,
+            confidence: ReclaimConfidence::Measured,
+            // GitPulse has no idea whether this is a dataset the user needs.
+            safety: ReclaimSafety::NeedsReview,
+            action: "Review, or move to Git LFS".into(),
+            detail: "An oversized file in the working tree.".into(),
+            blocked_reason: None,
+        });
+    }
+
+    // Largest first, and a stable tiebreak so two scans of an unchanged
+    // repository produce byte-identical reports.
+    items.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
+    items.truncate(MAX_RECLAIM_ITEMS);
+
+    let mut summary = ReclaimSummary {
+        item_count: items.len(),
+        partial,
+        ..Default::default()
+    };
+    for item in &items {
+        match (item.confidence, item.safety) {
+            (ReclaimConfidence::Measured, ReclaimSafety::Safe) => {
+                summary.reclaimable_bytes = summary.reclaimable_bytes.saturating_add(item.bytes);
+            }
+            (ReclaimConfidence::Estimated, _) => {
+                summary.estimated_bytes = summary.estimated_bytes.saturating_add(item.bytes);
+            }
+            (ReclaimConfidence::Measured, ReclaimSafety::NeedsReview) => {
+                summary.needs_review_bytes = summary.needs_review_bytes.saturating_add(item.bytes);
+            }
+        }
+    }
+    (items, summary)
+}
+
 pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let started = Instant::now();
     let repo = validate_repo(repo_path)?;
@@ -1190,6 +1488,18 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let is_truncated =
         worktree_budget.truncated || git_truncated || git_budget.truncated || wt_truncated;
 
+    // The deep audit. Derived from what the walks already measured, plus one
+    // cheap read_dir for prunable worktree admin.
+    let orphaned_admin = orphaned_worktree_admin(&git_dir, &mut git_budget);
+    let (reclaim, reclaim_summary) = build_reclaim(
+        &artifacts,
+        &git_storage,
+        &branches,
+        &large_files,
+        &orphaned_admin,
+        is_truncated,
+    );
+
     Ok(StorageReport {
         repo_path: repo_path.to_string(),
         generated_at_epoch_secs: SystemTime::now()
@@ -1209,6 +1519,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         largest_files: large_files,
         worktrees,
         branches,
+        reclaim,
+        reclaim_summary,
         scan: ScanStats {
             elapsed_ms: started.elapsed().as_millis(),
             files_visited: total_files,

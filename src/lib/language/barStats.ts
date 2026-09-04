@@ -99,3 +99,67 @@ export function pickLanguageBarStats(
   });
   return shown;
 }
+
+/** What a language reading is worth, once the caveats are applied. */
+export interface LanguageMix {
+  /** Languages to draw, already deduped and capped. Empty when unmeasured. */
+  stats: LanguageStat[];
+  /** The language the bar leads with, ignoring the "Other" aggregate. */
+  dominant: LanguageStat | null;
+  /**
+   * True when the percentages are a floor rather than a total — the scan was
+   * capped, or the repository moved since it ran. Both halves matter: a
+   * capped scan rendered as a complete one is the exact failure the backend's
+   * `truncated` flag exists to prevent, and a stale one is the same lie with
+   * a later timestamp.
+   */
+  partial: boolean;
+  /** Why the reading is partial, in the user's words; null when it is not. */
+  partialNotice: string | null;
+  /** True when the measurement failed and nothing survives to show. */
+  failed: boolean;
+}
+
+/** The shape `describeLanguageMix` needs from a metric snapshot. */
+export interface LanguageMixInput {
+  value: LanguageStatsReport | null;
+  state: "idle" | "loading" | "ready" | "failed";
+  /** Non-null when the value no longer describes the repository. */
+  stale: string | null;
+}
+
+const EMPTY_MIX: LanguageMix = {
+  stats: [],
+  dominant: null,
+  partial: false,
+  partialNotice: null,
+  failed: false,
+};
+
+/**
+ * Reduces a LOC metric snapshot to what the language segment draws.
+ *
+ * Kept out of the component so the honesty rule — that a capped or stale scan
+ * never renders as a complete reading — is a testable function rather than a
+ * condition buried in markup.
+ */
+export function describeLanguageMix(snapshot: LanguageMixInput): LanguageMix {
+  const failed = snapshot.state === "failed" && snapshot.value === null;
+  if (!snapshot.value || !Array.isArray(snapshot.value.stats)) {
+    return { ...EMPTY_MIX, failed };
+  }
+  const stats = pickLanguageBarStats(snapshot.value.stats);
+  const truncated = snapshot.value.truncated === true;
+  const stale = snapshot.stale !== null;
+  return {
+    stats,
+    dominant: stats.find((s) => s.language !== "Other") ?? stats[0] ?? null,
+    partial: truncated || stale,
+    partialNotice: truncated
+      ? `Partial scan: ${snapshot.value.scanned_files} of ${snapshot.value.candidate_files} files counted`
+      : stale
+        ? "The repository changed since this scan; percentages are a floor."
+        : null,
+    failed,
+  };
+}

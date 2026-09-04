@@ -94,6 +94,14 @@ tempfile = "3.10"
 # IPC bridge instead of calling the functions directly.
 tauri = { version = "2.0.0", features = ["test"] }
 
+# `build_native_menu` can only run on the process main thread (muda creates
+# NSMenuItem there and panics anywhere else), and a libtest harness runs every
+# case on a worker thread. `harness = false` gives this target its own `main`,
+# which IS the main thread — so the menu builder is reachable from a test.
+[[test]]
+name = "native_menu_main_thread"
+harness = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"

@@ -4,6 +4,7 @@ import * as checkCoverageTypes from "./check-coverage-types.mjs";
 import * as checkReleaseVersion from "./check-release-version.mjs";
 import * as checkReleaseAssets from "./check-release-assets.mjs";
 import * as checkCoverageFloor from "./check-coverage-floor.mjs";
+import * as checkMcpInstall from "./check-mcp-install.mjs";
 import * as releaseNotes from "./release-notes.mjs";
 import * as vendorCrates from "./vendor-crates.mjs";
 
@@ -12,22 +13,23 @@ import * as vendorCrates from "./vendor-crates.mjs";
  * exit 0 — the distinction between "helped" and "failed" is the point, so the
  * exit code is asserted, not just the output.
  */
-const ENTRY_POINTS: Array<[string, { main: (argv: string[]) => number }]> = [
+const ENTRY_POINTS: Array<[string, { main: (argv: string[]) => number | Promise<number> }]> = [
   ["check-ipc-contract", checkIpcContract],
   ["check-coverage-types", checkCoverageTypes],
   ["check-release-version", checkReleaseVersion],
   ["check-release-assets", checkReleaseAssets],
   ["check-coverage-floor", checkCoverageFloor],
+  ["check-mcp-install", checkMcpInstall],
   ["release-notes", releaseNotes],
   ["vendor-crates", vendorCrates],
 ];
 
-function captureLog(run: () => number): { code: number; text: string } {
+async function captureLog(run: () => number | Promise<number>): Promise<{ code: number; text: string }> {
   const logged: string[] = [];
   const original = console.log;
   console.log = (...args: unknown[]) => void logged.push(args.join(" "));
   try {
-    return { code: run(), text: logged.join("\n") };
+    return { code: await run(), text: logged.join("\n") };
   } finally {
     console.log = original;
   }
@@ -35,9 +37,9 @@ function captureLog(run: () => number): { code: number; text: string } {
 
 describe("CLI help contract", () => {
   for (const [name, module] of ENTRY_POINTS) {
-    it(`${name} answers --help with usage and exit 0`, () => {
-      const long = captureLog(() => module.main(["--help"]));
-      const short = captureLog(() => module.main(["-h"]));
+    it(`${name} answers --help with usage and exit 0`, async () => {
+      const long = await captureLog(() => module.main(["--help"]));
+      const short = await captureLog(() => module.main(["-h"]));
       expect(long.code).toBe(0);
       expect(short.code).toBe(0);
       expect(long.text).toContain("Usage:");

@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { repoStore } from "../../stores/repoStore";
   import { pulseStore } from "../../pulse/pulseStore";
   import PulseHeatmap from "./PulseHeatmap.svelte";
@@ -18,6 +17,8 @@
   import type { CoverageReport } from "../../coverage/types";
   import type { LanguageStatsReport } from "../../language/barStats";
   import { computeCommitWindow, computeHygiene } from "../../pulse/metrics";
+  import { coverageMetric, locMetric, totalCodeLines } from "../../metrics/repoMetrics";
+  import type { MetricSnapshot } from "../../metrics/freshness";
   import {
     Activity,
     AlertCircle,
@@ -36,10 +37,8 @@
     | { status: "failed" };
 
   let locState = $state<LocState>({ status: "idle" });
-  let locGeneration = 0;
   let coverageReport = $state<CoverageReport | null>(null);
   let coverageFailed = $state(false);
-  let coverageGeneration = 0;
   let coverageRequested = $state(false);
   let activeTab = $state<"overview" | "hotspots" | "knowledge" | "dora">("overview");
   let exportModalOpen = $state(false);
@@ -48,6 +47,22 @@
     { path: string; name: string; value: number | null; truncated: boolean; failed: boolean }[]
   >([]);
   let loadedPath = $state<string | null>(null);
+  /** Live subscriptions for the other open tabs, torn down with the view. */
+  let workspaceUnsubscribes: (() => void)[] = [];
+
+  /** Maps a LOC metric snapshot onto this view's display state. */
+  function toLocState(snap: MetricSnapshot<LanguageStatsReport>): LocState {
+    if (snap.value === null) {
+      return snap.state === "failed"
+        ? { status: "failed" }
+        : { status: snap.state === "loading" ? "loading" : "idle" };
+    }
+    const value = totalCodeLines(snap.value) ?? 0;
+    // `partial` covers both halves of "this is a floor, not a total": the
+    // backend truncated the scan, or the repository has changed since it ran.
+    const truncated = snap.value.truncated === true || snap.stale !== null;
+    return { status: truncated ? "partial" : "ok", value, truncated };
+  }
 
   $effect(() => {
     const path = $repoStore.currentPath;
@@ -58,97 +73,78 @@
       return;
     }
     void pulseStore.load(path);
-    void fetchTotalLoc(path);
-    void fetchWorkspaceLoc();
-    coverageReport = null;
-    coverageFailed = false;
-    coverageRequested = false;
     authorFilter = "all";
   });
 
+  // LOC now tracks the repository instead of the tab that opened it: the
+  // metric revalidates on every settled write, so the headline line count
+  // moves as the user works rather than freezing at whatever it was when this
+  // view was first mounted.
   $effect(() => {
     const path = $repoStore.currentPath;
-    if (activeTab === "hotspots" && path && !coverageRequested) {
-      void fetchCoverage(path);
+    if (!path) {
+      locState = { status: "idle" };
+      return;
     }
+    return locMetric.subscribe(path, (snap) => {
+      locState = toLocState(snap);
+      // Only a complete, current measurement is worth recording as a history
+      // point; a truncated or stale one would put a false dip in the trend.
+      if (snap.value && snap.stale === null && snap.value.truncated !== true) {
+        void pulseStore.recordSnapshot(totalCodeLines(snap.value) ?? 0);
+      }
+    });
   });
 
-  async function fetchTotalLoc(path: string) {
-    const gen = ++locGeneration;
-    locState = { status: "loading" };
-    try {
-      const langReport = await invoke<LanguageStatsReport>("cmd_get_language_stats", {
-        repoPath: path,
-      });
-      if (gen !== locGeneration) return;
-      const value = (langReport?.stats ?? []).reduce(
-        (sum: number, s) => sum + (s.code_lines ?? 0),
-        0,
-      );
-      const truncated = langReport?.truncated === true;
-      locState = { status: truncated ? "partial" : "ok", value, truncated };
-      if (!truncated) {
-        void pulseStore.recordSnapshot(value);
-      }
-    } catch {
-      if (gen !== locGeneration) return;
-      locState = { status: "failed" };
-    }
-  }
-
-  async function fetchCoverage(path: string) {
-    const gen = ++coverageGeneration;
+  // One shared coverage measurement. This view and CoverageViewer used to
+  // invoke `cmd_scan_coverage` separately and could disagree about the result.
+  $effect(() => {
+    const path = $repoStore.currentPath;
+    if (!path || activeTab !== "hotspots") return;
     coverageRequested = true;
-    try {
-      const report = await invoke<CoverageReport>("cmd_scan_coverage", {
-        repoPath: path,
-      });
-      if (gen !== coverageGeneration) return;
-      coverageReport = report;
-      coverageFailed = false;
-    } catch {
-      if (gen !== coverageGeneration) return;
-      coverageReport = null;
-      coverageFailed = true;
-    }
-  }
+    return coverageMetric.subscribe(path, (snap) => {
+      coverageReport = snap.value;
+      coverageFailed = snap.state === "failed" && snap.value === null;
+    });
+  });
 
-  async function fetchWorkspaceLoc() {
+  // Per-tab line counts for the workspace comparison strip. Same metric, so a
+  // repository open in two places is measured once.
+  $effect(() => {
     const tabs = $repoStore.openTabs;
+    for (const off of workspaceUnsubscribes) off();
+    workspaceUnsubscribes = [];
     if (tabs.length < 2) {
       workspaceLoc = [];
       return;
     }
-    const rows = await Promise.all(
-      tabs.map(async (tab) => {
-        try {
-          const langReport = await invoke<LanguageStatsReport>("cmd_get_language_stats", {
-            repoPath: tab.path,
-          });
-          const value = (langReport?.stats ?? []).reduce(
-            (sum: number, s) => sum + (s.code_lines ?? 0),
-            0,
-          );
-          return {
-            path: tab.path,
-            name: tab.label || tab.name,
-            value,
-            truncated: langReport?.truncated === true,
-            failed: false,
-          };
-        } catch {
-          return {
-            path: tab.path,
-            name: tab.label || tab.name,
-            value: null,
-            truncated: false,
-            failed: true,
-          };
-        }
+    const rows = tabs.map((tab) => ({
+      path: tab.path,
+      name: tab.label || tab.name,
+      value: null as number | null,
+      truncated: false,
+      failed: false,
+    }));
+    workspaceLoc = rows;
+    workspaceUnsubscribes = tabs.map((tab, index) =>
+      locMetric.subscribe(tab.path, (snap) => {
+        const next = [...workspaceLoc];
+        const row = next[index];
+        if (!row || row.path !== tab.path) return;
+        next[index] = {
+          ...row,
+          value: snap.value ? (totalCodeLines(snap.value) ?? 0) : null,
+          truncated: snap.value?.truncated === true || snap.stale !== null,
+          failed: snap.state === "failed" && snap.value === null,
+        };
+        workspaceLoc = next;
       }),
     );
-    workspaceLoc = rows;
-  }
+    return () => {
+      for (const off of workspaceUnsubscribes) off();
+      workspaceUnsubscribes = [];
+    };
+  });
 
   function handleDeepenScan() {
     if ($repoStore.currentPath) {

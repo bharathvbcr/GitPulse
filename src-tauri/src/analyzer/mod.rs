@@ -10,4 +10,4 @@ pub use coverage::{CoverageReport, CoverageScanner, FileCoverage};
 pub use deps::{DepsHealthReport, DepsScanner};
 pub use filter::CommitFilter;
 pub use language::{LanguageDetector, LanguageInfo};
-pub use loc_counter::{DiffChurn, LineCounts, LocCounter};
+pub use loc_counter::{CommentSyntax, DiffChurn, LineCounts, LocCounter, StringSyntax};

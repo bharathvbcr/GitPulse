@@ -89,6 +89,29 @@ CREATE TABLE IF NOT EXISTS pulse_snapshots (
   UNIQUE(day, repo_path)
 );
 CREATE INDEX IF NOT EXISTS idx_pulse_snapshots_repo_day ON pulse_snapshots(repo_path, day);
+CREATE TABLE IF NOT EXISTS fleet_metrics (
+  repo_path                 TEXT PRIMARY KEY,
+  loc                       INTEGER,
+  loc_language              TEXT,
+  loc_truncated             INTEGER NOT NULL DEFAULT 0,
+  loc_at                    TEXT,
+  storage_bytes             INTEGER,
+  storage_git_bytes         INTEGER,
+  storage_reclaimable_bytes INTEGER,
+  storage_truncated         INTEGER NOT NULL DEFAULT 0,
+  storage_at                TEXT,
+  vulns_critical            INTEGER,
+  vulns_high                INTEGER,
+  vulns_moderate            INTEGER,
+  vulns_low                 INTEGER,
+  vulns_unknown             INTEGER,
+  vulns_total               INTEGER,
+  health_complete           INTEGER NOT NULL DEFAULT 0,
+  health_at                 TEXT,
+  coverage_pct              REAL,
+  coverage_truncated        INTEGER NOT NULL DEFAULT 0,
+  coverage_at               TEXT
+);
 "#;
 
 /// This build's event schema version, written into every row.
@@ -1480,6 +1503,231 @@ pub fn get_pulse_snapshots(
     })
 }
 
+/// One repository's cached expensive-scan results, as the Fleet grid reads them.
+///
+/// Every family carries its own nullable value AND its own timestamp. `None`
+/// with a `None` timestamp is "never scanned"; a value with a timestamp is a
+/// measurement whose age can be shown. There is deliberately no encoding for
+/// "scanned, but we forgot when" — that is how a stale number comes to be read
+/// as a current one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetMetrics {
+    pub repo_path: String,
+    pub loc: Option<i64>,
+    pub loc_language: Option<String>,
+    pub loc_truncated: bool,
+    pub loc_at: Option<String>,
+    pub storage_bytes: Option<i64>,
+    pub storage_git_bytes: Option<i64>,
+    pub storage_reclaimable_bytes: Option<i64>,
+    pub storage_truncated: bool,
+    pub storage_at: Option<String>,
+    pub vulns_critical: Option<i64>,
+    pub vulns_high: Option<i64>,
+    pub vulns_moderate: Option<i64>,
+    pub vulns_low: Option<i64>,
+    pub vulns_unknown: Option<i64>,
+    pub vulns_total: Option<i64>,
+    pub health_complete: bool,
+    pub health_at: Option<String>,
+    pub coverage_pct: Option<f64>,
+    pub coverage_truncated: bool,
+    pub coverage_at: Option<String>,
+}
+
+/// One family's freshly scanned numbers, on their way into the ledger.
+///
+/// Exactly one group is populated per call and the rest arrive as `None`,
+/// which leaves whatever was already recorded untouched — a storage scan must
+/// not blank out last week's audit result just by not being one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetMetricsInput {
+    pub loc: Option<i64>,
+    pub loc_language: Option<String>,
+    pub loc_truncated: bool,
+    pub storage_bytes: Option<i64>,
+    pub storage_git_bytes: Option<i64>,
+    pub storage_reclaimable_bytes: Option<i64>,
+    pub storage_truncated: bool,
+    pub vulns_critical: Option<i64>,
+    pub vulns_high: Option<i64>,
+    pub vulns_moderate: Option<i64>,
+    pub vulns_low: Option<i64>,
+    pub vulns_unknown: Option<i64>,
+    pub vulns_total: Option<i64>,
+    pub health_complete: bool,
+    pub coverage_pct: Option<f64>,
+    pub coverage_truncated: bool,
+}
+
+fn fleet_metrics_from_row(row: &Row<'_>) -> rusqlite::Result<FleetMetrics> {
+    Ok(FleetMetrics {
+        repo_path: row.get(0)?,
+        loc: row.get(1)?,
+        loc_language: row.get(2)?,
+        loc_truncated: row.get::<_, i64>(3)? != 0,
+        loc_at: row.get(4)?,
+        storage_bytes: row.get(5)?,
+        storage_git_bytes: row.get(6)?,
+        storage_reclaimable_bytes: row.get(7)?,
+        storage_truncated: row.get::<_, i64>(8)? != 0,
+        storage_at: row.get(9)?,
+        vulns_critical: row.get(10)?,
+        vulns_high: row.get(11)?,
+        vulns_moderate: row.get(12)?,
+        vulns_low: row.get(13)?,
+        vulns_unknown: row.get(14)?,
+        vulns_total: row.get(15)?,
+        health_complete: row.get::<_, i64>(16)? != 0,
+        health_at: row.get(17)?,
+        coverage_pct: row.get(18)?,
+        coverage_truncated: row.get::<_, i64>(19)? != 0,
+        coverage_at: row.get(20)?,
+    })
+}
+
+const FLEET_METRICS_COLUMNS: &str = "repo_path, loc, loc_language, loc_truncated, loc_at, \
+     storage_bytes, storage_git_bytes, storage_reclaimable_bytes, storage_truncated, storage_at, \
+     vulns_critical, vulns_high, vulns_moderate, vulns_low, vulns_unknown, vulns_total, \
+     health_complete, health_at, coverage_pct, coverage_truncated, coverage_at";
+
+/// Records one family's scan result, stamping it with the moment it landed.
+///
+/// The `COALESCE`s are what keep the families independent: a column arriving
+/// as `NULL` means "this call is not about that family" and the stored value
+/// survives, so four separate scans accumulate into one row instead of each
+/// erasing the last. A family that IS in this call always overwrites, value
+/// and timestamp together — a value can never outlive its own stamp.
+pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<(), LedgerError> {
+    let repo_identity = redact::text(&canonical_repo(repo_path));
+    let now = ids::iso8601_utc(ids::now_millis());
+    let loc_at = input.loc.map(|_| now.clone());
+    let storage_at = input.storage_bytes.map(|_| now.clone());
+    let health_at = input.vulns_total.map(|_| now.clone());
+    let coverage_at = input.coverage_pct.map(|_| now.clone());
+    let loc_language = input.loc_language.as_deref().map(redact::text);
+    with_conn(repo_path, |conn| {
+        conn.execute(
+            r#"
+            INSERT INTO fleet_metrics (
+                repo_path, loc, loc_language, loc_truncated, loc_at,
+                storage_bytes, storage_git_bytes, storage_reclaimable_bytes, storage_truncated, storage_at,
+                vulns_critical, vulns_high, vulns_moderate, vulns_low, vulns_unknown, vulns_total,
+                health_complete, health_at,
+                coverage_pct, coverage_truncated, coverage_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+            ON CONFLICT(repo_path) DO UPDATE SET
+                loc                       = COALESCE(excluded.loc, fleet_metrics.loc),
+                loc_language              = COALESCE(excluded.loc_language, fleet_metrics.loc_language),
+                loc_truncated             = CASE WHEN excluded.loc_at IS NULL
+                                                 THEN fleet_metrics.loc_truncated
+                                                 ELSE excluded.loc_truncated END,
+                loc_at                    = COALESCE(excluded.loc_at, fleet_metrics.loc_at),
+                storage_bytes             = COALESCE(excluded.storage_bytes, fleet_metrics.storage_bytes),
+                storage_git_bytes         = COALESCE(excluded.storage_git_bytes, fleet_metrics.storage_git_bytes),
+                storage_reclaimable_bytes = COALESCE(excluded.storage_reclaimable_bytes, fleet_metrics.storage_reclaimable_bytes),
+                storage_truncated         = CASE WHEN excluded.storage_at IS NULL
+                                                 THEN fleet_metrics.storage_truncated
+                                                 ELSE excluded.storage_truncated END,
+                storage_at                = COALESCE(excluded.storage_at, fleet_metrics.storage_at),
+                vulns_critical            = COALESCE(excluded.vulns_critical, fleet_metrics.vulns_critical),
+                vulns_high                = COALESCE(excluded.vulns_high, fleet_metrics.vulns_high),
+                vulns_moderate            = COALESCE(excluded.vulns_moderate, fleet_metrics.vulns_moderate),
+                vulns_low                 = COALESCE(excluded.vulns_low, fleet_metrics.vulns_low),
+                vulns_unknown             = COALESCE(excluded.vulns_unknown, fleet_metrics.vulns_unknown),
+                vulns_total               = COALESCE(excluded.vulns_total, fleet_metrics.vulns_total),
+                health_complete           = CASE WHEN excluded.health_at IS NULL
+                                                 THEN fleet_metrics.health_complete
+                                                 ELSE excluded.health_complete END,
+                health_at                 = COALESCE(excluded.health_at, fleet_metrics.health_at),
+                coverage_pct              = COALESCE(excluded.coverage_pct, fleet_metrics.coverage_pct),
+                coverage_truncated        = CASE WHEN excluded.coverage_at IS NULL
+                                                 THEN fleet_metrics.coverage_truncated
+                                                 ELSE excluded.coverage_truncated END,
+                coverage_at               = COALESCE(excluded.coverage_at, fleet_metrics.coverage_at)
+            "#,
+            params![
+                repo_identity,
+                input.loc,
+                loc_language,
+                input.loc_truncated as i64,
+                loc_at,
+                input.storage_bytes,
+                input.storage_git_bytes,
+                input.storage_reclaimable_bytes,
+                input.storage_truncated as i64,
+                storage_at,
+                input.vulns_critical,
+                input.vulns_high,
+                input.vulns_moderate,
+                input.vulns_low,
+                input.vulns_unknown,
+                input.vulns_total,
+                input.health_complete as i64,
+                health_at,
+                input.coverage_pct,
+                input.coverage_truncated as i64,
+                coverage_at,
+            ],
+        )
+        .map_err(|e| LedgerError::new("insert_fleet_metrics_failed", e.to_string()))?;
+        Ok(())
+    })
+}
+
+/// Reads one repository's cached metrics, creating nothing.
+///
+/// The Fleet grid shows rows for repositories that are merely in the recents
+/// list — never opened in this session, possibly never opened at all. Going
+/// through [`with_conn`] would create `.devcouncil/ledger.sqlite` inside each
+/// of them just for asking a question, which is a write into someone else's
+/// repository as a side effect of rendering a row. So this opens read-only and
+/// returns `Ok(None)` for a database that is not there, exactly as the family
+/// importer does for its source ledgers.
+///
+/// A read failure is an error, never `Ok(None)`: "this repository has never
+/// been scanned" and "we could not find out" must not arrive as the same value.
+pub fn read_fleet_metrics(repo_path: &str) -> Result<Option<FleetMetrics>, LedgerError> {
+    let canonical_repo_path = canonical_repo(repo_path);
+    let repo_identity = redact::text(&canonical_repo_path);
+    let db_path = ledger_path(repo_path);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| LedgerError::new("fleet_metrics_open_failed", e.to_string()))?;
+    // A ledger written by a build that predates this table has no
+    // `fleet_metrics`, and a read-only connection cannot create it. That is
+    // "never scanned", not "unreadable" — checked explicitly rather than by
+    // pattern-matching a prepare error's message, which is not ours to parse.
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fleet_metrics'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| LedgerError::new("fleet_metrics_query_failed", e.to_string()))?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {FLEET_METRICS_COLUMNS} FROM fleet_metrics WHERE repo_path = ?1"
+        ))
+        .map_err(|e| LedgerError::new("fleet_metrics_query_failed", e.to_string()))?;
+    let mut found = stmt
+        .query_row(params![repo_identity], fleet_metrics_from_row)
+        .optional()
+        .map_err(|e| LedgerError::new("fleet_metrics_row_failed", e.to_string()))?;
+    if let Some(metrics) = found.as_mut() {
+        // Hand back the path the caller asked about, not the redacted identity
+        // the row is keyed by.
+        metrics.repo_path.clone_from(&canonical_repo_path);
+    }
+    Ok(found)
+}
+
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -1517,6 +1765,135 @@ mod tests {
             .expect("run git init");
         assert!(status.success(), "git init failed");
         dir
+    }
+
+    #[test]
+    fn reading_metrics_for_a_never_opened_repository_creates_nothing() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+
+        assert!(read_fleet_metrics(repo).expect("read").is_none());
+
+        let after: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        // The Fleet grid renders rows for repositories the user merely has in
+        // a recents list. Asking one a question must not write a state
+        // directory into it.
+        assert_eq!(before, after, "reading metrics must not create .devcouncil");
+        assert!(!dir.path().join(".devcouncil").exists());
+    }
+
+    #[test]
+    fn fleet_metrics_round_trip_carries_a_timestamp_with_every_value() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(4200),
+                loc_language: Some("Rust".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.loc, Some(4200));
+        assert_eq!(found.loc_language.as_deref(), Some("Rust"));
+        // A value with no stamp is a number nobody can date; the writer stamps
+        // exactly the families it carries.
+        assert!(found.loc_at.is_some());
+        assert!(found.storage_at.is_none());
+        assert!(found.storage_bytes.is_none());
+    }
+
+    #[test]
+    fn one_family_scan_never_erases_another() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                vulns_total: Some(3),
+                vulns_high: Some(3),
+                health_complete: true,
+                ..Default::default()
+            },
+        )
+        .expect("save health");
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                storage_bytes: Some(2048),
+                storage_git_bytes: Some(1024),
+                ..Default::default()
+            },
+        )
+        .expect("save storage");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        // A storage scan is not an audit result. Letting it blank the audit
+        // would turn "3 high" into "never scanned" for free.
+        assert_eq!(found.vulns_total, Some(3));
+        assert!(found.health_complete);
+        assert!(found.health_at.is_some());
+        assert_eq!(found.storage_bytes, Some(2048));
+        assert!(found.storage_at.is_some());
+    }
+
+    #[test]
+    fn a_rescan_replaces_its_own_family_flags() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                vulns_total: Some(0),
+                health_complete: false,
+                ..Default::default()
+            },
+        )
+        .expect("save partial audit");
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                vulns_total: Some(0),
+                health_complete: true,
+                ..Default::default()
+            },
+        )
+        .expect("save complete audit");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        // The flag has to follow its own family both ways, or a repository
+        // stays marked "coverage incomplete" forever after one bad scan.
+        assert!(found.health_complete);
+    }
+
+    #[test]
+    fn a_ledger_without_the_table_reads_as_never_scanned() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        // A ledger written by a build predating fleet_metrics: create the
+        // database with the events schema only.
+        append(draft(repo, "git.commit")).expect("append");
+        let db = ledger_path(repo);
+        {
+            let conn = Connection::open(&db).expect("open");
+            conn.execute("DROP TABLE IF EXISTS fleet_metrics", [])
+                .expect("drop");
+        }
+        registry().lock().unwrap().clear();
+
+        // Not an error: a missing table is "nothing was ever recorded", and a
+        // read-only connection could not create it anyway.
+        assert!(read_fleet_metrics(repo).expect("read").is_none());
     }
 
     #[test]

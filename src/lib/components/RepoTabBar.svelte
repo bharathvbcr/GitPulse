@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
@@ -19,6 +20,7 @@
     X,
     FolderGit2,
     FolderOpen,
+    LayoutGrid,
   } from "lucide-svelte";
   import WorkspaceActions from "./WorkspaceActions.svelte";
 
@@ -326,6 +328,22 @@
 
 {#if $repoStore.openTabs.length > 0}
   <div class="h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
+    <!-- Fleet sits left of the tabs because it is above them: one surface for
+         the whole workspace, not another repository. -->
+    <button
+      type="button"
+      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-colors {$interfaceStore.fleetOpen
+        ? 'border-accent/60 bg-accent/10 text-accent'
+        : 'border-transparent text-textMuted hover:bg-surfaceHover hover:text-textPrimary'}"
+      aria-pressed={$interfaceStore.fleetOpen}
+      data-testid="fleet-tab-chip"
+      onclick={() => interfaceStore.toggleFleet()}
+      title="Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health."
+    >
+      <LayoutGrid size={12} />
+      <span>Fleet</span>
+    </button>
+    <div class="h-4 w-px bg-border/70 shrink-0"></div>
     <div
       bind:this={scroller}
       class="flex-1 flex items-center gap-1 overflow-x-auto min-w-0 py-1"

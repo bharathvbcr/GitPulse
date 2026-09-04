@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseRegisteredHandlers, DEFAULT_LIB_RS } from "./check-ipc-contract.mjs";
@@ -13,7 +13,15 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
  * Each count is taken from the canonical implementation rather than recounted
  * here, so this cannot drift from what the checkers actually measure.
  */
-const DOCS = ["README.md", "CONTRIBUTING.md", "docs/ARCHITECTURE.md", "docs/FEATURES.md"] as const;
+// PROMO.md joined this list after its "13 Purpose-Built Views" survived two
+// consolidations unnoticed: it was outside the contract, so nothing read it.
+const DOCS = [
+  "README.md",
+  "CONTRIBUTING.md",
+  "docs/ARCHITECTURE.md",
+  "docs/FEATURES.md",
+  "docs/PROMO.md",
+] as const;
 
 function read(relative: string): string {
   return readFileSync(new URL(`../${relative}`, import.meta.url), "utf8");
@@ -98,20 +106,23 @@ describe("the contract-test table in CONTRIBUTING stays honest", () => {
     .filter((name) => name.endsWith(".test.ts"))
     .map((name) => name.replace(/\.test\.ts$/, ""));
 
-  /** Tests that belong to a `check:*` script rather than being a contract of their own. */
-  const SCRIPT_UNIT_TESTS = new Set([
-    "check-ipc-contract",
-    "check-coverage-types",
-    "check-coverage-floor",
-    "check-release-version",
-    "check-release-assets",
-    "check-workflows",
-    "release-notes",
-    "dev-port",
-    "vite-config",
-    "usage",
-    "columns",
-  ]);
+  /**
+   * Tests that belong to a script rather than being a contract of their own.
+   *
+   * Derived, not listed: a `foo.test.ts` sitting beside a `foo.mjs` is that
+   * script's unit test. The list this replaced had to be edited by hand every
+   * time a script gained tests, and the entry most likely to be forgotten was
+   * the newest one — so the table would start demanding a contract row for a
+   * plain unit test, and the honest fix would look like noise.
+   */
+  const SCRIPT_UNIT_TESTS = new Set(
+    files.filter((name) =>
+      existsSync(fileURLToPath(new URL(`./${name}.mjs`, import.meta.url))),
+    ),
+  );
+  // vite-config tests vite.config.ts, the one script-shaped test whose subject
+  // is not a sibling .mjs.
+  SCRIPT_UNIT_TESTS.add("vite-config");
 
   it("names only tests that exist", () => {
     const named = [...contributing.matchAll(/`([a-z-]+-contract|release-workflow)`/g)].map(

@@ -67,6 +67,9 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "High-performance native Git desktop client",
+    "resources": {
+      "../plugins/gitpulse/": "plugin/"
+    },
     "fileAssociations": [
       {
         "ext": [

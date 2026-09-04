@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { get } from "svelte/store";
 import {
   SECTION_STORAGE_KEY,
@@ -293,7 +294,7 @@ describe("loadLayout fuzz/stress", () => {
     }
 
     expect(inputs.length).toBeGreaterThanOrEqual(10_000);
-    expect(elapsedMs).toBeLessThan(1_500);
+    expectWithinBudget(elapsedMs, 300, "loadLayout over 10k garbage strings");
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 
     // Every accepted width must round-trip through JSON.stringify unchanged.
@@ -301,7 +302,7 @@ describe("loadLayout fuzz/stress", () => {
       const layout = loadLayout(inputs[i]);
       expect(loadLayout(JSON.stringify(layout))).toEqual(layout);
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("fuzzed sections parser also never throws", () => {
     const rng = makeRng(0xbeef_cafe);

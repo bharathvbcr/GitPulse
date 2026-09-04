@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { expectWithinBudget, STRESS_TIMEOUT_MS } from "../__tests__/perfBudget";
 import { detectLanguageFromPath, tokenizeLine, tokenClass } from "./syntaxHighlight";
 
 describe("syntaxHighlight", () => {
@@ -183,13 +184,13 @@ describe("syntaxHighlight — language-specific keywords", () => {
     ]) {
       const started = Date.now();
       const tokens = tokenizeLine(line, "css");
-      expect(Date.now() - started, `${line} took too long`).toBeLessThan(1000);
+      expectWithinBudget(Date.now() - started, 200, `tokenize ${line}`);
       expect(tokens.length, `${line} produced no tokens`).toBeGreaterThan(0);
       expect(tokens.map((t) => t.text).join("")).toBe(line);
     }
     // Svelte allows '@' as a word start too, so it had the same defect.
     expect(tokenizeLine("@const x", "svelte").map((t) => t.text).join("")).toBe("@const x");
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("marks yaml and css keys as properties", () => {
     // The scanner treats ':' as a word character, so the key token carries the
@@ -311,8 +312,8 @@ describe("syntaxHighlight — termination invariant", () => {
       for (const line of ["@".repeat(200), '"'.repeat(200), "/*".repeat(200), ":".repeat(200)]) {
         const started = Date.now();
         expect(tokenizeLine(line, language).map((t) => t.text).join("")).toBe(line);
-        expect(Date.now() - started, `${language} stalled`).toBeLessThan(500);
+        expectWithinBudget(Date.now() - started, 100, `tokenize ${language}`);
       }
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 });

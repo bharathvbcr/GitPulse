@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use gitpulse_lib::graph::{list_ref_decorations, RefKind};
+use gitpulse_lib::graph::{list_ref_decorations, RefKind, RefScope};
 use gitpulse_lib::harness::{check_command, check_file, HarnessStatus, PolicyStatus};
 use tempfile::TempDir;
 
@@ -54,7 +54,9 @@ fn repo_path(dir: &TempDir) -> String {
 #[test]
 fn ref_decorations_name_branches_tags_and_head() {
     let dir = fixture();
-    let refs = list_ref_decorations(&repo_path(&dir)).expect("refs");
+    let refs = list_ref_decorations(&repo_path(&dir), RefScope::Named)
+        .expect("refs")
+        .decorations;
 
     let head = refs
         .iter()
@@ -93,7 +95,9 @@ fn detached_head_is_still_reported() {
     .unwrap();
     git(dir.path(), &["checkout", "--detach", head.trim()]);
 
-    let refs = list_ref_decorations(&repo_path(&dir)).expect("refs");
+    let refs = list_ref_decorations(&repo_path(&dir), RefScope::Named)
+        .expect("refs")
+        .decorations;
     let marked = refs
         .iter()
         .find(|r| r.is_head)

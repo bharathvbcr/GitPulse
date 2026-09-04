@@ -3,6 +3,7 @@ import {
   GRAPH_FETCH_DEBOUNCE_MS,
   createGraphFetchScheduler,
   graphRequestKey,
+  normalizeGraphQuery,
   type GraphFetchRequest,
   type ScheduledLoad,
 } from "./graphFetchScheduler";
@@ -71,8 +72,8 @@ interface LoadRecord {
 
 /**
  * Drives one scheduler through a random op stream (re-presentations, path /
- * revision / server-query / client-query edits, null-path resets, explicit
- * resets, random clock advances) and enforces the four scheduling contract
+ * revision / ref-scope / server-query / client-query edits, null-path resets,
+ * explicit resets, random clock advances) and enforces the four scheduling contract
  * invariants after every step:
  *
  * 1. NO-LOSS — once the latest key's deadline has passed with no reset or
@@ -81,8 +82,8 @@ interface LoadRecord {
  *    intervening reset or a different key being presented.
  * 3. RESET KILLS — reset()/null-path cancels every pending timer; none can
  *    fire afterwards.
- * 4. ARG INTEGRITY — every load's exact {path, query, revision} was presented
- *    since the last reset (nothing fabricated or mixed).
+ * 4. ARG INTEGRITY — every load's exact {path, query, revision, refScope} was
+ *    presented since the last reset (nothing fabricated or mixed).
  */
 function fuzzIteration(seed: number): void {
   const rng = mulberry32(seed);
@@ -107,9 +108,25 @@ function fuzzIteration(seed: number): void {
     "type:fix",
     "sha:abc123",
   ] as const;
+  // The ref scope is a fourth dimension of request identity: the same
+  // repository at the same query answers with a different set of rows under
+  // each scope, so a scope edit must re-arm exactly like a filter edit.
+  const SCOPES = ["named", "all"] as const;
 
   let presentedExact: GraphFetchRequest[] = [];
   let latestKey: string | null = null;
+  /**
+   * The latest presented request as a TUPLE, independent of the key function.
+   *
+   * NO-LOSS used to compare the settled load's key against the latest key —
+   * both produced by `graphRequestKey`, so a key that fails to distinguish two
+   * genuinely different requests satisfies the check trivially. That is
+   * exactly how an under-discriminating key (one that ignored the ref scope)
+   * passed 200 fuzz iterations while the corresponding setting did nothing.
+   * Comparing the request itself makes the harness independent of the thing
+   * it is validating.
+   */
+  let latestTuple: ScheduledLoad | null = null;
   let latestArmTime: number | null = null;
   let mirror: { armed: boolean; key: string | null } = { armed: false, key: null };
   let prevLoad: LoadRecord | null = null;
@@ -130,7 +147,11 @@ function fuzzIteration(seed: number): void {
     loads.push(rec);
 
     const wasPresented = presentedExact.some(
-      (p) => p.path === rec.req.path && p.query === rec.req.query && p.revision === rec.req.revision
+      (p) =>
+        p.path === rec.req.path &&
+        p.query === rec.req.query &&
+        p.revision === rec.req.revision &&
+        (p.refScope ?? "named") === rec.req.refScope
     );
     if (!wasPresented) {
       fail(`ARG INTEGRITY violated: loaded ${JSON.stringify(rec.req)} was never presented`);
@@ -162,6 +183,7 @@ function fuzzIteration(seed: number): void {
     if (clock.pending !== 0) fail(`${label}: ${clock.pending} pending timer(s) survived the reset`);
     presentedExact = [];
     latestKey = null;
+    latestTuple = null;
     latestArmTime = null;
     mirror = { armed: false, key: null };
     sawResetSinceFire = true;
@@ -171,7 +193,7 @@ function fuzzIteration(seed: number): void {
 
   function doSync(req: GraphFetchRequest): void {
     journal.push(
-      `${opIndex}:sync(${req.path ?? "null"},${JSON.stringify(req.query)},${String(req.revision)})`
+      `${opIndex}:sync(${req.path ?? "null"},${JSON.stringify(req.query)},${String(req.revision)},${req.refScope ?? "named"})`
     );
     if (!req.path) {
       scheduler.sync(req); // delegates to reset() internally
@@ -188,8 +210,19 @@ function fuzzIteration(seed: number): void {
     // must leave it untouched.
     if (armed && (!wasArmed || prevMirrorKey !== key)) latestArmTime = clock.now;
     mirror = { armed, key: armed ? key : null };
-    presentedExact.push({ path: req.path, query: req.query, revision: req.revision });
+    presentedExact.push({
+      path: req.path,
+      query: req.query,
+      revision: req.revision,
+      refScope: req.refScope,
+    });
     latestKey = key;
+    latestTuple = {
+      path: req.path,
+      query: normalizeGraphQuery(req.query),
+      revision: req.revision,
+      refScope: req.refScope ?? "named",
+    };
     presentationsSinceFire.push(key);
     poison = false;
   }
@@ -206,12 +239,32 @@ function fuzzIteration(seed: number): void {
     if (sinceArm[0]!.key !== latestKey) {
       fail("NO-LOSS violated: the settled load does not match the latest presented key");
     }
+    // Key-independent: catches an under-discriminating key, which the check
+    // above cannot see because both sides of it come from that same key.
+    const settled = sinceArm[0]!.req;
+    const want = latestTuple!;
+    if (
+      settled.path !== want.path ||
+      settled.query !== want.query ||
+      settled.revision !== want.revision ||
+      settled.refScope !== want.refScope
+    ) {
+      fail(
+        `NO-LOSS violated: deadline passed for ${JSON.stringify(want)} but the settled load ` +
+          `was ${JSON.stringify(settled)} — the request key does not distinguish them`
+      );
+    }
     if (scheduler.armed) {
       fail("NO-LOSS violated: deadline passed but the scheduler is still armed");
     }
   }
 
-  let latest: GraphFetchRequest = { path: PATHS[0], query: "", revision: null };
+  let latest: GraphFetchRequest = {
+    path: PATHS[0],
+    query: "",
+    revision: null,
+    refScope: SCOPES[0],
+  };
 
   for (let step = 0; step < OPS_PER_ITERATION; step += 1) {
     opIndex = step;
@@ -235,8 +288,11 @@ function fuzzIteration(seed: number): void {
     } else if (roll < 0.78) {
       latest = { ...latest, revision: pick(REVISIONS) }; // branch switch
       doSync(latest);
-    } else {
+    } else if (roll < 0.92) {
       latest = { ...latest, query: pick(QUERIES) }; // filter edit
+      doSync(latest);
+    } else {
+      latest = { ...latest, refScope: pick(SCOPES) }; // "Refs drawn" toggled
       doSync(latest);
     }
   }

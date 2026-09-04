@@ -19,6 +19,8 @@
     "check:release": "node scripts/check-release-version.mjs",
     "check:coverage": "node scripts/check-coverage-floor.mjs",
     "check:workflows": "node scripts/check-workflows.mjs",
+    "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --locked --force",
+    "mcp:doctor": "node scripts/check-mcp-install.mjs",
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
     "release:notes": "node scripts/release-notes.mjs",

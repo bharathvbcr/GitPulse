@@ -75,6 +75,18 @@ fn path_classifiers_are_total() {
         let _ = D::coverage_family_hint(&path, &info);
         let _ = D::comment_prefix(info.name);
         let _ = D::coverage_family(info.name);
+        // Counting runs for every file in a language-stats scan, and a
+        // panic there aborts the whole report rather than one file.
+        let counts = gitpulse_lib::analyzer::LocCounter::count_for_language(
+            "a\n/* b */\n\n# c\n\"\"\"d\"\"\"\n<!-- e -->\n",
+            info.name,
+        );
+        assert_eq!(
+            counts.code_lines + counts.comment_lines + counts.blank_lines,
+            counts.total_lines,
+            "{} must partition every line",
+            info.name
+        );
     }
 }
 

@@ -12,6 +12,31 @@ export interface NativeEvent {
   path?: string | null;
 }
 
+/**
+ * The native id for the workspace-wide Fleet dashboard.
+ *
+ * Exported so `scripts/fleet-surface-contract.test.ts` can assert the Rust and
+ * TypeScript sides agree on it, rather than spelling the string twice and
+ * letting a rename pass both halves silently. Deliberately outside the `tab-`
+ * namespace: `viewTabForMenuId` claims everything in there.
+ *
+ * The switch below still spells the literal, because `view-menu-contract`
+ * scans this file for `case "<id>":` to prove no native menu id is clickable
+ * without a handler. A constant in the case label would be invisible to it —
+ * which is why that contract test also asserts the two agree.
+ */
+export const FLEET_ACTION_ID = "fleet";
+
+/**
+ * The native id for the terminal dock.
+ *
+ * Outside the `tab-` namespace for the same reason as Fleet: `viewTabForMenuId`
+ * claims everything in there, and the terminal is no longer a view. It is a
+ * dock beneath whichever view is on screen, so routing it through `setTab`
+ * would ask the app to navigate somewhere that does not exist.
+ */
+export const TERMINAL_DOCK_ACTION_ID = "terminal-dock";
+
 export interface NativeMenuHandlers {
   open: () => void;
   clone: () => void;
@@ -22,6 +47,10 @@ export interface NativeMenuHandlers {
   themeLight: () => void;
   themeDark: () => void;
   setTab: (tab: RepoState["activeTab"]) => void;
+  /** Opens the workspace-wide Fleet dashboard. Not a view: see actions.rs. */
+  fleet: () => void;
+  /** Shows or hides the terminal dock. Not a view: see actions.rs. */
+  terminalDock: () => void;
   fetch: () => void;
   pull: () => void;
   push: () => void;
@@ -90,6 +119,12 @@ export function dispatchNativeMenu(
       return true;
     case "quick-commit":
       handlers.quickCommit();
+      return true;
+    case "fleet":
+      handlers.fleet();
+      return true;
+    case "terminal-dock":
+      handlers.terminalDock();
       return true;
     case "palette":
       handlers.palette();

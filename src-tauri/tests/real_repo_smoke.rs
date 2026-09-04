@@ -17,50 +17,32 @@ use gitpulse_lib::analyzer::CommitFilter;
 use gitpulse_lib::commands::{assemble_commit_graph, resolve_mainline_hint};
 use gitpulse_lib::engine::GitReader;
 use gitpulse_lib::graph::{
-    list_ref_decorations, LaneSolver, MainlineHint, RawCommitNode, RefKind, VisualCommitRow,
-    MAINLINE_COLOR, MAINLINE_COLUMN,
+    hidden_ref_warning, list_ref_decorations, probe_hidden_history, LaneSolver, MainlineHint,
+    RawCommitNode, RefKind, RefScope, VisualCommitRow, MAINLINE_COLOR, MAINLINE_COLUMN,
 };
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 
+/// The scope the smoke run walks under, from `GITPULSE_SMOKE_SCOPE`
+/// (`named`, the default, or `all`).
+fn smoke_scope() -> RefScope {
+    match std::env::var("GITPULSE_SMOKE_SCOPE")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "all" => RefScope::All,
+        _ => RefScope::Named,
+    }
+}
+
+/// History through the PRODUCTION reader, not a private `git log --all`.
+///
+/// It used to shell out to its own `git log --all`, which made this smoke run
+/// a third independent copy of "which refs the graph is about" — the exact
+/// drift that let unnameable lanes reach the screen. A fixture dumped from a
+/// walk the app does not perform proves nothing about the app.
 fn load_history(repo: &str, max: usize) -> Vec<RawCommitNode> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo,
-            "log",
-            "--all",
-            "--topo-order",
-            &format!("--max-count={max}"),
-            "--format=%H\u{1}%P\u{1}%ct\u{1}%an\u{1}%ae\u{1}%s",
-        ])
-        .output()
-        .expect("git must be runnable for the smoke test");
-    assert!(
-        output.status.success(),
-        "git log failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\u{1}');
-            let id = parts.next()?.to_string();
-            let parents = parts.next().unwrap_or_default();
-            let timestamp = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-            let author_name = parts.next().unwrap_or_default().to_string();
-            let author_email = parts.next().unwrap_or_default().to_string();
-            let summary = parts.next().unwrap_or_default().to_string();
-            Some(RawCommitNode {
-                id,
-                parent_ids: parents.split_whitespace().map(str::to_string).collect(),
-                timestamp,
-                author_name,
-                author_email,
-                summary,
-            })
-        })
-        .collect()
+    GitReader::read_commit_history_paged(repo, 0, max, None, None, smoke_scope())
+        .expect("history through the production reader")
 }
 
 fn check_stable_column_invariants(commits: &[RawCommitNode], rows: &[VisualCommitRow]) {
@@ -294,7 +276,13 @@ fn mainline_for(
     Option<String>,
     Option<String>,
 ) {
-    let refs = list_ref_decorations(repo).expect("ref decorations");
+    // The SAME scope the history was walked under. Labelling under Named
+    // while walking under All reproduced the original defect inside the
+    // harness meant to detect it: the dump showed 35 lanes and 7 labels, and
+    // the fixture described a graph the app would never produce.
+    let refs = list_ref_decorations(repo, smoke_scope())
+        .expect("ref decorations")
+        .decorations;
     let head = GitReader::head_id(repo).ok();
     let default_branch = GitReader::default_branch_name(repo).expect("default branch probe");
     let resolved = resolve_mainline_hint(&refs, default_branch.as_deref(), head.as_deref());
@@ -456,6 +444,37 @@ fn real_repository_filtered_graphs_stay_connected() {
 /// GITPULSE_SMOKE_REPO=/path/to/repo GITPULSE_SMOKE_DUMP=/tmp/graph.json \
 ///   GITPULSE_SMOKE_DUMP_ROWS=300 cargo test --test real_repo_smoke -- --ignored
 /// ```
+/// What the named scope leaves out on a REAL repository, reported the way the
+/// graph pane reports it.
+///
+/// The synthetic fixtures in `graph_ref_scope.rs` prove the mechanism; this
+/// prints the actual sentence a user would see, so a repository carrying
+/// agent-harness or prefetch namespaces can be checked by eye.
+#[test]
+#[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
+fn real_repository_reports_the_history_the_named_scope_hides() {
+    let repo =
+        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let hidden = probe_hidden_history(&repo).expect("hidden-history probe");
+    match hidden_ref_warning(&hidden) {
+        Some(note) => {
+            assert!(
+                hidden.commits > 0,
+                "a warning was produced for zero hidden commits"
+            );
+            println!("{repo}: {note}");
+        }
+        None => {
+            assert_eq!(
+                hidden.commits, 0,
+                "{repo} hides {} commit(s) and said nothing",
+                hidden.commits
+            );
+            println!("{repo}: nothing outside branches, remotes and tags");
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_mainline_is_one_straight_rail() {

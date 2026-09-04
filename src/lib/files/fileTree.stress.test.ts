@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { buildFileTree, flattenFileTree } from "./fileTree";
 import type { FileTree, FileTreeDir } from "./fileTree";
 
@@ -56,8 +57,8 @@ describe("buildFileTree + flattenFileTree stress: 100k synthetic paths", () => {
     const rows = flattenFileTree(tree, () => false);
     const flattenMs = performance.now() - flattenStartedAt;
 
-    expect(buildMs).toBeLessThan(5000);
-    expect(flattenMs).toBeLessThan(5000);
+    expectWithinBudget(buildMs, 1000, "buildFileTree over 10k paths");
+    expectWithinBudget(flattenMs, 1000, "flattenTree over 10k paths");
     expect(rows).toHaveLength(totals.dirs + totals.files);
 
     // Memory sanity: every row key is distinct despite the prefix scheme.
@@ -67,7 +68,7 @@ describe("buildFileTree + flattenFileTree stress: 100k synthetic paths", () => {
     // Determinism: a second full pipeline run deep-equals the first.
     const secondRows = flattenFileTree(buildFileTree(corpus), () => false);
     expect(JSON.stringify(secondRows)).toBe(JSON.stringify(rows));
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("keeps unicode and spaced names sorted via the shared collator", () => {
     const tree = buildFileTree([
@@ -98,14 +99,14 @@ describe("buildFileTree stress: adversarial shapes", () => {
     const rows = flattenFileTree(tree, () => false);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(5000);
+    expectWithinBudget(elapsedMs, 1000, "10k paths on one 200-segment chain");
     // One chain: 200 dir headers + 10k file rows.
     expect(countTree(tree)).toEqual({ dirs: 200, files: 10_000 });
     expect(rows).toHaveLength(200 + 10_000);
     const deepest = rows.filter((r) => r.kind === "dir" && r.depth === 199);
     expect(deepest).toHaveLength(1);
     expect(deepest[0].kind === "dir" && deepest[0].path).toBe(spine.join("/"));
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("collapses duplicate-heavy input (same 100 paths x1000) to the unique-only tree", () => {
     const unique = Array.from({ length: 100 }, (_, i) => `mod${i % 10}/pkg${i}/file${i}.ts`);

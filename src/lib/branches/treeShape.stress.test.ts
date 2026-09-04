@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { groupBranches } from "./groupBranches";
 import { flattenRows, type FlatRow } from "./flattenRows";
 import type { BranchInfo, BranchSection } from "./types";
@@ -42,7 +43,7 @@ describe("groupBranches + flattenRows stress: deep-path scale", () => {
     const rows = expand(sections);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(2_500);
+    expectWithinBudget(elapsedMs, 500, "treeShape");
     // section header + 39 folder headers + 2000 branch rows.
     expect(rows).toHaveLength(1 + 39 + 2_000);
     const deepestFolderRows = rows.filter(
@@ -50,7 +51,7 @@ describe("groupBranches + flattenRows stress: deep-path scale", () => {
     );
     expect(deepestFolderRows).toHaveLength(1);
     expect(branchRows(rows)).toHaveLength(2_000);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("survives 40-deep DISJOINT paths (60 roots x 39 folders) under the same bound", () => {
     // 40 segments per name: root r{i} + 38 middles + leaf.
@@ -62,10 +63,10 @@ describe("groupBranches + flattenRows stress: deep-path scale", () => {
     const startedAt = performance.now();
     const rows = expand(groupBranches(branches));
     const elapsedMs = performance.now() - startedAt;
-    expect(elapsedMs).toBeLessThan(2_500);
+    expectWithinBudget(elapsedMs, 500, "treeShape");
     expect(rows.filter((r) => r.kind === "folder-header")).toHaveLength(60 * 39);
     expect(branchRows(rows)).toHaveLength(60);
-  });
+  }, STRESS_TIMEOUT_MS);
 });
 
 describe("groupBranches + flattenRows stress: duplicate ref names", () => {

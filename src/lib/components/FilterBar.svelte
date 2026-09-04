@@ -19,9 +19,14 @@
   });
 </script>
 
-<div class="h-10 bg-surface/60 border-b border-border/60 px-3 flex items-center gap-3 text-xs select-none">
+<!-- No row chrome of its own any more. This was a full-width strip stacked
+     under the header, above the sidebar, on every commit view — a fourth
+     horizontal band before any content, present for 5 of the app's views and
+     inert on the rest. It now sits inside History's section bar, which is the
+     only place it filters anything. -->
+<div class="flex-1 min-w-0 flex items-center gap-3 text-xs select-none">
   <div
-    class="flex-1 max-w-xl flex items-center gap-2 bg-background border border-border/80 rounded-full px-3 py-1.5 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)]"
+    class="flex-1 max-w-xl flex items-center gap-2 bg-background border border-border/80 rounded-full px-3 py-1 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)]"
   >
     <Search size={14} class="text-textMuted shrink-0" />
     <input

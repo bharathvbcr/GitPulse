@@ -30,7 +30,8 @@ export type PanelSource =
   | "rebase"
   | "remotes"
   | "submodules"
-  | "conflict";
+  | "conflict"
+  | "fleet";
 
 export interface ReporterOptions {
   /** Defaults to "warning": a failed panel load is degraded, not fatal. */

@@ -9,6 +9,10 @@ import {
   memoryStorage,
   savePersistedWorkspace,
   workspaceToPersisted,
+  isViewTab,
+  migrateViewTab,
+  retiredViewFor,
+  RETIRED_VIEWS,
 } from "./persist";
 import { emptyWorkspace, openTab } from "./tabModel";
 
@@ -92,7 +96,11 @@ describe("persist workspace", () => {
     expect(loaded.tabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
     expect(loaded.tabs[0].pinned).toBe(true);
     expect(loaded.tabs[0].viewTab).toBe("work");
-    expect(loaded.tabs[1].viewTab).toBe("blame");
+    // "blame" was a view; it is a section of Code now, so the restored tab
+    // lands on Code *showing blame* rather than on Code's default pane —
+    // otherwise the retirement reads to the user as the content being gone.
+    expect(loaded.tabs[1].viewTab).toBe("code");
+    expect(loaded.tabs[1].viewSections?.code).toBe("blame");
     expect(loaded.activePath).toBe("/r/a");
     expect(loaded.recents).toEqual(["/r/b", "/r/a"]);
   });
@@ -103,16 +111,24 @@ describe("persist workspace", () => {
     const second = openTab(first.workspace, "/r/b", opts);
     if (!second.ok) throw new Error("open");
     const persisted = workspaceToPersisted(second.workspace, {
-      [first.id]: { activeTab: "diff", searchQuery: "author:ada", selectedBranch: "main" },
-      [second.id]: { activeTab: "health", searchQuery: "", selectedBranch: null },
+      [first.id]: {
+        activeTab: "history",
+        viewSections: { history: "diff" },
+        searchQuery: "author:ada",
+        selectedBranch: "main",
+      },
+      [second.id]: { activeTab: "insights", searchQuery: "", selectedBranch: null },
     });
     const storage = memoryStorage();
     savePersistedWorkspace(storage, persisted);
     const loaded = loadPersistedWorkspace(storage, opts);
     expect(loaded.tabs.map((tab) => tab.path)).toEqual(["/r/a", "/r/b"]);
-    expect(loaded.tabs[0].viewTab).toBe("diff");
+    expect(loaded.tabs[0].viewTab).toBe("history");
+    // The lens survives the round trip too; a view restored without its
+    // section shows the wrong pane, which reads as lost work.
+    expect(loaded.tabs[0].viewSections).toEqual({ history: "diff" });
     expect(loaded.tabs[0].searchQuery).toBe("author:ada");
-    expect(loaded.tabs[1].viewTab).toBe("health");
+    expect(loaded.tabs[1].viewTab).toBe("insights");
     expect(loaded.activePath).toBe("/r/b");
     expect(JSON.parse(storage.getItem(STORAGE_KEY_RECENT) ?? "[]")).toEqual(["/r/b", "/r/a"]);
   });
@@ -185,7 +201,15 @@ describe("persist workspace migrations", () => {
     expect(migrated).toEqual(loadPersistedWorkspace(memoryStorage({
       [STORAGE_KEY_WORKSPACE]: JSON.stringify(v1Blob),
     }), opts));
-    expect(migrated?.tabs[0]).toMatchObject({ path: "/r/a", pinned: true, viewTab: "diff" });
+    // The fixture's `viewTab` is a retired id, so "unchanged" means the blob
+    // is not rewritten by a migration step — not that a retired view survives
+    // validation, which is exactly what sanitizing is for.
+    expect(migrated?.tabs[0]).toMatchObject({
+      path: "/r/a",
+      pinned: true,
+      viewTab: "history",
+      viewSections: { history: "diff" },
+    });
     expect(migrated?.version).toBe(WORKSPACE_VERSION);
   });
 
@@ -249,5 +273,67 @@ describe("persist workspace migrations", () => {
     const loaded = loadPersistedWorkspace(storage, opts);
     expect(loaded.tabs.map((tab) => tab.path)).toEqual(["/r/recovered"]);
     expect(loaded.activePath).toBe("/r/recovered");
+  });
+});
+
+describe("retired views", () => {
+  it("lands every retired id on the surface that now shows its content", () => {
+    // Not a loop for its own sake: each entry asserts that a restored session
+    // finds the content it was left on, rather than the start screen.
+    expect(migrateViewTab("repo")).toBe("work");
+    expect(migrateViewTab("terminal")).toBe("work");
+  });
+
+  it("names the terminal as a dock, so the surface reopens and not just the view", () => {
+    // Mapping `terminal` to Work alone would restore a session that had the
+    // terminal open onto a Work screen with no terminal on it — the
+    // retirement would read to the user as a deletion.
+    expect(retiredViewFor("terminal")).toEqual({ tab: "work", dock: "terminal" });
+    expect(retiredViewFor("repo")?.dock).toBeUndefined();
+  });
+
+  it("routes every retirement to a view this build actually registers", () => {
+    // A retirement pointing at another retired id would strand the session
+    // one hop short of anywhere real.
+    for (const [id, retired] of Object.entries(RETIRED_VIEWS)) {
+      expect(isViewTab(retired.tab), `${id} retires to an unregistered view`).toBe(true);
+      expect(isViewTab(id), `${id} is both retired and registered`).toBe(false);
+    }
+  });
+
+  it("treats an unknown or hostile id as unretired rather than guessing", () => {
+    expect(retiredViewFor("nonsense")).toBeNull();
+    expect(retiredViewFor(null)).toBeNull();
+    expect(retiredViewFor(42)).toBeNull();
+    // Prototype keys are not retirements: `Object.hasOwn` is what stops
+    // "toString" resolving to a function and being read as a view record.
+    expect(retiredViewFor("toString")).toBeNull();
+    expect(retiredViewFor("constructor")).toBeNull();
+    // Anything unknown still lands somewhere real.
+    expect(migrateViewTab("nonsense")).toBe("work");
+    expect(migrateViewTab(undefined)).toBe("work");
+  });
+
+  it("leaves a still-registered view untouched", () => {
+    expect(migrateViewTab("history")).toBe("history");
+    expect(migrateViewTab("insights")).toBe("insights");
+  });
+
+  it("restores a persisted terminal session onto Work rather than dropping the tab", () => {
+    // End to end through the real loader: a workspace written by a build that
+    // still had the Terminal view must come back with its repository intact.
+    const storage = memoryStorage({
+      [STORAGE_KEY_WORKSPACE]: JSON.stringify({
+        version: WORKSPACE_VERSION,
+        tabs: [{ path: "/r/one", pinned: false, viewTab: "terminal", searchQuery: "" }],
+        activePath: "/r/one",
+        recents: [],
+        lastClosed: [],
+      }),
+    });
+    const loaded = loadPersistedWorkspace(storage, opts);
+    expect(loaded.tabs).toHaveLength(1);
+    expect(loaded.tabs[0].path).toBe("/r/one");
+    expect(loaded.tabs[0].viewTab).toBe("work");
   });
 });

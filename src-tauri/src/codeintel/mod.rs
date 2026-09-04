@@ -105,6 +105,30 @@ fn open_store(repo_path: &str) -> Result<Store, String> {
     Store::open(&db_path).map_err(|e| format!("Failed to open devmap database: {e}"))
 }
 
+/// Opens the store AND requires that it actually hold an indexed generation.
+///
+/// The five query surfaces below all answered from a store that opened but held
+/// nothing, and `CodeintelResponse::ok` with an empty list is indistinguishable
+/// from a completed search that found no matches. So a repository whose map had
+/// never been built — or was still building — reported "no callers", "no
+/// dependencies" and "no dead symbols": a check that could not run, rendering
+/// exactly like one that ran and found nothing clean.
+///
+/// `status` deliberately does NOT use this. It has to tell "no database",
+/// "no generation yet" and "database unreadable" apart, because those call for
+/// three different actions, and collapsing them here would lose that.
+fn open_indexed_store(repo_path: &str) -> Result<Store, String> {
+    let store = open_store(repo_path)?;
+    match store.latest_generation_id() {
+        Ok(Some(_)) => Ok(store),
+        Ok(None) => Err(format!(
+            "No generation indexed in {}; the code map has not been built yet",
+            devmap_db_path(repo_path).to_string_lossy()
+        )),
+        Err(e) => Err(format!("Failed to read devmap generation: {e}")),
+    }
+}
+
 /// Reports the availability and metrics of the repository's code intelligence graph.
 pub fn status(repo_path: &str) -> CodeintelStatus {
     let db_path = devmap_db_path(repo_path);
@@ -166,7 +190,7 @@ pub fn search(
     query: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelSymbolHit> {
-    let store = match open_store(repo_path) {
+    let store = match open_indexed_store(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
@@ -205,7 +229,7 @@ pub fn impact(
     target: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    let store = match open_store(repo_path) {
+    let store = match open_indexed_store(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
@@ -242,7 +266,7 @@ pub fn dependencies(
     file_path: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    let store = match open_store(repo_path) {
+    let store = match open_indexed_store(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
@@ -278,7 +302,7 @@ pub fn dead_symbols(
     repo_path: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelDeadSymbol> {
-    let store = match open_store(repo_path) {
+    let store = match open_indexed_store(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
@@ -311,7 +335,7 @@ pub fn trace_between(
     to: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    let store = match open_store(repo_path) {
+    let store = match open_indexed_store(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
@@ -364,5 +388,141 @@ mod tests {
         let res = search("/nonexistent/repo/path", "test", None);
         assert!(!res.available);
         assert!(res.items.is_empty());
+    }
+
+    /// A repository directory with a devmap database at the canonical path.
+    ///
+    /// `Store::open` creates the schema, so this yields a real, readable
+    /// database that simply has no generation in it yet — the middle state
+    /// between "no map" and "a map with answers".
+    fn repo_with_empty_store() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db = devmap_db_path(&dir.path().to_string_lossy());
+        std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir codeintel");
+        drop(Store::open(&db).expect("store opens and creates its schema"));
+        dir
+    }
+
+    /// The three unavailable states must be distinguishable.
+    ///
+    /// `available: false` is the same boolean for a repository that has no map,
+    /// one whose map holds no generation, and one whose database cannot be
+    /// read at all — but they call for three different actions (build a map,
+    /// wait for indexing, repair a file). Only `reason` separates them, so a
+    /// reason that went missing or collapsed to one string would leave the UI
+    /// reporting "no code intelligence" for a corrupt database.
+    #[test]
+    fn the_three_unavailable_states_do_not_read_alike() {
+        let missing = status("/nonexistent/repo/path");
+        assert!(!missing.available);
+        let missing_reason = missing.reason.expect("missing map states a reason");
+        assert!(
+            missing_reason.contains("No devmap database"),
+            "{missing_reason}"
+        );
+
+        let empty = repo_with_empty_store();
+        let indexed = status(&empty.path().to_string_lossy());
+        assert!(!indexed.available, "an empty store is not available");
+        let indexed_reason = indexed.reason.expect("empty store states a reason");
+        assert!(
+            indexed_reason.contains("No generation indexed"),
+            "{indexed_reason}"
+        );
+        assert_ne!(
+            missing_reason, indexed_reason,
+            "a repository with no map and one still indexing must not read alike"
+        );
+
+        // A file that exists at the database path but is not a database.
+        let corrupt = tempfile::TempDir::new().expect("tempdir");
+        let db = devmap_db_path(&corrupt.path().to_string_lossy());
+        std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir");
+        std::fs::write(&db, b"this is not a sqlite file").expect("write junk");
+        let broken = status(&corrupt.path().to_string_lossy());
+        assert!(!broken.available, "a corrupt database is not available");
+        let broken_reason = broken.reason.expect("corrupt store states a reason");
+        assert_ne!(
+            broken_reason, indexed_reason,
+            "a corrupt database must not read as one that is merely empty"
+        );
+    }
+
+    /// Every read surface must refuse rather than answer emptily.
+    ///
+    /// An empty `items` list with `available: true` would say "this symbol has
+    /// no callers" for a repository whose map was never built — the exact
+    /// shape of a check that could not run reporting as one that ran and found
+    /// nothing. Enumerated over all five surfaces so a newly added one that
+    /// forgets the guard is not covered by nothing.
+    #[test]
+    fn no_read_surface_answers_emptily_when_there_is_no_map() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path().to_string_lossy().to_string();
+
+        let surfaces: Vec<(&str, bool, Option<String>)> = vec![
+            {
+                let r = search(&root, "anything", None);
+                ("search", r.available, r.reason)
+            },
+            {
+                let r = impact(&root, "anything", None);
+                ("impact", r.available, r.reason)
+            },
+            {
+                let r = dependencies(&root, "anything", None);
+                ("dependencies", r.available, r.reason)
+            },
+            {
+                let r = dead_symbols(&root, None);
+                ("dead_symbols", r.available, r.reason)
+            },
+            {
+                let r = trace_between(&root, "a", "b", None);
+                ("trace_between", r.available, r.reason)
+            },
+        ];
+        assert_eq!(surfaces.len(), 5, "all read surfaces must be covered");
+        for (name, available, reason) in surfaces {
+            assert!(!available, "{name} claimed availability with no map");
+            let reason = reason.unwrap_or_else(|| panic!("{name} gave no reason"));
+            assert!(
+                reason.contains("No devmap database"),
+                "{name} reason does not name the missing map: {reason}"
+            );
+        }
+    }
+
+    /// The same five surfaces against a database that opens but holds nothing.
+    ///
+    /// This is the state a repository sits in while its first index builds, and
+    /// it must not be reported as a completed search that found no matches.
+    #[test]
+    fn no_read_surface_answers_emptily_for_a_store_without_a_generation() {
+        let repo = repo_with_empty_store();
+        let root = repo.path().to_string_lossy().to_string();
+
+        assert!(!status(&root).available);
+        let claiming: Vec<&str> = [
+            ("search", search(&root, "anything", None).available),
+            ("impact", impact(&root, "anything", None).available),
+            (
+                "dependencies",
+                dependencies(&root, "anything", None).available,
+            ),
+            ("dead_symbols", dead_symbols(&root, None).available),
+            (
+                "trace_between",
+                trace_between(&root, "a", "b", None).available,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, available)| available.then_some(name))
+        .collect();
+        assert!(
+            claiming.is_empty(),
+            "these surfaces reported availability for a store with no generation, \
+             while status() reports the same repository as unavailable: {claiming:?}"
+        );
     }
 }

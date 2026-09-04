@@ -24,7 +24,7 @@ use crate::github::{
 };
 use crate::graph::{
     mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
-    MainlineHint, RawCommitNode, RefDecoration, RefKind, VisualCommitRow,
+    MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
 };
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
@@ -290,6 +290,12 @@ pub fn assemble_commit_graph(
     }
 }
 
+/// One page of solved graph rows, with the refs that decorate them.
+///
+/// `ref_scope` decides which refs seed the walk AND which refs get labelled —
+/// one answer for both, so the graph cannot draw a lane it has no name for
+/// (see [`crate::graph::ref_scope`]). `None` means the named set: branches,
+/// remote-tracking branches, tags and HEAD.
 #[tauri::command(async)]
 pub async fn cmd_get_commit_graph(
     repo_path: String,
@@ -297,6 +303,7 @@ pub async fn cmd_get_commit_graph(
     query: Option<String>,
     revision: Option<String>,
     skip: Option<usize>,
+    ref_scope: Option<RefScope>,
 ) -> Result<CommitGraphPayload, String> {
     off_thread(move || {
         // One row over the cap: the extra row is the has_more probe and is
@@ -306,6 +313,12 @@ pub async fn cmd_get_commit_graph(
         // ceiling-scale repository truncates silently (both helpers carry
         // tests pinning their side of the contract).
         let fetch_limit = graph_fetch_limit(max_commits);
+        // Absent, or from a client built before the field existed: the named
+        // set. A MALFORMED value never reaches here — serde refuses the whole
+        // argument struct, which is the right answer at an IPC boundary and is
+        // why the frontend normalizes the persisted preference before sending
+        // it. Widening the graph beyond the refs it can label stays opt-in.
+        let ref_scope = ref_scope.unwrap_or_default();
         let mut warnings: Vec<String> = Vec::new();
         let repo = repo_path.clone();
         let rev = revision.clone();
@@ -323,7 +336,18 @@ pub async fn cmd_get_commit_graph(
         // History is the long pole; HEAD and ref decorations are independent of
         // it, so they run concurrently instead of serializing three walks behind
         // one another on a large repository.
-        let (history, head, refs, default_branch) = std::thread::scope(|scope| {
+        // A named-scope walk deliberately leaves some refs out. Probing what
+        // it left out only makes sense when the scope is what chose the tips:
+        // an explicit `revision` already narrows the walk on the caller's
+        // orders, and RefScope::All leaves nothing out to report.
+        //
+        // Paging is excluded too. What a scope hides is a property of the
+        // repository's refs, not of the page being read, so re-probing on
+        // every "load more" would spend a subprocess to recompute a warning
+        // the first page already carries.
+        let probe_hidden =
+            revision.is_none() && ref_scope == RefScope::Named && skip.unwrap_or(0) == 0;
+        let (history, head, refs, default_branch, hidden) = std::thread::scope(|scope| {
             let history = scope.spawn(move || {
                 GitReader::read_commit_history_paged(
                     &repo,
@@ -331,14 +355,21 @@ pub async fn cmd_get_commit_graph(
                     fetch_limit,
                     rev.as_deref(),
                     path_filter.as_deref(),
+                    ref_scope,
                 )
             });
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
             let repo3 = repo_path.clone();
-            let refs = scope.spawn(move || crate::graph::list_ref_decorations(&repo3));
+            let refs = scope.spawn(move || crate::graph::list_ref_decorations(&repo3, ref_scope));
             let repo4 = repo_path.clone();
             let default_branch = scope.spawn(move || GitReader::default_branch_name(&repo4));
+            let repo5 = repo_path.clone();
+            let hidden = scope.spawn(move || {
+                probe_hidden
+                    .then(|| crate::graph::probe_hidden_history(&repo5))
+                    .transpose()
+            });
             (
                 history
                     .join()
@@ -346,6 +377,7 @@ pub async fn cmd_get_commit_graph(
                 head.join(),
                 refs.join(),
                 default_branch.join(),
+                hidden.join(),
             )
         });
         // A failed HEAD or decoration probe degrades exactly one facet of an
@@ -369,7 +401,15 @@ pub async fn cmd_get_commit_graph(
             }
         };
         let refs = match refs {
-            Ok(Ok(refs)) => refs,
+            Ok(Ok(listing)) => {
+                // A capped label set must not pass for a complete one: the
+                // rows are still drawn, so silence here would leave a chip
+                // missing with nothing to explain it.
+                if let Some(note) = listing.truncation_warning() {
+                    warnings.push(note);
+                }
+                listing.decorations
+            }
             Ok(Err(err)) => {
                 warnings.push(format!(
                     "ref decorations unavailable ({err}); branches/tags will not be labeled"
@@ -406,6 +446,28 @@ pub async fn cmd_get_commit_graph(
                 None
             }
         };
+
+        // History outside the walked scope is data, not an error: it is named
+        // so the reader can tell "GitPulse is not drawing this" apart from
+        // "this does not exist" — the same reason a dangling edge draws a stub
+        // instead of a line to whatever sits on the next row.
+        match hidden {
+            Ok(Ok(Some(hidden))) => {
+                if let Some(note) = crate::graph::hidden_ref_warning(&hidden) {
+                    warnings.push(note);
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => warnings.push(format!(
+                "hidden-ref probe failed ({err}); refs outside branches, remotes and tags may \
+                 hold history this graph does not draw"
+            )),
+            Err(_) => warnings.push(
+                "background task failed (thread panic): hidden-ref probe died; refs outside \
+                 branches, remotes and tags may hold history this graph does not draw"
+                    .into(),
+            ),
+        }
 
         let raw_commits = history?;
         Ok(assemble_commit_graph(
@@ -1425,11 +1487,30 @@ pub async fn cmd_discard_changes(
     file_path: String,
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
-        let policy = crate::harness::guard_file(&repo_path, &file_path, "modify")?;
+        let op = discard_file_op(&repo_path, &file_path);
+        let policy = crate::harness::guard_file(&repo_path, &file_path, op)?;
         GitWriter::discard_changes(&repo_path, &file_path)?;
         Ok(Guarded { policy, output: () })
     })
     .await
+}
+
+/// The file operation `GitWriter::discard_changes` will actually perform.
+///
+/// It runs `git restore` and `git clean -f` against the same path, so the act
+/// depends on whether the path is in the index: a tracked file is restored, an
+/// untracked one is *removed* by the clean. Declaring "modify" for both sent
+/// the policy sidecar — which receives `op` in `policy.check.file` — and the
+/// ledger, which records it as `file.modify`, a weaker operation than the one
+/// that ran, for exactly the case where the file is destroyed.
+///
+/// An unreadable index fails closed to the destructive reading: a probe that
+/// could not run must not produce the gentler claim.
+fn discard_file_op(repo_path: &str, file_path: &str) -> &'static str {
+    match GitReader::is_tracked(repo_path, file_path) {
+        Ok(true) => "modify",
+        Ok(false) | Err(_) => "delete",
+    }
 }
 
 #[tauri::command(async)]
@@ -2182,6 +2263,50 @@ pub async fn cmd_ai_coverage_report(
 mod tests {
     use super::*;
 
+    /// `git init` + one commit, plus an untracked file on disk.
+    fn repo_with_tracked_and_untracked() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("git runs");
+        };
+        run(&["init", "-b", "main"]);
+        std::fs::write(dir.path().join("README.md"), "# t\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "seed"]);
+        std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn discard_declares_delete_for_the_file_it_will_delete() {
+        // `discard_changes` runs `restore` AND `clean -f`. For an untracked
+        // path the clean is what acts, and it removes the file — so declaring
+        // "modify" asked the policy sidecar to judge, and the ledger to
+        // record, a gentler operation than the one that ran.
+        let dir = repo_with_tracked_and_untracked();
+        let root = dir.path().to_string_lossy().to_string();
+
+        assert_eq!(discard_file_op(&root, "README.md"), "modify");
+        assert_eq!(discard_file_op(&root, "fresh.txt"), "delete");
+    }
+
+    #[test]
+    fn discard_fails_closed_when_the_index_cannot_be_read() {
+        // A probe that could not run must not produce the gentler claim.
+        assert_eq!(
+            discard_file_op("/definitely/not/a/repository", "any.txt"),
+            "delete"
+        );
+    }
+
     fn verdict(status: crate::harness::PolicyStatus) -> crate::harness::PolicyVerdict {
         crate::harness::PolicyVerdict {
             status,
@@ -2901,6 +3026,37 @@ pub async fn cmd_collision_risk(
     repo_path: String,
 ) -> Result<crate::insights::CollisionRisk, String> {
     off_thread(move || Ok(crate::insights::collision_risk(&repo_path))).await
+}
+
+/// The cheap facet for a whole workspace of repositories, in one round trip.
+///
+/// Two `git` spawns per repository plus a read-only look at each repository's
+/// own ledger. Deliberately narrower than `cmd_insights_snapshot`, which
+/// probes every worktree and is priced for one repository on screen rather
+/// than two dozen. Per-repository failures ride in their own facet.
+#[tauri::command(async)]
+pub async fn cmd_fleet_snapshot(
+    repo_paths: Vec<String>,
+) -> Result<crate::insights::FleetSnapshot, String> {
+    off_thread(move || Ok(crate::insights::fleet_snapshot(&repo_paths))).await
+}
+
+/// Records one expensive scan's result in that repository's own ledger.
+///
+/// Called after a Fleet scan lands, so the number survives a restart and can
+/// be shown with its age. Families are independent: the fields this call
+/// leaves null keep whatever was recorded before.
+#[tauri::command(async)]
+pub async fn cmd_fleet_record_metrics(
+    repo_path: String,
+    metrics: crate::ledger::FleetMetricsInput,
+) -> Result<(), String> {
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        crate::ledger::save_fleet_metrics(&repo.to_string_lossy(), &metrics)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.

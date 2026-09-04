@@ -1,7 +1,6 @@
 {
-  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "gitpulse",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
   "author": {
     "name": "GitPulse Team",

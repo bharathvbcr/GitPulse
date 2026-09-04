@@ -4,6 +4,7 @@ import {
   gitpulseTauriFullReload,
   tauriHotUpdateDecision,
 } from "../vite.config.ts";
+import vitestConfig from "../vitest.config.ts";
 
 describe("gitpulseManualChunk", () => {
   it("isolates the large runtimes from the application entry", () => {
@@ -61,5 +62,12 @@ describe("gitpulseTauriFullReload", () => {
     expect(plugin.name).toBe("gitpulse-tauri-full-reload");
     expect(plugin.hotUpdate).toMatchObject({ order: "pre" });
     expect(plugin.handleHotUpdate).toBeUndefined();
+  });
+});
+
+describe("Vitest worker budget", () => {
+  it("keeps coverage stress tests below the measured safe file concurrency", () => {
+    const config = vitestConfig as { test?: { maxWorkers?: number } };
+    expect(config.test?.maxWorkers).toBe(4);
   });
 });

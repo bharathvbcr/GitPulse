@@ -64,6 +64,38 @@ export interface BranchStorageSummary {
   error: string | null;
 }
 
+export type ReclaimConfidence = "measured" | "estimated";
+
+export type ReclaimSafety = "safe" | "needs_review";
+
+export type ReclaimCategory =
+  | "build_output"
+  | "cache"
+  | "git_objects"
+  | "reflog"
+  | "orphaned_worktree_admin"
+  | "merged_branches"
+  | "large_file";
+
+export interface ReclaimItem {
+  category: ReclaimCategory;
+  label: string;
+  bytes: number;
+  confidence: ReclaimConfidence;
+  safety: ReclaimSafety;
+  action: string;
+  detail: string;
+  blocked_reason: string | null;
+}
+
+export interface ReclaimSummary {
+  reclaimable_bytes: number;
+  estimated_bytes: number;
+  needs_review_bytes: number;
+  item_count: number;
+  partial: boolean;
+}
+
 export interface ScanStats {
   elapsed_ms: number;
   files_visited: number;
@@ -85,5 +117,7 @@ export interface StorageReport {
   largest_files: LargeFile[];
   worktrees: WorktreeUsage[];
   branches: BranchStorageSummary;
+  reclaim: ReclaimItem[];
+  reclaim_summary: ReclaimSummary;
   scan: ScanStats;
 }

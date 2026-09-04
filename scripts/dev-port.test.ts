@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS } from "../src/lib/__tests__/perfBudget";
 import {
   DevPortError,
   PREFERRED_DEV_PORT,
@@ -552,7 +553,7 @@ describe("live ports", () => {
     } finally {
       await closeServer(occupied);
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it.runIf(process.platform !== "win32")(
     "kills a leftover Vite-named listener in this repo and keeps the preferred port",

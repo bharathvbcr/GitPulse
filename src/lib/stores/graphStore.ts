@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { diagnostics, type DiagnosticsStore } from "../diagnostics/diagnostics";
@@ -8,6 +8,8 @@ import {
   nextLoadLimit,
 } from "./graphLimits";
 import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
+import { isRefScope, type RefScope } from "../graph/refScope";
+import { interfaceStore } from "./interfaceStore";
 
 export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -127,7 +129,14 @@ export function normalizeDiffPayload(raw: unknown): DiffPayload {
  * enum-variant contract can compare the two sides: a renamed variant would
  * otherwise leave TypeScript compiling while the comparison stopped matching.
  */
-export type RefKind = "local" | "remote" | "tag" | "head";
+export type RefKind = "local" | "remote" | "tag" | "head" | "other";
+
+/**
+ * Re-exported, not redeclared. A second copy of the union here would be a
+ * third place the scope is written down, and the whole point of
+ * `graph/refScope.ts` is that there is one.
+ */
+export type { RefScope } from "../graph/refScope";
 
 export interface RefDecoration {
   name: string;
@@ -200,6 +209,12 @@ interface CachedGraph {
   selectedCommitDetails: CommitDetails | null;
   query: string;
   revision: string | null;
+  /**
+   * The ref scope this page was walked under. Part of the cache key: the
+   * same repository at the same query answers with a different set of rows
+   * under `all`, so a scope change must invalidate rather than reuse.
+   */
+  refScope: RefScope;
   maxCommits: number;
   hasMore: boolean;
   warnings: string[];
@@ -319,8 +334,31 @@ function cachedSignature(cache: {
   });
 }
 
-export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<DiagnosticsStore, "warn"> } = {}) {
+export function createGraphStore(
+  deps: {
+    invoke?: InvokeFn;
+    diagnostics?: Pick<DiagnosticsStore, "warn">;
+    /**
+     * The ref scope every load asks for. Read here rather than threaded
+     * through `loadGraph`'s six call sites: a caller that forgot the argument
+     * would silently reload the graph under a different scope than the one on
+     * screen — the same failure mode as the bare `loadGraph(path)` that used
+     * to reset query and branch.
+     */
+    refScope?: () => RefScope;
+  } = {}
+) {
   const invokeFn = deps.invoke ?? (invoke as InvokeFn);
+  // Normalized at the seam: a persisted preference is user data, and the IPC
+  // boundary must never receive a value the backend will refuse to
+  // deserialize. An unrecognized scope degrades to the named set rather than
+  // failing the whole graph load.
+  const readRefScope = deps.refScope ?? (() => get(interfaceStore).graphRefScope);
+  const refScopeOf = (override?: RefScope): RefScope => {
+    if (isRefScope(override)) return override;
+    const stored = readRefScope();
+    return isRefScope(stored) ? stored : "named";
+  };
   // Injectable so tests can observe breadcrumbs; the app-wide ring is the
   // default sink, same pattern as the invoke seam above.
   const reportFailure =
@@ -334,6 +372,19 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
    * fetch the way a per-path counter reset to 1 would.
    */
   const generations = new Map<string, number>();
+  /**
+   * The warning set last written to diagnostics, per repository.
+   *
+   * Assembly warnings are STATE, not events: a repository with refs outside
+   * the walked scope reports the same sentence on every load, and the watcher
+   * reloads on every settled write. The diagnostics ring coalesces identical
+   * CONSECUTIVE entries, which handles one persistent warning but not two —
+   * they alternate, each displacing the other as newest, and a repository with
+   * both fills the ring with the same pair forever, burying everything else.
+   * The live set still rides in `state.warnings`; this only stops the log from
+   * repeating what has not changed.
+   */
+  const warnedSignatures = new Map<string, string>();
   /** Monotonic per-repo ordering so a slow details fetch from an older
    * selection can never overwrite a newer one's pane. */
   const selections = new Map<string, number>();
@@ -448,6 +499,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       // store-wide sources above.
       generations.delete(path);
       selections.delete(path);
+      warnedSignatures.delete(path);
       if (visiblePath === path) {
         visiblePath = null;
         set(emptyVisible(null, DEFAULT_MAX_COMMITS, false));
@@ -462,7 +514,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       repoPath: string,
       query = "",
       revision: string | null = null,
-      opts: { forceLimit?: number } = {}
+      opts: { forceLimit?: number; refScope?: RefScope } = {}
     ) => {
       if (!repoPath) return;
       query = normalizeGraphQuery(query);
@@ -473,9 +525,13 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
       // rows that answer a different query or branch than the one asked
       // for, shows the loading state: the user just typed a filter and
       // must see it working, not a silent row swap half a second later.
+      const refScope = refScopeOf(opts.refScope);
       const cached = cache.get(repoPath);
       const refining =
-        cached !== undefined && (cached.query !== query || cached.revision !== revision);
+        cached !== undefined &&
+        (cached.query !== query ||
+          cached.revision !== revision ||
+          cached.refScope !== refScope);
       if ((!cached || refining) && visiblePath === repoPath) {
         update((s) => ({ ...s, isLoading: true, error: null, visiblePath: repoPath }));
       }
@@ -485,14 +541,43 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           maxCommits: max,
           query: query || null,
           revision: revision || null,
+          refScope,
         });
         if (!isCurrent(repoPath, token)) return;
+
+        // Assembly warnings ride along with an otherwise-good payload: each
+        // one marks a degraded facet (HEAD marker, ref labels, history the
+        // walked scope leaves out) that would otherwise render as if it were
+        // honestly empty.
+        //
+        // Handled BEFORE the identical-payload short-circuit below. Warnings
+        // are not part of the rendered-history signature, so a degradation
+        // that appears while the rows stay the same — a ref listing that
+        // starts failing, a namespace that starts hiding commits — returned
+        // early and was never reported at all. Whether history changed and
+        // whether the load degraded are two different questions.
+        //
+        // Logged when the SET changes: a warning that is still true is not
+        // news, the watcher reloads on every settled write, and re-logging
+        // the same pair every few seconds is how a ring buffer loses the
+        // entry that mattered. The live set still rides in `state.warnings`.
+        const warningList = payload.warnings ?? [];
+        const warningSignature = warningList.join("\u0001");
+        if (warningSignature === "") {
+          warnedSignatures.delete(repoPath);
+        } else if (warnedSignatures.get(repoPath) !== warningSignature) {
+          warnedSignatures.set(repoPath, warningSignature);
+          for (const w of warningList) {
+            reportFailure("graph", w);
+          }
+        }
 
         const previous = cache.get(repoPath);
         if (
           previous &&
           previous.query === query &&
           previous.revision === revision &&
+          previous.refScope === refScope &&
           previous.maxCommits === max &&
           cachedSignature(previous) === graphPayloadSignature(payload)
         ) {
@@ -502,13 +587,6 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
             update((s) => ({ ...s, isLoading: false }));
           }
           return;
-        }
-
-        // Assembly warnings ride along with an otherwise-good payload: each
-        // one marks a degraded facet (HEAD marker, ref labels) that would
-        // otherwise render as if it were honestly empty.
-        for (const w of payload.warnings ?? []) {
-          reportFailure("graph", w);
         }
 
         const keepId = previous?.selectedCommit?.id;
@@ -530,6 +608,7 @@ export function createGraphStore(deps: { invoke?: InvokeFn; diagnostics?: Pick<D
           selectedCommitDetails: keepDetails,
           query,
           revision,
+          refScope,
           maxCommits: max,
           hasMore: payload.has_more === true,
           warnings: payload.warnings ?? [],

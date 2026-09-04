@@ -55,8 +55,9 @@ describe("LivePulseDashboard", () => {
   });
 
   it("links to Diff, Blame, and Graph via inspectCommitInHistory", () => {
-    expect(source).toContain("repoStore.setActiveTab('diff')");
-    expect(source).toContain("repoStore.setActiveTab('blame')");
+    // Diff is addressed as a section of History now, not as a tab of its own.
+    expect(source).toContain("repoStore.setActiveTab('history', 'diff')");
+    expect(source).toContain("repoStore.setActiveTab('code', 'blame')");
     expect(source).toContain("inspectCommitInHistory");
     expect(source).toContain("statusLiveKey");
     expect(source).toContain("lastRefreshed");

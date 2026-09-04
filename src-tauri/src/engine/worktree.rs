@@ -398,6 +398,38 @@ fn status_paths(bytes: &[u8]) -> Vec<String> {
     paths
 }
 
+/// Lists every worktree of the repository without scanning any of them.
+///
+/// Exactly one `git` spawn, whatever the worktree count. [`list_worktrees`]
+/// additionally runs `git status` in up to [`MAX_DIRTY_SCANS`] worktrees,
+/// which is right for the Work view of ONE repository and wrong for a sweep
+/// over a whole workspace: twenty-four repositories with a dozen agent
+/// worktrees each is several hundred subprocesses for a column of counts.
+///
+/// Every entry comes back with `dirty_files: None`, which already means "not
+/// scanned" in this type — so a caller cannot mistake an unscanned worktree
+/// for a clean one.
+pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
+    let repo = validate_repo(repo_path)?;
+    let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_porcelain(&stdout)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, entry)| WorktreeInfo {
+            name: display_name(&entry.path),
+            is_main: idx == 0,
+            dirty_files: None,
+            path: entry.path,
+            head: entry.head,
+            branch: entry.branch,
+            is_bare: entry.is_bare,
+            is_detached: entry.is_detached,
+            is_locked: entry.is_locked,
+            is_prunable: entry.is_prunable,
+        })
+        .collect())
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts for the worktrees closest to the front of the list.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {

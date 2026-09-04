@@ -8,6 +8,7 @@
  * and assert the renderers stay total and stay honest.
  */
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   dependabotBadgeClass,
   formatAuditCounts,
@@ -279,7 +280,7 @@ describe("health renderers survive hostile scanner output", () => {
     });
     const started = performance.now();
     const text = formatHealthReport(big, "/repo", null);
-    expect(performance.now() - started).toBeLessThan(1_000);
+    expectWithinBudget(performance.now() - started, 200, "health adversarial report");
     expect(text.split("\n").length).toBeGreaterThan(400);
-  });
+  }, STRESS_TIMEOUT_MS);
 });

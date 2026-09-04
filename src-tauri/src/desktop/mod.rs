@@ -203,9 +203,15 @@ pub fn cmd_take_pending_open(state: State<DesktopState>) -> Option<String> {
     pending.take()
 }
 
-#[tauri::command(async)]
-pub fn cmd_set_recent_menu(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
-    let capped: Vec<String> = paths.into_iter().take(12).collect();
+/// Records the recent-repository list and rebuilds the native menu from it.
+///
+/// Extracted from `cmd_set_recent_menu` so the logic is reachable on a runtime
+/// other than Wry. A `#[tauri::command]` binds itself to the concrete `Wry`
+/// handle, which put the cap, the state write and the menu rebuild — every
+/// part of this that can be wrong — behind a signature no test can construct.
+/// The command below is now the thin wrapper it should always have been.
+pub fn set_recent_menu<R: Runtime>(app: &AppHandle<R>, paths: Vec<String>) -> Result<(), String> {
+    let capped: Vec<String> = paths.into_iter().take(RECENT_MENU_LIMIT).collect();
     {
         let state = app.state::<DesktopState>();
         let mut recents = state
@@ -214,9 +220,30 @@ pub fn cmd_set_recent_menu(app: AppHandle, paths: Vec<String>) -> Result<(), Str
             .map_err(|e| format!("Recent-repo lock poisoned: {e}"))?;
         *recents = capped.clone();
     }
-    let menu = build_native_menu(&app, &capped).map_err(|e| e.to_string())?;
+    let menu = build_native_menu(app, &capped).map_err(|e| e.to_string())?;
     app.set_menu(menu).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// How many recent repositories the File menu will show.
+///
+/// Named rather than inline so the test asserting the cap and the code applying
+/// it cannot disagree about the number.
+pub const RECENT_MENU_LIMIT: usize = 12;
+
+/// Reads back the recorded recent list. Exists so a caller — including a test —
+/// can check what was stored without reaching into private state.
+pub fn recent_menu_entries<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
+    app.state::<DesktopState>()
+        .recents
+        .lock()
+        .map(|entries| entries.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command(async)]
+pub fn cmd_set_recent_menu(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
+    set_recent_menu(&app, paths)
 }
 
 #[tauri::command(async)]

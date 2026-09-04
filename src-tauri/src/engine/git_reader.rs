@@ -5,6 +5,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
+use crate::graph::RefScope;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -654,7 +655,11 @@ impl GitReader {
         max_count: usize,
         revision: Option<&str>,
     ) -> Result<Vec<RawCommitNode>, String> {
-        Self::read_commit_history_paged(repo_path, 0, max_count, revision, None)
+        // Named scope: stack hierarchies and AI commit-message context are
+        // both about the branches a person works on. Machine-written
+        // namespaces (agent turn checkpoints, prefetch mirrors) would supply
+        // subjects nobody wrote as style examples.
+        Self::read_commit_history_paged(repo_path, 0, max_count, revision, None, RefScope::Named)
     }
 
     /// Reads one page of history, oldest-first paging via `--skip`.
@@ -672,12 +677,19 @@ impl GitReader {
     /// a full walk down to a path afterwards cannot do this: the survivors keep
     /// naming parents that were dropped, and the lane solver renders the result
     /// as disconnected stubs instead of a connected history.
+    ///
+    /// `scope` decides which refs seed the walk when `revision` is `None`.
+    /// It is not a preference the walk may reinterpret: the same scope drives
+    /// [`crate::graph::list_ref_decorations`], so every commit reached here is
+    /// reachable from a ref that listing can name. See
+    /// [`crate::graph::ref_scope`] for why the two must not drift.
     pub fn read_commit_history_paged(
         repo_path: &str,
         skip: usize,
         max_count: usize,
         revision: Option<&str>,
         path: Option<&str>,
+        scope: RefScope,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
         let count = Self::page_count_limit(max_count).to_string();
@@ -721,7 +733,12 @@ impl GitReader {
             validate_ref_name(rev)?;
             args.push(rev);
         } else {
-            args.push("--all");
+            // NOT `--all`. `--all` walks every namespace under `refs/` —
+            // including agent turn checkpoints, prefetch mirrors and CI pull
+            // refs — while only heads/remotes/tags are ever labelled, so
+            // those namespaces opened lanes nothing could name. One owner
+            // decides the set for both sides; see crate::graph::ref_scope.
+            args.extend_from_slice(crate::graph::history_rev_args(scope));
         }
         if let Some(spec) = spec.as_deref() {
             args.push("--");
@@ -1380,7 +1397,10 @@ impl GitReader {
                 continue;
             }
             let content = String::from_utf8_lossy(&bytes);
-            let loc = LocCounter::count(&content, LanguageDetector::comment_prefix(lang_info.name));
+            // Language-aware: block comments, docstrings and string literals
+            // all change what counts as code, and this sum IS the repository's
+            // headline LOC number.
+            let loc = LocCounter::count_for_language(&content, lang_info.name);
             record_lang(&mut lang_counts, lang_info, loc.code_lines);
             total_lines += loc.code_lines;
         }
@@ -1434,7 +1454,7 @@ impl GitReader {
         let probe_limit = cap.saturating_add(1);
         let count_arg = format!("-n{}", probe_limit);
 
-        let args = [
+        let mut args = vec![
             "log",
             count_arg.as_str(),
             "--topo-order",
@@ -1443,8 +1463,12 @@ impl GitReader {
             // `%b` is required: Co-authored-by trailers live in the body, never
             // in `%s`. A metric that can only ever be zero is not a metric.
             "--format=format:__GP_PULSE__%x00%H%x00%P%x00%at%x00%G?%x00%s%x00%aN%x00%aE%x00%b%x00",
-            "--all",
         ];
+        // The same named ref set the graph walks. Contributor counts and churn
+        // are claims about what people did; a `--all` walk credits them with
+        // machine-written checkpoint commits from agent-harness namespaces,
+        // which is a metric measuring the tooling rather than the team.
+        args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
 
         let (stdout, payload_truncated) =
             match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
@@ -1496,6 +1520,24 @@ impl GitReader {
             payload_truncated,
             duration_ms: started.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Whether `file_path` is in the index.
+    ///
+    /// Exists to let a caller declare the operation it is about to perform
+    /// accurately. Discarding a *tracked* file restores it; discarding an
+    /// *untracked* one deletes it, and a gate told "modify" for a deletion is
+    /// judging — and recording — a weaker act than the one that runs.
+    ///
+    /// `:(literal)` for the same reason stage/unstage use it: a `*` in a user
+    /// path must match a file named `*`, never expand across the worktree.
+    /// Emptiness of the listing is the answer, so an untracked path is an
+    /// ordinary `Ok(false)` rather than an error to be interpreted.
+    pub fn is_tracked(repo_path: &str, file_path: &str) -> Result<bool, String> {
+        let repo = validate_repo(repo_path)?;
+        let spec = format!(":(literal){file_path}");
+        let stdout = git_text(&repo, &["ls-files", "-z", "--", &spec])?;
+        Ok(!stdout.trim_matches('\0').is_empty())
     }
 
     pub fn knowledge_report(
@@ -4354,6 +4396,36 @@ mod tests {
         git_in(dir.path(), &["init", "-b", "main"]);
         let files = GitReader::list_repo_files(&dir.path().to_string_lossy()).expect("empty repo");
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn is_tracked_separates_indexed_paths_from_untracked_and_absent_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        std::fs::write(dir.path().join("README.md"), "# t\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+        std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+
+        assert_eq!(GitReader::is_tracked(&root, "README.md"), Ok(true));
+        // Present on disk but not in the index: discarding this DELETES it.
+        assert_eq!(GitReader::is_tracked(&root, "fresh.txt"), Ok(false));
+        assert_eq!(GitReader::is_tracked(&root, "never-existed.txt"), Ok(false));
+    }
+
+    #[test]
+    fn is_tracked_does_not_let_a_glob_answer_for_another_file() {
+        // Without `:(literal)` a path of `*` reports "tracked" on the strength
+        // of some other file entirely, and a delete would be declared a modify.
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        std::fs::write(dir.path().join("README.md"), "# t\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+        let root = dir.path().to_string_lossy().to_string();
+
+        assert_eq!(GitReader::is_tracked(&root, "*"), Ok(false));
     }
 
     /// Exact-result assertion covers everything at once: tracked files, the

@@ -415,7 +415,7 @@
           <div class="flex items-center gap-2 pt-1 border-t border-border/50">
             <button
               type="button"
-              onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('diff'); }}
+              onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('history', 'diff'); }}
               class="gp-btn flex-1 !py-1 !text-[10px] justify-center"
             >
               <Layers size={11} class="text-cyan-400" />
@@ -423,7 +423,7 @@
             </button>
             <button
               type="button"
-              onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('blame'); }}
+              onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('code', 'blame'); }}
               class="gp-btn flex-1 !py-1 !text-[10px] justify-center"
             >
               <GitCommit size={11} class="text-purple-400" />

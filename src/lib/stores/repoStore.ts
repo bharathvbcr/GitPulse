@@ -39,6 +39,7 @@ import {
   type StorageLike,
   type ViewTab,
 } from "../repos/persist";
+import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
 import { summarizeBulkOutcome } from "../repos/bulkOps";
 import type { StashAction, StashEntry } from "../repos/stash";
 import {
@@ -64,6 +65,7 @@ import {
   type RepoWipInput,
   type WorkspaceWip,
 } from "../repos/wipSummary";
+import { toWipInput, type RepoFacts } from "../repos/facts";
 import {
   IDLE_OPERATION,
   operationStatesEqual,
@@ -95,6 +97,7 @@ export type { OperationAction, OperationState, RepoOperation };
 export type { StashAction, StashEntry, RemoteChange, SubmoduleChange };
 export type { WatchState };
 export type { BulkRunReport, WorkspaceWip };
+export type { RepoFacts };
 export type { InvokeFn };
 
 /** Mirrors the Rust `ResetMode` under `rename_all = "lowercase"`. */
@@ -208,6 +211,14 @@ export interface RepoSession {
    */
   selectedDiffTruncated: boolean;
   activeTab: ViewTab;
+  /**
+   * The section last open in each sectioned view, keyed by view id.
+   *
+   * Per view rather than one value: a section is a lens on that view's
+   * subject, so leaving History on Reflog and returning through Files should
+   * come back to Reflog. Unset views open on their registered default.
+   */
+  viewSections: Record<string, string>;
   searchQuery: string;
   selectedBranch: string | null;
   commitDraft: string;
@@ -279,6 +290,8 @@ export interface RepoState {
    */
   selectedDiffTruncated: boolean;
   activeTab: ViewTab;
+  /** Section last open in each sectioned view; see the session field. */
+  viewSections: Record<string, string>;
   isLoading: boolean;
   error: string | null;
   commitDraft: string;
@@ -401,6 +414,7 @@ function emptyProjected(): RepoState {
     selectedDiff: null,
     selectedDiffTruncated: false,
     activeTab: "work",
+    viewSections: {},
     isLoading: false,
     error: null,
     commitDraft: "",
@@ -441,6 +455,7 @@ function createSession(
     selectedDiff: extras.selectedDiff ?? null,
     selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
     activeTab: extras.activeTab ?? "work",
+    viewSections: { ...(extras.viewSections ?? {}) },
     searchQuery: extras.searchQuery ?? "",
     selectedBranch: extras.selectedBranch ?? null,
     commitDraft: extras.commitDraft ?? "",
@@ -505,6 +520,7 @@ function project(internal: InternalState): RepoState {
     selectedDiff: active?.selectedDiff ?? null,
     selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
     activeTab: active?.activeTab ?? "work",
+    viewSections: active?.viewSections ?? {},
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
     commitDraft: active?.commitDraft ?? "",
@@ -821,10 +837,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   function applyToSession(
     id: string,
     generation: number,
-    patch: Partial<RepoSession>,
+    /**
+     * A patch, or a function given the LIVE session that returns one.
+     *
+     * The function form exists for fields that merge rather than replace —
+     * `viewSections` above all. A caller that spreads a session snapshot
+     * captured before an await would silently undo any section change made
+     * while its fetch was in flight; reading the live session here cannot.
+     */
+    patchOrFn: Partial<RepoSession> | ((current: RepoSession) => Partial<RepoSession>),
   ) {
     const session = internal.sessions[id];
     if (!session || session.generation !== generation) return false;
+    const patch = typeof patchOrFn === "function" ? patchOrFn(session) : patchOrFn;
     // A no-op patch must not publish: subscribers treat every store emission
     // as invalidation. Report "advanced" so callers do not retry the work.
     if (patchIsNoop(session, patch)) return false;
@@ -1224,6 +1249,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         pinned?: boolean;
         restore?: {
           viewTab?: ViewTab;
+          viewSections?: Record<string, string>;
           searchQuery?: string;
           selectedBranch?: string | null;
         };
@@ -1343,6 +1369,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               // An adopted alias tab hands over its state; an explicit
               // restore payload always wins over what the alias carried.
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
+              viewSections:
+                extras.restore?.viewSections ?? carriedSession?.viewSections,
               searchQuery:
                 extras.restore?.searchQuery ?? carriedSession?.searchQuery,
               selectedBranch:
@@ -1605,6 +1633,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           pinned: tab.pinned,
           restore: {
             viewTab: tab.viewTab,
+            viewSections: tab.viewSections,
             searchQuery: tab.searchQuery,
             selectedBranch: tab.selectedBranch,
           },
@@ -1649,7 +1678,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           ignoreWhitespace,
         });
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, {
+        applyToSession(session.id, generation, (current) => ({
           selectedFilePath: filePath,
           selectedCommitId: null,
           selectedDiff: diff.text,
@@ -1657,8 +1686,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedIsStaged: isStaged,
           selectedIgnoreWhitespace: ignoreWhitespace,
           selectionKind: "file",
-          activeTab: "diff",
-        });
+          activeTab: "history",
+          viewSections: { ...current.viewSections, history: "diff" },
+        }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: formatError(err) });
@@ -1738,15 +1768,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           filePath,
         });
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, {
+        applyToSession(session.id, generation, (current) => ({
           selectedCommitId: commitId,
           selectedFilePath: filePath,
           selectedDiff: fileDiff.text,
           selectedDiffTruncated: fileDiff.truncated,
           selectedIsStaged: false,
           selectionKind: "commit",
-          activeTab: "diff",
-        });
+          activeTab: "history",
+          viewSections: { ...current.viewSections, history: "diff" },
+        }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: formatError(err) });
@@ -1764,15 +1795,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           to,
         });
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, {
+        applyToSession(session.id, generation, (current) => ({
           selectedFilePath: `${from}...${to}`,
           selectedCommitId: null,
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
           selectedIsStaged: false,
           selectionKind: "range",
-          activeTab: "diff",
-        });
+          activeTab: "history",
+          viewSections: { ...current.viewSections, history: "diff" },
+        }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
         applyToSession(session.id, generation, { error: formatError(err) });
@@ -2004,6 +2036,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     workspaceWip: (): WorkspaceWip => summarizeWorkspace(wipInputs()),
 
     /**
+     * Live facts for every open repository, in tab order.
+     *
+     * Derived from session state rather than refetched, so it is free to call
+     * and always agrees with what the tabs are showing. The Fleet grid's
+     * cheapest tier is exactly this call.
+     */
+    repoFacts: (): RepoFacts[] => repoFacts(),
+
+    /**
      * Runs `fetch` (or `pull`) across every open repository.
      *
      * Repositories that are parked mid-operation, still loading, or holding
@@ -2133,12 +2174,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }),
       );
     },
-    setActiveTab: (tab: ViewTab) => {
+    /**
+     * Switch views, optionally landing on a particular section.
+     *
+     * Omitting `section` keeps whichever lens that view was last left on —
+     * the point of remembering it per view. Passing one is how a caller says
+     * "show them *this*", which is what the retired top-level tabs did by
+     * being separate destinations.
+     */
+    setActiveTab: (tab: ViewTab, section?: string) => {
       const session = activeSession();
       if (!session) return;
-      applyToSession(session.id, session.generation, { activeTab: tab });
+      const resolved = section ? resolveSection(tab, section) : null;
+      applyToSession(session.id, session.generation, {
+        activeTab: tab,
+        ...(resolved
+          ? { viewSections: { ...session.viewSections, [tab]: resolved } }
+          : {}),
+      });
       // The view tab is persisted state: flush so quitting right after a
       // switch does not restore the previous one.
+      flushPersist();
+    },
+    /** Change the lens within a view without leaving it. */
+    setViewSection: (tab: ViewTab, section: string) => {
+      const session = activeSession();
+      if (!session) return;
+      const resolved = resolveSection(tab, section);
+      if (!resolved || session.viewSections[tab] === resolved) return;
+      applyToSession(session.id, session.generation, {
+        viewSections: { ...session.viewSections, [tab]: resolved },
+      });
       flushPersist();
     },
     inspectCommitInHistory: (commitId: string) => {
@@ -2179,13 +2245,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * reconstructible after the fact.
    */
   /**
-   * Per-repository facts for the work-in-progress summary.
+   * Per-repository live facts, one record per open tab.
    *
    * `unpushedCommits` comes from the current branch's ahead count; a session
-   * that has not hydrated reports zero, and `hydrated: false` is what tells the
-   * summary to treat that zero as unknown rather than as "nothing to push".
+   * that has not hydrated reports zero, and `hydrated: false` is what tells
+   * every consumer to treat that zero as unknown rather than as "nothing to
+   * push". The same rule governs every other count here.
+   *
+   * This is the single extraction from session state. The work-in-progress
+   * summary and the Fleet grid both narrow from it (see repos/facts.ts)
+   * instead of walking `internal.sessions` themselves.
    */
-  function wipInputs(): RepoWipInput[] {
+  function repoFacts(): RepoFacts[] {
     const labels = disambiguateLabels(internal.workspace.tabs.map((tab) => tab.path));
     return internal.workspace.tabs.map((tab) => {
       const session = internal.sessions[tab.id];
@@ -2193,20 +2264,46 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const current = session?.branches.find(
         (branch) => branch.is_current || branch.name === session?.currentBranch,
       );
+      let additions = 0;
+      let deletions = 0;
+      let churnPartial = false;
+      for (const file of statuses) {
+        additions += file.additions;
+        deletions += file.deletions;
+        // Rust omits the key entirely while empty, so this is absent on the
+        // overwhelming majority of rows. Where it is present, the sums above
+        // are floors and must be rendered as such.
+        if (file.warnings && file.warnings.length > 0) churnPartial = true;
+      }
       return {
         path: tab.path,
         label: labels.get(tab.path) ?? displayName(tab.path),
+        branch: session?.currentBranch ?? null,
+        isBare: Boolean(session?.isBare),
         changedFiles: statuses.length,
         conflictedFiles: statuses.filter((file) => file.is_conflicted).length,
+        stagedFiles: statuses.filter((file) => file.is_staged).length,
+        additions,
+        deletions,
+        churnPartial,
         unpushedCommits: current?.ahead_count ?? 0,
-        // An unreadable stash list must not read as an empty one; the summary
-        // treats a failed probe as unknown through `loadFailed`.
+        behindCommits: current?.behind_count ?? 0,
+        // An unreadable stash list must not read as an empty one; consumers
+        // treat a failed probe as unknown through `stashFailed`/`loadFailed`.
         stashEntries: session?.stashEntries.length ?? 0,
+        stashFailed: Boolean(session?.stashFailed),
         operation: session?.operation ?? IDLE_OPERATION,
-        loadFailed: Boolean(session?.error) || Boolean(session?.stashFailed),
+        watch: session?.watch ?? WATCH_UNKNOWN,
+        loadFailed: Boolean(session?.error),
+        loadError: session?.error ?? null,
         hydrated: Boolean(session?.hasHydrated),
       };
     });
+  }
+
+  /** The work-in-progress model's narrower view of the same facts. */
+  function wipInputs(): RepoWipInput[] {
+    return repoFacts().map(toWipInput);
   }
 
   async function runMutating<T = unknown>(
@@ -2247,7 +2344,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           still.selectionKind === "file" &&
           still.selectedFilePath &&
           !still.selectedCommitId &&
-          still.activeTab === "diff"
+          isSectionOnScreen(still.activeTab, still.viewSections, "history", "diff")
         ) {
           void store.selectFileDiff(
             still.selectedFilePath,

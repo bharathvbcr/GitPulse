@@ -1,7 +1,9 @@
 //! Terminal execution module: PTY session management and bounded command execution.
 
 use crate::coverage_toolchain::{
-    repo_local_program, JS_COVERAGE_PROVIDERS, PYTEST_PACKAGES, VENV_DIR_NAMES,
+    repo_local_program, GCOVR_MODULE, GCOVR_PACKAGES, JS_COVERAGE_PROVIDERS,
+    NATIVE_COVERAGE_BUILD_DIR, NATIVE_COVERAGE_FLAG, NATIVE_COVERAGE_LCOV, PYTEST_PACKAGES,
+    VENV_DIR_NAMES,
 };
 use crate::engine::git_cli::{
     run_captured, sandbox_join, sandbox_join_canonical, validate_repo, RunOutcome,
@@ -954,7 +956,84 @@ fn pip_coverage_install_allowed(args: &[String], interpreter_is_repo_local: bool
         return false;
     }
     let packages: Vec<&str> = args.iter().skip(4).map(String::as_str).collect();
-    !packages.is_empty() && packages.iter().all(|pkg| PYTEST_PACKAGES.contains(pkg))
+    // Two pinned sets, not a general installer: the pytest toolchain for the
+    // Python family and gcovr for the C/C++ one. Both are rendered into the
+    // planner's command text from these same slices.
+    !packages.is_empty()
+        && packages
+            .iter()
+            .all(|pkg| PYTEST_PACKAGES.contains(pkg) || GCOVR_PACKAGES.contains(pkg))
+}
+
+/// `cmake -S . -B build-gitpulse-coverage -DCMAKE_*_FLAGS=--coverage` and
+/// `cmake --build build-gitpulse-coverage`.
+///
+/// Pinned to the two shapes the planner emits. Notably NOT permitted: any
+/// `-D` other than the three flag variables and the build type, `--install`
+/// (which writes outside the build directory), `-P` (which executes an
+/// arbitrary CMake script), and any build directory other than the managed
+/// one — a configure into the project's own `build/` would silently replace a
+/// developer's build with an instrumented one.
+fn cmake_coverage_allowed(args: &[String]) -> bool {
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    match rest.first().copied() {
+        // `cmake --build <managed dir>` and nothing else.
+        Some("--build") => rest.len() == 2 && rest[1] == NATIVE_COVERAGE_BUILD_DIR,
+        // The configure step.
+        Some("-S") => {
+            let allowed_define = |arg: &str| {
+                matches!(
+                    arg,
+                    "-DCMAKE_BUILD_TYPE=Debug" | "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+                ) || matches!(
+                    arg.strip_suffix(NATIVE_COVERAGE_FLAG)
+                        .and_then(|head| head.strip_suffix('=')),
+                    Some("-DCMAKE_C_FLAGS")
+                        | Some("-DCMAKE_CXX_FLAGS")
+                        | Some("-DCMAKE_EXE_LINKER_FLAGS")
+                        | Some("-DCMAKE_SHARED_LINKER_FLAGS")
+                )
+            };
+            rest.len() >= 4
+                && rest[1] == "."
+                && rest[2] == "-B"
+                && rest[3] == NATIVE_COVERAGE_BUILD_DIR
+                && rest[4..].iter().all(|arg| allowed_define(arg))
+        }
+        _ => false,
+    }
+}
+
+/// `ctest --test-dir build-gitpulse-coverage --output-on-failure`.
+///
+/// The directory is pinned so this cannot drive an arbitrary test tree, and
+/// the only other accepted token is the diagnostic output flag. `--build-and-test`
+/// and `-S` (script mode) are excluded: both execute project-supplied code
+/// beyond running the tests that were just built.
+fn ctest_coverage_allowed(args: &[String]) -> bool {
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    if rest.first().copied() != Some("--test-dir")
+        || rest.get(1).copied() != Some(NATIVE_COVERAGE_BUILD_DIR)
+    {
+        return false;
+    }
+    rest[2..].iter().all(|arg| *arg == "--output-on-failure")
+}
+
+/// `gcovr -r . build-gitpulse-coverage --lcov build-gitpulse-coverage/lcov.info`.
+///
+/// gcovr reads gcov data and writes a report; the only write it is allowed
+/// here is the pinned lcov path inside the managed build directory. Every
+/// other output flag (`--html`, `--json`, `--output`, `--txt`) is refused so
+/// this cannot be turned into a file writer aimed anywhere else.
+fn gcovr_coverage_allowed(args: &[String]) -> bool {
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    rest.first().copied() == Some("-r")
+        && rest.get(1).copied() == Some(".")
+        && rest.get(2).copied() == Some(NATIVE_COVERAGE_BUILD_DIR)
+        && rest.get(3).copied() == Some("--lcov")
+        && rest.get(4).copied() == Some(NATIVE_COVERAGE_LCOV)
+        && rest.len() == 5
 }
 
 /// `npm install --save-dev @vitest/coverage-v8`.
@@ -1128,6 +1207,15 @@ fn python_module_allowed(
         // is reachable from the read-only analysis action.
         ManviActionKind::CoverageGenerator => match module.as_deref() {
             Some("pytest") => true,
+            // The C/C++ report step, run through the interpreter gcovr was
+            // installed into. `args[2..]` starts at the module name, which is
+            // where `gcovr_coverage_allowed` expects the program to sit.
+            // Repo-local only, for the same reason `pip install` is: the
+            // planner never names the host interpreter, so neither may the
+            // gate accept one.
+            Some(m) if m == GCOVR_MODULE => {
+                interpreter_is_repo_local && gcovr_coverage_allowed(&args[2..])
+            }
             Some("coverage") => command_is_one_of(
                 &args[2..],
                 &["run", "report", "html", "xml", "json", "lcov"],
@@ -1302,6 +1390,12 @@ pub(crate) fn validate_manvi_action(args: &[String], kind: ManviActionKind) -> R
                 ManviActionKind::Coverage | ManviActionKind::CoverageGenerator
             ) && command_is_one_of(args, &["test"])
         }
+        // C/C++: configure and build an INSTRUMENTED tree in a directory
+        // GitPulse owns, run its tests, and turn the gcov data into lcov.
+        // Generation only — coverage analysis is read-only and never builds.
+        "cmake" => kind == ManviActionKind::CoverageGenerator && cmake_coverage_allowed(args),
+        "ctest" => kind == ManviActionKind::CoverageGenerator && ctest_coverage_allowed(args),
+        "gcovr" => kind == ManviActionKind::CoverageGenerator && gcovr_coverage_allowed(args),
         "mvn" | "mvnw" | "./mvnw" | ".\\mvnw" | "gradle" | "gradlew" | "./gradlew"
         | ".\\gradlew" => build_tool_tasks_allowed(args, kind),
         "phpunit" => matches!(
@@ -1342,6 +1436,13 @@ pub(crate) fn validate_manvi_paths(
         "-r",
         "-c",
         "-C",
+        // CMake source/build trees and the ctest build directory. Belt and
+        // braces: the allowlist already pins these to one literal directory,
+        // and this proves that directory resolves inside the repository.
+        "-S",
+        "-B",
+        "--build",
+        "--test-dir",
     ];
     const PREFIX_PATH_FLAGS: &[&str] = &[
         "--manifest-path=",
@@ -1917,6 +2018,229 @@ mod tests {
         ] {
             validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
                 .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
+        }
+    }
+
+    /// The C/C++ toolchain the generator may now drive.
+    ///
+    /// Adding `cmake`, `ctest` and `gcovr` widened what this app can spawn, so
+    /// each shape is pinned here and everything adjacent is refused below.
+    #[test]
+    fn coverage_generator_allows_exactly_the_native_build_steps() {
+        for argv in [
+            vec![
+                "cmake".into(),
+                "-S".into(),
+                ".".into(),
+                "-B".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+                "-DCMAKE_BUILD_TYPE=Debug".into(),
+                format!("-DCMAKE_C_FLAGS={NATIVE_COVERAGE_FLAG}"),
+                format!("-DCMAKE_CXX_FLAGS={NATIVE_COVERAGE_FLAG}"),
+                format!("-DCMAKE_EXE_LINKER_FLAGS={NATIVE_COVERAGE_FLAG}"),
+            ],
+            vec![
+                "cmake".into(),
+                "--build".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+            ],
+            vec![
+                "ctest".into(),
+                "--test-dir".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+                "--output-on-failure".into(),
+            ],
+            vec![
+                "gcovr".into(),
+                "-r".into(),
+                ".".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+                "--lcov".into(),
+                NATIVE_COVERAGE_LCOV.into(),
+            ],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "gcovr".into(),
+                "-r".into(),
+                ".".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+                "--lcov".into(),
+                NATIVE_COVERAGE_LCOV.into(),
+            ],
+            vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pip".into(),
+                "install".into(),
+                "gcovr".into(),
+            ],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .unwrap_or_else(|err| panic!("{argv:?} must be allowed: {err}"));
+        }
+    }
+
+    /// The blast radius of the C/C++ widening, stated as refusals.
+    ///
+    /// The load-bearing cases are the ones that would turn a coverage panel
+    /// into a general build runner or file writer: a configure into the
+    /// project's own build directory, an arbitrary `-D`, CMake's script mode,
+    /// and any gcovr output path other than the pinned one.
+    #[test]
+    fn coverage_generator_refuses_everything_adjacent_to_the_native_steps() {
+        for (argv, why) in [
+            (
+                vec![
+                    "cmake".into(),
+                    "-S".into(),
+                    ".".into(),
+                    "-B".into(),
+                    "build".into(),
+                ],
+                "configuring into the project's own build directory would replace a developer's build",
+            ),
+            (
+                vec![
+                    "cmake".into(),
+                    "-S".into(),
+                    ".".into(),
+                    "-B".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "-DCMAKE_TOOLCHAIN_FILE=/tmp/evil.cmake".into(),
+                ],
+                "only the coverage flag variables may be defined",
+            ),
+            (
+                vec![
+                    "cmake".into(),
+                    "-S".into(),
+                    ".".into(),
+                    "-B".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "-DCMAKE_C_FLAGS=-fsanitize=address".into(),
+                ],
+                "the flag variables may carry only the coverage flag",
+            ),
+            (
+                vec!["cmake".into(), "-P".into(), "script.cmake".into()],
+                "CMake script mode executes arbitrary project code",
+            ),
+            (
+                vec![
+                    "cmake".into(),
+                    "--install".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                ],
+                "install writes outside the build directory",
+            ),
+            (
+                vec![
+                    "ctest".into(),
+                    "--test-dir".into(),
+                    "build".into(),
+                    "--output-on-failure".into(),
+                ],
+                "only the managed build directory may be tested",
+            ),
+            (
+                vec![
+                    "ctest".into(),
+                    "--test-dir".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "--build-and-test".into(),
+                ],
+                "build-and-test drives a second, unpinned configure",
+            ),
+            (
+                vec![
+                    "gcovr".into(),
+                    "-r".into(),
+                    ".".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "--lcov".into(),
+                    "../escape.info".into(),
+                ],
+                "gcovr may write only the pinned lcov path",
+            ),
+            (
+                vec![
+                    "gcovr".into(),
+                    "-r".into(),
+                    ".".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "--html".into(),
+                    "report.html".into(),
+                ],
+                "no output format other than the pinned lcov one",
+            ),
+            (
+                vec![
+                    "python3".into(),
+                    "-m".into(),
+                    "gcovr".into(),
+                    "-r".into(),
+                    ".".into(),
+                    NATIVE_COVERAGE_BUILD_DIR.into(),
+                    "--lcov".into(),
+                    NATIVE_COVERAGE_LCOV.into(),
+                ],
+                "the host interpreter is never the one GitPulse runs modules in",
+            ),
+            (
+                vec![
+                    "python3".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "gcovr".into(),
+                ],
+                "host interpreter must never receive an install",
+            ),
+            (
+                vec![
+                    ".venv/bin/python".into(),
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "gcovr".into(),
+                    "evil-package".into(),
+                ],
+                "an extra package must not ride along with gcovr",
+            ),
+        ] {
+            let err = validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                .expect_err(&format!("{argv:?} must be refused: {why}"));
+            assert!(err.contains("refused"), "{err}");
+        }
+    }
+
+    /// Coverage *analysis* is read-only. None of the build steps may be
+    /// reached from it, only from generation.
+    #[test]
+    fn read_only_coverage_analysis_cannot_run_the_native_build() {
+        for argv in [
+            vec![
+                "cmake".into(),
+                "--build".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+            ],
+            vec![
+                "ctest".into(),
+                "--test-dir".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+            ],
+            vec![
+                "gcovr".into(),
+                "-r".into(),
+                ".".into(),
+                NATIVE_COVERAGE_BUILD_DIR.into(),
+                "--lcov".into(),
+                NATIVE_COVERAGE_LCOV.into(),
+            ],
+        ] {
+            validate_manvi_action(&argv, ManviActionKind::Coverage)
+                .expect_err(&format!("{argv:?} must be generation-only"));
         }
     }
 

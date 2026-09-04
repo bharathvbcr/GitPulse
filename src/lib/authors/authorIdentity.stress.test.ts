@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach } from "vitest";
+import { STRESS_TIMEOUT_MS } from "../__tests__/perfBudget";
 import {
   authorIdentity,
   authorColor,
@@ -65,7 +66,7 @@ describe("authorIdentity stress", () => {
       expect(id.key.length).toBeLessThanOrEqual(512);
     }
     expect(authorIdentityCacheSize()).toBeLessThanOrEqual(512);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("is deterministic regardless of cache warmth or eviction order", () => {
     const rnd = lcg(42);

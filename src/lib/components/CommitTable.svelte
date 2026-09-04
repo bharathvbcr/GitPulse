@@ -332,9 +332,16 @@
             ? "tag"
             : ref.kind === "remote"
               ? "remote-branch"
-              : ref.is_head
-                ? "current-branch"
-                : "local-branch";
+              // A ref outside branches, remotes and tags — only ever present
+              // under the "all refs" scope. It gets its own chip rather than
+              // falling through to "local-branch": drawing an agent-harness
+              // checkpoint as a branch is the mislabelling this whole path
+              // exists to prevent.
+              : ref.kind === "other"
+                ? "other"
+                : ref.is_head
+                  ? "current-branch"
+                  : "local-branch";
       const list = map.get(ref.commit_id) ?? [];
       if (!list.some((r) => r.name === ref.name && r.kind === kind)) {
         list.push({ name: ref.name, kind });

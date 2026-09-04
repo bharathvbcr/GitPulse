@@ -2,6 +2,7 @@
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import CommitCadence from "./CommitCadence.svelte";
+  import LanguageSegment from "./LanguageSegment.svelte";
   import {
     GitBranch,
     RefreshCw,
@@ -13,10 +14,13 @@
     CheckCircle2,
     GitMerge,
     HelpCircle,
+    SquareTerminal,
   } from "lucide-svelte";
   import { tabMarker, tabTooltip } from "../repos/operation";
   import { describeWatch, watchMarker } from "../repos/watchState";
   import { RadioTower } from "lucide-svelte";
+  import { interfaceStore } from "../stores/interfaceStore";
+  import { resolveStatusBarMode } from "../ui/statusBarMode";
 
   let {
     onOpenShortcuts,
@@ -39,7 +43,7 @@
   /**
    * A parked merge/rebase/cherry-pick is the highest-stakes thing the status
    * bar can say, so it renders first and it is a button: a user who has
-   * wandered to Files or Graph mid-merge has no other cue that the repository
+   * wandered to Code or the graph mid-merge has no other cue that the repository
    * is mid-operation, and one click takes them to where they can finish it.
    */
   /**
@@ -55,6 +59,25 @@
   let operationMarker = $derived(tabMarker(operationState));
   let operationTip = $derived(tabTooltip(operationState));
 
+  /**
+   * The bar owns its own visibility rather than App.svelte, because only it
+   * knows the three signals that override a hidden preference: a parked
+   * operation, unresolved conflicts, and a degraded watcher.
+   */
+  let resolved = $derived(
+    resolveStatusBarMode($interfaceStore.statusBarMode, {
+      operationParked: Boolean(operationMarker),
+      conflictedCount,
+      watchDegraded: Boolean(watchLabel),
+    }),
+  );
+  let detail = $derived(resolved.mode);
+  let forcedTip = $derived(
+    resolved.forced
+      ? "Shown despite the hidden status-bar setting: this repository needs attention."
+      : undefined,
+  );
+
   function openShortcuts() {
     if (onOpenShortcuts) {
       onOpenShortcuts();
@@ -68,7 +91,9 @@
   }
 </script>
 
+{#if detail !== "hidden"}
 <footer
+  title={forcedTip}
   class="h-6 shrink-0 bg-surface/95 border-t border-border/70 px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none gp-gpu z-20"
   role="status"
   aria-label="Repository Status Bar"
@@ -100,7 +125,7 @@
     {#if operationMarker}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("conflict")}
+        onclick={() => repoStore.setActiveTab("work", "resolve")}
         class="inline-flex items-center gap-1 px-1.5 py-0.2 rounded border font-medium transition-colors {operationState.probeFailed
           ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
           : 'border-accent/50 bg-accent/10 text-accent hover:bg-accent/20'}"
@@ -134,13 +159,17 @@
       </div>
     {/if}
 
-    <span class="text-border">|</span>
+    <!-- Ambient readouts below are what "Compact" drops: they say nothing is
+         wrong, which is exactly the noise a decluttered bar should lose. -->
+    {#if detail === "full"}
+      <span class="text-border">|</span>
+    {/if}
 
     <!-- Working Tree Changes / Dirty Files -->
     {#if dirtyCount > 0}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("diff")}
+        onclick={() => repoStore.setActiveTab("history", "diff")}
         class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors"
         title="View {dirtyCount} changed file{dirtyCount === 1 ? '' : 's'} ({stagedCount} staged)"
       >
@@ -152,7 +181,7 @@
           </span>
         {/if}
       </button>
-    {:else}
+    {:else if detail === "full"}
       <span class="inline-flex items-center gap-1 text-textMuted/70">
         <CheckCircle2 size={11} class="text-emerald-500/80" />
         <span>Clean</span>
@@ -163,7 +192,7 @@
     {#if conflictedCount > 0}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("conflict")}
+        onclick={() => repoStore.setActiveTab("work", "resolve")}
         class="inline-flex items-center gap-1 font-semibold text-rose-600 dark:text-rose-400 hover:brightness-110 transition-colors animate-pulse"
         title="{conflictedCount} unresolved conflict{conflictedCount === 1 ? '' : 's'}"
       >
@@ -173,12 +202,17 @@
     {/if}
   </div>
 
-  <!-- Center Segment: Background Activity -->
-  <div class="hidden sm:flex items-center gap-2 text-[10px]">
+  <!-- Center Segment: Language mix and background activity -->
+  <div class="hidden sm:flex items-center gap-3 text-[10px] min-w-0">
+    <!-- The language breakdown used to be its own 32px strip. It is reference
+         material, not a control, so it rides here and expands on demand. -->
+    {#if detail === "full" && $interfaceStore.showLanguageBar}
+      <LanguageSegment />
+    {/if}
     <!-- Cadence reads the commits already loaded for the graph, so it costs
          no additional fetch. Hidden while syncing, when the window would be
          drawn from a partially loaded history. -->
-    {#if !$repoStore.isLoading && $graphStore.commits.length > 0}
+    {#if detail === "full" && !$repoStore.isLoading && $graphStore.commits.length > 0}
       <CommitCadence commits={$graphStore.commits} days={30} />
     {/if}
     {#if $repoStore.isLoading}
@@ -190,7 +224,27 @@
   </div>
 
   <!-- Right Segment: Quick Shortcuts -->
+  {#if detail === "full"}
   <div class="flex items-center gap-3">
+    <!-- The terminal left the header when it stopped being a view. Without a
+         control here its only doors would be a chord and the palette, which
+         is how a dock becomes a feature nobody finds. -->
+    {#if $repoStore.currentPath}
+      <button
+        type="button"
+        onclick={() => interfaceStore.toggleTerminalDock()}
+        aria-pressed={$interfaceStore.terminalDockOpen}
+        class="inline-flex items-center gap-1 transition-colors text-[10px] {$interfaceStore
+          .terminalDockOpen
+          ? 'text-accent'
+          : 'text-textMuted hover:text-textPrimary'}"
+        title="Toggle the terminal dock (⌃`)"
+      >
+        <SquareTerminal size={11} class="shrink-0" />
+        <span class="hidden md:inline">Terminal</span>
+      </button>
+    {/if}
+
     <button
       type="button"
       onclick={openCommandPalette}
@@ -212,4 +266,6 @@
       <span class="hidden md:inline">Shortcuts</span>
     </button>
   </div>
+  {/if}
 </footer>
+{/if}

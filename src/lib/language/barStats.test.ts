@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { pickLanguageBarStats, type RepoLanguageStat } from "./barStats";
+import {
+  describeLanguageMix,
+  pickLanguageBarStats,
+  type LanguageMixInput,
+  type RepoLanguageStat,
+} from "./barStats";
 
 function stat(
   language: string,
@@ -103,5 +108,112 @@ describe("pickLanguageBarStats hardening", () => {
     expect(rustRows[0].percentage).toBeCloseTo(50);
     expect(rustRows[0].code_lines).toBe(50);
     expect(rustRows[0].file_count).toBe(2);
+  });
+});
+
+function snapshot(overrides: Partial<LanguageMixInput> = {}): LanguageMixInput {
+  return {
+    value: {
+      stats: [stat("Rust", 70), stat("TypeScript", 30)],
+      truncated: false,
+      scanned_files: 120,
+      candidate_files: 120,
+    },
+    state: "ready",
+    stale: null,
+    ...overrides,
+  };
+}
+
+describe("describeLanguageMix", () => {
+  it("leads with the dominant programming language", () => {
+    const mix = describeLanguageMix(snapshot());
+    expect(mix.dominant?.language).toBe("Rust");
+    expect(mix.partial).toBe(false);
+    expect(mix.partialNotice).toBeNull();
+    expect(mix.failed).toBe(false);
+  });
+
+  it("never leads with the Other aggregate when a real language is present", () => {
+    // "Other" sorts last out of pickLanguageBarStats, but a one-language
+    // repository past the cap can put it first; leading with it would name
+    // the repository after a bucket.
+    const mix = describeLanguageMix(
+      snapshot({
+        value: {
+          stats: [stat("JSON", 60, "data"), stat("Rust", 40)],
+          truncated: false,
+          scanned_files: 10,
+          candidate_files: 10,
+        },
+      }),
+    );
+    expect(mix.dominant?.language).not.toBe("Other");
+  });
+
+  it("marks a capped scan partial and names what it counted", () => {
+    const mix = describeLanguageMix(
+      snapshot({
+        value: {
+          stats: [stat("Rust", 70)],
+          truncated: true,
+          scanned_files: 800,
+          candidate_files: 10_000,
+        },
+      }),
+    );
+    expect(mix.partial).toBe(true);
+    expect(mix.partialNotice).toBe("Partial scan: 800 of 10000 files counted");
+  });
+
+  it("marks a stale reading partial even when the scan itself completed", () => {
+    // The other half of the honesty rule: a complete scan of a repository
+    // that has since moved is still a floor, and rendering it as a total is
+    // the same lie with a later timestamp.
+    const mix = describeLanguageMix(snapshot({ stale: "repository-changed" }));
+    expect(mix.partial).toBe(true);
+    expect(mix.partialNotice).toContain("changed since this scan");
+  });
+
+  it("prefers the truncation notice when a reading is both capped and stale", () => {
+    const mix = describeLanguageMix(
+      snapshot({
+        value: {
+          stats: [stat("Rust", 70)],
+          truncated: true,
+          scanned_files: 5,
+          candidate_files: 50,
+        },
+        stale: "repository-changed",
+      }),
+    );
+    expect(mix.partialNotice).toContain("Partial scan");
+  });
+
+  it("reports a failure only when nothing survives to show", () => {
+    expect(describeLanguageMix(snapshot({ value: null, state: "failed" })).failed).toBe(true);
+    // A refresh that failed over a previous good value keeps the value and
+    // reports it as stale, not as a failure with nothing behind it.
+    const kept = describeLanguageMix(snapshot({ state: "failed", stale: "refresh-failed" }));
+    expect(kept.failed).toBe(false);
+    expect(kept.partial).toBe(true);
+  });
+
+  it("renders nothing rather than guessing when no scan has landed", () => {
+    const mix = describeLanguageMix(snapshot({ value: null, state: "loading" }));
+    expect(mix.stats).toEqual([]);
+    expect(mix.dominant).toBeNull();
+    expect(mix.partial).toBe(false);
+    expect(mix.failed).toBe(false);
+  });
+
+  it("survives a malformed report instead of throwing into the status bar", () => {
+    const mix = describeLanguageMix({
+      value: { stats: null as never, truncated: false, scanned_files: 0, candidate_files: 0 },
+      state: "ready",
+      stale: null,
+    });
+    expect(mix.stats).toEqual([]);
+    expect(mix.dominant).toBeNull();
   });
 });

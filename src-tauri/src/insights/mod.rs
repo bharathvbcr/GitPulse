@@ -6,15 +6,18 @@
 //! nothing. Nothing here mutates a repository.
 
 use crate::codeintel::{self, CodeintelStatus};
+use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
 use crate::engine::worktree::{self, agent_kind, agent_session_slug, changed_paths, WorktreeInfo};
-use crate::ledger::LedgerStatus;
+use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// How many worktrees collision detection will porcelain-scan.
 const MAX_COLLISION_SCANS: usize = 16;
@@ -402,6 +405,221 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
     }
 }
 
+/* ── Fleet: the same idea at workspace scale ──────────────────────────────── */
+
+/// How many repositories one fleet sweep will visit.
+///
+/// The workspace caps open tabs at 24 and recents at 24, so 48 is the real
+/// ceiling; the extra headroom is for a caller that passes both plus a
+/// duplicate or two, and anything past it is dropped and reported through
+/// `truncated` rather than silently ignored.
+pub const MAX_FLEET_REPOS: usize = 64;
+
+/// Soft deadline for one whole sweep, not per repository.
+///
+/// Past it the remaining repositories are left unvisited and `truncated` says
+/// so. A per-repository timeout would let 24 slow repositories add up to a
+/// dashboard that never paints.
+const FLEET_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One repository's cheap facet: what can be learned in two `git` spawns.
+///
+/// Deliberately NOT what [`snapshot`] returns. That function probes every
+/// worktree for a parked operation, counts dirty files in up to 32 of them,
+/// and cross-scans up to 16 for colliding paths — right for one repository on
+/// screen, and several hundred subprocesses when multiplied by a workspace.
+/// Everything expensive is left to the per-repository views that already do it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetRepoFacet {
+    pub repo_path: String,
+    /// False when the repository could not be validated at all; nothing below
+    /// it means anything then.
+    pub ok: bool,
+    pub error: String,
+    /// Whether the worktree listing ran. False leaves `worktrees` and `agents`
+    /// meaningless rather than zero.
+    pub worktrees_ok: bool,
+    pub worktrees_error: String,
+    pub worktrees: u32,
+    pub agents: AgentSummary,
+    /// Whether the last-commit probe ran.
+    pub last_commit_ok: bool,
+    /// Unix seconds of the newest commit reachable from HEAD. Zero is a real
+    /// answer (a repository with no commits) only when `last_commit_ok`.
+    pub last_commit_epoch: i64,
+    /// Whether this repository's ledger could be consulted at all. False means
+    /// the metric cache below is unknown, not empty.
+    pub metrics_ok: bool,
+    pub metrics_error: String,
+    /// Cached expensive-scan results, or `None` when nothing was ever scanned.
+    pub metrics: Option<FleetMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetSnapshot {
+    pub repos: Vec<FleetRepoFacet>,
+    pub requested: u32,
+    pub scanned: u32,
+    /// True when the repository cap or the sweep deadline stopped the walk
+    /// short, so `repos` covers fewer repositories than were asked for.
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
+fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
+    FleetRepoFacet {
+        repo_path: repo_path.to_string(),
+        ok: false,
+        error,
+        worktrees_ok: false,
+        worktrees_error: String::new(),
+        worktrees: 0,
+        agents: AgentSummary {
+            sessions: 0,
+            kinds: Vec::new(),
+        },
+        last_commit_ok: false,
+        last_commit_epoch: 0,
+        metrics_ok: false,
+        metrics_error: String::new(),
+        metrics: None,
+    }
+}
+
+/// Newest commit time reachable from HEAD, in unix seconds.
+///
+/// An empty repository has no HEAD, and `git log` fails there. That is a
+/// readable answer — "no commits yet" — rather than a broken probe, so it
+/// comes back as `Ok(0)` and only a genuine failure becomes `Err`.
+fn last_commit_epoch(repo: &Path) -> Result<i64, String> {
+    match git_text(repo, &["log", "-1", "--format=%ct", "--"]) {
+        Ok(text) => Ok(text.trim().parse::<i64>().unwrap_or(0)),
+        Err(error) => {
+            // `git rev-parse HEAD` failing the same way confirms there is no
+            // commit at all, rather than a git that could not run.
+            if git_text(repo, &["rev-parse", "--verify", "HEAD"]).is_err() {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
+    let repo = match validate_repo(repo_path) {
+        Ok(path) => path,
+        Err(error) => return unreadable_facet(repo_path, error),
+    };
+
+    let (worktrees_ok, worktrees_error, worktree_count, agents) =
+        match worktree::list_worktrees_lite(repo_path) {
+            Ok(list) => {
+                // `summarise_worktree` is reused for its agent-kind and slug
+                // derivation, with an empty operation kind: probing every
+                // worktree for a parked merge is exactly the per-worktree cost
+                // this facet exists to avoid.
+                let items: Vec<WorktreeSummary> = list
+                    .iter()
+                    .map(|info| summarise_worktree(info, String::new()))
+                    .collect();
+                (
+                    true,
+                    String::new(),
+                    list.len() as u32,
+                    agent_summary(&items),
+                )
+            }
+            Err(error) => (
+                false,
+                error,
+                0,
+                AgentSummary {
+                    sessions: 0,
+                    kinds: Vec::new(),
+                },
+            ),
+        };
+
+    let (last_commit_ok, last_commit) = match last_commit_epoch(&repo) {
+        Ok(epoch) => (true, epoch),
+        Err(_) => (false, 0),
+    };
+
+    let (metrics_ok, metrics_error, metrics) = match crate::ledger::read_fleet_metrics(repo_path) {
+        Ok(found) => (true, String::new(), found),
+        // An unreadable ledger is not an unscanned repository. Reporting it as
+        // `None` would render every metric as "never scanned" for a repository
+        // that may have a full history of them.
+        Err(error) => (false, error.to_string(), None),
+    };
+
+    FleetRepoFacet {
+        repo_path: repo_path.to_string(),
+        ok: true,
+        error: String::new(),
+        worktrees_ok,
+        worktrees_error,
+        worktrees: worktree_count,
+        agents,
+        last_commit_ok,
+        last_commit_epoch: last_commit,
+        metrics_ok,
+        metrics_error,
+        metrics,
+    }
+}
+
+/// Reads the cheap facet for every repository in a workspace, in parallel.
+///
+/// One repository's failure is recorded in its own facet and never propagates:
+/// a deleted checkout in tab 3 must not blank the other twenty-three rows.
+/// Duplicate paths collapse to one facet, because two tabs can name the same
+/// repository through different symlinks or letter cases and scanning it twice
+/// makes the two runs contend for the same `.git` lock.
+pub fn fleet_snapshot(repo_paths: &[String]) -> FleetSnapshot {
+    let started = Instant::now();
+    let requested = repo_paths.len() as u32;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut targets: Vec<&String> = Vec::new();
+    for path in repo_paths {
+        if path.is_empty() || !seen.insert(path.as_str()) {
+            continue;
+        }
+        targets.push(path);
+    }
+    let over_cap = targets.len() > MAX_FLEET_REPOS;
+    targets.truncate(MAX_FLEET_REPOS);
+
+    let expired = AtomicBool::new(false);
+    let repos: Vec<FleetRepoFacet> = targets
+        .par_iter()
+        .map(|path| {
+            if started.elapsed() >= FLEET_DEADLINE {
+                expired.store(true, Ordering::Relaxed);
+                // Not visited, and said so. A repository skipped for time must
+                // never arrive looking like one that was read and found empty.
+                return unreadable_facet(path, "the fleet sweep ran out of time".to_string());
+            }
+            fleet_facet(path)
+        })
+        .collect();
+
+    let scanned = repos.iter().filter(|facet| facet.ok).count() as u32;
+    FleetSnapshot {
+        // `truncated` means only "fewer repositories were visited than asked
+        // for". A repository that WAS visited and failed is reported in its own
+        // facet; folding that in here would make the flag mean two things and
+        // leave a caller unable to tell a short sweep from a broken checkout.
+        truncated: over_cap || expired.load(Ordering::Relaxed),
+        requested,
+        scanned,
+        duration_ms: started.elapsed().as_millis() as u64,
+        repos,
+    }
+}
+
 fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
     let scan_targets: Vec<&WorktreeInfo> = list
         .iter()
@@ -654,28 +872,36 @@ fn resolve_mcp_binary() -> (bool, String, String) {
     )
 }
 
+fn is_native_plugin_root(path: &Path) -> bool {
+    path.join(".codex-plugin/plugin.json").is_file() && path.join(".mcp.json").is_file()
+}
+
 fn resolve_plugin_root() -> (bool, String, String) {
     if let Ok(explicit) = std::env::var("GITPULSE_PLUGIN_ROOT") {
         let path = Path::new(&explicit);
-        if path.join("plugin.json").is_file() {
+        if is_native_plugin_root(path) {
             return (true, explicit, String::new());
         }
         return (
             false,
             explicit,
-            "GITPULSE_PLUGIN_ROOT has no plugin.json".into(),
+            "GITPULSE_PLUGIN_ROOT has no .codex-plugin/plugin.json or .mcp.json".into(),
         );
     }
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // macOS app bundle: Contents/MacOS/gitpulse reads the package that
+            // Tauri copied to Contents/Resources/plugin.
+            candidates.push(dir.join("../Resources/plugin"));
             candidates.push(dir.join("plugin"));
-            candidates.push(dir.join("../../../plugin"));
+            // Development binaries live under src-tauri/target/<profile>.
+            candidates.push(dir.join("../../../plugins/gitpulse"));
         }
     }
-    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin"));
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse"));
     for candidate in candidates {
-        if candidate.join("plugin.json").is_file() {
+        if is_native_plugin_root(&candidate) {
             let canon = candidate
                 .canonicalize()
                 .unwrap_or(candidate)
@@ -687,21 +913,22 @@ fn resolve_plugin_root() -> (bool, String, String) {
     (
         false,
         String::new(),
-        "Agent Plugins package not found next to this app (expected plugin/plugin.json). Set GITPULSE_PLUGIN_ROOT."
+        "Codex plugin package not found next to this app (expected plugin/.codex-plugin/plugin.json and plugin/.mcp.json). Set GITPULSE_PLUGIN_ROOT."
             .into(),
     )
 }
 
-/// What Settings and an installer need: binary location, Agent Plugins 1.0
-/// manifests, and the tool catalog. Never claims a binary is present when
-/// the file could not be found.
+/// What Settings and an installer need: binary location, native Codex plugin
+/// manifests, and the tool catalog. Never claims a binary is present when the
+/// file could not be found.
 pub fn mcp_info() -> McpInfo {
     let (binary_found, binary_path, binary_error) = resolve_mcp_binary();
     let (plugin_found, plugin_path, plugin_error) = resolve_plugin_root();
     let (plugin_manifest_json, plugin_mcp_json) = if plugin_found {
         let root = Path::new(&plugin_path);
-        let manifest = std::fs::read_to_string(root.join("plugin.json")).unwrap_or_default();
-        let mcp = std::fs::read_to_string(root.join("mcp.json")).unwrap_or_default();
+        let manifest =
+            std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
+        let mcp = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
         (manifest, mcp)
     } else {
         (String::new(), String::new())
@@ -842,6 +1069,104 @@ mod tests {
     }
 
     #[test]
+    fn fleet_snapshot_isolates_one_bad_repository_from_the_rest() {
+        let good = init_repo();
+        let snap = fleet_snapshot(&[
+            good.path().to_str().unwrap().to_string(),
+            "/no/such/gitpulse-fleet-repo".to_string(),
+        ]);
+        assert_eq!(snap.requested, 2);
+        assert_eq!(snap.repos.len(), 2);
+        assert!(snap.repos[0].ok, "{:?}", snap.repos[0]);
+        assert!(!snap.repos[1].ok);
+        assert!(!snap.repos[1].error.is_empty());
+        // One unreadable checkout must not cost the other repository its row.
+        assert_eq!(snap.scanned, 1);
+    }
+
+    #[test]
+    fn fleet_snapshot_reads_worktrees_agents_and_last_commit() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        let wt = main.path().join(".claude/worktrees/session-a");
+        worktree::add_worktree(
+            repo,
+            wt.to_str().unwrap(),
+            Some("agent/session-a"),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+
+        let snap = fleet_snapshot(&[repo.to_string()]);
+        let facet = &snap.repos[0];
+        assert!(facet.worktrees_ok);
+        assert_eq!(facet.worktrees, 2);
+        assert_eq!(facet.agents.sessions, 1);
+        assert_eq!(facet.agents.kinds[0].kind, "claude");
+        assert!(facet.last_commit_ok);
+        assert!(facet.last_commit_epoch > 0);
+    }
+
+    #[test]
+    fn fleet_snapshot_collapses_a_repeated_path_to_one_facet() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap().to_string();
+        // Two tabs can name the same repository; scanning it twice makes the
+        // runs contend for the same .git lock for no gain.
+        let snap = fleet_snapshot(&[repo.clone(), repo.clone(), String::new()]);
+        assert_eq!(snap.requested, 3);
+        assert_eq!(snap.repos.len(), 1);
+    }
+
+    #[test]
+    fn fleet_snapshot_reports_no_commits_as_read_rather_than_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let snap = fleet_snapshot(&[dir.path().to_str().unwrap().to_string()]);
+        let facet = &snap.repos[0];
+        assert!(facet.ok);
+        // An empty repository has a readable answer — no commits — which is
+        // not the same fact as a probe that could not run.
+        assert!(facet.last_commit_ok);
+        assert_eq!(facet.last_commit_epoch, 0);
+    }
+
+    #[test]
+    fn fleet_snapshot_leaves_metrics_none_until_something_is_recorded() {
+        let main = init_repo();
+        let snap = fleet_snapshot(&[main.path().to_str().unwrap().to_string()]);
+        let facet = &snap.repos[0];
+        // The ledger read ran and found nothing. `metrics_ok` is what
+        // separates that from a ledger we could not open at all.
+        assert!(facet.metrics_ok, "{:?}", facet.metrics_error);
+        assert!(facet.metrics.is_none());
+    }
+
+    #[test]
+    fn fleet_snapshot_truncation_means_short_sweep_not_broken_repository() {
+        let snap = fleet_snapshot(&["/no/such/gitpulse-fleet-repo".to_string()]);
+        assert!(!snap.repos[0].ok);
+        // A visited-and-failed repository is reported in its facet. Setting
+        // `truncated` for it would leave a caller unable to tell a sweep that
+        // stopped early from a checkout that is simply gone.
+        assert!(!snap.truncated);
+    }
+
+    #[test]
+    fn fleet_snapshot_over_the_cap_is_reported_as_truncated() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        let paths: Vec<String> = (0..MAX_FLEET_REPOS + 3)
+            .map(|i| format!("{repo}/../nope-{i}"))
+            .collect();
+        let snap = fleet_snapshot(&paths);
+        assert!(snap.truncated);
+        assert_eq!(snap.repos.len(), MAX_FLEET_REPOS);
+    }
+
+    #[test]
     fn mcp_info_never_claims_a_binary_it_did_not_find() {
         // Force the miss path: an explicit env that is not a file.
         std::env::set_var("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp");
@@ -852,5 +1177,19 @@ mod tests {
         assert!(info.read_only);
         assert_eq!(info.protocol_version, crate::mcp::PROTOCOL_VERSION);
         assert!(!info.tools.is_empty());
+    }
+
+    #[test]
+    fn mcp_info_reads_the_native_codex_package() {
+        let info = mcp_info();
+        assert!(info.plugin_found, "{}", info.plugin_error);
+        assert!(
+            info.plugin_path.ends_with("/plugins/gitpulse"),
+            "unexpected plugin root: {}",
+            info.plugin_path
+        );
+        assert!(info.plugin_manifest_json.contains("\"mcpServers\""));
+        assert!(info.plugin_mcp_json.contains("\"gitpulse\""));
+        assert!(!info.plugin_mcp_json.contains("$schema"));
     }
 }

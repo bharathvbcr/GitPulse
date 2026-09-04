@@ -7,8 +7,9 @@
 
 use crate::analyzer::language::LanguageDetector;
 use crate::coverage_toolchain::{
-    managed_venv_python, pytest_install_arguments, DEFAULT_JS_COVERAGE_PROVIDER,
-    JS_COVERAGE_PROVIDERS, MANAGED_VENV_DIR, VENV_PYTHON_RELPATHS,
+    gcovr_install_arguments, managed_venv_python, pytest_install_arguments,
+    DEFAULT_JS_COVERAGE_PROVIDER, GCOVR_MODULE, JS_COVERAGE_PROVIDERS, MANAGED_VENV_DIR,
+    NATIVE_COVERAGE_BUILD_DIR, NATIVE_COVERAGE_FLAG, NATIVE_COVERAGE_LCOV, VENV_PYTHON_RELPATHS,
 };
 use crate::engine::git_cli::{
     capture_command, git_text_partial, sandbox_join, sandbox_join_canonical, validate_repo,
@@ -891,6 +892,9 @@ fn specs_for(family: &str) -> &'static [(&'static str, CoverageFormat)] {
             ("cobertura.xml", CoverageFormat::Cobertura),
         ],
         "native" => &[
+            // The file GitPulse's own generate step writes, first so a fresh
+            // run is preferred over a stale hand-made one.
+            (NATIVE_COVERAGE_LCOV, CoverageFormat::Lcov),
             ("lcov.info", CoverageFormat::Lcov),
             ("coverage.info", CoverageFormat::Lcov),
             ("coverage/lcov.info", CoverageFormat::Lcov),
@@ -945,7 +949,12 @@ fn extra_dirs_for(family: &str) -> &'static [&'static str] {
             "build/reports/jacoco",
             "build/reports/jacoco/test",
         ],
-        "native" => &["coverage", "build", "build/coverage"],
+        "native" => &[
+            "coverage",
+            "build",
+            "build/coverage",
+            NATIVE_COVERAGE_BUILD_DIR,
+        ],
         "swift" => &["coverage", ".build"],
         "dotnet" => &["TestResults", "coverage"],
         "php" => &["coverage", "build/logs"],
@@ -1386,13 +1395,23 @@ fn existing_venv_python(repo: &Path) -> Result<Option<&'static str>, &'static st
 /// the console script next to the interpreter, so its presence answers the
 /// same question for free.
 fn interpreter_has_pytest(repo: &Path, python_rel: &str) -> bool {
+    interpreter_has_console_script(repo, python_rel, "pytest")
+}
+
+/// True when `pip install <tool>` has already run for this interpreter.
+///
+/// Generalized from the pytest probe so the C/C++ planner asks the same
+/// question about gcovr the same way — and, critically, inherits the same
+/// rule: never by executing the interpreter.
+fn interpreter_has_console_script(repo: &Path, python_rel: &str, tool: &str) -> bool {
     let Some((bin_dir, _)) = python_rel.rsplit_once('/') else {
         return false;
     };
-    let candidates = if cfg!(windows) {
-        ["pytest.exe", "pytest"]
+    let exe = format!("{tool}.exe");
+    let candidates: [&str; 2] = if cfg!(windows) {
+        [exe.as_str(), tool]
     } else {
-        ["pytest", "pytest.exe"]
+        [tool, exe.as_str()]
     };
     candidates.iter().any(|name| {
         sandbox_join(repo, &format!("{bin_dir}/{name}"))
@@ -1501,6 +1520,97 @@ fn program_on_path(program: &str) -> bool {
         || capture_command(program, &["version"], None, TOOL_PROBE_TIMEOUT, &[]).is_ok()
 }
 
+/// A toolchain version the repository pins for itself, and how to materialize it.
+///
+/// Four families — go, swift, dotnet, dart — dead-end when their runtime is
+/// missing, and they are right to: installing a language runtime is a
+/// host-wide change with no bounded, reversible command, and a coverage panel
+/// does not get to make that trade for the user.
+///
+/// But "install Go, then rescan" is a poor answer for a repository that has
+/// already written down which Go it wants. When a project pins its toolchain,
+/// the useful sentence names that pin and the one command that honours it —
+/// which is what the developer would run anyway, and is driven by the
+/// project's own file rather than by a version this app picked.
+///
+/// GitPulse still does not run it. This is a message, not a plan: the command
+/// writes outside the repository, so it stays on the user's side of the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolchainPin {
+    /// The repository file doing the pinning.
+    file: &'static str,
+    /// The command that installs what that file asks for, when a manager that
+    /// reads it is actually on PATH. `None` means the pin was found but
+    /// nothing on this machine can act on it.
+    installer: Option<&'static str>,
+}
+
+/// Config files mise reads by default, plus asdf's.
+///
+/// Order matters only for which one gets named in the message; any of them
+/// answers the same question. Verified against mise's configuration
+/// documentation rather than recalled.
+const MISE_CONFIG_FILES: &[&str] = &[
+    "mise.toml",
+    ".mise.toml",
+    "mise/config.toml",
+    ".mise/config.toml",
+    ".config/mise.toml",
+    ".config/mise/config.toml",
+];
+
+/// The asdf-compatible file, which mise also reads.
+const TOOL_VERSIONS_FILE: &str = ".tool-versions";
+
+fn pinned_toolchain(repo: &Path) -> Option<ToolchainPin> {
+    // A mise-specific config can only be honoured by mise.
+    for file in MISE_CONFIG_FILES {
+        if manifest_is_file(repo, file) {
+            return Some(ToolchainPin {
+                file,
+                installer: program_on_path("mise").then_some("mise install"),
+            });
+        }
+    }
+    if manifest_is_file(repo, TOOL_VERSIONS_FILE) {
+        // Both managers read this one; name whichever is actually present.
+        let installer = if program_on_path("mise") {
+            Some("mise install")
+        } else if program_on_path("asdf") {
+            Some("asdf install")
+        } else {
+            None
+        };
+        return Some(ToolchainPin {
+            file: TOOL_VERSIONS_FILE,
+            installer,
+        });
+    }
+    None
+}
+
+/// The refusal text for a family whose runtime is absent.
+///
+/// `tool` is what is missing ("The Go toolchain", "swift"); `plain` is the
+/// fallback advice when the repository pins nothing.
+fn missing_runtime_detail(repo: &Path, tool: &str, plain: &str) -> String {
+    match pinned_toolchain(repo) {
+        Some(ToolchainPin {
+            file,
+            installer: Some(installer),
+        }) => format!(
+            "{tool} is not installed. This repository pins its toolchain in {file}; run `{installer}` to install the version it asks for, then rescan."
+        ),
+        Some(ToolchainPin {
+            file,
+            installer: None,
+        }) => format!(
+            "{tool} is not installed. This repository pins its toolchain in {file}, but neither mise nor asdf is on PATH to act on it. Install one of those, or {plain}"
+        ),
+        None => format!("{tool} is not installed. {plain}"),
+    }
+}
+
 fn family_present(families: &[CoverageFamilyStatus], name: &str) -> bool {
     families.iter().any(|status| status.family == name)
 }
@@ -1590,15 +1700,28 @@ fn javascript_provider_setup(repo: &Path) -> Option<(String, String)> {
     ))
 }
 
-fn javascript_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+fn javascript_coverage_plan(repo: &Path, npm_ready: bool) -> LanguageCoveragePlan {
     let generate = javascript_coverage_commands(repo);
     if !generate.is_empty() {
+        if !npm_ready {
+            // Every command this planner emits is `npm run …` or `npx …`.
+            // Publishing them without npm on PATH is a Run button that fails
+            // at spawn.
+            return LanguageCoveragePlan::unavailable(
+                "npm is not installed, so the coverage script cannot run. Install Node.js, then rescan.",
+            );
+        }
         return LanguageCoveragePlan::ready(
             generate,
             "Frontend coverage usually finishes in about a minute.",
         );
     }
     if let Some((setup, detail)) = javascript_provider_setup(repo) {
+        if !npm_ready {
+            return LanguageCoveragePlan::unavailable(
+                "npm is not installed, so the coverage provider cannot be installed. Install Node.js, then rescan.",
+            );
+        }
         return LanguageCoveragePlan {
             generate: vec!["npx --no-install vitest run --coverage".into()],
             setup: vec![setup],
@@ -1690,14 +1813,34 @@ fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
     }
 }
 
+/// Go coverage.
+///
+/// `go_ready` is not optional decoration. This was the one ready-producing
+/// planner in the file that probed nothing: swift, dotnet, dart, ruby, jvm and
+/// rust each check for their tool, and go asserted `tool_ready: true` purely
+/// because a `go.mod` existed. On a machine without the Go toolchain that
+/// published a Run button which failed at spawn — a check that never ran,
+/// reported exactly like a check that ran and passed.
+///
+/// Like swift/dotnet/dart, a missing toolchain is stated rather than installed:
+/// there is no bounded, repository-local command that installs a language
+/// runtime, and doing it host-wide is not this app's call to make.
 fn go_coverage_plan(
     repo: &Path,
     go_mod_dirs: &[String],
     go_work_at_root: bool,
+    go_ready: bool,
 ) -> LanguageCoveragePlan {
     let generate = go_coverage_commands(repo, go_mod_dirs, go_work_at_root);
     if generate.is_empty() {
         return LanguageCoveragePlan::unavailable("No go.mod or go.work in this repository.");
+    }
+    if !go_ready {
+        return LanguageCoveragePlan::unavailable(&missing_runtime_detail(
+            repo,
+            "The Go toolchain",
+            "Install Go, then rescan.",
+        ));
     }
     LanguageCoveragePlan::ready(generate, "Go coverage can take a few minutes.")
 }
@@ -1715,46 +1858,182 @@ fn jvm_coverage_plan(repo: &Path, mvn_ready: bool) -> LanguageCoveragePlan {
     LanguageCoveragePlan::unavailable("No Gradle wrapper or pom.xml in the repository.")
 }
 
-/// C/C++ has no planned coverage generator, and says so.
-///
-/// This used to publish `ctest --output-on-failure` / `make test` as a ready
-/// generator. Both were wrong, in two independent ways, and the row shipped
-/// with a Run button that could not work:
-///
-/// 1. Neither command was ever on the coverage-generation allowlist, so the
-///    gate refused it the instant the button was pressed. The planner-gate
-///    contract test now catches that class outright.
-/// 2. Even spawned, neither produces what this family looks for. GitPulse
-///    expects `lcov` under `coverage/` or `build/`; running a test suite emits
-///    coverage only if the binaries were *built* instrumented
-///    (`-fprofile-arcs -ftest-coverage`) and a `gcov`/`lcov`/`gcovr` capture
-///    step then collects it. Those flags live in the project's own CMake or
-///    Make configuration, which GitPulse cannot edit or infer for an arbitrary
-///    checkout, and inventing a capture command for a build that was never
-///    instrumented would produce an empty report, not coverage.
-///
-/// So the honest answer is the same one `beam` gives: no generator, and the
-/// reason. A row that explains itself is worth more than a button that lies.
-fn native_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
-    let has_build = manifest_is_file(repo, "CMakeLists.txt")
-        || manifest_is_file(repo, "Makefile")
-        || manifest_is_file(repo, "GNUmakefile");
-    if has_build {
-        return LanguageCoveragePlan::unavailable(
-            "C/C++ coverage needs an instrumented build (-fprofile-arcs -ftest-coverage) and a gcovr/lcov capture step, which GitPulse cannot add to this project's build files. Generate lcov into coverage/ yourself, then rescan.",
-        );
-    }
-    LanguageCoveragePlan::unavailable(
-        "No CMakeLists.txt or Makefile in this repository, so no C/C++ coverage build can be planned.",
-    )
+/// How the native planner will reach gcovr, if it can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GcovrRoute {
+    /// Already on PATH; invoke it by name.
+    OnPath,
+    /// Reachable as `<venv python> -m gcovr` once `setup` has run. `setup` is
+    /// empty when the package is already installed in that interpreter.
+    Venv {
+        python: &'static str,
+        setup: Vec<String>,
+    },
+    /// No route at all, with the reason to show instead of a Run button.
+    None(String),
 }
 
-fn swift_coverage_plan(has_package_swift: bool, swift_ready: bool) -> LanguageCoveragePlan {
+impl GcovrRoute {
+    /// The command prefix that runs gcovr, e.g. `gcovr` or
+    /// `.venv/bin/python -m gcovr`.
+    fn program(&self) -> Option<String> {
+        match self {
+            Self::OnPath => Some(GCOVR_MODULE.to_string()),
+            Self::Venv { python, .. } => Some(format!("{python} -m {GCOVR_MODULE}")),
+            Self::None(_) => None,
+        }
+    }
+
+    fn setup(&self) -> Vec<String> {
+        match self {
+            Self::Venv { setup, .. } => setup.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Decides how gcovr will be run, installing it into a project-local
+/// virtualenv when it is absent.
+///
+/// Identical policy to the Python planner, for identical reasons: the host
+/// interpreter may be externally managed (PEP 668), and mutating the system
+/// Python to render a coverage number is not a trade this app makes on the
+/// user's behalf.
+fn gcovr_route(repo: &Path) -> GcovrRoute {
+    if program_on_path(GCOVR_MODULE) {
+        return GcovrRoute::OnPath;
+    }
+    let venv = match existing_venv_python(repo) {
+        Ok(found) => found,
+        Err(reason) => {
+            return GcovrRoute::None(format!(
+                "The project virtualenv {reason}, so GitPulse will not use it to install gcovr. Recreate it with `python3 -m venv .venv`, then rescan."
+            ))
+        }
+    };
+    if let Some(python) = venv {
+        let setup = if interpreter_has_console_script(repo, python, GCOVR_MODULE) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{python} -m pip install {}",
+                gcovr_install_arguments()
+            )]
+        };
+        return GcovrRoute::Venv { python, setup };
+    }
+    let Some(host_python) = host_python_program(repo) else {
+        return GcovrRoute::None(
+            "gcovr is not installed and there is no Python interpreter to install it with. Install gcovr or Python, then rescan.".into(),
+        );
+    };
+    let python = managed_venv_python();
+    GcovrRoute::Venv {
+        python,
+        setup: vec![
+            format!("{host_python} -m venv {MANAGED_VENV_DIR}"),
+            format!("{python} -m pip install {}", gcovr_install_arguments()),
+        ],
+    }
+}
+
+/// C/C++ coverage, via an out-of-tree instrumented CMake build.
+///
+/// This family used to be a flat dead end: "GitPulse cannot add coverage flags
+/// to this project's build files." The premise was right — editing a
+/// checkout's `CMakeLists.txt` is not something this app may do — but the
+/// conclusion was too strong. CMake takes compiler and linker flags on the
+/// *configure command line*, into a *separate* build directory, so an
+/// instrumented build needs no edit to the project at all:
+///
+/// ```text
+/// cmake -S . -B build-gitpulse-coverage -DCMAKE_C_FLAGS=--coverage …
+/// cmake --build build-gitpulse-coverage
+/// ctest --test-dir build-gitpulse-coverage --output-on-failure
+/// <gcovr> -r . build-gitpulse-coverage --lcov build-gitpulse-coverage/lcov.info
+/// ```
+///
+/// The project's own `build/` is untouched, and the whole experiment is one
+/// removable directory.
+///
+/// Make-only projects stay a dead end, and that is not an oversight. There is
+/// no portable way to inject flags into an arbitrary Makefile: `make
+/// CFLAGS=--coverage` *overrides* the variable rather than appending to it,
+/// which drops the flags the project needs to compile at all. A refusal that
+/// explains itself beats a Run button that breaks the build.
+fn native_coverage_plan(repo: &Path, cmake_ready: bool, gcovr: GcovrRoute) -> LanguageCoveragePlan {
+    let has_cmake_project = manifest_is_file(repo, "CMakeLists.txt");
+    let has_make = manifest_is_file(repo, "Makefile") || manifest_is_file(repo, "GNUmakefile");
+
+    if !has_cmake_project {
+        if has_make {
+            return LanguageCoveragePlan::unavailable(
+                "This project builds with Make, and there is no portable way to add coverage flags to an arbitrary Makefile (`make CFLAGS=--coverage` replaces the project's own flags rather than adding to them). Generate lcov into coverage/ yourself, then rescan.",
+            );
+        }
+        return LanguageCoveragePlan::unavailable(
+            "No CMakeLists.txt in this repository, so no C/C++ coverage build can be planned.",
+        );
+    }
+    if !cmake_ready {
+        return LanguageCoveragePlan::unavailable(
+            "cmake is not installed, so an instrumented C/C++ build cannot be configured. Install CMake, then rescan.",
+        );
+    }
+    let Some(gcovr_program) = gcovr.program() else {
+        let GcovrRoute::None(reason) = gcovr else {
+            unreachable!("only GcovrRoute::None has no program")
+        };
+        return LanguageCoveragePlan::unavailable(&reason);
+    };
+
+    let setup = gcovr.setup();
+    let generate = vec![
+        format!(
+            "cmake -S . -B {dir} -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS={flag} -DCMAKE_CXX_FLAGS={flag} -DCMAKE_EXE_LINKER_FLAGS={flag}",
+            dir = NATIVE_COVERAGE_BUILD_DIR,
+            flag = NATIVE_COVERAGE_FLAG,
+        ),
+        format!("cmake --build {NATIVE_COVERAGE_BUILD_DIR}"),
+        format!("ctest --test-dir {NATIVE_COVERAGE_BUILD_DIR} --output-on-failure"),
+        format!(
+            "{gcovr_program} -r . {NATIVE_COVERAGE_BUILD_DIR} --lcov {NATIVE_COVERAGE_LCOV}"
+        ),
+    ];
+
+    if setup.is_empty() {
+        return LanguageCoveragePlan::ready(
+            generate,
+            "Configuring, building and testing an instrumented C/C++ tree can take several minutes.",
+        );
+    }
+    LanguageCoveragePlan {
+        generate,
+        setup,
+        tool_ready: false,
+        tool_detail: format!(
+            "gcovr is not installed. GitPulse will install it into {MANAGED_VENV_DIR} in this repository; your system Python is not touched."
+        ),
+        duration_hint:
+            "Installing gcovr and running an instrumented C/C++ build can take several minutes."
+                .into(),
+    }
+}
+
+fn swift_coverage_plan(
+    repo: &Path,
+    has_package_swift: bool,
+    swift_ready: bool,
+) -> LanguageCoveragePlan {
     if !has_package_swift {
         return LanguageCoveragePlan::unavailable("No Package.swift in this repository.");
     }
     if !swift_ready {
-        return LanguageCoveragePlan::unavailable("swift is not installed.");
+        return LanguageCoveragePlan::unavailable(&missing_runtime_detail(
+            repo,
+            "swift",
+            "Install the Swift toolchain, then rescan.",
+        ));
     }
     LanguageCoveragePlan::ready(
         vec!["swift test --enable-code-coverage".into()],
@@ -1762,12 +2041,20 @@ fn swift_coverage_plan(has_package_swift: bool, swift_ready: bool) -> LanguageCo
     )
 }
 
-fn dotnet_coverage_plan(has_dotnet_proj: bool, dotnet_ready: bool) -> LanguageCoveragePlan {
+fn dotnet_coverage_plan(
+    repo: &Path,
+    has_dotnet_proj: bool,
+    dotnet_ready: bool,
+) -> LanguageCoveragePlan {
     if !has_dotnet_proj {
         return LanguageCoveragePlan::unavailable("No .sln/.csproj/.fsproj in this repository.");
     }
     if !dotnet_ready {
-        return LanguageCoveragePlan::unavailable("dotnet is not installed.");
+        return LanguageCoveragePlan::unavailable(&missing_runtime_detail(
+            repo,
+            "dotnet",
+            "Install the .NET SDK, then rescan.",
+        ));
     }
     LanguageCoveragePlan::ready(
         vec!["dotnet test --collect:\"XPlat Code Coverage\"".into()],
@@ -1786,11 +2073,19 @@ fn php_coverage_commands(repo: &Path) -> Vec<String> {
     commands
 }
 
-fn php_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+fn php_coverage_plan(repo: &Path, php_ready: bool) -> LanguageCoveragePlan {
     let generate = php_coverage_commands(repo);
     if generate.is_empty() {
         return LanguageCoveragePlan::unavailable(
             "No composer.json or vendor/bin/phpunit in this repository.",
+        );
+    }
+    if !php_ready {
+        // `vendor/bin/phpunit` is a PHP script with a `#!/usr/bin/env php`
+        // shebang, and `composer` is itself PHP: without an interpreter every
+        // command here fails at spawn.
+        return LanguageCoveragePlan::unavailable(
+            "php is not installed, so PHPUnit cannot run. Install PHP, then rescan.",
         );
     }
     // A composer project whose vendor/ has never been installed has the
@@ -1853,12 +2148,16 @@ fn ruby_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
     )
 }
 
-fn dart_coverage_plan(has_pubspec: bool, dart_ready: bool) -> LanguageCoveragePlan {
+fn dart_coverage_plan(repo: &Path, has_pubspec: bool, dart_ready: bool) -> LanguageCoveragePlan {
     if !has_pubspec {
         return LanguageCoveragePlan::unavailable("No pubspec.yaml in this repository.");
     }
     if !dart_ready {
-        return LanguageCoveragePlan::unavailable("dart is not installed.");
+        return LanguageCoveragePlan::unavailable(&missing_runtime_detail(
+            repo,
+            "dart",
+            "Install the Dart SDK, then rescan.",
+        ));
     }
     LanguageCoveragePlan::ready(
         vec!["dart test --coverage=coverage".into()],
@@ -1931,23 +2230,38 @@ fn fill_suggested_commands(
     } else {
         true
     };
-    let javascript = javascript_coverage_plan(repo);
+    // Each probe is gated on its family being present: a repository with no
+    // Go in it must not pay for a `go version` spawn.
+    let javascript = javascript_coverage_plan(
+        repo,
+        !family_present(families, "javascript") || program_on_path("npm"),
+    );
     let rust = rust_coverage_plan(repo, layout.cargo_dirs, llvm_cov_ready);
     let python = if family_present(families, "python") {
         python_coverage_plan(repo)
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
     };
-    let go = go_coverage_plan(repo, layout.go_mod_dirs, layout.go_work_at_root);
+    let go = go_coverage_plan(
+        repo,
+        layout.go_mod_dirs,
+        layout.go_work_at_root,
+        !family_present(families, "go") || program_on_path("go"),
+    );
     let jvm = if family_present(families, "jvm") {
         let mvn_needed = manifest_is_file(repo, "pom.xml");
         jvm_coverage_plan(repo, !mvn_needed || program_on_path("mvn"))
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
     };
-    let native = native_coverage_plan(repo);
+    let native = if family_present(families, "native") {
+        native_coverage_plan(repo, program_on_path("cmake"), gcovr_route(repo))
+    } else {
+        LanguageCoveragePlan::ready(Vec::new(), "")
+    };
     let swift = if family_present(families, "swift") {
         swift_coverage_plan(
+            repo,
             layout.has_package_swift,
             layout.has_package_swift && program_on_path("swift"),
         )
@@ -1956,16 +2270,21 @@ fn fill_suggested_commands(
     };
     let dotnet = if family_present(families, "dotnet") {
         dotnet_coverage_plan(
+            repo,
             layout.has_dotnet_proj,
             layout.has_dotnet_proj && program_on_path("dotnet"),
         )
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
     };
-    let php = php_coverage_plan(repo);
+    let php = php_coverage_plan(
+        repo,
+        !family_present(families, "php") || program_on_path("php"),
+    );
     let ruby = ruby_coverage_plan(repo);
     let dart = if family_present(families, "dart") {
         dart_coverage_plan(
+            repo,
             layout.has_pubspec,
             layout.has_pubspec && program_on_path("dart"),
         )
@@ -4419,7 +4738,7 @@ src/main.go:4.1,4.8 1 0
 
     #[test]
     fn go_plan_is_unavailable_without_a_module() {
-        let plan = go_coverage_plan(Path::new("."), &[], false);
+        let plan = go_coverage_plan(Path::new("."), &[], false, true);
         assert!(!plan.tool_ready);
         assert!(plan.generate.is_empty());
         assert!(plan.tool_detail.contains("go.mod"));
@@ -4427,10 +4746,10 @@ src/main.go:4.1,4.8 1 0
 
     #[test]
     fn swift_plan_requires_package_manifest() {
-        let plan = swift_coverage_plan(false, true);
+        let plan = swift_coverage_plan(Path::new("."), false, true);
         assert!(plan.generate.is_empty());
         assert!(plan.tool_detail.contains("Package.swift"));
-        let ready = swift_coverage_plan(true, true);
+        let ready = swift_coverage_plan(Path::new("."), true, true);
         assert_eq!(
             ready.generate,
             vec!["swift test --enable-code-coverage".to_string()]
@@ -5433,6 +5752,238 @@ src/main.go:4.1,4.8 1 0
         }
     }
 
+    /// ─── Project-pinned toolchains ────────────────────────────────────────
+    ///
+    /// Four families dead-end when their runtime is missing, and that refusal
+    /// stays — installing a language runtime is a host-wide change with no
+    /// bounded command. What changed is the sentence: a repository that has
+    /// already written down which toolchain it wants gets told how to honour
+    /// its own pin instead of a flat "install it yourself".
+    mod pinned_toolchains {
+        use super::*;
+
+        #[test]
+        fn a_repository_with_no_pin_gets_the_plain_advice() {
+            let repo = git_repo();
+            let detail = missing_runtime_detail(repo.path(), "The Go toolchain", "Install Go.");
+            assert_eq!(detail, "The Go toolchain is not installed. Install Go.");
+        }
+
+        #[test]
+        fn a_tool_versions_pin_is_named_in_the_refusal() {
+            let repo = git_repo();
+            write(repo.path(), ".tool-versions", "golang 1.22.0\n");
+            let detail = missing_runtime_detail(repo.path(), "The Go toolchain", "Install Go.");
+            assert!(
+                detail.contains(".tool-versions"),
+                "the pin file must be named: {detail}"
+            );
+            // Whether an installer is offered depends on the host, but the two
+            // shapes are the only ones allowed, and both must stay actionable.
+            assert!(
+                detail.contains("mise install")
+                    || detail.contains("asdf install")
+                    || detail.contains("neither mise nor asdf"),
+                "{detail}"
+            );
+        }
+
+        #[test]
+        fn every_mise_config_spelling_is_recognised() {
+            for file in MISE_CONFIG_FILES {
+                let repo = git_repo();
+                write(repo.path(), file, "[tools]\ngo = \"1.22\"\n");
+                let pin = pinned_toolchain(repo.path())
+                    .unwrap_or_else(|| panic!("{file} must be recognised as a toolchain pin"));
+                assert_eq!(pin.file, *file);
+            }
+        }
+
+        /// A mise-only config must never suggest asdf, which cannot read it.
+        #[test]
+        fn a_mise_only_config_never_suggests_asdf() {
+            let repo = git_repo();
+            write(repo.path(), "mise.toml", "[tools]\ngo = \"1.22\"\n");
+            let detail = missing_runtime_detail(repo.path(), "The Go toolchain", "Install Go.");
+            assert!(
+                !detail.contains("asdf install"),
+                "asdf cannot read mise.toml: {detail}"
+            );
+        }
+
+        /// THE HONESTY HALF: a pin GitPulse cannot act on must say so rather
+        /// than print a command that is not on this machine.
+        #[test]
+        fn a_pin_with_no_manager_present_says_so_instead_of_naming_a_command() {
+            let pin = ToolchainPin {
+                file: ".tool-versions",
+                installer: None,
+            };
+            // Exercised directly, because whether mise is installed is a
+            // property of the host and this assertion must hold on every host.
+            assert_eq!(pin.installer, None);
+            assert_eq!(pin.file, ".tool-versions");
+        }
+
+        /// The refusal is still a refusal: no command is planned, and
+        /// `tool_ready` stays false whatever the repository pins.
+        #[test]
+        fn a_pinned_toolchain_does_not_make_an_absent_runtime_ready() {
+            let repo = git_repo();
+            write(repo.path(), ".tool-versions", "golang 1.22.0\n");
+            write(repo.path(), "go.mod", "module m\n");
+            write(repo.path(), "Package.swift", "// swift-tools-version:5.9\n");
+            write(repo.path(), "pubspec.yaml", "name: m\n");
+            write(repo.path(), "app.csproj", "<Project/>\n");
+
+            let plans = [
+                (
+                    "go",
+                    go_coverage_plan(repo.path(), &[String::new()], false, false),
+                ),
+                ("swift", swift_coverage_plan(repo.path(), true, false)),
+                ("dotnet", dotnet_coverage_plan(repo.path(), true, false)),
+                ("dart", dart_coverage_plan(repo.path(), true, false)),
+            ];
+            for (family, plan) in plans {
+                assert!(!plan.tool_ready, "{family} must stay unready");
+                assert!(plan.generate.is_empty(), "{family} must plan no command");
+                assert!(plan.setup.is_empty(), "{family} must plan no host install");
+                assert!(
+                    plan.tool_detail.contains(".tool-versions"),
+                    "{family} should name the pin: {}",
+                    plan.tool_detail
+                );
+            }
+        }
+    }
+
+    /// ─── Runtime-probe honesty ────────────────────────────────────────────
+    ///
+    /// `tool_ready == true` is a claim that the family's generate command can
+    /// actually be spawned. Three planners used to publish that claim without
+    /// ever probing the program the command invokes, so on a machine missing
+    /// the toolchain the UI showed a Run button indistinguishable from a
+    /// working one. These pin the refusal for each.
+    mod runtime_probe_honesty {
+        use super::*;
+
+        #[test]
+        fn go_without_a_toolchain_is_not_ready() {
+            let repo = git_repo();
+            write(repo.path(), "go.mod", "module example.com/m\n\ngo 1.21\n");
+            write(repo.path(), "main.go", "package main\n\nfunc main() {}\n");
+
+            let ready = go_coverage_plan(repo.path(), &[String::new()], false, true);
+            assert!(ready.tool_ready, "with go present the plan is runnable");
+            assert!(!ready.generate.is_empty());
+
+            let missing = go_coverage_plan(repo.path(), &[String::new()], false, false);
+            assert!(
+                !missing.tool_ready,
+                "THE REGRESSION: go claimed readiness without probing the toolchain"
+            );
+            assert!(
+                missing.generate.is_empty(),
+                "an unrunnable family must publish no command to press"
+            );
+            assert!(
+                missing.tool_detail.contains("Go toolchain"),
+                "the refusal must name what is missing: {}",
+                missing.tool_detail
+            );
+        }
+
+        #[test]
+        fn javascript_without_npm_is_not_ready() {
+            let repo = git_repo();
+            write(
+                repo.path(),
+                "package.json",
+                r#"{"scripts":{"coverage":"vitest run --coverage"}}"#,
+            );
+
+            let ready = javascript_coverage_plan(repo.path(), true);
+            assert!(ready.tool_ready);
+            assert_eq!(ready.generate, vec!["npm run coverage".to_string()]);
+
+            let missing = javascript_coverage_plan(repo.path(), false);
+            assert!(!missing.tool_ready);
+            assert!(missing.generate.is_empty());
+            assert!(
+                missing.tool_detail.contains("npm"),
+                "{}",
+                missing.tool_detail
+            );
+        }
+
+        #[test]
+        fn php_without_an_interpreter_is_not_ready() {
+            let repo = git_repo();
+            write(repo.path(), "composer.json", "{}");
+            write(repo.path(), "vendor/bin/phpunit", "#!/usr/bin/env php\n");
+
+            let ready = php_coverage_plan(repo.path(), true);
+            assert!(ready.tool_ready);
+            assert!(!ready.generate.is_empty());
+
+            let missing = php_coverage_plan(repo.path(), false);
+            assert!(!missing.tool_ready);
+            assert!(missing.generate.is_empty());
+            assert!(
+                missing.tool_detail.contains("php"),
+                "{}",
+                missing.tool_detail
+            );
+        }
+
+        /// The shared invariant, stated once: no planner may return a plan
+        /// that is simultaneously "ready" and unrunnable. `apply_language_plan`
+        /// enforces the empty-command half; this covers the probe half for
+        /// every planner that takes a readiness flag.
+        #[test]
+        fn no_planner_claims_readiness_when_its_runtime_is_absent() {
+            let repo = git_repo();
+            write(repo.path(), "go.mod", "module m\n");
+            write(
+                repo.path(),
+                "package.json",
+                r#"{"scripts":{"coverage":"x"}}"#,
+            );
+            write(repo.path(), "composer.json", "{}");
+            write(repo.path(), "vendor/bin/phpunit", "#!/usr/bin/env php\n");
+            write(repo.path(), "Package.swift", "// swift-tools-version:5.9\n");
+            write(repo.path(), "pubspec.yaml", "name: m\n");
+            write(repo.path(), "app.csproj", "<Project/>\n");
+
+            let unready: Vec<(&str, LanguageCoveragePlan)> = vec![
+                (
+                    "go",
+                    go_coverage_plan(repo.path(), &[String::new()], false, false),
+                ),
+                ("javascript", javascript_coverage_plan(repo.path(), false)),
+                ("php", php_coverage_plan(repo.path(), false)),
+                ("swift", swift_coverage_plan(repo.path(), true, false)),
+                ("dotnet", dotnet_coverage_plan(repo.path(), true, false)),
+                ("dart", dart_coverage_plan(repo.path(), true, false)),
+            ];
+            for (family, plan) in unready {
+                assert!(
+                    !plan.tool_ready,
+                    "{family} claims readiness with its runtime absent"
+                );
+                assert!(
+                    plan.generate.is_empty(),
+                    "{family} published a command it cannot run"
+                );
+                assert!(
+                    !plan.tool_detail.trim().is_empty(),
+                    "{family} refused without saying why"
+                );
+            }
+        }
+    }
+
     /// ─── Planner ⇄ gate contract ──────────────────────────────────────────
     ///
     /// The planner publishes command text; the gate decides what may be
@@ -5609,7 +6160,21 @@ src/main.go:4.1,4.8 1 0
             write(repo.path(), "composer.json", r#"{"name":"acme/app"}"#);
             write(repo.path(), "vendor/bin/phpunit", "#!/bin/sh\nexit 0\n");
             let checked = assert_published_commands_are_runnable(&repo, "php");
-            assert!(checked > 0, "the php fixture published no commands");
+            if checked == 0 {
+                // No PHP interpreter on this host (common on CI and on macOS
+                // since PHP was unbundled). The planner must then explain the
+                // dead end rather than publish a Run button that fails at
+                // spawn — and the gate invariant this test exists to protect
+                // is still asserted directly.
+                assert_dead_end_is_explained(&repo, "php");
+                let phpunit = [
+                    "vendor/bin/phpunit".to_string(),
+                    "--coverage-clover".to_string(),
+                    "coverage.xml".to_string(),
+                ];
+                validate_manvi_action(&phpunit, ManviActionKind::CoverageGenerator)
+                    .expect("vendor/bin/phpunit must be accepted by the gate");
+            }
         }
 
         /// The other command that shipped refused: `bundle install` was
@@ -5754,19 +6319,39 @@ src/main.go:4.1,4.8 1 0
             let root = repo.path();
 
             let plans: Vec<(&str, LanguageCoveragePlan)> = vec![
-                ("swift", swift_coverage_plan(true, true)),
-                ("dotnet", dotnet_coverage_plan(true, true)),
-                ("dart", dart_coverage_plan(true, true)),
+                ("swift", swift_coverage_plan(Path::new("."), true, true)),
+                ("dotnet", dotnet_coverage_plan(Path::new("."), true, true)),
+                ("dart", dart_coverage_plan(root, true, true)),
                 ("rust", rust_coverage_plan(root, &["".to_string()], true)),
                 (
                     "rust(setup)",
                     rust_coverage_plan(root, &["".to_string()], false),
                 ),
                 ("jvm", jvm_coverage_plan(root, true)),
-                ("php", php_coverage_plan(root)),
+                ("php", php_coverage_plan(root, true)),
                 ("ruby", ruby_coverage_plan(root)),
-                ("javascript", javascript_coverage_plan(root)),
-                ("native", native_coverage_plan(root)),
+                ("javascript", javascript_coverage_plan(root, true)),
+                (
+                    "native",
+                    native_coverage_plan(root, true, GcovrRoute::OnPath),
+                ),
+                (
+                    "native(setup)",
+                    native_coverage_plan(
+                        root,
+                        true,
+                        GcovrRoute::Venv {
+                            python: ".venv/bin/python",
+                            setup: vec![
+                                "python3 -m venv .venv".to_string(),
+                                format!(
+                                    ".venv/bin/python -m pip install {}",
+                                    gcovr_install_arguments()
+                                ),
+                            ],
+                        },
+                    ),
+                ),
             ];
 
             let mut checked = 0;

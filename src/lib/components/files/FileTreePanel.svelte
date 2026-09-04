@@ -983,7 +983,7 @@
         <span>New Folder in folder…</span>
       </button>
     {:else}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); if ($repoStore.activeTab !== 'files') repoStore.setActiveTab('files'); closeContextMenu(); }}>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
         <span>Open in Editor</span>
       </button>
@@ -1008,11 +1008,11 @@
 
       <div class="my-1 border-t border-border/60"></div>
 
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('diff'); closeContextMenu(); }}>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('history', 'diff'); closeContextMenu(); }}>
         <Layers size={13} class="text-cyan-400" />
         <span>View in Diff Tab</span>
       </button>
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('blame'); closeContextMenu(); }}>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('code', 'blame'); closeContextMenu(); }}>
         <GitCommit size={13} class="text-purple-400" />
         <span>View Git Blame</span>
       </button>

@@ -1,0 +1,19 @@
+{
+  "name": "gitpulse",
+  "version": "0.0.5",
+  "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
+  "author": {
+    "name": "GitPulse Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GitPulse",
+    "shortDescription": "Inspect Git repositories through GitPulse.",
+    "longDescription": "GitPulse exposes read-only repository, worktree, collision, ledger, provenance, and code-intelligence tools to Codex.",
+    "developerName": "GitPulse Team",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Inspect this repository with GitPulse before making changes."
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -5,6 +5,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
+  import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { graphStore } from "./lib/stores/graphStore";
   import { themeStore } from "./lib/stores/themeStore";
   import { filterStore } from "./lib/stores/filterStore";
@@ -16,6 +17,7 @@
   import { formatError } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
   import { diagnostics } from "./lib/diagnostics/diagnostics";
+  import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
     subscribeNativeShell,
     syncRecentMenu,
@@ -25,17 +27,14 @@
   import Logo from "./lib/components/Logo.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
-  import CommitTable from "./lib/components/CommitTable.svelte";
-  import CommitDetails from "./lib/components/CommitDetails.svelte";
-  import FileViewer from "./lib/components/FileViewer.svelte";
-  import DiffViewer from "./lib/components/DiffViewer.svelte";
-  import LanguageBar from "./lib/components/LanguageBar.svelte";
-  import FilterBar from "./lib/components/FilterBar.svelte";
+  // Graph, Diff and Reflog live inside History now; App no longer mounts any
+  // of them directly, nor the filter bar that used to strip across the top.
+  import HistoryView from "./lib/components/HistoryView.svelte";
+  import InsightsView from "./lib/components/InsightsView.svelte";
   import {
     FOCUS_COMMIT_SEARCH_EVENT,
     isCommitSearchChord,
     ownsCommitSearchChord,
-    showsCommitFilter,
     tabForCommitSearch,
   } from "./lib/views/commitFilter";
   import { isImeComposition } from "./lib/keyboard/imeGuard";
@@ -48,8 +47,10 @@
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
-  import WorkView from "./lib/components/WorkView.svelte";
+  import WorkspaceView from "./lib/components/WorkspaceView.svelte";
+  import CodeView from "./lib/components/CodeView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
+  import TerminalDock from "./lib/components/TerminalDock.svelte";
 
   // Views the app does not need to start. Each becomes its own chunk, so
   // opening a repository no longer parses the coverage, health, storage,
@@ -71,6 +72,7 @@
   const loadBlameViewer = () => import("./lib/components/BlameViewer.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
+  const loadFleetView = () => import("./lib/components/FleetView.svelte");
   import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -114,20 +116,24 @@
   let lastModalRepoPath: string | null = null;
   const macos = isMacOS();
 
-  // --- terminal keep-alive --------------------------------------------------
-  // The PTY and xterm instance must survive view-tab switches (a shell dies
-  // the moment its pane unmounts). Mounted once on first visit per repo,
-  // hidden afterwards; the outer {#key currentPath} tears it down on a real
-  // repo switch.
-  let terminalMounted = $state(false);
-  const terminalActive = $derived($repoStore.activeTab === "terminal");
+  // --- terminal dock --------------------------------------------------------
+  // The terminal is a dock beneath the active view, not a view of its own: a
+  // PTY has to survive a view switch, so this pane was already mounted once
+  // and hidden thereafter — a page you could never leave without closing.
+  // TerminalDock owns the mount-once-keep-mounted rule; the outer
+  // {#key currentPath} still tears the session down on a real repo switch.
+  const terminalDockOpen = $derived($interfaceStore.terminalDockOpen);
 
+  // --- fleet keep-alive -----------------------------------------------------
+  // Fleet is workspace-scoped, so it sits BESIDE the repository pane rather
+  // than inside it, and the two are swapped by hiding — never by unmounting.
+  // Rendering Fleet as an {:else} of the repo block would destroy the
+  // {#key currentPath} subtree on every toggle, which kills the live terminal
+  // PTY it contains and re-hydrates every open tab on the way back.
+  const fleetOpen = $derived($interfaceStore.fleetOpen);
+  let fleetMounted = $state(false);
   $effect(() => {
-    if (!$repoStore.currentPath) {
-      terminalMounted = false;
-      return;
-    }
-    if (terminalActive) terminalMounted = true;
+    if (fleetOpen) fleetMounted = true;
   });
 
   // Forward legacy repoStore.error to centralized toast queue
@@ -329,6 +335,15 @@
         isShortcutsOpen = true;
         return;
       }
+      // ⌃` toggles the terminal dock, the chord every terminal-hosting editor
+      // uses. Deliberately Control on macOS too: ⌘` is the OS window cycler.
+      // Guarded on an open repository because the dock lives inside the
+      // repository pane and has no shell to attach to without one.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === "`" && $repoStore.currentPath) {
+        e.preventDefault();
+        interfaceStore.toggleTerminalDock();
+        return;
+      }
       if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab)) {
         e.preventDefault();
         void focusCommitSearch();
@@ -357,6 +372,8 @@
       themeLight: () => themeStore.setTheme("light"),
       themeDark: () => themeStore.setTheme("dark"),
       setTab: (tab) => repoStore.setActiveTab(tab),
+      fleet: () => interfaceStore.setFleetOpen(true),
+      terminalDock: () => interfaceStore.toggleTerminalDock(),
       fetch: () => {
         repoStore.fetch().then(() => toastStore.info("Fetched remote updates"));
       },
@@ -409,7 +426,13 @@
         restoreWorkspace: () => repoStore.restoreWorkspace(),
         openRepo: openFromExternal,
         syncRecentMenu,
-        handleRepoChanged: (path) => void repoStore.handleRepoChanged(path),
+        handleRepoChanged: (path) => {
+          void repoStore.handleRepoChanged(path);
+          // The same event drives the metric panels. Each metric applies its
+          // own debounce and cost floor, so a checkout storm becomes one
+          // re-measurement per metric rather than one per file event.
+          if (path) repoMetrics.invalidate(path);
+        },
         listenRepoChanged: (changed) =>
           listen<RepoChangedPayload>("repo-changed", (event) =>
             changed(event.payload?.path),
@@ -491,7 +514,8 @@
    * untouched; only a real key change re-arms the window.
    */
   const graphScheduler = createGraphFetchScheduler({
-    load: ({ path, query, revision }) => void graphStore.loadGraph(path, query, revision),
+    load: ({ path, query, revision, refScope }) =>
+      void graphStore.loadGraph(path, query, revision, { refScope }),
     debounceMs: GRAPH_FETCH_DEBOUNCE_MS,
   });
   onDestroy(() => graphScheduler.reset());
@@ -501,6 +525,11 @@
       path: $repoStore.currentPath,
       query: $filterStore.searchQuery,
       revision: $filterStore.selectedBranch,
+      // Which refs the graph walks is part of WHICH GRAPH this is, so a
+      // change to it re-arms a fetch through the same single owner as a
+      // filter edit. Without it the setting was inert: the key never moved,
+      // the scheduler saw an already-served request, and nothing reloaded.
+      refScope: $interfaceStore.graphRefScope,
     });
   });
 
@@ -575,13 +604,26 @@
 
     <div class="gp-header-scroll min-w-0 flex-1 h-full">
       <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
-        <button onclick={() => repoStore.pickAndOpenRepo()} class="gp-btn !py-1 shrink-0">
+        <!-- The icons carry the meaning on their own; the words are the part
+             the Layout setting drops. Both keep their accessible name either
+             way, so the label is decoration, never the only cue. -->
+        <button
+          onclick={() => repoStore.pickAndOpenRepo()}
+          class="gp-btn !py-1 shrink-0"
+          title="Open a repository"
+          aria-label="Open a repository"
+        >
           <FolderOpen size={13} class="text-accent" />
-          <span>Open...</span>
+          {#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}
         </button>
-        <button onclick={() => (isCloneModalOpen = true)} class="gp-btn !py-1 shrink-0">
+        <button
+          onclick={() => (isCloneModalOpen = true)}
+          class="gp-btn !py-1 shrink-0"
+          title="Clone a repository"
+          aria-label="Clone a repository"
+        >
           <Download size={13} class="text-accent" />
-          <span>Clone...</span>
+          {#if $interfaceStore.showHeaderActionLabels}<span>Clone...</span>{/if}
         </button>
 
         {#if $repoStore.currentPath}
@@ -594,6 +636,9 @@
 
     <!-- Right Actions -->
     <div class="flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+      <!-- "When recorded" hides this only while the log is genuinely empty,
+           errors and warnings alike; the palette opens Diagnostics either way. -->
+      {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
       <button
         onclick={() => (isDiagnosticsOpen = true)}
         title="Diagnostics — errors, warnings and crash logs"
@@ -610,6 +655,7 @@
           </span>
         {/if}
       </button>
+      {/if}
       {#if $repoStore.currentPath}
         <button
           onclick={() => repoStore.refresh()}
@@ -626,11 +672,15 @@
   </header>
   </svelte:boundary>
 
-  <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />
+  {#if !$interfaceStore.autoHideRepoTabs || $repoStore.openTabs.length > 1}
+    <RepoTabBar onOpen={() => void repoStore.pickAndOpenRepo()} />
+  {/if}
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />
 
+  <!-- The repository surface. Hidden, not unmounted, while Fleet is open. -->
+  <div class="flex-1 flex flex-col min-h-0" class:hidden={fleetOpen}>
   {#if !$repoStore.currentPath}
     <!-- Welcome & Open Repository Screen -->
     <div class="flex-1 flex flex-col items-center justify-center p-8 bg-background select-none relative overflow-hidden">
@@ -685,67 +735,50 @@
     </div>
   {:else}
     {#key $repoStore.currentPath}
-      {#if $interfaceStore.showLanguageBar}
-        <LanguageBar />
-      {/if}
-      {#if showsCommitFilter($repoStore.activeTab)}
-        <FilterBar />
-      {/if}
       <div class="flex-1 flex overflow-hidden">
         <svelte:boundary failed={paneFailed}>
           <Sidebar />
         </svelte:boundary>
         <svelte:boundary failed={paneFailed}>
-          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={terminalActive}>
+          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane">
             <!-- No {#key activeTab}: keying here destroyed and rebuilt the
                  entire pane on every view switch and replayed the .gp-view
                  entrance fade — a full-screen flicker per tab. The {#if}
                  chain alone swaps panes; state lives in stores. -->
             <div class="gp-view flex-1 flex flex-col min-h-0">
               {#if $repoStore.activeTab === "work"}
-                <WorkView />
+                <WorkspaceView
+                  loadConflict={loadConflictEditor}
+                  loadGitHub={loadGitHubPanel}
+                  loadStack={loadCodeStackViewer}
+                  loadManvi={loadManviOpsPanel}
+                />
+              {:else if $repoStore.activeTab === "code"}
+                <CodeView loadBlame={loadBlameViewer} />
               {:else if $repoStore.activeTab === "history"}
-                <div class="flex-1 flex flex-col min-h-0">
-                  <CommitTable />
-                  <CommitDetails />
-                </div>
-              {:else if $repoStore.activeTab === "files"}
-                <FileViewer />
-              {:else if $repoStore.activeTab === "diff"}
-                <DiffViewer />
-              {:else if $repoStore.activeTab === "conflict"}
-                <LazyView load={loadConflictEditor} name="the conflict editor" />
-              {:else if $repoStore.activeTab === "blame"}
-                <LazyView load={loadBlameViewer} name="blame" />
-              {:else if $repoStore.activeTab === "coverage"}
-                <LazyView load={loadCoverageViewer} name="Coverage" />
-              {:else if $repoStore.activeTab === "health"}
-                <LazyView load={loadHealthPanel} name="Health" />
-              {:else if $repoStore.activeTab === "storage"}
-                <LazyView load={loadStoragePanel} name="Storage" />
-              {:else if $repoStore.activeTab === "stack"}
-                <LazyView load={loadCodeStackViewer} name="the code stack" />
-              {:else if $repoStore.activeTab === "pulse"}
-                <LazyView load={loadPulseView} name="Pulse" />
-              {:else if $repoStore.activeTab === "github"}
-                <LazyView load={loadGitHubPanel} name="GitHub" />
-              {:else if $repoStore.activeTab === "manvi"}
-                <LazyView load={loadManviOpsPanel} name="Manvi ops" />
-              {:else if $repoStore.activeTab === "reflog"}
-                <LazyView load={loadReflogViewer} name="the reflog" />
+                <HistoryView loadReflog={loadReflogViewer} />
+              {:else if $repoStore.activeTab === "insights"}
+                <InsightsView
+                  loadPulse={loadPulseView}
+                  loadCoverage={loadCoverageViewer}
+                  loadHealth={loadHealthPanel}
+                  loadStorage={loadStoragePanel}
+                />
               {/if}
             </div>
+            <!-- The terminal sits under the view rather than replacing it, so
+                 a command's output can be read against the thing that
+                 prompted it. A crash in the shell must not take the view with
+                 it, hence its own boundary. -->
+            <svelte:boundary failed={paneFailed}>
+              <TerminalDock
+                open={terminalDockOpen}
+                onClose={() => interfaceStore.setTerminalDockOpen(false)}
+                load={loadTerminalPanel}
+              />
+            </svelte:boundary>
           </main>
         </svelte:boundary>
-        {#if terminalMounted}
-          <!-- Kept mounted across tab switches so the PTY/xterm session
-               survives; display:none pauses rendering, not the process. -->
-          <svelte:boundary failed={paneFailed}>
-            <div class="flex-1 flex flex-col min-w-0 bg-background gp-pane" class:hidden={!terminalActive}>
-              <LazyView load={loadTerminalPanel} name="the terminal" />
-            </div>
-          </svelte:boundary>
-        {/if}
       </div>
 
       <!-- Bottom Ambient Status Bar -->
@@ -760,6 +793,17 @@
       shortcut="⌘K"
       class="bottom-10 right-6"
     />
+  {/if}
+  </div>
+
+  {#if fleetMounted}
+    <!-- Workspace-scoped, so it survives repository switches; hidden rather
+         than unmounted for the same reason the terminal is. -->
+    <svelte:boundary failed={paneFailed}>
+      <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
+        <LazyView load={loadFleetView} name="the Fleet dashboard" />
+      </div>
+    </svelte:boundary>
   {/if}
 
   {#if dropActive}

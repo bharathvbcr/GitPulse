@@ -40,6 +40,7 @@
     CircleUserRound,
     FileCode,
     Keyboard,
+    LayoutGrid,
     Settings,
     Plug,
   } from "lucide-svelte";
@@ -87,13 +88,10 @@
   });
 
   const VIEW_COMMAND_ICONS: Partial<Record<ViewTab, typeof ShieldAlert>> = {
-    files: FileCode,
-    terminal: Terminal,
-    manvi: ShieldAlert,
-    github: GitBranch,
-    coverage: Percent,
-    health: ShieldAlert,
-    reflog: Search,
+    code: FileCode,
+    work: GitBranch,
+    insights: Percent,
+    history: Search,
   };
 
   const viewCommands = Object.values(VIEW_REGISTRY)
@@ -108,7 +106,50 @@
       action: () => repoStore.setActiveTab(view.id),
     }));
 
+  /**
+   * One command per section that declares a palette label.
+   *
+   * This is what keeps a retired view reachable. Diff and Reflog stopped
+   * being tabs; without an entry here, consolidation would have quietly taken
+   * away the only door a user who types rather than clicks ever used. The
+   * labels live in the registry beside the sections, so a new section cannot
+   * be added without deciding whether it needs one.
+   */
+  const sectionCommands = Object.values(VIEW_REGISTRY).flatMap((view) =>
+    (view.sections ?? [])
+      .filter((section): section is typeof section & { paletteCommand: string } =>
+        Boolean(section.paletteCommand),
+      )
+      .map((section) => ({
+        id: `${view.id}:${section.id}`,
+        label: section.paletteCommand,
+        icon: VIEW_COMMAND_ICONS[view.id] ?? GitBranch,
+        shortcut: undefined as string | undefined,
+        action: () => repoStore.setActiveTab(view.id, section.id),
+      })),
+  );
+
   const commands = [
+    {
+      // Workspace-scoped rather than a view, so it is listed here rather than
+      // derived from VIEW_REGISTRY — and it works with nothing open.
+      id: "fleet",
+      label: "Open Fleet — every repository at a glance",
+      icon: LayoutGrid,
+      shortcut: undefined,
+      action: () => interfaceStore.setFleetOpen(true),
+    },
+    {
+      // Also not a view any more — the terminal is a dock under whichever
+      // view is open. Listed by hand for the same reason as Fleet: it left
+      // VIEW_REGISTRY, and a retired view whose only door was the header
+      // would simply be gone.
+      id: "terminal-dock",
+      label: "Toggle Terminal — the shell, docked under the current view",
+      icon: Terminal,
+      shortcut: "⌃`",
+      action: () => interfaceStore.toggleTerminalDock(),
+    },
     {
       id: "refresh",
       label: "Refresh Repository Status",
@@ -180,6 +221,7 @@
     { id: "pull", label: "Pull (fast-forward)", icon: Download, shortcut: undefined, action: () => repoStore.pull() },
     { id: "push", label: "Push Current Branch", icon: Upload, shortcut: undefined, action: () => repoStore.push() },
     ...viewCommands,
+    ...sectionCommands,
     { id: "stash", label: "Stash Working Tree", icon: Layers, shortcut: undefined, action: () => repoStore.stashSave() },
     { id: "stash_pop", label: "Pop Stash", icon: Layers, shortcut: undefined, action: () => repoStore.stashPop() },
     {
@@ -296,7 +338,7 @@
         category: "Code Intelligence",
         action: () => {
           repoStore.selectFilePath(hit.file_path);
-          repoStore.setActiveTab("files");
+          repoStore.setActiveTab("code", "explorer");
         },
       }));
     }

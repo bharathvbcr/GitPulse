@@ -224,8 +224,46 @@ describe("CoverageViewer flicker contracts", () => {
   });
 
   it("only invalidates gutters when the selected file's coverage changed", () => {
-    const scanBody = source.slice(source.indexOf("async function scan("), source.indexOf("function rescan()"));
-    expect(scanBody).toContain("sameCoverageSummary(prevEntry, nextEntry)");
+    // The apply step is now shared by a scan this panel started and a
+    // revalidation the file watcher triggered, so the assertion follows it
+    // into applyReport rather than staying in scan's body.
+    const applyBody = source.slice(
+      source.indexOf("function applyReport("),
+      source.indexOf("async function scan("),
+    );
+    expect(applyBody).toContain("sameCoverageSummary(prevEntry, nextEntry)");
+  });
+
+  it("routes both a self-started scan and a watcher revalidation through one apply step", () => {
+    // Two entry points that diverged would give the panel two different
+    // behaviours for the same report.
+    const scanBody = source.slice(
+      source.indexOf("async function scan("),
+      source.indexOf("function adoptExternalMeasurement("),
+    );
+    expect(scanBody).toContain("applyReport(repo, snap.value, snap.measuredAt)");
+    const adoptBody = source.slice(
+      source.indexOf("function adoptExternalMeasurement("),
+      source.indexOf("function rescan()"),
+    );
+    expect(adoptBody).toContain("applyReport(repo, next, measuredAt)");
+  });
+
+  it("cannot adopt its own measurement and re-trigger itself", () => {
+    // The metric publishes its result before scan() resumes from the await,
+    // so without the isScanning guard every scan would adopt its own report
+    // and start another one.
+    const adoptBody = source.slice(
+      source.indexOf("function adoptExternalMeasurement("),
+      source.indexOf("function rescan()"),
+    );
+    expect(adoptBody).toContain("if (isScanning) return;");
+    expect(adoptBody).toContain("measuredAt === appliedMeasurementAt");
+  });
+
+  it("shares one coverage measurement with PulseView instead of scanning twice", () => {
+    expect(source).toContain("coverageMetric.refresh(repo, { force: true })");
+    expect(source).not.toContain('invoke<CoverageReport>("cmd_scan_coverage"');
   });
 
   it("keeps old source lines visible while a gutter reload is in flight", () => {
@@ -246,7 +284,10 @@ describe("CoverageViewer flicker contracts", () => {
   });
 
   it("retains selections case-insensitively and echoes auto-picks to the session", () => {
-    const scanBody = source.slice(source.indexOf("async function scan("), source.indexOf("function rescan()"));
+    const scanBody = source.slice(
+      source.indexOf("function applyReport("),
+      source.indexOf("async function scan("),
+    );
     expect(scanBody).toContain("toLowerCase()");
     expect(scanBody).toContain("repoStore.selectFilePath(first)");
   });

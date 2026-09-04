@@ -1,4 +1,7 @@
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
   calculateDocumentStats,
@@ -252,18 +255,18 @@ describe("markDevParser — bounded rendering", () => {
     for (const size of [MAX_RENDER_BYTES * 2, MAX_RENDER_BYTES * 16, MAX_RENDER_BYTES * 32]) {
       const started = Date.now();
       renderMarkDevMarkdown(docOf(size));
-      expect(Date.now() - started, `${size} bytes took too long`).toBeLessThan(2000);
+      expectWithinBudget(Date.now() - started, 400, `render of ${size} bytes`);
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("does not choke on a long run of unmatched brackets", () => {
     // The shape that makes the link patterns scan from every '[' to the end of
     // the string: O(n) work at O(n) positions.
     const started = Date.now();
     const out = renderMarkDevMarkdown("[".repeat(MAX_RENDER_BYTES * 4));
-    expect(Date.now() - started).toBeLessThan(2000);
+    expectWithinBudget(Date.now() - started, 1200, "render of a capped document");
     expect(out).toContain("not shown");
-  });
+  }, STRESS_TIMEOUT_MS);
 });
 
 // Scaling audit of the frontend's repository-scale data paths, measured by
@@ -302,15 +305,59 @@ describe("markDevParser — document stats stay linear", () => {
       calculateDocumentStats("[".repeat(n));
       return Date.now() - started;
     });
+    // The budget is the whole guard, and it always runs. Measured on the
+    // unbounded pattern this test exists to keep out: 407ms / 1610ms / 6328ms,
+    // so the 80k case misses this budget by 2.5x. Measured on the bounded
+    // pattern in the file today: 35ms / 70ms / 142ms.
+    //
+    // There used to be a second assertion here comparing large/small against a
+    // ratio, guarded by `if (small > 5)`. It was wrong in both directions. On a
+    // fast machine `small` rounded to 0-5ms and the guard skipped the check
+    // entirely, so the test reported green having asserted nothing — a check
+    // that could not run rendering exactly like one that ran and passed. On a
+    // loaded machine the same tiny `small` made the ratio explode and the
+    // build failed on machine speed rather than on complexity (observed: 13.7
+    // against a threshold of 12, with the bounded, correct implementation).
+    // Complexity is asserted structurally instead, in the test below.
     for (const ms of timings) {
-      expect(ms, `took ${ms}ms`).toBeLessThan(2500);
+      expectWithinBudget(ms, 800, "calculateDocumentStats on unmatched brackets");
     }
-    // Quadratic would quadruple per doubling; linear roughly doubles. Allow
-    // generous headroom so this measures complexity, not machine speed.
-    const [small, , large] = timings;
-    if (small > 5) {
-      expect(large / small, "growth looks quadratic").toBeLessThan(12);
-    }
+  }, STRESS_TIMEOUT_MS);
+
+  // The quadratic shape is specific and can be named, so name it rather than
+  // inferring it from a stopwatch. Only ASYMMETRIC delimiter pairs have it: an
+  // unbounded `[^\]]+` scans from every `[` to the end of the string, giving
+  // O(n) work at O(n) positions. The symmetric pairs in this file (`` ` ``,
+  // `*`, `_`, `~`, `=`) open and close on the same character, so a run of them
+  // fails immediately and is safe left unbounded — which is why this asserts on
+  // the asymmetric classes only instead of banning unbounded quantifiers.
+  it("keeps every asymmetric bracket scan explicitly bounded", async () => {
+    const source = await readFile(
+      fileURLToPath(new URL("./markDevParser.ts", import.meta.url)),
+      "utf8",
+    );
+    // Comment lines are stripped first: this file *documents* the defect,
+    // quoting `[^\]]+` in prose twice, and a scanner that reads its own
+    // description as a finding fails on the fix it is checking for.
+    const production = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trimStart();
+        return !trimmed.startsWith("//") && !trimmed.startsWith("*");
+      })
+      .join("\n");
+    // `[^\]]`, `[^)]`, `[^}]`, `[^>]` followed by `+` or `*` rather than a
+    // `{m,n}` bound is the exact defect that was fixed here.
+    const unbounded = [
+      ...production.matchAll(/\[\^[^\]]*(?:\\\]|\)|\}|>)[^\]]*\][+*]/g),
+    ].map((match) => match[0]);
+    expect(unbounded, `unbounded asymmetric scan(s): ${unbounded.join(", ")}`).toEqual([]);
+
+    // Without this the regex above could stop matching anything and the
+    // assertion would pass by examining nothing at all.
+    const bounded = [...production.matchAll(/\[\^\\?\]\]\{\d+,\d+\}/g)];
+    expect(bounded.length, "found no bounded bracket scans to check").toBeGreaterThan(0);
   });
 
   it("still counts links, wikilinks and headings", () => {

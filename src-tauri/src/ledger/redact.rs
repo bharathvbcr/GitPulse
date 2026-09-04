@@ -11,6 +11,7 @@
 //! one that drifts is discovered by the leak.
 
 use regex::{Captures, Regex};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 static PRIVATE_KEY: OnceLock<Regex> = OnceLock::new();
@@ -240,27 +241,107 @@ fn normalized_cli_flag(value: &str) -> Option<String> {
     })
 }
 
+/// Field names whose *value* is a credential, whatever syntax carries them.
+///
+/// One table, three call sites: a CLI flag (`--client-secret X`), a JSON object
+/// key (`{"client_secret": "X"}`) and the contextual `name=value` regexes below
+/// must agree, because a name treated as secret in one syntax and ignored in
+/// another is precisely how a credential redacted at one gate walks out of the
+/// next. `authorization`, `cookie` and `private_key` are here because the
+/// contextual stage already treats them as secret-bearing in prose; a JSON key
+/// of the same name must not be weaker than the same name in a log line.
+///
+/// Mirrored by `SECRET_FIELD_NAMES` in `src/lib/diagnostics/diagnostics.ts`,
+/// and bound to it by `scripts/diagnostics-contract.test.ts` so the two cannot
+/// drift apart unnoticed.
+pub(crate) const SECRET_FIELD_NAMES: [&str; 19] = [
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "secret",
+    "token",
+    "auth_token",
+    "oauth_token",
+    "oauth2_bearer",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "aws_access_key_id",
+    "authorization",
+    "cookie",
+    "set_cookie",
+    "private_key",
+];
+
+/// Trailing words that make a compound name a credential name.
+///
+/// `github_token` and `webhook_secret` are credentials for the same reason
+/// `token` and `secret` are, and enumerating every vendor prefix is the losing
+/// half of that race. Deliberately excludes the bare word `key`, which would
+/// swallow `public_key`, `cache_key` and `primary_key` and gut the diagnostic
+/// value of the report to redact nothing that is actually secret.
+pub(crate) const SECRET_FIELD_SUFFIXES: [&str; 8] = [
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "credential",
+    "credentials",
+];
+
+/// A field name in comparable form: `X-Api-Key`, `clientSecret` and
+/// `client-secret` all have to reach the table as `x_api_key`,
+/// `client_secret` and `client_secret`.
+pub(crate) fn normalize_field_name(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    let mut prev_was_lower_or_digit = false;
+    for character in key.chars() {
+        if character == '-' || character == '_' || character == '.' || character == ' ' {
+            if !out.is_empty() && !out.ends_with('_') {
+                out.push('_');
+            }
+            prev_was_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() {
+            // camelCase boundary: `accessToken` must not normalize to one word.
+            if prev_was_lower_or_digit && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.push(character.to_ascii_lowercase());
+            prev_was_lower_or_digit = false;
+        } else {
+            out.push(character.to_ascii_lowercase());
+            prev_was_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// Whether a normalized name is one the table calls a credential.
+fn is_secret_name(normalized: &str) -> bool {
+    if SECRET_FIELD_NAMES.contains(&normalized) {
+        return true;
+    }
+    SECRET_FIELD_SUFFIXES.iter().any(|suffix| {
+        normalized
+            .strip_suffix(suffix)
+            .is_some_and(|head| head.ends_with('_'))
+    })
+}
+
+/// Whether a JSON object key declares its value to be a credential.
+pub(crate) fn is_secret_field_name(key: &str) -> bool {
+    is_secret_name(&normalize_field_name(key))
+}
+
 fn is_separate_secret_flag(value: &str) -> bool {
-    matches!(
-        normalized_cli_flag(value).as_deref(),
-        Some(
-            "password"
-                | "passwd"
-                | "api_key"
-                | "apikey"
-                | "access_token"
-                | "refresh_token"
-                | "client_secret"
-                | "secret"
-                | "token"
-                | "auth_token"
-                | "oauth_token"
-                | "oauth2_bearer"
-                | "aws_secret_access_key"
-                | "aws_session_token"
-                | "aws_access_key_id"
-        )
-    )
+    normalized_cli_flag(value).is_some_and(|flag| is_secret_name(&flag))
 }
 
 fn is_userinfo_flag(value: &str) -> bool {
@@ -322,6 +403,59 @@ fn redact_cli_array(values: &mut [serde_json::Value]) -> bool {
 
 const MAX_SERIALIZED_NESTING: usize = 32;
 
+/// Redacts credentials that appear as object *keys* rather than values.
+///
+/// The value side of this seam was blind to its keys; the key side was blind
+/// to its own contents. A token is a token wherever it sits, and
+/// `{"ghp_…": {…}}` — a cache or rate-limit map keyed by the credential — put
+/// one in the ledger and the durable log in full while the identical token one
+/// character to the right was redacted.
+///
+/// Renaming is done by rebuilding the map, and a rename that would collide
+/// with a key already present is disambiguated rather than allowed to
+/// overwrite: two distinct tokens of the same length redact to the same text,
+/// and silently dropping one entry would make the document claim there was
+/// only ever one.
+fn redact_object_keys(
+    values: &mut serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> bool {
+    // Computed once per key: `redact_value_at_depth` runs the whole boundary,
+    // and calling it again during the rebuild doubled the cost of every
+    // document with a wide object in it.
+    let renames: Vec<Option<String>> = values
+        .keys()
+        .map(|key| {
+            let redacted = redact_value_at_depth(key, depth + 1);
+            (redacted != *key).then_some(redacted)
+        })
+        .collect();
+    if renames.iter().all(Option::is_none) {
+        return false;
+    }
+    let mut rebuilt = serde_json::Map::with_capacity(values.len());
+    // Next ordinal per colliding base name. A linear probe from 2 on every
+    // insertion is quadratic exactly when the attack is cheapest to mount: N
+    // distinct tokens of equal length all redact to the SAME text, so key n
+    // pays n probes. Measured at 20k such keys: 31s probing, 24ms with this.
+    let mut next_ordinal: HashMap<String, usize> = HashMap::new();
+    for ((key, value), rename) in std::mem::take(values).into_iter().zip(renames) {
+        let replacement = rename.unwrap_or(key);
+        let mut candidate = replacement.clone();
+        let mut ordinal = next_ordinal.get(&replacement).copied().unwrap_or(2);
+        // The counter alone can still land on a literal key already present
+        // (a document containing both `x` and `x #2`), so confirm before use.
+        while rebuilt.contains_key(&candidate) {
+            candidate = format!("{replacement} #{ordinal}");
+            ordinal += 1;
+        }
+        next_ordinal.insert(replacement, ordinal);
+        rebuilt.insert(candidate, value);
+    }
+    *values = rebuilt;
+    true
+}
+
 fn redact_cli_json_value(value: &mut serde_json::Value, depth: usize) -> bool {
     if depth >= MAX_SERIALIZED_NESTING {
         // The remaining subtree was not inspected, so it cannot be treated as
@@ -342,8 +476,22 @@ fn redact_cli_json_value(value: &mut serde_json::Value, depth: usize) -> bool {
             changed
         }
         serde_json::Value::Object(values) => {
-            let mut changed = false;
-            for value in values.values_mut() {
+            let mut changed = redact_object_keys(values, depth);
+            for (key, value) in values.iter_mut() {
+                // A key that names a credential says what its value is, and it
+                // says so for every shape the value can take. Recursing instead
+                // would hand the value to the contextual stage stripped of the
+                // only context that identified it — which is how
+                // `{"access_token": "<opaque>"}`, the shape every OAuth
+                // response has, reached the ledger and the diagnostics report
+                // in full.
+                if is_secret_field_name(key) {
+                    if value.as_str() != Some("<redacted>") {
+                        *value = serde_json::Value::String("<redacted>".to_string());
+                        changed = true;
+                    }
+                    continue;
+                }
                 changed |= redact_cli_json_value(value, depth + 1);
             }
             changed
@@ -465,6 +613,148 @@ mod tests {
     use super::*;
 
     const KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+
+    #[test]
+    fn key_redaction_cost_stays_linear_in_the_number_of_keys() {
+        // N distinct tokens of equal length all redact to identical text, so a
+        // rename that probes linearly for a free name is quadratic on exactly
+        // the input an attacker finds cheapest. Correctness is the assertion
+        // that matters here: every entry must survive the disambiguation.
+        let mut hostile = serde_json::Map::new();
+        for index in 0..5000u32 {
+            hostile.insert(format!("ghp_{index:036}"), serde_json::Value::from(index));
+        }
+        let document = serde_json::Value::Object(hostile).to_string();
+        let started = std::time::Instant::now();
+        let out = text(&document);
+        let elapsed = started.elapsed();
+
+        assert!(
+            !out.contains("ghp_000000000000000000000000000000000001"),
+            "leaked"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            parsed.as_object().map(serde_json::Map::len),
+            Some(5000),
+            "entries were dropped during collision disambiguation"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn redacts_a_credential_that_appears_as_an_object_key() {
+        // A cache or rate-limit map keyed by the token. The value side was
+        // already scanned; the key side was not scanned at all.
+        for document in [
+            r#"{"ghp_0123456789abcdefghijklmnopqrstuvwxyzA":"x"}"#,
+            r#"{"cache":{"ghp_0123456789abcdefghijklmnopqrstuvwxyzA":1}}"#,
+        ] {
+            let out = text(document);
+            assert!(
+                !out.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyzA"),
+                "leaked from {document}: {out}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+                "redaction produced invalid JSON: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_both_entries_when_two_keys_redact_to_the_same_text() {
+        // Two distinct tokens of equal length redact to identical text.
+        // Overwriting would make the document claim there was only ever one.
+        let document = r#"{"ghp_0123456789abcdefghijklmnopqrstuvwxyzA":1,"ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210B":2}"#;
+        let out = text(document);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            parsed.as_object().map(serde_json::Map::len),
+            Some(2),
+            "an entry was dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn key_redaction_is_idempotent() {
+        let once = text(r#"{"ghp_0123456789abcdefghijklmnopqrstuvwxyzA":"x"}"#);
+        assert_eq!(text(&once), once, "second pass changed {once}");
+    }
+
+    #[test]
+    fn redacts_a_credential_named_by_its_json_key() {
+        // The shape every OAuth response and most API error bodies have. Before
+        // this, the object traversal handed the value to the contextual stage
+        // with the key discarded, so an opaque token matched nothing and the
+        // whole document was written through unchanged.
+        for document in [
+            r#"{"client_secret":"SUPERSECRETVALUE1234567890"}"#,
+            r#"{"access_token":"ya29.OPAQUEVALUE1234567890abcdef"}"#,
+            r#"{"clientSecret":"SUPERSECRETVALUE1234567890"}"#,
+            r#"{"x-api-key":"SUPERSECRETVALUE1234567890"}"#,
+            r#"{"Authorization":"Bearer SUPERSECRETVALUE1234567890"}"#,
+            r#"{"cfg":{"password":"SUPERSECRETVALUE1234567890"}}"#,
+            r#"{"github_token":"SUPERSECRETVALUE1234567890"}"#,
+        ] {
+            let out = text(document);
+            assert!(
+                !out.contains("SUPERSECRETVALUE1234567890")
+                    && !out.contains("ya29.OPAQUEVALUE1234567890abcdef"),
+                "leaked from {document}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn fails_closed_on_a_non_string_secret_value() {
+        // A number, array or object under a credential key is still the
+        // credential. Recursing into it would leave it whole.
+        for document in [
+            r#"{"password":1234567890}"#,
+            r#"{"token":["a","b"]}"#,
+            r#"{"secret":{"inner":"value"}}"#,
+        ] {
+            let out = text(document);
+            assert!(out.contains("<redacted>"), "not redacted: {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_by_key_is_idempotent() {
+        // `carries_secret` is `text(v) != v`, so a second pass that keeps
+        // rewriting would report an already-clean value as still carrying one.
+        let once = text(r#"{"access_token":"SUPERSECRETVALUE1234567890"}"#);
+        assert_eq!(text(&once), once, "second pass changed {once}");
+        assert!(
+            !carries_secret(&once),
+            "clean value reported as secret-bearing"
+        );
+    }
+
+    #[test]
+    fn leaves_benign_key_shaped_names_alone() {
+        // The suffix rule deliberately excludes the bare word `key`: redacting
+        // these would strip the report of the facts it exists to carry.
+        let document = r#"{"public_key":"ssh-ed25519 AAAA","cache_key":"abc","primary_key":"id"}"#;
+        let out = text(document);
+        assert!(out.contains("cache_key"), "{out}");
+        assert!(out.contains("abc"), "over-redacted a benign key: {out}");
+        assert!(out.contains("id"), "over-redacted a benign key: {out}");
+    }
+
+    #[test]
+    fn normalizes_field_names_across_naming_styles() {
+        assert_eq!(normalize_field_name("clientSecret"), "client_secret");
+        assert_eq!(normalize_field_name("X-Api-Key"), "x_api_key");
+        assert_eq!(normalize_field_name("ACCESS_TOKEN"), "access_token");
+        assert_eq!(normalize_field_name("accessToken"), "access_token");
+        assert!(is_secret_field_name("APIKey"));
+        assert!(!is_secret_field_name("public_key"));
+    }
 
     #[test]
     fn redacts_through_the_harness_pattern_table() {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS } from "../src/lib/__tests__/perfBudget";
 import {
   DEFAULT_LIB_RS,
   DEFAULT_SRC_DIR,
@@ -197,7 +198,7 @@ describe("check:ipc contract", () => {
     // beside it proves the string's stray brackets hid nothing.
     expect(quotedRun.stdout).toMatch(/missing commands\s*:\s*1/);
     expect(quotedRun.stdout).toMatch(/cmd_definitely_not_registered_quoted/);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("scans this repo's real src and src-tauri paths by default", () => {
     expect(DEFAULT_LIB_RS).toMatch(/[\\/]src-tauri[\\/]src[\\/]lib\.rs$/);
@@ -284,7 +285,7 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    expect(found.size).toBe(134);
+    expect(found.size).toBe(136);
     expect(found.has("cmd_stage_file")).toBe(true);
     for (const [, site] of found) {
       expect(site.file).toMatch(/^src-tauri\/src\//);

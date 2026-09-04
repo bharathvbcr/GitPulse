@@ -31,6 +31,7 @@
 
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "@tauri-apps/api/core";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
@@ -764,9 +765,9 @@
                 {/if}
                 <button
                   type="button"
-                  onclick={() => repoStore.setActiveTab("terminal")}
+                  onclick={() => interfaceStore.setTerminalDockOpen(true)}
                   class="gp-btn !py-1 !text-[11px]"
-                  title="Open Terminal view"
+                  title="Open the terminal below this panel, so the plan stays on screen while you run it"
                 >
                   <Terminal size={12} />
                   <span>Terminal</span>

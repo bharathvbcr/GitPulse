@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS } from "../__tests__/perfBudget";
 import { clampMenuPosition } from "./menuPosition";
 
 /** Deterministic PRNG so fuzz failures reproduce exactly (mulberry32). */
@@ -171,5 +172,5 @@ describe("clampMenuPosition stress: randomized invariants", () => {
         }
       }
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 });

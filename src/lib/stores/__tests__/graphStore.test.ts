@@ -685,3 +685,143 @@ describe("graphStore background load failure breadcrumb", () => {
   });
 });
 
+
+describe("graph ref scope", () => {
+  /**
+   * The scope decides which refs the backend walks, so two scopes answer the
+   * same repository with different rows. Sending it is not optional: without
+   * it every load would silently take the backend's default, and the setting
+   * would appear to do nothing.
+   */
+  it("sends the current ref scope with every load", async () => {
+    const seen: unknown[] = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") {
+        seen.push(args?.refScope);
+        return payload("a") as never;
+      }
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, changed_files: [] } as never;
+      }
+      throw new Error(cmd);
+    };
+    let scope: "named" | "all" = "named";
+    const store = createGraphStore({ invoke, refScope: () => scope });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    scope = "all";
+    await store.loadGraph("/r/a");
+    expect(seen).toEqual(["named", "all"]);
+  });
+
+  /**
+   * A scope change is a different question, not a background refresh of the
+   * same one. The store shows the loading state for a view it has no answer
+   * for yet — the user just changed what is being asked, and must see it
+   * working rather than get a silent row swap half a second later. Without
+   * the scope in the cache key this reads as a plain reload and the graph
+   * sits on the old scope's lanes with no indication.
+   */
+  it("shows the loading state while a scope change is in flight", async () => {
+    const slow = deferred<ReturnType<typeof payload>>();
+    let scope: "named" | "all" = "named";
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") {
+        return scope === "named" ? (payload("a") as never) : (slow.promise as never);
+      }
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, changed_files: [] } as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke, refScope: () => scope });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).isLoading).toBe(false);
+
+    scope = "all";
+    const pending = store.loadGraph("/r/a");
+    expect(get(store).isLoading).toBe(true);
+
+    slow.resolve(payload("b"));
+    await pending;
+    expect(get(store).isLoading).toBe(false);
+    expect(get(store).rows.map((r) => r.id)).toEqual(["b"]);
+  });
+});
+
+describe("graph warning breadcrumbs", () => {
+  function storeWith(warnings: () => string[]) {
+    const warned: string[] = [];
+    const invoke: InvokeFn = async (cmd, args) => {
+      if (cmd === "cmd_get_commit_graph") {
+        return { ...payload("a"), warnings: warnings() } as never;
+      }
+      if (cmd === "cmd_get_commit_details") {
+        return { id: args?.commitId, changed_files: [] } as never;
+      }
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({
+      invoke,
+      diagnostics: { warn: (_source, detail) => void warned.push(String(detail)) },
+    });
+    return { store, warned };
+  }
+
+  /**
+   * A repository whose refs sit outside the walked scope reports the same
+   * sentence on every load, and the watcher reloads on every settled write.
+   * The diagnostics ring coalesces identical CONSECUTIVE entries, so one
+   * persistent warning is fine — but two alternate, each displacing the other
+   * as newest, and the ring fills with the same pair forever.
+   */
+  it("logs a persistent warning set once, not on every reload", async () => {
+    const { store, warned } = storeWith(() => [
+      "36 commit(s) ... are not drawn",
+      "Ref labels are capped for this repository",
+    ]);
+    store.showRepo("/r/a");
+    for (let i = 0; i < 5; i += 1) await store.loadGraph("/r/a");
+    expect(warned).toHaveLength(2);
+  });
+
+  /**
+   * The rows are byte-identical across these loads; only the warning set
+   * moves. Warnings are not part of the rendered-history signature, so the
+   * identical-payload short-circuit used to return before they were reported
+   * — a degradation that appeared while history stood still (a ref listing
+   * starting to fail, a namespace starting to hide commits) was never logged
+   * at all. Whether history changed and whether the load degraded are two
+   * different questions.
+   */
+  it("logs again as soon as the set actually changes", async () => {
+    let current = ["first degradation"];
+    const { store, warned } = storeWith(() => current);
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    await store.loadGraph("/r/a");
+    expect(warned).toEqual(["first degradation"]);
+
+    current = ["first degradation", "second degradation"];
+    await store.loadGraph("/r/a");
+    expect(warned).toEqual([
+      "first degradation",
+      "first degradation",
+      "second degradation",
+    ]);
+  });
+
+  /** A degradation that clears and returns must be reported again. */
+  it("re-reports a warning that went away and came back", async () => {
+    let current: string[] = ["flaky degradation"];
+    const { store, warned } = storeWith(() => current);
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    current = [];
+    await store.loadGraph("/r/a");
+    current = ["flaky degradation"];
+    await store.loadGraph("/r/a");
+    expect(warned).toEqual(["flaky degradation", "flaky degradation"]);
+  });
+});

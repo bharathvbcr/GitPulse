@@ -356,7 +356,7 @@
           {#if previewTruncated}
             <button
               class="mt-2 self-start px-2.5 py-1 rounded-full border border-border/80 text-[11px] font-sans text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors"
-              onclick={() => repoStore.setActiveTab("diff")}
+              onclick={() => repoStore.setActiveTab("history", "diff")}
             >
               Preview capped at {PREVIEW_LINE_CAP.toLocaleString()} lines — open the full diff view
             </button>

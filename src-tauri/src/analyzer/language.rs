@@ -187,22 +187,21 @@ impl LanguageDetector {
         !matches!(info.name, "Image" | "PDF" | "Binary")
     }
 
+    /// The line-comment marker for `lang`, or `None` for a language that has
+    /// only block comments (CSS, HTML) or none at all (JSON).
+    ///
+    /// Delegates to [`crate::analyzer::loc_counter::comment_syntax`] rather
+    /// than keeping a second table. There used to be one match arm here and a
+    /// separate counting rule in `loc_counter`; they could disagree, and did —
+    /// this returned `Some("/*")` for CSS, which is a *block* opener that the
+    /// counter then applied as a line prefix, so only the first line of a CSS
+    /// comment was ever counted as a comment.
+    pub fn comment_syntax(lang: &str) -> crate::analyzer::CommentSyntax {
+        crate::analyzer::loc_counter::comment_syntax(lang)
+    }
+
     pub fn comment_prefix(lang: &str) -> Option<&'static str> {
-        match lang {
-            "Python" | "YAML" | "TOML" | "Shell" | "Ruby" | "Perl" | "R" | "Makefile"
-            | "Dockerfile" | "Elixir" | "Nim" | "Terraform" | "Julia" | "Prisma" | "Nix"
-            | "Crystal" | "GraphQL" => Some("#"),
-            "CSS" | "Less" | "Sass" | "SCSS" | "Stylus" | "PostCSS" => Some("/*"),
-            "HTML" | "XML" | "Markdown" | "Vue" | "Svelte" | "Astro" => Some("<!--"),
-            "Lua" | "SQL" | "Haskell" | "Elm" | "Ada" | "VHDL" => Some("--"),
-            "Lisp" | "Common Lisp" | "Clojure" | "Scheme" | "Racket" | "Assembly" | "INI" => {
-                Some(";")
-            }
-            "Erlang" | "Matlab" | "PostScript" | "Prolog" => Some("%"),
-            "Fortran" => Some("!"),
-            "Batchfile" => Some("REM"),
-            _ => Some("//"),
-        }
+        Self::comment_syntax(lang).first_line_marker()
     }
 
     pub fn coverage_family(lang: &str) -> Option<&'static str> {
@@ -1248,6 +1247,16 @@ mod tests {
     fn comment_prefix_for_rust_is_line_comment() {
         assert_eq!(LanguageDetector::comment_prefix("Rust"), Some("//"));
         assert_eq!(LanguageDetector::comment_prefix("Python"), Some("#"));
+        // Previously all four fell through to the `//` catch-all.
+        assert_eq!(LanguageDetector::comment_prefix("PowerShell"), Some("#"));
+        assert_eq!(LanguageDetector::comment_prefix("CMake"), Some("#"));
+        assert_eq!(LanguageDetector::comment_prefix("PureScript"), Some("--"));
+        assert_eq!(LanguageDetector::comment_prefix("WebAssembly"), Some(";;"));
+        // Languages with only block comments have no line marker to report,
+        // and must say so rather than naming a block opener.
+        assert_eq!(LanguageDetector::comment_prefix("CSS"), None);
+        assert_eq!(LanguageDetector::comment_prefix("HTML"), None);
+        assert_eq!(LanguageDetector::comment_prefix("JSON"), None);
     }
 
     #[test]

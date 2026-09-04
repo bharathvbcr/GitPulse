@@ -1,0 +1,20 @@
+{
+  "name": "gitpulse",
+  "interface": {
+    "displayName": "GitPulse"
+  },
+  "plugins": [
+    {
+      "name": "gitpulse",
+      "source": {
+        "source": "local",
+        "path": "./plugins/gitpulse"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

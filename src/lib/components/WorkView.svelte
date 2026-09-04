@@ -146,7 +146,8 @@
     // A parked operation is resolved in the Resolve view; anything else is
     // most usefully seen as its working-tree diff. openPathFor already picked
     // the stuck worktree when a task row holds several.
-    repoStore.setActiveTab(row.operation ? "conflict" : "diff");
+    if (row.operation) repoStore.setViewSection("work", "resolve");
+    else repoStore.setActiveTab("history", "diff");
   }
 
   function agentsOn(row: WorkRow): string[] {
@@ -164,7 +165,8 @@
 
   async function openBinding(binding: WorktreeBinding): Promise<void> {
     await repoStore.openRepo(binding.worktree.path);
-    repoStore.setActiveTab(binding.operation ? "conflict" : "diff");
+    if (binding.operation) repoStore.setViewSection("work", "resolve");
+    else repoStore.setActiveTab("history", "diff");
   }
 
   const degraded = $derived(projection ? degradedSummary(projection.sources) : "");

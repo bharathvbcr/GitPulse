@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS } from "../../__tests__/perfBudget";
 import { GraphRenderer, type VisualCommitRow } from "../GraphRenderer";
 import { makeRecordingCtx, row } from "./recordingCtx";
 import scholarlmConfluence from "./fixtures/scholarlmConfluence.json";
@@ -354,7 +355,7 @@ describe("connector rails", () => {
       }
       assertRailEnvelope(connector!, rowHeight, `iter ${iter} (rh=${rowHeight} lw=${laneWidth} ${fromLane}->${toLane} +${offset} merge=${isMerge})`);
     }
-  }, 30_000);
+  }, STRESS_TIMEOUT_MS);
 
   describe("scholarlm confluence fixture (real solver output behind the artifact screenshot)", () => {
     const rows = scholarlmConfluence as VisualCommitRow[];

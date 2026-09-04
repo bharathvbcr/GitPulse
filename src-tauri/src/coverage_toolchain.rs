@@ -44,6 +44,53 @@ pub(crate) fn pytest_install_arguments() -> String {
     PYTEST_PACKAGES.join(" ")
 }
 
+/// The Python package that turns gcov data into lcov, and nothing else.
+///
+/// Same rule as [`PYTEST_PACKAGES`]: this slice is the entire blast radius of
+/// the C/C++ `pip install` step, the gate refuses anything outside it, and the
+/// planner renders its command text from the same values.
+pub(crate) const GCOVR_PACKAGES: &[&str] = &["gcovr"];
+
+/// The tail of `<venv python> -m pip install …` for the C/C++ toolchain.
+pub(crate) fn gcovr_install_arguments() -> String {
+    GCOVR_PACKAGES.join(" ")
+}
+
+/// The module name `<venv python> -m …` invokes to run gcovr.
+///
+/// gcovr ships `gcovr/__main__.py`, so the module form works wherever the
+/// package is importable. It is preferred over the `gcovr` console script
+/// because the gate already understands `<venv python> -m <module>` and does
+/// not have to learn a new repository-local program spelling.
+pub(crate) const GCOVR_MODULE: &str = "gcovr";
+
+/// Out-of-tree build directory GitPulse configures for an instrumented C/C++
+/// build.
+///
+/// Deliberately NOT the project's own `build/`. GitPulse compiles with
+/// coverage instrumentation and a forced `CMAKE_BUILD_TYPE`; doing that in the
+/// directory a developer builds from would silently replace their build with a
+/// slower instrumented one. A separate directory also means the whole
+/// experiment is removable with one `rm -rf`, and it keeps this app out of the
+/// project's own CMake files — which is the reason C/C++ coverage was declared
+/// unplannable before.
+pub(crate) const NATIVE_COVERAGE_BUILD_DIR: &str = "build-gitpulse-coverage";
+
+/// Where gcovr writes lcov inside [`NATIVE_COVERAGE_BUILD_DIR`].
+///
+/// Inside the build directory on purpose: `cmake -B` creates that directory,
+/// so nothing has to `mkdir` first, and the path cannot collide with the
+/// root-level `lcov.info` that the Rust family also claims.
+pub(crate) const NATIVE_COVERAGE_LCOV: &str = "build-gitpulse-coverage/lcov.info";
+
+/// The one compiler and linker flag that enables gcov instrumentation.
+///
+/// `--coverage` is the documented shorthand GCC and Clang both accept; it
+/// implies `-fprofile-arcs -ftest-coverage` when compiling and links `libgcov`.
+/// Passing it through `-D CMAKE_*_FLAGS` on the configure command line is what
+/// makes this work without editing the project's `CMakeLists.txt`.
+pub(crate) const NATIVE_COVERAGE_FLAG: &str = "--coverage";
+
 /// JavaScript coverage providers GitPulse knows how to drive. Appearing here
 /// is what makes a provider both installable by the gate and recognizable by
 /// the planner when it decides whether one is already declared.
@@ -169,5 +216,36 @@ mod tests {
     #[test]
     fn the_default_js_provider_is_installable() {
         assert!(JS_COVERAGE_PROVIDERS.contains(&DEFAULT_JS_COVERAGE_PROVIDER));
+    }
+
+    /// The generate step writes lcov into the directory the configure step
+    /// creates. If these drift, GitPulse builds coverage data into a place its
+    /// own scanner never looks.
+    #[test]
+    fn the_native_lcov_path_is_inside_the_managed_build_directory() {
+        let prefix = format!("{NATIVE_COVERAGE_BUILD_DIR}/");
+        assert!(
+            NATIVE_COVERAGE_LCOV.starts_with(&prefix),
+            "{NATIVE_COVERAGE_LCOV} must live inside {NATIVE_COVERAGE_BUILD_DIR}"
+        );
+        // The build directory is created by the tool, so it must not collide
+        // with a name projects use themselves.
+        assert_ne!(NATIVE_COVERAGE_BUILD_DIR, "build");
+        assert_ne!(NATIVE_COVERAGE_BUILD_DIR, "cmake-build-debug");
+    }
+
+    #[test]
+    fn the_gcovr_install_tail_lists_exactly_the_allowed_packages() {
+        let tail = gcovr_install_arguments();
+        let rendered: Vec<&str> = tail.split(' ').collect();
+        assert_eq!(rendered, GCOVR_PACKAGES.to_vec());
+        assert!(
+            !GCOVR_PACKAGES.is_empty(),
+            "an empty set would allow `pip install` with no packages"
+        );
+        assert!(
+            GCOVR_PACKAGES.contains(&GCOVR_MODULE),
+            "the module GitPulse runs must be one it is allowed to install"
+        );
     }
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { get } from "svelte/store";
 import {
   APP_VERSION,
@@ -11,6 +12,8 @@ import {
   diagnosticFingerprint,
   isHostRuntimeNoise,
   redactDiagnosticText,
+  isSecretFieldName,
+  normalizeFieldName,
   type DiagnosticEntry,
   type DiagnosticSeverity,
 } from "./diagnostics";
@@ -663,7 +666,7 @@ describe("message clamping keeps both ends", () => {
     const kept = recordAndRead(`START${"y".repeat(50_000)}END`);
     expect(kept.startsWith("START")).toBe(true);
     expect(kept.endsWith("END")).toBe(true);
-  });
+  }, STRESS_TIMEOUT_MS);
 });
 
 /**
@@ -1007,7 +1010,7 @@ describe("diagnostics ring under fuzz", () => {
 
     // The persisted blob restores an identical ring.
     expect(get(createDiagnostics({ storage }))).toEqual(entries);
-  });
+  }, STRESS_TIMEOUT_MS);
 
   it("accounts for every event exactly while the ring has room", () => {
     const random = seeded(7);
@@ -1036,4 +1039,133 @@ describe("diagnostics ring under fuzz", () => {
     const perCall = (performance.now() - started) / 1000;
     expect(perCall).toBeLessThan(1);
   });
+});
+
+describe("credentials named by a JSON object key", () => {
+  const SECRET = "SUPERSECRETVALUE1234567890";
+
+  // Before this, the object traversal handed each value to the contextual
+  // stage with its key discarded, so an opaque token matched nothing and the
+  // whole document was reported and persisted unchanged. Every entry below
+  // leaked in full.
+  it.each([
+    ["client_secret", `{"client_secret":"${SECRET}"}`],
+    ["access_token", `{"access_token":"${SECRET}"}`],
+    ["camelCase clientSecret", `{"clientSecret":"${SECRET}"}`],
+    ["header-style x-api-key", `{"x-api-key":"${SECRET}"}`],
+    ["Authorization", `{"Authorization":"Bearer ${SECRET}"}`],
+    ["nested under an ordinary key", `{"cfg":{"password":"${SECRET}"}}`],
+    ["vendor-prefixed github_token", `{"github_token":"${SECRET}"}`],
+    ["Cookie", `{"Cookie":"session=${SECRET}"}`],
+  ])("redacts %s", (_label, document) => {
+    const out = redactDiagnosticText(document);
+    expect(out, `leaked: ${out}`).not.toContain(SECRET);
+  });
+
+  it("fails closed on a non-string value under a credential key", () => {
+    // A number, array or object under a credential key is still the
+    // credential; recursing into it would leave it whole.
+    for (const document of [
+      '{"password":1234567890}',
+      '{"token":["a","b"]}',
+      '{"secret":{"inner":"value"}}',
+    ]) {
+      expect(redactDiagnosticText(document), document).toContain("<redacted>");
+    }
+  });
+
+  it("is idempotent, so a clean value never reads as secret-bearing", () => {
+    const once = redactDiagnosticText(`{"access_token":"${SECRET}"}`);
+    expect(redactDiagnosticText(once)).toBe(once);
+  });
+
+  it("leaves benign key-shaped names alone", () => {
+    // The suffix rule deliberately excludes the bare word `key`: redacting
+    // these would strip the report of the facts it exists to carry.
+    const out = redactDiagnosticText(
+      '{"public_key":"ssh-ed25519 AAAA","cache_key":"abc","primary_key":"id"}',
+    );
+    expect(out).toContain("abc");
+    expect(out).toContain("id");
+  });
+
+  it("normalizes field names across naming styles", () => {
+    expect(normalizeFieldName("clientSecret")).toBe("client_secret");
+    expect(normalizeFieldName("X-Api-Key")).toBe("x_api_key");
+    expect(normalizeFieldName("ACCESS_TOKEN")).toBe("access_token");
+    expect(normalizeFieldName("accessToken")).toBe("access_token");
+    expect(isSecretFieldName("APIKey")).toBe(true);
+    expect(isSecretFieldName("public_key")).toBe(false);
+  });
+});
+
+describe("credentials that appear as a JSON object key", () => {
+  const GHP = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+
+  it.each([
+    ["at the top level", `{"${GHP}":"x"}`],
+    ["nested in a cache map", `{"cache":{"${GHP}":1}}`],
+  ])("redacts a vendor token used as a key %s", (_label, document) => {
+    const out = redactDiagnosticText(document);
+    expect(out, `leaked: ${out}`).not.toContain(GHP);
+    expect(() => JSON.parse(out), `invalid JSON: ${out}`).not.toThrow();
+  });
+
+  it("keeps both entries when two keys redact to the same text", () => {
+    // Two distinct tokens of equal length redact to identical text.
+    // Overwriting would make the document claim there was only ever one.
+    const other = "ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210B";
+    const out = redactDiagnosticText(`{"${GHP}":1,"${other}":2}`);
+    expect(Object.keys(JSON.parse(out)), `an entry was dropped: ${out}`).toHaveLength(2);
+  });
+
+  it("is idempotent", () => {
+    const once = redactDiagnosticText(`{"${GHP}":"x"}`);
+    expect(redactDiagnosticText(once)).toBe(once);
+  });
+});
+
+describe("redaction cost stays linear in the number of object keys", () => {
+  it("does not blow up when every key redacts to the same text", () => {
+    // The adversarial shape is also the cheapest to mount: N distinct tokens of
+    // equal length all redact to identical text, so a rename that probes for a
+    // free name linearly from 2 pays n probes on key n. Measured at 20k such
+    // keys: 31s while probing, 277ms with a per-base counter. Quadratic misses
+    // this budget by 3x; linear clears it by 36x.
+    const hostile: Record<string, unknown> = {};
+    for (let index = 0; index < 20000; index += 1) {
+      hostile[`ghp_${String(index).padStart(36, "0")}`] = index;
+    }
+    const started = Date.now();
+    const out = redactDiagnosticText(JSON.stringify(hostile));
+    const elapsed = Date.now() - started;
+
+    expect(out).not.toContain("ghp_000000000000000000000000000000000001");
+    // Collision disambiguation must not drop entries: 20k keys in, 20k out.
+    expect(Object.keys(JSON.parse(out)), "entries were dropped").toHaveLength(20000);
+    expectWithinBudget(elapsed, 2000, "redaction over 20k colliding keys");
+  }, STRESS_TIMEOUT_MS);
+
+  it("terminates on a deeply nested document", () => {
+    let document = '"leaf"';
+    for (let level = 0; level < 200; level += 1) document = `{"level_${level}":${document}}`;
+    expect(redactDiagnosticText(document).length).toBeGreaterThan(0);
+  });
+});
+
+describe("the key rebuild preserves exotic keys", () => {
+  const GHP = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+
+  it.each([["__proto__"], ["constructor"], ["prototype"], ["toString"]])(
+    "keeps a %s entry when a sibling key is renamed",
+    (exotic) => {
+      // JSON.parse creates `__proto__` as a genuine own property, so a document
+      // can carry one. Writing it back with `value[key] = entry` reaches
+      // Object.prototype's setter instead of storing anything, which silently
+      // shrank the report by one entry.
+      const out = redactDiagnosticText(`{"${GHP}":1,"${exotic}":2}`);
+      expect(out, `leaked: ${out}`).not.toContain(GHP);
+      expect(Object.keys(JSON.parse(out)), `entry lost: ${out}`).toHaveLength(2);
+    },
+  );
 });

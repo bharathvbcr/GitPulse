@@ -11,6 +11,11 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: true,
+    // Coverage instrumentation plus 18 CPU-bound file workers starved the
+    // stress tests past their 5s safety budgets on an 18-core host. Four
+    // concurrent files keep the suite parallel while the same hostile cases
+    // complete in 1.5-2.6s, so the budgets stay strict instead of being raised.
+    maxWorkers: 4,
     include: ["src/**/*.{test,spec}.{js,ts}", "scripts/**/*.test.ts"],
     coverage: {
       provider: "v8",

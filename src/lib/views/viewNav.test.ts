@@ -2,66 +2,43 @@ import { describe, expect, it } from "vitest";
 import { VIEW_TABS } from "../repos/persist";
 import {
   VIEW_NAV,
-  flattenedViewNavTabs,
   formatViewTabLabel,
-  isViewNavGroupActive,
-  viewNavGroupFor,
+  viewNavCoversAllTabs,
   viewNavItemFor,
-  viewNavPartitionsAllTabs,
-  viewNavTriggerLabel,
+  viewNavTabs,
 } from "./viewNav";
 
 describe("viewNav", () => {
-  it("partitions every persisted view tab exactly once", () => {
-    expect(viewNavPartitionsAllTabs()).toBe(true);
-    expect([...flattenedViewNavTabs()].sort()).toEqual([...VIEW_TABS].sort());
+  it("lists every persisted view tab exactly once", () => {
+    expect(viewNavCoversAllTabs()).toBe(true);
+    expect([...viewNavTabs()].sort()).toEqual([...VIEW_TABS].sort());
   });
 
-  it("keeps daily work as tabs and folds the rest into menus", () => {
-    const work = VIEW_NAV.find((group) => group.id === "work");
-    expect(work?.kind).toBe("tabs");
-    expect(work?.items.map((item) => item.id)).toEqual(["work", "files", "history", "diff", "conflict"]);
-
-    const menus = VIEW_NAV.filter((group) => group.kind === "menu");
-    expect(menus.length).toBeGreaterThanOrEqual(1);
-    const tabCount = VIEW_NAV.filter((group) => group.kind === "tabs").flatMap((group) => group.items)
-      .length;
-    expect(tabCount).toBeLessThan(VIEW_TABS.length);
-    // The bound exists so the title bar cannot grow a button per panel, not
-    // to pin the count at whatever it was the day it was written. It moved
-    // from 4 to 5 when Work joined — the projection of tasks, worktrees, PRs,
-    // runs and verdicts is where a session starts, so burying it in a menu
-    // would defeat it. Anything further needs the same argument made again.
-    expect(tabCount).toBeLessThanOrEqual(5);
+  it("puts every view in the header, in registry order", () => {
+    // The old bound — "fewer tabs than views, so the title bar cannot grow a
+    // button per panel" — was managing a symptom. Consolidation removed its
+    // cause: a new panel is a section of the view that owns its subject, not
+    // a fifth top-level entry. So every view is a tab, and the check that
+    // matters is the ceiling on how many views there can be at all.
+    expect(viewNavTabs()).toEqual(["work", "code", "history", "insights"]);
+    expect(VIEW_NAV.length).toBe(VIEW_TABS.length);
+    // Nine digit accelerators exist and the native menu asserts it too; a
+    // header wider than that is the point at which grouping has to come back.
+    expect(VIEW_NAV.length).toBeLessThanOrEqual(9);
   });
 
-  it("resolves group and item metadata for each tab", () => {
-    expect(viewNavGroupFor("history")?.id).toBe("work");
-    expect(viewNavGroupFor("files")?.id).toBe("work");
-    expect(viewNavGroupFor("coverage")?.id).toBe("inspect");
-    expect(viewNavGroupFor("github")?.id).toBe("more");
-    expect(viewNavGroupFor("terminal")?.id).toBe("more");
-    expect(viewNavItemFor("history")?.label).toBe("Graph");
-    expect(viewNavItemFor("files")?.label).toBe("Files");
-    expect(viewNavItemFor("conflict")?.label).toBe("Resolve");
-    expect(viewNavItemFor("terminal")?.label).toBe("Terminal");
+  it("resolves item metadata for each tab", () => {
+    expect(viewNavItemFor("work")?.label).toBe("Work");
+    expect(viewNavItemFor("code")?.label).toBe("Code");
+    expect(viewNavItemFor("history")?.label).toBe("History");
+    expect(viewNavItemFor("insights")?.label).toBe("Insights");
   });
 
-  it("uses the active child as the menu trigger, otherwise the group label", () => {
-    const inspect = VIEW_NAV.find((group) => group.id === "inspect")!;
-    const more = VIEW_NAV.find((group) => group.id === "more")!;
-    expect(viewNavTriggerLabel(inspect, "history")).toBe("Inspect");
-    expect(viewNavTriggerLabel(inspect, "coverage")).toBe("Coverage");
-    expect(viewNavTriggerLabel(more, "github")).toBe("GitHub");
-    expect(isViewNavGroupActive(inspect, "blame")).toBe(true);
-    expect(isViewNavGroupActive(inspect, "diff")).toBe(false);
-  });
-
-  it("only suffixes Resolve with the conflict count", () => {
-    const resolve = viewNavItemFor("conflict")!;
-    const graph = viewNavItemFor("history")!;
-    expect(formatViewTabLabel(resolve, 0)).toBe("Resolve");
-    expect(formatViewTabLabel(resolve, 3)).toBe("Resolve (3)");
-    expect(formatViewTabLabel(graph, 3)).toBe("Graph");
+  it("only suffixes Work — which owns Resolve now — with the conflict count", () => {
+    const work = viewNavItemFor("work")!;
+    const history = viewNavItemFor("history")!;
+    expect(formatViewTabLabel(work, 0)).toBe("Work");
+    expect(formatViewTabLabel(work, 3)).toBe("Work (3)");
+    expect(formatViewTabLabel(history, 3)).toBe("History");
   });
 });

@@ -24,6 +24,8 @@ const repo = (relative: string): string =>
 const CARGO = repo("src-tauri/Cargo.toml");
 const LOGGING = repo("src-tauri/src/logging.rs");
 const LIB_RS = repo("src-tauri/src/lib.rs");
+const REDACT_RS = repo("src-tauri/src/ledger/redact.rs");
+const DIAGNOSTICS_TS = repo("src/lib/diagnostics/diagnostics.ts");
 
 /**
  * Source with the test module removed, so fixtures never satisfy a check.
@@ -189,5 +191,87 @@ describe("every declared panel source actually reports", () => {
   it("leaves no reporter using a source the union never declared", () => {
     const undeclared = [...used()].filter((source) => !declared().includes(source));
     expect(undeclared).toEqual([]);
+  });
+});
+
+
+/**
+ * The two credential-name tables are the same table written twice — once for
+ * the ledger's write path (Rust, protects what reaches disk) and once for the
+ * diagnostics report (TypeScript, protects what reaches the clipboard). Their
+ * own source comments name the failure this guards: two tables drift, and the
+ * one that drifted is discovered by the leak.
+ *
+ * They drifted before this existed. The `Object` branch of both redactors
+ * ignored its keys entirely, so `{"access_token": "<opaque>"}` — the shape of
+ * every OAuth response — was written through in full on both sides.
+ *
+ * Parsed from the source that owns each list rather than restated here, since
+ * a third hand-written copy is one more thing to drift.
+ */
+function rustList(name: string): string[] {
+  const match = REDACT_RS.match(
+    new RegExp(`const ${name}: \\[&str; (\\d+)\\] = \\[([^\\]]*)\\];`),
+  );
+  if (!match) return [];
+  const entries = [...match[2].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
+  // A declared length that disagrees with the entries is its own drift: the
+  // array would not compile, but the mismatch would be reported as a build
+  // error far from here, so assert it where the list is read.
+  expect(entries.length, `${name} declares ${match[1]} entries`).toBe(Number(match[1]));
+  return entries;
+}
+
+function tsList(name: string): string[] {
+  const match = DIAGNOSTICS_TS.match(
+    new RegExp(`export const ${name}: readonly string\\[\\] = \\[([^\\]]*)\\];`),
+  );
+  return match ? [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]) : [];
+}
+
+describe("the two credential-name tables cannot drift apart", () => {
+  for (const table of ["SECRET_FIELD_NAMES", "SECRET_FIELD_SUFFIXES"]) {
+    const rust = rustList(table);
+    const typescript = tsList(table);
+
+    it(`finds ${table} on both sides`, () => {
+      // Without this the comparison below passes vacuously the moment either
+      // declaration is reshaped and the regex stops matching.
+      expect(rust.length, `${table} not found in redact.rs`).toBeGreaterThan(0);
+      expect(typescript.length, `${table} not found in diagnostics.ts`).toBeGreaterThan(0);
+    });
+
+    it(`keeps ${table} identical in Rust and TypeScript`, () => {
+      expect([...typescript].sort()).toEqual([...rust].sort());
+    });
+  }
+
+  it("keeps the bare word `key` out of the suffix table", () => {
+    // `key` as a suffix swallows public_key, cache_key and primary_key, which
+    // would redact the report down to nothing useful while adding no secrecy.
+    expect(rustList("SECRET_FIELD_SUFFIXES")).not.toContain("key");
+    expect(tsList("SECRET_FIELD_SUFFIXES")).not.toContain("key");
+  });
+
+  it("scans the object key itself on both sides of the seam", () => {
+    // The other half of the same blindness: keys were neither consulted for
+    // what they name nor scanned for what they contain, so a token used as a
+    // map key was written through in full.
+    expect(REDACT_RS, "redact.rs never scans its keys").toMatch(/fn redact_object_keys\(/);
+    expect(DIAGNOSTICS_TS, "diagnostics.ts never scans its keys").toMatch(
+      /function redactObjectKeys\(/,
+    );
+  });
+
+  it("consults the object key on both sides of the seam", () => {
+    // The defect was structural, not a missing table entry: both `Object`
+    // branches iterated values and discarded keys.
+    expect(REDACT_RS, "redact.rs object branch ignores its keys").toMatch(
+      /for \(key, value\) in values\.iter_mut\(\)/,
+    );
+    expect(REDACT_RS).toMatch(/is_secret_field_name\(key\)/);
+    expect(DIAGNOSTICS_TS, "diagnostics.ts object branch ignores its keys").toMatch(
+      /isSecretFieldName\(key\)/,
+    );
   });
 });

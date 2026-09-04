@@ -24,12 +24,28 @@ describe("BlameViewer file explorer integration", () => {
     expect(source).toContain('key.toLowerCase() === "b"');
   });
 
-  it("routes manual path entry through the store's single selection site", () => {
-    // New values must go through selectFilePath (which also persists across
-    // tab switches); only an identical resubmit may load directly.
-    expect(source).toContain("repoStore.selectFilePath(path)");
-    const directBranch = source.indexOf("$repoStore.selectedFilePath === path");
-    expect(directBranch).toBeGreaterThan(-1);
+  it("reads the selection instead of offering a second way to name a file", () => {
+    // The path box is gone. It existed because Blame was a destination you
+    // could arrive at with nothing selected; Blame is a section of Code now,
+    // and Explorer — one click away, sharing `selectedFilePath` — is where a
+    // file is chosen. A second picker here would be a second source of truth
+    // for one subject, and the one that could disagree.
+    expect(source).not.toContain("bind:value={filePath}");
+    expect(source).not.toContain('placeholder="Path to file in repo..."');
+    expect(source).not.toContain("repoStore.selectFilePath(");
+    // The selection is still what drives the load, and it is still the only
+    // thing that does.
+    expect(source).toContain("const selected = $repoStore.selectedFilePath;");
+  });
+
+  it("keeps a way to ask for the same file again after a failure", () => {
+    // Retry used to mean re-typing the path and pressing Enter — deleting the
+    // box without replacing that would have removed the only recovery from a
+    // failed blame. The store does not notify for an unchanged value, so the
+    // retry calls the loader directly.
+    expect(source).toContain("function retryBlame()");
+    expect(source).toContain("void loadBlameFor(repo, path);");
+    expect(source).toContain("onclick={retryBlame}");
   });
 });
 

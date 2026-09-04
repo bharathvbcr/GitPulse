@@ -20,8 +20,25 @@ describe("PulseView honesty contracts", () => {
   });
 
   it("surfaces a partial language scan instead of a complete count", () => {
-    expect(source).toContain("langReport?.truncated");
+    // Two ways the headline count can be a floor rather than a total: the
+    // backend's own scan budget fired, or the repository changed after the
+    // measurement. Both must land in "partial" — a stale count rendered as
+    // "ok" is the same lie as a truncated one.
+    expect(source).toContain("snap.value.truncated === true || snap.stale !== null");
     expect(source).toContain('status: truncated ? "partial" : "ok"');
+  });
+
+  it("records a LOC history point only from a complete, current measurement", () => {
+    // A truncated or stale reading appended to the trend would draw a dip the
+    // repository never had.
+    expect(source).toContain(
+      "if (snap.value && snap.stale === null && snap.value.truncated !== true)",
+    );
+  });
+
+  it("shares one coverage measurement with CoverageViewer instead of scanning twice", () => {
+    expect(source).toContain("coverageMetric.subscribe(path,");
+    expect(source).not.toContain('invoke<CoverageReport>("cmd_scan_coverage"');
   });
 
   it("does not deepen a payload-capped walk", () => {

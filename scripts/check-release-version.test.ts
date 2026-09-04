@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   CRATE_NAME,
+  discoverPluginPackages,
   parseCargoLockVersion,
   parseCargoTomlVersion,
   parseTag,
@@ -37,8 +38,8 @@ async function runScript(args: string[]) {
 }
 
 /**
- * Build a synthetic repo root carrying all five version sources, so drift can
- * be seeded without ever touching the tracked tree.
+ * Build a synthetic repo root carrying all app and plugin version sources, so
+ * drift can be seeded without ever touching the tracked tree.
  */
 async function scratchTree(
   prefix: string,
@@ -49,6 +50,9 @@ async function scratchTree(
     tauri: string;
     cargoToml: string;
     cargoLock: string;
+    plugin: string;
+    pluginClaude: string;
+    pluginCodex: string;
   }> = {},
 ) {
   const base = "0.4.2";
@@ -59,11 +63,16 @@ async function scratchTree(
     tauri: base,
     cargoToml: base,
     cargoLock: base,
+    plugin: base,
+    pluginClaude: base,
+    pluginCodex: base,
     ...versions,
   };
   const dir = await mkdtemp(path.join(tmpdir(), `gitpulse-relver-${prefix}-`));
   tempDirs.push(dir);
   await mkdir(path.join(dir, "src-tauri"), { recursive: true });
+  await mkdir(path.join(dir, "plugins", "gitpulse", ".claude-plugin"), { recursive: true });
+  await mkdir(path.join(dir, "plugins", "gitpulse", ".codex-plugin"), { recursive: true });
 
   await writeFile(
     path.join(dir, "package.json"),
@@ -96,6 +105,18 @@ async function scratchTree(
     path.join(dir, "src-tauri", "Cargo.lock"),
     `version = 3\n\n[[package]]\nname = "serde"\nversion = "1.0.203"\n\n[[package]]\nname = "${CRATE_NAME}"\nversion = "${v.cargoLock}"\ndependencies = [\n "serde",\n]\n`,
   );
+  await writeFile(
+    path.join(dir, "plugins", "gitpulse", "plugin.json"),
+    JSON.stringify({ name: CRATE_NAME, version: v.plugin }, null, 2),
+  );
+  await writeFile(
+    path.join(dir, "plugins", "gitpulse", ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: CRATE_NAME, version: v.pluginClaude }, null, 2),
+  );
+  await writeFile(
+    path.join(dir, "plugins", "gitpulse", ".codex-plugin", "plugin.json"),
+    JSON.stringify({ name: CRATE_NAME, version: v.pluginCodex }, null, 2),
+  );
   return dir;
 }
 
@@ -111,6 +132,9 @@ describe("release version gate", () => {
       "src-tauri/tauri.conf.json",
       "src-tauri/Cargo.toml",
       `src-tauri/Cargo.lock (${CRATE_NAME})`,
+      "plugins/gitpulse/plugin.json",
+      "plugins/gitpulse/.claude-plugin/plugin.json",
+      "plugins/gitpulse/.codex-plugin/plugin.json",
     ]) {
       expect(stdout).toContain(label);
     }
@@ -146,6 +170,81 @@ describe("release version gate", () => {
     const { code, stdout } = await runScript(["--root", dir]);
     expect(code).toBe(1);
     expect(stdout).toMatch(/packages\[""\]\) = "0\.4\.1"/);
+  });
+
+  it("fails when the Agent Plugins manifest lags the app manifests", async () => {
+    // The shape found in the tree at v0.0.5: every build manifest had been
+    // bumped and the Agent Plugins package still advertised the prior version,
+    // so agents installed 0.0.4 metadata against an 0.0.5 binary.
+    const dir = await scratchTree("plugin-drift", { plugin: "0.4.1" });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/plugins\/gitpulse\/plugin\.json = "0\.4\.1"/);
+    expect(stdout).toMatch(/FAIL: release version gate violated/);
+  });
+
+  it("fails when the Claude Code plugin manifest drifts from the Agent Plugins one", async () => {
+    // Two manifests describing one package: whichever client reads the stale
+    // one records an install version the MCP handshake will not corroborate.
+    const dir = await scratchTree("plugin-claude-drift", { pluginClaude: "0.4.1" });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/plugins\/gitpulse\/\.claude-plugin\/plugin\.json = "0\.4\.1"/);
+  });
+
+  it("fails when the native Codex manifest drifts from the package", async () => {
+    const dir = await scratchTree("plugin-codex-drift", { pluginCodex: "0.4.1" });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/plugins\/gitpulse\/\.codex-plugin\/plugin\.json = "0\.4\.1"/);
+  });
+
+  it("reports a missing plugin manifest rather than passing on the remaining sources", async () => {
+    // Discovery must not turn a deleted manifest into "nothing to check":
+    // plugin.json is required per package for exactly this reason.
+    const dir = await scratchTree("plugin-missing");
+    await rm(path.join(dir, "plugins", "gitpulse", "plugin.json"));
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/unreadable: plugins\/gitpulse\/plugin\.json yielded no version/);
+  });
+
+  it("discovers a second package under plugins/ without being told about it", async () => {
+    // A newly added package must be covered the moment it exists.
+    const dir = await scratchTree("plugins-dir");
+    await mkdir(path.join(dir, "plugins", "extra", ".codex-plugin"), { recursive: true });
+    await writeFile(
+      path.join(dir, "plugins", "extra", "plugin.json"),
+      JSON.stringify({ name: CRATE_NAME, version: "0.4.2" }, null, 2),
+    );
+    await writeFile(
+      path.join(dir, "plugins", "extra", ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: CRATE_NAME, version: "0.4.1" }, null, 2),
+    );
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toContain("plugins/extra/plugin.json");
+    expect(stdout).toMatch(/plugins\/extra\/\.codex-plugin\/plugin\.json = "0\.4\.1"/);
+  });
+
+  it("requires plugin.json in a package directory that only carries client manifests", async () => {
+    const dir = await scratchTree("plugins-no-base");
+    await mkdir(path.join(dir, "plugins", "orphan", ".claude-plugin"), { recursive: true });
+    await writeFile(
+      path.join(dir, "plugins", "orphan", ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: CRATE_NAME, version: "0.4.2" }, null, 2),
+    );
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/unreadable: plugins\/orphan\/plugin\.json yielded no version/);
+  });
+
+  it("fails closed when the repo carries no plugin package at all", async () => {
+    const dir = await scratchTree("no-package");
+    await rm(path.join(dir, "plugins"), { recursive: true, force: true });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/no plugins\/<name>\/ package directory found/);
   });
 
   it("fails when the tag names a version the manifests do not carry", async () => {
@@ -185,6 +284,50 @@ describe("release version gate", () => {
     const { code, stdout } = await runScript(["--nope"]);
     expect(code).toBe(2);
     expect(stdout).toMatch(/unknown argument: --nope/);
+  });
+});
+
+describe("discoverPluginPackages", () => {
+  /**
+   * These build their own trees rather than reusing scratchTree: the walker's
+   * contract is "every plugins/<name>/", independent of which packages the
+   * repo happens to ship.
+   */
+  async function bareTree(prefix: string, dirs: string[]) {
+    const dir = await mkdtemp(path.join(tmpdir(), `gitpulse-discover-${prefix}-`));
+    tempDirs.push(dir);
+    for (const rel of dirs) await mkdir(path.join(dir, rel), { recursive: true });
+    return dir;
+  }
+
+  it("returns every plugins/<name>/ in a stable order", async () => {
+    const dir = await bareTree("order", ["plugins/beta", "plugins/alpha"]);
+    expect(discoverPluginPackages(dir).map((p: string) => path.relative(dir, p))).toEqual([
+      path.join("plugins", "alpha"),
+      path.join("plugins", "beta"),
+    ]);
+  });
+
+  it("does not resurrect the retired top-level plugin/ directory", async () => {
+    // The package moved to plugins/<name>/; a leftover plugin/ on someone's
+    // disk must not be picked up as a second package and gate the release.
+    const dir = await bareTree("retired", ["plugin", "plugins/gitpulse"]);
+    expect(discoverPluginPackages(dir).map((p: string) => path.relative(dir, p))).toEqual([
+      path.join("plugins", "gitpulse"),
+    ]);
+  });
+
+  it("ignores loose files beside the packages", async () => {
+    const dir = await bareTree("files", ["plugins/gitpulse"]);
+    await writeFile(path.join(dir, "plugins", "README.md"), "not a package");
+    expect(discoverPluginPackages(dir).map((p: string) => path.relative(dir, p))).toEqual([
+      path.join("plugins", "gitpulse"),
+    ]);
+  });
+
+  it("returns an empty list for a tree with no packages, rather than throwing", async () => {
+    const dir = await bareTree("none", ["src"]);
+    expect(discoverPluginPackages(dir)).toEqual([]);
   });
 });
 

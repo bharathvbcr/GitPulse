@@ -108,7 +108,11 @@ describe("WorkView", () => {
 
   it("opens the stuck worktree, not the first one on the row", () => {
     expect(source).toContain("openPathFor(row)");
-    expect(source).toContain('binding.operation ? "conflict" : "diff"');
+    // A parked operation still goes to Resolve — a section of Work now, so
+    // it switches section without leaving the view the row was clicked in.
+    // Anything else lands on the working-tree diff, a section of History.
+    expect(source).toContain('if (binding.operation) repoStore.setViewSection("work", "resolve")');
+    expect(source).toContain('repoStore.setActiveTab("history", "diff")');
   });
 
   it("refreshes when repository status generation changes", () => {

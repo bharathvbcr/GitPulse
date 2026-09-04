@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   annotateRange,
   classifyMetaLine,
@@ -240,7 +241,7 @@ describe("parseUnifiedDiff + annotateRange stress: 200-line document", () => {
     const annotated = annotateRange(parsed, 0, parsed.length);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(2_000);
+    expectWithinBudget(elapsedMs, 400, "wordDiff stress");
     const dels = annotated.filter((l) => l.type === "del");
     const adds = annotated.filter((l) => l.type === "add");
     expect(dels).toHaveLength(29);
@@ -251,7 +252,7 @@ describe("parseUnifiedDiff + annotateRange stress: 200-line document", () => {
     for (const add of adds) {
       expect(add.segments?.length).toBeGreaterThan(0);
     }
-  });
+  }, STRESS_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------
@@ -391,8 +392,8 @@ describe("parseUnifiedDiff stress: performance bounds", () => {
     console.timeEnd("parseUnifiedDiff:1MB-line");
     expect(rows).toHaveLength(1);
     expect(rows[0].type).toBe("add");
-    expect(elapsedMs).toBeLessThan(2_000);
-  });
+    expectWithinBudget(elapsedMs, 400, "wordDiff stress");
+  }, STRESS_TIMEOUT_MS);
 
   it("parses a 50k-line payload in under 3000ms", () => {
     const lines: string[] = ["@@ -1,25000 +1,25000 @@"];
@@ -405,8 +406,8 @@ describe("parseUnifiedDiff stress: performance bounds", () => {
     const elapsedMs = performance.now() - startedAt;
     expect(rows).toHaveLength(50_001);
     expect(rows.filter((r) => r.type === "add")).toHaveLength(25_000);
-    expect(elapsedMs).toBeLessThan(3_000);
-  });
+    expectWithinBudget(elapsedMs, 600, "wordDiff pathological");
+  }, STRESS_TIMEOUT_MS);
 });
 
 describe("parseUnifiedDiff stress: --- / +++ inside hunk bodies", () => {

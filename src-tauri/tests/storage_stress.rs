@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-use gitpulse_lib::storage::scan_storage;
+use gitpulse_lib::storage::{scan_storage, ReclaimConfidence, ReclaimSafety};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -698,4 +698,228 @@ fn runaway_recursive_project_nesting_is_pruned() {
         "runaway directory cycle must trigger truncation"
     );
     assert!(report.totals.worktree_bytes >= 1_000);
+}
+
+// ─── Reclaim audit ────────────────────────────────────────────────────────
+//
+// The audit's whole value is that its bottom line can be trusted, so these
+// pin the accounting rules rather than any particular byte figure.
+
+fn ignore(repo: &TempRepo, body: &str) {
+    fs::write(repo.root.join(".gitignore"), body).unwrap();
+}
+
+/// A build directory with nothing committed in it is measured, safe, and
+/// counted toward the headline.
+#[test]
+fn reclaim_counts_a_clean_build_directory_as_recoverable() {
+    let repo = TempRepo::new();
+    ignore(&repo, "target/\n");
+    repo.write("target/debug/blob.bin", 200_000);
+    repo.write("src/main.rs", 64);
+    repo.commit_all("seed");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    let item = report
+        .reclaim
+        .iter()
+        .find(|i| i.label.starts_with("target"))
+        .expect("the build directory must appear in the audit");
+    assert_eq!(item.confidence, ReclaimConfidence::Measured);
+    assert_eq!(item.safety, ReclaimSafety::Safe);
+    assert!(item.bytes >= 200_000, "bytes = {}", item.bytes);
+    assert!(item.blocked_reason.is_none());
+    assert!(
+        report.reclaim_summary.reclaimable_bytes >= 200_000,
+        "a measured, safe item must reach the headline: {:?}",
+        report.reclaim_summary
+    );
+}
+
+/// THE ACCOUNTING RULE: the headline counts measured *and* safe bytes only.
+///
+/// Committed build output is measured but not safe — deleting it is a commit.
+/// Folding it into "reclaimable" would promise space the user can only have by
+/// losing tracked content.
+#[test]
+fn committed_build_output_is_not_counted_as_reclaimable() {
+    let repo = TempRepo::new();
+    repo.write("dist/bundle.js", 150_000);
+    repo.commit_all("commit the build output");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    let item = report
+        .reclaim
+        .iter()
+        .find(|i| i.label.starts_with("dist"))
+        .expect("a committed build directory is still audited");
+    assert_eq!(item.safety, ReclaimSafety::NeedsReview);
+    assert!(
+        item.blocked_reason.is_some(),
+        "a blocked item must say what blocks it"
+    );
+    assert_eq!(
+        report.reclaim_summary.reclaimable_bytes, 0,
+        "tracked content must never be promised as free space"
+    );
+    assert!(report.reclaim_summary.needs_review_bytes >= 150_000);
+}
+
+/// Every item lands in exactly one bucket of the summary.
+#[test]
+fn the_summary_partitions_every_item_exactly_once() {
+    let repo = TempRepo::new();
+    ignore(&repo, "target/\nnode_modules/\n");
+    repo.write("target/a.bin", 120_000);
+    repo.write("node_modules/pkg/b.bin", 90_000);
+    repo.write("src/main.rs", 64);
+    repo.commit_all("seed");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    let summary = &report.reclaim_summary;
+    assert_eq!(summary.item_count, report.reclaim.len());
+
+    let mut measured_safe = 0u64;
+    let mut estimated = 0u64;
+    let mut review = 0u64;
+    for item in &report.reclaim {
+        match (item.confidence, item.safety) {
+            (ReclaimConfidence::Measured, ReclaimSafety::Safe) => measured_safe += item.bytes,
+            (ReclaimConfidence::Estimated, _) => estimated += item.bytes,
+            (ReclaimConfidence::Measured, ReclaimSafety::NeedsReview) => review += item.bytes,
+        }
+    }
+    assert_eq!(summary.reclaimable_bytes, measured_safe);
+    assert_eq!(summary.estimated_bytes, estimated);
+    assert_eq!(summary.needs_review_bytes, review);
+}
+
+/// Every row must carry an action; a row the user cannot act on is noise.
+#[test]
+fn every_reclaim_item_states_an_action_and_a_reason() {
+    let repo = TempRepo::new();
+    ignore(&repo, "target/\n");
+    repo.write("target/big.bin", 300_000);
+    repo.write("data/huge.bin", 11 * 1024 * 1024);
+    repo.commit_all("seed");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    assert!(!report.reclaim.is_empty());
+    for item in &report.reclaim {
+        assert!(
+            !item.action.trim().is_empty(),
+            "{:?} has no action",
+            item.label
+        );
+        assert!(
+            !item.detail.trim().is_empty(),
+            "{:?} has no reason",
+            item.label
+        );
+        assert!(!item.label.trim().is_empty());
+    }
+}
+
+/// Rows are largest-first with a stable tiebreak, so two scans of an unchanged
+/// repository produce byte-identical reports.
+#[test]
+fn reclaim_ordering_is_deterministic_and_largest_first() {
+    let repo = TempRepo::new();
+    ignore(&repo, "target/\nnode_modules/\n.cache/\n");
+    repo.write("target/a.bin", 300_000);
+    repo.write("node_modules/b.bin", 200_000);
+    repo.write(".cache/c.bin", 100_000);
+    repo.write("src/main.rs", 64);
+    repo.commit_all("seed");
+
+    let path = repo.root.to_str().unwrap();
+    let first = scan_storage(path).expect("scan ok");
+    let second = scan_storage(path).expect("rescan ok");
+
+    let labels: Vec<&str> = first.reclaim.iter().map(|i| i.label.as_str()).collect();
+    let again: Vec<&str> = second.reclaim.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels, again,
+        "an unchanged repository must audit identically"
+    );
+
+    for pair in first.reclaim.windows(2) {
+        assert!(
+            pair[0].bytes >= pair[1].bytes,
+            "{} ({}) sorted before {} ({})",
+            pair[0].label,
+            pair[0].bytes,
+            pair[1].label,
+            pair[1].bytes
+        );
+    }
+}
+
+/// The audit's partial flag must track the scan's: a truncated walk produces a
+/// sample, and its total is a floor.
+#[test]
+fn the_audit_partial_flag_tracks_the_scan() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 64);
+    repo.commit_all("seed");
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    assert_eq!(report.reclaim_summary.partial, report.scan.truncated);
+}
+
+/// A repository with nothing to clean must produce an empty audit rather than
+/// invented busywork.
+#[test]
+fn a_clean_repository_has_an_empty_audit() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 64);
+    repo.write("README.md", 32);
+    repo.commit_all("seed");
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    assert!(
+        report.reclaim.is_empty(),
+        "nothing to reclaim, but got {:?}",
+        report.reclaim.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+    assert_eq!(report.reclaim_summary.reclaimable_bytes, 0);
+    assert_eq!(report.reclaim_summary.item_count, 0);
+}
+
+/// THE NEW DETECTION: a worktree deleted with `rm -rf` leaves admin state in
+/// `.git/worktrees` that nothing in the previous report noticed —
+/// `worktrees_admin_bytes` counted the space and attributed it to a live
+/// worktree.
+#[test]
+fn an_orphaned_worktree_admin_directory_is_found_and_prunable() {
+    let repo = TempRepo::new();
+    repo.write("src/main.rs", 64);
+    repo.commit_all("seed");
+
+    let linked = repo.root.parent().unwrap().join("gone-worktree");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        linked.to_str().unwrap(),
+        "-b",
+        "side",
+    ]);
+    // Delete the checkout the way a user in a hurry does, leaving the admin
+    // directory behind.
+    fs::remove_dir_all(&linked).unwrap();
+
+    let report = scan_storage(repo.root.to_str().unwrap()).expect("scan ok");
+    let item = report
+        .reclaim
+        .iter()
+        .find(|i| i.label.starts_with(".git/worktrees/"))
+        .unwrap_or_else(|| {
+            panic!(
+                "orphaned worktree admin not audited; rows: {:?}",
+                report.reclaim.iter().map(|i| &i.label).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(item.safety, ReclaimSafety::Safe);
+    assert_eq!(item.confidence, ReclaimConfidence::Measured);
+    assert_eq!(item.action, "git worktree prune");
 }

@@ -997,6 +997,238 @@ mod tests {
         }
     }
 
+    /// A loopback model server that answers one `/chat/completions` and hands
+    /// the request body back, so a test can assert what was actually sent.
+    ///
+    /// Real socket, real HTTP, real JSON: the transport is part of what these
+    /// tests exist to cover, and a mocked `complete()` would prove nothing
+    /// about the request the model server receives.
+    fn fake_model_server(content: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": { "content": content },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 7 },
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read headers, then exactly Content-Length bytes of body.
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            while !raw.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => raw.push(byte[0]),
+                    _ => return,
+                }
+            }
+            let head = String::from_utf8_lossy(&raw).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut payload = vec![0u8; length];
+            if stream.read_exact(&mut payload).is_err() {
+                return;
+            }
+            let _ = tx.send(String::from_utf8_lossy(&payload).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    /// A repository with one staged change, which is what the commit-message
+    /// feature requires before it will say anything at all.
+    fn repo_with_staged_change() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("git runs");
+        };
+        run(&["init", "-b", "main"]);
+        std::fs::write(dir.path().join("seed.txt"), "seed\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "chore: seed"]);
+        std::fs::write(dir.path().join("README.md"), "# hello\n").unwrap();
+        run(&["add", "README.md"]);
+        dir
+    }
+
+    fn probing_selection(base_url: String) -> (AiSelection, Hits) {
+        let hits = install_fake_probe(Ok(ProbeResult {
+            context_window: 8192,
+            describe: "fake probe".into(),
+            ..Default::default()
+        }));
+        (
+            AiSelection {
+                base_url,
+                model: "test-model".into(),
+            },
+            hits,
+        )
+    }
+
+    /// The whole pipeline with NO harness installed — which is the ordinary
+    /// case for a user who has never run MANVI, and was covered by nothing:
+    /// `local_ai_live.rs` needs a real model server and is opt-in, so in CI
+    /// every one of these five entry points was exercised by no test at all.
+    #[test]
+    fn generate_commit_message_runs_end_to_end_and_admits_the_harness_did_not() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+
+        let repo = repo_with_staged_change();
+        let (base_url, requests) = fake_model_server("feat: add a readme");
+        let (selection, _hits) = probing_selection(base_url);
+
+        let generation = generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
+            .expect("generation succeeds without a harness");
+
+        assert_eq!(generation.text, "feat: add a readme");
+        assert_eq!(generation.prompt_tokens, 11);
+        assert_eq!(generation.completion_tokens, 7);
+
+        // The harness could not be asked. Degrading is correct; degrading
+        // SILENTLY is not — an unparsed reply must never read like a parsed
+        // one, so the absence has to reach the caller as a warning.
+        assert!(
+            generation
+                .warnings
+                .iter()
+                .any(|w| w.contains("parsed locally rather than by the harness")),
+            "no warning that the harness never ran: {:?}",
+            generation.warnings
+        );
+
+        // The staged change must actually reach the model, or the feature is
+        // describing nothing.
+        let sent = requests.recv_timeout(TEST_WAIT).expect("request captured");
+        assert!(sent.contains("README.md"), "diff not sent: {sent}");
+        assert!(sent.contains("test-model"), "model not sent: {sent}");
+    }
+
+    #[test]
+    fn commit_message_refuses_to_invent_one_for_an_empty_stage() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+
+        // Nothing staged: the feature must refuse rather than ask a model to
+        // describe a change that does not exist.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        let error = generate_commit_message(
+            &dir.path().to_string_lossy(),
+            Some(AiSelection {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "unused".into(),
+            }),
+        )
+        .expect_err("empty stage must refuse");
+        assert!(error.contains("Nothing is staged"), "{error}");
+    }
+
+    #[test]
+    fn suggest_branch_name_and_explain_commit_reach_the_model() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+
+        let repo = repo_with_staged_change();
+        let root = repo.path().to_string_lossy().to_string();
+
+        let (base_url, requests) = fake_model_server("add-readme");
+        let (selection, _hits) = probing_selection(base_url);
+        let branch =
+            suggest_branch_name(&root, Some(selection)).expect("branch suggestion succeeds");
+        assert!(!branch.text.is_empty(), "empty branch name");
+        let sent = requests.recv_timeout(TEST_WAIT).expect("request captured");
+        // `working_diff` folds staged and unstaged together, so the change in
+        // flight has to reach the model or the name describes nothing.
+        assert!(sent.contains("README.md"), "diff not sent: {sent}");
+
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .expect("rev-parse runs")
+                .stdout,
+        )
+        .expect("utf8 oid")
+        .trim()
+        .to_string();
+        let (base_url, requests) = fake_model_server("This commit seeds the repository.");
+        let (selection, _hits) = probing_selection(base_url);
+        let explained = explain_commit(&root, &head, Some(selection)).expect("explain succeeds");
+        assert!(explained.text.contains("seeds the repository"));
+        assert!(requests.recv_timeout(TEST_WAIT).is_ok(), "no request sent");
+    }
+
+    /// Generous: it bounds a hang, it does not measure speed.
+    const TEST_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Forces "no harness installed" for the duration of a test.
+    ///
+    /// Without this the outcome depends on whether a real `manvi` happens to
+    /// be on the developer's PATH: on this machine one is, so the first run of
+    /// these tests silently exercised the harness-present path and asserted
+    /// nothing about the degraded one. A test whose meaning changes with the
+    /// machine is the same defect as a check that quietly does not run.
+    struct NoHarness(crate::harness::sidecar::SidecarTestGuard);
+    impl NoHarness {
+        fn install() -> Self {
+            let guard = crate::harness::sidecar::test_serial();
+            crate::harness::sidecar::set_test_binary(
+                &guard,
+                Some("/nonexistent/gitpulse-test/manvi".into()),
+            );
+            crate::harness::sidecar::reset();
+            Self(guard)
+        }
+    }
+    impl Drop for NoHarness {
+        fn drop(&mut self) {
+            crate::harness::sidecar::set_test_binary(&self.0, None);
+            crate::harness::sidecar::reset();
+        }
+    }
+
     #[test]
     fn positive_probe_is_served_from_cache_within_ttl() {
         let _serial = PROBE_TEST_LOCK

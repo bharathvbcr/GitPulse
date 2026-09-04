@@ -229,6 +229,7 @@
   import { onDestroy } from "svelte";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "@tauri-apps/api/core";
   import type { GrantView } from "../grants/types";
@@ -244,6 +245,7 @@
     type ScanResult,
   } from "../ai/scan";
   import { formatError } from "../ui/formatError";
+  import { manviSectionId } from "../ui/manviFocus";
   import { beginGeneration } from "../async/guard";
   import {
     harnessPermissionMode,
@@ -366,11 +368,36 @@
   let orderedGrants = $derived((grants?.grants ?? []).slice().reverse());
   let activeGrantCount = $derived(selectActiveGrants(grants?.grants ?? [], grantClock).length);
 
-  type CapabilityTab = "health" | "coverage" | "terminal" | "github";
+  /**
+   * The surfaces this pane links to, as (view, section) pairs.
+   *
+   * Health and Coverage stopped being views of their own — they are scans of
+   * the repository, and they live in Insights beside Pulse and Storage. The
+   * pair is what a link needs now: the view alone would land on Insights'
+   * default section, which is not the capability the button names.
+   */
+  const CAPABILITY_TARGETS = {
+    health: { tab: "insights", section: "health" },
+    coverage: { tab: "insights", section: "coverage" },
+    github: { tab: "work", section: "remote" },
+  } as const;
+
+  type CapabilityTab = keyof typeof CAPABILITY_TARGETS;
 
   function openCapability(tab: CapabilityTab) {
     if (!$repoStore.currentPath) return;
-    repoStore.setActiveTab(tab);
+    const target = CAPABILITY_TARGETS[tab];
+    repoStore.setActiveTab(target.tab, target.section);
+  }
+
+  /**
+   * The terminal is a dock, not a view, so it opens *over* whatever is on
+   * screen instead of navigating away from this pane — which is the point:
+   * the grant list stays readable while the shell it describes is running.
+   */
+  function openTerminal() {
+    if (!$repoStore.currentPath) return;
+    interfaceStore.setTerminalDockOpen(true);
   }
 
   function actionTime(ts: number): string {
@@ -498,7 +525,7 @@
 
 <div class="space-y-4">
   <!-- Harness -->
-  <section class="gp-card p-4 space-y-2">
+  <section id={manviSectionId("harness")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between gap-2">
       <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">MANVI harness</h3>
       <button
@@ -628,8 +655,8 @@
       <button
         class="gp-btn justify-start"
         disabled={!$repoStore.currentPath}
-        onclick={() => openCapability("terminal")}
-        title="Open the user-owned shell and bounded console"
+        onclick={openTerminal}
+        title="Show the user-owned shell and bounded console in the dock below"
       >
         <SquareTerminal size={12} /> Terminal
       </button>
@@ -645,7 +672,7 @@
   </section>
 
   <!-- Model servers -->
-  <section class="gp-card p-4 space-y-2">
+  <section id={manviSectionId("model")} tabindex="-1" class="gp-card p-4 space-y-2">
     <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Local model servers</h3>
     {#if ai}
       <!--
@@ -910,7 +937,7 @@
   {/if}
 
   <!-- Agent activity journal -->
-  <section class="gp-card p-4 space-y-2">
+  <section id={manviSectionId("activity")} tabindex="-1" class="gp-card p-4 space-y-2">
     <div class="flex items-center justify-between">
       <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted flex items-center gap-1.5">
         <History size={11} />

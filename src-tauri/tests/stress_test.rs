@@ -366,6 +366,145 @@ fn test_large_file_loc_analyzer() {
     assert_eq!(counts.code_lines, 10_000);
 }
 
+/// Adversarial line counting: inputs built to break the scanner's state
+/// machine rather than to be counted correctly.
+///
+/// The counter carries state across lines (block-comment depth, open strings),
+/// which is exactly what makes it correct and exactly what makes it attackable.
+/// Every case here is a shape that could make it loop, panic, slice a
+/// multi-byte character, or silently reclassify the rest of a file.
+#[test]
+fn loc_counter_survives_adversarial_content() {
+    use gitpulse_lib::analyzer::LocCounter;
+
+    let cases: Vec<(&str, String)> = vec![
+        ("empty", String::new()),
+        ("only newlines", "\n".repeat(50_000)),
+        ("no trailing newline", "fn a() {}".to_string()),
+        ("lone carriage returns", "a\rb\rc".to_string()),
+        ("mixed line endings", "a\r\nb\nc\r\n".to_string()),
+        ("one enormous line", "x".repeat(1_000_000)),
+        // An unterminated block comment must not loop; the rest stays comment.
+        ("unterminated block", format!("/*{}", "a".repeat(100_000))),
+        // Alternating open/close hammers the depth counter both ways.
+        ("nesting churn", "/*/**/".repeat(20_000)),
+        // Deep nesting past the cap must saturate, never overflow.
+        ("deep nesting", "/*".repeat(200_000)),
+        // An unterminated string on every line: the single-line reset is what
+        // stops this turning the whole file into one literal.
+        ("quote storm", "let s = \"unclosed\n".repeat(20_000)),
+        // A closing delimiter with nothing open.
+        ("orphan close", "*/\n".repeat(20_000)),
+        // Delimiters split across a line boundary must not join up.
+        ("split delimiter", "/\n*\n".repeat(20_000)),
+        // Multi-byte content beside every delimiter: the scanner walks bytes,
+        // so a naive slice here would panic on a char boundary.
+        ("multibyte soup", "日本//語/*テ*/ス\"ト\"\n".repeat(20_000)),
+        ("emoji", "🙂// 🙃\n/* 🙂 */\n".repeat(10_000)),
+        // Control bytes inside otherwise valid UTF-8.
+        ("control bytes", "a\u{0}b\n\u{7}// c\n".repeat(10_000)),
+        // A trailing backslash must not let the escape read past end of line.
+        ("trailing escape", "let s = \"a\\\n".repeat(20_000)),
+        ("bom only", "\u{feff}".to_string()),
+        (
+            "bom then comments",
+            format!("\u{feff}{}", "// c\n".repeat(10_000)),
+        ),
+        // Every delimiter this table knows, interleaved.
+        (
+            "delimiter salad",
+            "//#--;%!<!--/*(*{-#|;;*)-}*/-->\n".repeat(10_000),
+        ),
+    ];
+
+    // Every language, because the syntax table picks different delimiters and a
+    // panic in any one of them aborts a whole language-stats scan.
+    let languages = [
+        "Rust",
+        "C",
+        "C++",
+        "Python",
+        "JavaScript",
+        "TypeScript",
+        "Go",
+        "YAML",
+        "HTML",
+        "CSS",
+        "SQL",
+        "Lua",
+        "Haskell",
+        "Clojure",
+        "OCaml",
+        "Ruby",
+        "Julia",
+        "Elixir",
+        "Erlang",
+        "WebAssembly",
+        "Batchfile",
+        "PHP",
+        "Shell",
+        "JSON",
+        "Markdown",
+        "Svelte",
+        "D",
+        "Fortran",
+    ];
+
+    for (label, content) in &cases {
+        // Counted after the byte-order mark, because the counter strips it
+        // first: a BOM is an encoding marker, not content. This matters only
+        // for the degenerate BOM-only file, where `str::lines()` reports one
+        // line and the counter — correctly — reports none. Every other input
+        // sees the two agree, so this still catches a lost or invented line.
+        let expected_lines = content
+            .strip_prefix('\u{feff}')
+            .unwrap_or(content)
+            .lines()
+            .count();
+        for lang in languages {
+            let counts = LocCounter::count_for_language(content, lang);
+            // The one invariant that must hold for every input: each line is
+            // counted exactly once, in exactly one bucket.
+            assert_eq!(
+                counts.code_lines + counts.comment_lines + counts.blank_lines,
+                counts.total_lines,
+                "{lang} did not partition lines for {label}"
+            );
+            assert_eq!(
+                counts.total_lines, expected_lines,
+                "{lang} lost or invented lines for {label}"
+            );
+        }
+    }
+}
+
+/// An unbalanced quote must not change how anything after it is counted.
+///
+/// This is the bound that makes single-line strings reset at end of line. Its
+/// absence is not a crash — it is a file where every comment below a stray
+/// apostrophe silently becomes code.
+#[test]
+fn an_unbalanced_quote_cannot_change_the_rest_of_a_file() {
+    use gitpulse_lib::analyzer::LocCounter;
+
+    let tail = "# a real comment\nkey: value\n# another comment\n";
+    let clean = LocCounter::count_for_language(tail, "YAML");
+    assert_eq!(clean.comment_lines, 2, "fixture sanity");
+
+    for prefix in [
+        "name: it's fine\n",
+        "quote: \"unclosed\n",
+        "both: \"it's\n",
+        "apostrophes: don't won't can't\n",
+    ] {
+        let combined = LocCounter::count_for_language(&format!("{prefix}{tail}"), "YAML");
+        assert_eq!(
+            combined.comment_lines, clean.comment_lines,
+            "prefix {prefix:?} leaked string state into the rest of the file"
+        );
+    }
+}
+
 #[test]
 fn test_ref_name_injection_adversarial_suite() {
     use gitpulse_lib::engine::git_writer::{

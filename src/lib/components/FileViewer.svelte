@@ -344,10 +344,19 @@
     }
   }
 
-  function inspectIn(tab: "diff" | "blame") {
+  /**
+   * Open the current file under another lens.
+   *
+   * Both are sections now, so neither button leaves the subject behind:
+   * Blame is a lens on this same file inside Code, and Diff is a lens on the
+   * repository's history. Selecting the path first is what makes the switch
+   * land on the file the user is looking at rather than the last one.
+   */
+  function inspectIn(lens: "diff" | "blame") {
     if (!activeTabPath) return;
     repoStore.selectFilePath(activeTabPath);
-    repoStore.setActiveTab(tab);
+    if (lens === "diff") repoStore.setActiveTab("history", "diff");
+    else repoStore.setViewSection("code", "blame");
   }
 
   function toggleSidePane(pane: FileSidePane) {

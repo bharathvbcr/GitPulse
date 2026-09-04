@@ -54,9 +54,14 @@ describe("ManviHarnessPane capability truth", () => {
   });
 
   it("links the actual health, coverage, terminal and CI surfaces", () => {
-    for (const tab of ["health", "coverage", "terminal", "github"]) {
+    for (const tab of ["health", "coverage", "github"]) {
       expect(source).toContain(`openCapability("${tab}")`);
     }
+    // The terminal is a dock, not a view, so its button opens it over this
+    // pane instead of navigating away — the grant list stays readable while
+    // the shell it describes runs. Still a real link, just not a tab switch.
+    expect(source).toContain("onclick={openTerminal}");
+    expect(source).toContain("interfaceStore.setTerminalDockOpen(true)");
     expect(source).toContain("cargo-llvm-cov");
     expect(source).toContain("several minutes");
   });

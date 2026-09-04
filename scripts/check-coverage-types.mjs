@@ -138,6 +138,12 @@ export const CONTRACTS = Object.freeze([
     "CollisionParty", "CollisionItem", "CollisionRisk", "InsightsSnapshot",
     "ChangedFile", "ActiveChanges", "ChangeContext", "McpToolInfo", "McpInfo",
   ] },
+  // The Fleet grid's two wire surfaces. The metrics row is the one that must
+  // not drift: every field is nullable ON PURPOSE — a null value with a null
+  // timestamp is "never scanned", and a field that silently became
+  // non-optional would render that as a measured zero on every row.
+  { label: "fleet", rustPath: rust("insights", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetRepoFacet", "FleetSnapshot"] },
+  { label: "fleet-metrics", rustPath: rust("ledger", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetMetrics", "FleetMetricsInput"] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
   { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Release version gate — the five manifests that carry a version must agree,
+ * Release version gate — the seven manifests that carry a version must agree,
  * and (when a tag is supplied) the tag must name that same version.
  *
  * Nothing else in the repo owns this invariant, and every part of the release
@@ -12,6 +12,20 @@
  *   - src-tauri/Cargo.toml    -> the compiled crate version
  *   - src-tauri/Cargo.lock    -> must track Cargo.toml or `--locked` builds fail
  *   - package.json / -lock.json -> `npm ci` fails outright when these disagree
+ *   - every plugin manifest   -> the version an agent client reads out of the
+ *                                package, and records at install time
+ *
+ * The plugin manifests are the reason this list grew: the MCP binary answers
+ * `initialize` with the *crate* version, so a stale plugin manifest makes a
+ * client's installed-version record disagree with the server that client is
+ * talking to, with nothing in the handshake to reveal it.
+ *
+ * Those manifests are DISCOVERED, not listed. One package is published to
+ * several agent clients that each want their own manifest file
+ * (`plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`),
+ * and the set grows whenever a client is added. A hand-maintained list would
+ * silently stop covering the newest one — which is the manifest most likely to
+ * be wrong.
  *
  * So a tag pushed against a stale manifest produces a release *tagged* v0.0.2
  * whose assets are all 0.0.1 — a silent, published-artifact-level wrong answer
@@ -29,8 +43,11 @@
  *   --tauri-conf <path>  alternate tauri.conf.json
  *   --cargo-toml <path>  alternate Cargo.toml
  *   --cargo-lock <path>  alternate Cargo.lock
+ *
+ * Plugin manifests are found under <root>/plugins/<name>, so --root moves them
+ * along with everything else.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
@@ -51,6 +68,9 @@ export function defaultSources(root) {
     tauriConfPath: path.join(root, "src-tauri", "tauri.conf.json"),
     cargoTomlPath: path.join(root, "src-tauri", "Cargo.toml"),
     cargoLockPath: path.join(root, "src-tauri", "Cargo.lock"),
+    // Discovery needs the root itself; the plugin manifests are not a fixed
+    // set of paths.
+    root,
   };
 }
 
@@ -120,6 +140,49 @@ export function parseCargoLockVersion(source, crate) {
   return null;
 }
 
+/** @param {string} dir */
+function isDirectory(dir) {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every directory under `plugins/` that is an agent-plugin package.
+ *
+ * @param {string} root
+ * @returns {string[]} absolute directories, stable order
+ */
+export function discoverPluginPackages(root) {
+  /** @type {string[]} */
+  const packages = [];
+  const nested = path.join(root, "plugins");
+  if (isDirectory(nested)) {
+    for (const name of readdirSync(nested).sort()) {
+      const dir = path.join(nested, name);
+      if (isDirectory(dir)) packages.push(dir);
+    }
+  }
+  return packages;
+}
+
+/**
+ * The per-client manifest names inside one package directory.
+ *
+ * `plugin.json` is required — it is the manifest every client falls back to,
+ * and a package without one is a packaging error rather than a version one.
+ * The dot-directory manifests are optional, because which clients a package
+ * targets is a choice; whichever are present must still agree.
+ */
+export const REQUIRED_PLUGIN_MANIFEST = "plugin.json";
+export const OPTIONAL_PLUGIN_MANIFESTS = Object.freeze([
+  path.join(".claude-plugin", "plugin.json"),
+  path.join(".codex-plugin", "plugin.json"),
+  path.join(".agents", "plugin.json"),
+]);
+
 /**
  * @param {string} filePath
  * @returns {unknown}
@@ -181,6 +244,35 @@ export function collectVersions(sources) {
   add(`src-tauri/Cargo.lock (${CRATE_NAME})`, sources.cargoLockPath, () =>
     parseCargoLockVersion(readFileSync(sources.cargoLockPath, "utf8"), CRATE_NAME),
   );
+  // Plugin manifests are separate files for separate clients, so each is read
+  // on its own; a shared reader would hide one lagging the others.
+  const packages = discoverPluginPackages(sources.root);
+  if (packages.length === 0) {
+    found.push({
+      label: "plugin package",
+      file: sources.root,
+      version: null,
+      error: "no plugins/<name>/ package directory found",
+    });
+  }
+  for (const dir of packages) {
+    const rel = (/** @type {string} */ file) => path.relative(sources.root, file).split(path.sep).join("/");
+    const required = path.join(dir, REQUIRED_PLUGIN_MANIFEST);
+    // Required, so absence is a violation rather than something discovery
+    // quietly skips — a deleted manifest must not read as "nothing to check".
+    add(rel(required), required, () => {
+      const manifest = /** @type {{ version?: unknown }} */ (readJson(required));
+      return typeof manifest.version === "string" ? manifest.version : null;
+    });
+    for (const name of OPTIONAL_PLUGIN_MANIFESTS) {
+      const file = path.join(dir, name);
+      if (!existsSync(file)) continue;
+      add(rel(file), file, () => {
+        const manifest = /** @type {{ version?: unknown }} */ (readJson(file));
+        return typeof manifest.version === "string" ? manifest.version : null;
+      });
+    }
+  }
 
   return found;
 }

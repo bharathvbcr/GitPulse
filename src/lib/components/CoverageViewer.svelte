@@ -38,6 +38,7 @@
   import { formatError } from "../ui/formatError";
   import { diagnostics } from "../diagnostics/diagnostics";
   import { reportPanelError } from "../diagnostics/report";
+  import { coverageMetric } from "../metrics/repoMetrics";
   import {
     coverageBarColor,
     coverageHitClass,
@@ -95,6 +96,9 @@
   let scanTruncated = $state(false);
   let reportVersion = $state(0);
   let scanInflight: AsyncGuard | null = null;
+  /** Measurement time of the report currently applied, so a revalidation
+   *  triggered by the watcher is adopted exactly once. */
+  let appliedMeasurementAt: number | null = null;
   let reportCopied = $state(false);
   let reportCopyTimer: number | null = null;
 
@@ -105,41 +109,71 @@
     return guard;
   }
 
+  /**
+   * Adopts a measured report into the panel: selection, gutter invalidation
+   * and the local cache.
+   *
+   * Split out because a report now reaches this panel two ways — a scan it
+   * started, and a revalidation the file watcher triggered — and both must
+   * land identically. `measuredAt` is recorded so the subscription can tell a
+   * measurement it has already applied from a genuinely new one.
+   */
+  function applyReport(repo: string, next: CoverageReport, measuredAt: number | null) {
+    appliedMeasurementAt = measuredAt;
+    const prev = report;
+    report = next;
+    reportCache.set(repo, next);
+    // Case-insensitive on purpose: the backend folds case when serving
+    // detail lookups, so a path differing only in case from the artifact's
+    // recorded form must not be reset to files[0].
+    const wanted = selectedPath;
+    const retained =
+      wanted !== null && next.files.some((f) => f.path.toLowerCase() === wanted.toLowerCase());
+    if (!retained) {
+      const first = next.files[0]?.path ?? null;
+      selectedPath = first;
+      // The auto-pick is a real selection: echo it into the per-repo session
+      // store so persistence and the other views agree on what is showing.
+      if (first) repoStore.selectFilePath(first);
+    }
+    // Only invalidate gutters when the selected file's coverage actually
+    // changed: plans/scripts call rescan() after every step, and bumping
+    // unconditionally re-ran the gutter fetch behind a full-pane
+    // "Loading …" swap even when nothing moved.
+    const nextEntry = selectedPath ? next.files.find((f) => f.path === selectedPath) : undefined;
+    const prevEntry =
+      prev && selectedPath ? prev.files.find((f) => f.path === selectedPath) : undefined;
+    if (!prevEntry || !nextEntry || !sameCoverageSummary(prevEntry, nextEntry)) {
+      reportVersion += 1;
+    }
+  }
+
+  /**
+   * Runs a coverage measurement and applies it.
+   *
+   * The scan itself now belongs to the shared `coverageMetric`: this component
+   * and `PulseView` used to invoke `cmd_scan_coverage` independently, keep
+   * separate caches, and could show different numbers for the same repository.
+   * `force` because every caller here is an explicit action — opening the
+   * repository, pressing Rescan, or finishing a generate step — and each must
+   * measure the tree as it is now rather than join a scan that started before
+   * the command ran.
+   */
   async function scan(repo: string, guard: AsyncGuard): Promise<CoverageReport | null> {
     isScanning = true;
     scanError = null;
     try {
-      const next = await invoke<CoverageReport>("cmd_scan_coverage", { repoPath: repo });
+      await coverageMetric.refresh(repo, { force: true });
       if (!guard.isLive()) return null;
-      const prev = report;
-      report = next;
-      reportCache.set(repo, next);
-      // Case-insensitive on purpose: the backend folds case when serving
-      // detail lookups, so a path differing only in case from the artifact's
-      // recorded form must not be reset to files[0].
-      const wanted = selectedPath;
-      const retained =
-        wanted !== null && next.files.some((f) => f.path.toLowerCase() === wanted.toLowerCase());
-      if (!retained) {
-        const first = next.files[0]?.path ?? null;
-        selectedPath = first;
-        // The auto-pick is a real selection: echo it into the per-repo session
-        // store so persistence and the other views agree on what is showing.
-        if (first) repoStore.selectFilePath(first);
+      const snap = coverageMetric.snapshot(repo);
+      if (snap.value === null) {
+        // The metric already formatted and logged this through the same
+        // reporter the old catch block used.
+        if (snap.state === "failed") scanError = snap.error;
+        return null;
       }
-      // Only invalidate gutters when the selected file's coverage actually
-      // changed: plans/scripts call rescan() after every step, and bumping
-      // unconditionally re-ran the gutter fetch behind a full-pane
-      // "Loading …" swap even when nothing moved.
-      const nextEntry = selectedPath
-        ? next.files.find((f) => f.path === selectedPath)
-        : undefined;
-      const prevEntry =
-        prev && selectedPath ? prev.files.find((f) => f.path === selectedPath) : undefined;
-      if (!prevEntry || !nextEntry || !sameCoverageSummary(prevEntry, nextEntry)) {
-        reportVersion += 1;
-      }
-      return next;
+      applyReport(repo, snap.value, snap.measuredAt);
+      return snap.value;
     } catch (err: unknown) {
       if (!guard.isLive()) return null;
       scanError = reportPanelError("coverage", err);
@@ -147,6 +181,28 @@
     } finally {
       if (guard.isLive()) isScanning = false;
     }
+  }
+
+  /**
+   * Adopts a measurement this component did not ask for.
+   *
+   * The watcher revalidates coverage whenever the repository settles, so a new
+   * report can arrive while the user is just looking at the panel — after a
+   * test run in their own terminal, for instance.
+   *
+   * Two guards, and both are load-bearing. `isScanning` suppresses the
+   * publication caused by this panel's *own* `refresh`, which is delivered
+   * before `scan` resumes from its await; without it every scan would adopt
+   * its own result and start another, forever. `appliedMeasurementAt` then
+   * makes adoption idempotent for every later re-publication of the same
+   * measurement. Note this applies the report the metric already has rather
+   * than scanning again — the measurement has happened, and repeating it would
+   * be the duplication this refactor removed.
+   */
+  function adoptExternalMeasurement(repo: string, next: CoverageReport, measuredAt: number | null) {
+    if (isScanning) return;
+    if (measuredAt === null || measuredAt === appliedMeasurementAt) return;
+    applyReport(repo, next, measuredAt);
   }
 
   function rescan() {
@@ -1129,11 +1185,24 @@
     // the scan below then refreshes in place behind the visible content.
     report = reportCache.get(repo) ?? null;
     resetManvi();
+    // Seed from what the metric already holds so the subscription's immediate
+    // first delivery is a no-op rather than a second scan racing the first.
+    appliedMeasurementAt = coverageMetric.snapshot(repo).measuredAt;
     const guard = beginScan();
     void scan(repo, guard).then((fresh) => {
       if (fresh) maybeAutoRunCoverage(repo, guard);
     });
+    // Coverage now tracks the repository: a test run in the user's own
+    // terminal writes a new lcov, the watcher fires, and the shared metric
+    // revalidates. Without this the panel would keep showing the report from
+    // whenever it was opened.
+    const unsubscribe = coverageMetric.subscribe(repo, (snap) => {
+      if (snap.state === "ready" && snap.value) {
+        adoptExternalMeasurement(repo, snap.value, snap.measuredAt);
+      }
+    });
     return () => {
+      unsubscribe();
       if (scanInflight === guard) {
         guard.cancel();
       }

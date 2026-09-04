@@ -1,6 +1,7 @@
 use super::actions::{self, NativeAction};
 use tauri::menu::{
-    AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID,
+    AboutMetadata, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID,
+    WINDOW_SUBMENU_ID,
 };
 use tauri::{AppHandle, Runtime};
 
@@ -15,17 +16,13 @@ const SETTINGS_ACCEL: &str = "CmdOrCtrl+,";
 
 /// View-menu digit shortcuts. Repository tab actions must not reuse these.
 const VIEW_TAB_BINDINGS: &[(&str, &str, &str)] = &[
-    (actions::TAB_FILES, "Files", "CmdOrCtrl+1"),
-    (actions::TAB_HISTORY, "Graph", "CmdOrCtrl+2"),
-    (actions::TAB_DIFF, "Diff", "CmdOrCtrl+3"),
-    (actions::TAB_CONFLICT, "Resolve Conflicts", "CmdOrCtrl+4"),
-    (actions::TAB_BLAME, "Blame", "CmdOrCtrl+5"),
-    (actions::TAB_STACK, "Stack", "CmdOrCtrl+6"),
-    (actions::TAB_GITHUB, "GitHub", "CmdOrCtrl+7"),
-    (actions::TAB_COVERAGE, "Coverage", "CmdOrCtrl+8"),
-    (actions::TAB_HEALTH, "Health", "CmdOrCtrl+9"),
+    (actions::TAB_CODE, "Code", "CmdOrCtrl+1"),
+    (actions::TAB_HISTORY, "History", "CmdOrCtrl+2"),
+    (actions::TAB_INSIGHTS, "Insights", "CmdOrCtrl+3"),
 ];
-const _: () = assert!(VIEW_TAB_BINDINGS.len() == 9);
+/// Nine digits are available; consolidation frees them as views merge, and
+/// the list must never claim more than exist.
+const _: () = assert!(VIEW_TAB_BINDINGS.len() <= 9);
 
 fn item<R: Runtime>(
     app: &AppHandle<R>,
@@ -161,104 +158,65 @@ pub fn build_native_menu<R: Runtime>(
         ],
     )?;
 
-    let view_menu = Submenu::with_items(
+    // Built from VIEW_TAB_BINDINGS rather than nine hand-unrolled indexes.
+    // The unrolled form silently required the list to be exactly nine long:
+    // shortening it by one panics at startup, and lengthening it drops the
+    // extra view from the menu with nothing to say so.
+    let view_tab_items: Vec<MenuItem<R>> = VIEW_TAB_BINDINGS
+        .iter()
+        .map(|(id, title, accel)| item(app, id, title, Some(accel)))
+        .collect::<tauri::Result<_>>()?;
+
+    let work_item = item(app, actions::TAB_WORK, "Work", Some("F10"))?;
+    let sep_one = PredefinedMenuItem::separator(app)?;
+    let fleet_item = item(app, actions::FLEET, "Fleet", Some("Shift+F10"))?;
+    let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
+    let sep_two = PredefinedMenuItem::separator(app)?;
+    let search_item = item(app, actions::FOCUS_FILTER, "Search Commits…", Some("CmdOrCtrl+F"))?;
+    let palette_item = item(app, actions::PALETTE, "Command Palette…", None)?;
+    let refresh_item = item(app, actions::REFRESH, "Refresh", Some("CmdOrCtrl+R"))?;
+    let sep_three = PredefinedMenuItem::separator(app)?;
+    let theme_system = item(app, actions::THEME_SYSTEM, "Use System Appearance", None)?;
+    let theme_light = item(app, actions::THEME_LIGHT, "Light Appearance", None)?;
+    let theme_dark = item(app, actions::THEME_DARK, "Dark Appearance", None)?;
+    let theme_toggle = item(
         app,
-        "View",
-        true,
-        &[
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[0].0,
-                VIEW_TAB_BINDINGS[0].1,
-                Some(VIEW_TAB_BINDINGS[0].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[1].0,
-                VIEW_TAB_BINDINGS[1].1,
-                Some(VIEW_TAB_BINDINGS[1].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[2].0,
-                VIEW_TAB_BINDINGS[2].1,
-                Some(VIEW_TAB_BINDINGS[2].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[3].0,
-                VIEW_TAB_BINDINGS[3].1,
-                Some(VIEW_TAB_BINDINGS[3].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[4].0,
-                VIEW_TAB_BINDINGS[4].1,
-                Some(VIEW_TAB_BINDINGS[4].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[5].0,
-                VIEW_TAB_BINDINGS[5].1,
-                Some(VIEW_TAB_BINDINGS[5].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[6].0,
-                VIEW_TAB_BINDINGS[6].1,
-                Some(VIEW_TAB_BINDINGS[6].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[7].0,
-                VIEW_TAB_BINDINGS[7].1,
-                Some(VIEW_TAB_BINDINGS[7].2),
-            )?,
-            &item(
-                app,
-                VIEW_TAB_BINDINGS[8].0,
-                VIEW_TAB_BINDINGS[8].1,
-                Some(VIEW_TAB_BINDINGS[8].2),
-            )?,
-            // Work is the projection of everything else — tasks, worktrees,
-            // pull requests, runs and verdicts on one screen. It sits above
-            // Terminal because it is where a session starts, and takes F10
-            // rather than a digit: CmdOrCtrl+1..9 are already spoken for, and
-            // renumbering nine existing shortcuts to make room would break
-            // muscle memory for the sake of ordering.
-            &item(app, actions::TAB_WORK, "Work", Some("F10"))?,
-            &item(app, actions::TAB_TERMINAL, "Terminal", None)?,
-            &item(app, actions::TAB_MANVI, "MANVI", None)?,
-            // Storage and Reflog are registered views with a menu group, but
-            // had no menu item: Storage had no action at all, and Reflog had
-            // one that nothing could emit. Both were reachable only through
-            // the command palette.
-            &item(app, actions::TAB_STORAGE, "Storage", None)?,
-            &item(app, actions::TAB_REFLOG, "Reflog", None)?,
-            &item(app, actions::TAB_PULSE, "Pulse", None)?,
-            &PredefinedMenuItem::separator(app)?,
-            &item(
-                app,
-                actions::FOCUS_FILTER,
-                "Search Commits…",
-                Some("CmdOrCtrl+F"),
-            )?,
-            &item(app, actions::PALETTE, "Command Palette…", None)?,
-            &item(app, actions::REFRESH, "Refresh", Some("CmdOrCtrl+R"))?,
-            &PredefinedMenuItem::separator(app)?,
-            &item(app, actions::THEME_SYSTEM, "Use System Appearance", None)?,
-            &item(app, actions::THEME_LIGHT, "Light Appearance", None)?,
-            &item(app, actions::THEME_DARK, "Dark Appearance", None)?,
-            &item(
-                app,
-                actions::TOGGLE_THEME,
-                "Toggle Dark / Light",
-                Some("CmdOrCtrl+Shift+T"),
-            )?,
-            &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::fullscreen(app, None)?,
-        ],
+        actions::TOGGLE_THEME,
+        "Toggle Dark / Light",
+        Some("CmdOrCtrl+Shift+T"),
     )?;
+    let sep_four = PredefinedMenuItem::separator(app)?;
+    let fullscreen = PredefinedMenuItem::fullscreen(app, None)?;
+
+    let mut view_items: Vec<&dyn IsMenuItem<R>> = Vec::new();
+    for entry in &view_tab_items {
+        view_items.push(entry);
+    }
+    // Work is the projection of everything else — tasks, worktrees, pull
+    // requests, runs and verdicts on one screen. It takes F10 rather than a
+    // digit: the digits are spoken for, and renumbering them to make room
+    // would break muscle memory for the sake of ordering.
+    view_items.push(&work_item);
+    view_items.push(&sep_one);
+    // Neither Fleet nor the terminal is a repository view. Fleet shows every
+    // open repository at once; the terminal is a dock beneath whichever view
+    // is on screen. Both sit after the separator, away from the views.
+    // Ctrl, not Cmd, on every platform — Cmd+` is the macOS window cycler.
+    view_items.push(&fleet_item);
+    view_items.push(&terminal_item);
+    view_items.push(&sep_two);
+    view_items.push(&search_item);
+    view_items.push(&palette_item);
+    view_items.push(&refresh_item);
+    view_items.push(&sep_three);
+    view_items.push(&theme_system);
+    view_items.push(&theme_light);
+    view_items.push(&theme_dark);
+    view_items.push(&theme_toggle);
+    view_items.push(&sep_four);
+    view_items.push(&fullscreen);
+
+    let view_menu = Submenu::with_items(app, "View", true, &view_items)?;
 
     let repo_menu = Submenu::with_items(
         app,
@@ -391,17 +349,31 @@ mod tests {
     }
 
     #[test]
-    fn view_tabs_own_cmd_or_ctrl_1_through_9() {
+    fn view_tabs_take_the_digits_from_one_without_a_gap() {
+        // Asserted as a shape rather than a fixed list of nine: consolidation
+        // retires views, and a hardcoded expectation would have to be rewritten
+        // every time while checking nothing that matters. What matters is that
+        // the digits start at 1, have no gap, and no two views share one — a
+        // gap or a duplicate is a shortcut that silently does the wrong thing.
         let digits: Vec<String> = VIEW_TAB_BINDINGS
             .iter()
             .map(|(_, _, accel)| (*accel).to_string())
             .collect();
-        let expected: Vec<String> = (1..=9).map(|digit| format!("CmdOrCtrl+{digit}")).collect();
+        let expected: Vec<String> = (1..=VIEW_TAB_BINDINGS.len())
+            .map(|digit| format!("CmdOrCtrl+{digit}"))
+            .collect();
         assert_eq!(digits, expected);
-        assert_eq!(VIEW_TAB_BINDINGS[0].0, actions::TAB_FILES);
+        assert_eq!(VIEW_TAB_BINDINGS[0].0, actions::TAB_CODE);
         assert_eq!(VIEW_TAB_BINDINGS[1].0, actions::TAB_HISTORY);
-        assert_eq!(VIEW_TAB_BINDINGS[7].0, actions::TAB_COVERAGE);
-        assert_eq!(VIEW_TAB_BINDINGS[8].0, actions::TAB_HEALTH);
+        // Retired views must not linger in the binding list: a menu item for
+        // a view the frontend cannot resolve is inert, and looks like a bug
+        // in the app rather than a stale table here.
+        for (id, _, _) in VIEW_TAB_BINDINGS {
+            assert!(
+                NativeAction::parse(id).is_some(),
+                "{id} has a digit shortcut but no action"
+            );
+        }
     }
 
     #[test]

@@ -57,16 +57,18 @@ function harness() {
 
 describe("graphRequestKey", () => {
   it("keys on path and revision", () => {
-    expect(graphRequestKey(req("/a", "", "main"))).toBe("/a\u241fmain");
-    expect(graphRequestKey(req("/a"))).toBe("/a\u241f");
+    expect(graphRequestKey(req("/a", "", "main"))).toBe("/a\u241fmain\u241fnamed");
+    expect(graphRequestKey(req("/a"))).toBe("/a\u241f\u241fnamed");
     expect(graphRequestKey(req("/a", "", "dev"))).not.toBe(graphRequestKey(req("/a")));
   });
 
   it("includes every non-blank query, normalized: each filter edit is its own request", () => {
     // Every term runs in the backend (author, sha, type, free text, path),
     // so a different query is a different graph and must refetch.
-    expect(graphRequestKey(req("/a", "path:src/**/*.ts"))).toBe("/a\u241f\u241fpath:src/**/*.ts");
-    expect(graphRequestKey(req("/a", "author:ada"))).toBe("/a\u241f\u241fauthor:ada");
+    expect(graphRequestKey(req("/a", "path:src/**/*.ts"))).toBe(
+      "/a\u241f\u241fnamed\u241fpath:src/**/*.ts"
+    );
+    expect(graphRequestKey(req("/a", "author:ada"))).toBe("/a\u241f\u241fnamed\u241fauthor:ada");
     expect(graphRequestKey(req("/a", "dead"))).not.toBe(graphRequestKey(req("/a", "beef")));
     // Whitespace is not a different request: a stray space never re-walks.
     expect(graphRequestKey(req("/a", "  author:ada   fix:  "))).toBe(
@@ -85,6 +87,35 @@ describe("normalizeGraphQuery", () => {
   });
 });
 
+/**
+ * The "Refs drawn" setting changes WHICH GRAPH is being asked for, not how it
+ * is drawn. Before the scope joined the request key, flipping it left the key
+ * unchanged: the scheduler saw an already-served request, refused to re-arm,
+ * and the setting did nothing at all until an unrelated event happened to
+ * reload the pane. A setting that silently does nothing is worse than one
+ * that is missing.
+ */
+describe("graphRequestKey ref scope", () => {
+  it("gives each scope its own request identity", () => {
+    const named = graphRequestKey({ path: "/a", query: "", revision: "main", refScope: "named" });
+    const all = graphRequestKey({ path: "/a", query: "", revision: "main", refScope: "all" });
+    expect(named).not.toBe(all);
+  });
+
+  it("treats an absent or unrecognized scope as the named default", () => {
+    const explicit = graphRequestKey({ path: "/a", query: "", revision: null, refScope: "named" });
+    expect(graphRequestKey({ path: "/a", query: "", revision: null })).toBe(explicit);
+    expect(
+      graphRequestKey({
+        path: "/a",
+        query: "",
+        revision: null,
+        refScope: "nonsense" as never,
+      })
+    ).toBe(explicit);
+  });
+});
+
 describe("createGraphFetchScheduler", () => {
   it("fires once after the debounce window with the presented arguments", () => {
     const { clock, loads, scheduler } = harness();
@@ -93,7 +124,7 @@ describe("createGraphFetchScheduler", () => {
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS - 1);
     expect(loads).toEqual([]);
     clock.advance(1);
-    expect(loads).toEqual([{ path: "/repo", query: "", revision: "main" }]);
+    expect(loads).toEqual([{ path: "/repo", query: "", revision: "main", refScope: "named" }]);
     expect(scheduler.armed).toBe(false);
   });
 
@@ -114,7 +145,7 @@ describe("createGraphFetchScheduler", () => {
       expect(scheduler.armed).toBe(true);
     }
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS - 160);
-    expect(loads).toEqual([{ path: "/repo", query: "", revision: null }]);
+    expect(loads).toEqual([{ path: "/repo", query: "", revision: null, refScope: "named" }]);
   });
 
   it("restarts the window only when the request genuinely changes (trailing debounce)", () => {
@@ -125,7 +156,7 @@ describe("createGraphFetchScheduler", () => {
     clock.advance(150); // 300 total, but window restarted at 150
     expect(loads).toEqual([]);
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS - 150);
-    expect(loads).toEqual([{ path: "/repo", query: "path:src/lib", revision: null }]);
+    expect(loads).toEqual([{ path: "/repo", query: "path:src/lib", revision: null, refScope: "named" }]);
   });
 
   it("does not refetch an already-served request on later emissions", () => {
@@ -161,7 +192,7 @@ describe("createGraphFetchScheduler", () => {
     expect(loads).toEqual([]);
     scheduler.sync(req("/repo"));
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
-    expect(loads).toEqual([{ path: "/repo", query: "", revision: null }]);
+    expect(loads).toEqual([{ path: "/repo", query: "", revision: null, refScope: "named" }]);
   });
 
   it("fetches again when a superseding key resolves back to an older state", () => {
@@ -182,7 +213,7 @@ describe("createGraphFetchScheduler", () => {
     scheduler.sync(req("/repo", ""));
     scheduler.sync(req("/repo", "  author:me  "));
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
-    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null }]);
+    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null, refScope: "named" }]);
   });
 
   it("does not refetch when the query only changed in whitespace", () => {
@@ -191,7 +222,7 @@ describe("createGraphFetchScheduler", () => {
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
     scheduler.sync(req("/repo", " author:me "));
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
-    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null }]);
+    expect(loads).toEqual([{ path: "/repo", query: "author:me", revision: null, refScope: "named" }]);
   });
 });
 
@@ -224,7 +255,12 @@ describe("legacy inline pattern (pre-fix)", () => {
       if (key === lastGraphKey) return;
       lastGraphKey = key;
       handle = clock.setTimeoutFn(() => {
-        void loads.push({ path: r.path!, query: r.query, revision: r.revision });
+        void loads.push({
+          path: r.path!,
+          query: r.query,
+          revision: r.revision,
+          refScope: r.refScope ?? "named",
+        });
       }, GRAPH_FETCH_DEBOUNCE_MS);
     };
 
@@ -236,5 +272,37 @@ describe("legacy inline pattern (pre-fix)", () => {
     clock.advance(GRAPH_FETCH_DEBOUNCE_MS * 5);
 
     expect(loads).toEqual([]); // ← the loader-spins-forever bug
+  });
+});
+
+describe("createGraphFetchScheduler ref scope", () => {
+  it("re-arms and fires when only the ref scope changes", () => {
+    const { clock, loads, scheduler } = harness();
+
+    scheduler.sync({ path: "/repo", query: "", revision: null, refScope: "named" });
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads.map((l) => l.refScope)).toEqual(["named"]);
+
+    // Same repo, same query, same branch — only the setting moved.
+    scheduler.sync({ path: "/repo", query: "", revision: null, refScope: "all" });
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads.map((l) => l.refScope)).toEqual(["named", "all"]);
+
+    // Re-presenting the served request must still be a no-op.
+    scheduler.sync({ path: "/repo", query: "", revision: null, refScope: "all" });
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads).toHaveLength(2);
+  });
+
+  it("normalizes the scope before it reaches the load, never passing a stored typo through", () => {
+    const { clock, loads, scheduler } = harness();
+    scheduler.sync({
+      path: "/repo",
+      query: "",
+      revision: null,
+      refScope: "aII" as never,
+    });
+    clock.advance(GRAPH_FETCH_DEBOUNCE_MS);
+    expect(loads.map((l) => l.refScope)).toEqual(["named"]);
   });
 });

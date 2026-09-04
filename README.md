@@ -44,7 +44,7 @@ GitPulse operates completely locally on your machine with strict IPC boundaries 
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        Views["15 Specialized Views<br/>(Work, Files, Graph, Diff, Coverage, Health...)"]
+        Views["4 Specialized Views<br/>(Work, Code, History, Insights)"]
         Stores["Reactive Svelte 5 Stores & Runes"]
         CanvasEngine["GPU-Accelerated HTML5 Canvas"]
         AsyncGuards["Async Cancellation Guards"]
@@ -56,7 +56,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(134 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(136 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -90,35 +90,36 @@ flowchart TB
 
 ## View Catalog & Workflows
 
-GitPulse organizes 15 purpose-built views into three intuitive functional groups:
+GitPulse organizes 4 purpose-built views, each holding the lenses on one
+subject as **sections** rather than as separate destinations:
 
 ```mermaid
 flowchart LR
-    subgraph Work["🔨 Work Views"]
-        WorkTab["<b>Work</b> (<code>work</code>)<br/>Worktrees, PRs, remotes & verdicts"]
-        Files["<b>Files</b> (<code>files</code>)<br/>IDE file explorer & code viewer"]
-        Graph["<b>Graph</b> (<code>history</code>)<br/>Canvas commit graph & lanes"]
-        Diff["<b>Diff</b> (<code>diff</code>)<br/>Word-level diff & selective staging"]
-        Conflict["<b>Resolve</b> (<code>conflict</code>)<br/>3-way merge conflict editor"]
+    subgraph Views["🔨 The four views"]
+        WorkTab["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame"]
+        History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog"]
+        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage"]
     end
 
-    subgraph Inspect["🔍 Inspect Views"]
-        Blame["<b>Blame</b> (<code>blame</code>)<br/>Line authorship & heatmap"]
-        Coverage["<b>Coverage</b> (<code>coverage</code>)<br/>Universal scanner & line gutters"]
-        Health["<b>Health</b> (<code>health</code>)<br/>Vulnerabilities & Dependabot"]
-        Storage["<b>Storage</b> (<code>storage</code>)<br/>Disk usage & history trends"]
-        Stack["<b>Stack</b> (<code>stack</code>)<br/>Stacked branch visualization"]
-        Pulse["<b>Pulse</b> (<code>pulse</code>)<br/>Cadence, heatmap, rhythm & hygiene"]
-    end
-
-    subgraph System["⚙️ System & Ops"]
-        Terminal["<b>Terminal</b> (<code>terminal</code>)<br/>Isolated native PTY shell"]
-        MANVI["<b>MANVI</b> (<code>manvi</code>)<br/>Policy gate & local AI harness"]
-        GitHub["<b>GitHub</b> (<code>github</code>)<br/>PRs, workflow dispatch & CI:local"]
-        Reflog["<b>Reflog</b> (<code>reflog</code>)<br/>Reference history log"]
-        MCP["<b>MCP</b> (<code>mcp</code>)<br/>Read-only Agent Plugins tools"]
+    subgraph Docked["⚙️ Docked & Workspace Surfaces"]
+        Terminal["<b>Terminal</b> (<code>⌃`</code>)<br/>Native PTY, docked under the current view"]
+        Fleet["<b>Fleet</b> (<code>Shift+F10</code>)<br/>Every open repository at once — not a view"]
+        MCP["<b>MCP</b><br/>Read-only Agent Plugins tools"]
     end
 ```
+
+A section switches the lens without changing the subject: picking a commit in
+**History → Graph** and moving to **Diff** keeps that commit, opening a file in
+**Code → Explorer** and moving to **Blame** keeps that file, and a blocked
+worktree row in **Work → Overview** opens **Resolve** on the worktree that is
+actually stuck. Every section a former top-level view became keeps its own
+command-palette entry, so no door was closed by the consolidation.
+
+> **Fleet is deliberately not one of the 4 views.** Each view answers a
+> question about the active repository and is persisted on that repository's
+> session; Fleet answers one about the whole workspace, so it lives above the
+> repository tab strip and survives switching between repositories.
 
 ---
 
@@ -133,6 +134,7 @@ flowchart LR
 | **Precision Diff Viewer** | File, commit, and range diffs with embedded file rail, quick commit picker, intra-line word highlighting, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
+| **Fleet Dashboard** | Workspace-wide grid (`Shift+F10`) covering every open repository and every recent one: changes, sync, conflicts, stash, worktrees, agent sessions and last activity live; lines of code, disk usage, dependency audits and coverage on demand, cached with their age. Every cell is a value, *not scanned*, or *could not read* — never a reassuring zero — and every total states what it could not count. |
 | **Language Vector Logos & Path Scannability** | Zero-dependency vector logos for 34+ programming languages, configs, and markups across the file tree, editor tabs, diff toolbar, and dashboard, with dimmed path hierarchy for scannable file lists. |
 
 ### 🛡️ Code Intelligence & Auditing
@@ -145,7 +147,7 @@ flowchart LR
 | **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
 | **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
 | **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
-| **MCP 2.0 + Agent Plugins 1.0** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. Packaged as an [Agent Plugins 1.0](https://agent-plugins.org/specification) directory at `plugin/` (`plugin.json`, `mcp.json`, skills). Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
+| **MCP 2.0 + agent plugins** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. The canonical package is `plugins/gitpulse/`, with native Codex, Claude Code, and [Agent Plugins 1.0](https://agent-plugins.org/specification) manifests plus shared skills. Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
 
 ### 🤖 Local AI & Policy Safety Gate
 | Feature | Description |
@@ -266,9 +268,11 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 134 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 136 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
-| `npm run check:release` | Assert all 5 version manifests agree (`package.json`, `Cargo.toml`, `tauri.conf.json`, etc.) |
+| `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
+| `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |
+| `npm run mcp:doctor` | Assert the `gitpulse-mcp` on PATH is this tree's build, not a stale copy |
 | `npm run ci:local` | Run full local CI suite (checks, tests, builds, clippy, cargo tests, coverage floors) |
 | `npm test` | Run Vitest unit and integration test suite (2,000+ tests) |
 | `npm run coverage` | Generate Vitest v8 code coverage report |
@@ -285,7 +289,7 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
-- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 15 application views and keyboard shortcuts.
+- 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 4 application views, their sections and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.
 - 🔒 **[Security Policy](docs/SECURITY.md)** — Zero-telemetry model, local credential safety, and vulnerability reporting.

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import {
   branchLeafName,
   filterBranchSections,
@@ -49,7 +50,7 @@ describe("groupBranches stress: 5,000 branches across 50 namespaces", () => {
     const filtered = filterBranchSections(sections, "ns07/");
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(2_000);
+    expectWithinBudget(elapsedMs, 400, "groupBranches stress");
 
     // Correctness spot checks.
     const local = sections.find((s) => s.id === "local")!;
@@ -69,7 +70,7 @@ describe("groupBranches stress: 5,000 branches across 50 namespaces", () => {
     const labels = local.folders.map((f) => f.label);
     expect([...labels].sort((a, b) => a.localeCompare(b))).toEqual(labels);
     expect(JSON.stringify(groupBranches(branches))).toBe(JSON.stringify(sections));
-  });
+  }, STRESS_TIMEOUT_MS);
 });
 
 describe("groupBranches stress: pathological names", () => {

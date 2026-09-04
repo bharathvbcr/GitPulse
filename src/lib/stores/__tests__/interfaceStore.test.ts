@@ -120,6 +120,47 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).autoRunCoverage).toBe(false);
   });
 
+  it("starts with the Fleet dashboard closed", () => {
+    interfaceStore.reset();
+    expect(get(interfaceStore).fleetOpen).toBe(false);
+  });
+
+  it("opens, closes and toggles the Fleet dashboard", () => {
+    interfaceStore.reset();
+    interfaceStore.setFleetOpen(true);
+    expect(get(interfaceStore).fleetOpen).toBe(true);
+    interfaceStore.toggleFleet();
+    expect(get(interfaceStore).fleetOpen).toBe(false);
+    interfaceStore.toggleFleet();
+    expect(get(interfaceStore).fleetOpen).toBe(true);
+    interfaceStore.setFleetOpen(false);
+    expect(get(interfaceStore).fleetOpen).toBe(false);
+  });
+
+  it("persists the Fleet surface across a reload", async () => {
+    // Fleet lives here rather than in the workspace blob precisely so it can
+    // be remembered without bumping that schema version — which would make an
+    // older build fall back to its legacy keys and lose the user's tabs.
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ fleetOpen: true }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      expect(get(reloaded).fleetOpen).toBe(true);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
   it("toggles automatic coverage generation", () => {
     interfaceStore.setAutoRunCoverage(true);
     expect(get(interfaceStore).autoRunCoverage).toBe(true);
@@ -184,5 +225,120 @@ describe("interfaceStore", () => {
     interfaceStore.dismissUpdateVersion("0.1.0");
     interfaceStore.setCheckForUpdates(true);
     expect(get(interfaceStore).dismissedUpdateVersion).toBe("0.1.0");
+  });
+});
+
+describe("interfaceStore chrome preferences", () => {
+  beforeEach(() => {
+    interfaceStore.reset();
+  });
+
+  it("starts with every piece of chrome present", () => {
+    // Defaults must not quietly hide anything: a fresh install shows the
+    // whole frame, and decluttering is something the user chooses.
+    const prefs = get(interfaceStore);
+    expect(prefs.hiddenViews).toEqual([]);
+    expect(prefs.statusBarMode).toBe("full");
+    expect(prefs.showHeaderActionLabels).toBe(true);
+    expect(prefs.autoHideRepoTabs).toBe(false);
+    expect(prefs.diagnosticsButton).toBe("always");
+  });
+
+  it("sets each chrome preference without disturbing the others", () => {
+    interfaceStore.setStatusBarMode("hidden");
+    interfaceStore.setShowHeaderActionLabels(false);
+    interfaceStore.setAutoHideRepoTabs(true);
+    interfaceStore.setDiagnosticsButton("issues");
+    const prefs = get(interfaceStore);
+    expect(prefs.statusBarMode).toBe("hidden");
+    expect(prefs.showHeaderActionLabels).toBe(false);
+    expect(prefs.autoHideRepoTabs).toBe(true);
+    expect(prefs.diagnosticsButton).toBe("issues");
+    // Untouched neighbours from other sections stay put.
+    expect(prefs.showLanguageBar).toBe(true);
+    expect(prefs.uiFontScale).toBe(1.0);
+  });
+
+  it("hides and re-shows individual views without duplicating entries", () => {
+    interfaceStore.setViewHidden("code", true);
+    interfaceStore.setViewHidden("code", true);
+    interfaceStore.setViewHidden("insights", true);
+    expect(get(interfaceStore).hiddenViews).toEqual(["code", "insights"]);
+
+    interfaceStore.setViewHidden("code", false);
+    expect(get(interfaceStore).hiddenViews).toEqual(["insights"]);
+
+    // Un-hiding something that was never hidden is a no-op, not an error.
+    interfaceStore.setViewHidden("work", false);
+    expect(get(interfaceStore).hiddenViews).toEqual(["insights"]);
+
+    interfaceStore.showAllViews();
+    expect(get(interfaceStore).hiddenViews).toEqual([]);
+  });
+
+  it("reset restores the chrome defaults and cannot poison them", () => {
+    interfaceStore.setViewHidden("code", true);
+    interfaceStore.setStatusBarMode("minimal");
+    interfaceStore.reset();
+    expect(get(interfaceStore).hiddenViews).toEqual([]);
+    expect(get(interfaceStore).statusBarMode).toBe("full");
+
+    // A second cycle proves the first reset handed out its own array rather
+    // than the module-level default everyone would then share.
+    interfaceStore.setViewHidden("insights", true);
+    interfaceStore.reset();
+    expect(get(interfaceStore).hiddenViews).toEqual([]);
+  });
+
+  it("falls back rather than trusting a corrupt chrome blob", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: Record<string, unknown>) => {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify(stored),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore);
+    };
+    try {
+      const bad = await load({
+        statusBarMode: "off",
+        diagnosticsButton: "errors",
+        hiddenViews: ["code", "blame", "not-a-view", 7, null],
+        showHeaderActionLabels: "no",
+        autoHideRepoTabs: 1,
+      });
+      expect(bad.statusBarMode).toBe("full");
+      expect(bad.diagnosticsButton).toBe("always");
+      // "blame" is a retired view id: it survives in old preference blobs and
+      // must be dropped like any other non-view, or the preference would name
+      // something the header can never list.
+      expect(bad.hiddenViews).toEqual(["code"]);
+      expect(bad.showHeaderActionLabels).toBe(true);
+      expect(bad.autoHideRepoTabs).toBe(false);
+
+      // The control: valid values do survive, so the cases above are not
+      // passing because the reader ignores these fields.
+      const good = await load({
+        statusBarMode: "minimal",
+        diagnosticsButton: "issues",
+        hiddenViews: ["insights"],
+        showHeaderActionLabels: false,
+        autoHideRepoTabs: true,
+      });
+      expect(good.statusBarMode).toBe("minimal");
+      expect(good.diagnosticsButton).toBe("issues");
+      expect(good.hiddenViews).toEqual(["insights"]);
+      expect(good.showHeaderActionLabels).toBe(false);
+      expect(good.autoHideRepoTabs).toBe(true);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
   });
 });
