@@ -179,11 +179,17 @@ describe("graphStore generation", () => {
     expect(get(store).rows[0]?.id).toBe("fresh");
   });
 
-  it("surfaces backend read warnings in state and the diagnostics channel", async () => {
-    const warned: string[] = [];
-    const original = console.warn;
+  it("surfaces backend read warnings in state and the diagnostics channel, once, named by repo", async () => {
+    // Asserted on the injected diagnostics seam rather than by spying on
+    // console.warn: the store used to do BOTH, so every warning was recorded
+    // twice — and the console copy fired on every load, not only when the
+    // warning set changed. Spying on the global console is also why that
+    // duplication went unnoticed; this seam is the channel that matters.
+    const warned: Array<[string, unknown]> = [];
+    const consoleWarned: string[] = [];
+    const originalWarn = console.warn;
     console.warn = (msg?: unknown) => {
-      warned.push(String(msg));
+      consoleWarned.push(String(msg));
     };
     try {
       const withWarnings = {
@@ -198,18 +204,28 @@ describe("graphStore generation", () => {
           return { id: "x", summary: "d", changed_files: [] } as never;
         throw new Error(cmd);
       };
-      const store = createGraphStore({ invoke });
+      const store = createGraphStore({
+        invoke,
+        diagnostics: { warn: (source, detail) => warned.push([source, detail]) },
+      });
       store.showRepo("/r/a");
       await store.loadGraph("/r/a");
       expect(get(store).warnings).toEqual([
         "ref decorations unavailable: fatal: broken ref",
       ]);
+      expect(warned).toEqual([
+        ["graph", "/r/a: ref decorations unavailable: fatal: broken ref"],
+      ]);
+      // A second load of the same warning set is not news, and must not add a
+      // second breadcrumb through any channel.
+      await store.loadGraph("/r/a");
+      expect(warned).toHaveLength(1);
       expect(
-        warned.some((w) => w.includes("ref decorations unavailable")),
-        "warnings must reach the console/diagnostics channel"
-      ).toBe(true);
+        consoleWarned.filter((w) => w.includes("ref decorations unavailable")),
+        "the graph warning must reach diagnostics only, never a second console channel"
+      ).toEqual([]);
     } finally {
-      console.warn = original;
+      console.warn = originalWarn;
     }
   });
 
@@ -801,14 +817,14 @@ describe("graph warning breadcrumbs", () => {
     store.showRepo("/r/a");
     await store.loadGraph("/r/a");
     await store.loadGraph("/r/a");
-    expect(warned).toEqual(["first degradation"]);
+    expect(warned).toEqual(["/r/a: first degradation"]);
 
     current = ["first degradation", "second degradation"];
     await store.loadGraph("/r/a");
     expect(warned).toEqual([
-      "first degradation",
-      "first degradation",
-      "second degradation",
+      "/r/a: first degradation",
+      "/r/a: first degradation",
+      "/r/a: second degradation",
     ]);
   });
 
@@ -822,6 +838,6 @@ describe("graph warning breadcrumbs", () => {
     await store.loadGraph("/r/a");
     current = ["flaky degradation"];
     await store.loadGraph("/r/a");
-    expect(warned).toEqual(["flaky degradation", "flaky degradation"]);
+    expect(warned).toEqual(["/r/a: flaky degradation", "/r/a: flaky degradation"]);
   });
 });

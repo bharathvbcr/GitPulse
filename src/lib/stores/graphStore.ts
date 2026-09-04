@@ -568,7 +568,12 @@ export function createGraphStore(
         } else if (warnedSignatures.get(repoPath) !== warningSignature) {
           warnedSignatures.set(repoPath, warningSignature);
           for (const w of warningList) {
-            reportFailure("graph", w);
+            // Named by repository, like graph-details and graph-load below.
+            // The ring coalesces by fingerprint and deliberately keeps
+            // repository names discriminating, so an unattributed warning
+            // folds two repositories' problems into one entry with a count —
+            // which is exactly the case a workspace of several repos hits.
+            reportFailure("graph", `${repoPath}: ${w}`);
           }
         }
 
@@ -635,12 +640,17 @@ export function createGraphStore(
             visiblePath: repoPath,
           }));
         }
-        // Backend reads that failed land in the diagnostics channel; a graph
-        // without decorations must never be silently indistinguishable from
-        // a repository that has none.
-        for (const warning of next.warnings) {
-          console.warn(`[graph:${repoPath}] ${warning}`);
-        }
+        // No console.warn for `next.warnings` here, deliberately. Backend read
+        // failures already reach diagnostics above, via reportFailure("graph").
+        // That path replaced this console loop but landed beside it instead of
+        // removing it, so every warning was recorded TWICE — once as "graph",
+        // once as "console" (the global console patch records both severities)
+        // — and the console copy re-fired on every load rather than only when
+        // the warning set changed. Two entries per warning, one of them
+        // repeating, is precisely how the ring loses the entry that mattered,
+        // which is the thing the dedupe above exists to prevent. Failures that
+        // are not warnings keep their own breadcrumbs: see graph-details and
+        // graph-load below.
 
         if (selectedCommit) {
           await fetchDetails(repoPath, token, selectedCommit.id);
