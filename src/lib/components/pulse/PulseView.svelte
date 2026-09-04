@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../../stores/repoStore";
   import { pulseStore } from "../../pulse/pulseStore";
   import PulseHeatmap from "./PulseHeatmap.svelte";
@@ -47,8 +48,17 @@
     { path: string; name: string; value: number | null; truncated: boolean; failed: boolean }[]
   >([]);
   let loadedPath = $state<string | null>(null);
-  /** Live subscriptions for the other open tabs, torn down with the view. */
-  let workspaceUnsubscribes: (() => void)[] = [];
+
+  // The tab set as a VALUE, not a reference. repoStore rebuilds openTabs with
+  // .map() on every status poll (~6s), so an effect that depends on the array
+  // itself re-runs on every emission and tore down and rebuilt every LOC
+  // subscription each time. The joined key changes only when the tabs do.
+  const workspaceTabs = $derived(
+    $repoStore.openTabs.map((tab) => ({ path: tab.path, name: tab.label || tab.name })),
+  );
+  const workspaceKey = $derived(
+    workspaceTabs.map((tab) => `${tab.path}\u0000${tab.name}`).join("\u001f"),
+  );
 
   /** Maps a LOC metric snapshot onto this view's display state. */
   function toLocState(snap: MetricSnapshot<LanguageStatsReport>): LocState {
@@ -111,38 +121,44 @@
   // Per-tab line counts for the workspace comparison strip. Same metric, so a
   // repository open in two places is measured once.
   $effect(() => {
-    const tabs = $repoStore.openTabs;
-    for (const off of workspaceUnsubscribes) off();
-    workspaceUnsubscribes = [];
+    // Depend on the tab set's value; read the tabs themselves untracked so a
+    // fresh-but-equal openTabs array does not re-run this.
+    void workspaceKey;
+    const tabs = untrack(() => workspaceTabs);
     if (tabs.length < 2) {
       workspaceLoc = [];
       return;
     }
+    // `rows` is a plain, non-reactive array and is the source of truth the
+    // subscription callbacks merge into. Reading `workspaceLoc` here instead
+    // is what crashed this pane: locMetric delivers the current snapshot
+    // SYNCHRONOUSLY from inside subscribe(), so that read registered
+    // `workspaceLoc` as a dependency of the very effect that writes it, and
+    // each write re-invalidated the effect until Svelte gave up with
+    // effect_update_depth_exceeded. Writing without reading cannot loop.
     const rows = tabs.map((tab) => ({
       path: tab.path,
-      name: tab.label || tab.name,
+      name: tab.name,
       value: null as number | null,
       truncated: false,
       failed: false,
     }));
-    workspaceLoc = rows;
-    workspaceUnsubscribes = tabs.map((tab, index) =>
+    workspaceLoc = [...rows];
+    const unsubscribes = tabs.map((tab, index) =>
       locMetric.subscribe(tab.path, (snap) => {
-        const next = [...workspaceLoc];
-        const row = next[index];
+        const row = rows[index];
         if (!row || row.path !== tab.path) return;
-        next[index] = {
+        rows[index] = {
           ...row,
           value: snap.value ? (totalCodeLines(snap.value) ?? 0) : null,
           truncated: snap.value?.truncated === true || snap.stale !== null,
           failed: snap.state === "failed" && snap.value === null,
         };
-        workspaceLoc = next;
+        workspaceLoc = [...rows];
       }),
     );
     return () => {
-      for (const off of workspaceUnsubscribes) off();
-      workspaceUnsubscribes = [];
+      for (const off of unsubscribes) off();
     };
   });
 

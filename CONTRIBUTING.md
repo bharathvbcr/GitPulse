@@ -180,6 +180,7 @@ several were added after the drift had already happened.
 | `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
 | `cli-help-contract`, `cli-json-contract` | A script entry point losing `--help` or `--json`, or their exit codes diverging. |
 | `release-workflow` | Release preflight losing a gate, or the release body reverting to a literal block. |
+| `effect-loop-contract` | A pane that crashes itself with `effect_update_depth_exceeded`. `Metric.subscribe` delivers the current snapshot *synchronously*, so a callback registered inside an `$effect` runs while that effect is still tracking: reading a `$state` there that the effect also writes makes the effect depend on its own output, and Svelte kills the pane after ~1000 passes. Two panes shipped it — PulseView's workspace LOC strip and StoragePanel's usage history, where `historyVersion += 1` is the read. Neither is visible on inspection, and the crash needs two open repositories or a warm cache to reproduce. The scan walks `src/` rather than listing the panes that subscribe today. |
 
 Adding a contract test is preferred over adding a `check:*` script unless the
 check is something you would want to run on its own.

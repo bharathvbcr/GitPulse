@@ -46,7 +46,20 @@
   let errorMsg = $state<string | null>(null);
   let staleNote = $state<string | null>(null);
   let copied = $state(false);
+
+  // Bump counter for the persisted-history derive. The next value is kept in a
+  // plain `let` so bumping never READS the reactive one: applySnapshot runs
+  // inside the storage subscription, which delivers its current snapshot
+  // synchronously from the $effect that registered it, and a `historyVersion
+  // += 1` there made that effect depend on state it writes — the effect then
+  // re-invalidated itself until Svelte aborted with
+  // effect_update_depth_exceeded and the pane crashed.
+  let historySeq = 0;
   let historyVersion = $state(0);
+
+  function bumpHistory() {
+    historyVersion = ++historySeq;
+  }
 
   // The last measurement whose snapshot was written to usage history. Keyed on
   // the measurement time so re-renders of the same scan do not append a
@@ -108,7 +121,7 @@
       recordedAt = snap.measuredAt;
       const map = recordSnapshot(readHistory(), repoKey(repoPath), toSnapshot(snap.value));
       saveHistory(persistentStorage(), map);
-      historyVersion += 1;
+      bumpHistory();
     }
   }
 
@@ -206,7 +219,7 @@
       persistentStorage(),
       clearRepoHistory(readHistory(), repoKey(path)),
     );
-    historyVersion += 1;
+    bumpHistory();
   }
 
   // ---- Copy-as-text ------------------------------------------------------
