@@ -3,18 +3,30 @@ fn main() {
     tauri_build::build()
 }
 
-/// Gives this crate's TEST binaries the same comctl32 version 6 dependency the
-/// application binary gets from `tauri_build`.
+/// Gives this crate's TEST binaries an application manifest declaring the
+/// comctl32 version 6 dependency, which the application binary already gets
+/// from `tauri_build`.
 ///
-/// `muda` and `wry` import `SetWindowSubclass`, `RemoveWindowSubclass` and
-/// `DefSubclassProc`, which only comctl32 version 6 exports. Without a manifest
-/// saying so, the loader binds the System32 copy (version 5), cannot resolve
-/// them, and kills the process with STATUS_ENTRYPOINT_NOT_FOUND before `main`
-/// runs -- which is how two integration suites failed on Windows without ever
-/// reaching a test.
+/// Without it, two integration suites died on Windows with
+/// STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before `main` ran, so nothing in
+/// them was ever checked. Only those two reach the window code in `muda` and
+/// `wry`, which is why only they failed.
+///
+/// What was verified on the runner: the failing binaries import comctl32
+/// alongside the rest of the GUI stack, and every DLL they import resolves in
+/// System32 -- so the loader was failing on a missing EXPORT, not a missing
+/// DLL. Embedding this manifest makes both suites load and pass.
+///
+/// What was NOT pinned down: which single import was unresolvable. The
+/// manifest decides which comctl32 the loader binds -- the 5.82 copy in
+/// System32, or the version 6 assembly in the side-by-side store -- and the
+/// three subclassing functions those crates call by name (`SetWindowSubclass`,
+/// `RemoveWindowSubclass`, `DefSubclassProc`) are exported by the System32
+/// copy too, so the unresolved import is something else. Naming it would take
+/// another run against a Windows host; the fix is the same either way.
 ///
 /// `rustc-link-arg-tests` applies to test targets only, so the application
-/// binary keeps the manifest `tauri_build` embeds and nothing is emitted on
+/// binary keeps the manifest `tauri_build` embeds, and nothing is emitted on
 /// platforms whose linker has no such flag.
 fn embed_test_manifest() {
     println!("cargo:rerun-if-changed=tests.manifest");

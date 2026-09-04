@@ -2,16 +2,14 @@
 <!--
   Application manifest for this crate's TEST binaries.
 
-  muda and wry import SetWindowSubclass, RemoveWindowSubclass and
-  DefSubclassProc from comctl32. Those are exported only by comctl32
-  version 6, which lives in the side-by-side store; the copy in System32 is
-  version 5 and does not export them. A binary that does not declare this
-  dependency binds to the System32 copy, and the loader then fails the
-  process with STATUS_ENTRYPOINT_NOT_FOUND before main runs.
+  Without it, the two suites that reach muda's and wry's window code died at
+  load with STATUS_ENTRYPOINT_NOT_FOUND before main ran. Declaring the
+  comctl32 version 6 dependency binds the side-by-side assembly instead of the
+  5.82 copy in System32, and both suites then load and pass.
 
   The application binary gets an equivalent manifest from tauri_build; cargo
-  test binaries get none, which is why only the two suites that reach that
-  window code could not start.
+  test binaries get none, which is why only the tests were affected. See
+  build.rs for what was and was not verified about the exact failing import.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
