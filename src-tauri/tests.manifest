@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for this crate's TEST binaries.
+
+  muda and wry import SetWindowSubclass, RemoveWindowSubclass and
+  DefSubclassProc from comctl32. Those are exported only by comctl32
+  version 6, which lives in the side-by-side store; the copy in System32 is
+  version 5 and does not export them. A binary that does not declare this
+  dependency binds to the System32 copy, and the loader then fails the
+  process with STATUS_ENTRYPOINT_NOT_FOUND before main runs.
+
+  The application binary gets an equivalent manifest from tauri_build; cargo
+  test binaries get none, which is why only the two suites that reach that
+  window code could not start.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

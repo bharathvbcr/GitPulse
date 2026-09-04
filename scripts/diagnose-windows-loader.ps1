@@ -46,6 +46,20 @@ $extra | ForEach-Object {
   Write-Host ("  {0,-32} -> {1}" -f $_, ($found ?? 'NOT FOUND ON PATH'))
 }
 
+Write-Host "`n=== comctl32 functions the binary IMPORTS ==="
+$imp = & $dumpbin.FullName /nologo /imports $failing.FullName
+$inComctl = $false
+foreach ($line in $imp) {
+  if ($line -match '^\s{4}(\S+\.dll)') { $inComctl = ($Matches[1].ToLower() -eq 'comctl32.dll') ; continue }
+  if ($inComctl -and $line -match '^\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)') { Write-Host "  $($Matches[1])" }
+}
+Write-Host "`n=== does the System32 comctl32 EXPORT them? ==="
+$exp = & $dumpbin.FullName /nologo /exports "$env:WINDIR\System32\comctl32.dll"
+foreach ($fn in @('SetWindowSubclass','RemoveWindowSubclass','DefSubclassProc')) {
+  $has = $exp | Select-String -SimpleMatch $fn
+  Write-Host ("  {0,-24} in System32 comctl32: {1}" -f $fn, [bool]$has)
+}
+
 Write-Host "`n=== running the failing binary to capture the loader error ==="
 & $failing.FullName --list 2>&1 | Select-Object -First 8
 Write-Host "exit code: $LASTEXITCODE"
