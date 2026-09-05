@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -13,14 +14,14 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
  * Each count is taken from the canonical implementation rather than recounted
  * here, so this cannot drift from what the checkers actually measure.
  */
-// PROMO.md joined this list after its "13 Purpose-Built Views" survived two
-// consolidations unnoticed: it was outside the contract, so nothing read it.
+// This committed contract covers versioned docs. PROMO.md is ignored and
+// absent from fresh checkouts; track it before bringing its counts under this
+// contract. A local copy must never be required for these checks to run.
 const DOCS = [
   "README.md",
   "CONTRIBUTING.md",
   "docs/ARCHITECTURE.md",
   "docs/FEATURES.md",
-  "docs/PROMO.md",
 ] as const;
 
 function read(relative: string): string {
@@ -52,6 +53,27 @@ function expectAllClaim(pattern: RegExp, actual: number, label: string): void {
 }
 
 describe("documented counts match the code", () => {
+  it("only depends on tracked documents available in fresh checkouts", () => {
+    const tracked = new Set(
+      execFileSync("git", ["ls-files", "-z", "--", ...DOCS], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        encoding: "utf8",
+        timeout: 5_000,
+      }).split("\0"),
+    );
+    expect(
+      DOCS.filter((doc) => !tracked.has(doc)),
+      "counted documents must be tracked; local or ignored files cannot satisfy the contract",
+    ).toEqual([]);
+  });
+
+  it("rejects a count check when no document makes a matching claim", () => {
+    // The negative lookahead never matches, regardless of document contents.
+    expect(() => expectAllClaim(/(\d+)(?!)/g, 0, "handler")).toThrow(
+      "no document states a handler count",
+    );
+  });
+
   it("states the real number of IPC handlers", () => {
     // Counted by the IPC checker's own parser, not by a second regex here.
     const { handlers, errors } = parseRegisteredHandlers(readFileSync(DEFAULT_LIB_RS, "utf8"));

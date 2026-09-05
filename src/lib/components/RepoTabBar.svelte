@@ -327,7 +327,7 @@
 </script>
 
 {#if $repoStore.openTabs.length > 0}
-  <div class="h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
+  <div class="gp-glass gp-repo-tabs h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button

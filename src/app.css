@@ -377,6 +377,146 @@ html.macos ::-webkit-scrollbar {
   height: 11px;
 }
 
+/* macOS material system. Static ambient color sits behind a bounded number
+   of glass surfaces; scrolling rows and code/graph canvases stay opaque.
+   WKWebView owns GPU compositing. No WebGL context, animated blur, global
+   will-change, or perpetual rendering loop is needed for these materials. */
+html.macos {
+  --mac-glass-fill: rgb(var(--c-surface) / 0.76);
+  --mac-glass-edge: rgb(255 255 255 / 0.10);
+  --mac-glass-sheen: rgb(255 255 255 / 0.045);
+  --mac-liquid-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html.macos.light {
+  --mac-glass-fill: rgb(255 255 255 / 0.78);
+  --mac-glass-edge: rgb(var(--c-border) / 0.22);
+  --mac-glass-sheen: rgb(255 255 255 / 0.65);
+}
+
+html.macos .gp-shell {
+  background-image:
+    radial-gradient(ellipse at 0% 12%, rgb(var(--c-accent) / 0.24), transparent 55%),
+    radial-gradient(ellipse at 85% 90%, rgb(45 175 180 / 0.12), transparent 55%);
+}
+
+html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
+  /* Solid fallback is the default; translucency requires filter support. */
+  background-color: rgb(var(--c-surface));
+  background-image: linear-gradient(155deg, var(--mac-glass-sheen), transparent 48%);
+  border-color: var(--mac-glass-edge);
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), var(--shadow-card);
+}
+
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
+    background-color: var(--mac-glass-fill);
+    -webkit-backdrop-filter: blur(20px) saturate(135%);
+    backdrop-filter: blur(20px) saturate(135%);
+  }
+}
+
+html.macos .gp-titlebar-actions,
+html.macos .gp-welcome {
+  background-color: transparent;
+}
+
+html.macos .gp-welcome-card {
+  padding: 32px;
+  border: 1px solid var(--mac-glass-edge);
+  border-radius: 28px;
+}
+
+html.macos .gp-workspace {
+  margin: 8px 8px 8px 0;
+  border: 1px solid rgb(var(--c-border) / 0.65);
+  border-radius: 16px;
+  box-shadow: var(--shadow-card);
+}
+
+html.macos .gp-sidebar {
+  border-right-color: transparent;
+}
+
+html.macos :is(.gp-menu, .gp-card.shadow-float) {
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), var(--shadow-float);
+}
+
+/* A single shared-element selection glides between the four view buttons.
+   Svelte crossfade animates transform/opacity, never the labels or layout. */
+html.macos .gp-liquid-tabs {
+  padding: 3px;
+  background: rgb(var(--c-bg) / 0.38);
+  border-color: var(--mac-glass-edge);
+}
+
+html.macos .gp-liquid-tabs .gp-seg-btn {
+  position: relative;
+  padding: 5px 13px;
+}
+
+html.macos .gp-liquid-tabs .gp-seg-btn[data-active="true"] {
+  background: transparent;
+  box-shadow: none;
+}
+
+html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
+  outline: 2px solid rgb(var(--c-accent));
+  outline-offset: 2px;
+}
+
+.gp-liquid-selection {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  background: linear-gradient(160deg, var(--mac-glass-sheen), transparent), rgb(var(--c-surface-hover));
+  border: 1px solid var(--mac-glass-edge);
+  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), 0 2px 5px rgb(0 0 0 / 0.14);
+}
+
+.gp-liquid-tabs .gp-seg-btn > span:not(.gp-liquid-selection) {
+  position: relative;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn) {
+    transition-property: color, background-color, border-color, box-shadow, transform;
+    transition-duration: 180ms;
+    transition-timing-function: var(--mac-liquid-ease);
+  }
+
+  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active:not(:disabled) {
+    transform: translate3d(0, 1px, 0) scale(0.97);
+  }
+}
+
+/* These preferences remain live CSS queries. Opaque surfaces also cover
+   browsers that expose increased contrast but not reduced transparency. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
+  html.macos .gp-shell {
+    background-image: none;
+  }
+
+  html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float, .gp-liquid-tabs) {
+    background: rgb(var(--c-surface));
+    border-color: rgb(var(--c-border));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  html.macos .backdrop-blur-sm {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: rgb(var(--c-bg) / 0.96);
+  }
+
+  html.macos .gp-liquid-selection {
+    background: rgb(var(--c-surface-hover));
+    border-color: rgb(var(--c-accent));
+  }
+}
+
 .overflow-auto,
 .overflow-y-auto,
 .overflow-x-auto,
@@ -462,6 +602,15 @@ html.macos ::-webkit-scrollbar {
   .gp-pop {
     animation: gp-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
   }
+
+  html.macos .gp-view,
+  html.macos .gp-pop {
+    animation-duration: 260ms;
+    animation-timing-function: var(--mac-liquid-ease);
+    /* Release the transform layer after entrance, so fixed descendants keep
+       their viewport coordinates and idle surfaces do not retain textures. */
+    animation-fill-mode: backwards;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -480,6 +629,10 @@ html.macos ::-webkit-scrollbar {
   .transition,
   [class*="transition-["] {
     transition: none !important;
+  }
+
+  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active {
+    transform: none;
   }
 }
 

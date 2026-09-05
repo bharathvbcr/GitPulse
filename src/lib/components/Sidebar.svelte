@@ -183,7 +183,7 @@
 </script>
 
 <aside
-  class="relative bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
+  class="gp-glass gp-sidebar relative bg-surface border-r border-border flex flex-col font-sans select-none text-xs shrink-0 h-full gp-pane {!dragging
     ? 'transition-[width] duration-150'
     : ''}"
   style="width:{$layoutStore.collapsed ? SIDEBAR_COLLAPSED_WIDTH : $layoutStore.width}px"

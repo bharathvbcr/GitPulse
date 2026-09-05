@@ -94,7 +94,7 @@
 {#if detail !== "hidden"}
 <footer
   title={forcedTip}
-  class="h-6 shrink-0 bg-surface/95 border-t border-border/70 px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none gp-gpu z-20"
+  class="gp-glass h-6 shrink-0 bg-surface/95 border-t border-border/70 px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none gp-gpu z-20"
   role="status"
   aria-label="Repository Status Bar"
 >

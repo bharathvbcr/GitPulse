@@ -2,6 +2,8 @@
 
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
+On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md), with opaque content panes and accessibility fallbacks.
+
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
