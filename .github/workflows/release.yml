@@ -42,6 +42,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-tags: true
 
       - name: Confirm Checkout Is The Tagged Commit
         run: |
@@ -93,6 +94,13 @@ jobs:
       - name: Release Version Gate
         run: npm run check:release -- --tag "$RELEASE_TAG"
 
+      # Fail here, before 90-minute platform builds, if CHANGELOG.md has no
+      # section for this tag. The notes themselves are applied after upload:
+      # they are 54 KB for v0.0.5, past the 48 KB environment-file variable cap, so
+      # they must not travel through an environment variable.
+      - name: Changelog Has Notes For This Tag
+        run: npm run release:notes -- --tag "$RELEASE_TAG"
+
       # Preflight mirrors ci.yml step-for-step. Previously it ran only the
       # type check and clippy, so a tag whose commit CI never covered — or
       # covered red — could still ship binaries.
@@ -112,7 +120,10 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Rust Unit & Integration Tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        # Match ci.yml: --locked refuses a lockfile the tree would rewrite,
+        # --no-fail-fast reports every failing binary rather than stopping at
+        # the first, and --nocapture keeps panic text on the job log.
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
 
   release:
     name: Build & Upload (${{ matrix.platform }})
@@ -143,6 +154,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-tags: true
 
       - name: Install System Dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
@@ -169,25 +181,6 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
-      # The release body comes from CHANGELOG.md rather than a literal block
-      # here, which described v0.0.3 regardless of the tag being built. A tag
-      # with no changelog section fails the job: publishing a release whose
-      # notes silently vanished is worse than not publishing.
-      - name: Release Notes from Changelog
-        shell: bash
-        run: |
-          # Capture first so the failure is visible without relying on the
-          # runner's `set -e`: appending the extractor's output straight into a
-          # `{ ... } >> $GITHUB_ENV` group makes the group's status the last
-          # echo, so the guarantee would hinge on a shell flag rather than on
-          # this command.
-          notes=$(node scripts/release-notes.mjs --tag "$RELEASE_TAG")
-          {
-            echo "RELEASE_NOTES<<GITPULSE_NOTES_EOF"
-            echo "$notes"
-            echo "GITPULSE_NOTES_EOF"
-          } >> "$GITHUB_ENV"
-
       - name: Build Tauri Desktop Application
         uses: tauri-apps/tauri-action@v1
         env:
@@ -200,13 +193,17 @@ jobs:
           # dead on a tag push and actively wrong on a dispatch, where
           # github.sha is the branch head rather than the tagged commit.
           releaseName: 'GitPulse v__VERSION__'
-          releaseBody: ${{ env.RELEASE_NOTES }}
+          # Stub only. The v0.0.5 changelog section is 54 KB, past GitHub's
+          # 48 KB cap on an environment-file variable, so the full notes cannot
+          # pass through the runner env into this input. The verify job writes
+          # them from CHANGELOG.md with `gh release edit --notes-file`.
+          releaseBody: 'Draft — changelog notes are applied after every platform uploads.'
           releaseDraft: true
           prerelease: false
           # No updater plugin is configured in tauri.conf.json, so there is no
-          # latest.json to publish. Left at its default (true) this would be a
-          # no-op today and would start publishing an update manifest the
-          # moment the updater is switched on, without anyone deciding to.
+          # latest.json to publish. v1 renamed the v0 updater-json input; the
+          # old key is ignored and the default (true) would upload an updater
+          # manifest the moment the plugin appears, without anyone deciding to.
           #
           # Still accurate as of the opt-in release check (src-tauri/src/updates):
           # that feature only compares published tags via `git ls-remote` and
@@ -214,7 +211,8 @@ jobs:
           # nothing, so it needs neither signed update artifacts nor a manifest.
           # Flipping this to true requires adding tauri-plugin-updater AND a
           # signing keypair (TAURI_SIGNING_PRIVATE_KEY) first.
-          includeUpdaterJson: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
           # A 20-to-90-minute build should not be thrown away by one flaky
           # asset upload.
           retryAttempts: 3
@@ -233,8 +231,10 @@ jobs:
       # `contents: write` is the *minimum* that works here, not a convenience:
       # the REST releases API only lists draft releases for callers with push
       # access, so a `contents: read` token 404s on the very release this job
-      # exists to inspect and the check fails for the wrong reason. This job
-      # only reads; it never mutates the release.
+      # exists to inspect and the check fails for the wrong reason. After the
+      # inventory holds, this job also writes the changelog onto the draft
+      # (`gh release edit --notes-file`) because the notes do not fit in
+      # an environment-file variable.
       contents: write
     steps:
       - name: Report Build Matrix Outcome
@@ -250,12 +250,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-tags: true
 
       - name: Inventory Draft Release Assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This job intentionally has no checkout, so gh cannot infer the
-          # repository from a git remote.
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -279,3 +278,18 @@ jobs:
             echo
             echo "All three platforms produced an installer. The release is a **draft**; publish it manually."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply Changelog Notes To The Draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # File, not env: v0.0.5 notes are 54 KB and GitHub caps an
+          # environment-file variable at 48 KB. `gh release edit --notes-file`
+          # reads the changelog section from disk. Leave the release a draft.
+          node scripts/release-notes.mjs --tag "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          bytes=$(wc -c < "$RUNNER_TEMP/release-notes.md" | tr -d ' ')
+          echo "changelog notes: ${bytes} bytes"
+          gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release view "$RELEASE_TAG" --json body --jq '.body | length'

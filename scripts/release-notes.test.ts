@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { extractNotes, main, normalizeTag } from "./release-notes.mjs";
 
@@ -70,5 +72,15 @@ describe("release notes extraction", () => {
 
   it("matches the repository's own changelog for a released tag", () => {
     expect(main(["--tag", "v0.0.3"])).toBe(0);
+  });
+
+  it("extracts the current v0.0.5 section, including the language-mix fix", () => {
+    const changelog = readFileSync(fileURLToPath(new URL("../CHANGELOG.md", import.meta.url)), "utf8");
+    const result = extractNotes(changelog, "v0.0.5");
+    expect(result.found).toBe(true);
+    if (!result.found) return;
+    expect(result.body).toContain("Language mix was ordered by category, not by share");
+    expect(result.body).toContain("Release notes for this tag would have failed to publish");
+    expect(result.body.length).toBeGreaterThan(48_000);
   });
 });
