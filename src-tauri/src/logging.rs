@@ -661,19 +661,35 @@ fn safe_log_line(value: &str) -> String {
     bound_utf8(&single_line, MAX_LOG_ENTRY_BYTES)
 }
 
+/// Largest index `<= max` in `value` that sits on a UTF-8 character boundary.
+///
+/// Every byte budget in this module has to pass through here before it
+/// reaches a slice. A raw `&str[..n]` panics whenever `n` lands inside a
+/// multi-byte character, and this module *is* the panic hook's formatter: a
+/// panic raised here re-enters the hook and aborts the process instead of
+/// logging anything.
+fn floor_char_boundary(value: &str, max: usize) -> usize {
+    let mut cut = max.min(value.len());
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
 fn bound_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
     }
     if max_bytes <= LOG_TRUNCATION_MARKER.len() {
-        return LOG_TRUNCATION_MARKER[..max_bytes].to_string();
+        // The marker is not ASCII — it carries two U+2026 ellipses — so the
+        // budget must be floored onto a boundary here too. Slicing it raw
+        // panicked for every budget of 2, 3, 26 or 27 bytes.
+        return LOG_TRUNCATION_MARKER[..floor_char_boundary(LOG_TRUNCATION_MARKER, max_bytes)]
+            .to_string();
     }
 
     let body = max_bytes - LOG_TRUNCATION_MARKER.len();
-    let mut head_end = body * 35 / 100;
-    while head_end > 0 && !value.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
+    let head_end = floor_char_boundary(value, body * 35 / 100);
     let tail_budget = body - head_end;
     let mut tail_start = value.len().saturating_sub(tail_budget);
     while tail_start < value.len() && !value.is_char_boundary(tail_start) {
@@ -1371,5 +1387,45 @@ mod tests {
                 .is_some_and(|d| d.contains(LOG_DIR_ENV)),
             "absence must be stated, and say how to change it: {reported:?}"
         );
+    }
+
+    /// Regression: `bound_utf8` sliced `LOG_TRUNCATION_MARKER` at a raw byte
+    /// index. The marker carries two U+2026 ellipses, so every budget landing
+    /// inside one panicked — the same char-boundary class as the
+    /// `parse_co_authors` crash, but sited in the panic hook's own formatter,
+    /// where a panic re-enters the hook and aborts the process.
+    ///
+    /// Swept rather than spot-checked: the failing budgets (2, 3, 26, 27)
+    /// depend on where the ellipses sit, so editing the marker text moves
+    /// them. A sweep re-derives them from whatever the marker currently is.
+    #[test]
+    fn bound_utf8_holds_its_budget_on_a_boundary_for_every_marker_sized_budget() {
+        for value in ["\u{2014}".repeat(64), "e\u{301}\u{1f600}x".repeat(32)] {
+            for max_bytes in 0..=LOG_TRUNCATION_MARKER.len() {
+                let out = bound_utf8(&value, max_bytes);
+                assert!(
+                    out.len() <= max_bytes,
+                    "budget {max_bytes} overrun by {out:?}"
+                );
+            }
+        }
+    }
+
+    /// The budget is a *byte* cap, and the head/tail split must respect it at
+    /// every size — not only the comfortable ones well past the marker.
+    #[test]
+    fn bound_utf8_never_exceeds_its_budget_at_any_size() {
+        let value = "\u{1f600}a\u{4e2d}b\u{301}".repeat(200);
+        for max_bytes in 0..=value.len() + 8 {
+            let out = bound_utf8(&value, max_bytes);
+            assert!(
+                out.len() <= max_bytes,
+                "budget {max_bytes} overrun by {} bytes",
+                out.len().saturating_sub(max_bytes)
+            );
+            // Output must itself be valid UTF-8 text, which `String` proves,
+            // and must never end mid-character.
+            assert!(out.is_char_boundary(out.len()));
+        }
     }
 }
