@@ -104,7 +104,34 @@ Its data is tiered by cost, and the tier boundary is visible to the reader:
 ### Svelte 5 Runes & Dependency Injection
 - **Component State**: Uses modern Svelte 5 runes (`$state`, `$derived`, `$effect`) for local, reactive component state.
 - **Store Architecture**: Domain stores (e.g. `repoStore`, `graphStore`, `filterStore`, `harnessStore`) are instantiated using factory functions with injectable dependencies (`createRepoStore(deps)`), enabling 100% headless unit testing without requiring Tauri runtime mocks.
-- **Domain Modules**: Pure business logic is isolated under `src/lib/` (`files/`, `coverage/`, `health/`, `diff/`, `canvas/`, `terminal/`, `branches/`), completely independent of the DOM.
+- **Domain Modules**: Pure business logic is isolated under `src/lib/` (`files/`, `coverage/`, `health/`, `diff/`, `canvas/`, `terminal/`, `branches/`, `stack/`, `work/`, `github/`, `text/`), completely independent of the DOM. Presentation helpers that still need no DOM of their own live beside them in `ui/`, and the few that genuinely touch elements are quarantined in `dom/`.
+
+### One owner per cross-pane behaviour
+
+Several behaviours are needed by more than one pane, and each was independently
+reimplemented at least once before being pulled into a shared module. The rule
+is that the pane calls the owner rather than carrying its own copy, and a
+contract test holds the panes to it:
+
+| Behaviour | Owner | Enforced by |
+|---|---|---|
+| Row height for every fixed-row surface | [`src/lib/ui/density.ts`](../src/lib/ui/density.ts) | `density.test.ts` greps each pane for `rowHeight("<surface>", $densityStore)` |
+| Tablist roving focus and arrow keys | [`src/lib/dom/tablist.ts`](../src/lib/dom/tablist.ts) | `tablist.test.ts` checks every `role="tablist"` implements what it announces |
+| Bounded in-file / in-diff search | [`src/lib/text/lineSearch.ts`](../src/lib/text/lineSearch.ts) | `lineSearch.test.ts` covers the cap, the deadline and the backtracking refusal |
+| UI scale | [`src/lib/ui/uiScale.ts`](../src/lib/ui/uiScale.ts) | writes `--ui-font-scale` to `documentElement` |
+
+Two of these are worth stating plainly, because both were live defects:
+
+- **`--ui-font-scale` must be written to the root.** It was previously declared
+  on a `<div>` inside `<body>` and read by a rule on `body` — an ancestor of the
+  element declaring it. Custom properties inherit *downward only*, so the rule
+  resolved the `:root` default of `1` forever and the setting moved nothing.
+- **In-file search must go through `lineSearch`.** A hand-rolled `RegExp` loop
+  is unbounded: it can spin forever on a zero-width match, and a pattern like
+  `(a+)+c` cannot be interrupted once a JavaScript regex starts backtracking.
+  The owner refuses such a pattern, caps the match list, and stops at a
+  wall-clock deadline — reporting `2 of 5+` rather than presenting a capped
+  sample as a total.
 
 ### Async Hygiene & Cancellation Guards
 When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.

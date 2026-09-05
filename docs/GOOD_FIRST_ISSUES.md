@@ -225,7 +225,7 @@ the five genuinely-correct suppressions now state their reasoning, with
 ### D2 · Document the keyboard shortcut surface ✅ *(Completed)*
 **Labels:** `documentation`
 
-*Completed in [`docs/FEATURES.md`](FEATURES.md#4-keyboard-shortcuts-reference).*
+*Completed in [`docs/FEATURES.md`](FEATURES.md#6-keyboard-shortcuts-reference).*
 
 All keyboard shortcuts from `ShortcutsModal.svelte`, `App.svelte`, and native OS menus are documented with macOS and Windows/Linux chords.
 
