@@ -11,6 +11,12 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+- Automatic macOS glass styling for window chrome, sidebar, menus, and dialogs; fluid view-selection and dialog transitions with reduced-motion, reduced-transparency, and contrast fallbacks. In-app glass preserves existing distribution options.
+
+### Fixed
+- Exclude iPhones, iPads, and desktop-mode iPads from Mac-specific window chrome and appearance.
+
 ## [0.0.5] - 2026-09-04
 
 ### Changed

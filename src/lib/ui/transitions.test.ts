@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   BACKDROP_IN_MS,
   BACKDROP_OUT_MS,
@@ -16,6 +16,11 @@ function media(matches: boolean) {
 }
 
 describe("modal transition params", () => {
+  // Pin the standard profile: Node now exposes the host platform through
+  // navigator. Mac behavior has its own coverage in macAppearance.test.ts.
+  beforeEach(() => vi.stubGlobal("navigator", { platform: "Win32" }));
+  afterEach(() => vi.unstubAllGlobals());
+
   it("pins exact durations; every OUT is strictly shorter than its IN twin", () => {
     expect(BACKDROP_IN_MS).toBe(140);
     expect(BACKDROP_OUT_MS).toBe(60);

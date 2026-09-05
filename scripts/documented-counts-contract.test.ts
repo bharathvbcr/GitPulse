@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -13,6 +14,9 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
  * Each count is taken from the canonical implementation rather than recounted
  * here, so this cannot drift from what the checkers actually measure.
  */
+// This committed contract covers versioned docs. PROMO.md is ignored and
+// absent from fresh checkouts; track it before bringing its counts under this
+// contract. A local copy must never be required for these checks to run.
 const TRACKED_DOCS = [
   "README.md",
   "CONTRIBUTING.md",
@@ -145,6 +149,33 @@ describe("documented counts match the code", () => {
       [...new Set(stating)].sort(),
       "every committed document must state one of the counts this contract checks",
     ).toEqual([...TRACKED_DOCS].sort());
+  });
+
+  /**
+   * Existing on this machine is weaker than being tracked: an ignored or
+   * untracked local copy satisfies `existsSync` and is absent from every fresh
+   * clone, which is the shape PROMO.md had when it crashed CI. Asking git,
+   * rather than the filesystem, is what makes the corpus a repository fact.
+   */
+  it("only depends on tracked documents available in fresh checkouts", () => {
+    const tracked = new Set(
+      execFileSync("git", ["ls-files", "-z", "--", ...TRACKED_DOCS], {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        encoding: "utf8",
+        timeout: 5_000,
+      }).split("\0"),
+    );
+    expect(
+      TRACKED_DOCS.filter((doc) => !tracked.has(doc)),
+      "counted documents must be tracked; local or ignored files cannot satisfy the contract",
+    ).toEqual([]);
+  });
+
+  it("rejects a count check when no document makes a matching claim", () => {
+    // The negative lookahead never matches, regardless of document contents.
+    expect(() => expectClaims(TRACKED_DOCS, /(\d+)(?!)/g, 0, "handler")).toThrow(
+      "no document states a handler count",
+    );
   });
 
   it("states the real number of IPC handlers", () => {

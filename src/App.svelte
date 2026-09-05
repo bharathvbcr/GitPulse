@@ -580,13 +580,13 @@
   {/snippet}
 
 <div
-  class="h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
+  class="gp-shell h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
   style="--ui-font-scale: {$interfaceStore.uiFontScale};"
 >
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed}>
     <header
-    class="bg-surface border-b border-border flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
+    class="gp-glass gp-titlebar bg-surface border-b border-border flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
       ? 'h-12 pr-3'
       : 'h-10 px-3'}"
   >
@@ -635,7 +635,7 @@
     </div>
 
     <!-- Right Actions -->
-    <div class="flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
+    <div class="gp-titlebar-actions flex items-center gap-2 shrink-0 bg-surface pl-1 h-full">
       <!-- "When recorded" hides this only while the log is genuinely empty,
            errors and warnings alike; the palette opens Diagnostics either way. -->
       {#if showsDiagnosticsButton($interfaceStore.diagnosticsButton, $diagnostics.length)}
@@ -683,14 +683,14 @@
   <div class="flex-1 flex flex-col min-h-0" class:hidden={fleetOpen}>
   {#if !$repoStore.currentPath}
     <!-- Welcome & Open Repository Screen -->
-    <div class="flex-1 flex flex-col items-center justify-center p-8 bg-background select-none relative overflow-hidden">
+    <div class="gp-welcome flex-1 flex flex-col items-center justify-center p-8 bg-background select-none relative overflow-hidden">
       <!-- Ambient brand glow behind the hero card. -->
       <div
         aria-hidden="true"
         class="pointer-events-none absolute -top-32 left-1/2 h-96 w-[36rem] -translate-x-1/2 rounded-full opacity-25 blur-3xl"
         style="background: var(--brand-gradient);"
       ></div>
-      <div class="gp-view max-w-md w-full flex flex-col items-center text-center space-y-6 relative">
+      <div class="gp-welcome-card gp-glass gp-view max-w-md w-full flex flex-col items-center text-center space-y-6 relative">
         <Logo size={68} variant="badge" animated />
 
         <div>
@@ -740,7 +740,7 @@
           <Sidebar />
         </svelte:boundary>
         <svelte:boundary failed={paneFailed}>
-          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane">
+          <main class="gp-workspace flex-1 flex flex-col min-w-0 bg-background gp-pane">
             <!-- No {#key activeTab}: keying here destroyed and rebuilt the
                  entire pane on every view switch and replayed the .gp-view
                  entrance fade — a full-screen flicker per tab. The {#if}

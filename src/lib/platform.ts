@@ -2,7 +2,11 @@ export function isMacOS(): boolean {
   if (typeof navigator === "undefined") return false;
   const platform = navigator.platform || "";
   const ua = navigator.userAgent || "";
-  return /Mac|Macintosh/.test(platform) || /Mac OS X/.test(ua);
+  // iOS says "like Mac OS X", and desktop-mode iPads report MacIntel.
+  // Neither should receive desktop chrome (including traffic-light spacing).
+  if (/iPad|iPhone|iPod/.test(ua) || /iPad|iPhone|iPod/.test(platform)) return false;
+  if (navigator.maxTouchPoints > 1) return false;
+  return /Mac/.test(platform) || /Macintosh|Mac OS X/.test(ua);
 }
 
 export function isTauri(): boolean {

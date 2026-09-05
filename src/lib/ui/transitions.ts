@@ -1,4 +1,6 @@
-import { motionDuration, type MediaMatch } from "../motion/easing";
+import { easeOutCubic, motionDuration, type MediaMatch } from "../motion/easing";
+import { isMacOS } from "../platform";
+import type { CrossfadeParams, ScaleParams } from "svelte/transition";
 
 /**
  * Shared transition params for every modal backdrop and card — one seam so
@@ -23,10 +25,22 @@ export function backdropFadeOut(media?: MediaMatch | null): { duration: number }
   return { duration: motionDuration(BACKDROP_OUT_MS, media) };
 }
 
-export function cardScale(media?: MediaMatch | null): { duration: number; start: number } {
+export function cardScale(media?: MediaMatch | null): ScaleParams & { duration: number; start: number } {
+  if (isMacOS()) {
+    return { duration: motionDuration(260, media), start: 0.985, easing: easeOutCubic };
+  }
   return { duration: motionDuration(CARD_IN_MS, media), start: CARD_START };
 }
 
 export function cardScaleOut(media?: MediaMatch | null): { duration: number; start: number } {
-  return { duration: motionDuration(CARD_OUT_MS, media), start: CARD_START };
+  return { duration: motionDuration(CARD_OUT_MS, media), start: isMacOS() ? 0.985 : CARD_START };
+}
+
+export function liquidSelection(media?: MediaMatch | null): CrossfadeParams {
+  return {
+    easing: easeOutCubic,
+    // An outgoing pill may have mounted before the system preference changed.
+    // Svelte evaluates this callback when each transition actually starts.
+    duration: () => motionDuration(280, media),
+  };
 }

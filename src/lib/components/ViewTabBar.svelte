@@ -4,6 +4,14 @@
   import { formatViewTabLabel, type ViewNavItem } from "../views/viewNav";
   import { visibleViewNav } from "../views/viewVisibility";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
+
+  const macos = isMacOS();
+  // Svelte owns interruption and element cleanup. Only the decorative pill
+  // moves; labels and focus targets stay in place, even during rapid changes.
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   /**
    * The header view switcher: four tabs, no menus.
@@ -54,7 +62,7 @@
 </script>
 
 <div bind:this={scroller} class="flex items-center gap-1.5 shrink-0" role="tablist" aria-label="Views">
-  <div class="gp-segmented">
+  <div class="gp-segmented" class:gp-liquid-tabs={macos}>
     {#each navItems as item (item.id)}
       {@const active = activeTab === item.id}
       <button
@@ -66,6 +74,14 @@
         onclick={() => selectTab(item.id)}
         class="gp-seg-btn {tabClass(item, active)}"
       >
+        {#if macos && active}
+          <span
+            class="gp-liquid-selection gp-gpu"
+            aria-hidden="true"
+            in:receiveSelection={{ key: "active-view" }}
+            out:sendSelection={{ key: "active-view" }}
+          ></span>
+        {/if}
         <span>{formatViewTabLabel(item, conflictedCount)}</span>
         <!-- The uncommitted-file count rode the Diff tab. Diff is a section
              of History now, and History is where that count is acted on, so
