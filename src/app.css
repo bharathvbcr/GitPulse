@@ -245,6 +245,14 @@ html.dark {
     transform: scale(0.94);
   }
 
+  /* Small status chip: a count, a label, a state.
+     Written by a dozen call sites across the GitHub, MANVI and Stack panes
+     and never defined, so every one of them rendered as bare inline text
+     with the `!bg-…`/`!text-…` overrides beside it landing on nothing. */
+  .gp-pill {
+    @apply inline-flex select-none items-center gap-1 rounded-full border border-border/70 bg-surfaceHover px-1.5 py-0.5 text-[10px] font-medium leading-none text-textMuted;
+  }
+
   /* Elevated card. */
   .gp-card {
     @apply rounded-2xl border border-border/70 bg-surface;

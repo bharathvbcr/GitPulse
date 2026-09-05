@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 
 import CodeStackViewer from "./CodeStackViewer.svelte";
+import { VIEW_REGISTRY } from "../views/viewRegistry";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "CodeStackViewer.svelte"),
@@ -51,18 +52,21 @@ describe("CodeStackViewer restack safety", () => {
   });
 
   it("journals the settled restack before returning stale UI work", () => {
-    const body = source.slice(source.indexOf("async function restack"), source.indexOf("$effect"));
-    const settled = body.indexOf('await invoke("cmd_restack"');
-    const successJournal = body.indexOf("harnessStore.recordAction", settled);
-    const successGuard = body.indexOf("if (!guard.isLive()", settled);
+    // Each rebase settles inside runStep, which journals on both paths and
+    // holds no liveness check of its own — so a superseded cascade cannot
+    // return past a rebase that really ran and leave it out of the journal.
+    const body = source.slice(source.indexOf("async function runStep"), source.lastIndexOf("</script>"));
+    const step = body.slice(0, body.indexOf("\n  }"));
+    expect(step).not.toContain("guard.isLive()");
+    const settled = step.indexOf('await invoke("cmd_restack"');
+    const successJournal = step.indexOf("harnessStore.recordAction", settled);
     expect(successJournal).toBeGreaterThan(settled);
-    expect(successJournal).toBeLessThan(successGuard);
-
-    const caught = body.indexOf("} catch", successGuard);
-    const failureJournal = body.indexOf("harnessStore.recordAction", caught);
-    const failureGuard = body.indexOf("if (!guard.isLive()", caught);
+    const caught = step.indexOf("} catch", successJournal);
+    const failureJournal = step.indexOf("harnessStore.recordAction", caught);
     expect(failureJournal).toBeGreaterThan(caught);
-    expect(failureJournal).toBeLessThan(failureGuard);
+    // A failed step still ends the cascade: the error travels up rather than
+    // letting the next branch rebase onto a parent that did not move.
+    expect(step.slice(failureJournal)).toContain("throw err;");
   });
 
   it("keeps every rejection routed through the diagnostics reporting seam", () => {
@@ -98,7 +102,7 @@ describe("CodeStackViewer load correctness", () => {
   });
 
   it("keys each stack row", () => {
-    expect(source).toContain("{#each stackNodes as node (node.branch_name)}");
+    expect(source).toContain("{#each rows as row (row.node.branch_name)}");
   });
 });
 
@@ -118,6 +122,78 @@ describe("CodeStackViewer accessibility", () => {
 
   it("renders without a repository (SSR smoke)", () => {
     const { body } = render(CodeStackViewer);
-    expect(body).toContain("Code Stack Hierarchy");
+    expect(body).toContain("Stack");
+  });
+
+  it("titles the pane the way the section that opens it is labelled", () => {
+    const section = VIEW_REGISTRY.work.sections?.find((s) => s.id === "stack");
+    expect(section?.label).toBe("Stack");
+    expect(source).toContain(`\n        ${section?.label}\n`);
+  });
+});
+
+describe("CodeStackViewer cascade contracts", () => {
+  it("plans the whole subtree from the snapshot on screen, before anything moves", () => {
+    // Once a parent is rebased the commit its children were cut from is no
+    // longer reachable from it, so the fork points have to be read before the
+    // first rewrite — which is the tree the reader was looking at.
+    expect(source).toContain("cascadePlan(stackNodes, node.branch_name)");
+    expect(source).toContain("forkPoint: step.forkPoint");
+    const fn = source.slice(source.indexOf("async function restack"), source.indexOf("async function runStep"));
+    const plan = fn.indexOf("cascadePlan(");
+    const firstInvoke = fn.indexOf("runStep(");
+    expect(plan).toBeGreaterThan(-1);
+    expect(firstInvoke).toBeGreaterThan(plan);
+  });
+
+  it("names every branch a rewrite would touch before running it", () => {
+    // "Restack 4 branches" does not tell the reader which four, and this
+    // rewrites commits on all of them.
+    expect(source).toContain("askConfirm(");
+    expect(source).toContain("describeCascade(steps)");
+    const fn = source.slice(source.indexOf("async function restack"), source.indexOf("async function runStep"));
+    expect(fn.indexOf("askConfirm(")).toBeLessThan(fn.indexOf("runStep("));
+  });
+
+  it("reports what moved when a cascade stops part-way", () => {
+    // Two of four branches rebased and then a failure leaves a repository the
+    // reader has to know about; the error alone describes it as if nothing
+    // had happened.
+    expect(source).toContain("Rebased: ${done.join(\", \")}");
+    expect(source).toContain("Still on their old base:");
+    expect(source).toContain("No branch was rebased.");
+  });
+
+  it("does not erase the partial-cascade report with the reload it triggers", () => {
+    // Caught in the real UI: the failure path sets the banner and then calls
+    // loadStack, which cleared it — so a half-rebased repository showed a
+    // screen saying nothing had happened. Clearing belongs to the next
+    // attempt, which does it before its first await; a watcher tick is not
+    // an attempt.
+    const load = source.slice(source.indexOf("async function loadStack"), source.indexOf("async function restack"));
+    expect(load).not.toContain("restackError = null");
+    const attempt = source.slice(source.indexOf("async function restack"), source.indexOf("async function runStep"));
+    expect(attempt.indexOf("restackError = null;")).toBeLessThan(attempt.indexOf("await runStep("));
+  });
+
+  it("reloads the tree once any branch has moved", () => {
+    // A stale tree is what a second click would plan its fork points from.
+    const fn = source.slice(source.indexOf("async function restack"), source.indexOf("async function runStep"));
+    const caught = fn.indexOf("} catch");
+    expect(fn.indexOf("if (done.length > 0)", caught)).toBeGreaterThan(caught);
+  });
+
+  it("draws the hierarchy as a tree rather than a flat list of parent names", () => {
+    expect(source).toContain("stackTreeRows(stackNodes)");
+    expect(source).toContain("row.depth");
+  });
+
+  it("says what the hierarchy cannot see, and lists what it placed nowhere", () => {
+    // A branch left behind by a rebase of its parent stops being a child and
+    // reappears as its own root. Without saying so, a stack that fell apart
+    // reads as a repository that never had one.
+    expect(source).toContain("rootlessBranches(stackNodes");
+    expect(source).toContain("On no stack (");
+    expect(source).toMatch(/only while it sits on its parent's current tip/);
   });
 });

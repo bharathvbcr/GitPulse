@@ -1230,6 +1230,7 @@ pub async fn cmd_restack(
     repo_path: String,
     branch: String,
     onto: String,
+    fork_point: Option<String>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
         // Plan, judge, and execute under ONE mutation-lock span: the upstream
@@ -1243,7 +1244,9 @@ pub async fn cmd_restack(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(&branch)?;
         validate_ref_name(&onto)?;
-        let upstream = GitWriter::prepare_restack(&repo, &branch, &onto)?;
+        // A cascade supplies the parent tip it read the stack at; every other
+        // caller passes none and gets the computed fork point.
+        let upstream = GitWriter::prepare_restack(&repo, &branch, &onto, fork_point.as_deref())?;
         let planned = [
             "git",
             "rebase",
@@ -2596,10 +2599,37 @@ mod tests {
         let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
         run_git(dir.path(), &["branch", "feature", &base]);
         let canon = validate_repo(dir.path().to_str().unwrap()).unwrap();
-        let upstream = GitWriter::prepare_restack(&canon, "feature", "main").unwrap();
+        let upstream = GitWriter::prepare_restack(&canon, "feature", "main", None).unwrap();
         assert_eq!(upstream, base, "upstream must resolve to the fork base");
         // Invalid refs are refused before anything is rendered or judged.
-        assert!(GitWriter::prepare_restack(&canon, "-evil", "main").is_err());
+        assert!(GitWriter::prepare_restack(&canon, "-evil", "main", None).is_err());
+    }
+
+    /// A cascade names the fork point it read the stack at. It is honoured
+    /// when it really is an ancestor, and refused — never silently replaced
+    /// by the computed one — when the stack has moved since it was read.
+    #[test]
+    fn restack_honours_a_caller_supplied_fork_point_and_refuses_a_stale_one() {
+        let (dir, base, c_a, _c_b) = init_repo_with_branch_commits();
+        run_git(dir.path(), &["branch", "feature", &base]);
+        let canon = validate_repo(dir.path().to_str().unwrap()).unwrap();
+
+        // `base` is genuinely an ancestor of `feature`, so it is taken as-is.
+        let honoured =
+            GitWriter::prepare_restack(&canon, "feature", "main", Some(base.as_str())).unwrap();
+        assert_eq!(honoured, base);
+
+        // `c_a` sits on the other branch, so it is not an ancestor of
+        // `feature`: the plan the caller built no longer describes this
+        // repository and the restack must not proceed on a widened range.
+        let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(c_a.as_str()))
+            .expect_err("a non-ancestor fork point must be refused");
+        assert!(err.contains("no longer the stack on disk"), "{err}");
+
+        // Anything that is not an object id is refused before it reaches argv.
+        assert!(
+            GitWriter::prepare_restack(&canon, "feature", "main", Some("--exec=boom")).is_err()
+        );
     }
 
     /// The payload carries assembly warnings through a serde round trip when

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import GitHubPanel from "./GitHubPanel.svelte";
+import { VIEW_REGISTRY } from "../views/viewRegistry";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "GitHubPanel.svelte"),
@@ -13,9 +14,21 @@ const source = readFileSync(
 describe("GitHubPanel", () => {
   it("renders header and action buttons", () => {
     const { body } = render(GitHubPanel);
-    expect(body).toContain("GitHub");
+    // The heading names the section the reader clicked. Which forge this is
+    // stays legible from the mark and the owner/repo link beside it, both of
+    // which need a context this render has not got.
+    expect(body).toContain("Remote");
+    expect(body).toContain("lucide-github");
     expect(body).toContain("Run CI locally");
     expect(body).toContain("Refresh");
+  });
+
+  it("titles the pane the way the section that opens it is labelled", () => {
+    // Header and tab disagreeing about a pane's name is how a reader ends up
+    // unsure whether they arrived where they clicked.
+    const section = VIEW_REGISTRY.work.sections?.find((s) => s.id === "remote");
+    expect(section?.label).toBe("Remote");
+    expect(source).toContain(`\n        ${section?.label}\n`);
   });
 });
 
@@ -117,6 +130,16 @@ describe("GitHubPanel guarded-action contracts", () => {
     expect(fn).toContain("requested");
   });
 
+  it("gives every CI verdict both shades, so neither theme reads it as grey", () => {
+    // A bare `-400` is tuned for the dark theme and sits near 2:1 on the
+    // light theme's card — on the labels a reader came here to check.
+    const fn = source.slice(source.indexOf("function ciClass"), source.indexOf("function runLabel"));
+    for (const hue of ["green", "red", "amber"]) {
+      expect(fn, `${hue} has no light shade`).toContain(`text-${hue}-700 dark:text-${hue}-400`);
+    }
+    expect(fn).not.toMatch(/return "text-(green|red|amber)-400"/);
+  });
+
   it("reloads the graph with the visible filter context after a PR checkout", () => {
     // A bare loadGraph(repo) reset the view to query=""/HEAD while FilterBar
     // still showed the selection, and the scheduler memo then blocked the
@@ -127,5 +150,63 @@ describe("GitHubPanel guarded-action contracts", () => {
       /graphStore\.loadGraph\(\s*repo,\s*\$filterStore\.searchQuery,\s*\$filterStore\.selectedBranch,?\s*\)/,
     );
     expect(source).not.toMatch(/graphStore\.loadGraph\(\s*repo\s*\)/);
+  });
+});
+
+describe("GitHubPanel narrowing contracts", () => {
+  it("counts the facets with the same predicate the list filters by", () => {
+    // A chip reading "4 failing" over a list that shows three is the one
+    // failure a filter built from two implementations always eventually has.
+    expect(source).toContain("prFacetCounts(ctx?.pull_requests ?? [])");
+    expect(source).toContain("filterPullRequests(ctx?.pull_requests ?? [], prFacet, prQuery)");
+    expect(source).toContain("{#each visiblePrs as pr (pr.number)}");
+    expect(source).toContain("{#each visibleIssues as issue (issue.number)}");
+    expect(source).toContain("{#each visibleRuns as run (run.id)}");
+  });
+
+  it("never dresses a filter that matches nothing as an empty repository", () => {
+    expect(source).toContain("prsNarrowedToNothing");
+    expect(source).toContain("issuesNarrowedToNothing");
+    expect(source).toContain("No pull request matches this filter");
+    expect(source).toContain("No issue matches this filter");
+    expect(source).toContain("No run on this branch");
+    // The reader can always get back to the full list from the empty state.
+    expect(source).toContain("Clear filter");
+    expect(source).toContain("Show all runs");
+  });
+
+  it("drops the previous repository's narrowing on a switch", () => {
+    const effect = source.slice(source.indexOf("ctx = ctxCache.get("));
+    expect(effect).toContain("clearPrFilter();");
+    expect(effect).toContain('issueQuery = "";');
+    expect(effect).toContain("runsThisBranch = false;");
+  });
+
+  it("stamps when the context was fetched, and clears the stamp on hydration", () => {
+    // A cached listing is from whenever it was fetched. Carrying the previous
+    // repository's stamp onto it would date it to a fetch that never happened.
+    expect(source).toContain("fetchedAt = Date.now();");
+    expect(source).toContain("fetchedAt = null;");
+    expect(source).toContain("fetched {fetchedAgo}");
+  });
+
+  it("keeps the CI:local report reachable after it is folded away", () => {
+    // Whether the run became a durable git-native claim is the part a reader
+    // who has collapsed the steps still needs.
+    const report = source.slice(source.indexOf("{:else if ciReport}"));
+    const fold = report.indexOf("{#if ciReportOpen}");
+    const recorded = report.indexOf("recorded on {ciReport.recorded_commit");
+    const notRecorded = report.indexOf("not recorded —");
+    expect(fold).toBeGreaterThan(-1);
+    expect(recorded).toBeGreaterThan(report.indexOf("{/if}", fold));
+    expect(notRecorded).toBeGreaterThan(-1);
+  });
+
+  it("lays the listings out in columns rather than one ragged grid", () => {
+    // Grid rows are as tall as their tallest cell: twenty pull requests beside
+    // a three-line releases card left a screen of white space, and Workflows
+    // sat a row away from the runs they produce.
+    expect(source).not.toContain("lg:grid-cols-2 xl:grid-cols-3");
+    expect(source).toContain('class="xl:col-span-2 space-y-5 min-w-0"');
   });
 });

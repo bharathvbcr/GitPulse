@@ -47,7 +47,7 @@ describe("WorkView", () => {
 
   it("states an incomplete screen above the rows, not below them", () => {
     const warning = source.indexOf("degradedSummary");
-    const rows = source.indexOf("{#each projection.rows");
+    const rows = source.indexOf("{#each visibleRows as row");
     expect(warning).toBeGreaterThan(-1);
     expect(rows).toBeGreaterThan(-1);
     expect(source.indexOf("{degraded}")).toBeLessThan(rows);
@@ -79,8 +79,50 @@ describe("WorkView", () => {
     // Keying on task id collapsed a repository with no task store into a
     // single row labelled "Not bound to a task". Rows are keyed on `key`,
     // which is the worktree path when there is no task model.
-    expect(source).toContain("projection.rows as row (row.key");
+    expect(source).toContain("as row (row.key");
     expect(source).not.toContain("as row (row.taskId");
+  });
+
+  it("renders a narrowed list that is derived from the projection, not a second one", () => {
+    // The strip's counts and the rows must answer to the same list, or a
+    // tile can say three and the list show none of them.
+    expect(source).toContain("filterWorkRows(projection.rows, facet, query)");
+    expect(source).toContain("{#each visibleRows as row");
+  });
+
+  it("does not dress a filter that matches nothing as a repository with nothing in it", () => {
+    // "Nothing in flight" is a statement about the repository. Reusing it for
+    // a filter the reader can clear sends them looking for a problem that is
+    // their own search box.
+    expect(source).toContain("narrowedToNothing");
+    expect(source).toContain("No row matches this filter");
+    const narrowed = source.indexOf("narrowedToNothing}");
+    const nothing = source.indexOf("Nothing in flight");
+    expect(narrowed).toBeGreaterThan(-1);
+    expect(nothing).toBeGreaterThan(narrowed);
+  });
+
+  it("clears the narrowing when the repository changes", () => {
+    // A filter carried across a repository switch hides rows the reader has
+    // never seen, for a reason that scrolled off screen with the old repo.
+    expect(source).toContain("facetRepo");
+    expect(source).toMatch(/facet = "all";\s+query = "";/);
+  });
+
+  it("says where the reader is standing, and admits when it has not measured it", () => {
+    // The branch list arrives progressively; rendering its pre-fetch zeroes
+    // claims parity with a remote nobody has asked about.
+    expect(source).toContain("hereSummary(");
+    expect(source).toContain("here.unmeasured");
+    expect(source).toContain("sync not measured yet");
+  });
+
+  it("never reports a failed operation probe as an idle worktree", () => {
+    // A probe that could not run leaves the same empty space as a worktree
+    // with nothing parked in it, which is the one thing this screen may not
+    // let happen.
+    expect(source).toContain("$repoStore.operation.probeFailed");
+    expect(source).toContain("Could not check for a parked merge or rebase here");
   });
 
   it("surfaces a parked operation, which is the one thing that needs a person", () => {

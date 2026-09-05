@@ -1,5 +1,6 @@
 use crate::engine::git_cli::{
-    git_global, git_text, git_with_stdin, resolve_git_common_dir, sandbox_join, validate_repo,
+    git_captured, git_global, git_text, git_with_stdin, resolve_git_common_dir, sandbox_join,
+    validate_repo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -602,9 +603,43 @@ impl GitWriter {
     /// Caller MUST hold the repo mutation lock: the value returned here is
     /// frozen into the argv the harness gate judges AND the argv executed,
     /// closing the plan-vs-execute TOCTOU.
-    pub fn prepare_restack(repo_canon: &Path, branch: &str, onto: &str) -> Result<String, String> {
+    ///
+    /// `requested` is the caller's own record of where `branch` was cut — the
+    /// tip its parent carried when the stack was last read. Cascading a stack
+    /// needs it: the moment the parent has been rebased, `merge-base(parent,
+    /// branch)` collapses back to the trunk, and replaying from there would
+    /// re-apply the parent's own commits on top of the parent. A requested
+    /// fork point that is not an ancestor of `branch` is refused rather than
+    /// quietly swapped for the computed one — the caller planned one specific
+    /// rewrite, and silently widening it is how a cascade becomes an accident.
+    pub fn prepare_restack(
+        repo_canon: &Path,
+        branch: &str,
+        onto: &str,
+        requested: Option<&str>,
+    ) -> Result<String, String> {
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
+        if let Some(fork_point) = requested {
+            validate_oid(fork_point)?;
+            // `git_captured`, not `git_text`: a non-zero exit means "not an
+            // ancestor", while a spawn failure means the question was never
+            // asked. Flattening both into one Err would let a git that could
+            // not run read exactly like a fork point that was checked and
+            // rejected — and the caller would retry into the same wall.
+            let run = git_captured(
+                repo_canon,
+                &["merge-base", "--is-ancestor", fork_point, branch],
+            )?;
+            if !run.success {
+                return Err(format!(
+                    "Fork point {} is not an ancestor of '{branch}', so the stack this \
+                     restack was planned from is no longer the stack on disk. Reload and retry.",
+                    &fork_point[..fork_point.len().min(12)]
+                ));
+            }
+            return Ok(fork_point.to_string());
+        }
         Ok([
             vec!["merge-base", "--fork-point", onto, branch],
             vec!["merge-base", onto, branch],
@@ -737,7 +772,7 @@ impl GitWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = guard;
-        let upstream = Self::prepare_restack(&repo, branch, onto)?;
+        let upstream = Self::prepare_restack(&repo, branch, onto, None)?;
         Self::execute_restack(&repo, branch, onto, &upstream)
     }
 

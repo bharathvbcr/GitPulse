@@ -30,6 +30,9 @@ flowchart TD
 - **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight. Remotes can be added, renamed, re-pointed, pruned, or removed; submodules can be initialized, URL-synced, or deinitialized (never force-discarded). A remote, tag, or submodule listing cut by a cap says so, instead of looking complete.
 - **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
 - **A Branch on Two Tasks Appears on Both**: Assigning it to one would hide the work from the other with nothing on screen to say so.
+- **Where You Are Standing**: A strip above the rows for the checked-out branch itself — tracking state against its upstream, how far behind the default branch it is, and the working tree split into staged, unstaged and conflicted. A branch the progressive branch-stats pass has not reached yet reads *"sync not measured yet"* rather than as `0↑ 0↓`, which is what a pushed, current branch looks like. A parked operation here gets its own line into Resolve, and a probe that could not run says so instead of leaving the same empty space as an idle worktree.
+- **The Counts Are Doors**: Each tile in the strip selects exactly the rows it counted, and a filter box matches on branch, path, task and pull request. Strip and list share one predicate, so a tile saying three can never sit above a list showing none of them. A filter matching nothing says so — and offers to clear itself — rather than borrowing the wording of a repository with nothing in flight. Narrowing is dropped on a repository switch.
+- **How Long It Has Been Sitting**: Each row carries the age of the most recent commit on its branches. A worktree nobody has touched in three weeks and one from ten minutes ago read identically without it and want opposite things done; a branch the branch list has not measured shows nothing rather than the epoch.
 - **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
 - **Unreadable Is Its Own State**: A verdict this build cannot parse is counted as `unreadable`, never as `allowed` — a check that could not be read must never render as one that ran and passed.
 - **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem). The absence itself is never the headline: a reader who does not run one is told what *is* here, not what is missing.
@@ -160,8 +163,11 @@ rather than presenting a floor as a total.
 - **Historical Snapshots**: Records repo size history to plot trend sparklines ("+180 MB this week").
 
 ### 2.3 Stack (`stack`)
-- **Stacked Branch Management**: Visualizes branch chains and dependencies.
-- **Interactive Rebase Helper**: Smooth workflow for updating and rebasing stacked PR branches.
+- **The Chain, As A Chain**: The hierarchy renders as a tree — parents above, children indented under them — rather than a flat list with "based on X" on every row, which made the reader rebuild the shape in their head.
+- **Each Branch, Joined To What Is Known About It**: How far it is ahead of its parent and behind the default branch, its tracking state (`↑`/`↓`, `upstream gone`, or `untracked` — never `0↑ 0↓` for a branch with no upstream), and when it last moved and by whom.
+- **Updating A Stack Cascades**: Rebasing one branch moves every branch above it off the commit it was cut from, so a single restack silently strands the rest of the stack. The action plans the whole subtree from the tree on screen *before* the first rewrite — the last moment those fork points exist — names every branch it will touch in the confirmation, and runs the steps in parent-before-child order. Each step is an independently gated, independently rolled-back rebase; a cascade that stops part-way reports which branches were rebased and which are still on their old base, then reloads so a second attempt cannot plan from a stale tree.
+- **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
+- **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
 
 ---
 
@@ -198,10 +204,13 @@ Health remediation plan, a failing test, the diff you are about to commit.
 - **Commit Review**: Analyzes outgoing commits before pushing, reporting reviewed vs total counts.
 - **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
 
-### 3.3 GitHub (`github`) & Local CI
+### 3.3 Remote (`remote`) & Local CI
+- **Two Columns, Not One Ragged Grid**: Pull requests and issues take the wide column because they are what a reader acts on; workflows, the runs they produce, and releases sit together in a CI rail. The five listings used to share one grid whose rows are as tall as their tallest cell, so twenty pull requests left a screen of white space beside a three-line releases card — and Workflows sat a row away from its own runs.
 - **PR Management**: List repository PRs with one-click checkout, and a **New pull request** action that opens GitHub's compare form for the current branch onto the default branch.
-- **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list.
-- **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events.
+- **The Queue's Counts Are The Way Into It**: `All / Awaiting review / Failing / Drafts` chips carry their own counts and filter the list, plus a search across number, title and both refs. Chip and list share one predicate. "Failing" means a red verdict only — a run still going and a repository whose checks never start are neither passing nor failing, and neither is folded into the other.
+- **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list, each carrying when it was last updated, and searchable by number, title, author or label.
+- **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
+- **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
 - **CI:Local Runner**: Runs full repository CI pipeline locally before pushing commits:
   ```mermaid
   flowchart LR
