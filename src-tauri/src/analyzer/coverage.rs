@@ -3446,7 +3446,6 @@ fn relativize_or_suffix(repo: &Path, reported: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::analyzer::language::LanguageInfo;
-    use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -3687,24 +3686,7 @@ mod tests {
         assert_eq!(report.go_modules, vec!["svc"]);
     }
 
-    fn git_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        let status = Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git init");
-        assert!(status.success());
-        dir
-    }
-
-    fn write(dir: &Path, rel: &str, content: &str) {
-        let dest = dir.join(rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(dest, content).unwrap();
-    }
+    use crate::test_support::{git_repo, write};
 
     /// Regression: a detected family with no plannable generator published
     /// `tool_ready = true` with no command, no reason and no duration — the

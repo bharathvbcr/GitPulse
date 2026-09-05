@@ -1179,7 +1179,12 @@ fn is_checked_out_in_any_worktree(repo: &Path, branch_name: &str) -> Result<bool
 
 /// Rewrites only the subject line of a commit message, keeping the body —
 /// including its blank-line separation from the subject — intact.
-fn reworded_message(original: &str, new_subject: &str) -> String {
+///
+/// Canonical for the crate: the rebase argv preview in [`crate::commands`]
+/// must compose the very message this writer will pass to git, so it calls
+/// this rather than mirroring it — a second copy could drift and make the
+/// gate approve an argv that differs from the one executed.
+pub(crate) fn reworded_message(original: &str, new_subject: &str) -> String {
     match original.split_once('\n') {
         Some((_, rest)) => format!("{new_subject}\n{rest}"),
         None => new_subject.to_string(),

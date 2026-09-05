@@ -27,3 +27,14 @@ export function shortHash(hash: string | null | undefined, len = 7): string {
   if (!hash) return "";
   return hash.slice(0, len);
 }
+
+/**
+ * "1 repository" / "3 repositories" — a count with the right noun form.
+ *
+ * Canonical for the app: declared once here because two independent copies
+ * (fleet/aggregate.ts, repos/wipSummary.ts) had already appeared, and a
+ * pluralisation rule spelled twice can be corrected on one side only.
+ */
+export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}

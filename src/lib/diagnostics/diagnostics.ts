@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 import { formatError } from "../ui/formatError";
 import { browserStorage, type StorageLike } from "../repos/persist";
+import { escapeRegExp } from "../text/lineSearch";
 
 /**
  * Central capture of everything that goes wrong while the app runs: uncaught
@@ -198,10 +199,6 @@ function isSecretName(normalized: string): boolean {
 /** Whether a JSON object key declares its value to be a credential. */
 export function isSecretFieldName(key: string): boolean {
   return isSecretName(normalizeFieldName(key));
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function redactAssignedValue(_match: string, prefix: string, raw: string): string {

@@ -611,26 +611,7 @@ mod tests {
         );
     }
 
-    fn git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args([
-                "-c",
-                "user.name=GitPulse",
-                "-c",
-                "user.email=gitpulse@test.local",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use crate::test_support::git_in;
 
     fn init_linked_worktree() -> (TempDir, TempDir, std::path::PathBuf) {
         let main = TempDir::new().unwrap();

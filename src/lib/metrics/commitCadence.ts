@@ -41,7 +41,14 @@ export interface CadenceCommit {
 /** Guards against a runaway window turning into an unbounded array. */
 export const MAX_BUCKETS = 366;
 
-function startOfLocalDay(ms: number): number {
+/**
+ * Midnight of the local calendar day containing `ms`.
+ *
+ * Canonical for the app: [`../pulse/metrics`] buckets by the same day
+ * boundary and imports these rather than keeping a second pair — a calendar
+ * rule spelled twice can be fixed for one view and not the other.
+ */
+export function startOfLocalDay(ms: number): number {
   const date = new Date(ms);
   date.setHours(0, 0, 0, 0);
   return date.getTime();
@@ -55,7 +62,8 @@ function localDayKey(dayStart: number): string {
 }
 
 /** Step forward exactly one calendar day, which is not always 24 hours. */
-function nextLocalDay(dayStart: number): number {
+/** Step forward exactly one calendar day, which is not always 24 hours. */
+export function nextLocalDay(dayStart: number): number {
   const date = new Date(dayStart);
   date.setDate(date.getDate() + 1);
   date.setHours(0, 0, 0, 0);

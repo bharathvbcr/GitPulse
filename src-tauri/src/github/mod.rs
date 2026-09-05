@@ -768,7 +768,11 @@ fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), Str
 /// repo-controlled tag name (`v1..<script>`, spaces, `#`) can only ever
 /// produce a well-formed link, never a mangled or misparsed one. `/` is
 /// kept verbatim: slash-bearing tags are real and encode to themselves.
-fn percent_encode_tag(tag: &str) -> String {
+///
+/// Canonical for the crate: [`crate::updates`] builds the same
+/// `/releases/tag/<tag>` link and calls this rather than keeping a second
+/// encoder that could be hardened on one side only.
+pub(crate) fn percent_encode_tag(tag: &str) -> String {
     let mut out = String::with_capacity(tag.len());
     for byte in tag.bytes() {
         let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/');
