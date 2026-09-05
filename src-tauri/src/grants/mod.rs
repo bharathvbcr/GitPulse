@@ -248,6 +248,7 @@ pub fn view(repo_path: &str) -> GrantView {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn real_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let status = std::process::Command::new("git")

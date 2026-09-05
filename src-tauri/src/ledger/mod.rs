@@ -1756,6 +1756,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn real_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let status = std::process::Command::new("git")

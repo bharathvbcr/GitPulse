@@ -13,7 +13,7 @@ before that tag is pushed.
 
 ### Fixed
 
-- **Windows and macOS CI treated a check that could not run as a product failure.** Source-contract tests read files via a file URL's pathname property, which is not a filesystem path on Windows. The MCP doctor test assumed POSIX execute bits, which Node's `X_OK` ignores on Windows. Go coverage planner tests assumed `go` is on PATH; macos-26 only keeps it in the tool cache. The portable-path contract now catches the split `url.pathname` form, the doctor test injects `access`, and Go command-shape tests drive the planner with the toolchain forced present so a missing runtime is explained rather than failed.
+- **Windows and macOS CI treated a check that could not run as a product failure.** Source-contract tests read files via a file URL's pathname property, which is not a filesystem path on Windows. The MCP doctor test assumed POSIX execute bits, which Node's `X_OK` ignores on Windows. Go coverage planner tests assumed `go` is on PATH; macos-26 only keeps it in the tool cache. Unix-only `real_repo` helpers were still compiled on Windows, so clippy `-D warnings` failed once Vitest started passing. The portable-path contract now catches the split pathname form, the doctor test injects `access`, Go command-shape tests force the toolchain present so a missing runtime is explained rather than failed, and those helpers are gated `#[cfg(unix)]`.
 
 ## [0.0.5] - 2026-09-05
 
