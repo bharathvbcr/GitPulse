@@ -24,6 +24,16 @@
     virtualize?: boolean;
     overscan?: number;
     /**
+     * Size the row container to its widest row instead of to the viewport.
+     *
+     * Off by default: for a list of truncating rows it would turn every long
+     * label into horizontal scroll. The diff turns it on because its rows are
+     * code — one shared horizontal scrollbar for the surface, and every row's
+     * background running the full width of it, rather than a scrollbar per
+     * row and tints that stop where the viewport used to end.
+     */
+    contentWidth?: boolean;
+    /**
      * Two-way bound scroll position. Binding several lists to one variable
      * keeps split panes scrolling in lockstep.
      */
@@ -39,6 +49,7 @@
     rowHeight,
     virtualize = true,
     overscan = 8,
+    contentWidth = false,
     scrollTop = $bindable(0),
     row,
     class: className = "",
@@ -98,7 +109,7 @@
   {#if virtualize}
     <div style="height: {total * rowHeight}px; position: relative;">
       <div
-        class="absolute inset-x-0 top-0"
+        class="absolute top-0 {contentWidth ? 'left-0 w-max min-w-full' : 'inset-x-0'}"
         style="transform: translate3d(0, {win.start * rowHeight}px, 0);"
       >
         {#each { length: win.end - win.start } as _, i}
@@ -110,8 +121,10 @@
     <!-- Normal flow: each row takes the height its content needs, and the
          browser does the layout. Scroll binding still works, so split panes
          stay in lockstep. -->
-    {#each { length: total } as _, i}
-      {@render row(items?.[i], i)}
-    {/each}
+    <div class={contentWidth ? "w-max min-w-full" : "contents"}>
+      {#each { length: total } as _, i}
+        {@render row(items?.[i], i)}
+      {/each}
+    </div>
   {/if}
 </div>

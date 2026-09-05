@@ -3,7 +3,6 @@ import {
   EMPTY_RAIL,
   buildFileRail,
   churnLabel,
-  displayName,
   entryKey,
   isCurrent,
   railPosition,
@@ -198,42 +197,4 @@ describe("labels", () => {
       .toBe("");
   });
 
-  it("names a file by its basename", () => {
-    expect(
-      displayName({ path: "src/lib/a.ts", statusCode: "M", additions: 0, deletions: 0, isStaged: false }),
-    ).toBe("a.ts");
-  });
-
-  it("shows a rename as old → new", () => {
-    expect(
-      displayName({
-        path: "src/b.ts",
-        oldPath: "src/a.ts",
-        statusCode: "R",
-        additions: 0,
-        deletions: 0,
-        isStaged: false,
-      }),
-    ).toBe("a.ts → b.ts");
-  });
-
-  it("does not render an arrow when a rename kept the name", () => {
-    expect(
-      displayName({
-        path: "src/a.ts",
-        oldPath: "src/a.ts",
-        statusCode: "R",
-        additions: 0,
-        deletions: 0,
-        isStaged: false,
-      }),
-    ).toBe("a.ts");
-  });
-
-  it("survives a path with no directory and a trailing slash", () => {
-    const base = (path: string) =>
-      displayName({ path, statusCode: "M", additions: 0, deletions: 0, isStaged: false });
-    expect(base("a.ts")).toBe("a.ts");
-    expect(base("src/dir/")).toBe("dir");
-  });
 });

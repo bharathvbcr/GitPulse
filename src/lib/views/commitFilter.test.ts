@@ -38,14 +38,30 @@ describe("commit-search chord", () => {
     expect(isCommitSearchChord({ key: "f" })).toBe(false);
   });
 
-  it("leaves Code to the in-file search, and takes every other view", () => {
-    // Per view, not per section: Blame is a section of Code and its lines are
-    // the same file's lines, so ⌘F must not mean one thing on a file and
-    // something else on that same file one click later.
+  it("leaves Code to the in-file search, in both of its sections", () => {
+    // Blame is a section of Code and its lines are the Explorer's lines, so
+    // ⌘F must not mean one thing on a file and something else on that same
+    // file one click later.
     expect(ownsCommitSearchChord("code")).toBe(false);
+    expect(ownsCommitSearchChord("code", "explorer")).toBe(false);
+    expect(ownsCommitSearchChord("code", "blame")).toBe(false);
+  });
+
+  it("leaves History's diff to its own find bar, and keeps the rest", () => {
+    // Graph and Reflog are lists of commits, which the filter narrows. Diff
+    // is a file — or a commit's worth of files — and the chord belongs to the
+    // find bar inside it, for the same reason Code owns it.
+    expect(ownsCommitSearchChord("history", "diff")).toBe(false);
+    expect(ownsCommitSearchChord("history", "graph")).toBe(true);
+    expect(ownsCommitSearchChord("history", "reflog")).toBe(true);
+    expect(ownsCommitSearchChord("history")).toBe(true);
+  });
+
+  it("takes the chord for every other view, whatever section is open", () => {
     for (const tab of VIEW_TABS) {
-      if (tab === "code") continue;
+      if (tab === "code" || tab === "history") continue;
       expect(ownsCommitSearchChord(tab), tab).toBe(true);
+      expect(ownsCommitSearchChord(tab, "diff"), tab).toBe(true);
     }
   });
 

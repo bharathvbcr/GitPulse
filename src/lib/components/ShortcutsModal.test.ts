@@ -33,4 +33,21 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("Search commits");
     expect(body).toContain("switches to Graph");
   });
+
+  it("names the views ⌘-digit actually reaches", () => {
+    // The sheet listed nine retired views — "Files, Graph, Diff, Resolve,
+    // Blame, Stack, GitHub, Coverage, Health" — long after the consolidation
+    // left three digits bound to three views.
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Code, History, Insights");
+    expect(body).not.toContain("Resolve, Blame, Stack");
+  });
+
+  it("documents the diff's own chords, which have no menu entry to find them by", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Find in this diff");
+    expect(body).toContain("Previous / next block of changes");
+    expect(body).toContain("Previous / next file in this change");
+    expect(body).toContain("F3");
+  });
 });

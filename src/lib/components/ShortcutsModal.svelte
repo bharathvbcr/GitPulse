@@ -4,7 +4,7 @@
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid } from "lucide-svelte";
+  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "lucide-svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
 
   let {
@@ -47,9 +47,9 @@
       icon: Search,
       shortcuts: [
         { keys: ["⌘", "K"], description: "Open Command Palette" },
-        { keys: ["⌘", "1–9"], description: "Jump to view: Files, Graph, Diff, Resolve, Blame, Stack, GitHub, Coverage, Health" },
+        { keys: ["⌘", "1–3"], description: "Jump to view: Code, History, Insights" },
         { keys: ["F10"], description: "Open Work — tasks, worktrees, PRs, runs and verdicts" },
-        { keys: ["⌘", "F"], description: "Search commits — switches to Graph from Work and other views. In Files, searches the open file." },
+        { keys: ["⌘", "F"], description: "Search commits — switches to Graph from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
         { keys: ["⌘", "+"], description: "Zoom in UI font scale" },
         { keys: ["⌘", "-"], description: "Zoom out UI font scale" },
@@ -65,6 +65,17 @@
         { keys: ["Esc"], description: "Close modal / dismiss overlay" },
         { keys: ["↑", "↓"], description: "Navigate commits or branches in list" },
         { keys: ["Enter"], description: "Select highlighted item or run action" },
+      ],
+    },
+    {
+      title: "Diff",
+      icon: FileDiff,
+      shortcuts: [
+        { keys: ["⌘", "F"], description: "Find in this diff" },
+        { keys: ["F3"], description: "Next match (⇧F3 for previous)" },
+        { keys: ["Esc"], description: "Close the find bar" },
+        { keys: ["Alt", "↑ / ↓"], description: "Previous / next file in this change" },
+        { keys: ["Alt", "PgUp / PgDn"], description: "Previous / next block of changes" },
       ],
     },
     {

@@ -1,3 +1,5 @@
+import { gitHeaderSides, stripSidePrefix } from "./gitPaths";
+
 export type DiffChunkKind = "Equal" | "Added" | "Removed";
 
 export interface DiffSegment {
@@ -383,20 +385,6 @@ function isFileHeader(line: string): boolean {
   return line.startsWith("diff --git ");
 }
 
-function stripGitSide(side: string): string {
-  return side.startsWith("a/") || side.startsWith("b/") ? side.slice(2) : side;
-}
-
-/** Splits `a/<old> b/<new>` out of a `diff --git` line, quoted or bare. */
-function gitHeaderSides(header: string): [string, string] | null {
-  const rest = header.slice("diff --git ".length);
-  const quoted = /^"a\/(.*)" "b\/(.*)"$/.exec(rest);
-  if (quoted) return [quoted[1], quoted[2]];
-  const bare = /^(.*?) b\/(.*)$/.exec(rest);
-  if (bare) return [bare[1], bare[2]];
-  return null;
-}
-
 function sectionMentionsPath(section: string[], path: string): boolean {
   const header = section.find(isFileHeader);
   if (!header) return false;
@@ -405,8 +393,8 @@ function sectionMentionsPath(section: string[], path: string): boolean {
     !!sides &&
     (sides[0] === path ||
       sides[1] === path ||
-      stripGitSide(sides[0]) === path ||
-      stripGitSide(sides[1]) === path);
+      stripSidePrefix(sides[0]) === path ||
+      stripSidePrefix(sides[1]) === path);
   if (headerMatch) return true;
   // Timestamps ride after a tab: "+++ b/src/main.rs<TAB>2024-01-01 ...".
   const marked = (marker: string): boolean =>

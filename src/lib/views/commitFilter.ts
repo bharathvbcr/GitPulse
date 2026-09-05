@@ -21,17 +21,26 @@ export function showsCommitFilter(tab: ViewTab): boolean {
 }
 
 /**
- * Code owns ⌘F for in-file search on the code viewer. Every other view either
- * shows the commit-search bar or switches to History so the chord is not a
- * silent no-op (Work used to swallow it).
+ * Views that read a file's lines own ⌘F for searching those lines; everything
+ * else either shows the commit-search bar or switches to History so the chord
+ * is not a silent no-op (Work used to swallow it).
  *
- * Deliberately per view, not per section: Blame is a section of Code, and its
- * lines are the same file's lines. Handing the chord to commit search there
- * would mean ⌘F did one thing on a file and a different thing on the same
- * file one click later.
+ * The rule is "does this pane show lines of code" — not "which view is it".
+ * Code says no for both its sections, because Blame's lines are the Explorer's
+ * lines and ⌘F must not mean one thing on a file and something else on the
+ * same file one click later. History's Diff section shows lines too, which is
+ * why the section matters here: Graph and Reflog are lists of commits and
+ * ⌘F belongs to the filter that narrows them, while Diff is a file — or a
+ * commit's worth of files — and ⌘F belongs to the find bar inside it.
+ *
+ * The section argument is optional so callers that only know the view keep
+ * working; omitting it answers for the view's sections that are not diffs,
+ * which is the safe direction (the commit filter always exists in History).
  */
-export function ownsCommitSearchChord(tab: ViewTab): boolean {
-  return tab !== "code";
+export function ownsCommitSearchChord(tab: ViewTab, section?: string | null): boolean {
+  if (tab === "code") return false;
+  if (tab === "history" && section === "diff") return false;
+  return true;
 }
 
 /** Native "Search Commits" always lands on the view the bar actually filters. */

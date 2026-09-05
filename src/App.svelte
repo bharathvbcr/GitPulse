@@ -37,6 +37,7 @@
     ownsCommitSearchChord,
     tabForCommitSearch,
   } from "./lib/views/commitFilter";
+  import { activeSectionFor } from "./lib/views/viewRegistry";
   import { isImeComposition } from "./lib/keyboard/imeGuard";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import Tooltip from "./lib/components/Tooltip.svelte";
@@ -344,7 +345,7 @@
         interfaceStore.toggleTerminalDock();
         return;
       }
-      if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab)) {
+      if (isCommitSearchChord(e) && !isImeComposition(e) && ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))) {
         e.preventDefault();
         void focusCommitSearch();
         return;

@@ -23,6 +23,7 @@
     Hash,
   } from "lucide-svelte";
   import VirtualList from "../VirtualList.svelte";
+  import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
 
   let {
     filePath,
@@ -88,60 +89,36 @@
   });
   let byteSize = $derived(content.length);
 
-  // Search matches across lines
-  let searchMatches = $derived.by<Array<{ lineIdx: number; colStart: number; length: number }>>(() => {
-    if (!searchQuery.trim()) return [];
-    const matches: Array<{ lineIdx: number; colStart: number; length: number }> = [];
-    const lines = rawLines;
-
-    try {
-      let matcher: RegExp;
-      if (isRegex) {
-        matcher = new RegExp(searchQuery, isCaseSensitive ? "g" : "gi");
-      } else {
-        const escaped = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        matcher = new RegExp(escaped, isCaseSensitive ? "g" : "gi");
-      }
-
-      for (let l = 0; l < lines.length; l++) {
-        const line = lines[l];
-        matcher.lastIndex = 0;
-        let match: RegExpExecArray | null;
-        while ((match = matcher.exec(line)) !== null) {
-          matches.push({
-            lineIdx: l,
-            colStart: match.index,
-            length: match[0].length,
-          });
-          if (!matcher.global) break;
-        }
-      }
-    } catch {
-      // Invalid regex - gracefully return empty
-    }
-    return matches;
-  });
-
+  // Search matches across lines. The loop this replaced never advanced past a
+  // zero-length match, so a pattern like `a*` or `\b` — anything a user can
+  // type into a regex box — spun forever. `text/lineSearch` owns it now, and
+  // the diff viewer's find bar runs the same code.
+  let searchResult = $derived(
+    findMatches(rawLines, searchQuery, { caseSensitive: isCaseSensitive, regex: isRegex }),
+  );
+  let searchMatches = $derived(searchResult.matches);
   let matchCount = $derived(searchMatches.length);
 
   function nextMatch() {
-    if (matchCount === 0) return;
-    currentMatchIdx = (currentMatchIdx + 1) % matchCount;
-    scrollToMatch(currentMatchIdx);
+    const next = stepMatch(currentMatchIdx, matchCount, 1);
+    if (next < 0) return;
+    currentMatchIdx = next;
+    scrollToMatch(next);
   }
 
   function prevMatch() {
-    if (matchCount === 0) return;
-    currentMatchIdx = (currentMatchIdx - 1 + matchCount) % matchCount;
-    scrollToMatch(currentMatchIdx);
+    const next = stepMatch(currentMatchIdx, matchCount, -1);
+    if (next < 0) return;
+    currentMatchIdx = next;
+    scrollToMatch(next);
   }
 
   function scrollToMatch(idx: number) {
     const match = searchMatches[idx];
     if (!match) return;
-    selectedLine = match.lineIdx + 1;
+    selectedLine = match.lineIndex + 1;
     selectedLineEnd = null;
-    scrollToLine(match.lineIdx);
+    scrollToLine(match.lineIndex);
   }
 
   function scrollToLine(lineIdx: number) {
@@ -464,7 +441,7 @@
           />
           {#if searchQuery}
             <span class="text-[10px] font-mono text-textMuted shrink-0">
-              {matchCount > 0 ? `${currentMatchIdx + 1} of ${matchCount}` : "0 matches"}
+              {matchLabel(searchResult, currentMatchIdx)}
             </span>
           {/if}
         </div>
