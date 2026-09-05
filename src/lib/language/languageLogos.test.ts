@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
-  resolveLanguageIconKey,
+  ICON_KEYS,
+  contrastRatio,
   getLanguageBrandColor,
   getLanguageDisplayName,
+  getLanguageIconColor,
+  getLanguageInkColor,
+  resolveLanguageIconKey,
 } from "./languageLogos";
 
 describe("languageLogos resolver", () => {
@@ -61,5 +65,62 @@ describe("languageLogos resolver", () => {
     expect(resolveLanguageIconKey("")).toBe("file");
     expect(resolveLanguageIconKey("unknown_file.xyz")).toBe("file");
     expect(getLanguageBrandColor("file")).toBe("#6b7280");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Display-colour contract
+ *
+ * Brand hexes are picked against a white page. Painted straight onto this
+ * app's surfaces, several of them vanished — Lua's `#000080` and Docker's
+ * `#384d54` into the dark rows, JavaScript's `#f7df1e` and the image tint
+ * `#a2d9ff` into the light ones. The fix derives the display colour instead
+ * of curating a second table, so this asserts the derivation rather than the
+ * 68 values it produces: a new key is covered the day it is added.
+ * ------------------------------------------------------------------ */
+
+/** Lightest dark row (`--c-surface-hover`) and lightest light row (`--c-surface`). */
+const WORST_ROW = { dark: "#1f273a", light: "#ffffff" } as const;
+
+describe("icon display colours", () => {
+  it.each(ICON_KEYS)("keeps %s readable against both themes' worst-case row", (key) => {
+    for (const theme of ["dark", "light"] as const) {
+      const colour = getLanguageIconColor(key, theme);
+      expect(
+        contrastRatio(colour, WORST_ROW[theme]),
+        `${key} on ${theme}: ${colour}`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it.each(ICON_KEYS)("keeps %s's detail readable against its own body", (key) => {
+    for (const theme of ["dark", "light"] as const) {
+      const body = getLanguageIconColor(key, theme);
+      const ink = getLanguageInkColor(key, theme);
+      expect(contrastRatio(ink, body), `${key} ink on ${theme}`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it("leaves a brand colour alone when it already clears the bar", () => {
+    // Most do. Moving a colour that did not need moving would be a second
+    // palette by accident.
+    expect(getLanguageIconColor("rust", "dark")).toBe(getLanguageBrandColor("rust"));
+    expect(getLanguageIconColor("typescript", "light")).toBe(getLanguageBrandColor("typescript"));
+  });
+
+  it("moves only the colours that fail, and keeps their hue", () => {
+    // Lua's navy is invisible on the dark surface; the fix lightens it rather
+    // than replacing it, so it still reads as Lua blue.
+    const lua = getLanguageIconColor("lua", "dark");
+    expect(lua).not.toBe(getLanguageBrandColor("lua"));
+    const [r, g, b] = [1, 3, 5].map((offset) => Number.parseInt(lua.slice(offset, offset + 2), 16));
+    expect(b).toBeGreaterThan(r);
+    expect(b).toBeGreaterThan(g);
+  });
+
+  it("reports contrast symmetrically", () => {
+    expect(contrastRatio("#ffffff", "#000000")).toBeCloseTo(21, 5);
+    expect(contrastRatio("#000000", "#ffffff")).toBeCloseTo(21, 5);
+    expect(contrastRatio("#123456", "#123456")).toBeCloseTo(1, 5);
   });
 });

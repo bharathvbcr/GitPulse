@@ -37,8 +37,13 @@
   <ViewSectionBar view="code">
     <!-- The subject both sections share, named once. Blame used to print the
          path into its own input; there is one file here, and it is the file
-         the Explorer section has open. -->
-    {#if selected}
+         the Explorer section has open.
+
+         Explorer draws its own breadcrumb, where each folder is a control that
+         reveals it in the tree. Repeating the path here put the same string on
+         screen twice, three lines apart, one copy inert — so this now speaks
+         only for Blame, which has no breadcrumb of its own. -->
+    {#if selected && section === "blame"}
       <span
         class="ml-auto shrink-0 max-w-[40ch] truncate font-mono text-[11px] text-textMuted"
         title={selected}

@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
+  import { densityStore } from "../../stores/densityStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
     ChevronDown,
@@ -18,6 +19,9 @@
     MoreVertical,
     Check,
     Undo2,
+    FoldVertical,
+    SlidersHorizontal,
+    X,
   } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -34,7 +38,7 @@
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
   import {
     classifyFileChange,
-    dirtyAncestorSet,
+    dirtyAncestorCounts,
     mergeListedAndStatusPaths,
     statusBadgeClass,
     statusBadgeLabel,
@@ -59,14 +63,30 @@
     onSelectFile,
     onPinFile,
     selectedFile = null,
+    revealRequest = null,
   }: {
     onSelectFile?: (path: string) => void;
     onPinFile?: (path: string) => void;
     selectedFile?: string | null;
+    /**
+     * A directory the surrounding view wants brought into view — the file
+     * breadcrumb's folder crumbs raise these. Carries a nonce because asking
+     * twice for the same folder is a real second request, and comparing paths
+     * alone would swallow it.
+     */
+    revealRequest?: { path: string; nonce: number } | null;
   } = $props();
 
-  const ROW_HEIGHT = 24;
   const OVERSCAN = 12;
+  /**
+   * Row height tracks the app-wide density switch instead of a private
+   * constant. The setting already governed the graph; the explorer was simply
+   * not listening, so "compact" left the densest list in the window alone.
+   */
+  const rowHeight = $derived($densityStore === "compact" ? 22 : 26);
+  /** Left gutter before depth 0, and the width of one nesting level. */
+  const INDENT_BASE = 6;
+  const INDENT_STEP = 14;
 
   type StatusFilter = "all" | "modified" | "staged" | "untracked" | "conflicted";
   type SortOrder = "name-asc" | "name-desc" | "status" | "churn";
@@ -81,6 +101,8 @@
   let statusFilter = $state<StatusFilter>("all");
   let sortOrder = $state<SortOrder>("name-asc");
   let selectedExt = $state<string | null>(null);
+  let filtersPinned = $state(false);
+  let queryFocused = $state(false);
 
   let collapsed = $state<Record<string, boolean>>({});
   let selectedIndex = $state<number>(-1);
@@ -117,7 +139,7 @@
     };
   });
 
-  let dirtyDirs = $derived.by(() => dirtyAncestorSet($repoStore.statuses.map((s) => s.path)));
+  let dirtyDirs = $derived.by(() => dirtyAncestorCounts($repoStore.statuses.map((s) => s.path)));
 
   let parsedQuery = $derived.by(() => parseFileQuery(debouncedQuery));
 
@@ -219,6 +241,38 @@
     debouncedQuery.trim().length > 0 || statusFilter !== "all" || selectedExt !== null
   );
 
+  /**
+   * The query grammar, stated once. It used to live in the input's
+   * placeholder, where a 288px rail truncated it to "Filter: name, *.ts, /re…"
+   * — a syntax reference nobody could finish reading. As a caption under the
+   * field it wraps into the space it has, and it steps aside as soon as there
+   * is a query to look at.
+   */
+  const QUERY_SYNTAX = "name · *.ts glob · /regex/ · ~fuzzy · is:staged";
+
+  /**
+   * `mark` is the same letter the row badges use, so the chip that filters to
+   * modified files and the badge on a modified row say the same thing. The
+   * full word lives in the accessible name and the tooltip — spelling it out
+   * in the rail is what overflowed the old pills off the right edge.
+   */
+  const STATUS_SCOPES = [
+    { id: "modified", label: "Modified", mark: statusBadgeLabel("unstaged"), tint: "text-amber-300", on: "bg-amber-500/25 text-amber-300 border-amber-500/50" },
+    { id: "staged", label: "Staged", mark: statusBadgeLabel("staged"), tint: "text-emerald-300", on: "bg-emerald-500/25 text-emerald-300 border-emerald-500/50" },
+    { id: "untracked", label: "Untracked", mark: statusBadgeLabel("untracked"), tint: "text-cyan-300", on: "bg-cyan-500/25 text-cyan-300 border-cyan-500/50" },
+    { id: "conflicted", label: "Conflicted", mark: statusBadgeLabel("conflict"), tint: "text-rose-300", on: "bg-rose-500/25 text-rose-300 border-rose-500/50" },
+  ] as const satisfies readonly { id: Exclude<StatusFilter, "all">; label: string; mark: string; tint: string; on: string }[];
+
+  let anyChanges = $derived(
+    statusCounts.modified + statusCounts.staged + statusCounts.untracked + statusCounts.conflicted >
+      0,
+  );
+
+  // A filter the shelf is hiding would narrow the listing with nothing on
+  // screen to explain it, so an applied filter forces the shelf open.
+  let filtersOpen = $derived(filtersPinned || selectedExt !== null || sortOrder !== "name-asc");
+
+
   // Flattened rows
   let rows = $derived.by<FileRow[]>(() => {
     const flattened = flattenFileTree(buildFileTree(filteredPaths), (dirPath) =>
@@ -248,6 +302,12 @@
       });
     }
     return flattened;
+  });
+
+  /** Drives the header's one fold control, which flips to Expand when true. */
+  let allCollapsed = $derived.by(() => {
+    const dirs = rows.filter((row) => row.kind === "dir");
+    return dirs.length > 0 && dirs.every((row) => collapsed[row.path] === true);
   });
 
   function isCollapsed(dirPath: string): boolean {
@@ -607,8 +667,8 @@
     // VirtualList owns the actual scroll container, while this same-height
     // wrapper gives us its viewport. Update the binding minimally so routine
     // arrow navigation does not pin every selected row to the top.
-    const itemTop = index * ROW_HEIGHT;
-    const itemBottom = itemTop + ROW_HEIGHT;
+    const itemTop = index * rowHeight;
+    const itemBottom = itemTop + rowHeight;
     const viewportHeight = containerEl?.clientHeight ?? 0;
     if (viewportHeight <= 0 || itemTop < scrollTop) {
       scrollTop = itemTop;
@@ -619,26 +679,37 @@
 
   let effectiveSelected = $derived(selectedFile ?? $repoStore.selectedFilePath);
 
-  // Reveal active file in tree
+  /**
+   * Reveal the active file in the tree.
+   *
+   * The body reads and writes `collapsed`, so tracking it made this effect
+   * re-run on every expand and collapse — and each re-run re-armed
+   * `locatePath`, which scrolled the tree back to the open file. Opening a
+   * folder anywhere in a large repository therefore threw away the position
+   * the user had just navigated to. A new selection is the only thing that
+   * should reveal anything, so the collapse bookkeeping is untracked.
+   */
   $effect(() => {
     const selected = effectiveSelected;
     if (!selected) return;
-    locatePath = selected;
-    let changed = false;
-    const next = { ...collapsed };
-    for (const dir of ancestorsOf(selected)) {
-      if (next[dir] === true) {
-        next[dir] = false;
-        changed = true;
+    untrack(() => {
+      locatePath = selected;
+      let changed = false;
+      const next = { ...collapsed };
+      for (const dir of ancestorsOf(selected)) {
+        if (next[dir] === true) {
+          next[dir] = false;
+          changed = true;
+        }
       }
-    }
-    if (changed) collapsed = next;
+      if (changed) collapsed = next;
+    });
   });
 
   $effect(() => {
     const target = locatePath;
     if (!target) return;
-    const idx = rows.findIndex((row) => row.kind === "file" && row.path === target);
+    const idx = rows.findIndex((row) => row.path === target);
     if (idx < 0) {
       locatePath = null;
       return;
@@ -646,6 +717,24 @@
     locatePath = null;
     selectedIndex = idx;
     ensureVisible(idx);
+  });
+
+  /**
+   * Reveal a directory: open the path down to it, open the folder itself so
+   * its contents are what the user lands on, then scroll it into view through
+   * the same `locatePath` handshake a file selection uses.
+   */
+  let lastRevealNonce = 0;
+  $effect(() => {
+    const request = revealRequest;
+    if (!request?.path || request.nonce === lastRevealNonce) return;
+    lastRevealNonce = request.nonce;
+    untrack(() => {
+      const next = { ...collapsed };
+      for (const dir of [...ancestorsOf(request.path), request.path]) next[dir] = false;
+      collapsed = next;
+      locatePath = request.path;
+    });
   });
 
   $effect(() => {
@@ -672,17 +761,30 @@
 </script>
 
 <div class="flex flex-col h-full bg-surface/50 font-sans text-xs min-h-0 border-r border-border/70 select-none">
-  <!-- Top Explorer Header -->
-  <div class="flex items-center justify-between px-3 py-2 border-b border-border/60 shrink-0 bg-surface/80">
-    <div class="flex items-center gap-1.5 min-w-0">
+  <!--
+    Explorer chrome.
+
+    This used to be four stacked rows — title, search, status pills, then
+    extension chips beside a native `<select>` — roughly 118px of header above
+    the first file in a 288px rail, with the last pill and the last chip both
+    clipped off the right edge behind a scrollbar-less overflow. It is now two
+    rows plus a shelf that opens on request. The shelf cannot hide an active
+    filter: `filtersOpen` is the toggle OR'd with "a filter is actually
+    applied", so a narrowed listing always shows what narrowed it.
+  -->
+  <div class="flex items-center justify-between gap-1 px-2.5 h-9 shrink-0 border-b border-border/60 bg-surface/80">
+    <div class="flex items-baseline gap-1.5 min-w-0">
       <span class="text-[11px] font-bold uppercase tracking-wider text-textMuted">Explorer</span>
-      <span class="text-[10px] text-textMuted/80 tabular-nums font-mono">({filteredPaths.length})</span>
+      <span class="text-[10px] text-textMuted/80 tabular-nums font-mono" title="{filteredPaths.length} of {listedPaths.length} files shown">
+        {filteredPaths.length}{#if isFiltering}<span class="text-textMuted/60">/{listedPaths.length}</span>{/if}
+      </span>
     </div>
-    <div class="flex items-center gap-1">
+    <div class="flex items-center gap-0.5 shrink-0">
       <button
         type="button"
         onclick={() => createNewFile("")}
-        title="New File"
+        title="New file in repository root"
+        aria-label="New file in repository root"
         class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
       >
         <FilePlus size={13} />
@@ -690,140 +792,142 @@
       <button
         type="button"
         onclick={() => createNewFolder("")}
-        title="New Folder"
+        title="New folder in repository root"
+        aria-label="New folder in repository root"
         class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
       >
         <FolderPlus size={13} />
       </button>
       <button
         type="button"
-        onclick={expandAll}
-        title="Expand all folders"
-        class="px-1.5 py-0.5 text-[9px] font-mono rounded hover:bg-surfaceHover text-textMuted hover:text-textPrimary transition-colors"
-      >+All</button>
+        onclick={allCollapsed ? expandAll : collapseAll}
+        title={allCollapsed ? "Expand all folders" : "Collapse all folders"}
+        aria-label={allCollapsed ? "Expand all folders" : "Collapse all folders"}
+        class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+      >
+        <FoldVertical size={13} />
+      </button>
       <button
         type="button"
-        onclick={collapseAll}
-        title="Collapse all folders"
-        class="px-1.5 py-0.5 text-[9px] font-mono rounded hover:bg-surfaceHover text-textMuted hover:text-textPrimary transition-colors"
-      >-All</button>
+        onclick={() => (filtersPinned = !filtersOpen)}
+        aria-expanded={filtersOpen}
+        aria-controls="file-tree-filters"
+        title="Sort and file-type filters"
+        aria-label="Sort and file-type filters"
+        class="gp-icon-btn !p-1 {filtersOpen ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+      >
+        <SlidersHorizontal size={13} />
+      </button>
     </div>
   </div>
 
-  <!-- Filter & Search Bar -->
-  <div class="p-2 space-y-2 border-b border-border/60 shrink-0 bg-surface/30">
-    <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full px-2.5 py-1 focus-within:border-accent/70 transition-colors">
+  <div class="px-2 pt-2 pb-1.5 shrink-0 border-b border-border/60 bg-surface/30 space-y-1.5">
+    <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
       <Search size={12} class="text-textMuted shrink-0" />
       <input
         type="text"
         bind:value={query}
         oninput={(e) => applyQuery((e.target as HTMLInputElement).value)}
         onkeydown={handleKeydown}
-        placeholder="Filter: name, *.ts, /regex/, ~fuzzy, is:staged"
+        onfocus={() => (queryFocused = true)}
+        onblur={() => (queryFocused = false)}
+        placeholder="Filter files"
+        title={QUERY_SYNTAX}
         spellcheck="false"
         class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none"
       />
       {#if query}
         <button
           type="button"
-          onclick={() => { query = ""; debouncedQuery = ""; }}
-          class="text-textMuted hover:text-textPrimary text-[10px] px-1"
-        >✕</button>
-      {/if}
-    </div>
-
-      {#if parsedQuery.error}
-        <p class="text-[10px] text-rose-400 px-1">{parsedQuery.error}</p>
-      {/if}
-    <div class="flex items-center gap-1 overflow-x-auto gp-header-scroll py-0.5">
-      <button
-        type="button"
-        onclick={() => (statusFilter = "all")}
-        class="px-2 py-0.5 text-[10px] rounded-full transition-all shrink-0 font-medium {statusFilter === 'all'
-          ? 'bg-accent/20 text-accent font-semibold border border-accent/40'
-          : 'text-textMuted hover:bg-surfaceHover border border-transparent'}"
-      >All</button>
-
-      {#if statusCounts.modified > 0}
-        <button
-          type="button"
-          onclick={() => (statusFilter = statusFilter === 'modified' ? 'all' : 'modified')}
-          class="px-2 py-0.5 text-[10px] rounded-full transition-all shrink-0 flex items-center gap-1 font-medium {statusFilter === 'modified'
-            ? 'bg-amber-500/25 text-amber-300 font-semibold border border-amber-500/50'
-            : 'text-amber-400/80 hover:bg-surfaceHover border border-transparent'}"
+          onclick={() => { query = ""; applyQuery.cancel(); debouncedQuery = ""; }}
+          aria-label="Clear filter"
+          title="Clear filter"
+          class="gp-icon-btn !p-0.5 text-textMuted hover:text-textPrimary"
         >
-          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-          <span>Mod ({statusCounts.modified})</span>
-        </button>
-      {/if}
-
-      {#if statusCounts.staged > 0}
-        <button
-          type="button"
-          onclick={() => (statusFilter = statusFilter === 'staged' ? 'all' : 'staged')}
-          class="px-2 py-0.5 text-[10px] rounded-full transition-all shrink-0 flex items-center gap-1 font-medium {statusFilter === 'staged'
-            ? 'bg-emerald-500/25 text-emerald-300 font-semibold border border-emerald-500/50'
-            : 'text-emerald-400/80 hover:bg-surfaceHover border border-transparent'}"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-          <span>Staged ({statusCounts.staged})</span>
-        </button>
-      {/if}
-
-      {#if statusCounts.untracked > 0}
-        <button
-          type="button"
-          onclick={() => (statusFilter = statusFilter === 'untracked' ? 'all' : 'untracked')}
-          class="px-2 py-0.5 text-[10px] rounded-full transition-all shrink-0 flex items-center gap-1 font-medium {statusFilter === 'untracked'
-            ? 'bg-cyan-500/25 text-cyan-300 font-semibold border border-cyan-500/50'
-            : 'text-cyan-400/80 hover:bg-surfaceHover border border-transparent'}"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
-          <span>Untracked ({statusCounts.untracked})</span>
-        </button>
-      {/if}
-
-      {#if statusCounts.conflicted > 0}
-        <button
-          type="button"
-          onclick={() => (statusFilter = statusFilter === 'conflicted' ? 'all' : 'conflicted')}
-          class="px-2 py-0.5 text-[10px] rounded-full transition-all shrink-0 flex items-center gap-1 font-medium {statusFilter === 'conflicted'
-            ? 'bg-rose-500/25 text-rose-300 font-semibold border border-rose-500/50'
-            : 'text-rose-400 hover:bg-surfaceHover border border-transparent'}"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
-          <span>Conflict ({statusCounts.conflicted})</span>
+          <X size={11} />
         </button>
       {/if}
     </div>
 
-    <!-- Quick Extension Filters & Sort dropdown -->
-    <div class="flex items-center justify-between gap-1 pt-0.5">
-      {#if availableExts.length > 0}
-        <div class="flex items-center gap-1 overflow-x-auto gp-header-scroll min-w-0">
-          {#each availableExts as ext}
+    <!--
+      The grammar appears when someone is about to use it and costs nothing at
+      rest. As a permanent caption it spent ~21px of a 288px rail on a line
+      most users read once; as a placeholder before that, it was truncated
+      mid-token and could not be read even once.
+    -->
+    {#if parsedQuery.error}
+      <p class="text-[10px] text-rose-400 px-1">{parsedQuery.error}</p>
+    {:else if queryFocused}
+      <p class="text-[10px] text-textMuted/70 px-1.5 leading-snug">{QUERY_SYNTAX}</p>
+    {/if}
+
+    <!--
+      Status scopes. Wordless in the rail: a coloured dot plus its count fits
+      four scopes inside 288px, which the old "Untracked (2)" labels did not —
+      they overflowed, and the overflow had no scrollbar to advertise itself.
+      The name still reaches keyboard and screen-reader users through the
+      accessible label, and the mouse through the tooltip.
+    -->
+    {#if anyChanges}
+      <div class="flex items-center gap-1" role="group" aria-label="Filter by working-tree status">
+        <button
+          type="button"
+          onclick={() => (statusFilter = "all")}
+          aria-pressed={statusFilter === "all"}
+          title="Show all files"
+          class="px-2 py-0.5 text-[10px] rounded-full border transition-colors shrink-0 font-medium {statusFilter === 'all'
+            ? 'bg-accent/20 text-accent font-semibold border-accent/40'
+            : 'text-textMuted hover:bg-surfaceHover border-transparent'}"
+        >All</button>
+        {#each STATUS_SCOPES as scope (scope.id)}
+          {@const count = statusCounts[scope.id]}
+          {#if count > 0}
             <button
               type="button"
-              onclick={() => (selectedExt = selectedExt === ext ? null : ext)}
-              class="px-1.5 py-0.5 text-[9px] rounded font-mono uppercase transition-colors shrink-0 {selectedExt === ext
-                ? 'bg-accent/20 text-accent font-bold border border-accent/40'
-                : 'text-textMuted/80 hover:bg-surfaceHover'}"
-            >{ext.replace('.', '')}</button>
-          {/each}
-        </div>
-      {/if}
-      <div class="shrink-0 flex items-center">
-        <select
-          bind:value={sortOrder}
-          class="bg-background text-[10px] text-textMuted rounded border border-border/70 px-1 py-0.5 focus:outline-none cursor-pointer"
-        >
-          <option value="name-asc">Sort: A-Z</option>
-          <option value="name-desc">Sort: Z-A</option>
-          <option value="status">Sort: Git Status</option>
-          <option value="churn">Sort: Churn</option>
-        </select>
+              onclick={() => (statusFilter = statusFilter === scope.id ? "all" : scope.id)}
+              aria-pressed={statusFilter === scope.id}
+              aria-label="{scope.label} ({count})"
+              title="{scope.label} ({count})"
+              class="flex-1 min-w-0 px-1.5 py-0.5 rounded-full border transition-colors flex items-center justify-center gap-1 font-mono text-[10px] {statusFilter === scope.id
+                ? `${scope.on} font-bold`
+                : `border-transparent ${scope.tint} hover:bg-surfaceHover`}"
+            >
+              <span class="font-bold" aria-hidden="true">{scope.mark}</span>
+              <span class="tabular-nums">{count}</span>
+            </button>
+          {/if}
+        {/each}
       </div>
-    </div>
+    {/if}
+
+    {#if filtersOpen}
+      <div id="file-tree-filters" class="space-y-1.5 pt-0.5">
+        <label class="flex items-center gap-1.5">
+          <span class="text-[10px] text-textMuted shrink-0">Sort</span>
+          <select bind:value={sortOrder} class="gp-select flex-1 text-[10px]">
+            <option value="name-asc">Name, A to Z</option>
+            <option value="name-desc">Name, Z to A</option>
+            <option value="status">Git status</option>
+            <option value="churn">Lines changed</option>
+          </select>
+        </label>
+
+        {#if availableExts.length > 0}
+          <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Filter by file type">
+            {#each availableExts as ext (ext)}
+              <button
+                type="button"
+                onclick={() => (selectedExt = selectedExt === ext ? null : ext)}
+                aria-pressed={selectedExt === ext}
+                class="px-1.5 py-0.5 text-[9px] rounded font-mono uppercase transition-colors {selectedExt === ext
+                  ? 'bg-accent/20 text-accent font-bold border border-accent/40'
+                  : 'text-textMuted/80 hover:bg-surfaceHover border border-transparent'}"
+              >{ext.replace('.', '')}</button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   <!-- Main Tree Viewport -->
@@ -858,38 +962,71 @@
       <div bind:this={containerEl} class="h-full">
         <VirtualList
           items={rows}
-          rowHeight={ROW_HEIGHT}
+          {rowHeight}
           overscan={OVERSCAN}
           bind:scrollTop
           class="h-full"
         >
-          {#snippet row(r)}
+          {#snippet row(r, index)}
             {#if r}
-              {@const isSelected = effectiveSelected === r.path}
+              {@const isOpen = effectiveSelected === r.path}
+              {@const isCursor = rows[selectedIndex]?.key === r.key}
               {@const status = r.kind === "file" ? statusMap.get(r.path) : null}
               {@const changeKind = classifyFileChange(status)}
-              {@const dirDirty = r.kind === "dir" && dirtyDirs.has(r.path)}
+              {@const dirtyCount = r.kind === "dir" ? (dirtyDirs.get(r.path) ?? 0) : 0}
               <div
                 id={treeItemId(r)}
                 role="treeitem"
                 tabindex="-1"
-                aria-selected={isSelected}
+                aria-selected={isOpen}
                 aria-level={r.depth + 1}
+                aria-setsize={rows.length}
+                aria-posinset={index + 1}
                 aria-expanded={r.kind === "dir" ? !isCollapsed(r.path) : undefined}
                 onclick={() => rowAction(r)}
                 ondblclick={() => { if (r.kind === "file") pinFile(r.path); }}
                 onkeydown={(e) => { if (e.key === "Enter") rowAction(r); }}
                 oncontextmenu={(e) => openContextMenu(r, e)}
-                class="flex items-center justify-between w-full h-full px-2 text-left rounded-md transition-colors group cursor-pointer {isSelected
-                  ? 'bg-accent/15 text-textPrimary font-medium border-l-2 border-accent'
-                  : selectedIndex >= 0 && rows[selectedIndex]?.key === r.key
-                  ? 'bg-surfaceHover text-textPrimary'
-                  : 'hover:bg-surfaceHover/80 text-textPrimary/90'}"
-                style="padding-left: {6 + r.depth * 14}px;"
-                title="{r.path}{status ? ` (${status.status_code})` : ''}"
+                style="height: {rowHeight}px;"
+                class="relative flex items-center gap-1 w-full pr-1.5 text-left cursor-pointer group transition-colors {isOpen
+                  ? 'bg-accent/15 text-textPrimary'
+                  : isCursor
+                    ? 'bg-surfaceHover text-textPrimary'
+                    : 'hover:bg-surfaceHover/70 text-textPrimary/90'} {isCursor && !isOpen
+                  ? 'ring-1 ring-inset ring-accent/40'
+                  : ''}"
+                title={r.path}
               >
-                <!-- Left: Icon + Label -->
-                <div class="flex items-center gap-1.5 min-w-0 flex-1 truncate pr-1">
+                <!--
+                  The height is stated, not inherited. VirtualList places row
+                  n at n * rowHeight and renders the snippet with no sizing
+                  wrapper, so a row whose content happens to measure something
+                  else drifts out of its slot — which is exactly what the
+                  previous `h-full` did the moment the density switch moved
+                  rowHeight off the 24px the old padding happened to produce.
+
+                  Depth is drawn, not padded. Indent guides make a fifth-level
+                  file traceable to its folder; the old rail only shifted the
+                  row right and left the reader counting pixels. The bar and
+                  the guides are both `inset` so neither adds to the box —
+                  selection used to come with `border-l-2`, which widened the
+                  row and nudged every glyph in it 2px sideways.
+                -->
+                {#if isOpen}
+                  <span class="absolute inset-y-0 left-0 w-[2px] bg-accent" aria-hidden="true"></span>
+                {/if}
+                {#each { length: r.depth } as _, level (level)}
+                  <span
+                    class="absolute inset-y-0 w-px bg-border/45 pointer-events-none"
+                    style="left: {INDENT_BASE + level * INDENT_STEP}px;"
+                    aria-hidden="true"
+                  ></span>
+                {/each}
+
+                <div
+                  class="flex items-center gap-1.5 min-w-0 flex-1"
+                  style="padding-left: {INDENT_BASE + r.depth * INDENT_STEP}px;"
+                >
                   {#if r.kind === "dir"}
                     {#if isCollapsed(r.path)}
                       <ChevronRight size={12} class="shrink-0 text-textMuted" />
@@ -899,13 +1036,18 @@
                       <FolderOpen size={13} class="shrink-0 text-amber-400" />
                     {/if}
                     <span class="truncate text-textPrimary font-medium">{r.name}</span>
-                    {#if dirDirty}
-                      <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" title="Contains uncommitted changes"></span>
+                    {#if dirtyCount > 0}
+                      <!-- A collapsed folder says how much it is hiding, not
+                           merely that it hides something. -->
+                      <span
+                        class="shrink-0 px-1 rounded-full text-[9px] font-mono tabular-nums bg-amber-500/15 text-amber-300/90"
+                        title="{dirtyCount} changed {dirtyCount === 1 ? 'file' : 'files'} inside"
+                      >{dirtyCount}</span>
                     {/if}
                   {:else}
-                    <span class="w-3 shrink-0"></span>
+                    <span class="w-3 shrink-0" aria-hidden="true"></span>
                     <LanguageLogo filePath={r.path} size={14} class="shrink-0" />
-                    <span class="truncate {isSelected ? 'text-accent font-semibold' : status ? 'text-textPrimary' : 'text-textPrimary/80'}">
+                    <span class="truncate {isOpen ? 'text-accent font-semibold' : status ? 'text-textPrimary' : 'text-textPrimary/80'}">
                       {#each highlightMatches(r.name, debouncedQuery) as chunk, i (`${i}:${chunk.matched}:${chunk.text}`)}{#if chunk.matched}<mark class="bg-accent/30 text-textPrimary rounded-sm font-semibold">{chunk.text}</mark>{:else}{chunk.text}{/if}{/each}
                     </span>
                   {/if}
@@ -939,7 +1081,7 @@
                     tabindex="-1"
                     onclick={(e) => { e.stopPropagation(); openContextMenu(r, e); }}
                     aria-label={`Actions for ${r.path}`}
-                    class="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-surface text-textMuted hover:text-textPrimary transition-opacity"
+                    class="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 p-0.5 rounded hover:bg-surface text-textMuted hover:text-textPrimary transition-opacity"
                     title="Actions"
                   >
                     <MoreVertical size={11} />
