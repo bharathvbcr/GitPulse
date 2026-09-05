@@ -1893,3 +1893,134 @@ fn history_assigns_every_format_field_to_its_own_slot() {
         "%ct must be the committer date (2022), not the author date (2021)"
     );
 }
+
+/// Cascading a stack: main moves, the stack's root is rebased onto it, and
+/// every branch above the root must follow.
+///
+/// The child has to be replayed from the tip its parent carried *before* the
+/// cascade started. Computing that fork point works only while `parent`'s
+/// reflog still holds the pre-rebase tip — it does not in a fresh clone, in a
+/// bare repository (`core.logAllRefUpdates` defaults off there), or once
+/// `gc.reflogExpire` has run. Plain `merge-base` then collapses to the trunk,
+/// and git is told to replay the parent's own commits onto the parent. Patch
+/// id equivalence usually hides that; it stops hiding it the moment the
+/// parent's commits were revised while the stack was being updated, which is
+/// the ordinary way a stack gets updated.
+///
+/// This builds exactly that repository and asserts both halves: the computed
+/// fork point drags the parent's stale pre-image into the child and conflicts
+/// on a file the child never touched, and the recorded tip replays only the
+/// child's own commit.
+#[test]
+fn cascading_a_stack_replays_each_child_from_its_recorded_parent_tip() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "base\n");
+    repo.commit_all("root");
+
+    // parent: root -> "parent work", touching p.txt
+    run_git(repo.dir.path(), &["checkout", "-b", "parent"]);
+    repo.write("p.txt", "p v1\n");
+    repo.commit_all("parent work");
+
+    // child: stacked directly on parent's tip. This is the tip a reader of
+    // the stack records, and the only thing that still names where the child
+    // was cut once the reflog cannot answer.
+    run_git(repo.dir.path(), &["checkout", "-b", "child"]);
+    repo.write("c.txt", "c\n");
+    repo.commit_all("child work");
+    let recorded_parent_tip = git_out(repo.dir.path(), &["rev-parse", "parent"]);
+
+    // main moves on, so the whole stack is behind it.
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("m.txt", "m\n");
+    repo.commit_all("main moves");
+
+    let canon = validate_repo(&repo.path_str()).expect("repo");
+
+    // Step one: the root of the stack onto the new main. Nothing is recorded
+    // for a root — it forks from the trunk, and the computed value is right.
+    let root_upstream =
+        GitWriter::prepare_restack(&canon, "parent", "main", None).expect("plan root restack");
+    GitWriter::execute_restack(&canon, "parent", "main", &root_upstream).expect("restack root");
+    // The parent's work is revised as part of updating it, so its patch id no
+    // longer matches the pre-image the child still carries.
+    run_git(repo.dir.path(), &["checkout", "parent"]);
+    repo.write("p.txt", "p v2 revised during the update\n");
+    run_git(repo.dir.path(), &["add", "-A"]);
+    run_git(repo.dir.path(), &["commit", "--amend", "-m", "parent work"]);
+    run_git(repo.dir.path(), &["checkout", "main"]);
+
+    // A clone, a bare repository, or an expiry run: the reflog can no longer
+    // say where the child was cut.
+    run_git(
+        repo.dir.path(),
+        &[
+            "reflog",
+            "expire",
+            "--expire=now",
+            "--expire-unreachable=now",
+            "--all",
+        ],
+    );
+
+    // What the computed fork point now plans, and what it costs.
+    let collapsed =
+        GitWriter::prepare_restack(&canon, "child", "parent", None).expect("plan child restack");
+    assert_ne!(
+        collapsed, recorded_parent_tip,
+        "with no reflog, merge-base can no longer see where the child was cut"
+    );
+    let collapsed_err = GitWriter::execute_restack(&canon, "child", "parent", &collapsed)
+        .expect_err("replaying from the collapsed fork point drags in the parent's pre-image");
+    assert!(
+        collapsed_err.contains("rolled back"),
+        "a failed restack must roll back and say so: {collapsed_err}"
+    );
+
+    // The recorded tip is still an ancestor of the child, so it is honoured,
+    // and it replays only the child's own commit.
+    let recorded = GitWriter::prepare_restack(
+        &canon,
+        "child",
+        "parent",
+        Some(recorded_parent_tip.as_str()),
+    )
+    .expect("plan child restack from the recorded tip");
+    assert_eq!(recorded, recorded_parent_tip);
+    GitWriter::execute_restack(&canon, "child", "parent", &recorded).expect("restack child");
+
+    let subjects = git_out(repo.dir.path(), &["log", "--format=%s", "parent..child"]);
+    assert_eq!(
+        subjects, "child work",
+        "only the child's own commit may sit above the rebased parent"
+    );
+    let child_parent = git_out(repo.dir.path(), &["rev-parse", "child^"]);
+    let parent_tip = git_out(repo.dir.path(), &["rev-parse", "parent"]);
+    assert_eq!(child_parent, parent_tip, "child must sit on the new parent");
+    // And the whole stack really did move onto main.
+    let main_tip = git_out(repo.dir.path(), &["rev-parse", "main"]);
+    let parent_base = git_out(repo.dir.path(), &["rev-parse", "parent^"]);
+    assert_eq!(parent_base, main_tip, "the stack root must sit on main");
+}
+
+/// A fork point the caller recorded from a stack that has since moved must be
+/// refused, not silently widened into a bigger rewrite than was planned.
+#[test]
+fn a_fork_point_that_is_not_an_ancestor_is_refused_rather_than_replaced() {
+    let repo = TestRepo::init();
+    repo.write("base.txt", "base\n");
+    repo.commit_all("root");
+    run_git(repo.dir.path(), &["checkout", "-b", "sibling"]);
+    repo.write("s.txt", "s\n");
+    repo.commit_all("sibling work");
+    let sibling_tip = git_out(repo.dir.path(), &["rev-parse", "sibling"]);
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    run_git(repo.dir.path(), &["checkout", "-b", "feature"]);
+    repo.write("f.txt", "f\n");
+    repo.commit_all("feature work");
+
+    let canon = validate_repo(&repo.path_str()).expect("repo");
+    let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(sibling_tip.as_str()))
+        .expect_err("a fork point off another branch must be refused");
+    assert!(err.contains("no longer the stack on disk"), "{err}");
+}

@@ -13,12 +13,15 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     AlertTriangle,
+    ArrowDown,
+    ArrowUp,
     ExternalLink,
     GitBranch,
     GitPullRequest,
     LayoutGrid,
     Play,
     RefreshCw,
+    Search,
     ShieldCheck,
     Trees,
     Bot,
@@ -46,6 +49,13 @@
   import { formatError } from "../ui/formatError";
   import { headline, kindTitle } from "../repos/operation";
   import { agentKind, agentKindsOn, agentSessionSlug } from "../work/agentWorktree";
+  import {
+    filterWorkRows,
+    hereSummary,
+    rowLastActivity,
+    type WorkFacet,
+  } from "../work/focus";
+  import { formatRelativeTime } from "../format";
   import type { PolicyStatus } from "../stores/harnessStore";
 
   let projection = $state<WorkProjection | null>(null);
@@ -172,6 +182,61 @@
   const degraded = $derived(projection ? degradedSummary(projection.sources) : "");
   const summary = $derived(projection ? insightSummary(projection) : null);
 
+  /**
+   * Where the reader is standing.
+   *
+   * Work described every worktree in flight and never the one checked out in
+   * front of them — not the branch, not whether it had drifted from its
+   * remote, not what was uncommitted in it. Those are the questions asked most
+   * often on this screen and they were answered nowhere on it.
+   */
+  const here = $derived(
+    hereSummary($repoStore.currentBranch, $repoStore.branches, $repoStore.statuses),
+  );
+
+  /* --- narrowing ---------------------------------------------------------- */
+
+  /**
+   * The counts above the rows are doors now.
+   *
+   * "3 blocked" over a list of forty was a number the reader then had to go
+   * find. Selecting a tile filters to exactly the rows it counted, so the
+   * strip and the list can never disagree about what "blocked" means.
+   */
+  let facet = $state<WorkFacet>("all");
+  let query = $state("");
+
+  const visibleRows = $derived(
+    projection ? filterWorkRows(projection.rows, facet, query) : [],
+  );
+  /** True when a filter is on and has hidden every row. */
+  const narrowedToNothing = $derived(
+    projection !== null && projection.rows.length > 0 && visibleRows.length === 0,
+  );
+
+  function toggleFacet(next: WorkFacet) {
+    facet = facet === next ? "all" : next;
+  }
+
+  /** Tile chrome: pressed tiles read as selected rather than merely hovered. */
+  function tileClass(target: WorkFacet): string {
+    return facet === target
+      ? "border-accent/60 bg-accent/10 ring-1 ring-accent/30"
+      : "border-border/70 bg-surface hover:border-accent/40";
+  }
+
+  // A repository switch must not leave the previous repository's narrowing
+  // on: the reader would be looking at a filtered view of a list they have
+  // never seen, with rows missing for a reason that is off screen.
+  let facetRepo: string | null = null;
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    if (repo === facetRepo) return;
+    facetRepo = repo;
+    facet = "all";
+    query = "";
+  });
+
   function openMcpSettings() {
     window.dispatchEvent(new CustomEvent("gitpulse:settings"));
   }
@@ -189,11 +254,11 @@
 </script>
 
 <div class="flex-1 overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
-  <div class="flex items-center justify-between mb-3 max-w-5xl">
-    <h2 class="flex items-center gap-2 text-[13px] font-semibold">
-      <LayoutGrid size={15} class="text-accent" />
+  <div class="flex items-center justify-between gap-3 mb-3 max-w-6xl">
+    <h2 class="flex items-center gap-2 text-[13px] font-semibold min-w-0">
+      <LayoutGrid size={15} class="text-accent shrink-0" />
       Work
-      <span class="text-textMuted font-normal text-[11px]">
+      <span class="text-textMuted font-normal text-[11px] truncate">
         {hasTasks
           ? "tasks, worktrees, pull requests, runs and verdicts, joined"
           : "every worktree in flight, with its changes, pull requests and runs"}
@@ -201,7 +266,7 @@
     </h2>
     <button
       type="button"
-      class="flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px] disabled:opacity-50"
+      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px] disabled:opacity-50"
       disabled={loading || !$repoStore.currentPath}
       onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}
     >
@@ -210,9 +275,114 @@
     </button>
   </div>
 
+  <!-- Where the reader is standing. First, because every other row on this
+       screen is somewhere else. -->
+  {#if here && $repoStore.currentPath}
+    <div class="mb-3 max-w-6xl rounded-2xl border border-border/70 bg-surface px-3.5 py-2.5 shadow-card">
+      <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span class="flex items-center gap-1.5 font-medium text-[13px] min-w-0">
+          <GitBranch size={14} class="text-accent shrink-0" />
+          <span class="truncate">{here.branch}</span>
+          <span class="text-[10px] bg-accent/20 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
+        </span>
+
+        <!-- A branch the stats pass has not reached yet says so. Rendering its
+             pre-fetch zeroes would claim it is level with a remote nobody has
+             asked about. -->
+        {#if here.unmeasured}
+          <span class="text-[11px] text-textMuted font-mono">sync not measured yet</span>
+        {:else if here.upstream === null}
+          <span class="text-[11px] text-textMuted font-mono" title="No tracking branch is configured">
+            no upstream
+          </span>
+        {:else if here.upstream.gone}
+          <span class="gp-pill !border-rose-500/30 !bg-rose-500/10 !text-rose-700 dark:!text-rose-300 font-mono"
+            title="{here.upstream.name} no longer exists on the remote">
+            upstream gone
+          </span>
+        {:else if here.upstream.ahead > 0 || here.upstream.behind > 0}
+          <span class="text-[11px] font-mono text-textMuted inline-flex items-center gap-1.5"
+            title="Against {here.upstream.name}">
+            {#if here.upstream.ahead > 0}
+              <span class="inline-flex items-center gap-0.5 text-emerald-600 dark:text-emerald-400"><ArrowUp size={11} />{here.upstream.ahead}</span>
+            {/if}
+            {#if here.upstream.behind > 0}
+              <span class="inline-flex items-center gap-0.5 text-amber-600 dark:text-amber-400"><ArrowDown size={11} />{here.upstream.behind}</span>
+            {/if}
+          </span>
+        {:else}
+          <span class="text-[11px] font-mono text-textMuted">in sync with {here.upstream.name}</span>
+        {/if}
+
+        {#if !here.unmeasured && here.behindBase > 0 && here.comparedTo && here.comparedTo !== here.branch}
+          <span class="text-[11px] font-mono text-amber-600 dark:text-amber-400"
+            title="{here.behindBase} commit{here.behindBase === 1 ? '' : 's'} on {here.comparedTo} that this branch does not have">
+            {here.behindBase} behind {here.comparedTo}
+          </span>
+        {/if}
+
+        <span class="ml-auto flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] font-mono">
+          {#if here.conflicted > 0}
+            <button
+              type="button"
+              class="text-rose-600 dark:text-rose-400 hover:underline"
+              onclick={() => repoStore.setViewSection("work", "resolve")}
+              title="Open Resolve"
+            >
+              {here.conflicted} conflicted
+            </button>
+          {/if}
+          {#if here.staged > 0}
+            <span class="text-emerald-600 dark:text-emerald-400">{here.staged} staged</span>
+          {/if}
+          {#if here.unstaged > 0}
+            <span class="text-amber-600 dark:text-amber-400">{here.unstaged} unstaged</span>
+          {/if}
+          {#if here.staged + here.unstaged + here.conflicted === 0}
+            <span class="text-textMuted">working tree clean</span>
+          {:else}
+            <button
+              type="button"
+              class="text-textMuted hover:text-accent"
+              onclick={() => repoStore.setActiveTab("history", "diff")}
+              title="Open the working-tree diff"
+            >
+              review
+            </button>
+          {/if}
+        </span>
+      </div>
+
+      <!-- The one thing here that cannot make progress on its own. -->
+      {#if $repoStore.operation.operation}
+        <button
+          type="button"
+          class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
+          onclick={() => repoStore.setViewSection("work", "resolve")}
+          title="Open Resolve to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
+        >
+          <GitMerge size={12} class="mt-px shrink-0" />
+          <span class="min-w-0">{headline($repoStore.operation.operation)}</span>
+        </button>
+      {:else if $repoStore.operation.probeFailed}
+        <p class="mt-2 text-[11px] text-amber-600 dark:text-amber-400">
+          Could not check for a parked merge or rebase here — this line is not “nothing is parked”.
+        </p>
+      {/if}
+    </div>
+  {/if}
+
   {#if summary && $repoStore.currentPath}
-    <div class="mb-3 max-w-5xl grid grid-cols-2 md:grid-cols-4 gap-2">
-      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+    <!-- Each tile selects the rows it counted. Tiles the projection can only
+         ever count as zero would be four doors to an empty room, so a zero
+         tile stays readable but is not offered as a filter. -->
+    <div class="mb-3 max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-2">
+      <button
+        type="button"
+        aria-pressed={facet === "all"}
+        onclick={() => (facet = "all")}
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 {tileClass('all')}"
+      >
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <Layers size={11} /> Worktrees
         </div>
@@ -221,8 +391,14 @@
           {summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
             · {summary.unscannedDirty} unscanned{/if}
         </div>
-      </div>
-      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+      </button>
+      <button
+        type="button"
+        aria-pressed={facet === "agents"}
+        disabled={summary.agentSessions === 0}
+        onclick={() => toggleFacet("agents")}
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('agents')}"
+      >
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <Bot size={11} /> Agent sessions
         </div>
@@ -230,8 +406,14 @@
         <div class="text-[10px] text-textMuted truncate">
           {summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "none from directory layout"}
         </div>
-      </div>
-      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+      </button>
+      <button
+        type="button"
+        aria-pressed={facet === "blocked"}
+        disabled={summary.blocked === 0}
+        onclick={() => toggleFacet("blocked")}
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('blocked')}"
+      >
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <GitMerge size={11} /> Blocked
         </div>
@@ -239,23 +421,53 @@
           {summary.blocked}
         </div>
         <div class="text-[10px] text-textMuted">parked merge / rebase / cherry-pick</div>
-      </div>
-      <div class="rounded-xl border border-border/70 bg-surface px-3 py-2">
+      </button>
+      <button
+        type="button"
+        aria-pressed={facet === "pullRequests"}
+        disabled={summary.pullRequests === 0}
+        onclick={() => toggleFacet("pullRequests")}
+        class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('pullRequests')}"
+      >
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <GitPullRequest size={11} /> Pull requests
         </div>
         <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.pullRequests}</div>
         <div class="text-[10px] text-textMuted">joined through a worktree branch</div>
-      </div>
+      </button>
     </div>
-    <div class="mb-3 max-w-5xl flex items-center justify-between gap-2">
-      <p class="text-[11px] text-textMuted">
-        Agents read this same snapshot over MCP 2.0 (`gitpulse_insights`).
-      </p>
+
+    <div class="mb-3 max-w-6xl flex flex-wrap items-center gap-2">
+      <label class="relative flex-1 min-w-[13rem]">
+        <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
+        <input
+          class="gp-field w-full !pl-7 !py-1"
+          type="search"
+          placeholder="Filter by branch, path, task or pull request"
+          aria-label="Filter work rows"
+          bind:value={query}
+        />
+      </label>
+      {#if projection && (facet !== "all" || query.trim() !== "")}
+        <span class="text-[11px] text-textMuted font-mono">
+          {visibleRows.length} of {projection.rows.length}
+        </span>
+        <button
+          type="button"
+          class="px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px]"
+          onclick={() => {
+            facet = "all";
+            query = "";
+          }}
+        >
+          Clear
+        </button>
+      {/if}
       <button
         type="button"
         class="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px]"
         onclick={openMcpSettings}
+        title="Agents read this same snapshot over MCP 2.0 (gitpulse_insights)"
       >
         <Plug size={12} class="text-accent" />
         Connect an agent
@@ -265,14 +477,14 @@
 
   {#if collisionError}
     <div
-      class="mb-3 max-w-5xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
     </div>
   {:else if collisions && collisions.ok && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated)}
     <div
-      class="mb-3 max-w-5xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
@@ -306,7 +518,7 @@
        before they start reading it. -->
   {#if degraded}
     <div
-      class="mb-3 max-w-5xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>{degraded}</span>
@@ -316,11 +528,20 @@
   {#if !$repoStore.currentPath}
     <EmptyState icon={LayoutGrid} title="No repository open" hint="Open a repository to see the work in it." />
   {:else if loading && !projection}
-    <div class="max-w-5xl space-y-2">
+    <div class="max-w-6xl space-y-2">
       <Skeleton />
       <Skeleton />
       <Skeleton />
     </div>
+  {:else if narrowedToNothing}
+    <!-- A filter hiding every row is not the same screen as a repository with
+         nothing in flight, and must never borrow its wording. -->
+    <EmptyState
+      icon={Search}
+      title="No row matches this filter"
+      hint="{projection?.rows.length ?? 0} rows are loaded; the current filter matches none of them."
+      action={{ label: "Clear filter", onClick: () => { facet = "all"; query = ""; } }}
+    />
   {:else if projection && projection.rows.length === 0}
     <!-- Reaching here means git listed no worktrees at all, which is close to
          impossible for an open repository — every repository has at least its
@@ -334,8 +555,8 @@
         : "The worktree list could not be read, so this screen cannot say what is in flight."}
     />
   {:else if projection}
-    <div class="max-w-5xl space-y-2">
-      {#each projection.rows as row (row.key || "__unbound")}
+    <div class="max-w-6xl space-y-2">
+      {#each visibleRows as row (row.key || "__unbound")}
         {@const chips = noteworthyStatuses(row.verdicts)}
         <div
           class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card"
@@ -432,6 +653,17 @@
                 {#if projection.sources.ledger.present}
                   <span class="font-mono" title="Ledger events attributed to this row">
                     {row.verdicts.events} events
+                  </span>
+                {/if}
+                <!-- How long this row has been sitting. A worktree nobody has
+                     touched in three weeks and one from ten minutes ago read
+                     identically without it, and they want opposite things
+                     done. Absent when no branch on the row has been measured,
+                     rather than rendered as the epoch. -->
+                {#if rowLastActivity(row, $repoStore.branches)}
+                  {@const activity = rowLastActivity(row, $repoStore.branches)!}
+                  <span title="{activity.branch} last moved{activity.author ? ` — ${activity.author}` : ''}">
+                    {formatRelativeTime(activity.timestamp)}
                   </span>
                 {/if}
               </div>
@@ -532,7 +764,7 @@
   {/if}
 
   {#if $repoStore.currentPath}
-    <div class="mt-4 max-w-5xl">
+    <div class="mt-4 max-w-6xl">
       <button
         type="button"
         class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"
