@@ -1184,7 +1184,7 @@ mod tests {
         let info = mcp_info();
         assert!(info.plugin_found, "{}", info.plugin_error);
         assert!(
-            info.plugin_path.ends_with("/plugins/gitpulse"),
+            Path::new(&info.plugin_path).ends_with("plugins/gitpulse"),
             "unexpected plugin root: {}",
             info.plugin_path
         );
