@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { MANVI_PANE_IDS } from "../ui/manviFocus";
 
-const components = new URL("./", import.meta.url);
-const source = (path: string) => readFileSync(join(components.pathname, path), "utf8");
+const here = dirname(fileURLToPath(import.meta.url));
+const source = (path: string) => readFileSync(join(here, path), "utf8");
 
 describe("modal accessible-name contract", () => {
   it.each([

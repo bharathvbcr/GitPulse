@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -14,8 +15,8 @@ import { describe, expect, it } from "vitest";
  * These assertions are the shape of the fix, not its wording: the content
  * spans opt in, the gutters stay opted out, and the stylesheet grants it.
  */
-const components = new URL("./", import.meta.url);
-const source = (path: string) => readFileSync(join(components.pathname, path), "utf8");
+const here = dirname(fileURLToPath(import.meta.url));
+const source = (path: string) => readFileSync(join(here, path), "utf8");
 const css = readFileSync(new URL("../../app.css", import.meta.url), "utf8");
 
 describe("diff and blame source text is selectable", () => {

@@ -52,12 +52,15 @@ export const DEFAULT_TIMEOUT_MS = 10_000;
  * does not depend on a shell being present or on its builtins.
  *
  * @param {string} name
- * @param {{ pathValue?: string, platform?: string }} [env]
+ * @param {{ pathValue?: string, platform?: string, access?: (full: string, mode: number) => void }} [env]
  * @returns {string | null}
  */
 export function resolveOnPath(name, env = {}) {
   const pathValue = env.pathValue ?? process.env.PATH ?? "";
   const platform = env.platform ?? process.platform;
+  // Node's X_OK is existence on Windows (execute bits are not a filesystem
+  // concept there). Tests that need Unix "not executable" inject `access`.
+  const access = env.access ?? ((full, mode) => accessSync(full, mode));
   // Windows resolves a bare name through PATHEXT; the other suffixes are not
   // meaningful for a Rust binary, so .exe is the only one worth trying.
   const candidates = platform === "win32" ? [`${name}.exe`, name] : [name];
@@ -66,7 +69,7 @@ export function resolveOnPath(name, env = {}) {
     for (const candidate of candidates) {
       const full = path.join(dir, candidate);
       try {
-        accessSync(full, constants.X_OK);
+        access(full, constants.X_OK);
         return full;
       } catch {
         // Not here, or not executable — keep looking rather than reporting the

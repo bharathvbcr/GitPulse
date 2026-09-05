@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -52,6 +53,21 @@ describe("resolveOnPath", () => {
 
   it("returns null rather than a near-miss when the file is not executable", async () => {
     const dir = await scratchDir("nonexec");
+    const bin = path.join(dir, SERVER_BIN);
+    await writeFile(bin, "not a program");
+    // Node ignores X_OK on Windows, and chmod cannot clear an execute bit
+    // there, so a host chmod is not a portable way to stage "not executable".
+    const access = (_full: string, mode: number) => {
+      if (mode === constants.X_OK) {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }
+    };
+    expect(resolveOnPath(SERVER_BIN, { pathValue: dir, platform: "linux", access })).toBeNull();
+  });
+
+  const onPosix = it.runIf(process.platform !== "win32");
+  onPosix("refuses a mode-0644 file on a Unix host, not only an injected access", async () => {
+    const dir = await scratchDir("nonexec-chmod");
     const bin = path.join(dir, SERVER_BIN);
     await writeFile(bin, "not a program");
     await chmod(bin, 0o644);

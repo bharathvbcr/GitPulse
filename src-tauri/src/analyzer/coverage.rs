@@ -5104,6 +5104,26 @@ src/main.go:4.1,4.8 1 0
         }
     }
 
+    /// Command shape is asserted against `go_coverage_plan(..., true)` so it
+    /// holds on a host without the Go toolchain. The scan path must then
+    /// either publish that same plan or explain the missing runtime — never
+    /// an empty ready family. macos-26 CI only has Go in the tool cache.
+    fn assert_go_scan_matches_ready_plan(go: &CoverageFamilyStatus, ready_generate: &[String]) {
+        if go.suggested_commands.is_empty() {
+            assert!(
+                !go.tool_ready,
+                "an empty Go plan must not claim the toolchain is ready"
+            );
+            assert!(
+                go.tool_detail.contains("Go toolchain"),
+                "missing Go must be named: {}",
+                go.tool_detail
+            );
+            return;
+        }
+        assert_eq!(go.suggested_commands, ready_generate);
+    }
+
     #[test]
     fn nested_go_mod_plans_chdir_coverprofile() {
         let repo = git_repo();
@@ -5117,24 +5137,33 @@ src/main.go:4.1,4.8 1 0
             "backend/go_orchestrator/main.go",
             "package main\nfunc main() {}\n",
         );
+        let planned = go_coverage_plan(
+            repo.path(),
+            &["backend/go_orchestrator".into()],
+            false,
+            true,
+        );
+        assert_eq!(
+            planned.generate,
+            vec!["go -C backend/go_orchestrator test ./... -coverprofile=coverage.out".to_string()]
+        );
+        assert!(
+            !planned
+                .generate
+                .iter()
+                .any(|c| c == "go test ./... -coverprofile=coverage.out"),
+            "root ./... must not be planned when go.mod is nested: {:?}",
+            planned.generate
+        );
+        assert_argv_safe(&planned.generate);
+
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
         let go = report
             .families
             .iter()
             .find(|f| f.family == "go")
             .expect("go family");
-        assert_eq!(
-            go.suggested_commands,
-            vec!["go -C backend/go_orchestrator test ./... -coverprofile=coverage.out".to_string()]
-        );
-        assert!(
-            !go.suggested_commands
-                .iter()
-                .any(|c| c == "go test ./... -coverprofile=coverage.out"),
-            "root ./... must not be planned when go.mod is nested: {:?}",
-            go.suggested_commands
-        );
-        assert_argv_safe(&go.suggested_commands);
+        assert_go_scan_matches_ready_plan(go, &planned.generate);
     }
 
     #[test]
@@ -5142,16 +5171,19 @@ src/main.go:4.1,4.8 1 0
         let repo = git_repo();
         write(repo.path(), "go.mod", "module example.com/app\n\ngo 1.22\n");
         write(repo.path(), "main.go", "package main\nfunc main() {}\n");
+        let planned = go_coverage_plan(repo.path(), &[String::new()], false, true);
+        assert_eq!(
+            planned.generate,
+            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        );
+
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
         let go = report
             .families
             .iter()
             .find(|f| f.family == "go")
             .expect("go family");
-        assert_eq!(
-            go.suggested_commands,
-            vec!["go test ./... -coverprofile=coverage.out".to_string()]
-        );
+        assert_go_scan_matches_ready_plan(go, &planned.generate);
     }
 
     #[test]
@@ -5172,21 +5204,25 @@ src/main.go:4.1,4.8 1 0
             "backend/go_orchestrator/main.go",
             "package main\nfunc main() {}\n",
         );
+        let planned =
+            go_coverage_plan(repo.path(), &["backend/go_orchestrator".into()], true, true);
+        assert_eq!(
+            planned.generate,
+            vec!["go test ./... -coverprofile=coverage.out".to_string()]
+        );
+        assert!(
+            !planned.generate.iter().any(|c| c.contains("-C")),
+            "workspace root must not emit per-module -C: {:?}",
+            planned.generate
+        );
+
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
         let go = report
             .families
             .iter()
             .find(|f| f.family == "go")
             .expect("go family");
-        assert_eq!(
-            go.suggested_commands,
-            vec!["go test ./... -coverprofile=coverage.out".to_string()]
-        );
-        assert!(
-            !go.suggested_commands.iter().any(|c| c.contains("-C")),
-            "workspace root must not emit per-module -C: {:?}",
-            go.suggested_commands
-        );
+        assert_go_scan_matches_ready_plan(go, &planned.generate);
     }
 
     #[test]
@@ -5204,20 +5240,23 @@ src/main.go:4.1,4.8 1 0
             "module example.com/cli\n\ngo 1.22\n",
         );
         write(repo.path(), "cli/main.go", "package main\nfunc main() {}\n");
+        let planned = go_coverage_plan(repo.path(), &["api".into(), "cli".into()], false, true);
+        assert_eq!(
+            planned.generate,
+            vec![
+                "go -C api test ./... -coverprofile=coverage.out".to_string(),
+                "go -C cli test ./... -coverprofile=coverage.out".to_string(),
+            ]
+        );
+        assert_argv_safe(&planned.generate);
+
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
         let go = report
             .families
             .iter()
             .find(|f| f.family == "go")
             .expect("go family");
-        assert_eq!(
-            go.suggested_commands,
-            vec![
-                "go -C api test ./... -coverprofile=coverage.out".to_string(),
-                "go -C cli test ./... -coverprofile=coverage.out".to_string(),
-            ]
-        );
-        assert_argv_safe(&go.suggested_commands);
+        assert_go_scan_matches_ready_plan(go, &planned.generate);
     }
 
     #[test]
@@ -6232,8 +6271,27 @@ src/main.go:4.1,4.8 1 0
             let repo = git_repo();
             write(repo.path(), "svc/main.go", "package main\n");
             write(repo.path(), "svc/go.mod", "module svc\n\ngo 1.22\n");
+            let planned = go_coverage_plan(repo.path(), &["svc".into()], false, true);
+            assert_eq!(
+                planned.generate,
+                vec!["go -C svc test ./... -coverprofile=coverage.out".to_string()]
+            );
             let checked = assert_published_commands_are_runnable(&repo, "go");
-            assert!(checked > 0, "the go fixture published no commands");
+            if checked == 0 {
+                // macos-26 (and any host without `go` on PATH) must explain
+                // the dead end rather than claim a Run button that cannot spawn.
+                assert_dead_end_is_explained(&repo, "go");
+                let argv = [
+                    "go".to_string(),
+                    "-C".to_string(),
+                    "svc".to_string(),
+                    "test".to_string(),
+                    "./...".to_string(),
+                    "-coverprofile=coverage.out".to_string(),
+                ];
+                validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
+                    .expect("go -C <dir> test must be accepted by the gate");
+            }
         }
 
         /// C/C++ with a CMake build — the family the user's own report showed
