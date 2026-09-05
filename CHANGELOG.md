@@ -11,6 +11,8 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-09-05
+
 ### Added
 
 - **The MCP server now answers four capabilities, not one.** It advertised `tools` and nothing else, so the only way to ask it anything was a tool call. It now implements every server method the 2026-07-28 schema defines: `resources/list`, `resources/read` and `resources/templates/list` expose the control plane as addressable `gitpulse://` documents (eight repository facets as RFC 6570 templates, plus `gitpulse://server/manifest` and `gitpulse://server/health`); `prompts/list` and `prompts/get` ship four workflows that resolve against live state and embed it as `resource` blocks rather than telling the model to go and fetch it; and `completion/complete` completes `repo_path` for both. All four list operations are cursor-paginated. The method set is taken from the published schema, which is also why there is no `ping` and no `logging/setLevel` — neither exists in this revision, and inventing them would have been worse than omitting them.
@@ -509,7 +511,8 @@ before that tag is pushed.
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.2...v0.0.3
