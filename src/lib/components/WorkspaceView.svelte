@@ -2,6 +2,10 @@
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewSectionPanel from "./ViewSectionPanel.svelte";
+
+  /** Named once: the tab and its panel must agree on the id. */
+  const view = "work" as const;
   import WorkView from "./WorkView.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
 
@@ -55,16 +59,18 @@
       </button>
     {/if}
   </ViewSectionBar>
+  <ViewSectionPanel {view} {section}>
 
-  {#if section === "resolve"}
-    <LazyView load={loadConflict} name="the conflict editor" />
-  {:else if section === "remote"}
-    <LazyView load={loadGitHub} name="GitHub" />
-  {:else if section === "stack"}
-    <LazyView load={loadStack} name="the code stack" />
-  {:else if section === "policy"}
-    <LazyView load={loadManvi} name="Manvi ops" />
-  {:else}
-    <WorkView />
-  {/if}
+    {#if section === "resolve"}
+      <LazyView load={loadConflict} name="the conflict editor" />
+    {:else if section === "remote"}
+      <LazyView load={loadGitHub} name="GitHub" />
+    {:else if section === "stack"}
+      <LazyView load={loadStack} name="the code stack" />
+    {:else if section === "policy"}
+      <LazyView load={loadManvi} name="Manvi ops" />
+    {:else}
+      <WorkView />
+    {/if}
+  </ViewSectionPanel>
 </div>

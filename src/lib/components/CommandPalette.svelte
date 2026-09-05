@@ -469,18 +469,40 @@
     }
   }
 
+  /**
+   * Opens on a request App made before this component existed.
+   *
+   * The palette is deferred until first use, so the ⌘K that asks for it is
+   * caught by App's global handler and cannot be delivered as an event — the
+   * listener below is registered a chunk-load later, and the keystroke would
+   * be lost. App raises a counter instead; the effect below reads it after
+   * mount, so the FIRST ⌘K opens the palette exactly like every one after it.
+   * Zero means "no request yet" and is the initial value, so a fresh mount
+   * with no request does not open on its own.
+   */
+  let { openSignal = 0 }: { openSignal?: number } = $props();
+  let servedSignal = 0;
+
+  function requestOpen() {
+    if (modalOccupied()) return;
+    isOpen = true;
+    query = "";
+    highlighted = 0;
+  }
+
+  $effect(() => {
+    if (openSignal > servedSignal) {
+      servedSignal = openSignal;
+      requestOpen();
+    }
+  });
+
   onMount(() => {
     window.addEventListener("keydown", handleKeyDown);
-    const openPalette = () => {
-      if (modalOccupied()) return;
-      isOpen = true;
-      query = "";
-      highlighted = 0;
-    };
-    window.addEventListener("gitpulse:palette", openPalette);
+    window.addEventListener("gitpulse:palette", requestOpen);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("gitpulse:palette", openPalette);
+      window.removeEventListener("gitpulse:palette", requestOpen);
     };
   });
 

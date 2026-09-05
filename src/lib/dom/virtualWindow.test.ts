@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "./virtualWindow";
 
@@ -227,4 +228,28 @@ describe("ensureNonEmptyWindow", () => {
       end: 2.5,
     });
   });
+});
+
+describe("every fixed-row list windows through this owner", () => {
+  const read = (path: string) =>
+    readFileSync(new URL(`../components/${path}`, import.meta.url), "utf8");
+
+  it.each([["VirtualList.svelte"], ["BranchList.svelte"], ["CommitTable.svelte"]])(
+    "%s derives its window here rather than re-deriving the arithmetic",
+    (file) => {
+      const source = read(file);
+      expect(source).toContain("computeWindow(");
+      // The hand-rolled shape this replaced. CommitTable's copy had drifted:
+      // no scroll clamp, and an asymmetric overscan band.
+      expect(source).not.toMatch(/Math\.floor\(scrollTop \/ rowHeight\)/);
+    },
+  );
+
+  it.each([["BranchList.svelte"], ["CommitTable.svelte"]])(
+    "%s clamps its anchor so a shrinking list does not paint an empty frame",
+    (file) => {
+      expect(read(file)).toContain("clampScrollTop(");
+      expect(read(file)).toContain("ensureNonEmptyWindow(");
+    },
+  );
 });

@@ -2,6 +2,10 @@
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewSectionPanel from "./ViewSectionPanel.svelte";
+
+  /** Named once: the tab and its panel must agree on the id. */
+  const view = "insights" as const;
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
 
   /**
@@ -37,14 +41,16 @@
 
 <div class="flex-1 flex flex-col min-h-0">
   <ViewSectionBar view="insights" />
+  <ViewSectionPanel {view} {section}>
 
-  {#if section === "coverage"}
-    <LazyView load={loadCoverage} name="Coverage" />
-  {:else if section === "health"}
-    <LazyView load={loadHealth} name="Health" />
-  {:else if section === "storage"}
-    <LazyView load={loadStorage} name="Storage" />
-  {:else}
-    <LazyView load={loadPulse} name="Pulse" />
-  {/if}
+    {#if section === "coverage"}
+      <LazyView load={loadCoverage} name="Coverage" />
+    {:else if section === "health"}
+      <LazyView load={loadHealth} name="Health" />
+    {:else if section === "storage"}
+      <LazyView load={loadStorage} name="Storage" />
+    {:else}
+      <LazyView load={loadPulse} name="Pulse" />
+    {/if}
+  </ViewSectionPanel>
 </div>

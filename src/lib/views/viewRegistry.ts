@@ -116,6 +116,15 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
   },
 };
 
+/**
+ * DOM id of the pane the view tabs control.
+ *
+ * The header tablist declared `role="tab"` with no `aria-controls`, so the
+ * relationship it announced pointed at nothing. App stamps this id on the
+ * `<main>` element the tabs actually swap.
+ */
+export const VIEW_PANE_ID = "gitpulse-view-pane";
+
 /** Registry entries in declaration (= header) order. */
 export const REGISTERED_VIEWS: readonly ViewRegistration[] = Object.values(VIEW_REGISTRY);
 

@@ -1,5 +1,7 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { densityStore } from "../stores/densityStore";
+  import { rowHeight } from "../ui/density";
   import type { CoverageReport, FileCoverageSummary } from "../coverage/types";
 
   // Survives the per-tab remount so revisiting the coverage view renders the
@@ -1592,7 +1594,7 @@
       {:else if report && report.files.length > 0}
         <!-- Virtualized: the scan cap allows 4,000 files, and a keyed each of
              that size mounts ~20k nodes and re-diffs them on every selection. -->
-        <VirtualList items={report.files} rowHeight={26} overscan={20} class="flex-1">
+        <VirtualList items={report.files} rowHeight={rowHeight("coverageFile", $densityStore)} overscan={20} class="flex-1">
           {#snippet row(file)}
             {#if file}
               <button
@@ -1725,7 +1727,7 @@
       {:else if fileError}
         <div class="h-full flex items-center justify-center text-rose-400 font-sans p-4">{fileError}</div>
       {:else if sourceLines.length > 0}
-        <VirtualList items={sourceLines} rowHeight={24} overscan={15} class="h-full">
+        <VirtualList items={sourceLines} rowHeight={rowHeight("coverageSource", $densityStore)} overscan={15} class="h-full">
           {#snippet row(line, index)}
             {#if line !== undefined}
               {@const hits = hitMap.get(index + 1)}

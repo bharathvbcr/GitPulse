@@ -777,6 +777,82 @@ mod tests {
         assert!(RepoFileWatcher::watch(missing).is_err());
     }
 
+    /// Every path a repository needs must survive being registered as a set.
+    ///
+    /// The registration was rewritten from three sequential `watch()` calls to
+    /// one `paths_mut()` batch committed once, because on FSEvents each
+    /// `watch()` tore down and recreated the stream with a fresh
+    /// `SinceNow` epoch — losing anything that landed in between. The risk of
+    /// the rewrite is the opposite failure: a path silently dropped from the
+    /// batch. This asserts all three still deliver.
+    #[test]
+    fn batched_registration_watches_every_path_it_was_given() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonicalize");
+        let git_dir = root.join(".git");
+        let common = root.join("common.git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        std::fs::create_dir_all(&common).expect("common dir");
+
+        let watcher = RepoFileWatcher::watch_repo(&git_dir, Some(&root), Some(&common))
+            .expect("watch_repo should install every path");
+
+        // Let the backend install before touching anything.
+        thread::sleep(Duration::from_millis(400));
+
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
+        std::fs::write(common.join("packed-refs"), b"# pack\n").expect("write packed-refs");
+        std::fs::write(root.join("tracked.txt"), b"hello\n").expect("write worktree file");
+
+        // Collect whatever arrives within a generous window and check that the
+        // three roots are all represented. Bounded rather than blocking: a
+        // dropped path shows up as a missing root, not as a hang.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_git_dir = false;
+        let mut saw_common = false;
+        let mut saw_worktree = false;
+        while Instant::now() < deadline && !(saw_git_dir && saw_common && saw_worktree) {
+            match watcher.receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(Ok(event)) => {
+                    for path in &event.paths {
+                        if path.starts_with(&common) {
+                            saw_common = true;
+                        } else if path.starts_with(&git_dir) {
+                            saw_git_dir = true;
+                        } else if path.starts_with(&root) {
+                            saw_worktree = true;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(_) => {}
+            }
+        }
+
+        assert!(saw_git_dir, "git dir events were not delivered");
+        assert!(saw_common, "common dir events were not delivered");
+        assert!(saw_worktree, "worktree root events were not delivered");
+    }
+
+    /// A missing worktree root must fail before anything is installed.
+    ///
+    /// The old order registered the git dir first and only then validated the
+    /// root, so the error path left a live, half-registered watcher behind.
+    #[test]
+    fn a_missing_worktree_root_is_rejected_before_any_path_is_installed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+
+        let missing_root = temp.path().join("no-such-worktree");
+        // `RepoFileWatcher` holds an OS watcher and is not Debug, so match
+        // rather than `expect_err`.
+        match RepoFileWatcher::watch_repo(&git_dir, Some(&missing_root), None) {
+            Ok(_) => panic!("a missing work tree must be refused"),
+            Err(err) => assert!(err.contains("work tree does not exist"), "{err}"),
+        }
+    }
+
     #[test]
     fn test_repo_changed_payload_is_path_object() {
         let payload = RepoChangedPayload {

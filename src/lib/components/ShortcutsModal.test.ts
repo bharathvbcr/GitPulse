@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { COMMIT_FILTER_VIEW } from "../views/commitFilter";
+import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { render } from "svelte/server";
 import ShortcutsModal from "./ShortcutsModal.svelte";
 
@@ -28,19 +30,29 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("O");
   });
 
-  it("documents that commit search switches to Graph rather than no-opping on Work", () => {
+  it("documents where commit search actually lands, not where it used to", () => {
+    // The sheet said "switches to Graph" long after Graph stopped being a
+    // view; COMMIT_FILTER_VIEW is the fact, so assert against that rather
+    // than against a second hand-written copy of it.
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Search commits");
-    expect(body).toContain("switches to Graph");
+    const label = VIEW_REGISTRY[COMMIT_FILTER_VIEW].label;
+    expect(body).toContain(`switches to ${label}`);
   });
 
   it("names the views ⌘-digit actually reaches", () => {
     // The sheet listed nine retired views — "Files, Graph, Diff, Resolve,
     // Blame, Stack, GitHub, Coverage, Health" — long after the consolidation
     // left three digits bound to three views.
+    // The list is derived from the registry now rather than written out, so
+    // each view is named beside the digit that actually reaches it — a prose
+    // list could go stale again; a per-row mapping cannot.
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
-    expect(body).toContain("Code, History, Insights");
+    expect(body).toContain("Open Code");
+    expect(body).toContain("Open History");
+    expect(body).toContain("Open Insights");
     expect(body).not.toContain("Resolve, Blame, Stack");
+    expect(body).not.toContain("⌘1–9");
   });
 
   it("documents the diff's own chords, which have no menu entry to find them by", () => {

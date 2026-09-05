@@ -2,6 +2,10 @@
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewSectionPanel from "./ViewSectionPanel.svelte";
+
+  /** Named once: the tab and its panel must agree on the id. */
+  const view = "code" as const;
   import FileViewer from "./FileViewer.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
 
@@ -52,13 +56,15 @@
       </span>
     {/if}
   </ViewSectionBar>
+  <ViewSectionPanel {view} {section}>
 
-  <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane
-       and replay the entrance fade, and FileViewer would lose its open tabs
-       and unsaved drafts on every switch. -->
-  {#if section === "blame"}
-    <LazyView load={loadBlame} name="blame" />
-  {:else}
-    <FileViewer />
-  {/if}
+    <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane
+         and replay the entrance fade, and FileViewer would lose its open tabs
+         and unsaved drafts on every switch. -->
+    {#if section === "blame"}
+      <LazyView load={loadBlame} name="blame" />
+    {:else}
+      <FileViewer />
+    {/if}
+  </ViewSectionPanel>
 </div>

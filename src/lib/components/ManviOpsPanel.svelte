@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { createVisibleInterval } from "../dom/visibleInterval";
   import { invoke } from "@tauri-apps/api/core";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import { formatError } from "../ui/formatError";
@@ -399,15 +400,15 @@
   });
 
   onMount(() => {
-    const timer = window.setInterval(() => {
-      // Only poll while the ops pane is visible: the harness pane renders
-      // this panel's data away, and each tick costs four parallel gh round
-      // trips on the backend.
-      if (!document.hidden && pane === "ops" && $repoStore.currentPath) {
+    // Each tick costs four parallel gh round trips, so it runs only while the
+    // window is on screen AND this pane is the one showing. The visibility
+    // half belongs to the timer now — it used to keep firing behind other
+    // windows and merely decline the work, which still woke the renderer.
+    return createVisibleInterval(() => {
+      if (pane === "ops" && $repoStore.currentPath) {
         void loadIssues(undefined, { background: true });
       }
     }, ISSUE_REFRESH_MS);
-    return () => window.clearInterval(timer);
   });
 
   // `lastRepo` memoizes this effect's real dependency: repoStore republishes

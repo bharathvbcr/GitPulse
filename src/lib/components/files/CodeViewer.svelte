@@ -1,9 +1,12 @@
 <script lang="ts">
   import { repoStore } from "../../stores/repoStore";
+  import { densityStore } from "../../stores/densityStore";
+  import { rowHeight } from "../../ui/density";
   import { invoke } from "@tauri-apps/api/core";
   import {
     detectLanguageFromPath,
-    tokenizeLine,
+    tokenizeLineWithCarry,
+    createCarryIndex,
     tokenClass,
     type SupportedLanguage,
   } from "../../files/syntaxHighlight";
@@ -24,6 +27,8 @@
   } from "lucide-svelte";
   import VirtualList from "../VirtualList.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
+  import { debounce } from "../../async/debounce";
+  import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
 
   let {
     filePath,
@@ -43,7 +48,7 @@
     onRequestDiscard?: () => Promise<boolean>;
   } = $props();
 
-  const ROW_HEIGHT = 20;
+  let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
   const OVERSCAN = 20;
   const MAX_RENDER_LINES = 80_000;
 
@@ -78,25 +83,60 @@
   let language = $derived<SupportedLanguage>(detectLanguageFromPath(filePath));
   let hasUnsavedChanges = $derived(dirty || (isEditing && editDraft !== content));
 
-  let rawLines = $derived.by(() => {
+  // One split, not two. `linesTruncated` used to re-split the whole file just
+  // to compare a length and then throw the array away — a second full pass and
+  // a second full allocation, on a string that can be 80,000 lines long, every
+  // time either input changed.
+  let splitFile = $derived.by(() => {
     const text = isEditing ? editDraft : content;
     const lines = text.split("\n");
-    return lines.length > MAX_RENDER_LINES ? lines.slice(0, MAX_RENDER_LINES) : lines;
+    const truncated = lines.length > MAX_RENDER_LINES;
+    return { lines: truncated ? lines.slice(0, MAX_RENDER_LINES) : lines, truncated };
   });
-  let linesTruncated = $derived.by(() => {
-    const text = isEditing ? editDraft : content;
-    return text.split("\n").length > MAX_RENDER_LINES;
-  });
+  let rawLines = $derived(splitFile.lines);
+  let linesTruncated = $derived(splitFile.truncated);
+
+  /**
+   * Where each line starts: inside a block comment, a template literal, or
+   * ordinary code.
+   *
+   * Rebuilt whenever the text or the language changes, and extended lazily as
+   * the window moves — a virtualized row cannot be coloured correctly from its
+   * own text alone, because the construct that governs it may have opened
+   * thousands of lines earlier.
+   */
+  let carryAt = $derived.by(() => createCarryIndex(splitFile.lines, language));
   let byteSize = $derived(content.length);
+
+  /**
+   * Debounced copy of the query. `searchQuery` is bound to the input, so the
+   * scan would otherwise re-run on every keystroke over the whole file.
+   */
+  let debouncedQuery = $state("");
+  const applySearchQuery = debounce((q: string) => (debouncedQuery = q), SEARCH_DEBOUNCE_MS);
+  $effect(() => {
+    const next = searchQuery;
+    // An emptied box clears immediately: waiting to REMOVE highlighting reads
+    // as lag, and costs nothing to do now.
+    if (next === "") {
+      applySearchQuery.cancel();
+      debouncedQuery = "";
+      return;
+    }
+    applySearchQuery(next);
+  });
 
   // Search matches across lines. The loop this replaced never advanced past a
   // zero-length match, so a pattern like `a*` or `\b` — anything a user can
   // type into a regex box — spun forever. `text/lineSearch` owns it now, and
-  // the diff viewer's find bar runs the same code.
+  // the diff viewer's find bar runs the same code: it also refuses a pattern
+  // whose nesting can backtrack catastrophically, bounds the scan with a
+  // deadline, and caps the match list while reporting the cap honestly.
   let searchResult = $derived(
-    findMatches(rawLines, searchQuery, { caseSensitive: isCaseSensitive, regex: isRegex }),
+    findMatches(rawLines, debouncedQuery, { caseSensitive: isCaseSensitive, regex: isRegex }),
   );
   let searchMatches = $derived(searchResult.matches);
+
   let matchCount = $derived(searchMatches.length);
 
   function nextMatch() {
@@ -552,7 +592,7 @@
                 (selectedLineEnd === null
                   ? selectedLine === lineNum
                   : lineNum >= Math.min(selectedLine, selectedLineEnd) && lineNum <= Math.max(selectedLine, selectedLineEnd))}
-              {@const tokens = tokenizeLine(line ?? "", language)}
+              {@const tokens = tokenizeLineWithCarry(line ?? "", language, carryAt(lineIdx)).tokens}
               <div
                 class="flex items-center w-full leading-5 transition-colors {isHighlighted
                   ? 'bg-accent/15 border-l-2 border-accent'

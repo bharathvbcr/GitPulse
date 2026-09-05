@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { guardedDismiss } from "./modalGuard";
   import { fade, scale } from "svelte/transition";
   import { repoStore } from "../stores/repoStore";
   import {
@@ -55,8 +56,7 @@
 
   /** Mid-clone dismissal hides progress and completes invisibly later. */
   function requestClose() {
-    if (isCloning) return;
-    onClose?.();
+    guardedDismiss(isCloning, onClose);
   }
 </script>
 

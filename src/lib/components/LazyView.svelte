@@ -31,6 +31,8 @@
 </script>
 
 <script lang="ts">
+  import Skeleton from "./Skeleton.svelte";
+
   interface Props {
     load: ViewLoader;
     /**
@@ -45,9 +47,13 @@
 
   let view = $derived(resolved.get(load));
   let failure = $state<string | null>(null);
+  /** Bumped by Retry to re-run the load effect for the same loader. */
+  let attempt = $state(0);
 
   $effect(() => {
     const loader = load;
+    // Read so a retry re-runs this effect; the loader identity has not changed.
+    void attempt;
     if (resolved.has(loader)) return;
     // Guarded rather than fire-and-forget: the pane can be switched away
     // before the chunk lands, and a late failure from an abandoned load must
@@ -79,19 +85,29 @@
   >
     <span class="text-sm text-textPrimary">{name} could not be loaded.</span>
     <span class="text-[11px] text-textMuted max-w-md">{failure}</span>
-    <span class="text-[11px] text-textMuted">
+    <span class="text-[11px] text-textMuted max-w-md">
       This view ships as its own chunk, so a failed load means the install is
-      incomplete — not that the view has nothing to show. Reopening the window
-      retries it.
+      incomplete — not that the view has nothing to show.
     </span>
+    <!-- A button, rather than telling the user to reopen the window: a
+         transient fetch failure is the common case, and retrying in place
+         keeps the rest of the session (open tabs, terminal, selection). -->
+    <button type="button" class="gp-btn mt-1" onclick={() => { failure = null; attempt += 1; }}>
+      Retry
+    </button>
   </div>
 {:else}
+  <!-- A skeleton rather than a line of centred text: the pane is about to be
+       filled, and a placeholder that occupies roughly the same space does not
+       jump when it is. The accessible name still says what is arriving. -->
   <div
-    class="flex-1 flex items-center justify-center font-sans text-[11px] text-textMuted"
+    class="flex-1 flex flex-col gap-3 p-4 font-sans"
     role="status"
     aria-busy="true"
     aria-label="Loading {name}"
   >
-    Loading {name}…
+    <Skeleton variant="text" width="35%" height="1rem" />
+    <Skeleton variant="card" />
+    <Skeleton variant="text" count={4} />
   </div>
 {/if}

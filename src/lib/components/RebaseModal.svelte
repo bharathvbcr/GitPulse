@@ -1,5 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { guardedDismiss } from "./modalGuard";
   import { graphStore } from "../stores/graphStore";
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -108,8 +109,7 @@
 
   /** Mid-run dismissal hides progress and completes invisibly later. */
   function requestClose() {
-    if (isExecuting) return;
-    onClose?.();
+    guardedDismiss(isExecuting, onClose);
   }
 </script>
 

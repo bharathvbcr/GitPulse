@@ -396,7 +396,9 @@ describe("DiffViewer keeps its frame when there is nothing to show", () => {
     // The image viewer used to be returned at the top level, taking the
     // toolbar, the rail and the file stepper with it.
     expect(source).not.toMatch(/^\{#if showingImage\}/m);
-    const imageIdx = source.indexOf("<ImageDiffViewer");
+    // Deferred behind LazyMount — only an image diff reaches this pane — so
+    // the mount point is what has to sit after the rail, not a static tag.
+    const imageIdx = source.indexOf("load={loadImageDiffViewer}");
     const railIdx = source.indexOf("<DiffFileRail");
     expect(railIdx).toBeGreaterThan(-1);
     expect(imageIdx).toBeGreaterThan(railIdx);

@@ -53,7 +53,12 @@ describe("ViewSectionBar", () => {
 
   it("marks the active section for assistive tech, not just visually", () => {
     expect(sectionBar).toContain('role="tab"');
-    expect(sectionBar).toContain("aria-selected={isActive}");
+    // The attribute comes from the shared `tabProps` owner now rather than
+    // being hand-written per call site. What must hold is that the active
+    // section is announced AND that the tab points at a panel that exists —
+    // the bar used to declare role="tab" with no tabpanel anywhere in the app.
+    expect(sectionBar).toContain('aria-selected={props["aria-selected"]}');
+    expect(sectionBar).toContain('aria-controls={props["aria-controls"]}');
   });
 });
 

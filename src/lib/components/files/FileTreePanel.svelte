@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { repoStore, type FileStatus } from "../../stores/repoStore";
   import { densityStore } from "../../stores/densityStore";
+  import { rowHeight } from "../../ui/density";
+  import { repoStore, type FileStatus } from "../../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
     ChevronDown,
@@ -77,13 +78,13 @@
     revealRequest?: { path: string; nonce: number } | null;
   } = $props();
 
+  let ROW_HEIGHT = $derived(rowHeight("fileTree", $densityStore));
   const OVERSCAN = 12;
   /**
    * Row height tracks the app-wide density switch instead of a private
    * constant. The setting already governed the graph; the explorer was simply
    * not listening, so "compact" left the densest list in the window alone.
    */
-  const rowHeight = $derived($densityStore === "compact" ? 22 : 26);
   /** Left gutter before depth 0, and the width of one nesting level. */
   const INDENT_BASE = 6;
   const INDENT_STEP = 14;
@@ -667,8 +668,8 @@
     // VirtualList owns the actual scroll container, while this same-height
     // wrapper gives us its viewport. Update the binding minimally so routine
     // arrow navigation does not pin every selected row to the top.
-    const itemTop = index * rowHeight;
-    const itemBottom = itemTop + rowHeight;
+    const itemTop = index * ROW_HEIGHT;
+    const itemBottom = itemTop + ROW_HEIGHT;
     const viewportHeight = containerEl?.clientHeight ?? 0;
     if (viewportHeight <= 0 || itemTop < scrollTop) {
       scrollTop = itemTop;
@@ -962,7 +963,7 @@
       <div bind:this={containerEl} class="h-full">
         <VirtualList
           items={rows}
-          {rowHeight}
+          rowHeight={ROW_HEIGHT}
           overscan={OVERSCAN}
           bind:scrollTop
           class="h-full"
@@ -987,7 +988,7 @@
                 ondblclick={() => { if (r.kind === "file") pinFile(r.path); }}
                 onkeydown={(e) => { if (e.key === "Enter") rowAction(r); }}
                 oncontextmenu={(e) => openContextMenu(r, e)}
-                style="height: {rowHeight}px;"
+                style="height: {ROW_HEIGHT}px;"
                 class="relative flex items-center gap-1 w-full pr-1.5 text-left cursor-pointer group transition-colors {isOpen
                   ? 'bg-accent/15 text-textPrimary'
                   : isCursor
@@ -1003,7 +1004,7 @@
                   wrapper, so a row whose content happens to measure something
                   else drifts out of its slot — which is exactly what the
                   previous `h-full` did the moment the density switch moved
-                  rowHeight off the 24px the old padding happened to produce.
+                  ROW_HEIGHT off the 24px the old padding happened to produce.
 
                   Depth is drawn, not padded. Indent guides make a fifth-level
                   file traceable to its folder; the old rail only shifted the

@@ -26,7 +26,14 @@ describe("InsightsView", () => {
       expect(source).toContain(`${loader}: ViewLoader`);
       expect(source).toContain(`load={${loader}}`);
     }
-    expect(source).not.toMatch(/import\s+\w*(Panel|Viewer)\s+from/);
+    // Shared section chrome is not a pane: it carries no view content and is
+    // imported by every host by design. Matching on the spelling "Panel"
+    // alone would forbid the tabpanel wrapper the tablist points at.
+    const SECTION_CHROME = ["ViewSectionBar", "ViewSectionPanel"];
+    const staticPanes = [...source.matchAll(/import\s+(\w*(?:Panel|Viewer))\s+from/g)]
+      .map(([, name]) => name)
+      .filter((name) => !SECTION_CHROME.includes(name));
+    expect(staticPanes).toEqual([]);
   });
 
   it("opens on Pulse when nothing is remembered", () => {

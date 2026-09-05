@@ -59,7 +59,7 @@
   import LanguageLogo from "./LanguageLogo.svelte";
   import { joinWorktreePath } from "../files/fileTree";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
-  import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
+  import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { resolveFilePaneLayout } from "../files/filePaneLayout";
   import {
     activateEditorTab,
@@ -77,6 +77,10 @@
     updateEditorDraft,
     type EditorTabState as Tabs,
   } from "../files/editorTabs";
+
+  /** Id of the editor region the open-file tabs control. */
+  const EDITOR_PANE_ID = "gitpulse-editor-pane";
+  let tabStrip: HTMLDivElement | undefined = $state();
 
 
   let explorerOpen = $state(true);
@@ -410,13 +414,16 @@
    * six files on the way to the seventh.
    */
   function handleTabStripKeydown(e: KeyboardEvent) {
-    const strip = e.currentTarget as HTMLElement;
-    const tabs = [...strip.querySelectorAll<HTMLElement>('[role="tab"]')];
-    const current = tabs.findIndex((tab) => tab.contains(e.target as Node));
-    const next = nextRovingIndex(current, tabs.length, e.key as RovingKey);
-    if (next === null) return;
+    const current = openTabs.findIndex((tab) => tab.path === activeTabPath);
+    const move = handleTablistKeydown(e.key, current, openTabs.length);
+    if (!move) return;
     e.preventDefault();
-    tabs[next]?.focus();
+    const target = openTabs[move.index];
+    if (!target) return;
+    // Selection follows focus, as it does in the view and section switchers:
+    // the tab a keyboard user has arrowed onto is the one that is open.
+    activateTab(target.path);
+    focusTabAt(tabStrip, move.index);
   }
 
   function handleWindowKeydown(e: KeyboardEvent) {
@@ -570,6 +577,7 @@
       <!-- The strip listens for the arrow keys but is not itself a tab stop:
            the roving tabindex on the tabs is what the user lands on. -->
       <div
+        bind:this={tabStrip}
         class="flex items-stretch gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll py-1"
         role="tablist"
         aria-label="Open files"
@@ -585,6 +593,7 @@
             data-editor-tab={tab.path}
             tabindex={isActive ? 0 : -1}
             aria-selected={isActive}
+            aria-controls={EDITOR_PANE_ID}
             onclick={() => activateTab(tab.path)}
             ondblclick={() => pinFile(tab.path)}
             onkeydown={(e) => {
@@ -770,7 +779,13 @@
     {/if}
 
     {#if paneLayout.editorVisible}
-      <div class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative">
+      <!-- The panel the open-file tabs control; the strip announced the
+           relationship with no referent before this id existed. -->
+      <div
+        id={EDITOR_PANE_ID}
+        role="tabpanel"
+        class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative"
+      >
         {#if isLoadingFile}
           <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
             <span>Loading file contents...</span>

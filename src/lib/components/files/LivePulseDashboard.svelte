@@ -2,6 +2,7 @@
   import type { LanguageInfo } from "../../files/types";
   import type { CommitGraphPayload } from "../../stores/graphStore";
   import { onMount } from "svelte";
+  import { createVisibleInterval } from "../../dom/visibleInterval";
   import { repoStore } from "../../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -59,9 +60,13 @@
   // Periodic refresh ticker for "just now" / relative age
   let tick = $state(0);
   onMount(() => {
-    const timer = setInterval(() => (tick += 1), 5000);
+    // Relative-age labels only need re-rendering while someone is looking at
+    // them. The status poll already refuses to work on a hidden window; this
+    // ticker used to keep firing behind other windows, invalidating derived
+    // state across the pane every five seconds for a label nobody could see.
+    const stopTicking = createVisibleInterval(() => (tick += 1), 5000);
     return () => {
-      clearInterval(timer);
+      stopTicking();
       commitGuard?.cancel();
     };
   });

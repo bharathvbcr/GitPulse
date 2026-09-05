@@ -160,10 +160,24 @@ html.dark {
 }
 
 @layer base {
+  /* UI scale lives on the ROOT, which is both where the preference is written
+     and the element `rem` resolves against — so every rem-based Tailwind
+     utility (text, spacing, sizing) follows it. The rule this replaces read
+     the variable on `body`, an ANCESTOR of the div that declared it, and
+     custom properties inherit downward only: it resolved the `:root` default
+     of 1 forever and the setting moved nothing. Under Tauri the webview's own
+     zoom does the scaling and this stays at 1 — see lib/ui/uiScale.ts for why
+     exactly one of the two ever applies. */
+  html {
+    font-size: calc(16px * var(--ui-font-scale, 1));
+  }
+
   body {
     background-color: rgb(var(--c-bg));
     color: rgb(var(--c-text));
-    font-size: calc(12px * var(--ui-font-scale, 1));
+    /* 0.75rem is the previous 12px at the default root size, now derived from
+       the root so it scales with everything else instead of separately. */
+    font-size: 0.75rem;
   }
 
   ::selection {
@@ -178,6 +192,59 @@ html.dark {
   select:focus-visible {
     outline: none;
     box-shadow: var(--ring-focus);
+  }
+}
+
+/*
+ * Forced colours (Windows High Contrast) and high-contrast preferences.
+ *
+ * The base focus style is `outline: none` plus a `box-shadow` ring. Forced
+ * colours suppress box-shadow, and the removed outline is not restored — so
+ * keyboard focus became invisible on a platform GitPulse ships to. The shadow
+ * ring is the enhancement; a real outline is the floor, and it is drawn in the
+ * system's own Highlight colour rather than a token, because in forced-colours
+ * mode the palette belongs to the user, not to us.
+ */
+@media (forced-colors: active) {
+  button:focus-visible,
+  [role="button"]:focus-visible,
+  [role="tab"]:focus-visible,
+  [role="option"]:focus-visible,
+  a:focus-visible,
+  [tabindex]:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  .gp-focus-flash:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* Meaning carried only by a translucent tint is lost when the system
+     replaces every background. Keep the shapes readable as structure. */
+  .gp-card,
+  .gp-menu,
+  .gp-chip,
+  .gp-keycap,
+  .gp-segmented,
+  .gp-btn,
+  .gp-btn-primary,
+  .gp-btn-success,
+  .gp-field {
+    border: 1px solid CanvasText;
+  }
+
+  .gp-seg-btn[data-active="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}
+
+/* A user asking for more contrast gets a thicker, opaque ring rather than the
+   soft translucent halo the default theme uses. */
+@media (prefers-contrast: more) {
+  :root {
+    --ring-focus: 0 0 0 3px rgb(var(--c-accent));
   }
 }
 
@@ -370,20 +437,6 @@ input[type="range"]::-webkit-slider-thumb {
 }
 input[type="range"]:active::-webkit-slider-thumb {
   transform: scale(1.15);
-}
-input[type="range"]::-moz-range-track {
-  height: 6px;
-  border-radius: 9999px;
-  background: rgb(var(--c-border));
-}
-input[type="range"]::-moz-range-thumb {
-  width: 12px;
-  height: 12px;
-  border-radius: 9999px;
-  border: 2px solid rgb(var(--c-surface));
-  background-image: var(--brand-gradient);
-  box-shadow: var(--shadow-glow);
-  cursor: pointer;
 }
 
 /* Custom smooth scrollbars */
@@ -621,6 +674,18 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
      density-aware row height in src/lib/sidebar/metrics.ts, which is the
      single source of truth — this static value covers non-JS edge paints. */
   contain-intrinsic-size: auto 30px;
+}
+
+/* Diff and blame source text is selectable; the surrounding chrome is not.
+   The panes set `select-none` on their root so the toolbar, rails and gutters
+   cannot be dragged into a selection — but `user-select` inherits, so the code
+   between the gutters inherited it too and a diff could not be copied at all.
+   The gutters keep their own `select-none`, which is what that markup always
+   implied. Cursor follows the capability so the affordance is visible. */
+.gp-diff-text {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 
 /* Title-block drag affordance: children ignore the pointer so the block

@@ -5,6 +5,8 @@
   import { createParseCache, type AnnotatedDiffLine } from "../diff/wordDiff";
   import { composeSpans, shiftMatches, type DiffSpan, type Range } from "../diff/highlight";
   import type { SupportedLanguage } from "../files/syntaxHighlight";
+  import { densityStore } from "../stores/densityStore";
+  import { rowHeight } from "../ui/density";
 
   const parseCache = createParseCache();
 
@@ -74,7 +76,10 @@
     WrapText,
     X,
   } from "lucide-svelte";
-  import ImageDiffViewer from "./ImageDiffViewer.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  // Only an image diff reaches this pane; it does not belong in the chunk
+  // every launch parses.
+  const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import VirtualList from "./VirtualList.svelte";
@@ -130,7 +135,9 @@
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
-  const ROW_HEIGHT = 20;
+  // Row height follows the Compact/Spacious setting like the branch list
+  // and commit table already did; this pane used to ignore it entirely.
+  let ROW_HEIGHT = $derived(rowHeight("diff", $densityStore));
   /**
    * How many diff lines may be wrapped at once.
    *
@@ -674,6 +681,13 @@
 
   function onLinePointerDown(index: number, event: PointerEvent) {
     if (!isWorkingTreeFile || !lineSelectable(index)) return;
+    // A drag that starts on the code itself is a TEXT selection, not a
+    // line-range selection. Both gestures live on the same row, so the split
+    // is by where the pointer went down: the gutter (checkbox, line number,
+    // +/- marker) drags a staging range, the text drags a selection. Without
+    // this the row's preventDefault below suppresses native selection and the
+    // diff stays uncopyable exactly where people copy from most.
+    if ((event.target as Element | null)?.closest?.(".gp-diff-text")) return;
     event.preventDefault();
     isDragging = true;
     dragAnchor = index;
@@ -697,6 +711,30 @@
     if (!patch) return;
     await repoStore.stageSelectivePatch(patch, !isStaged);
     selectedLines = new Set();
+  }
+
+  /**
+   * Copies the selected lines as plain source, without the +/- markers.
+   *
+   * The markers are diff notation, not part of the code — pasting them into an
+   * editor makes the snippet uncompilable, which is the whole reason someone
+   * copies a line out of a diff.
+   */
+  async function copySelectedLines() {
+    if (selectedLines.size === 0) return;
+    const text = [...selectedLines]
+      .sort((a, b) => a - b)
+      .map((index) => {
+        const line = lines[index];
+        if (!line) return "";
+        return line.type === "add" || line.type === "del"
+          ? line.content.slice(1)
+          : line.content;
+      })
+      .join("\n");
+    const copied = await copyText(text);
+    if (copied) toastStore.success(`Copied ${selectedLines.size} line${selectedLines.size === 1 ? "" : "s"}`);
+    else toastStore.error("Could not reach the clipboard");
   }
 
   async function stageSelected(isStaging: boolean) {
@@ -1290,10 +1328,18 @@
             <span>Reading the diff…</span>
           </div>
         {:else if showingImage}
-          <ImageDiffViewer
-            filePath={singleSection?.path ?? $repoStore.selectedFilePath ?? "image"}
-            {oldSrc}
-            {newSrc}
+          <!-- Deferred: only an image diff reaches this pane, so it does not
+               belong in the chunk every launch parses. Mounted inside the
+               frame rather than in place of it, so the rail and the file
+               stepper survive a `.png` the way they survive an empty diff. -->
+          <LazyMount
+            load={loadImageDiffViewer}
+            name="The image comparison view"
+            props={{
+              filePath: singleSection?.path ?? $repoStore.selectedFilePath ?? "image",
+              oldSrc,
+              newSrc,
+            }}
           />
         {:else if showEmpty}
           <div class="flex flex-1 items-center justify-center">
@@ -1391,6 +1437,10 @@
         <button onclick={() => (selectedLines = new Set())} class="gp-btn !py-1 !text-xs">
           Clear
         </button>
+        <button onclick={copySelectedLines} class="gp-btn !py-1 !text-xs" title="Copy the selected lines without their diff markers">
+          <Copy size={12} />
+          <span>Copy</span>
+        </button>
         {#if isStaged}
           <button onclick={() => stageSelected(false)} class="gp-btn-primary !py-1 !text-xs" disabled={truncatedSource}>
             <Check size={12} />
@@ -1412,7 +1462,11 @@
 <!-- ---------------------------------------------------------------------- -->
 
 {#snippet code(line: AnnotatedDiffLine, index: number)}
-  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}"
+  <!-- `gp-diff-text` is what makes the code selectable and what
+       `onLinePointerDown` looks for to tell a text drag from a line-range
+       drag. Both layouts render through this one snippet, so the marker
+       cannot be present on some rows and missing on others. -->
+  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}"
     >{#each rowSpans(line, index) as span}<span
         class="{syntaxActive ? tokenClass(span.token) : ''} {span.changed
           ? line.type === 'del'

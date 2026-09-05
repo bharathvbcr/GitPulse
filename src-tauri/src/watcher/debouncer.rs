@@ -31,25 +31,27 @@ impl RepoFileWatcher {
     /// inside `.git`. Both `notify` backends in use here support the mode:
     /// inotify natively, FSEvents via its own filtering.
     ///
-    /// # Known hazard (macOS): sequential registrations are not atomic
+    /// # Registration is atomic (was: lossy on macOS)
     ///
-    /// The sequential `watcher.watch(..)` calls below are lossy on FSEvents.
-    /// notify's fsevent backend implements every `watch()` call as
-    /// `stop()` + append-path + `run()` (`fsevent.rs`, `watch_inner`), and
-    /// `run()` recreates the whole `FSEventStream` with a fresh
-    /// `kFSEventStreamEventIdSinceNow` epoch. Changes landing between two
-    /// successive `watch()` calls therefore fall into no epoch and are
-    /// permanently missed, and changes racing the first stream installation
-    /// are equally unreliable. Until this is fixed, treat the startup of a
-    /// watch as lossy on macOS (the app-level periodic refresh papers over
-    /// missed changes).
+    /// Every path is accumulated through one `Watcher::paths_mut()` handle and
+    /// installed by a single `commit()`, rather than by successive `watch()`
+    /// calls.
     ///
-    /// Recommended future fix: register all paths atomically instead of
-    /// sequentially — notify 8 exposes multi-path registration via
-    /// `Watcher::paths_mut()` plus a single `PathsMut::commit()`, which lets
-    /// the complete git-dir / common-dir / worktree-root set be accumulated
-    /// before the FSEvents stream is created once, eliminating the
-    /// per-call stop/recreate window entirely.
+    /// This is not tidiness. notify's fsevent backend implements each
+    /// `watch()` as `stop()` + append-path + `run()`, and `run()` recreates
+    /// the whole `FSEventStream` with a fresh `kFSEventStreamEventIdSinceNow`
+    /// epoch — so a change landing between two successive registrations fell
+    /// into no epoch and was missed permanently. With three paths to register
+    /// (git dir, common dir, worktree root) that left two windows on every
+    /// watch startup, and the six-second status poll existed partly to paper
+    /// over them. `FsEventPathsMut` stops once on construction, only appends
+    /// in `add()`, and runs once in `commit()`: one stream creation for the
+    /// whole set, and no window at all.
+    ///
+    /// The `PathsMut` API is uniform across backends (inotify and the polling
+    /// fallback implement it as plain add/remove), so this is not a
+    /// macOS-specific code path — it is the same call everywhere, and it is
+    /// simply also correct on FSEvents.
     pub fn watch_repo(
         git_dir: &Path,
         worktree_root: Option<&Path>,
@@ -72,18 +74,9 @@ impl RepoFileWatcher {
         )
         .map_err(|e| format!("Failed to create filesystem watcher: {}", e))?;
 
-        watcher
-            .watch(git_dir, RecursiveMode::Recursive)
-            .map_err(|e| format!("Failed to watch git directory: {}", e))?;
-
-        if let Some(common) = common_dir {
-            if common != git_dir && common.exists() {
-                watcher
-                    .watch(common, RecursiveMode::Recursive)
-                    .map_err(|e| format!("Failed to watch common git directory: {}", e))?;
-            }
-        }
-
+        // Validate before touching the watcher: a missing worktree root used to
+        // be reported only AFTER two paths were already live, which left a
+        // half-registered watcher behind on the error path.
         if let Some(root) = worktree_root {
             if !root.exists() {
                 return Err(format!(
@@ -91,11 +84,39 @@ impl RepoFileWatcher {
                     root.display()
                 ));
             }
-            if root != git_dir {
-                watcher
-                    .watch(root, RecursiveMode::NonRecursive)
-                    .map_err(|e| format!("Failed to watch work tree root: {}", e))?;
+        }
+
+        {
+            let mut paths = watcher.paths_mut();
+            paths
+                .add(git_dir, RecursiveMode::Recursive)
+                .map_err(|e| format!("Failed to watch git directory: {}", e))?;
+
+            if let Some(common) = common_dir {
+                if common != git_dir && common.exists() {
+                    paths
+                        .add(common, RecursiveMode::Recursive)
+                        .map_err(|e| format!("Failed to watch common git directory: {}", e))?;
+                }
             }
+
+            if let Some(root) = worktree_root {
+                if root != git_dir {
+                    // Non-recursive on purpose: a recursive watch of a whole
+                    // checkout is far too hot for the debounce loop.
+                    paths
+                        .add(root, RecursiveMode::NonRecursive)
+                        .map_err(|e| format!("Failed to watch work tree root: {}", e))?;
+                }
+            }
+
+            // One stream creation for the whole set. An early `?` above drops
+            // `paths` without committing, which leaves the watcher stopped
+            // rather than partially armed — the honest state for a failed
+            // registration.
+            paths
+                .commit()
+                .map_err(|e| format!("Failed to install repository watches: {}", e))?;
         }
 
         Ok(Self {

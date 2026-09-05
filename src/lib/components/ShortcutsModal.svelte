@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { sectionShortcutRows, viewShortcutRows } from "../views/viewShortcuts";
   import { fade, scale } from "svelte/transition";
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
@@ -47,13 +48,19 @@
       icon: Search,
       shortcuts: [
         { keys: ["⌘", "K"], description: "Open Command Palette" },
-        { keys: ["⌘", "1–3"], description: "Jump to view: Code, History, Insights" },
-        { keys: ["F10"], description: "Open Work — tasks, worktrees, PRs, runs and verdicts" },
-        { keys: ["⌘", "F"], description: "Search commits — switches to Graph from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
+        // Derived, never restated. The hand-written line here promised nine
+        // views ("Files, Graph, Diff, Resolve, Blame, Stack, GitHub, Coverage,
+        // Health") for months after the app consolidated to four — from the
+        // one screen whose entire job is to be right about this.
+        ...viewShortcutRows(),
+        ...sectionShortcutRows(),
+        { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
+        { keys: ["Ctrl", "`"], description: "Toggle the terminal dock" },
+        { keys: ["⌘", "F"], description: "Search commits — switches to History from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
-        { keys: ["⌘", "+"], description: "Zoom in UI font scale" },
-        { keys: ["⌘", "-"], description: "Zoom out UI font scale" },
-        { keys: ["⌘", "0"], description: "Reset UI font scale" },
+        { keys: ["⌘", "+"], description: "Zoom in — scales the whole interface" },
+        { keys: ["⌘", "-"], description: "Zoom out — scales the whole interface" },
+        { keys: ["⌘", "0"], description: "Reset the interface scale to 100%" },
       ],
     },
     {
