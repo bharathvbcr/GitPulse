@@ -210,6 +210,21 @@ export interface RepoSession {
    * a hunk from a prefix stages less than the rows imply.
    */
   selectedDiffTruncated: boolean;
+  /**
+   * True while a newly selected diff is still being fetched.
+   *
+   * The store publishes a selection's fields atomically on completion, so
+   * without this the pane keeps showing the PREVIOUS file — its path, its
+   * line count, its rows — for as long as the read takes. On a large commit
+   * that is over a second of a viewer confidently displaying the wrong file.
+   *
+   * Only a change of target raises it. A refetch of the diff already on
+   * screen (the one that follows a stage, or a watcher-driven refresh) leaves
+   * it false, because flashing a skeleton over content that is about to be
+   * replaced by nearly the same content is worse than the staleness it
+   * announces.
+   */
+  selectedDiffPending: boolean;
   activeTab: ViewTab;
   /**
    * The section last open in each sectioned view, keyed by view id.
@@ -289,6 +304,21 @@ export interface RepoState {
    * a hunk from a prefix stages less than the rows imply.
    */
   selectedDiffTruncated: boolean;
+  /**
+   * True while a newly selected diff is still being fetched.
+   *
+   * The store publishes a selection's fields atomically on completion, so
+   * without this the pane keeps showing the PREVIOUS file — its path, its
+   * line count, its rows — for as long as the read takes. On a large commit
+   * that is over a second of a viewer confidently displaying the wrong file.
+   *
+   * Only a change of target raises it. A refetch of the diff already on
+   * screen (the one that follows a stage, or a watcher-driven refresh) leaves
+   * it false, because flashing a skeleton over content that is about to be
+   * replaced by nearly the same content is worse than the staleness it
+   * announces.
+   */
+  selectedDiffPending: boolean;
   activeTab: ViewTab;
   /** Section last open in each sectioned view; see the session field. */
   viewSections: Record<string, string>;
@@ -413,6 +443,7 @@ function emptyProjected(): RepoState {
     selectedIgnoreWhitespace: false,
     selectedDiff: null,
     selectedDiffTruncated: false,
+    selectedDiffPending: false,
     activeTab: "work",
     viewSections: {},
     isLoading: false,
@@ -454,6 +485,7 @@ function createSession(
     selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
     selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
+    selectedDiffPending: extras.selectedDiffPending ?? false,
     activeTab: extras.activeTab ?? "work",
     viewSections: { ...(extras.viewSections ?? {}) },
     searchQuery: extras.searchQuery ?? "",
@@ -519,6 +551,7 @@ function project(internal: InternalState): RepoState {
     selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
     selectedDiff: active?.selectedDiff ?? null,
     selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
+    selectedDiffPending: active?.selectedDiffPending ?? false,
     activeTab: active?.activeTab ?? "work",
     viewSections: active?.viewSections ?? {},
     isLoading: active?.isLoading ?? false,
@@ -573,6 +606,34 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // only moves on tab activation, so it cannot order two rapid selections of
   // the same tab; this does.
   const selectionGeneration = beginGeneration();
+
+  /**
+   * Marks a diff fetch as in flight, but only when the target actually moves.
+   *
+   * The `select*Diff` calls are also how the app refetches the diff already
+   * on screen after a mutation or a watcher event. Raising the flag for those
+   * would blink a skeleton over content that is about to be replaced by
+   * nearly the same content, several times a minute.
+   */
+  const beginDiffFetch = (
+    session: RepoSession,
+    target: {
+      filePath: string | null;
+      commitId: string | null;
+      isStaged: boolean;
+      ignoreWhitespace: boolean;
+    },
+  ): void => {
+    const unchanged =
+      session.selectedFilePath === target.filePath &&
+      session.selectedCommitId === target.commitId &&
+      session.selectedIsStaged === target.isStaged &&
+      session.selectedIgnoreWhitespace === target.ignoreWhitespace &&
+      session.selectedDiff !== null;
+    if (unchanged) return;
+    applyToSession(session.id, session.generation, { selectedDiffPending: true });
+  };
+
 
   /**
    * How many poll ticks between re-asserting the active repository's watch.
@@ -1670,6 +1731,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // every refetch of this diff must carry whatever the user last chose.
       const ignoreWhitespace = session.selectedIgnoreWhitespace;
       const token = selectionGeneration.next();
+      beginDiffFetch(session, {
+        filePath,
+        commitId: null,
+        isStaged,
+        ignoreWhitespace,
+      });
       try {
         const diff = await invokeFn<DiffPayload>("cmd_get_file_diff", {
           repoPath: session.path,
@@ -1685,13 +1752,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiffTruncated: diff.truncated,
           selectedIsStaged: isStaged,
           selectedIgnoreWhitespace: ignoreWhitespace,
+          selectedDiffPending: false,
           selectionKind: "file",
           activeTab: "history",
           viewSections: { ...current.viewSections, history: "diff" },
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: formatError(err) });
+        // The flag clears on failure too: a fetch that errored is not still
+        // running, and leaving a spinner up would report a dead read as a
+        // slow one.
+        applyToSession(session.id, generation, {
+          error: formatError(err),
+          selectedDiffPending: false,
+        });
       }
     },
     selectFilePath: (filePath: string | null) => {
@@ -1734,6 +1808,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!session) return;
       const generation = session.generation;
       const token = selectionGeneration.next();
+      beginDiffFetch(session, {
+        filePath: null,
+        commitId,
+        isStaged: false,
+        ignoreWhitespace: session.selectedIgnoreWhitespace,
+      });
       try {
         const diff = await invokeFn<DiffPayload>("cmd_get_commit_diff", {
           repoPath: session.path,
@@ -1746,11 +1826,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
           selectedIsStaged: false,
+          selectedDiffPending: false,
           selectionKind: "commit",
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: formatError(err) });
+        // The flag clears on failure too: a fetch that errored is not still
+        // running, and leaving a spinner up would report a dead read as a
+        // slow one.
+        applyToSession(session.id, generation, {
+          error: formatError(err),
+          selectedDiffPending: false,
+        });
       }
     },
     /**
@@ -1761,6 +1848,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!session) return;
       const generation = session.generation;
       const token = selectionGeneration.next();
+      beginDiffFetch(session, {
+        filePath,
+        commitId,
+        isStaged: false,
+        ignoreWhitespace: session.selectedIgnoreWhitespace,
+      });
       try {
         const fileDiff = await invokeFn<DiffPayload>("cmd_get_commit_file_diff", {
           repoPath: session.path,
@@ -1774,13 +1867,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiff: fileDiff.text,
           selectedDiffTruncated: fileDiff.truncated,
           selectedIsStaged: false,
+          selectedDiffPending: false,
           selectionKind: "commit",
           activeTab: "history",
           viewSections: { ...current.viewSections, history: "diff" },
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: formatError(err) });
+        // The flag clears on failure too: a fetch that errored is not still
+        // running, and leaving a spinner up would report a dead read as a
+        // slow one.
+        applyToSession(session.id, generation, {
+          error: formatError(err),
+          selectedDiffPending: false,
+        });
       }
     },
     selectRangeDiff: async (from: string, to: string) => {
@@ -1788,6 +1888,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!session) return;
       const generation = session.generation;
       const token = selectionGeneration.next();
+      beginDiffFetch(session, {
+        filePath: `${from}...${to}`,
+        commitId: null,
+        isStaged: false,
+        ignoreWhitespace: session.selectedIgnoreWhitespace,
+      });
       try {
         const diff = await invokeFn<DiffPayload>("cmd_get_range_diff", {
           repoPath: session.path,
@@ -1801,13 +1907,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
           selectedIsStaged: false,
+          selectedDiffPending: false,
           selectionKind: "range",
           activeTab: "history",
           viewSections: { ...current.viewSections, history: "diff" },
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, { error: formatError(err) });
+        // The flag clears on failure too: a fetch that errored is not still
+        // running, and leaving a spinner up would report a dead read as a
+        // slow one.
+        applyToSession(session.id, generation, {
+          error: formatError(err),
+          selectedDiffPending: false,
+        });
       }
     },
     stageFile: async (filePath: string) =>

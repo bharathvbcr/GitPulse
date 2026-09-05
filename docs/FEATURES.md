@@ -82,11 +82,20 @@ the commit you had just selected.
 - **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in the Resolve view if a conflict results.
 
 #### Diff
-- **Embedded File Rail & Commit Picker**: Browse changed files and move between recent commits without leaving the section. Uncommitted changes are prioritized as first-class entries, history truncation is explicitly surfaced, and state uses the commits the graph already drew with zero IPC overhead.
-- **Precision Word Wrap & Normal-Flow Reflow**: Toggleable word-wrapping that gracefully disables row virtualization (`virtualize={false}`) up to `WRAP_MAX_LINES`, allowing long lines to reflow naturally without clipping, row overlap, or pushing split-view columns off-screen.
+- **Identity Read From The Diff**: The header names what the body actually holds — one file by path, or `N files` with the combined `+X −Y` — taken from the patch's own `diff --git` sections rather than from whichever path was last clicked. A commit-wide or worktree-wide diff no longer wears one file's name, icon and line count.
+- **True Side-By-Side Split**: Replacement blocks align `del[k]` against `add[k]`, so a three-line rewrite reads across, not down; the longer side spills into rows whose other column is empty, and file/hunk chrome spans both columns instead of leaving one blank. Unified and Split derive from one row model and one intra-line pairing, so the two views cannot disagree about what a change replaced or which words changed.
+- **One Horizontal Scroll, Pinned Gutter**: The surface scrolls sideways as a whole with the line-number gutter stuck to the left over an opaque background. Rows used to scroll independently — a scrollbar per line, and the numbers rode away with the code.
+- **Both Line Numbers**: Old and new columns, sized to the file's widest number, instead of one column that meant `oldNo` on deletions and `newNo` on additions.
+- **Syntax Colouring**: The same zero-dependency tokenizer the code viewer uses, composed under the intra-line word diff and the search highlight so all three read at once. Bounded by line length and by diff size, and toggleable.
+- **Find In Diff**: ⌘F, case and regex toggles, match count, F3 / ⇧F3 stepping, and highlighting that follows the rendered text rather than the raw `+`/`-` column. A pattern whose nesting can backtrack exponentially (`(a+)+`) is refused with a message rather than run — a JavaScript regex cannot be interrupted once it starts.
+- **Change Stepping & Sticky Context**: Alt+PgUp/PgDn walk block to block, and a strip above the rows names the file and hunk you are inside once its header has scrolled away.
+- **Embedded File Rail & Commit Picker**: Browse changed files and move between recent commits without leaving the section. Rows carry the shortest path suffix that tells them apart (`analyzer/mod.rs` beside `codeintel/mod.rs`), filter as you type, group into a directory tree on request, virtualize past sixty entries, and the rail resizes. Uncommitted changes stay a first-class entry, and history truncation is surfaced rather than passed off as a whole list.
+- **A Frame That Survives Empty**: The rail, the toolbars and the file stepper stay put through an empty diff, an image diff and a pending fetch. Each of those used to replace the entire pane, so a clean merge or a `.png` left no way to reach the next file.
+- **Precision Word Wrap & Normal-Flow Reflow**: Toggleable word-wrapping that gracefully disables row virtualization (`virtualize={false}`) up to `WRAP_MAX_LINES`, allowing long lines to reflow naturally without clipping or row overlap.
 - **Intra-Line Word Highlighting**: Pinpoints exact character and token changes within modified lines.
-- **Selective Patch Staging**: Stage or unstage individual hunks or selected line ranges directly from the diff view.
-- **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets.
+- **Selective Patch Staging**: Stage or unstage individual hunks or selected line ranges, from either layout. Only the action that applies to this side of the index is offered, and a selection is cleared when the diff text changes underneath it — indices into a replaced patch would stage lines nobody picked.
+- **Honest Map**: The minimap projects the list actually on screen (unified lines or split rows), marks each file boundary, shows the viewport band, and centres what you click instead of scrolling past it.
+- **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets, inside the same frame.
 
 #### Reflog
 - **Reference Log Browser**: Full history of HEAD movements, checkouts, commits, rebases, and resets.

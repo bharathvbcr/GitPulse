@@ -341,7 +341,7 @@ describe("adversarial inputs", () => {
   });
 
   it("does not break on a hostile branch name", () => {
-    const nasty = "</script><img src=x onerror=alert(1)>\n ";
+    const nasty = "</script><img src=x onerror=alert(1)>\n\u0000";
     const line = headline(op({ head_ref: nasty }));
     // Svelte escapes on render; the model's job is only to not lose or mangle
     // the value, so a corrupted name is never shown as a different branch.

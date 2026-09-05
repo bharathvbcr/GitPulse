@@ -1,4 +1,5 @@
 import type { AnnotatedDiffLine } from "./wordDiff";
+import { parseHeaderPath, stripSidePrefix } from "./gitPaths";
 
 export type DiffLineType = "Context" | "Addition" | "Deletion";
 
@@ -59,74 +60,6 @@ export function parseHunkHeaderNumbers(header: string): {
 // ---------------------------------------------------------------------------
 // Authoritative paths from parsed ---/+++ headers
 // ---------------------------------------------------------------------------
-
-/**
- * Decodes git's C-style quoted path body (the text between the double
- * quotes). Git escapes every non-ASCII byte as \NNN octal, so the escapes
- * are BYTES that must be reassembled as UTF-8 — decoding each escape to an
- * isolated code unit would turn \303\251 into "Ã©" instead of "é".
- */
-function decodeQuotedGitPath(body: string): string {
-  const bytes: number[] = [];
-  for (let i = 0; i < body.length; i += 1) {
-    const ch = body[i];
-    if (ch !== "\\") {
-      bytes.push(body.charCodeAt(i));
-      continue;
-    }
-    i += 1;
-    const esc = body[i];
-    if (esc === undefined) break;
-    if (esc >= "0" && esc <= "7") {
-      let value = 0;
-      let digits = 0;
-      while (digits < 3 && i < body.length && body[i] >= "0" && body[i] <= "7") {
-        value = value * 8 + (body.charCodeAt(i) - 48);
-        i += 1;
-        digits += 1;
-      }
-      i -= 1;
-      bytes.push(value & 0xff);
-    } else if (esc === "n") bytes.push(10);
-    else if (esc === "t") bytes.push(9);
-    else if (esc === "r") bytes.push(13);
-    else if (esc === '"') bytes.push(34);
-    else if (esc === "\\") bytes.push(92);
-    else bytes.push(esc.charCodeAt(0));
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
-  } catch {
-    return bytes.map((b) => String.fromCharCode(b)).join("");
-  }
-}
-
-/**
- * Extracts the path from a raw `--- `/`+++ ` header line, dropping any
- * timestamp git appends after a tab and unwrapping git's quoted form.
- */
-function parseHeaderPath(headerLine: string): string | null {
-  let rest = headerLine.slice(4);
-  const tab = rest.indexOf("\t");
-  if (tab >= 0) rest = rest.slice(0, tab);
-  // CRLF diff text leaves a stray \r on the header line; strip exactly that.
-  rest = rest.replace(/\r$/, "");
-  if (rest.startsWith('"') && rest.endsWith('"') && rest.length >= 2) {
-    return decodeQuotedGitPath(rest.slice(1, -1));
-  }
-  return rest;
-}
-
-/**
- * Strips exactly one git side prefix. Only the leading occurrence is removed
- * ("a/a/real.rs" → "a/real.rs"), so repositories with a genuine top-level
- * `a/` directory keep targeting the right files. `/dev/null` passes through
- * verbatim — git requires it unprefixed on whichever side lacks a file.
- */
-function stripSidePrefix(path: string, side: "a" | "b"): string {
-  if (path === "/dev/null") return path;
-  return path.startsWith(`${side}/`) ? path.slice(2) : path;
-}
 
 interface SourceHeaders {
   /** Raw parsed `--- ` path, or null when absent. */

@@ -137,8 +137,18 @@ describe("App overlay wiring", () => {
     expect(fn).toContain("tabForCommitSearch");
     expect(fn).toContain("repoStore.setActiveTab(target)");
     expect(fn).toContain("FOCUS_COMMIT_SEARCH_EVENT");
-    expect(source).toContain("ownsCommitSearchChord($repoStore.activeTab)");
     expect(source).toContain("focusFilter: () => void focusCommitSearch()");
+  });
+
+  it("asks the chord owner about the section, not only about the view", () => {
+    // History's Diff section reads a file's lines and owns ⌘F for finding
+    // inside them; its Graph and Reflog sections are commit lists and hand
+    // the chord to the filter that narrows them. Passing only the view made
+    // ⌘F focus the commit filter over an open diff.
+    expect(source).toContain(
+      "ownsCommitSearchChord($repoStore.activeTab, activeSectionFor($repoStore.activeTab, $repoStore.viewSections))",
+    );
+    expect(source).toContain('import { activeSectionFor } from "./lib/views/viewRegistry"');
   });
 
   it("keeps PromptModal and DiagnosticsModal in separate crash boundaries", () => {

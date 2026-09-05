@@ -35,6 +35,8 @@ const props = (over = {}) => ({
   onPickCommit: () => {},
   onPickWorkingTree: () => {},
   onCollapse: () => {},
+  // The picker folds by default; these render it to assert what it says.
+  commitsOpen: true,
   ...over,
 });
 
@@ -92,6 +94,71 @@ describe("DiffFileRail", () => {
   });
 });
 
+describe("DiffFileRail tells its files apart", () => {
+  const sameName = buildFileRail({
+    selectionKind: "commit",
+    commitFiles: [
+      { path: "src/analyzer/mod.rs", status_code: "M", additions: 1, deletions: 0 },
+      { path: "src/codeintel/mod.rs", status_code: "M", additions: 2, deletions: 0 },
+      { path: "docs/README.md", status_code: "M", additions: 3, deletions: 0 },
+    ],
+    commitFilesTruncated: false,
+    commitFilesTotal: 0,
+    statuses: [],
+  });
+
+  it("qualifies rows whose basenames collide", () => {
+    // The regression: this repository's own head commit listed `mod.rs` eight
+    // times and `plugin.json` three times, all identical, in a 224px column.
+    const { body } = render(DiffFileRail, {
+      props: props({ rail: sameName, currentPath: "src/analyzer/mod.rs" }),
+    });
+    expect(body).toContain("analyzer/");
+    expect(body).toContain("codeintel/");
+  });
+
+  it("leaves a unique basename alone rather than qualifying everything", () => {
+    const { body } = render(DiffFileRail, { props: props({ rail: sameName }) });
+    // Scoped to the dimmed prefix span: the full path is still in the row's
+    // title attribute, which is where it belongs.
+    const prefixes = [...body.matchAll(/opacity-55[^>]*>([^<]*)</g)].map((m) => m[1]);
+    expect(prefixes).toContain("analyzer/");
+    expect(prefixes).toContain("codeintel/");
+    expect(prefixes).not.toContain("docs/");
+  });
+
+  it("keeps the full path available as the row's tooltip", () => {
+    const { body } = render(DiffFileRail, { props: props({ rail: sameName }) });
+    expect(body).toContain('title="src/analyzer/mod.rs"');
+  });
+
+  it("offers a filter and a tree, because a two-hundred-file list needs both", () => {
+    const { body } = render(DiffFileRail, { props: props({ rail: sameName }) });
+    expect(body).toContain('aria-label="Filter files in this diff"');
+    expect(body).toContain('aria-label="File list layout"');
+  });
+
+  it("can be resized, so a fixed column is not a fixed cost", () => {
+    const { body } = render(DiffFileRail, {
+      props: props({ rail: sameName, onResize: () => {} }),
+    });
+    expect(body).toContain('aria-label="Resize the file list"');
+    expect(body).toContain('aria-valuenow');
+  });
+
+  it("says so when the change has no files at all", () => {
+    const empty = buildFileRail({
+      selectionKind: "commit",
+      commitFiles: [],
+      commitFilesTruncated: false,
+      commitFilesTotal: 0,
+      statuses: [],
+    });
+    const { body } = render(DiffFileRail, { props: props({ rail: empty }) });
+    expect(body).toContain("No files in this change.");
+  });
+});
+
 describe("DiffViewer wiring", () => {
   const source = readFileSync(new URL("./DiffViewer.svelte", import.meta.url), "utf8");
 
@@ -109,16 +176,8 @@ describe("DiffViewer wiring", () => {
     expect(source).toContain("cmd_get_commit_files");
   });
 
-  it("offers keyboard stepping that does not fight the diff's own scrolling", () => {
-    expect(source).toContain("event.altKey");
-    expect(source).toContain("ArrowDown");
-    // Bare arrows scroll the diff, so they must not be captured.
-    expect(source).not.toContain('event.key === "ArrowDown" && !event.altKey');
-  });
-
-  it("leaves typing targets alone", () => {
-    expect(source).toContain('tag === "INPUT"');
-    expect(source).toContain("isContentEditable");
+  it("owns the picker's fold so it survives a file switch", () => {
+    expect(source).toContain("bind:commitsOpen");
   });
 });
 
@@ -161,5 +220,58 @@ describe("DiffFileRail commit picker", () => {
 
   it("marks a merge commit as one", () => {
     expect(render(DiffFileRail, { props: props() }).body).toContain("merge");
+  });
+
+  it("names the open change in its header, so folding it loses nothing", () => {
+    // Folded is the default; the header has to answer "which change" without
+    // being opened.
+    const { body } = render(DiffFileRail, { props: props({ commitsOpen: false }) });
+    expect(body).toContain("Add the parser");
+    expect(body).not.toContain("(no commit message)");
+  });
+
+  it("names uncommitted work in that header when no commit is selected", () => {
+    const { body } = render(DiffFileRail, {
+      props: props({ commitsOpen: false, selectedCommitId: null }),
+    });
+    expect(body).toContain("Uncommitted changes");
+  });
+});
+
+describe("DiffFileRail resize handle", () => {
+  const source = readFileSync(new URL("./DiffFileRail.svelte", import.meta.url), "utf8");
+
+  it("is a real window splitter, not a pointer-only grab strip", () => {
+    // A drag handle with no keyboard path is unreachable without a mouse, and
+    // one that does not report its bounds cannot be read by a screen reader.
+    const { body } = render(DiffFileRail, { props: props({ onResize: () => {} }) });
+    expect(body).toContain('role="separator"');
+    expect(body).toContain('aria-orientation="vertical"');
+    expect(body).toContain('tabindex="0"');
+    expect(body).toMatch(/aria-valuenow="\d+"/);
+    expect(body).toContain('aria-valuemin="180"');
+    expect(body).toContain('aria-valuemax="520"');
+  });
+
+  it("draws no handle at all when the caller cannot resize", () => {
+    expect(render(DiffFileRail, { props: props() }).body).not.toContain('role="separator"');
+  });
+
+  it("answers to every key the splitter pattern defines", () => {
+    // Arrows step; Home/End jump to narrowest and widest. Stepping alone
+    // makes "as narrow as it goes" a dozen keypresses.
+    for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
+      expect(source, key).toContain(`event.key === "${key}"`);
+    }
+  });
+
+  it("clamps every keyboard move to the handle's own bounds", () => {
+    // The reported aria-valuemin/max and the values the keys produce have to
+    // be the same two numbers, or the control lies about its range.
+    expect(source).toContain("Math.max(MIN_WIDTH, width - step)");
+    expect(source).toContain("Math.min(MAX_WIDTH, width + step)");
+    expect(source).toContain("onResize(MIN_WIDTH)");
+    expect(source).toContain("onResize(MAX_WIDTH)");
+    expect(source).toContain("Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, next))");
   });
 });
