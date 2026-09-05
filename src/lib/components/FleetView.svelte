@@ -58,6 +58,7 @@
     RefreshCw,
     ShieldAlert,
     SquareCode,
+    Trash2,
     Trees,
     X,
   } from "lucide-svelte";
@@ -159,6 +160,11 @@
       void openRow(visibleRows[index]);
       return;
     }
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      void removeRow(visibleRows[index]);
+      return;
+    }
     const next = nextRovingIndex(index, visibleRows.length, event.key as RovingKey, "vertical");
     if (next === null) return;
     event.preventDefault();
@@ -171,6 +177,11 @@
     if (!row) return;
     await repoStore.openRepo(row.path);
     interfaceStore.setFleetOpen(false);
+  }
+
+  async function removeRow(row: FleetRow | undefined) {
+    if (!row) return;
+    await repoStore.removeRepo(row.path);
   }
 </script>
 
@@ -338,6 +349,7 @@
             <th scope="col" class="font-medium px-3 py-2 text-right">Storage</th>
             <th scope="col" class="font-medium px-3 py-2 text-right">Vulns</th>
             <th scope="col" class="font-medium px-3 py-2 text-right">Coverage</th>
+            <th scope="col" class="font-medium px-3 py-2 text-right w-8"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody>
@@ -521,6 +533,24 @@
                     <span class="text-textPrimary">{row.coverage.value.toFixed(1)}%</span>
                   {/if}
                 </FleetCell>
+              </td>
+
+              <td class="px-3 py-2 align-top text-right">
+                <button
+                  type="button"
+                  class="p-1 rounded text-textMuted hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                  title={row.presence === "open"
+                    ? `Remove ${row.label} from Fleet (closes repository)`
+                    : `Remove ${row.label} from Fleet`}
+                  aria-label={`Remove ${row.label} from Fleet`}
+                  data-testid="fleet-remove-repo"
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void removeRow(row);
+                  }}
+                >
+                  <Trash2 size={12} />
+                </button>
               </td>
             </tr>
           {/each}

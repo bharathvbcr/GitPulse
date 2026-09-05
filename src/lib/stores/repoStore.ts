@@ -1621,6 +1621,25 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       );
       publish();
     },
+    removeRepo: async (path: string) => {
+      const tab = internal.workspace.tabs.find((item) =>
+        sameRepo(item.path, path, options),
+      );
+      if (tab) {
+        await store.closeTab(tab.id);
+      }
+      replaceWorkspace({
+        ...internal.workspace,
+        recents: internal.workspace.recents.filter(
+          (item) => !sameRepo(item, path, options),
+        ),
+        lastClosed: internal.workspace.lastClosed.filter(
+          (item) => !sameRepo(item, path, options),
+        ),
+      });
+      publish();
+      flushPersist();
+    },
     refresh: async (repoPath?: string) => {
       const session = repoPath
         ? Object.values(internal.sessions).find((item) =>

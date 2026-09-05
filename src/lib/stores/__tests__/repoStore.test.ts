@@ -2665,3 +2665,51 @@ describe("repoStore watch self-healing", () => {
     }
   });
 });
+
+describe("repoStore.removeRepo", () => {
+  it("removes a closed repository from recents", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    await store.openRepo("/r/beta");
+    // Close alpha tab so it becomes recent
+    const alphaTab = get(store).openTabs.find((t) => t.path === "/r/alpha");
+    expect(alphaTab).toBeDefined();
+    await store.closeTab(alphaTab!.id);
+
+    expect(get(store).recentRepos).toContain("/r/alpha");
+    expect(get(store).openTabs.map((t) => t.path)).not.toContain("/r/alpha");
+
+    await store.removeRepo("/r/alpha");
+
+    expect(get(store).recentRepos).not.toContain("/r/alpha");
+    expect(get(store).openTabs.map((t) => t.path)).not.toContain("/r/alpha");
+  });
+
+  it("closes an open tab and removes it from recents and lastClosed", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    await store.openRepo("/r/beta");
+
+    expect(get(store).openTabs).toHaveLength(2);
+    expect(get(store).recentRepos).toContain("/r/beta");
+
+    await store.removeRepo("/r/beta");
+
+    const state = get(store);
+    expect(state.openTabs.map((t) => t.path)).toEqual(["/r/alpha"]);
+    expect(state.recentRepos).not.toContain("/r/beta");
+    expect(state.lastClosed).not.toContain("/r/beta");
+    expect(state.currentPath).toBe("/r/alpha");
+  });
+
+  it("is a no-op for a path not in tabs or recents", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    const countBefore = get(store).openTabs.length;
+
+    await store.removeRepo("/r/non-existent");
+
+    expect(get(store).openTabs).toHaveLength(countBefore);
+  });
+});
+

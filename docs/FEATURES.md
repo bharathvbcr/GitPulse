@@ -291,6 +291,11 @@ sessions survive and nothing re-hydrates on the way back.
   spawn your package manager) and reports successes, failures and skips
   separately, attributing each failure to the repository and column it
   happened in.
+- **Remove from Fleet (`Delete` / `Backspace` or remove icon).** Any open or
+  recent repository can be removed directly from the Fleet grid. Removing an
+  open repository closes its tab and drops it from the workspace; removing a
+  recent repository purges it from workspace history so stale or moved project
+  paths stay clean without lingering.
 
 ---
 

@@ -183,3 +183,28 @@ describe("expensive scans stay opt-in", () => {
     expect(source).toContain("if (key === lastSwept) return;");
   });
 });
+
+describe("FleetView repository removal", () => {
+  it("provides a remove button in each row and wires it to repoStore.removeRepo", () => {
+    expect(source).toContain('data-testid="fleet-remove-repo"');
+    expect(source).toContain("removeRow(row)");
+    expect(source).toContain("repoStore.removeRepo(row.path)");
+  });
+
+  it("supports keyboard removal via Delete and Backspace keys on focused rows", () => {
+    expect(source).toContain('event.key === "Delete" || event.key === "Backspace"');
+    expect(source).toContain("removeRow(visibleRows[index])");
+  });
+
+  it("labels the remove button according to whether the repository is open or recent", () => {
+    expect(source).toContain('title={row.presence === "open"');
+    expect(source).toContain("Remove ${row.label} from Fleet (closes repository)");
+    expect(source).toContain("Remove ${row.label} from Fleet");
+    expect(source).toContain("aria-label={`Remove ${row.label} from Fleet`}");
+  });
+
+  it("includes an Actions column header with accessible screen reader text", () => {
+    expect(source).toContain('<span class="sr-only">Actions</span>');
+  });
+});
+
