@@ -97,6 +97,10 @@ describe("HealthPanel rendering", () => {
     expect(body).toContain("Health");
     expect(body).toContain("Scan");
     expect(body).toContain("GitHub alerts are not checked automatically");
+    // With no repository open there is nothing to have checked, so the
+    // Dependabot state chip stays out of the header entirely.
+    expect(body).not.toContain("Dependabot not checked");
+    expect(body).toContain("Open a repository to scan dependency health");
   });
 
   it("feeds scanners_ran into formatAuditCounts so an unrun audit never renders as clean", () => {
@@ -274,5 +278,103 @@ describe("HealthPanel error-state separation (regression)", () => {
     expect(issuesHeading.slice(0, 200)).toContain("issuesTotal");
     const vulnHeading = source.slice(source.indexOf("Vulnerabilities ("));
     expect(vulnHeading.slice(0, 300)).toContain("vulnerabilitiesTotal");
+  });
+
+  /**
+   * The "All" tab could always disclose a cap because `audit.total` is
+   * computed before `cap_report` truncates. "Direct" has no equivalent total
+   * — it filters the surviving rows — so it printed a floor as though it were
+   * the count. The cap keeps the most severe findings, so the rows dropped
+   * are exactly the ones nobody is looking at.
+   */
+  it("does not print the direct-vulnerability count as a total when the scan was capped", () => {
+    expect(source).toContain("vulnerabilitiesCapped");
+    const vulnHeading = source.slice(source.indexOf("Vulnerabilities ("), source.indexOf("gp-segmented"));
+    expect(vulnHeading).toContain('vulnerabilitiesCapped ? "at least " : ""');
+  });
+
+  /**
+   * GitHub alerts are never checked automatically, so "nobody has looked" is
+   * the default state — and it rendered as the same empty space as "looked,
+   * nothing open". A clean local audit next to that blank read as an
+   * all-clear for a repository whose alerts had never been fetched.
+   */
+  it("distinguishes an unchecked Dependabot from a checked-and-clear one", () => {
+    expect(source).toContain("Dependabot not checked");
+    expect(source).toContain("Dependabot 0 open");
+    expect(source).toContain("Dependabot unavailable");
+  });
+
+  /**
+   * `cmd_codeintel_dead_symbols` answers under a token budget and returns
+   * `total`/`truncated` next to the rows. Both were dropped on arrival, so
+   * the heading counted surviving rows and called that the repository's
+   * unreferenced-symbol count.
+   */
+  it("keeps the dead-symbol total and truncation flag rather than counting rows", () => {
+    expect(source).toContain("deadSymbolsTotal");
+    expect(source).toContain("deadSymbolsTruncated");
+    const heading = source.slice(source.indexOf("Dead code & unreferenced symbols ("));
+    expect(heading.slice(0, 260)).toContain("deadSymbolsTotal");
+    // An empty result from a truncated query is not an all-clear.
+    expect(source).toContain("this is not an all-clear");
+  });
+
+  /**
+   * A scanner that was installed, dispatched and then failed left the summary
+   * saying "incomplete" and naming nothing, because the panel derived only
+   * the missing-CLI half of the reason.
+   */
+  /**
+   * Two cuts hid behind one list: the backend keeps at most
+   * MAX_ECOSYSTEM_MANIFESTS per family and records a notice, and the row then
+   * printed only the first four of whatever survived — with nothing marking
+   * either. "4 lockfiles" and "the 4 lockfiles there are" looked identical.
+   */
+  it("says how many ecosystem artifacts it is not showing", () => {
+    expect(source).toContain("ecosystemArtifactTotal");
+    expect(source).toContain("ecosystem artifacts`");
+    expect(source).toContain("more`");
+    // The bare slice with no disclosure must be gone.
+    expect(source).not.toContain('{eco.manifests.slice(0, 4).join(", ")}');
+  });
+
+  /**
+   * The class behind every count defect this panel has had: a bounded
+   * collection headlined by the rows that survived the bound.
+   *
+   * Derived from the source rather than from a list of today's sections, so a
+   * new counted section is covered the day it is written. Every heading that
+   * prints a count must either print an observed total (a `*Total` binding)
+   * or print the count beside a truncation marker — `.length` on its own is
+   * the shape that reads as complete coverage and is not.
+   *
+   * Caught in the wild by this rule: the dead-symbol heading counted the rows
+   * that fitted the token budget, and the direct-vulnerability filter counted
+   * the rows that survived the scan cap.
+   */
+  it("never headlines a bounded section with a bare row count", () => {
+    const headings = [...source.matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>/g)].map((m) => m[1]);
+    expect(headings.length, "no headings parsed — the scan is broken").toBeGreaterThan(3);
+    const counted = headings.filter((heading) => heading.includes("{"));
+    expect(counted.length, "no counted headings parsed").toBeGreaterThan(2);
+    for (const heading of counted) {
+      if (!/\.length/.test(heading)) continue;
+      const disclosesTotal = /Total\b/.test(heading);
+      const disclosesCap = /truncated|at least|showing/.test(heading);
+      expect(
+        disclosesTotal || disclosesCap,
+        `a heading prints a bare row count with no observed total and no cap ` +
+          `disclosure, so a bounded result reads as complete: ${heading.trim()}`,
+      ).toBe(true);
+    }
+  });
+
+  it("names failed scanners, not only missing ones, when coverage is short", () => {
+    expect(source).toContain("coverageGap");
+    // The old wording derived only from `skippedAudits`; the single owner
+    // now covers both halves, so the narrower one must be gone.
+    expect(source).not.toContain("skippedAudits(report)");
+    expect(source).toContain("Local audit incomplete${gap");
   });
 });

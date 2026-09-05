@@ -16,7 +16,13 @@ import {
   severityClass,
   updateKind,
 } from "./format";
-import { formatHealthReport, observedTotal, skippedAudits } from "./report";
+import {
+  coverageGap,
+  failedAudits,
+  formatHealthReport,
+  observedTotal,
+  skippedAudits,
+} from "./report";
 import type { DependabotReport, DepsHealthReport } from "./types";
 
 function bareReport(over: Partial<DepsHealthReport> = {}): DepsHealthReport {
@@ -282,5 +288,107 @@ describe("health renderers survive hostile scanner output", () => {
     const text = formatHealthReport(big, "/repo", null);
     expectWithinBudget(performance.now() - started, 200, "health adversarial report");
     expect(text.split("\n").length).toBeGreaterThan(400);
+  }, STRESS_TIMEOUT_MS);
+});
+
+describe("the audit breakdown accounts for every finding", () => {
+  /**
+   * The invariant, fuzzed over magnitudes rather than bucket combinations
+   * (`format.test.ts` sweeps all 2^6 of those exhaustively): whatever numbers
+   * the summary prints must add up to the total it claims to summarise.
+   *
+   * The bug this pins: `info` was absent from both the parts list and the
+   * parameter type, so informational findings counted into `total` and then
+   * disappeared from the breakdown. `AuditSummary::from_vulns` pins a real
+   * case — critical 1, unknown 1, info 1, total 3 — that rendered as
+   * "1 critical · 1 unranked".
+   */
+  it("prints numbers that sum to the total, at every magnitude", () => {
+    // Deterministic LCG, same shape the Rust fuzzers use, so a failure names
+    // the seed that reproduces it.
+    let state = 0x9e3779b9;
+    const next = (bound: number) => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state % bound;
+    };
+    for (let round = 0; round < 5_000; round += 1) {
+      const summary = {
+        critical: next(40),
+        high: next(40),
+        moderate: next(40),
+        low: next(40),
+        info: next(40),
+        unknown: next(40),
+        total: 0,
+      };
+      summary.total =
+        summary.critical +
+        summary.high +
+        summary.moderate +
+        summary.low +
+        summary.info +
+        summary.unknown;
+      if (summary.total === 0) continue;
+      const rendered = formatAuditCounts(summary, { complete: true, ran: true });
+      const printed = [...rendered.matchAll(/(\d+)\s/g)].reduce(
+        (sum, match) => sum + Number(match[1]),
+        0,
+      );
+      expect(printed, `round ${round} rendered ${rendered}`).toBe(summary.total);
+    }
+  });
+
+  /**
+   * A backend that grows a severity bucket this formatter has never heard of
+   * must widen the printed count, not shrink it. Silence here would be the
+   * "capped sample as complete coverage" failure in miniature.
+   */
+  it("never prints fewer findings than the total claims", () => {
+    for (const extra of [1, 7, 1_000, Number.MAX_SAFE_INTEGER - 10]) {
+      const rendered = formatAuditCounts(
+        { critical: 1, high: 0, moderate: 0, low: 0, info: 0, unknown: 0, total: 1 + extra },
+        { complete: true, ran: true },
+      );
+      expect(rendered).toContain(`${extra} unclassified`);
+    }
+  });
+});
+
+describe("coverage gaps stay total on hostile issue lists", () => {
+  it("never throws, whatever the issue codes are", () => {
+    for (const hostile of HOSTILE_STRINGS) {
+      const report = bareReport({
+        issues: [
+          { severity: hostile, code: hostile, message: hostile, path: hostile },
+          { severity: "warning", code: "cargo_audit_failed", message: hostile, path: null },
+        ],
+      });
+      expect(() => failedAudits(report)).not.toThrow();
+      expect(() => coverageGap(report)).not.toThrow();
+      // The real failure code must still be found next to the hostile ones.
+      expect(failedAudits(report)).toContain("cargo-audit");
+    }
+  });
+
+  it("reports no gap for a report with no issues at all", () => {
+    expect(failedAudits(bareReport())).toEqual([]);
+    expect(coverageGap(bareReport())).toBeNull();
+  });
+
+  it("stays fast on a saturated issue list", () => {
+    const issues = Array.from({ length: 5_000 }, (_, index) => ({
+      severity: "warning",
+      code: index % 3 === 0 ? "audit_failed" : `unrelated_${index}`,
+      message: "x".repeat(200),
+      path: null,
+    }));
+    const report = bareReport({ issues });
+    const started = performance.now();
+    expect(failedAudits(report)).toEqual(["npm audit"]);
+    expectWithinBudget(
+      performance.now() - started,
+      50,
+      "failedAudits over a saturated issue list",
+    );
   }, STRESS_TIMEOUT_MS);
 });

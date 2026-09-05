@@ -55,6 +55,71 @@ export function skippedAudits(report: DepsHealthReport): string[] {
 }
 
 /**
+ * Issue codes the backend writes when an audit it dispatched then failed,
+ * mapped to the name a reader would recognise.
+ *
+ * These are the same codes `audit_is_complete` treats as disqualifying in
+ * `analyzer/deps.rs`, and `scripts/health-failure-codes-contract.test.ts`
+ * asserts the two lists stay identical — otherwise a scanner could start
+ * failing in a way that clears `audit_complete` while this map stays silent
+ * about which one it was.
+ */
+export const AUDIT_FAILURE_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  audit_cwd: "audit path validation",
+  audit_failed: "npm audit",
+  cargo_audit_failed: "cargo-audit",
+  pip_audit_failed: "pip-audit",
+  govulncheck_failed: "govulncheck",
+  composer_audit_failed: "composer audit",
+  bundler_audit_failed: "bundler-audit",
+});
+
+/**
+ * Audits that ran and failed — as opposed to [`skippedAudits`], which covers
+ * only audits that never started because their CLI was missing.
+ *
+ * Between them these are the two reasons `audit_complete` goes false with a
+ * scan that otherwise looks finished, and until now the UI could name only
+ * the first. A scanner that was installed, dispatched and then errored left
+ * "Local audit incomplete" on screen with nothing saying which one or why,
+ * while the reason sat in the issues list further down the page.
+ *
+ * Derived from the issues actually returned, so a capped scan may name fewer
+ * failures than occurred. That is not a silent undercount: capping sets
+ * `truncated`, which forces `audit_complete` false and puts the cap notice on
+ * screen ahead of this.
+ */
+export function failedAudits(report: DepsHealthReport): string[] {
+  const named = new Set<string>();
+  for (const issue of report.issues) {
+    const label = AUDIT_FAILURE_LABELS[issue.code];
+    if (label) named.add(label);
+  }
+  return [...named].sort();
+}
+
+/**
+ * Every reason local audit coverage is incomplete, in one sentence, or null
+ * when there is nothing to explain.
+ *
+ * Canonical owner for the Health view's one-line phrasing, so its header and
+ * body cannot disagree about the same scan. The text report states the two
+ * halves on separate lines instead — it has the room, and a reader pasting it
+ * into an issue acts differently on "never ran" than on "ran and failed" —
+ * but both sides read the same two functions, so neither can omit a reason
+ * the other names.
+ */
+export function coverageGap(report: DepsHealthReport): string | null {
+  const skipped = skippedAudits(report);
+  const failed = failedAudits(report);
+  const clauses: string[] = [];
+  if (skipped.length > 0) clauses.push(`not installed: ${skipped.join(", ")}`);
+  if (failed.length > 0) clauses.push(`failed: ${failed.join(", ")}`);
+  if (clauses.length === 0) return null;
+  return clauses.join("; ");
+}
+
+/**
  * Renders the health report as plain markdown-ish text that survives a paste
  * into an issue, an agent prompt or a notes file: every finding keeps its
  * severity, fix version and advisory link, and capped scans say so.
@@ -104,6 +169,16 @@ export function formatHealthReport(
   if (skipped.length > 0) {
     out.push(
       `NOTE: checks that did NOT run (CLI missing): ${skipped.join(", ")}. The counts above are not complete coverage.`,
+    );
+  }
+  // A scanner that was installed, dispatched and then errored is the other
+  // way coverage goes short, and the report named only the first. Its own
+  // line rather than a clause on the one above: "did not run" and "ran and
+  // failed" are different facts and a reader acts on them differently.
+  const failed = failedAudits(report);
+  if (failed.length > 0) {
+    out.push(
+      `NOTE: checks that ran and FAILED: ${failed.join(", ")}. The counts above are not complete coverage.`,
     );
   }
   if (dependabot?.available) {

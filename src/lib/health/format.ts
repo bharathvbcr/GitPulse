@@ -103,15 +103,38 @@ export function updateKindClass(kind: UpdateKind): string {
   }
 }
 
+/**
+ * Every severity bucket the wire type carries, worst first, with the label
+ * each is printed under.
+ *
+ * One list, walked once, so a bucket cannot be counted into `total` on the
+ * backend and then forgotten here. `info` used to be missing from both this
+ * list and the parameter type below, which is why TypeScript never noticed:
+ * `AuditSummary::from_vulns` pins a case with `critical 1, unknown 1, info 1,
+ * total 3`, and the summary rendered "1 critical · 1 unranked" — two of three
+ * findings, with no hint that a third existed.
+ */
+const SEVERITY_BUCKETS = [
+  ["critical", "critical"],
+  ["high", "high"],
+  ["moderate", "moderate"],
+  ["low", "low"],
+  ["info", "info"],
+  ["unknown", "unranked"],
+] as const;
+
+export interface AuditCountSummary {
+  critical: number;
+  high: number;
+  moderate: number;
+  low: number;
+  info?: number;
+  unknown?: number;
+  total: number;
+}
+
 export function formatAuditCounts(
-  summary: {
-    critical: number;
-    high: number;
-    moderate: number;
-    low: number;
-    unknown?: number;
-    total: number;
-  },
+  summary: AuditCountSummary,
   options?: { complete?: boolean; ran?: boolean },
 ): string {
   if (summary.total === 0) {
@@ -120,11 +143,17 @@ export function formatAuditCounts(
     return "Audit did not run";
   }
   const parts: string[] = [];
-  if (summary.critical) parts.push(`${summary.critical} critical`);
-  if (summary.high) parts.push(`${summary.high} high`);
-  if (summary.moderate) parts.push(`${summary.moderate} moderate`);
-  if (summary.low) parts.push(`${summary.low} low`);
-  if (summary.unknown) parts.push(`${summary.unknown} unranked`);
+  let accounted = 0;
+  for (const [key, label] of SEVERITY_BUCKETS) {
+    const count = summary[key] ?? 0;
+    accounted += count;
+    if (count > 0) parts.push(`${count} ${label}`);
+  }
+  // The buckets have to explain the total. If the backend ever reports more
+  // findings than the buckets above account for, say how many are unexplained
+  // rather than printing a breakdown that quietly understates the count.
+  const remainder = summary.total - accounted;
+  if (remainder > 0) parts.push(`${remainder} unclassified`);
   const counts = parts.join(" · ") || `${summary.total} findings`;
   // A partial scan that happens to have findings is still a partial scan.
   // Consulting `complete` only in the zero case let a capped or half-run

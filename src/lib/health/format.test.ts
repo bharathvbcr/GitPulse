@@ -90,6 +90,82 @@ describe("health format", () => {
     ).toBe("1 critical · 2 unranked");
   });
 
+  /**
+   * The breakdown is the only thing most readers look at, so it has to
+   * account for every finding in the total. `info` was absent from the
+   * parameter type entirely, so TypeScript never noticed that informational
+   * findings were counted into `total` and then dropped from the summary —
+   * the Rust side pins exactly this shape in `AuditSummary::from_vulns`
+   * (critical 1, unknown 1, info 1, total 3).
+   */
+  it("accounts for every finding in the total, informational ones included", () => {
+    expect(
+      formatAuditCounts({
+        critical: 1,
+        high: 0,
+        moderate: 0,
+        low: 0,
+        info: 1,
+        unknown: 1,
+        total: 3,
+      }),
+    ).toBe("1 critical · 1 info · 1 unranked");
+  });
+
+  /**
+   * Derived rather than spot-checked: whatever buckets exist, the numbers the
+   * summary prints must add up to the total it is summarising. A future
+   * severity bucket that nobody wires into the parts list shows up here as a
+   * sum mismatch instead of silently vanishing from the UI.
+   */
+  it("prints a breakdown that sums to the total, for every bucket combination", () => {
+    const buckets = ["critical", "high", "moderate", "low", "info", "unknown"] as const;
+    // 2^6 subsets, each bucket carrying a distinct count so a dropped bucket
+    // cannot be masked by an equal one elsewhere.
+    for (let mask = 1; mask < 1 << buckets.length; mask += 1) {
+      const summary = {
+        critical: 0,
+        high: 0,
+        moderate: 0,
+        low: 0,
+        info: 0,
+        unknown: 0,
+        total: 0,
+      };
+      buckets.forEach((bucket, index) => {
+        if (mask & (1 << index)) {
+          summary[bucket] = index + 1;
+          summary.total += index + 1;
+        }
+      });
+      const rendered = formatAuditCounts(summary, { complete: true, ran: true });
+      const printed = [...rendered.matchAll(/(\d+)\s/g)].reduce(
+        (sum, match) => sum + Number(match[1]),
+        0,
+      );
+      expect(printed, `mask ${mask} rendered ${rendered}`).toBe(summary.total);
+    }
+  });
+
+  /**
+   * A total larger than the buckets explain means the backend grew a bucket
+   * this formatter does not know about. Saying so is the honest outcome;
+   * printing only the buckets it recognises understates the finding count.
+   */
+  it("names the remainder when the buckets do not explain the total", () => {
+    expect(
+      formatAuditCounts({
+        critical: 1,
+        high: 0,
+        moderate: 0,
+        low: 0,
+        info: 0,
+        unknown: 0,
+        total: 4,
+      }),
+    ).toBe("1 critical · 3 unclassified");
+  });
+
   it("styles unrated severities as muted, not alarming", () => {
     expect(severityClass("unknown")).toBe(severityClass("info"));
     expect(normalizeSeverity("unknown")).toBe("info");

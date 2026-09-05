@@ -53,7 +53,7 @@
     type AiGeneration,
   } from "../stores/harnessStore";
   import { copyText } from "../desktop/clipboard";
-  import { formatHealthReport, observedTotal, skippedAudits } from "../health/report";
+  import { coverageGap, formatHealthReport, observedTotal } from "../health/report";
   import { buildRunnablePlanSteps } from "../terminal/tokenize";
   import type {
     Vulnerability,
@@ -85,6 +85,17 @@
   let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
   let deadSymbolsAvailable = $state(false);
   let deadSymbolsReason = $state<string | null>(null);
+  /**
+   * How many unreferenced symbols the query actually observed, and whether it
+   * stopped early.
+   *
+   * `cmd_codeintel_dead_symbols` answers under a token budget and reports
+   * `total`/`truncated` alongside the rows it returns. Both were dropped on
+   * arrival, so the heading counted the rows that survived the budget and
+   * presented that as the number of unreferenced symbols in the repository.
+   */
+  let deadSymbolsTotal = $state(0);
+  let deadSymbolsTruncated = $state(false);
   /**
    * Whether this repository has a devmap code graph at all.
    *
@@ -150,8 +161,13 @@
     return current.vulnerabilities;
   });
 
-  /** Audits that could not run because their CLI was missing. */
-  let skipped = $derived(report ? skippedAudits(report) : []);
+  /**
+   * Every reason local coverage is short, missing CLIs and failed scanners
+   * alike. The panel used to derive only the missing-CLI half, which left a
+   * scanner that ran and errored unexplained: the summary said "incomplete"
+   * and named nothing.
+   */
+  let gap = $derived(report ? coverageGap(report) : null);
 
   /** A clean result is valid only after every discovered supported target ran. */
   let auditComplete = $derived(report?.audit_complete === true);
@@ -178,6 +194,33 @@
   );
   let vulnerabilitiesTotal = $derived(
     report ? Math.max(report.audit.total, report.vulnerabilities.length) : 0,
+  );
+  /**
+   * True when findings were dropped by the scan cap.
+   *
+   * The "All" count could always say `N; showing M` because `audit.total` is
+   * computed before `cap_report` truncates. "Direct" has no such total — it
+   * filters the rows that survived — so an unqualified "3 direct" was a floor
+   * printed as a total. The cap sorts by severity first, so the rows dropped
+   * are the least severe, and how many of them were direct is unknowable.
+   */
+  /**
+   * How many artifacts of this family the scan actually saw.
+   *
+   * Two separate cuts hid behind one list: the backend keeps at most
+   * `MAX_ECOSYSTEM_MANIFESTS` per family (recording a limit notice), and the
+   * row then printed only the first four of whatever survived. Neither said
+   * so, so "4 lockfiles" was indistinguishable from "the 4 lockfiles there
+   * are". The notice resource is the family name, so the observed total comes
+   * from the same reader every other capped section uses.
+   */
+  function ecosystemArtifactTotal(eco: { family: string; manifests: string[] }): number {
+    if (!report) return eco.manifests.length;
+    return observedTotal(report, `${eco.family} ecosystem artifacts`, eco.manifests.length);
+  }
+
+  let vulnerabilitiesCapped = $derived(
+    report ? vulnerabilitiesTotal > report.vulnerabilities.length : false,
   );
 
   const scanned = { path: "" };
@@ -231,12 +274,21 @@
     if (dead.status === "fulfilled") {
       deadSymbolsAvailable = dead.value.available;
       deadSymbols = dead.value.available ? dead.value.items : [];
+      // `total` counts what the query saw; `items` is what fitted in the
+      // budget. Never below the row count, so a backend that reports only
+      // `shown` cannot make the heading claim fewer than it lists.
+      deadSymbolsTotal = dead.value.available
+        ? Math.max(dead.value.total ?? 0, dead.value.items.length)
+        : 0;
+      deadSymbolsTruncated = dead.value.available && dead.value.truncated === true;
       deadSymbolsReason = dead.value.available
         ? null
         : (dead.value.reason ?? "dead-symbol query unavailable");
     } else {
       deadSymbols = [];
       deadSymbolsAvailable = false;
+      deadSymbolsTotal = 0;
+      deadSymbolsTruncated = false;
       deadSymbolsReason = formatError(dead.reason);
     }
     // An IPC-level failure is folded into the same unavailable shape the
@@ -627,12 +679,22 @@
           {/if}
         </span>
       {/if}
+      <!-- All four states are named. "Checked, nothing open" and "never
+           checked" used to render the same empty space, so a clean local
+           audit read as an all-clear for a repository whose GitHub alerts
+           nobody had looked at — and GitHub is never checked automatically. -->
       {#if openDependabotCount > 0}
         <span class={`truncate ${dependabotBadgeClass}`}>
           · Dependabot {openDependabotCount}{dependabot?.truncated ? "+" : ""}
         </span>
       {:else if dependabot && !dependabot.available}
         <span class="truncate text-amber-300">· Dependabot unavailable</span>
+      {:else if dependabot?.available}
+        <span class="truncate text-textMuted">· Dependabot 0 open</span>
+      {:else if report}
+        <!-- Gated on a local scan existing: with no repository open there is
+             nothing to have checked, and the chip would be noise. -->
+        <span class="truncate text-textMuted">· Dependabot not checked</span>
       {/if}
     </div>
     <div class="flex items-center gap-2">
@@ -953,11 +1015,15 @@
         {#if report.ecosystems.length > 0}
           <div class="space-y-1 max-w-3xl pt-1">
             {#each report.ecosystems as eco}
+              {@const shown = eco.manifests.slice(0, 4)}
+              {@const seen = ecosystemArtifactTotal(eco)}
               <div class="text-textMuted">
                 <span class="text-textPrimary font-medium">{eco.family}</span>
                 <span class="mx-1.5">·</span>
                 {eco.note}
-                <span class="font-mono text-[10px] ml-1.5 opacity-70">{eco.manifests.slice(0, 4).join(", ")}</span>
+                <span class="font-mono text-[10px] ml-1.5 opacity-70">
+                  {shown.join(", ")}{seen > shown.length ? ` +${seen - shown.length} more` : ""}
+                </span>
               </div>
             {/each}
           </div>
@@ -968,7 +1034,7 @@
         <div class="flex items-center justify-between max-w-5xl">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
             Vulnerabilities ({filter === "direct"
-              ? `${visibleVulns.length} direct`
+              ? `${vulnerabilitiesCapped ? "at least " : ""}${visibleVulns.length} direct`
               : `${vulnerabilitiesTotal}${
                   vulnerabilitiesTotal > visibleVulns.length
                     ? `; showing ${visibleVulns.length}`
@@ -1000,8 +1066,8 @@
               ? auditComplete
                 ? "No vulnerabilities found by completed local audits."
                 : auditsRan
-                  ? `Local audit incomplete${skipped.length > 0 ? ` (not run: ${skipped.join(", ")})` : ""}; no all-clear is available.`
-                  : `Local audit did not run${skipped.length > 0 ? ` (not run: ${skipped.join(", ")})` : ""}.`
+                  ? `Local audit incomplete${gap ? ` (${gap})` : ""}; no all-clear is available.`
+                  : `Local audit did not run${gap ? ` (${gap})` : ""}.`
               : "No direct dependencies are vulnerable."}
           </p>
         {:else}
@@ -1144,14 +1210,25 @@
           That is not the same as finding no unreferenced symbols.
         </p>
       {:else if deadSymbolsAvailable && deadSymbols.length === 0}
-        <p class="text-[11px] text-textMuted pb-4">
-          No unreferenced symbols in the indexed graph.
+        <p class="text-[11px] {deadSymbolsTruncated ? 'text-amber-300' : 'text-textMuted'} pb-4">
+          {deadSymbolsTruncated
+            ? "The dead-symbol query stopped at its token budget before returning anything; this is not an all-clear."
+            : "No unreferenced symbols in the indexed graph."}
         </p>
       {:else if deadSymbolsAvailable && deadSymbols.length > 0}
         <section class="space-y-2 pb-4">
           <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
-            Dead code & unreferenced symbols ({deadSymbols.length})
+            Dead code & unreferenced symbols ({deadSymbolsTotal}{deadSymbolsTotal >
+            deadSymbols.length
+              ? `; showing ${deadSymbols.length}`
+              : ""})
           </h3>
+          {#if deadSymbolsTruncated}
+            <p class="text-[11px] text-amber-300">
+              The dead-symbol query stopped at its token budget, so this list is a floor, not
+              the complete set.
+            </p>
+          {/if}
           <div class="border border-border/70 rounded-2xl overflow-hidden max-w-5xl shadow-card">
             <table class="w-full text-left">
               <thead class="bg-surface text-[10px] uppercase text-textMuted">

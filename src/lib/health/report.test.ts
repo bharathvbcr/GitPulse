@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatHealthReport } from "./report";
+import { coverageGap, failedAudits, formatHealthReport, skippedAudits } from "./report";
 import type { DependabotAlertInfo, DependabotReport, DepsHealthReport } from "./types";
 
 function emptyReport(): DepsHealthReport {
@@ -351,5 +351,103 @@ describe("formatHealthReport", () => {
     const text = formatHealthReport(emptyReport(), "/repo", dependabot);
     expect(text).toContain("GitHub Dependabot: 0 open alert(s).");
     expect(text).toContain("No issues, vulnerabilities or outdated packages were reported.");
+  });
+});
+
+describe("audits that ran and failed", () => {
+  /**
+   * The gap this closes: `audit_complete` goes false for two different
+   * reasons, and only one of them was nameable. A scanner whose CLI is
+   * installed, that GitPulse dispatched, and that then errored, left the
+   * summary saying "incomplete" with nothing saying which one — while the
+   * reason sat in the issues list further down.
+   */
+  it("names a scanner that ran and failed, which skippedAudits cannot see", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = true;
+    report.scanners_ran = ["npm", "cargo"];
+    report.audit_complete = false;
+    report.ecosystems = [{ family: "rust", manifests: ["Cargo.lock"], note: "cargo" }];
+    report.issues = [
+      {
+        severity: "warning",
+        code: "cargo_audit_failed",
+        message: "cargo audit exited 101",
+        path: "Cargo.lock",
+      },
+    ];
+
+    // The CLI was present, so the missing-CLI view of the world sees nothing.
+    expect(skippedAudits(report)).toEqual([]);
+    expect(failedAudits(report)).toEqual(["cargo-audit"]);
+    expect(coverageGap(report)).toBe("failed: cargo-audit");
+  });
+
+  it("reports both halves when one scanner is absent and another failed", () => {
+    const report = emptyReport();
+    report.npm_cli_present = false;
+    report.manifests = [
+      {
+        path: "package.json",
+        name: "app",
+        version: "1.0.0",
+        private: true,
+        package_manager: "npm",
+        has_workspaces: false,
+        dep_count: 1,
+        dev_dep_count: 0,
+        optional_dep_count: 0,
+        peer_dep_count: 0,
+        lifecycle_scripts: [],
+      },
+    ];
+    report.ecosystems = [{ family: "go", manifests: ["go.mod"], note: "go" }];
+    report.govulncheck_present = true;
+    report.audit_complete = false;
+    report.issues = [
+      { severity: "warning", code: "govulncheck_failed", message: "exited 1", path: "go.mod" },
+    ];
+
+    expect(skippedAudits(report)).toEqual(["npm audit/outdated"]);
+    expect(failedAudits(report)).toEqual(["govulncheck"]);
+    expect(coverageGap(report)).toBe("not installed: npm audit/outdated; failed: govulncheck");
+  });
+
+  it("stays silent when every discovered audit completed", () => {
+    const report = emptyReport();
+    expect(failedAudits(report)).toEqual([]);
+    expect(coverageGap(report)).toBeNull();
+  });
+
+  it("names each failed scanner once, however many times it failed", () => {
+    const report = emptyReport();
+    report.issues = [
+      { severity: "error", code: "audit_failed", message: "a", path: "one/package.json" },
+      { severity: "error", code: "audit_failed", message: "b", path: "two/package.json" },
+    ];
+    expect(failedAudits(report)).toEqual(["npm audit"]);
+  });
+
+  it("puts the failure in the copied report, not only on screen", () => {
+    const report = emptyReport();
+    report.cargo_audit_present = true;
+    report.scanners_ran = ["npm", "cargo"];
+    report.audit_complete = false;
+    report.issues = [
+      { severity: "warning", code: "cargo_audit_failed", message: "exited 101", path: null },
+    ];
+    const text = formatHealthReport(report, "/repo");
+    expect(text).toContain("ran and FAILED: cargo-audit");
+    expect(text).toContain("not complete coverage");
+  });
+
+  /** An issue code that is not an audit failure must not be read as one. */
+  it("ignores ordinary issues", () => {
+    const report = emptyReport();
+    report.issues = [
+      { severity: "warning", code: "lockfile_missing", message: "no lockfile", path: null },
+    ];
+    expect(failedAudits(report)).toEqual([]);
+    expect(coverageGap(report)).toBeNull();
   });
 });
