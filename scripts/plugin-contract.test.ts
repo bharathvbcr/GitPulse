@@ -83,6 +83,91 @@ describe("Agent Plugins 1.0 mcp.json", () => {
   });
 });
 
+/**
+ * Hooks are the half of the plugin a client executes rather than reads.
+ *
+ * They live at `<plugin>/hooks/hooks.json` — NOT inside `.claude-plugin/`,
+ * which holds only `plugin.json`. A file in the wrong place is not an error a
+ * client reports; the hooks are simply never registered, and the package looks
+ * installed and does nothing.
+ */
+describe("plugin hooks", () => {
+  const HOOKS = path.join(PLUGIN, "hooks", "hooks.json");
+
+  it("lives at hooks/hooks.json, outside .claude-plugin", () => {
+    expect(existsSync(HOOKS)).toBe(true);
+    expect(existsSync(path.join(PLUGIN, ".claude-plugin", "hooks.json"))).toBe(false);
+  });
+
+  const hooks = JSON.parse(readFileSync(HOOKS, "utf8")) as {
+    hooks: Record<string, Array<{ matcher?: string; hooks: Array<Record<string, unknown>> }>>;
+  };
+
+  it("declares only hook events this plugin actually handles", () => {
+    // An event named here that the binary has no subcommand for spawns a
+    // process per matching tool call to do nothing.
+    expect(Object.keys(hooks.hooks).sort()).toEqual(["PreToolUse", "SessionStart"]);
+  });
+
+  it("spawns a bounded command for every entry", () => {
+    for (const [event, groups] of Object.entries(hooks.hooks)) {
+      for (const group of groups) {
+        expect(Array.isArray(group.hooks), `${event} group has no hooks`).toBe(true);
+        for (const handler of group.hooks) {
+          expect(handler.type, `${event}`).toBe("command");
+          expect(typeof handler.command, `${event}`).toBe("string");
+          // A hook runs on every matching tool call. One without a timeout can
+          // hang the user's editor indefinitely.
+          expect(typeof handler.timeout, `${event} has no timeout`).toBe("number");
+          expect(handler.timeout as number).toBeGreaterThan(0);
+          expect(handler.timeout as number).toBeLessThanOrEqual(60);
+        }
+      }
+    }
+  });
+
+  it("invokes the same binary this repo builds, with a real subcommand", () => {
+    // The MCP manifest resolves `gitpulse-mcp` off PATH for the same reason a
+    // published plugin must: the client runs the installed server, not a path
+    // baked into a manifest. The hook binary follows that, so the subcommand is
+    // the part a typo can break silently.
+    const declared = new Set<string>();
+    for (const groups of Object.values(hooks.hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          const [bin, ...rest] = String(handler.command).split(/\s+/);
+          expect(bin).toBe("gitpulse-hook");
+          expect(rest.length, `${handler.command} names no subcommand`).toBe(1);
+          declared.add(rest[0]);
+        }
+      }
+    }
+    // Derived from the Rust source rather than listed here, so a subcommand
+    // renamed on one side fails instead of silently going unhandled.
+    const source = readFileSync(
+      path.join(ROOT, "src-tauri", "src", "hooks", "mod.rs"),
+      "utf8",
+    );
+    const known = source.match(/pub const SUBCOMMANDS: \[&str; \d+\] = \[([^\]]*)\]/)?.[1] ?? "";
+    const implemented = new Set(
+      [...known.matchAll(/"([a-z-]+)"/g)].map((m) => m[1]),
+    );
+    expect(implemented.size).toBeGreaterThan(0);
+    for (const subcommand of declared) {
+      expect(implemented, `${subcommand} is declared but not implemented`).toContain(subcommand);
+    }
+  });
+
+  it("matches tool names with anchored patterns", () => {
+    // `Edit` unanchored also matches `NotebookEdit` and any MCP tool whose name
+    // contains it, so a guard meant for three tools fires on many.
+    for (const group of hooks.hooks.PreToolUse) {
+      const matcher = String(group.matcher);
+      expect(matcher.startsWith("^") && matcher.endsWith("$"), matcher).toBe(true);
+    }
+  });
+});
+
 describe("Agent Plugins 1.0 skills", () => {
   it("discovers only immediate child directories that contain SKILL.md", () => {
     const skillsDir = path.join(PLUGIN, "skills");

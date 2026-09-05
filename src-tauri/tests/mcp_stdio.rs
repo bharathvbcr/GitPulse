@@ -69,6 +69,11 @@ fn speak_once() -> Vec<Value> {
     }
     drop(stdin);
 
+    // Correlate by id, never by arrival order. The server answers requests
+    // concurrently — a fast `tools/list` deliberately overtakes a slow
+    // `tools/call` — and the stdio binding says responses are "correlated by
+    // JSON-RPC `id`". Indexing by position encoded an ordering the protocol
+    // does not promise, and only passed while the server was single-threaded.
     let mut lines = Vec::new();
     let reader = BufReader::new(stdout);
     for raw in reader.lines() {
@@ -97,6 +102,7 @@ fn speak_once() -> Vec<Value> {
         requests.len(),
         lines.len()
     );
+    lines.sort_by_key(|line| line["id"].as_u64().unwrap_or(u64::MAX));
     lines
 }
 

@@ -35,6 +35,14 @@ path = "src/bin/gitpulsed.rs"
 name = "gitpulse-mcp"
 path = "src/bin/gitpulse-mcp.rs"
 
+# The hook executable a Claude Code / agent-plugin host spawns per hook event.
+# It is its own binary rather than a `gitpulse-mcp` subcommand because a hook is
+# spawned on every matching tool call and must not pay for an MCP server's
+# startup: a hook that is slow is a hook users turn off.
+[[bin]]
+name = "gitpulse-hook"
+path = "src/bin/gitpulse-hook.rs"
+
 [dependencies]
 tauri = { version = "2.0.0", features = [] }
 tauri-plugin-opener = "2.0.0"
@@ -83,6 +91,19 @@ dc-store = { path = "vendored/dc-store" }
 devmap-query = { path = "vendored/devmap-query", default-features = false }
 devmap-store = { path = "vendored/devmap-store", default-features = false }
 
+# Process-group control for children we spawn (`src/procguard`).
+#
+# `setpgid` in the post-fork child and `killpg` at shutdown are what stop a
+# `git` this process started from outliving it when a supervisor sends SIGTERM
+# — a plain `Child` has no killing `Drop`, and `process::exit` runs none anyway.
+# Unix-scoped because the calls do not exist elsewhere; Windows keeps the
+# `taskkill /T /F` tree kill it already had.
+#
+# Already resolved in Cargo.lock at 0.2.189 as a transitive dependency of
+# rusqlite and tauri, so this adds a direct edge, not a crate to the build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 
@@ -101,6 +122,22 @@ tauri = { version = "2.0.0", features = ["test"] }
 [[test]]
 name = "native_menu_main_thread"
 harness = false
+
+# Wall-clock measurement, not a pass/fail gate. `test = false` keeps it out of
+# `cargo test`: a timing assertion fails on a loaded machine for reasons that
+# have nothing to do with the code, and a check that fails spuriously is worse
+# than no check. Run it deliberately with `cargo bench --bench mcp_protocol`.
+[[bench]]
+name = "mcp_protocol"
+harness = false
+test = false
+
+# Same reasoning: wall-clock measurement, run deliberately with
+# `cargo bench --bench process_spawn`.
+[[bench]]
+name = "process_spawn"
+harness = false
+test = false
 
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.

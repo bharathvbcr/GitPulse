@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1231,8 +1231,11 @@ pub(crate) fn run_bounded_capped(
     // unbounded fan-out here exhausted the process descriptor table.
     let _permit = spawn_gate().acquire();
 
-    let mut child = cmd
-        .spawn()
+    // Spawned into a process group of its own and registered, so a SIGTERM to
+    // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
+    // shutdown path — takes this child and everything it forked down with it
+    // instead of orphaning them. See [`crate::procguard`].
+    let (mut child, guard) = crate::procguard::spawn(&mut cmd, label)
         .map_err(|e| format!("Failed to spawn {}: {}", label, e))?;
 
     let stdout_pipe = child.stdout.take();
@@ -1274,12 +1277,15 @@ pub(crate) fn run_bounded_capped(
     let start = Instant::now();
     let mut backoff = POLL_BACKOFF_START;
     let outcome = loop {
-        match child.try_wait() {
+        // Every wait goes through the registration so the registry never
+        // holds a pid that has already been reaped — see `procguard` for why
+        // signalling a recycled pid is the thing to avoid.
+        match guard.poll(|| child.try_wait()) {
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    kill_process_tree(&mut child);
-                    let _ = child.wait();
+                    guard.kill_tree(&mut child);
+                    let _ = guard.reap(|| child.wait());
                     break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs()));
                 }
                 thread::sleep(backoff);
@@ -1347,18 +1353,23 @@ pub(crate) fn run_bounded_capped(
 
 /// Collects a pipe-drain result, waiting at most [`DRAIN_JOIN_GRACE`] for EOF.
 ///
-/// Residual leak, documented deliberately: when a timed-out command forked a
-/// grandchild that inherited stdout/stderr, killing the direct child does not
-/// close the pipe write ends and the drain thread stays blocked on read. This
-/// crate has no libc dependency, so a portable Unix process-group kill
-/// (`setsid`/`killpg` via `pre_exec`) is unavailable — Windows gets a real
-/// tree kill through `taskkill /T`, but on Unix the orphan cannot be signalled
-/// portably. The honest options were hanging forever or detaching; we detach.
-/// The detached thread unblocks when the orphan exits (pipe EOF) or at app
-/// shutdown, holds at most [`MAX_OUTPUT_BYTES`], and at most two exist per
-/// timed-out command. When the grace expires, bytes read but not yet delivered
-/// (no EOF seen) are discarded — acceptable because git and the other tools
-/// routed through this engine do not fork pipe-holding descendants.
+/// A drain thread can be left blocked on read when the command forked a
+/// grandchild that inherited stdout/stderr: killing the direct child does not
+/// close the pipe write ends. The honest options are hanging forever or
+/// detaching; we detach, and the thread unblocks when the holder exits (pipe
+/// EOF) or at app shutdown, holding at most [`MAX_OUTPUT_BYTES`], at most two
+/// per command. Bytes read but not delivered when the grace expires are
+/// discarded, which is why the caller reports that stdout as truncated rather
+/// than as a shorter answer.
+///
+/// What that costs is now much smaller than it was. `crate::procguard` puts
+/// every child in a process group of its own, so the timeout path kills the
+/// grandchild along with the child on Unix and EOF arrives immediately. Two
+/// cases still reach the grace window: Windows, where `taskkill /T` is
+/// best-effort, and a command that *succeeded* after daemonising something
+/// that kept the pipes — there the group must not be killed, because the
+/// command worked and the descendant outliving it is what the caller asked
+/// for.
 fn collect_drained(rx: &mpsc::Receiver<Drained>) -> Drained {
     collect_drained_deadline(rx, Instant::now() + DRAIN_JOIN_GRACE)
 }
@@ -1375,22 +1386,6 @@ fn collect_drained_deadline(rx: &mpsc::Receiver<Drained>, deadline: Instant) -> 
         ))),
         ..Drained::default()
     })
-}
-
-/// Kills `child`, best-effort taking its whole process tree down on Windows.
-fn kill_process_tree(child: &mut Child) {
-    #[cfg(windows)]
-    {
-        // `taskkill /T /F` walks the PID tree. Spawned directly by argv,
-        // never through a shell, and best-effort only.
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
 }
 
 /// Detects transient git lock contention errors (e.g. background AI agents or terminal processes holding index.lock)

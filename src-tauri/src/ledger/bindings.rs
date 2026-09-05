@@ -84,6 +84,35 @@ pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, 
     }
 }
 
+/// [`repository_status`] for a caller that must not create or migrate anything.
+///
+/// Two things are skipped relative to the creating path: the legacy
+/// consolidation (which *imports rows* into the anchor database, and is a
+/// migration, not a read), and the open-to-probe in [`super::status`]. Both
+/// were reachable from tools annotated `readOnlyHint: true`.
+pub(crate) fn repository_status_readonly(
+    repo_path: &str,
+) -> Result<super::LedgerStatus, LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    let mut status = super::status_readonly(&family.address.anchor);
+    // A repository whose siblings still carry pre-consolidation ledgers has
+    // rows this read cannot see. Saying so beats silently under-reporting, and
+    // beats running the migration from a read to make the number right.
+    if status.recording
+        && family.members.iter().any(|member| {
+            member.as_path() != std::path::Path::new(&family.address.anchor)
+                && super::is_initialised(&member.to_string_lossy())
+        })
+    {
+        status.error =
+            "a sibling worktree still holds its own ledger; open this repository in GitPulse to \
+             consolidate. Events recorded there are not included here."
+                .to_string();
+        status.error_code = "legacy_ledger_unconsolidated".to_string();
+    }
+    Ok(status)
+}
+
 fn validate_task(anchor: &str, task_id: &str) -> Result<(), LedgerError> {
     if task_id.trim().is_empty() {
         return Err(LedgerError::new(
@@ -177,6 +206,14 @@ pub(crate) fn resolve_binding(
     worktree_path: &str,
 ) -> Result<Option<ResolvedBinding>, LedgerError> {
     let address = address(repo_path, worktree_path)?;
+    // A binding *is* a ledger event, so a repository with no ledger has none —
+    // and scanning for one would open the database, which creates it. That put
+    // `.devcouncil/` into a fresh checkout on a `gitpulse_change_context` call,
+    // a tool annotated `readOnlyHint: true`. `Ok(None)` here is the same answer
+    // the scan would have reached, without the side effect.
+    if !super::is_initialised(&address.anchor) {
+        return Ok(None);
+    }
     let stored_worktree = super::redact::text(&address.worktree);
     let mut cursor = 0i64;
     // Imported rows receive new integer cursors in the anchor database. ULIDs
@@ -265,6 +302,31 @@ mod tests {
         let dir = git_repo();
         let path = dir.path().to_str().unwrap().to_string();
         (dir, path)
+    }
+
+    #[test]
+    fn zz_characterize_a_read_creates_the_state_directory() {
+        let (dir, repo) = repo();
+        let state = dir.path().join(".devcouncil");
+        println!(
+            "CHARACTERIZE before read: .devcouncil exists = {}",
+            state.exists()
+        );
+        let status = repository_status(&repo).expect("status");
+        println!(
+            "CHARACTERIZE after repository_status: .devcouncil exists = {}, recording = {}",
+            state.exists(),
+            status.recording
+        );
+        let mut created: Vec<String> = std::fs::read_dir(&state)
+            .map(|entries| {
+                entries
+                    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        created.sort();
+        println!("CHARACTERIZE files written into the repository: {created:?}");
     }
 
     #[test]

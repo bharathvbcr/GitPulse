@@ -25,14 +25,21 @@
 //! to DevCouncil and Manvi, and a background process that took a writer lease
 //! would contend with the agent actually doing the work.
 //!
-//! # Interruption is safe, so there is no signal handler
+//! # Interruption is safe for the *ledger*; it was not safe for the children
 //!
 //! Every append is one SQLite transaction against a WAL database, so a process
 //! killed mid-cycle leaves a consistent ledger. Catch-up is idempotent against
 //! a watermark read back out of the ledger itself, so the next cycle re-reads
-//! whatever the interrupted one did not finish and writes it exactly once.
-//! Adding a signal-handling dependency would buy a tidier log line and nothing
-//! else.
+//! whatever the interrupted one did not finish and writes it exactly once. For
+//! the record this daemon writes, a signal handler would buy a tidier log line
+//! and nothing else.
+//!
+//! What it does buy is the `git` processes. A cycle walks the reflog of every
+//! repository it was given, so at any moment this process is likely to have a
+//! `git` child running; SIGTERM's default action ends us without ending them,
+//! and an unattended daemon is exactly the process nobody is watching when
+//! that happens. `procguard` handles the signal, takes those children's
+//! process groups down with us, and only then exits.
 
 use gitpulse_lib::engine::git_cli::validate_repo;
 use gitpulse_lib::{ingest, ledger};
@@ -258,6 +265,12 @@ fn main() {
     // binary most likely to run out of descriptors and the least likely to
     // have anyone watching when it does.
     log::info!(target: "setup", "{}", gitpulse_lib::limits::raise_open_file_limit().describe());
+    let signals = gitpulse_lib::procguard::install_signal_handlers();
+    if signals.is_armed() {
+        log::info!(target: "setup", "{}", signals.describe());
+    } else {
+        log::warn!(target: "setup", "{}", signals.describe());
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse(&argv) {
         Parsed::Help => {
@@ -266,7 +279,7 @@ fn main() {
         Parsed::Error(reason) => {
             eprintln!("gitpulsed: {reason}\n");
             eprint!("{USAGE}");
-            std::process::exit(2);
+            gitpulse_lib::procguard::exit(2);
         }
         Parsed::Run(config) => {
             let mut cycle = 0u64;
@@ -284,12 +297,16 @@ fn main() {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
                 if config.once {
-                    return;
+                    break;
                 }
                 std::thread::sleep(config.interval);
             }
         }
     }
+    // Not a bare `return`: a cycle that finished while a caught signal was
+    // still being swept would otherwise exit 0 out from under the sweep, and
+    // tell the supervisor a terminated run was clean.
+    gitpulse_lib::procguard::exit(0);
 }
 
 #[cfg(test)]

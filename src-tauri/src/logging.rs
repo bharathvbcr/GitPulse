@@ -30,7 +30,7 @@ const LOG_FILE_MAX_BYTES: u64 = 1_048_576;
 /// The file is named from `current_exe()`, so without this gate every `cargo
 /// test` binary would drop a log into the user's real log directory. Unknown
 /// stems fail closed and get no file; [`LOG_DIR_ENV`] opts anything in.
-const LOGGED_BINARIES: [&str; 3] = ["gitpulse", "gitpulsed", "gitpulse-mcp"];
+const LOGGED_BINARIES: [&str; 4] = ["gitpulse", "gitpulsed", "gitpulse-mcp", "gitpulse-hook"];
 
 /// Lines of panic backtrace kept.
 ///

@@ -38,12 +38,20 @@ pub struct WorktreeSummary {
     pub path: String,
     pub name: String,
     pub branch: Option<String>,
+    /// True when this checkout's HEAD is detached. A null `branch` otherwise
+    /// says two different things — deliberately on no branch, or a branch
+    /// nobody could read — and a reader cannot tell them apart without this.
+    pub is_detached: bool,
     pub is_main: bool,
     pub is_bare: bool,
     pub dirty_files: Option<u32>,
     pub agent_kind: String,
     pub session_slug: String,
     pub operation_kind: String,
+    /// Whether the parked-operation probe ran for this worktree. An empty
+    /// `operation_kind` with `operation_ok: false` means "not looked at",
+    /// which is not the same fact as "nothing parked here".
+    pub operation_ok: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +62,10 @@ pub struct AgentKindCount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
+    /// Whether the worktree listing these counts are derived from ran at all.
+    /// Zero sessions with `ok: false` is "we could not look", which must never
+    /// render as "no agent sessions running".
+    pub ok: bool,
     pub sessions: u32,
     pub kinds: Vec<AgentKindCount>,
 }
@@ -62,9 +74,23 @@ pub struct AgentSummary {
 pub struct WorktreeFacet {
     pub ok: bool,
     pub error: String,
+    /// How many worktrees git reported. Every counter below is over `items`,
+    /// which `truncated` says may be a shorter list than this.
     pub count: u32,
+    /// Worktrees measured to have uncommitted work.
     pub dirty: u32,
+    /// Worktrees whose dirty-file count was actually measured. `dirty` is a
+    /// statement about these and no others.
+    pub scanned: u32,
+    /// Non-bare worktrees whose dirty-file count is unknown: past the listing
+    /// scan cap, or `git status` failed there. They are not counted in
+    /// `dirty`, and counting them as clean would be a claim nobody checked.
+    pub dirty_unknown: u32,
+    /// Worktrees with a parked operation (a merge, rebase, cherry-pick).
     pub blocked: u32,
+    /// Worktrees whose parked-operation probe did not run or failed, so
+    /// "not blocked" was never established for them.
+    pub blocked_unknown: u32,
     pub truncated: bool,
     pub items: Vec<WorktreeSummary>,
 }
@@ -80,6 +106,13 @@ pub struct ChangesFacet {
     pub conflicted: u32,
     pub additions: u32,
     pub deletions: u32,
+    /// Rows whose own churn numbers carry a warning: their numstat record
+    /// could not be parsed, so they contributed 0/0 to the two totals above.
+    /// Non-zero means those totals are a floor, not a measurement.
+    pub churn_warnings: u32,
+    /// True when a churn total stopped at `u32::MAX` instead of counting
+    /// further. A saturated total must not be read as exact.
+    pub churn_overflowed: bool,
     pub truncated: bool,
 }
 
@@ -98,12 +131,21 @@ pub struct CollisionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollisionRisk {
+    /// True only when every worktree this scan targeted was read. A scan that
+    /// read fifteen worktrees and failed on one is not a scan that found no
+    /// collision in the sixteenth.
     pub ok: bool,
+    /// The first scan failure, if any. `failed_worktrees` carries how many.
     pub error: String,
     pub overlapping_files: u32,
     pub worktrees_involved: u32,
+    /// Worktrees read successfully. The findings stand on these.
     pub scanned_worktrees: u32,
+    /// Worktrees never attempted, because the scan cap stopped first.
     pub unscanned_worktrees: u32,
+    /// Worktrees attempted and failed. Their paths are absent from every item
+    /// below, so a party list is only complete while this is zero.
+    pub failed_worktrees: u32,
     pub truncated: bool,
     pub items: Vec<CollisionItem>,
 }
@@ -111,13 +153,23 @@ pub struct CollisionRisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsightsSnapshot {
     pub repo_path: String,
+    /// The main worktree's branch. Null means detached or bare when
+    /// `branch_ok`, and "nobody could tell" when not.
     pub branch: Option<String>,
+    /// Whether the main worktree's branch was actually established.
+    pub branch_ok: bool,
     pub worktrees: WorktreeFacet,
     pub agents: AgentSummary,
     pub changes: ChangesFacet,
     pub collisions: CollisionRisk,
     pub ledger: LedgerStatus,
     pub codeintel: CodeintelStatus,
+    /// True when [`SNAPSHOT_DEADLINE`] stopped the expensive stages early.
+    /// The facets they would have filled say so themselves — unprobed
+    /// worktrees carry `operation_ok: false`, and a collision scan that never
+    /// started is `ok: false` — so a partial snapshot is visibly partial.
+    pub deadline_expired: bool,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +180,13 @@ pub struct ChangedFile {
     pub is_conflicted: bool,
     pub additions: u32,
     pub deletions: u32,
+    /// Why this row's additions/deletions may understate reality: its numstat
+    /// record could not be parsed, so the numbers above defaulted to zero.
+    /// Carried from [`FileStatus`] rather than dropped, or an unreadable diff
+    /// reads as a file with no changes. Absent from the JSON entirely while
+    /// empty, so existing consumers see no shape change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,16 +205,44 @@ pub struct ActiveChanges {
     pub conflicted: u32,
     pub additions: u32,
     pub deletions: u32,
+    /// Rows among `files` whose churn numbers carry a warning. See
+    /// [`ChangesFacet::churn_warnings`].
+    pub churn_warnings: u32,
+    /// True when a churn total saturated at `u32::MAX`. See
+    /// [`ChangesFacet::churn_overflowed`].
+    pub churn_overflowed: bool,
 }
 
+/// In-flight context for one worktree.
+///
+/// Five separate probes feed this, and each one can fail on its own, so each
+/// one reports whether it ran. Without that, four of the five failed into
+/// values that read as facts: no collisions, no bound task, no parked
+/// operation, and a worktree with a null branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeContext {
     pub repo_path: String,
     pub worktree: WorktreeSummary,
+    /// Whether the worktree listing ran AND this worktree was in it. False
+    /// leaves every field of `worktree` that comes from git — branch,
+    /// dirty_files, is_main — unestablished rather than false-or-zero.
+    pub worktree_ok: bool,
+    pub worktree_error: String,
     pub task_id: String,
+    /// Whether the ledger could be consulted. An empty `task_id` with
+    /// `task_ok: false` is an unread binding, not an unbound worktree.
+    pub task_ok: bool,
+    pub task_error: String,
     pub changes: ActiveChanges,
-    pub collisions: Vec<CollisionItem>,
+    /// The whole risk payload, not just its rows: an empty item list means
+    /// nothing without the `ok`, `scanned_worktrees` and `failed_worktrees`
+    /// that say whether anything was looked at.
+    pub collisions: CollisionRisk,
     pub operation: Option<RepoOperation>,
+    /// Whether the parked-operation probe ran. A null `operation` with
+    /// `operation_ok: false` is "we did not look", not "nothing parked".
+    pub operation_ok: bool,
+    pub operation_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,9 +275,21 @@ fn empty_worktrees(error: impl Into<String>) -> WorktreeFacet {
         error: error.into(),
         count: 0,
         dirty: 0,
+        scanned: 0,
+        dirty_unknown: 0,
         blocked: 0,
+        blocked_unknown: 0,
         truncated: false,
         items: Vec::new(),
+    }
+}
+
+/// Agent counts from a listing that never ran.
+fn unknown_agents() -> AgentSummary {
+    AgentSummary {
+        ok: false,
+        sessions: 0,
+        kinds: Vec::new(),
     }
 }
 
@@ -205,6 +304,8 @@ fn empty_changes(error: impl Into<String>) -> ChangesFacet {
         conflicted: 0,
         additions: 0,
         deletions: 0,
+        churn_warnings: 0,
+        churn_overflowed: false,
         truncated: false,
     }
 }
@@ -217,26 +318,66 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
         worktrees_involved: 0,
         scanned_worktrees: 0,
         unscanned_worktrees: 0,
+        failed_worktrees: 0,
         truncated: false,
         items: Vec::new(),
     }
 }
 
-fn summarise_worktree(info: &WorktreeInfo, operation_kind: String) -> WorktreeSummary {
+/// A file list from a read that failed. Zero files with `ok: false` is "we
+/// could not look", and the caller still learns which worktree was asked for.
+fn failed_changes(repo_path: &str, worktree_path: &str, error: String) -> ActiveChanges {
+    ActiveChanges {
+        repo_path: repo_path.to_string(),
+        worktree_path: worktree_path.to_string(),
+        ok: false,
+        error,
+        files: Vec::new(),
+        total: 0,
+        shown: 0,
+        truncated: false,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        conflicted: 0,
+        additions: 0,
+        deletions: 0,
+        churn_warnings: 0,
+        churn_overflowed: false,
+    }
+}
+
+/// `operation_ok` is the caller's answer, not this function's: a caller that
+/// deliberately skipped the probe (the fleet facet, or a snapshot past its
+/// deadline) passes `false` so the empty `operation_kind` cannot be read as
+/// "nothing parked".
+fn summarise_worktree(
+    info: &WorktreeInfo,
+    operation_kind: String,
+    operation_ok: bool,
+) -> WorktreeSummary {
     WorktreeSummary {
         path: info.path.clone(),
         name: info.name.clone(),
         branch: info.branch.clone(),
+        is_detached: info.is_detached,
         is_main: info.is_main,
         is_bare: info.is_bare,
         dirty_files: info.dirty_files.map(|n| n as u32),
         agent_kind: agent_kind(&info.path).unwrap_or_default(),
         session_slug: agent_session_slug(&info.path).unwrap_or_default(),
         operation_kind,
+        operation_ok,
     }
 }
 
-fn agent_summary(items: &[WorktreeSummary]) -> AgentSummary {
+/// Rolls per-worktree agent labels into counts.
+///
+/// `ok` travels in from the caller because it is a fact about the listing
+/// these items came from, which this function never sees: an empty slice from
+/// a failed listing and an empty slice from a repository with no agents are
+/// the same input and must not be the same answer.
+fn agent_summary(ok: bool, items: &[WorktreeSummary]) -> AgentSummary {
     let mut counts: Vec<AgentKindCount> = Vec::new();
     for item in items {
         if item.agent_kind.is_empty() {
@@ -253,107 +394,205 @@ fn agent_summary(items: &[WorktreeSummary]) -> AgentSummary {
     }
     let sessions = counts.iter().map(|c| c.sessions).sum();
     AgentSummary {
+        ok,
         sessions,
         kinds: counts,
     }
 }
 
-fn detect_operation(path: &str) -> String {
+/// The parked operation in one worktree, and whether the probe ran.
+///
+/// `("", true)` is "nothing parked". `("", false)` is a probe that could not
+/// run — an unvalidatable path, or a `.git` directory that would not be read —
+/// which used to arrive as the same empty string as a clean worktree.
+fn detect_operation(path: &str) -> (String, bool) {
     let Ok(repo) = validate_repo(path) else {
-        return String::new();
+        return (String::new(), false);
     };
     match repo_op::detect(&repo) {
-        Ok(Some(op)) => format!("{:?}", op.kind),
-        Ok(None) => String::new(),
-        Err(_) => String::new(),
+        Ok(Some(op)) => (format!("{:?}", op.kind), true),
+        Ok(None) => (String::new(), true),
+        Err(_) => (String::new(), false),
     }
 }
 
-fn count_statuses(files: &[FileStatus]) -> (u32, u32, u32, u32, u32, u32) {
-    let mut staged = 0u32;
-    let mut unstaged = 0u32;
-    let mut untracked = 0u32;
-    let mut conflicted = 0u32;
-    let mut additions = 0u32;
-    let mut deletions = 0u32;
+/// Rolls up the per-worktree rows a successful listing produced.
+///
+/// The counters are over `items`; `count` is what git reported and
+/// `truncated` says when the two differ. Splitting "measured clean" from
+/// "never measured" is the whole point: a worktree whose `git status` failed,
+/// or that fell past the listing scan cap, arrives with `dirty_files: null`,
+/// and folding that into `dirty` would report it as clean.
+fn worktree_facet(count: u32, truncated: bool, items: Vec<WorktreeSummary>) -> WorktreeFacet {
+    let scanned = items.iter().filter(|w| w.dirty_files.is_some()).count() as u32;
+    let dirty = items
+        .iter()
+        .filter(|w| w.dirty_files.is_some_and(|n| n > 0))
+        .count() as u32;
+    // A bare entry has no working tree, so having no dirty count there is an
+    // answer rather than a gap. Every other missing count is a gap.
+    let dirty_unknown = items
+        .iter()
+        .filter(|w| !w.is_bare && w.dirty_files.is_none())
+        .count() as u32;
+    let blocked = items
+        .iter()
+        .filter(|w| !w.operation_kind.is_empty())
+        .count() as u32;
+    let blocked_unknown = items.iter().filter(|w| !w.operation_ok).count() as u32;
+    WorktreeFacet {
+        ok: true,
+        error: String::new(),
+        count,
+        dirty,
+        scanned,
+        dirty_unknown,
+        blocked,
+        blocked_unknown,
+        truncated,
+        items,
+    }
+}
+
+/// Totals over one set of working-tree rows.
+///
+/// The two churn fields at the bottom exist so the two totals above them are
+/// never read as exact when they are not: a row whose numstat record could not
+/// be parsed contributed 0/0, and a total that reached `u32::MAX` stopped
+/// counting.
+#[derive(Debug, Clone, Default)]
+struct StatusCounts {
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    conflicted: u32,
+    additions: u32,
+    deletions: u32,
+    churn_warnings: u32,
+    churn_overflowed: bool,
+}
+
+/// Adds one row's churn to a running total without wrapping.
+///
+/// `[profile.release]` sets no `overflow-checks`, so the plain `+=` this
+/// replaces panicked in debug and wrapped silently in release — turning a
+/// five-billion-line total into a small number that read as authoritative.
+/// Saturating keeps the total a floor, and `overflowed` says it is one.
+fn add_churn(total: u32, add: usize, overflowed: &mut bool) -> u32 {
+    let add = u32::try_from(add).unwrap_or_else(|_| {
+        *overflowed = true;
+        u32::MAX
+    });
+    match total.checked_add(add) {
+        Some(sum) => sum,
+        None => {
+            *overflowed = true;
+            u32::MAX
+        }
+    }
+}
+
+fn count_statuses(files: &[FileStatus]) -> StatusCounts {
+    let mut counts = StatusCounts::default();
     for file in files {
         if file.is_conflicted {
-            conflicted += 1;
+            counts.conflicted += 1;
         }
         if file.is_staged {
-            staged += 1;
+            counts.staged += 1;
         }
         if file.status_code.contains('?') {
-            untracked += 1;
+            counts.untracked += 1;
         } else if !file.is_staged || file.status_code.chars().nth(1).is_some_and(|c| c != ' ') {
-            unstaged += 1;
+            counts.unstaged += 1;
         }
-        additions += file.additions as u32;
-        deletions += file.deletions as u32;
+        if !file.warnings.is_empty() {
+            counts.churn_warnings += 1;
+        }
+        counts.additions = add_churn(
+            counts.additions,
+            file.additions,
+            &mut counts.churn_overflowed,
+        );
+        counts.deletions = add_churn(
+            counts.deletions,
+            file.deletions,
+            &mut counts.churn_overflowed,
+        );
     }
-    (
-        staged, unstaged, untracked, conflicted, additions, deletions,
-    )
+    counts
 }
 
 fn changes_from_status(files: &[FileStatus], truncated: bool) -> ChangesFacet {
-    let (staged, unstaged, untracked, conflicted, additions, deletions) = count_statuses(files);
+    let counts = count_statuses(files);
     ChangesFacet {
         ok: true,
         error: String::new(),
         files: files.len() as u32,
-        staged,
-        unstaged,
-        untracked,
-        conflicted,
-        additions,
-        deletions,
+        staged: counts.staged,
+        unstaged: counts.unstaged,
+        untracked: counts.untracked,
+        conflicted: counts.conflicted,
+        additions: counts.additions,
+        deletions: counts.deletions,
+        churn_warnings: counts.churn_warnings,
+        churn_overflowed: counts.churn_overflowed,
         truncated,
     }
 }
+
+/// Soft deadline for one whole snapshot, not per probe.
+///
+/// The expensive half of this call is unbounded in `git` spawns: a parked-
+/// operation probe per worktree (2-5 spawns each, up to
+/// [`MAX_SNAPSHOT_WORKTREES`] of them) and then a cross-worktree collision
+/// scan. Git's own per-spawn timeout is 90 s with no ceiling above it, so a
+/// pathological tree could hold the single-threaded MCP server — which
+/// answers nothing else meanwhile — for minutes. Past the deadline those two
+/// stages are skipped and say so, exactly as [`FLEET_DEADLINE`] does for a
+/// workspace sweep.
+///
+/// The fixed-cost stages — one worktree listing, one `git status`, two local
+/// store reads — always run. Cutting them would leave a snapshot with nothing
+/// in it, and their cost does not grow with the number of worktrees.
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One-shot read of everything an agent needs to see the repository as the
 /// Work view does: worktrees, agent sessions, dirty files, collisions, ledger
 /// and code graph. Individual facets fail independently.
 pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
+    snapshot_within(repo_path, SNAPSHOT_DEADLINE)
+}
+
+/// [`snapshot`] with the deadline as an argument, so the partial-snapshot path
+/// is reachable in a test without a pathological repository.
+fn snapshot_within(repo_path: &str, deadline: Duration) -> InsightsSnapshot {
+    let started = Instant::now();
     let listed = worktree::list_worktrees(repo_path);
+    let mut deadline_expired = false;
     let (worktrees, agents) = match &listed {
         Ok(list) => {
             let truncated = list.len() > MAX_SNAPSHOT_WORKTREES;
-            let slice: Vec<&WorktreeInfo> = list.iter().take(MAX_SNAPSHOT_WORKTREES).collect();
-            let items: Vec<WorktreeSummary> = slice
+            let items: Vec<WorktreeSummary> = list
                 .iter()
-                .map(|info| summarise_worktree(info, detect_operation(&info.path)))
+                .take(MAX_SNAPSHOT_WORKTREES)
+                .map(|info| {
+                    // Sequential on purpose: `repo_op::detect` spawns several
+                    // git processes per worktree, and 64 of those at once is
+                    // the spawn storm this deadline exists to bound.
+                    if started.elapsed() >= deadline {
+                        deadline_expired = true;
+                        return summarise_worktree(info, String::new(), false);
+                    }
+                    let (kind, probed) = detect_operation(&info.path);
+                    summarise_worktree(info, kind, probed)
+                })
                 .collect();
-            let dirty = items
-                .iter()
-                .filter(|w| w.dirty_files.unwrap_or(0) > 0)
-                .count() as u32;
-            let blocked = items
-                .iter()
-                .filter(|w| !w.operation_kind.is_empty())
-                .count() as u32;
-            let agents = agent_summary(&items);
-            (
-                WorktreeFacet {
-                    ok: true,
-                    error: String::new(),
-                    count: list.len() as u32,
-                    dirty,
-                    blocked,
-                    truncated,
-                    items,
-                },
-                agents,
-            )
+            let facet = worktree_facet(list.len() as u32, truncated, items);
+            let agents = agent_summary(true, &facet.items);
+            (facet, agents)
         }
-        Err(error) => (
-            empty_worktrees(error.clone()),
-            AgentSummary {
-                sessions: 0,
-                kinds: Vec::new(),
-            },
-        ),
+        Err(error) => (empty_worktrees(error.clone()), unknown_agents()),
     };
 
     let changes = match GitReader::get_status(repo_path) {
@@ -372,17 +611,33 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
     };
 
     let collisions = match &listed {
-        Ok(list) => collision_from_list(list),
+        Ok(list) => {
+            if started.elapsed() >= deadline {
+                deadline_expired = true;
+                // A scan that never started is a failed facet, not an empty
+                // one: `ok: false` with a reason, never `overlapping_files: 0`.
+                empty_collisions("the snapshot ran out of time before the collision scan")
+            } else {
+                collision_from_list(list)
+            }
+        }
         Err(error) => empty_collisions(error.clone()),
     };
 
-    let branch = worktrees
-        .items
-        .iter()
-        .find(|w| w.is_main)
-        .and_then(|w| w.branch.clone());
+    let main_worktree = worktrees.items.iter().find(|w| w.is_main);
+    let branch = main_worktree.and_then(|w| w.branch.clone());
+    // A null branch means the main worktree is on none — detached, or bare —
+    // only when the listing that would have said so actually ran.
+    let branch_ok = worktrees.ok && main_worktree.is_some();
 
-    let ledger = match crate::ledger::bindings::repository_status(repo_path) {
+    // The read-only variant. A snapshot is a read on every surface that takes
+    // one — the MCP tool annotated `readOnlyHint: true`, and the Work view —
+    // and the creating variant opens the database (which makes it) and runs the
+    // legacy consolidation (which migrates rows). A ledger comes into existence
+    // when the first event is *recorded*, which is the honest moment for it to;
+    // until then `not_initialised` is the true answer rather than one arranged
+    // by writing to the user's repository so that "recording" could be said.
+    let ledger = match crate::ledger::bindings::repository_status_readonly(repo_path) {
         Ok(status) => status,
         Err(error) => crate::ledger::LedgerStatus {
             recording: false,
@@ -396,12 +651,15 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
     InsightsSnapshot {
         repo_path: repo_path.to_string(),
         branch,
+        branch_ok,
         worktrees,
         agents,
         changes,
         collisions,
         ledger,
         codeintel: codeintel::status(repo_path),
+        deadline_expired,
+        duration_ms: started.elapsed().as_millis() as u64,
     }
 }
 
@@ -474,10 +732,7 @@ fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
         worktrees_ok: false,
         worktrees_error: String::new(),
         worktrees: 0,
-        agents: AgentSummary {
-            sessions: 0,
-            kinds: Vec::new(),
-        },
+        agents: unknown_agents(),
         last_commit_ok: false,
         last_commit_epoch: 0,
         metrics_ok: false,
@@ -521,24 +776,16 @@ fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
                 // this facet exists to avoid.
                 let items: Vec<WorktreeSummary> = list
                     .iter()
-                    .map(|info| summarise_worktree(info, String::new()))
+                    .map(|info| summarise_worktree(info, String::new(), false))
                     .collect();
                 (
                     true,
                     String::new(),
                     list.len() as u32,
-                    agent_summary(&items),
+                    agent_summary(true, &items),
                 )
             }
-            Err(error) => (
-                false,
-                error,
-                0,
-                AgentSummary {
-                    sessions: 0,
-                    kinds: Vec::new(),
-                },
-            ),
+            Err(error) => (false, error, 0, unknown_agents()),
         };
 
     let (last_commit_ok, last_commit) = match last_commit_epoch(&repo) {
@@ -640,6 +887,7 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
     let mut by_path: HashMap<String, Vec<CollisionParty>> = HashMap::new();
     let mut scan_error = String::new();
     let mut scanned = 0u32;
+    let mut failed = 0u32;
     let mut paths_truncated = false;
     for (wt, result) in scans {
         match result {
@@ -656,6 +904,11 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
                 }
             }
             Err(error) => {
+                // A worktree that could not be read contributes no paths, so
+                // it is absent from every item below and from
+                // `worktrees_involved`. Counting it is the only thing that
+                // keeps that absence distinguishable from "it had nothing".
+                failed += 1;
                 if scan_error.is_empty() {
                     scan_error = error;
                 }
@@ -670,7 +923,8 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
         .collect();
     items.sort_by(|a, b| a.path.cmp(&b.path));
     let overlapping_files = items.len() as u32;
-    let truncated = items.len() > MAX_COLLISION_ITEMS || paths_truncated || unscanned > 0;
+    let truncated =
+        items.len() > MAX_COLLISION_ITEMS || paths_truncated || unscanned > 0 || failed > 0;
     if items.len() > MAX_COLLISION_ITEMS {
         items.truncate(MAX_COLLISION_ITEMS);
     }
@@ -682,12 +936,22 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
     }
 
     CollisionRisk {
-        ok: scan_error.is_empty() || scanned > 0,
+        // Every attempted worktree has to have been read. The old rule —
+        // "no error, OR at least one success" — let one success speak for
+        // fifteen failures, so a caller reading `ok` alone concluded the whole
+        // family had been checked.
+        //
+        // The scan cap does NOT clear this flag: `unscanned_worktrees` and
+        // `truncated` already report a short scan, and folding that in here
+        // would make one field mean both "cut short" and "broken", the same
+        // conflation `fleet_snapshot::truncated` is documented to avoid.
+        ok: failed == 0,
         error: scan_error,
         overlapping_files,
         worktrees_involved: involved.len() as u32,
         scanned_worktrees: scanned,
         unscanned_worktrees: unscanned as u32,
+        failed_worktrees: failed,
         truncated,
         items,
     }
@@ -709,24 +973,84 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
         is_conflicted: file.is_conflicted,
         additions: file.additions as u32,
         deletions: file.deletions as u32,
+        // Dropping these turned "the diff for this row could not be read" into
+        // `additions: 0, deletions: 0`, which reads as a measured fact.
+        warnings: file.warnings.clone(),
     }
 }
 
+/// Resolves the worktree an insights read is about, and proves it belongs to
+/// `repo_path`.
+///
+/// Without this, `worktree_path` was taken on trust: a path naming a totally
+/// unrelated repository came back stamped with `repo_path`'s identity, so the
+/// answer described one repository while claiming to describe another. The
+/// ledger route has always authenticated this pair; these read tools now use
+/// the same gate. The returned path is the canonical one git registered, so
+/// later comparisons against the worktree listing are not defeated by
+/// symlinks or a trailing slash.
+/// Do two path strings name the same directory?
+///
+/// A literal comparison is not enough on macOS, where every temporary directory
+/// lives under `/var/folders/...` and `/var` is a symlink to `/private/var`.
+/// `git worktree list` prints the resolved form while a caller passes whatever
+/// it was given, so the two disagree for the same directory — and the caller is
+/// then told its own repository "was not in this repository's worktree
+/// listing".
+///
+/// Canonicalization is attempted on both sides and the literal comparison is
+/// the fallback, because a worktree that was removed between the listing and
+/// this call cannot be canonicalized and must still compare equal to itself.
+fn same_path(left: &str, right: &str) -> bool {
+    if Path::new(left) == Path::new(right) {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, String> {
+    let Some(requested) = worktree_path else {
+        // No worktree named: the repository itself is the target, and there is
+        // no second identity to authenticate.
+        return Ok(repo_path.to_string());
+    };
+    if Path::new(requested) == Path::new(repo_path) {
+        return Ok(repo_path.to_string());
+    }
+    let family = worktree::resolve_worktree_family(repo_path, requested)?;
+    Ok(family.worktree.to_string_lossy().into_owned())
+}
+
 /// Working-tree file list for one worktree, capped and counted.
+///
+/// `worktree_path` must be a checkout of `repo_path`; one that is not is
+/// refused rather than read, because the payload stamps `repo_path` on
+/// whatever it returns.
 pub fn active_changes(
     repo_path: &str,
     worktree_path: Option<&str>,
     limit: Option<u32>,
 ) -> ActiveChanges {
-    let target = worktree_path.unwrap_or(repo_path);
+    let requested = worktree_path.unwrap_or(repo_path);
+    match resolve_target(repo_path, worktree_path) {
+        Ok(target) => changes_in(repo_path, &target, limit),
+        Err(error) => failed_changes(repo_path, requested, error),
+    }
+}
+
+/// [`active_changes`] for a target already proven to belong to `repo_path`, so
+/// a caller that has resolved the family does not pay for a second resolution.
+fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChanges {
     let cap = (limit.unwrap_or(MAX_ACTIVE_FILES as u32) as usize).clamp(1, 500);
     match GitReader::get_status(target) {
         Ok(files) => {
             let total = files.len() as u32;
             let truncated = files.len() > cap;
             let kept: Vec<FileStatus> = files.iter().take(cap).cloned().collect();
-            let (staged, unstaged, untracked, conflicted, additions, deletions) =
-                count_statuses(&kept);
+            let counts = count_statuses(&kept);
             ActiveChanges {
                 repo_path: repo_path.to_string(),
                 worktree_path: target.to_string(),
@@ -736,83 +1060,163 @@ pub fn active_changes(
                 files: kept.iter().map(to_changed).collect(),
                 total,
                 truncated,
-                staged,
-                unstaged,
-                untracked,
-                conflicted,
-                additions,
-                deletions,
+                staged: counts.staged,
+                unstaged: counts.unstaged,
+                untracked: counts.untracked,
+                conflicted: counts.conflicted,
+                additions: counts.additions,
+                deletions: counts.deletions,
+                churn_warnings: counts.churn_warnings,
+                churn_overflowed: counts.churn_overflowed,
             }
         }
-        Err(error) => ActiveChanges {
-            repo_path: repo_path.to_string(),
-            worktree_path: target.to_string(),
-            ok: false,
-            error,
-            files: Vec::new(),
-            total: 0,
-            shown: 0,
-            truncated: false,
-            staged: 0,
-            unstaged: 0,
-            untracked: 0,
-            conflicted: 0,
-            additions: 0,
-            deletions: 0,
-        },
+        Err(error) => failed_changes(repo_path, target, error),
+    }
+}
+
+/// The worktree row for a checkout the listing did not describe.
+///
+/// Everything git would have supplied is left unset rather than defaulted to a
+/// value that reads as read; the context's `worktree_ok` says why. The agent
+/// labels are derived from the path text alone, so they are as true here as
+/// anywhere.
+fn unlisted_worktree(target: &str, operation_kind: String, operation_ok: bool) -> WorktreeSummary {
+    WorktreeSummary {
+        path: target.to_string(),
+        name: Path::new(target)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.to_string()),
+        branch: None,
+        is_detached: false,
+        is_main: false,
+        is_bare: false,
+        dirty_files: None,
+        agent_kind: agent_kind(target).unwrap_or_default(),
+        session_slug: agent_session_slug(target).unwrap_or_default(),
+        operation_kind,
+        operation_ok,
+    }
+}
+
+/// A context for a worktree that could not be tied to the repository.
+///
+/// Every facet reports the same failure, because not one of them ran: reading
+/// the named path anyway is what let an unrelated repository's files come back
+/// stamped with this repository's identity.
+fn unresolved_context(repo_path: &str, requested: &str, error: String) -> ChangeContext {
+    ChangeContext {
+        repo_path: repo_path.to_string(),
+        worktree: unlisted_worktree(requested, String::new(), false),
+        worktree_ok: false,
+        worktree_error: error.clone(),
+        task_id: String::new(),
+        task_ok: false,
+        task_error: error.clone(),
+        changes: failed_changes(repo_path, requested, error.clone()),
+        collisions: empty_collisions(error.clone()),
+        operation: None,
+        operation_ok: false,
+        operation_error: error,
+    }
+}
+
+/// Narrows a repository-wide risk to the rows that involve one worktree.
+///
+/// The row counts follow the rows they describe. The scan-coverage fields —
+/// `ok`, `error`, `scanned_worktrees`, `unscanned_worktrees`,
+/// `failed_worktrees`, `truncated` — are facts about the scan, not about these
+/// rows, and are carried through untouched: they are the only thing that says
+/// whether an empty list means "nothing collides here" or "we could not tell".
+fn collisions_involving(risk: CollisionRisk, target: &str) -> CollisionRisk {
+    let items: Vec<CollisionItem> = risk
+        .items
+        .into_iter()
+        .filter(|item| {
+            item.worktrees
+                .iter()
+                .any(|party| Path::new(&party.path) == Path::new(target))
+        })
+        .collect();
+    let mut involved = std::collections::BTreeSet::new();
+    for item in &items {
+        for party in &item.worktrees {
+            involved.insert(party.path.clone());
+        }
+    }
+    CollisionRisk {
+        overlapping_files: items.len() as u32,
+        worktrees_involved: involved.len() as u32,
+        items,
+        ..risk
     }
 }
 
 /// In-flight context for one worktree: changes, parked operation, bound task,
 /// collisions that involve it.
+///
+/// `worktree_path` must be a checkout of `repo_path`, and each of the five
+/// probes reports whether it ran.
 pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeContext {
-    let target = worktree_path.unwrap_or(repo_path).to_string();
-    let listed = worktree::list_worktrees(repo_path).ok();
-    let info = listed.as_ref().and_then(|list| {
-        list.iter()
-            .find(|w| Path::new(&w.path) == Path::new(&target) || w.path == target)
-    });
-    let operation = validate_repo(&target)
-        .ok()
-        .and_then(|repo| repo_op::detect(&repo).ok().flatten());
+    let requested = worktree_path.unwrap_or(repo_path).to_string();
+    let target = match resolve_target(repo_path, worktree_path) {
+        Ok(path) => path,
+        Err(error) => return unresolved_context(repo_path, &requested, error),
+    };
+
+    let (operation, operation_ok, operation_error) =
+        match validate_repo(&target).and_then(|repo| repo_op::detect(&repo)) {
+            Ok(found) => (found, true, String::new()),
+            Err(error) => (None, false, error),
+        };
     let operation_kind = operation
         .as_ref()
         .map(|op| format!("{:?}", op.kind))
         .unwrap_or_default();
-    let worktree = match info {
-        Some(found) => summarise_worktree(found, operation_kind),
-        None => WorktreeSummary {
-            path: target.clone(),
-            name: Path::new(&target)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| target.clone()),
-            branch: None,
-            is_main: false,
-            is_bare: false,
-            dirty_files: None,
-            agent_kind: agent_kind(&target).unwrap_or_default(),
-            session_slug: agent_session_slug(&target).unwrap_or_default(),
-            operation_kind,
+
+    let (worktree, worktree_ok, worktree_error) = match worktree::list_worktrees(repo_path) {
+        Ok(list) => match list.iter().find(|w| same_path(&w.path, &target)) {
+            Some(found) => (
+                summarise_worktree(found, operation_kind, operation_ok),
+                true,
+                String::new(),
+            ),
+            // Registered a moment ago and gone from the listing now, or a git
+            // that prints a path neither form of comparison matches. Either
+            // way the row below is not something git said.
+            None => (
+                unlisted_worktree(&target, operation_kind, operation_ok),
+                false,
+                format!("worktree '{target}' was not in this repository's worktree listing"),
+            ),
         },
+        Err(error) => (
+            unlisted_worktree(&target, operation_kind, operation_ok),
+            false,
+            error,
+        ),
     };
-    let task_id = crate::ledger::bindings::resolve(repo_path, &target)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let changes = active_changes(repo_path, Some(&target), None);
-    let collisions = collision_risk(repo_path)
-        .items
-        .into_iter()
-        .filter(|item| item.worktrees.iter().any(|p| p.path == target))
-        .collect();
+
+    let (task_id, task_ok, task_error) = match crate::ledger::bindings::resolve(repo_path, &target)
+    {
+        Ok(found) => (found.unwrap_or_default(), true, String::new()),
+        Err(error) => (String::new(), false, error.to_string()),
+    };
+
     ChangeContext {
         repo_path: repo_path.to_string(),
         worktree,
+        worktree_ok,
+        worktree_error,
         task_id,
-        changes,
-        collisions,
+        task_ok,
+        task_error,
+        // The family was resolved above, so the target needs no second proof.
+        changes: changes_in(repo_path, &target, None),
+        collisions: collisions_involving(collision_risk(repo_path), &target),
         operation,
+        operation_ok,
+        operation_error,
     }
 }
 
@@ -1144,6 +1548,415 @@ mod tests {
         let snap = fleet_snapshot(&paths);
         assert!(snap.truncated);
         assert_eq!(snap.repos.len(), MAX_FLEET_REPOS);
+    }
+
+    /// Three worktrees, one of them unreadable: the fixture behind every
+    /// "failed is not empty" assertion below. Returns the main checkout, the
+    /// path of the worktree that will be broken, and the repository path.
+    fn repo_with_a_worktree_to_break() -> (tempfile::TempDir, std::path::PathBuf) {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap().to_string();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        for name in ["a", "b"] {
+            let wt = main.path().join(".claude/worktrees").join(name);
+            worktree::add_worktree(
+                &repo,
+                wt.to_str().unwrap(),
+                Some(&format!("agent/{name}")),
+                Some("main"),
+                false,
+            )
+            .expect("add worktree");
+        }
+        // Two worktrees dirty the same file, so there is a real finding for a
+        // partial scan to keep hold of.
+        fs::write(main.path().join("shared.txt"), "main-edit").unwrap();
+        fs::write(
+            main.path().join(".claude/worktrees/a/shared.txt"),
+            "agent-edit",
+        )
+        .unwrap();
+        let doomed = main.path().join(".claude/worktrees/b");
+        (main, doomed)
+    }
+
+    #[test]
+    fn collision_risk_counts_a_worktree_it_could_not_scan_instead_of_reporting_ok() {
+        let (main, doomed) = repo_with_a_worktree_to_break();
+        let repo = main.path().to_str().unwrap();
+
+        let whole = collision_risk(repo);
+        assert!(whole.ok, "{whole:?}");
+        assert_eq!(whole.scanned_worktrees, 3);
+        assert_eq!(whole.failed_worktrees, 0);
+        assert!(!whole.truncated);
+
+        // git still lists the worktree; it just cannot be read any more.
+        fs::remove_dir_all(&doomed).unwrap();
+        let partial = collision_risk(repo);
+
+        // The two payloads must not be readable as the same answer.
+        assert!(!partial.ok, "a failed scan must not report ok: {partial:?}");
+        assert_eq!(partial.failed_worktrees, 1, "{partial:?}");
+        assert_eq!(partial.scanned_worktrees, 2, "{partial:?}");
+        assert_eq!(partial.unscanned_worktrees, 0, "{partial:?}");
+        assert!(partial.truncated, "{partial:?}");
+        assert!(!partial.error.is_empty(), "{partial:?}");
+        // ...and the finding it did make still stands on its own evidence.
+        assert!(
+            partial
+                .items
+                .iter()
+                .any(|item| item.path == "shared.txt" && item.worktrees.len() >= 2),
+            "a partial scan must keep what it did find: {partial:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_an_unscanned_worktree_as_unknown_rather_than_clean() {
+        let (main, doomed) = repo_with_a_worktree_to_break();
+        let repo = main.path().to_str().unwrap();
+
+        let measured = snapshot(repo);
+        assert!(measured.worktrees.ok, "{:?}", measured.worktrees);
+        assert_eq!(measured.worktrees.count, 3);
+        assert_eq!(measured.worktrees.scanned, 3);
+        assert_eq!(measured.worktrees.dirty_unknown, 0);
+        assert_eq!(measured.worktrees.blocked_unknown, 0);
+
+        fs::remove_dir_all(&doomed).unwrap();
+        let partial = snapshot(repo);
+
+        assert_eq!(partial.worktrees.count, 3, "{:?}", partial.worktrees);
+        assert_eq!(partial.worktrees.scanned, 2, "{:?}", partial.worktrees);
+        // The worktree nobody could read is NOT in `dirty`, and saying so is
+        // the whole point: `dirty` alone would have counted it clean.
+        assert_eq!(
+            partial.worktrees.dirty_unknown, 1,
+            "{:?}",
+            partial.worktrees
+        );
+        assert_eq!(
+            partial.worktrees.dirty + partial.worktrees.dirty_unknown,
+            3,
+            "{:?}",
+            partial.worktrees
+        );
+        // The same gap in the parked-operation probe, which used to fail into
+        // an empty string that read as "nothing parked".
+        assert_eq!(
+            partial.worktrees.blocked_unknown, 1,
+            "{:?}",
+            partial.worktrees
+        );
+        assert!(
+            partial
+                .worktrees
+                .items
+                .iter()
+                .any(|w| !w.operation_ok && w.operation_kind.is_empty()),
+            "{:?}",
+            partial.worktrees
+        );
+    }
+
+    #[test]
+    fn snapshot_marks_agent_counts_unavailable_when_the_worktree_listing_fails() {
+        let main = init_repo();
+        let read = snapshot(main.path().to_str().unwrap());
+        // A repository with no agent worktrees: looked, found none.
+        assert!(read.agents.ok, "{:?}", read.agents);
+        assert_eq!(read.agents.sessions, 0);
+
+        let unread = snapshot("/no/such/gitpulse-agents-repo");
+        // Same zero, opposite meaning — and now they are distinguishable.
+        assert!(!unread.agents.ok, "{:?}", unread.agents);
+        assert_eq!(unread.agents.sessions, 0);
+        assert_ne!(read.agents.ok, unread.agents.ok);
+    }
+
+    #[test]
+    fn snapshot_separates_a_detached_head_from_a_branch_it_could_not_read() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        git_in(main.path(), &["checkout", "--detach"]);
+
+        let detached = snapshot(repo);
+        // The listing ran and reported a checkout on no branch.
+        assert!(detached.branch_ok, "{detached:?}");
+        assert!(detached.branch.is_none(), "{:?}", detached.branch);
+        assert!(
+            detached
+                .worktrees
+                .items
+                .iter()
+                .any(|w| w.is_main && w.is_detached),
+            "{:?}",
+            detached.worktrees.items
+        );
+
+        let unknown = snapshot("/no/such/gitpulse-branch-repo");
+        assert!(!unknown.branch_ok, "{unknown:?}");
+        assert!(unknown.branch.is_none());
+        assert_ne!(detached.branch_ok, unknown.branch_ok);
+    }
+
+    #[test]
+    fn snapshot_past_its_deadline_reports_partial_facets_rather_than_empty_ones() {
+        let (main, _doomed) = repo_with_a_worktree_to_break();
+        let repo = main.path().to_str().unwrap();
+
+        let whole = snapshot(repo);
+        assert!(!whole.deadline_expired, "{whole:?}");
+        assert!(whole.collisions.ok, "{:?}", whole.collisions);
+        assert!(whole.worktrees.items.iter().all(|w| w.operation_ok));
+        assert_eq!(whole.worktrees.blocked_unknown, 0);
+
+        // Zero budget: the fixed-cost stages still run, and every stage whose
+        // cost grows with the worktree count is skipped and says so.
+        let rushed = snapshot_within(repo, Duration::ZERO);
+        assert!(rushed.deadline_expired, "{rushed:?}");
+        assert!(rushed.worktrees.ok, "{:?}", rushed.worktrees);
+        assert_eq!(rushed.worktrees.count, 3);
+        assert!(rushed.changes.ok, "{:?}", rushed.changes);
+        assert!(
+            rushed.worktrees.items.iter().all(|w| !w.operation_ok),
+            "{:?}",
+            rushed.worktrees.items
+        );
+        assert_eq!(rushed.worktrees.blocked_unknown, 3);
+        // A collision scan that never started must not arrive as "no overlaps".
+        assert!(!rushed.collisions.ok, "{:?}", rushed.collisions);
+        assert!(
+            rushed.collisions.error.contains("time"),
+            "{:?}",
+            rushed.collisions
+        );
+        assert_eq!(rushed.collisions.scanned_worktrees, 0);
+        assert!(whole.collisions.overlapping_files > 0);
+        assert_eq!(rushed.collisions.overlapping_files, 0);
+    }
+
+    #[test]
+    fn active_changes_refuses_a_worktree_belonging_to_another_repository() {
+        let here = init_repo();
+        let elsewhere = init_repo();
+        fs::write(elsewhere.path().join("shared.txt"), "other-repo-edit").unwrap();
+
+        let changes = active_changes(
+            here.path().to_str().unwrap(),
+            Some(elsewhere.path().to_str().unwrap()),
+            None,
+        );
+        // Reading it anyway stamped this repository's identity on another
+        // repository's files.
+        assert!(!changes.ok, "{changes:?}");
+        assert!(
+            changes.error.contains("does not belong"),
+            "unexpected error: {}",
+            changes.error
+        );
+        assert!(changes.files.is_empty(), "{changes:?}");
+        assert_eq!(changes.total, 0);
+    }
+
+    #[test]
+    fn change_context_refuses_a_worktree_belonging_to_another_repository() {
+        let here = init_repo();
+        let elsewhere = init_repo();
+        fs::write(elsewhere.path().join("shared.txt"), "other-repo-edit").unwrap();
+
+        let ctx = change_context(
+            here.path().to_str().unwrap(),
+            Some(elsewhere.path().to_str().unwrap()),
+        );
+        assert!(!ctx.worktree_ok, "{ctx:?}");
+        assert!(!ctx.changes.ok, "{:?}", ctx.changes);
+        assert!(!ctx.collisions.ok, "{:?}", ctx.collisions);
+        assert!(!ctx.task_ok, "{ctx:?}");
+        assert!(!ctx.operation_ok, "{ctx:?}");
+        assert!(ctx.changes.files.is_empty(), "{:?}", ctx.changes);
+        assert!(
+            ctx.worktree_error.contains("does not belong"),
+            "unexpected error: {}",
+            ctx.worktree_error
+        );
+    }
+
+    #[test]
+    fn active_changes_still_reads_a_worktree_that_does_belong_to_the_repository() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        let wt = main.path().join(".claude/worktrees/session-a");
+        worktree::add_worktree(
+            repo,
+            wt.to_str().unwrap(),
+            Some("agent/session-a"),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+        fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
+
+        let changes = active_changes(repo, Some(wt.to_str().unwrap()), None);
+        assert!(changes.ok, "{changes:?}");
+        assert_eq!(changes.repo_path, repo);
+        assert_eq!(
+            Path::new(&changes.worktree_path),
+            fs::canonicalize(&wt).unwrap(),
+            "the authenticated worktree is the one git registered"
+        );
+        assert!(
+            changes.files.iter().any(|f| f.path == "shared.txt"),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn change_context_on_a_missing_repository_marks_every_probe_as_failed() {
+        let read = {
+            let main = init_repo();
+            change_context(main.path().to_str().unwrap(), None)
+        };
+        // Looked, and found a clean repository with nothing bound to it.
+        assert!(read.worktree_ok, "{read:?}");
+        assert!(read.changes.ok, "{:?}", read.changes);
+        assert!(read.collisions.ok, "{:?}", read.collisions);
+        assert!(read.task_ok, "{}", read.task_error);
+        assert!(read.operation_ok, "{}", read.operation_error);
+        assert!(read.collisions.items.is_empty());
+        assert!(read.task_id.is_empty());
+        assert!(read.operation.is_none());
+
+        let unread = change_context("/no/such/gitpulse-context-repo", None);
+        // Same empty values, and not one of them was established. Before this
+        // the two payloads agreed on every field but `changes.ok`.
+        assert!(!unread.worktree_ok, "{unread:?}");
+        assert!(!unread.changes.ok, "{:?}", unread.changes);
+        assert!(!unread.collisions.ok, "{:?}", unread.collisions);
+        assert!(!unread.task_ok, "{unread:?}");
+        assert!(!unread.operation_ok, "{unread:?}");
+        assert!(unread.collisions.items.is_empty());
+        assert_eq!(unread.collisions.scanned_worktrees, 0);
+        assert!(!unread.worktree_error.is_empty());
+        assert!(!unread.collisions.error.is_empty());
+    }
+
+    #[test]
+    fn change_context_keeps_the_collision_scans_coverage_alongside_its_rows() {
+        let (main, doomed) = repo_with_a_worktree_to_break();
+        let repo = main.path().to_str().unwrap();
+        fs::remove_dir_all(&doomed).unwrap();
+
+        let ctx = change_context(repo, None);
+        // The rows are narrowed to this worktree; the coverage fields describe
+        // the scan that produced them and are what make an empty list readable.
+        assert!(!ctx.collisions.ok, "{:?}", ctx.collisions);
+        assert_eq!(ctx.collisions.failed_worktrees, 1, "{:?}", ctx.collisions);
+        assert_eq!(ctx.collisions.scanned_worktrees, 2, "{:?}", ctx.collisions);
+        assert!(
+            ctx.collisions.items.iter().all(|item| item
+                .worktrees
+                .iter()
+                .any(|p| Path::new(&p.path) == fs::canonicalize(main.path()).unwrap())),
+            "rows must involve the requested worktree: {:?}",
+            ctx.collisions.items
+        );
+        assert_eq!(
+            ctx.collisions.overlapping_files as usize,
+            ctx.collisions.items.len(),
+            "the row count must describe the rows that are here"
+        );
+    }
+
+    fn status_row(path: &str, additions: usize, warnings: Vec<String>) -> FileStatus {
+        FileStatus {
+            path: path.to_string(),
+            old_path: None,
+            status_code: " M".to_string(),
+            is_staged: false,
+            is_conflicted: false,
+            additions,
+            deletions: 0,
+            warnings,
+        }
+    }
+
+    #[test]
+    fn a_changed_file_carries_its_churn_warning_instead_of_dropping_it() {
+        let warned = status_row(
+            "src/lib.rs",
+            0,
+            vec!["numstat record had unparseable counts".to_string()],
+        );
+        let row = to_changed(&warned);
+        // 0/0 on an unreadable diff is not a measurement, and this is the only
+        // thing on the row that says so.
+        assert_eq!(row.additions, 0);
+        assert_eq!(row.warnings, warned.warnings);
+
+        // Additive on the wire: absent entirely while empty, exactly as
+        // `FileStatus` does it.
+        let clean = to_changed(&status_row("src/main.rs", 3, Vec::new()));
+        let value = serde_json::to_value(&clean).unwrap();
+        assert!(
+            value.get("warnings").is_none(),
+            "empty warnings must not appear on the wire: {value}"
+        );
+        let carried = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            carried["warnings"][0],
+            "numstat record had unparseable counts"
+        );
+    }
+
+    #[test]
+    fn churn_counts_report_how_many_rows_could_not_be_measured() {
+        let counts = count_statuses(&[
+            status_row("a.rs", 5, Vec::new()),
+            status_row(
+                "b.rs",
+                0,
+                vec!["numstat record had unparseable counts".into()],
+            ),
+        ]);
+        assert_eq!(counts.additions, 5);
+        // The total is a floor: one row contributed a zero nobody measured.
+        assert_eq!(counts.churn_warnings, 1);
+        assert!(!counts.churn_overflowed);
+
+        let facet = changes_from_status(
+            &[status_row(
+                "b.rs",
+                0,
+                vec!["numstat record had unparseable counts".into()],
+            )],
+            false,
+        );
+        assert_eq!(facet.churn_warnings, 1);
+    }
+
+    #[test]
+    fn churn_totals_saturate_and_say_so_instead_of_wrapping() {
+        // Two rows that overflow a u32 between them: the old `+=` panicked in
+        // debug and wrapped silently in release, reporting a small fabricated
+        // total as authoritative.
+        let counts = count_statuses(&[
+            status_row("huge.bin", u32::MAX as usize, Vec::new()),
+            status_row("more.bin", 12, Vec::new()),
+        ]);
+        assert_eq!(counts.additions, u32::MAX);
+        assert!(counts.churn_overflowed, "a saturated total must say so");
+
+        // A row that does not even fit a u32 on its own is caught the same way.
+        let single = count_statuses(&[status_row("vast.bin", u32::MAX as usize + 9, Vec::new())]);
+        assert_eq!(single.additions, u32::MAX);
+        assert!(single.churn_overflowed);
+
+        let ordinary = count_statuses(&[status_row("small.rs", 12, Vec::new())]);
+        assert_eq!(ordinary.additions, 12);
+        assert!(!ordinary.churn_overflowed);
     }
 
     #[test]

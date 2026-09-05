@@ -1498,6 +1498,7 @@ dependencies = [
  "dc-verify",
  "devmap-query",
  "devmap-store",
+ "libc",
  "log",
  "notify",
  "portable-pty",

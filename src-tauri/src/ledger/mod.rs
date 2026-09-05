@@ -1384,6 +1384,54 @@ pub fn latest_cursor(repo_path: &str) -> Result<i64, LedgerError> {
 }
 
 /// Whether this repo's ledger is recording, and what has been lost if not.
+/// Does this repository already have a ledger?
+///
+/// The read-only surfaces ask before touching it, because [`with_conn`] opens
+/// the database and opening *creates* it — directory, journal and all.
+pub fn is_initialised(repo_path: &str) -> bool {
+    ledger_path(repo_path).exists()
+}
+
+/// [`status`] for a caller that must not create anything.
+///
+/// `gitpulse-mcp` annotates its tools `readOnlyHint: true, destructiveHint:
+/// false`, and MCP clients gate user approval on exactly those. A "read" that
+/// created `.devcouncil/ledger.sqlite` in the user's repository — verified: a
+/// fresh checkout gained the database, its `-wal` and its `-shm` after a single
+/// `gitpulse_insights` call — made that annotation false.
+///
+/// The desktop app deliberately keeps the creating path: opening a repository
+/// there is when the ledger is meant to come into being. This is the read half,
+/// and "there is no ledger yet" is a distinct, reported state rather than one
+/// conjured into existence so the answer can be "recording".
+pub fn status_readonly(repo_path: &str) -> LedgerStatus {
+    if is_initialised(repo_path) {
+        return status(repo_path);
+    }
+    LedgerStatus {
+        recording: false,
+        path: ledger_path(repo_path).display().to_string(),
+        dropped: 0,
+        error: "no ledger in this repository yet; nothing has been recorded".to_string(),
+        error_code: "not_initialised".to_string(),
+    }
+}
+
+/// [`tail`] for a caller that must not create anything.
+///
+/// `Ok(None)` means there is no ledger — which is not the same as a ledger
+/// holding no events, and must not be rendered as one.
+pub fn tail_readonly(
+    repo_path: &str,
+    cursor: i64,
+    limit: u32,
+) -> Result<Option<Vec<LedgerEvent>>, LedgerError> {
+    if !is_initialised(repo_path) {
+        return Ok(None);
+    }
+    tail(repo_path, cursor, limit).map(Some)
+}
+
 pub fn status(repo_path: &str) -> LedgerStatus {
     let path = ledger_path(repo_path);
     let dropped = dropped_appends(repo_path);
@@ -1742,6 +1790,54 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
 
+    /// A read must never bring the thing it is reading into existence.
+    ///
+    /// `gitpulse-mcp` annotates every tool `readOnlyHint: true,
+    /// destructiveHint: false`, and MCP clients gate user approval on exactly
+    /// those. Verified before the fix: a fresh checkout gained
+    /// `.devcouncil/ledger.sqlite` plus its `-wal` and `-shm` after one
+    /// `gitpulse_insights` call, because `status` probes by opening and opening
+    /// creates.
+    #[test]
+    fn a_read_only_status_leaves_no_ledger_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+
+        let before = status_readonly(&repo);
+        assert!(!before.recording, "an absent ledger is not recording");
+        assert_eq!(before.error_code, "not_initialised");
+        assert!(
+            !dir.path().join(".devcouncil").exists(),
+            "a read created state in the repository"
+        );
+        assert!(!is_initialised(&repo));
+
+        // The same call, any number of times, still creates nothing.
+        for _ in 0..3 {
+            let _ = status_readonly(&repo);
+        }
+        assert!(!dir.path().join(".devcouncil").exists());
+    }
+
+    #[test]
+    fn a_read_only_tail_separates_no_ledger_from_an_empty_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+
+        // No ledger at all: `None`, and nothing created.
+        assert!(tail_readonly(&repo, 0, 10).expect("reads").is_none());
+        assert!(!dir.path().join(".devcouncil").exists());
+
+        // A ledger that exists and holds nothing: `Some([])`. The two must not
+        // render alike — one means "nothing has happened here", the other means
+        // "this repository has never been recorded into".
+        let created = status(&repo);
+        assert!(created.recording, "{}", created.error);
+        let empty = tail_readonly(&repo, 0, 10).expect("reads");
+        assert_eq!(empty.as_deref(), Some(&[][..]));
+        assert!(is_initialised(&repo));
+    }
+
     fn temp_repo() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -1895,6 +1991,27 @@ mod tests {
         // Not an error: a missing table is "nothing was ever recorded", and a
         // read-only connection could not create it anyway.
         assert!(read_fleet_metrics(repo).expect("read").is_none());
+    }
+
+    #[test]
+    fn zz_characterize_tail_returns_oldest_and_hides_clamping() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        for i in 0..60 {
+            append(draft(repo, &format!("git.commit{i}"))).expect("append");
+        }
+        let page = tail(repo, 0, 10).expect("tail");
+        println!(
+            "CHARACTERIZE tail(cursor=0, limit=10) -> first={:?} last={:?} len={}",
+            page.first().map(|e| e.action.clone()),
+            page.last().map(|e| e.action.clone()),
+            page.len()
+        );
+        let big = tail(repo, 0, 100_000).expect("tail");
+        println!(
+            "CHARACTERIZE tail(limit=100000) -> len={} (asked for 100000, nothing says it was capped)",
+            big.len()
+        );
     }
 
     #[test]
