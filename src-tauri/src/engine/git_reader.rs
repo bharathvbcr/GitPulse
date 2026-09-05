@@ -2975,73 +2975,59 @@ fn parse_numstat_with_issues(stdout: &str) -> NumstatParse {
         let add_raw = fields.next().unwrap_or("");
         let del_raw = fields.next();
         let path_field = fields.next().unwrap_or("");
+
+        let mut target_paths = Vec::new();
+        if path_field.is_empty() {
+            if let Some(first_path) = tokens.next().filter(|s| !s.is_empty()) {
+                let is_rename = tokens
+                    .peek()
+                    .is_some_and(|next| !next.is_empty() && !is_numstat_header(next));
+                target_paths.push(first_path.to_string());
+                if is_rename {
+                    if let Some(second_path) = tokens.next().filter(|s| !s.is_empty()) {
+                        target_paths.push(second_path.to_string());
+                    }
+                }
+            }
+        } else {
+            target_paths.push(path_field.to_string());
+        }
+
         // "-" is git's binary marker and legitimately decodes to 0±0; only
         // values that are neither a number nor "-" are untrustworthy.
         let trust = |raw: &str| raw == "-" || raw.parse::<usize>().is_ok();
         let add_ok = trust(add_raw);
         let del_ok = del_raw.map(trust).unwrap_or(false);
         if !del_ok {
-            if let Some(reason) = issue_for(path_field, add_raw, del_raw) {
-                out.issues.push(reason);
+            for p in &target_paths {
+                out.issues.push((
+                    p.clone(),
+                    format!(
+                        "numstat record had unparseable change counts ({}, {})",
+                        add_raw,
+                        del_raw.unwrap_or("<missing>")
+                    ),
+                ));
             }
-            if del_raw.is_none() && path_field.is_empty() {
+            if del_raw.is_none() && target_paths.is_empty() {
                 continue;
             }
         }
         if !add_ok {
-            if path_field.is_empty() {
-                // Rename-shaped record with bad counts: attribute to both
-                // names so whichever side renders gets the warning.
-                if let Some(first) = tokens.next() {
-                    out.issues.push((
-                        first.to_string(),
-                        format!("numstat record had unparseable change count {:?}", add_raw),
-                    ));
-                }
-            } else {
+            for p in &target_paths {
                 out.issues.push((
-                    path_field.to_string(),
+                    p.clone(),
                     format!("numstat record had unparseable change count {:?}", add_raw),
                 ));
             }
         }
         let add: usize = add_raw.parse().unwrap_or(0);
         let del: usize = del_raw.and_then(|d| d.parse().ok()).unwrap_or(0);
-        if path_field.is_empty() {
-            if let Some(first_path) = tokens.next().filter(|s| !s.is_empty()) {
-                let is_rename = tokens
-                    .peek()
-                    .is_some_and(|next| !next.is_empty() && !is_numstat_header(next));
-                if is_rename {
-                    let second_path = tokens.next().unwrap();
-                    out.churn.insert(first_path.to_string(), (add, del));
-                    out.churn.insert(second_path.to_string(), (add, del));
-                } else {
-                    out.churn.insert(first_path.to_string(), (add, del));
-                }
-            }
-        } else {
-            out.churn.insert(path_field.to_string(), (add, del));
+        for p in target_paths {
+            out.churn.insert(p, (add, del));
         }
     }
     out
-}
-
-/// Shapes one untrustworthy numstat record into a row-attributable warning,
-/// or None when no path survives to attach it to.
-fn issue_for(path_field: &str, add_raw: &str, del_raw: Option<&str>) -> Option<(String, String)> {
-    if !path_field.is_empty() {
-        Some((
-            path_field.to_string(),
-            format!(
-                "numstat record had unparseable change counts ({}, {})",
-                add_raw,
-                del_raw.unwrap_or("<missing>")
-            ),
-        ))
-    } else {
-        None
-    }
 }
 
 /// Same wire format as [`parse_numstat`], but every record becomes a
@@ -3944,6 +3930,29 @@ mod tests {
         ));
         assert!(parsed.issues.is_empty(), "got: {:?}", parsed.issues);
         assert_eq!(parsed.churn.len(), 4);
+    }
+
+    #[test]
+    fn parse_numstat_rename_with_unparseable_count_keeps_stream_synchronized() {
+        let parsed = parse_numstat_with_issues(concat!(
+            "junk\t0\t\0old.txt\0new.txt\0",
+            "7\t2\tsubsequent.txt\0"
+        ));
+        assert_eq!(parsed.churn.get("old.txt"), Some(&(0, 0)));
+        assert_eq!(parsed.churn.get("new.txt"), Some(&(0, 0)));
+        assert_eq!(parsed.churn.get("subsequent.txt"), Some(&(7, 2)));
+
+        let flagged: Vec<&str> = parsed.issues.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            flagged.contains(&"old.txt"),
+            "old.txt should be flagged: {:?}",
+            flagged
+        );
+        assert!(
+            flagged.contains(&"new.txt"),
+            "new.txt should be flagged: {:?}",
+            flagged
+        );
     }
 
     /// The additive FileStatus warnings field must be invisible in JSON while

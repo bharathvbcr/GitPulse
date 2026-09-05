@@ -155,9 +155,9 @@ export interface CommitGraphPayload {
    * HEAD belongs to no branch at all, so neither survives a derivation from
    * branch tips.
    */
-  refs?: RefDecoration[];
+  refs: RefDecoration[];
   /** True when older commits exist beyond this page. */
-  has_more?: boolean;
+  has_more: boolean;
   /**
    * Degradations the backend hit while assembling this page (HEAD resolution
    * or ref decoration listing failing without failing the load). Optional:

@@ -24,6 +24,7 @@ export interface StatusLike {
   is_conflicted: boolean;
   additions: number;
   deletions: number;
+  warnings?: string[];
 }
 
 /**

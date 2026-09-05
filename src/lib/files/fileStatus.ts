@@ -7,14 +7,8 @@
 import { ancestorsOf } from "./fileTree";
 import type { FileStatusScope } from "./fileQuery";
 
-export interface StatusLike {
-  path: string;
-  status_code: string;
-  is_staged: boolean;
-  is_conflicted: boolean;
-  additions: number;
-  deletions: number;
-}
+import type { StatusLike } from "../repos/statusPoll";
+export type { StatusLike };
 
 export type FileChangeKind = "clean" | "staged" | "unstaged" | "untracked" | "conflict";
 

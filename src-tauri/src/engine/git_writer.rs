@@ -1,6 +1,6 @@
 use crate::engine::git_cli::{
-    git_captured, git_global, git_text, git_with_stdin, resolve_git_common_dir, sandbox_join,
-    validate_repo,
+    git_captured, git_global_with_timeout, git_text, git_text_network, git_with_stdin,
+    resolve_git_common_dir, sandbox_join, validate_repo, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +14,9 @@ pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     let mut map = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() >= 64 {
+        map.retain(|_, arc| Arc::strong_count(arc) > 1);
+    }
     map.entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -505,9 +508,9 @@ impl GitWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(r) = remote {
             validate_ref_name(r)?;
-            git_text(&repo, &["fetch", r])
+            git_text_network(&repo, &["fetch", r])
         } else {
-            git_text(&repo, &["fetch", "--all", "--prune"])
+            git_text_network(&repo, &["fetch", "--all", "--prune"])
         }
     }
 
@@ -525,13 +528,13 @@ impl GitWriter {
             (Some(r), Some(b)) => {
                 validate_ref_name(r)?;
                 validate_ref_name(b)?;
-                git_text(&repo, &["pull", r, b])
+                git_text_network(&repo, &["pull", r, b])
             }
             (Some(r), None) => {
                 validate_ref_name(r)?;
-                git_text(&repo, &["pull", r])
+                git_text_network(&repo, &["pull", r])
             }
-            _ => git_text(&repo, &["pull"]),
+            _ => git_text_network(&repo, &["pull"]),
         }
     }
 
@@ -558,7 +561,7 @@ impl GitWriter {
             validate_ref_name(b)?;
             args.push(b);
         }
-        git_text(&repo, &args)
+        git_text_network(&repo, &args)
     }
 
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
@@ -572,7 +575,7 @@ impl GitWriter {
         validate_ref_name(remote)?;
         validate_ref_name(tag)?;
         let refspec = format!("refs/tags/{tag}");
-        git_text(&repo, &["push", remote, &refspec])
+        git_text_network(&repo, &["push", remote, &refspec])
     }
 
     pub fn merge_branch(
@@ -1019,7 +1022,9 @@ impl GitWriter {
             return Err(format!("Already cloned at {}", clone_path.display()));
         }
         let clone_str = clone_path.to_string_lossy().into_owned();
-        if let Err(clone_err) = git_global(&["clone", "--", url, &clone_str]) {
+        if let Err(clone_err) =
+            git_global_with_timeout(&["clone", "--", url, &clone_str], NETWORK_TIMEOUT)
+        {
             // git materializes <dest>/.git before transferring objects, so a
             // failed or timed-out clone leaves a skeleton behind that blocks
             // every retry ("already exists"). Its absence was verified just
@@ -2229,5 +2234,16 @@ mod tests {
         for message in [&removed, &kept] {
             assert!(message.contains("clone failed (timeout)"), "{message}");
         }
+    }
+
+    #[test]
+    fn repo_mutation_lock_prunes_idle_locks_at_cap() {
+        let held_lock = repo_mutation_lock(Path::new("/mock/repo_held"));
+        for i in 0..70 {
+            let path = format!("/mock/repo_{i}");
+            let _ = repo_mutation_lock(Path::new(&path));
+        }
+        let reacquired = repo_mutation_lock(Path::new("/mock/repo_held"));
+        assert!(Arc::ptr_eq(&held_lock, &reacquired));
     }
 }
