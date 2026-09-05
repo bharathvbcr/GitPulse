@@ -38,6 +38,56 @@ describe("pickLanguageBarStats", () => {
     expect(pickLanguageBarStats(stats).map((s) => s.language)).toEqual(["Rust", "Svelte"]);
   });
 
+  it("orders and sorts languages per percentage descending", () => {
+    const stats = [
+      stat("HTML", 40, "markup"),
+      stat("TypeScript", 35),
+      stat("CSS", 15, "markup"),
+      stat("Rust", 10),
+    ];
+    const picked = pickLanguageBarStats(stats, 6);
+    expect(picked.map((s) => s.language)).toEqual(["HTML", "TypeScript", "CSS", "Rust"]);
+    expect(picked.map((s) => s.percentage)).toEqual([40, 35, 15, 10]);
+  });
+
+  it("sorts a mixed programming and data mix by percentage with Other last", () => {
+    const stats = [
+      stat("JSON", 40, "data"),
+      stat("Markdown", 20, "prose"),
+      stat("TOML", 10, "data"),
+      stat("YAML", 8, "data"),
+      stat("CSS", 7, "markup"),
+      stat("HTML", 6, "markup"),
+      stat("Svelte", 5),
+      stat("TypeScript", 3),
+      stat("Rust", 1),
+    ];
+    const picked = pickLanguageBarStats(stats, 6);
+    expect(picked.map((s) => s.language)).toEqual([
+      "JSON",
+      "Markdown",
+      "TOML",
+      "Svelte",
+      "TypeScript",
+      "Rust",
+      "Other",
+    ]);
+    expect(picked.map((s) => s.percentage)).toEqual([40, 20, 10, 5, 3, 1, 21]);
+    const named = picked.filter((s) => s.language !== "Other");
+    for (let i = 1; i < named.length; i++) {
+      expect(named[i - 1].percentage).toBeGreaterThanOrEqual(named[i].percentage);
+    }
+    expect(picked.at(-1)?.language).toBe("Other");
+  });
+
+  it("breaks equal percentages alphabetically by language name", () => {
+    const picked = pickLanguageBarStats(
+      [stat("Rust", 20), stat("Go", 20), stat("CSS", 20, "markup")],
+      6,
+    );
+    expect(picked.map((s) => s.language)).toEqual(["CSS", "Go", "Rust"]);
+  });
+
   it("lists folded languages on Other and omits the field when there is no fold", () => {
     const stats = [
       stat("JSON", 40, "data"),
@@ -108,6 +158,24 @@ describe("pickLanguageBarStats hardening", () => {
     expect(rustRows[0].percentage).toBeCloseTo(50);
     expect(rustRows[0].code_lines).toBe(50);
     expect(rustRows[0].file_count).toBe(2);
+    expect(picked.map((s) => s.language)).toEqual(["Rust", "JSON", "Markdown"]);
+    expect(picked.map((s) => s.percentage)).toEqual([50, 25, 15]);
+  });
+
+  it("places a merged language by its summed percentage", () => {
+    const picked = pickLanguageBarStats(
+      [
+        stat("JSON", 25, "data"),
+        stat("Rust", 30),
+        stat("JSON", 25, "data"),
+        stat("Markdown", 15, "prose"),
+      ],
+      6,
+    );
+    expect(picked.map((s) => s.language)).toEqual(["JSON", "Rust", "Markdown"]);
+    expect(picked.map((s) => s.percentage)).toEqual([50, 30, 15]);
+    expect(picked[0].code_lines).toBe(50);
+    expect(picked[0].file_count).toBe(2);
   });
 });
 
@@ -134,6 +202,27 @@ describe("describeLanguageMix", () => {
     expect(mix.failed).toBe(false);
   });
 
+  it("names the highest-percentage language as dominant, including markup", () => {
+    const mix = describeLanguageMix(
+      snapshot({
+        value: {
+          stats: [
+            stat("HTML", 40, "markup"),
+            stat("TypeScript", 35),
+            stat("CSS", 15, "markup"),
+            stat("Rust", 10),
+          ],
+          truncated: false,
+          scanned_files: 40,
+          candidate_files: 40,
+        },
+      }),
+    );
+    expect(mix.dominant?.language).toBe("HTML");
+    expect(mix.dominant?.percentage).toBe(40);
+    expect(mix.stats.map((s) => s.language)).toEqual(["HTML", "TypeScript", "CSS", "Rust"]);
+  });
+
   it("never leads with the Other aggregate when a real language is present", () => {
     // "Other" sorts last out of pickLanguageBarStats, but a one-language
     // repository past the cap can put it first; leading with it would name
@@ -149,6 +238,8 @@ describe("describeLanguageMix", () => {
       }),
     );
     expect(mix.dominant?.language).not.toBe("Other");
+    expect(mix.dominant?.language).toBe("JSON");
+    expect(mix.dominant?.percentage).toBe(60);
   });
 
   it("marks a capped scan partial and names what it counted", () => {

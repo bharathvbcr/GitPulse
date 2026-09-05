@@ -110,7 +110,7 @@ so the editor's **Blame** button changes lens instead of teleporting.
 - **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators.
 - **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
-- **Interactive Language Bar**: Live breakdown of repository language distribution with click-to-filter navigation into Code → Explorer.
+- **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
 
 ### 2.2 Blame
 

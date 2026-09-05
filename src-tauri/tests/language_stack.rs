@@ -199,3 +199,44 @@ fn multi_language_repo_detects_common_languages() {
         assert_eq!(stat.file_count, 1, "{lang} file count mismatch");
     }
 }
+
+#[test]
+fn language_stats_ordered_and_sorted_per_percentage() {
+    let repo = TestRepo::init();
+    repo.write("docs/guide.md", &"# Guide\n".repeat(50));
+    repo.write("index.html", &"<div>content</div>\n".repeat(30));
+    repo.write("src/main.rs", &"fn main() {}\n".repeat(20));
+    repo.write("data.json", &"{\"a\": 1}\n".repeat(10));
+    repo.commit_all("chore: mixed repo");
+
+    let stats = GitReader::get_repo_language_stats(&repo.path_str())
+        .expect("stats")
+        .stats;
+
+    let names: Vec<&str> = stats.iter().map(|s| s.language.as_str()).collect();
+    assert_eq!(names, vec!["Markdown", "HTML", "Rust", "JSON"]);
+    for window in stats.windows(2) {
+        assert!(
+            window[0].code_lines >= window[1].code_lines,
+            "line counts must be sorted descending: {:?}",
+            stats
+                .iter()
+                .map(|s| (s.language.as_str(), s.code_lines, s.percentage))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            window[0].percentage >= window[1].percentage,
+            "percentages must be sorted descending: {:?}",
+            stats
+                .iter()
+                .map(|s| (s.language.as_str(), s.percentage))
+                .collect::<Vec<_>>()
+        );
+    }
+    let rust_idx = stats.iter().position(|s| s.language == "Rust").unwrap();
+    let markdown_idx = stats.iter().position(|s| s.language == "Markdown").unwrap();
+    assert!(
+        markdown_idx < rust_idx,
+        "higher-volume Markdown must precede programming Rust: {names:?}"
+    );
+}

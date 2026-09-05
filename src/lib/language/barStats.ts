@@ -55,9 +55,20 @@ function finiteOrZero(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+/** Highest percentage first; equal percentages break ties by language name. */
+function compareByPercentageThenName(a: LanguageStat, b: LanguageStat): number {
+  const pa = finiteOrZero(a.percentage);
+  const pb = finiteOrZero(b.percentage);
+  if (pa !== pb) return pb - pa;
+  if (a.language < b.language) return -1;
+  if (a.language > b.language) return 1;
+  return 0;
+}
+
 /**
  * Prefer programming languages so a small Rust crate cannot be sliced
  * off the bar by lockfiles / JSON / Markdown. Remainder folds into Other.
+ * The bar itself is then ordered by percentage, with Other last.
  */
 export function pickLanguageBarStats(
   stats: RepoLanguageStat[],
@@ -77,8 +88,8 @@ export function pickLanguageBarStats(
   }
   const cap = Number.isFinite(maxShown) ? Math.max(0, Math.floor(maxShown)) : 0;
   const deduped = [...merged.values()];
-  const programming = deduped.filter(isProgramming);
-  const rest = deduped.filter((s) => !isProgramming(s));
+  const programming = deduped.filter(isProgramming).sort(compareByPercentageThenName);
+  const rest = deduped.filter((s) => !isProgramming(s)).sort(compareByPercentageThenName);
   const shown: LanguageStat[] = [];
   shown.push(...programming.slice(0, cap));
   if (shown.length < cap) {
@@ -86,6 +97,7 @@ export function pickLanguageBarStats(
   }
   const used = new Set(shown.map((s) => s.language));
   const leftover = deduped.filter((s) => !used.has(s.language));
+  shown.sort(compareByPercentageThenName);
   if (leftover.length === 0) return shown;
   const otherPct = leftover.reduce((sum, s) => sum + finiteOrZero(s.percentage), 0);
   const otherLines = leftover.reduce((sum, s) => sum + finiteOrZero(s.code_lines), 0);
@@ -104,7 +116,7 @@ export function pickLanguageBarStats(
 export interface LanguageMix {
   /** Languages to draw, already deduped and capped. Empty when unmeasured. */
   stats: LanguageStat[];
-  /** The language the bar leads with, ignoring the "Other" aggregate. */
+  /** Highest-percentage language among `stats`, ignoring the "Other" aggregate. */
   dominant: LanguageStat | null;
   /**
    * True when the percentages are a floor rather than a total — the scan was

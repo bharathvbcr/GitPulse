@@ -1424,10 +1424,8 @@ impl GitReader {
             })
             .collect();
         stats.sort_by(|a, b| {
-            let pa = u8::from(a.category == "programming");
-            let pb = u8::from(b.category == "programming");
-            pb.cmp(&pa)
-                .then_with(|| b.code_lines.cmp(&a.code_lines))
+            b.code_lines
+                .cmp(&a.code_lines)
                 .then_with(|| a.language.cmp(&b.language))
         });
         Ok(LanguageStatsReport {
