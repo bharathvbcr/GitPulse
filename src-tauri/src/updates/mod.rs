@@ -97,25 +97,8 @@ pub fn release_tag_url(tag: &str) -> String {
     format!(
         "{}/releases/tag/{}",
         REPOSITORY_URL.trim_end_matches(".git"),
-        percent_encode_tag(tag)
+        crate::github::percent_encode_tag(tag)
     )
-}
-
-/// Percent-encodes every byte outside a URL-safe tag vocabulary, so a tag
-/// name from the remote can only ever produce a well-formed link. Mirrors the
-/// encoder in [`crate::github`]; `/` stays verbatim because slash-bearing
-/// tags are real and encode to themselves.
-fn percent_encode_tag(tag: &str) -> String {
-    let mut out = String::with_capacity(tag.len());
-    for byte in tag.bytes() {
-        let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/');
-        if safe {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// A parsed `MAJOR.MINOR.PATCH` release version.

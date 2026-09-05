@@ -16,6 +16,7 @@
  */
 
 import type { OperationState } from "./operation";
+import { plural } from "../format";
 
 /** The per-repository facts this summary is computed from. */
 export interface RepoWipInput {
@@ -93,10 +94,6 @@ function rank(kind: WipReasonKind): number {
   // An unrecognized kind from a newer caller sorts last rather than first, so
   // it can never displace a real conflict at the top of the list.
   return index < 0 ? SEVERITY_ORDER.length : index;
-}
-
-function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
 /** Computes one repository's at-risk reasons, most severe first. */

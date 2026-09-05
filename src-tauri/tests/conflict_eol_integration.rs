@@ -5,9 +5,11 @@
 use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
 use gitpulse_lib::engine::GitWriter;
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+
+mod common;
+use common::run_git;
 
 struct TestRepo {
     dir: TempDir,
@@ -60,24 +62,6 @@ impl TestRepo {
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
-}
-
-fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_AUTHOR_NAME", "Test User")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// 30-line base file: every line LF except line 15, which is CRLF.

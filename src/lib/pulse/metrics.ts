@@ -21,20 +21,7 @@ import type {
   RhythmStats,
   WeeklyLineBucket,
 } from "./types";
-
-export function startOfLocalDay(ms: number): number {
-  const d = new Date(ms);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-/** Step forward exactly one calendar day, which is not always 24 hours. */
-export function nextLocalDay(dayStart: number): number {
-  const date = new Date(dayStart);
-  date.setDate(date.getDate() + 1);
-  date.setHours(0, 0, 0, 0);
-  return date.getTime();
-}
+import { nextLocalDay, startOfLocalDay } from "../metrics/commitCadence";
 
 export function formatLocalDayKey(ms: number): string {
   const d = new Date(ms);

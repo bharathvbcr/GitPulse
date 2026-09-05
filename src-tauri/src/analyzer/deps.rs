@@ -1479,7 +1479,12 @@ fn cargo_audit_available(env: &ScanEnv) -> bool {
     .unwrap_or(false)
 }
 
-fn npm_program() -> &'static str {
+/// npm's binary name for this platform.
+///
+/// Canonical for the crate: [`crate::ci_local`] plans `npm` CI steps and calls
+/// this rather than keeping a second copy — a fact spelled twice can disagree
+/// on Windows without either side failing loudly.
+pub(crate) fn npm_program() -> &'static str {
     if cfg!(windows) {
         "npm.cmd"
     } else {
@@ -2758,24 +2763,7 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn git_repo() -> TempDir {
-        let dir = TempDir::new().expect("tempdir");
-        let status = Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git init");
-        assert!(status.success());
-        dir
-    }
-
-    fn write(dir: &Path, rel: &str, content: &str) {
-        let dest = dir.join(rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(dest, content).unwrap();
-    }
+    use crate::test_support::{git_repo, write};
 
     fn git_add(dir: &Path, rel: &str) {
         let status = Command::new("git")

@@ -14,6 +14,7 @@
  */
 
 import type { Cell, FleetRow, FleetSeverity } from "./types";
+import { plural } from "../format";
 
 export interface FleetTally {
   /** The reduced value across every repository that contributed. */
@@ -83,10 +84,6 @@ export function tally<T>(
     else unscanned += 1;
   }
   return { value, counted, eligible: scope.length, failed, unscanned, partial };
-}
-
-function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
 /**

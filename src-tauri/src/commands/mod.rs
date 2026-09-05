@@ -11,7 +11,9 @@ use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
     LanguageStatsReport, PulseReport, ReflogEntry,
 };
-use crate::engine::git_writer::{validate_oid_or_revision, validate_ref_name, RebaseStep};
+use crate::engine::git_writer::{
+    reworded_message, validate_oid_or_revision, validate_ref_name, RebaseStep,
+};
 use crate::engine::{
     BranchInfo, BranchStatsReport, FileStatus, GitReader, GitWriter, OperationAction, RemoteChange,
     RemoteList, RepoOperation, ResetMode, StashAction, StashEntry, SubmoduleChange, SubmoduleList,
@@ -2000,15 +2002,6 @@ fn commit_amend_argv(message: &str, amend: bool) -> Vec<String> {
         }
     }
     args
-}
-
-/// Mirrors git_writer's private `reworded_message`: rewrites only the subject
-/// line, keeping the body intact.
-fn reworded_message(original: &str, new_subject: &str) -> String {
-    match original.split_once('\n') {
-        Some((_, rest)) => format!("{new_subject}\n{rest}"),
-        None => new_subject.to_string(),
-    }
 }
 
 /// The exact mutating commands [`GitWriter::execute_rebase_sequence`] will run

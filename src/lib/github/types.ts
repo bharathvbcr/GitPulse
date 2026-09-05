@@ -1,4 +1,6 @@
-import type { IssueInfo } from "../ops/model";
+import type { IssueInfo, ReleaseInfo } from "../ops/model";
+
+export type { ReleaseInfo };
 
 /**
  * Wire types for GitHub payloads returned by the Tauri commands. These are
@@ -68,17 +70,6 @@ export interface CiLocalReport {
    * failed".
    */
   not_recorded_reason: string;
-}
-
-export interface ReleaseInfo {
-  tag_name: string;
-  name: string;
-  is_draft: boolean;
-  is_prerelease: boolean;
-  is_latest: boolean;
-  published_at: string;
-  created_at: string;
-  url: string;
 }
 
 /**

@@ -954,28 +954,8 @@ pub fn mcp_info() -> McpInfo {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
 
-    fn git_in(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args([
-                "-c",
-                "user.name=GitPulse",
-                "-c",
-                "user.email=gitpulse@test.local",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use crate::test_support::git_in;
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();

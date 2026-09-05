@@ -1935,26 +1935,7 @@ mod tests {
         assert!(!is_timeout_error("git", &formatted));
     }
 
-    fn git_in(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=GitPulse",
-                "-c",
-                "user.email=gitpulse@test.local",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use crate::test_support::git_in;
 
     fn init_linked_worktree() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
         let main = init_test_repo(false);

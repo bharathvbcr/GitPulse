@@ -226,26 +226,7 @@ pub(crate) fn resolve_binding(
 mod tests {
     use super::*;
 
-    fn git_in(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=GitPulse",
-                "-c",
-                "user.email=gitpulse@test.local",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use crate::test_support::git_in;
 
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp repository");

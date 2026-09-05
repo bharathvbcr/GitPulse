@@ -788,26 +788,7 @@ some-future-field whatever
     }
 
     #[cfg(test)]
-    fn git_in(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=GitPulse",
-                "-c",
-                "user.email=gitpulse@test.local",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    use crate::test_support::git_in;
 
     #[test]
     fn test_list_add_remove_roundtrip() {

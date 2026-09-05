@@ -22,6 +22,8 @@ pub mod stack;
 pub mod storage;
 pub mod tasks;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod updates;
 pub mod watcher;
 

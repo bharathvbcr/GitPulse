@@ -21,6 +21,7 @@
 //! HEAD *plus* uncommitted changes, and a note saying HEAD passed would be a
 //! claim about a tree that was never tested.
 
+use crate::analyzer::deps::npm_program;
 use crate::engine::git_cli::{capture_command, git_text, validate_repo, CapturedOutput};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -90,14 +91,6 @@ impl CiStep {
             }
         }
         line
-    }
-}
-
-fn npm_program() -> &'static str {
-    if cfg!(windows) {
-        "npm.cmd"
-    } else {
-        "npm"
     }
 }
 

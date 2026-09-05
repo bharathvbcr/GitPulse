@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
+mod common;
+use common::run_git;
+
 struct TestRepo {
     dir: TempDir,
 }
@@ -47,24 +50,6 @@ impl TestRepo {
         run_git(self.dir.path(), &["add", "-A"]);
         run_git(self.dir.path(), &["commit", "-m", message]);
     }
-}
-
-fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_AUTHOR_NAME", "Test User")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "Test User")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// Regression (NUL-safe record framing): a commit subject containing a raw

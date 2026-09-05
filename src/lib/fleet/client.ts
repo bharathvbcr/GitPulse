@@ -23,7 +23,10 @@ import type { DepsHealthReport } from "../health/types";
 import type { CoverageReport } from "../coverage/types";
 import type { FleetMetricsInput, FleetSnapshot, ScanFamily } from "./types";
 
-export type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+import type { InvokeFn } from "../stores/graphStore";
+
+/** Re-exported so `./fleetStore` keeps importing it from its own client. */
+export type { InvokeFn };
 
 /** Every field null: the shape a family-specific mapper fills in one group of. */
 export function emptyMetricsInput(): FleetMetricsInput {
