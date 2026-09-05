@@ -51,7 +51,7 @@ function facet(path: string, overrides: Partial<FleetRepoFacet> = {}): FleetRepo
     worktrees_ok: true,
     worktrees_error: "",
     worktrees: 1,
-    agents: { sessions: 0, kinds: [] },
+    agents: { ok: true, sessions: 0, kinds: [] },
     last_commit_ok: true,
     last_commit_epoch: 1_757_000_000,
     metrics_ok: true,
@@ -202,7 +202,7 @@ describe("Tier 1 cells", () => {
         snapshot: snapshot([
           facet("/repo/a", {
             worktrees: 4,
-            agents: { sessions: 3, kinds: [{ kind: "claude", sessions: 3 }] },
+            agents: { ok: true, sessions: 3, kinds: [{ kind: "claude", sessions: 3 }] },
             last_commit_epoch: 1_757_000_000,
           }),
         ]),

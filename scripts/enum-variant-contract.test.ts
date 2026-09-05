@@ -25,6 +25,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   ["ManviActionKind", "activity labels are produced by the frontend, not parsed from the backend"],
   [
+    "PermissionDecision",
+    "a `gitpulse-hook` wire type: it is serialized to the agent host's hook protocol on stdout, never to this app's frontend, and its spelling is fixed by that protocol rather than by us",
+  ],
+  [
     "RebaseActionKind",
     "modelled in the UI as PlannerAction plus a separate wire union, because Reword carries a payload and serializes as an object rather than a bare string",
   ],
@@ -34,6 +38,9 @@ const NO_TS_MIRROR = new Map<string, string>([
 function serializedName(variant: string, rule: string | undefined): string {
   if (rule === "lowercase") return variant.toLowerCase();
   if (rule === "snake_case") return variant.replace(/(?<!^)(?=[A-Z])/g, "_").toLowerCase();
+  // Used by the hook wire types, whose field and variant names are fixed by the
+  // host's hook protocol rather than by this repo.
+  if (rule === "camelCase") return variant.charAt(0).toLowerCase() + variant.slice(1);
   if (rule === undefined) return variant;
   throw new Error(`unsupported rename_all on an enum: ${rule}`);
 }

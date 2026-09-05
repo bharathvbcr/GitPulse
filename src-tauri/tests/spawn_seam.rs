@@ -29,6 +29,16 @@ const ALLOWED: &[(&str, &str)] = &[
         "one long-lived sidecar per session; holding a gate permit for its \
          whole life would starve every git call behind it",
     ),
+    (
+        "src/procguard/mod.rs",
+        "the Windows arm of the tree kill (`taskkill /T /F`), which moved here \
+         from `git_cli::kill_process_tree` when process-group teardown became \
+         one owner. It kills children rather than doing work: a gate permit, a \
+         timeout and an output cap are exactly what a shutdown must not wait \
+         on. `procguard::spawn` itself never constructs a `Command` — it is \
+         handed one the caller built inside the seam, so the rule this test \
+         exists for is untouched",
+    ),
 ];
 
 #[test]

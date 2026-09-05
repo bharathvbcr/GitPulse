@@ -9,6 +9,12 @@ export interface CodeintelSymbolHit {
   span_start_line: number;
   span_end_line: number;
   source_span: string;
+  /**
+   * Set when `source_span` is empty because the file could not be read — a map
+   * generation newer than the checkout, or a file since deleted — rather than
+   * because the symbol has no body. Without it the two render identically.
+   */
+  source_unavailable_reason?: string | null;
   score: number;
 }
 

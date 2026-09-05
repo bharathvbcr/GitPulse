@@ -142,15 +142,23 @@ pub fn view(repo_path: &str) -> TaskView {
                     .collect(),
                 error: String::new(),
             },
+            // The store opened but its leases could not be read. `available`
+            // means "the leases in this view were actually read"; saying true
+            // here made an unreadable store render identically to one that
+            // opened and holds no active leases.
             Err(e) => TaskView {
-                available: true,
+                available: false,
                 store_path: path,
                 leases: Vec::new(),
                 error: format!("{e}"),
             },
         },
+        // The store could not be opened at all — a file at the path that is not
+        // a database, a permissions failure. `error` is what separates this
+        // from `Ok(None)` above: empty means there was nothing to read, and
+        // non-empty means there was and we could not.
         Err(e) => TaskView {
-            available: true,
+            available: false,
             store_path: path,
             leases: Vec::new(),
             error: e,
@@ -264,10 +272,54 @@ mod tests {
         std::fs::write(&db, b"this is not a sqlite database").unwrap();
 
         let v = view(repo);
-        assert!(v.available, "the file is there, so this is not absence");
+        // `available` used to mean "a file is there", which made this case
+        // indistinguishable from a store that opened and held no leases. It
+        // means "the leases in this view were actually read", and they were
+        // not: the file is not a database.
+        assert!(
+            !v.available,
+            "a store we could not read must not claim its lease list was read"
+        );
         assert!(
             !v.error.is_empty(),
             "a store we cannot read must not render as a store with no leases"
         );
+        assert!(v.leases.is_empty());
+    }
+
+    /// The three answers this view has to keep apart.
+    ///
+    /// `available: true` with an empty list is the machine-readable statement
+    /// "I read the store; there are no active leases". Two of these three
+    /// cases never read anything, and neither may say that. `error` is what
+    /// separates the two that did not: empty means there was nothing to read,
+    /// non-empty means there was and we could not.
+    #[test]
+    fn available_means_the_leases_were_read_not_that_a_file_was_present() {
+        let absent = tempfile::tempdir().unwrap();
+        let absent_view = view(absent.path().to_str().unwrap());
+        assert!(!absent_view.available);
+        assert!(absent_view.error.is_empty(), "absence is not a failure");
+
+        let broken = tempfile::tempdir().unwrap();
+        let broken_db = store_path(broken.path().to_str().unwrap());
+        std::fs::create_dir_all(broken_db.parent().unwrap()).unwrap();
+        std::fs::write(&broken_db, b"not a database").unwrap();
+        let broken_view = view(broken.path().to_str().unwrap());
+        assert!(!broken_view.available);
+        assert!(!broken_view.error.is_empty(), "a failure must say so");
+
+        let real = tempfile::tempdir().unwrap();
+        let real_db = store_path(real.path().to_str().unwrap());
+        std::fs::create_dir_all(real_db.parent().unwrap()).unwrap();
+        dc_store::Store::open(&real_db).unwrap();
+        let real_view = view(real.path().to_str().unwrap());
+        assert!(
+            real_view.available,
+            "a store that opened and answered must be available: {}",
+            real_view.error
+        );
+        assert!(real_view.error.is_empty());
+        assert!(real_view.leases.is_empty(), "nothing was leased");
     }
 }

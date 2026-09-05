@@ -213,16 +213,29 @@ pub fn compute_freshness(
     commit_sha: &str,
     base_branch: Option<&str>,
 ) -> ProvenanceFreshness {
-    let base = base_branch.unwrap_or("HEAD");
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
         Err(e) => return ProvenanceFreshness::unexamined(commit_sha, e),
     };
 
+    // Resolved before anything is measured or read. A revision this repository
+    // cannot name has no note to read and no distance to measure, and there is
+    // no half-answer worth spending two subprocesses on: it is unexamined, and
+    // says so.
+    let sha = match resolve_rev(&repo, commit_sha) {
+        Ok(sha) => sha,
+        Err(reason) => return ProvenanceFreshness::unexamined(commit_sha, reason),
+    };
+
     // Every failure yields `None` with a reason, never 0 — see
     // `measure_distance`, which owns that rule for both this and the batch
-    // path so the two can never drift into disagreeing about it.
-    let (distance, unmeasured_reason) = measure_distance(&repo, commit_sha, base);
+    // path so the two can never drift into disagreeing about it. A base that
+    // will not resolve costs the distance and nothing else: the notes on this
+    // commit are still real, and still readable.
+    let (distance, unmeasured_reason) = match resolve_base(&repo, base_branch) {
+        Ok(base) => measure_distance(&repo, &sha, &base),
+        Err(reason) => (None, reason),
+    };
 
     let confidence = distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32));
     let is_fresh = distance == Some(0);
@@ -233,8 +246,8 @@ pub fn compute_freshness(
     // between an unverified commit and an unexamined one.
     let listable = noted_commits(&repo, VERIFICATION_NOTES_REF).is_ok()
         && noted_commits(&repo, SESSION_NOTES_REF).is_ok();
-    let verification = read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, commit_sha);
-    let session = read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, commit_sha);
+    let verification = read_note::<VerificationNote>(&repo, VERIFICATION_NOTES_REF, &sha);
+    let session = read_note::<SessionEpisodeNote>(&repo, SESSION_NOTES_REF, &sha);
     // A read that failed is not an absence. Folding it into `None` while still
     // claiming the notes were readable is precisely the lie this flag exists
     // to prevent, so either failing read clears it.
@@ -619,10 +632,50 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String
         .collect())
 }
 
+/// The base a distance is measured against when the caller does not name one.
+const DEFAULT_BASE: &str = "HEAD";
+
+/// Resolves one revision to a commit sha, or says why it could not be.
+///
+/// Goes through [`resolve_revisions`] rather than spelling out its own git
+/// call. That path sends revisions on *stdin*, so nothing a caller passes ever
+/// reaches an argument list where git could read it as an option or a
+/// pathspec, and it already owns the blank, over-long and control-character
+/// guards. A one-element batch costs exactly the subprocess a bespoke
+/// `rev-parse` would have cost.
+fn resolve_rev(repo: &Path, rev: &str) -> Result<String, String> {
+    let one = [rev.to_string()];
+    resolve_revisions(repo, &one, 1)
+        .pop()
+        .unwrap_or_else(|| Err(format!("git cat-file answered nothing for {rev:?}")))
+}
+
+/// Resolves the base a distance is measured against.
+///
+/// `None` means the caller did not name a base, which is documented to mean
+/// [`DEFAULT_BASE`]. `Some("")` is not that: it is a base the caller *did*
+/// name and git cannot resolve. `unwrap_or` fires only on `None`, so an empty
+/// string arrived as the default and then as the empty half of a `sha..`
+/// range — which git also reads as `sha..HEAD`, answering a measured number
+/// for a request that named no measurable base.
+fn resolve_base(repo: &Path, base_branch: Option<&str>) -> Result<String, String> {
+    let base = base_branch.unwrap_or(DEFAULT_BASE);
+    resolve_rev(repo, base)
+        .map_err(|reason| format!("not measured: base {base:?} could not be resolved: {reason}"))
+}
+
 /// Measures `commit_sha` against `base`, exactly as [`compute_freshness`] does.
+///
+/// Both ends are object names git itself produced, and the argument list is
+/// closed with `--`. Neither is tidiness. An unresolved revision reaches
+/// `rev-list` as argv, where the empty string builds the range `..HEAD` —
+/// which git resolves to `HEAD..HEAD` and answers `0` with a zero exit status,
+/// the strongest freshness this type can express, for a commit nobody named.
+/// Resolving first leaves nothing in the range for git to reinterpret, and
+/// `--` leaves nothing after it that git could read as a path.
 fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, String) {
     let range = format!("{commit_sha}..{base}");
-    match git_captured(repo, &["rev-list", "--count", &range]) {
+    match git_captured(repo, &["rev-list", "--count", &range, "--"]) {
         Err(e) => (None, format!("could not run git rev-list: {e}")),
         Ok(run) if !run.success => (
             None,
@@ -674,7 +727,6 @@ pub fn freshness_batch_within(
     base_branch: Option<&str>,
     budget: usize,
 ) -> Vec<ProvenanceFreshness> {
-    let base = base_branch.unwrap_or("HEAD");
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
         Err(e) => {
@@ -685,6 +737,10 @@ pub fn freshness_batch_within(
         }
     };
     let resolved = resolve_revisions(&repo, revisions, MAX_RESOLVED_PER_BATCH);
+    // One base for the whole batch, resolved once. Every row measured against
+    // an unresolvable base reports the same reason rather than a number, which
+    // is what keeps the batch's answer identical to the single-commit path's.
+    let base = resolve_base(&repo, base_branch);
 
     // A failed listing is carried into every entry's reason rather than
     // silently becoming an empty set: "this repository has no verification
@@ -731,7 +787,10 @@ pub fn freshness_batch_within(
             }
             measured += 1;
 
-            let (distance, unmeasured_reason) = measure_distance(&repo, &sha, base);
+            let (distance, unmeasured_reason) = match &base {
+                Ok(base) => measure_distance(&repo, &sha, base),
+                Err(reason) => (None, reason.clone()),
+            };
             // The listing says these notes are there. A read that fails now is
             // a note we could not get at, so the entry says the notes were not
             // readable rather than handing back a `None` that reads as "this
@@ -1192,6 +1251,116 @@ mod batch_tests {
         );
     }
 
+    /// The guard the whole `Option<u32>` distance exists for.
+    ///
+    /// `format!("{commit_sha}..{base}")` with an empty commit builds the range
+    /// `..HEAD`, which git resolves to `HEAD..HEAD` and answers `0` with a
+    /// zero exit status. Nothing downstream can tell that apart from a commit
+    /// measured against the tip and found level with it, so an argument naming
+    /// no commit reported the strongest freshness this type can express.
+    #[test]
+    fn an_empty_commit_sha_is_unexamined_rather_than_maximally_fresh() {
+        let repo = Repo::new(2);
+
+        let f = compute_freshness(repo.as_str(), "", None);
+
+        assert_eq!(f.distance, None, "nothing was measured");
+        assert_eq!(f.confidence, None);
+        assert!(!f.is_fresh, "an unnamed commit is not a fresh one");
+        assert!(
+            !f.unmeasured_reason.is_empty(),
+            "the reason must say why nothing was measured"
+        );
+        assert!(
+            !f.notes_readable,
+            "no notes were read for a commit that was never resolved"
+        );
+    }
+
+    /// `unwrap_or` fires on `None`, never on `Some("")`, so an empty base
+    /// bypassed the documented `HEAD` default and became the empty half of a
+    /// `sha..` range — which git also reads as `sha..HEAD`. A caller naming an
+    /// unusable base therefore got a measured number back.
+    #[test]
+    fn an_empty_base_branch_is_refused_rather_than_silently_defaulting_to_head() {
+        let repo = Repo::new(2);
+        repo.verify("HEAD", "passed");
+        let tip = repo.rev("HEAD");
+
+        let f = compute_freshness(repo.as_str(), &tip, Some(""));
+
+        assert_eq!(f.distance, None, "an unusable base measures nothing");
+        assert_eq!(f.confidence, None);
+        assert!(!f.is_fresh);
+        assert!(
+            f.verification.is_some(),
+            "the note is still readable even when the distance is not"
+        );
+        assert!(
+            f.notes_readable,
+            "an unusable base costs the distance, not the notes"
+        );
+    }
+
+    #[test]
+    fn an_empty_base_branch_is_refused_for_every_row_of_a_batch() {
+        let repo = Repo::new(2);
+        repo.verify("HEAD", "passed");
+
+        let got = freshness_batch(repo.as_str(), &[repo.rev("HEAD")], Some(""));
+
+        assert_eq!(
+            got[0].distance, None,
+            "the batch must agree with the single"
+        );
+        assert_eq!(got[0].confidence, None);
+        assert!(!got[0].is_fresh);
+        assert!(
+            got[0].unmeasured_reason.contains("base"),
+            "the reason must name the base, got {:?}",
+            got[0].unmeasured_reason
+        );
+    }
+
+    /// A revision is resolved through `git cat-file --batch-check`, which
+    /// reads it on stdin. Nothing a caller passes reaches an argument list
+    /// where git could read it as an option or a pathspec, and the range that
+    /// does reach one is built from two object names git itself produced.
+    #[test]
+    fn a_revision_spelled_like_a_flag_is_never_handed_to_git_as_one() {
+        let repo = Repo::new(2);
+        let tip = repo.rev("HEAD");
+
+        for f in [
+            compute_freshness(repo.as_str(), "--all", None),
+            compute_freshness(repo.as_str(), &tip, Some("--all")),
+            compute_freshness(repo.as_str(), "-n1", None),
+        ] {
+            assert_eq!(f.distance, None, "nothing measurable was named");
+            assert!(!f.is_fresh);
+            assert!(!f.unmeasured_reason.is_empty());
+        }
+    }
+
+    /// `a..HEAD` where `a` is a tracked file is ambiguous to git, and a rev
+    /// that is only a path is not a rev at all. Resolution refuses it before
+    /// the range is built, so the answer is a reason rather than whatever git
+    /// decided the argument was.
+    #[test]
+    fn a_path_shaped_revision_is_refused_before_the_range_is_built() {
+        let repo = Repo::new(2);
+
+        let f = compute_freshness(repo.as_str(), "f0", None);
+
+        assert_eq!(f.distance, None);
+        assert!(!f.is_fresh);
+        assert!(
+            f.unmeasured_reason.contains("f0"),
+            "the reason must name what could not be resolved, got {:?}",
+            f.unmeasured_reason
+        );
+    }
+
     #[test]
     fn an_unmeasurable_base_is_reported_for_a_noted_commit() {
         let repo = Repo::new(1);
@@ -1207,6 +1376,14 @@ mod batch_tests {
         assert_eq!(f.distance, None);
         assert_eq!(f.confidence, None);
         assert!(!f.is_fresh);
-        assert!(f.unmeasured_reason.contains("rev-list"));
+        // The base is now refused at resolution rather than by `rev-list`, so
+        // the reason names the base the caller passed instead of the command
+        // that would have used it. Naming the unusable input is the stronger
+        // statement of the two.
+        assert!(
+            f.unmeasured_reason.contains("no-such-base"),
+            "the reason must name the base that could not be resolved, got {:?}",
+            f.unmeasured_reason
+        );
     }
 }

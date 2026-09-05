@@ -11,13 +11,16 @@ pub mod github;
 pub mod grants;
 pub mod graph;
 pub mod harness;
+pub mod hooks;
 pub mod ingest;
 pub mod insights;
 pub mod ledger;
 pub mod limits;
 pub mod logging;
 pub mod mcp;
+pub mod ndjson;
 pub mod ops;
+pub mod procguard;
 pub mod stack;
 pub mod storage;
 pub mod tasks;
@@ -57,6 +60,15 @@ pub fn run() {
         log::info!(target: "setup", "{}", limits.describe());
     } else {
         log::warn!(target: "setup", "{}", limits.describe());
+    }
+    // Quitting the app, logging out, or a `kill` from a terminal all arrive as
+    // a signal whose default action ends this process and leaves whatever git
+    // commands the UI had in flight running against the user's repository.
+    let signals = procguard::install_signal_handlers();
+    if signals.is_armed() {
+        log::info!(target: "setup", "{}", signals.describe());
+    } else {
+        log::warn!(target: "setup", "{}", signals.describe());
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

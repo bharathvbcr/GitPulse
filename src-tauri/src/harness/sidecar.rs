@@ -129,6 +129,11 @@ struct Sidecar {
     /// can kill the child *immediately* instead of waiting for the next call
     /// to notice the disconnected channel.
     child: std::sync::Arc<Mutex<Child>>,
+    /// The child's place in `procguard`'s registry, shared with the same two
+    /// reader threads so whichever one kills the child clears the registry
+    /// entry in the same breath. Without it a SIGTERM to GitPulse would leave
+    /// a `manvi serve` running against a scratch directory nothing owns.
+    guard: std::sync::Arc<crate::procguard::Registration>,
     /// `None` once stdin has been closed for shutdown. An `Option` is what
     /// lets [`Drop`] hand the pipe back to the OS without moving out of
     /// `&mut self`.
@@ -150,7 +155,11 @@ impl Drop for Sidecar {
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shutdown_child(&mut child, self.stdin.take(), SHUTDOWN_GRACE);
+        let stdin = self.stdin.take();
+        // Recorded through the registration so `procguard`'s shutdown sweep
+        // cannot signal this pid after `shutdown_child` has waited on it.
+        self.guard
+            .reap(|| shutdown_child(&mut child, stdin, SHUTDOWN_GRACE));
     }
 }
 
@@ -159,12 +168,14 @@ impl Drop for Sidecar {
 /// overflow is detected; the faulting reader reaps it here, and the
 /// disconnected channel turns the next (or in-flight) call into a transport
 /// fault that sets the respawn backoff.
-fn force_kill(child: &Mutex<Child>) {
+fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
     let mut child = child
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = child.kill();
-    let _ = child.wait();
+    // The whole group, not just the direct child: a harness that forked a
+    // helper holding our pipes is exactly the case this reader is faulting on.
+    guard.kill_tree(&mut child);
+    let _ = guard.reap(|| child.wait());
 }
 
 /// Clean-shutdown escalation ladder, factored out of [`Drop for Sidecar`]
@@ -612,56 +623,21 @@ fn test_binary_override() -> Option<String> {
 ///   the child and sets the respawn backoff rather than treating a hostile
 ///   stream as a clean exit. The remainder is drained only up to its newline.
 fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
-    let mut out: Vec<u8> = Vec::with_capacity(4096);
-    let mut overflowed = false;
-    let mut saw_data = false;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            break;
-        }
-        saw_data = true;
-        match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                let chunk = &available[..=pos];
-                if !overflowed && out.len() + chunk.len() <= max {
-                    out.extend_from_slice(chunk);
-                } else {
-                    overflowed = true;
-                }
-                reader.consume(pos + 1);
-                break;
-            }
-            None => {
-                if !overflowed && out.len() + available.len() > max {
-                    overflowed = true;
-                    out.clear();
-                } else if !overflowed {
-                    out.extend_from_slice(available);
-                }
-                let len = available.len();
-                reader.consume(len);
-            }
-        }
-    }
-    if !saw_data && out.is_empty() {
-        return Ok(None);
-    }
-    if overflowed {
-        return Err(std::io::Error::new(
+    // The framing itself lives in `crate::ndjson`, shared with the MCP server's
+    // stdin reader — the two needed the identical guarantee and only this one
+    // had it. The `io::Result` shape is kept because this module's callers key
+    // on it to kill the child and set the respawn backoff.
+    use crate::ndjson::FrameError;
+    crate::ndjson::read_frame(reader, max).map_err(|error| match error {
+        FrameError::Io(io) => io,
+        FrameError::TooLong(cap) => std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("sidecar frame exceeds the {max} byte cap"),
-        ));
-    }
-    if out.is_empty() {
-        return Ok(None);
-    }
-    while out.last() == Some(&b'\n') {
-        out.pop();
-    }
-    String::from_utf8(out)
-        .map(Some)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "sidecar sent non-UTF8"))
+            format!("sidecar frame exceeds the {cap} byte cap"),
+        ),
+        FrameError::NotUtf8 => {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "sidecar sent non-UTF8")
+        }
+    })
 }
 
 fn spawn() -> Result<Sidecar, HarnessError> {
@@ -672,7 +648,8 @@ fn spawn() -> Result<Sidecar, HarnessError> {
     })?;
 
     let dir = scratch_dir()?;
-    let mut child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args(["serve", "--posture", "host"])
         .current_dir(&dir)
         // Both of these keep the harness out of the working tree: the first
@@ -683,11 +660,12 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            HarnessError::Unavailable(format!("could not start `{} serve`: {}", binary, e))
-        })?;
+        .stderr(Stdio::piped());
+    // Its own process group, and registered, so this long-lived child dies
+    // with us rather than outliving the app that started it.
+    let (mut child, guard) = crate::procguard::spawn(&mut command, "manvi serve").map_err(|e| {
+        HarnessError::Unavailable(format!("could not start `{} serve`: {}", binary, e))
+    })?;
 
     let stdin = child
         .stdin
@@ -703,7 +681,9 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         .ok_or_else(|| HarnessError::Unavailable("sidecar has no stderr".into()))?;
 
     let child = std::sync::Arc::new(Mutex::new(child));
+    let guard = std::sync::Arc::new(guard);
     let child_for_stdout = child.clone();
+    let guard_for_stdout = guard.clone();
 
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -720,7 +700,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
                 }
                 Ok(None) => return,
                 Err(_) => {
-                    force_kill(&child_for_stdout);
+                    force_kill(&child_for_stdout, &guard_for_stdout);
                     return;
                 }
             }
@@ -730,6 +710,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
     let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let tail_writer = tail.clone();
     let child_for_stderr = child.clone();
+    let guard_for_stderr = guard.clone();
     std::thread::spawn(move || {
         // Bounded exactly like stdout: stderr is untrusted bytes from the
         // same child, and `.lines()` would buffer an unlimited newline-less
@@ -748,7 +729,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
                 }
                 Ok(None) => return,
                 Err(_) => {
-                    force_kill(&child_for_stderr);
+                    force_kill(&child_for_stderr, &guard_for_stderr);
                     return;
                 }
             }
@@ -757,6 +738,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
 
     let mut sidecar = Sidecar {
         child,
+        guard,
         stdin: Some(stdin),
         lines: rx,
         stderr: tail,
@@ -1252,13 +1234,16 @@ mod tests {
     /// `spawn`'s reader plumbing but skipping its handshake — each test wants
     /// a different script and a different deadline.
     fn scripted_sidecar(script: &str, write_deadline: Duration) -> Sidecar {
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        // Through the same seam production uses, so the helper cannot drift
+        // into testing a child shape that never ships.
+        let (mut child, guard) = crate::procguard::spawn(&mut command, "scripted sidecar")
             .expect("spawn scripted sidecar");
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -1288,6 +1273,7 @@ mod tests {
 
         Sidecar {
             child: std::sync::Arc::new(Mutex::new(child)),
+            guard: std::sync::Arc::new(guard),
             stdin: Some(stdin),
             lines: rx,
             stderr: tail,

@@ -83,6 +83,32 @@ pub fn raise_open_file_limit() -> LimitOutcome {
     imp::raise(&CANDIDATES, TARGET_OPEN_FILES)
 }
 
+/// The soft open-file limit currently in force, without changing it.
+///
+/// [`raise_open_file_limit`] is a startup action with a side effect, so it is
+/// the wrong thing to call from a read: an MCP `resources/read` that silently
+/// mutated process limits would be a mutation advertised as read-only. This is
+/// the query half.
+pub fn observe_open_file_limit() -> Option<u64> {
+    imp::observe()
+}
+
+/// One line describing descriptor headroom for a status document.
+///
+/// An unreadable limit is reported as unknown rather than as a number, because
+/// "we could not ask" and "the answer is fine" must not render the same.
+pub fn describe_open_file_limit() -> String {
+    match observe_open_file_limit() {
+        Some(current) if current >= MIN_USABLE_OPEN_FILES => {
+            format!("{current} (sufficient)")
+        }
+        Some(current) => format!(
+            "{current} (below the {MIN_USABLE_OPEN_FILES} floor; git spawns may fail with \"Too many open files\")"
+        ),
+        None => "unknown: this platform does not expose a soft limit".to_string(),
+    }
+}
+
 #[cfg(all(unix, target_pointer_width = "64"))]
 mod imp {
     use super::LimitOutcome;
@@ -120,6 +146,10 @@ mod imp {
         } else {
             Err(last_os_error())
         }
+    }
+
+    pub(super) fn observe() -> Option<u64> {
+        get().ok().map(|limit| limit.rlim_cur)
     }
 
     fn set(limit: RLimit) -> Result<(), String> {
@@ -187,6 +217,10 @@ mod imp {
 
     pub(super) fn raise(_candidates: &[u64], _target: u64) -> LimitOutcome {
         LimitOutcome::Unsupported
+    }
+
+    pub(super) fn observe() -> Option<u64> {
+        None
     }
 }
 

@@ -52,7 +52,12 @@ describe("every shipped binary is wired for diagnostics", () => {
 
   it("finds the binaries at all", () => {
     // Without this the loop below passes vacuously on a parser change.
-    expect(binaries.map((b) => b.name).sort()).toEqual(["gitpulse", "gitpulse-mcp", "gitpulsed"]);
+    expect(binaries.map((b) => b.name).sort()).toEqual([
+      "gitpulse",
+      "gitpulse-hook",
+      "gitpulse-mcp",
+      "gitpulsed",
+    ]);
   });
 
   for (const { name, path } of binaries) {
