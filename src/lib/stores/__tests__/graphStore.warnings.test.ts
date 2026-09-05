@@ -66,7 +66,7 @@ describe("graphStore graph payload warnings", () => {
 
     await store.loadGraph("/repo");
 
-    expect(calls).toEqual(WARNINGS.map((w): [string, string] => ["graph", w]));
+    expect(calls).toEqual(WARNINGS.map((w): [string, string] => ["graph", `/repo: ${w}`]));
   });
 
   it("logs nothing when the payload carries no warnings", async () => {
@@ -93,7 +93,7 @@ describe("graphStore graph payload warnings", () => {
     await store.loadGraph("/repo");
     await store.loadGraph("/repo");
 
-    expect(calls).toEqual(WARNINGS.map((w): [string, string] => ["graph", w]));
+    expect(calls).toEqual(WARNINGS.map((w): [string, string] => ["graph", `/repo: ${w}`]));
   });
 
   // Regression: a failed best-effort details fetch used to vanish silently,
