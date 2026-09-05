@@ -172,7 +172,12 @@ pub fn build_native_menu<R: Runtime>(
     let fleet_item = item(app, actions::FLEET, "Fleet", Some("Shift+F10"))?;
     let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
     let sep_two = PredefinedMenuItem::separator(app)?;
-    let search_item = item(app, actions::FOCUS_FILTER, "Search Commits…", Some("CmdOrCtrl+F"))?;
+    let search_item = item(
+        app,
+        actions::FOCUS_FILTER,
+        "Search Commits…",
+        Some("CmdOrCtrl+F"),
+    )?;
     let palette_item = item(app, actions::PALETTE, "Command Palette…", None)?;
     let refresh_item = item(app, actions::REFRESH, "Refresh", Some("CmdOrCtrl+R"))?;
     let sep_three = PredefinedMenuItem::separator(app)?;
