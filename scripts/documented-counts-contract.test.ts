@@ -13,24 +13,46 @@ import { REGISTERED_VIEWS } from "../src/lib/views/viewRegistry";
  * Each count is taken from the canonical implementation rather than recounted
  * here, so this cannot drift from what the checkers actually measure.
  */
-// PROMO.md joined this list after its "13 Purpose-Built Views" survived two
-// consolidations unnoticed: it was outside the contract, so nothing read it.
-const DOCS = [
+/**
+ * Documents that ship with the repository. A missing one is a hard failure:
+ * a tracked doc was deleted and the contract has to say so.
+ */
+const REPO_DOCS = [
   "README.md",
   "CONTRIBUTING.md",
   "docs/ARCHITECTURE.md",
   "docs/FEATURES.md",
-  "docs/PROMO.md",
 ] as const;
 
+/**
+ * Local-only drafts, gitignored under "internal notes and promotional drafts".
+ *
+ * PROMO.md joined this contract after its "13 Purpose-Built Views" survived two
+ * consolidations unnoticed: it was outside the contract, so nothing read it.
+ * But it is not IN the repository, so requiring it made this suite pass only on
+ * a machine that happened to have a copy, and fail on every clean clone.
+ *
+ * It is still checked wherever it exists. Where it does not, the test below is
+ * reported as SKIPPED rather than passing — a check that could not run must
+ * never look like one that ran and found nothing wrong.
+ */
+const LOCAL_DOCS = ["docs/PROMO.md"] as const;
+
+const docUrl = (relative: string) => new URL(`../${relative}`, import.meta.url);
+
 function read(relative: string): string {
-  return readFileSync(new URL(`../${relative}`, import.meta.url), "utf8");
+  return readFileSync(docUrl(relative), "utf8");
+}
+
+/** The documents this run actually reads; local drafts count when present. */
+function presentDocs(): string[] {
+  return [...REPO_DOCS, ...LOCAL_DOCS].filter((doc) => existsSync(docUrl(doc)));
 }
 
 /** Every distinct number asserted about `thing` across the docs. */
 function claimedCounts(pattern: RegExp): Map<string, Set<number>> {
   const found = new Map<string, Set<number>>();
-  for (const doc of DOCS) {
+  for (const doc of presentDocs()) {
     for (const match of read(doc).matchAll(pattern)) {
       const value = Number(match[1].replace(/,/g, ""));
       if (!Number.isFinite(value)) continue;
@@ -41,6 +63,15 @@ function claimedCounts(pattern: RegExp): Map<string, Set<number>> {
   return found;
 }
 
+/**
+ * Every count pattern is case-INSENSITIVE.
+ *
+ * They were not, and the handler pattern compensated by listing "Registered
+ * Handlers" and "Handlers" beside "handlers" by hand — a workaround the views
+ * and fields patterns never got. So a heading or table cell claiming
+ * "13 Purpose-Built Views" matched nothing and passed, which is the exact
+ * phrasing this contract was extended to catch.
+ */
 function expectAllClaim(pattern: RegExp, actual: number, label: string): void {
   const claims = claimedCounts(pattern);
   expect(claims.size, `no document states a ${label} count`).toBeGreaterThan(0);
@@ -52,18 +83,29 @@ function expectAllClaim(pattern: RegExp, actual: number, label: string): void {
 }
 
 describe("documented counts match the code", () => {
+  it("reads every document that ships with the repository", () => {
+    // Every count assertion below is vacuous over a document that was not
+    // read, so which documents are readable is itself part of the contract.
+    for (const doc of REPO_DOCS) {
+      expect(existsSync(docUrl(doc)), `${doc} is part of the repository but missing`).toBe(
+        true,
+      );
+    }
+    expect(presentDocs()).toEqual(expect.arrayContaining([...REPO_DOCS]));
+  });
+
   it("states the real number of IPC handlers", () => {
     // Counted by the IPC checker's own parser, not by a second regex here.
     const { handlers, errors } = parseRegisteredHandlers(readFileSync(DEFAULT_LIB_RS, "utf8"));
     expect(errors.length, "the registry must parse cleanly for the count to mean anything").toBe(0);
     const actual = handlers.size;
     expect(actual).toBeGreaterThan(50);
-    expectAllClaim(/(\d+)\s+(?:Rust commands|Registered Handlers|Handlers|handlers)/g, actual, "handler");
+    expectAllClaim(/(\d+)\s+(?:rust commands|registered handlers|handlers)/gi, actual, "handler");
   });
 
   it("states the real number of registered views", () => {
     expectAllClaim(
-      /(\d+)\s+(?:application |specialized |purpose-built )?views/g,
+      /(\d+)\s+(?:application |specialized |purpose-built )?views/gi,
       REGISTERED_VIEWS.length,
       "view",
     );
@@ -84,7 +126,7 @@ describe("documented counts match the code", () => {
     const reports = JSON.parse(logged.join("\n")) as Array<{ fieldCount?: number }>;
     const actual = reports.reduce((sum, report) => sum + (report.fieldCount ?? 0), 0);
     expect(actual, "the checker should report a field count").toBeGreaterThan(0);
-    expectAllClaim(/(\d+)\s+(?:data )?fields/g, actual, "field");
+    expectAllClaim(/(\d+)\s+(?:data )?fields/gi, actual, "field");
   });
 
   it("states test-suite sizes as floors, so growth does not make them false", () => {
@@ -94,6 +136,14 @@ describe("documented counts match the code", () => {
     expect(contributing).toContain("2,000+ tests");
     expect(contributing).toContain("850+ tests");
     expect(contributing).not.toContain("~200+");
+  });
+});
+
+describe.each(LOCAL_DOCS)("%s, a local-only draft", (doc) => {
+  // Skipped, not passed, when the draft is absent: the run then says out loud
+  // that this document went unchecked instead of implying it was clean.
+  it.runIf(existsSync(docUrl(doc)))("is covered by the count contract while it exists", () => {
+    expect(presentDocs()).toContain(doc);
   });
 });
 

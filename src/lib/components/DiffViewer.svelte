@@ -3,6 +3,8 @@
   // changes, so unrelated store publications cost O(1) and the exact parsed
   // row objects survive (keeping memoized word-diff segments attached).
   import { createParseCache } from "../diff/wordDiff";
+  import { densityStore } from "../stores/densityStore";
+  import { rowHeight } from "../ui/density";
 
   const parseCache = createParseCache();
 </script>
@@ -29,8 +31,12 @@
     ChevronUp,
     ChevronDown,
     PanelLeftOpen,
+    Copy,
   } from "lucide-svelte";
-  import ImageDiffViewer from "./ImageDiffViewer.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  // Only an image diff reaches this pane; it does not belong in the chunk
+  // every launch parses.
+  const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import VirtualList from "./VirtualList.svelte";
@@ -47,11 +53,15 @@
     buildFilePatchFromLines,
   } from "../diff/patchBuilder";
   import { getImpact } from "../codeintel/client";
+  import { copyText } from "../desktop/clipboard";
+  import { toastStore } from "../stores/toastStore";
   import type { CodeintelEdge } from "../codeintel/types";
 
   // Fixed row geometry keeps the virtualized window math trivial and lets a
   // half-million-line agent diff render exactly like a twenty-line one.
-  const ROW_HEIGHT = 20;
+  // Row height follows the Compact/Spacious setting like the branch list
+  // and commit table already did; this pane used to ignore it entirely.
+  let ROW_HEIGHT = $derived(rowHeight("diff", $densityStore));
   /**
    * How many diff lines may be wrapped at once.
    *
@@ -374,6 +384,13 @@
 
   function onLinePointerDown(index: number, event: PointerEvent) {
     if (!isWorkingTreeFile || !lineSelectable(index)) return;
+    // A drag that starts on the code itself is a TEXT selection, not a
+    // line-range selection. Both gestures live on the same row, so the split
+    // is by where the pointer went down: the gutter (checkbox, line number,
+    // +/- marker) drags a staging range, the text drags a selection. Without
+    // this the row's preventDefault below suppresses native selection and the
+    // diff stays uncopyable exactly where people copy from most.
+    if ((event.target as Element | null)?.closest?.(".gp-diff-text")) return;
     event.preventDefault();
     isDragging = true;
     dragAnchor = index;
@@ -397,6 +414,30 @@
     if (!patch) return;
     await repoStore.stageSelectivePatch(patch, !isStaged);
     selectedLines = new Set();
+  }
+
+  /**
+   * Copies the selected lines as plain source, without the +/- markers.
+   *
+   * The markers are diff notation, not part of the code — pasting them into an
+   * editor makes the snippet uncompilable, which is the whole reason someone
+   * copies a line out of a diff.
+   */
+  async function copySelectedLines() {
+    if (selectedLines.size === 0) return;
+    const text = [...selectedLines]
+      .sort((a, b) => a - b)
+      .map((index) => {
+        const line = lines[index];
+        if (!line) return "";
+        return line.type === "add" || line.type === "del"
+          ? line.content.slice(1)
+          : line.content;
+      })
+      .join("\n");
+    const copied = await copyText(text);
+    if (copied) toastStore.success(`Copied ${selectedLines.size} line${selectedLines.size === 1 ? "" : "s"}`);
+    else toastStore.error("Could not reach the clipboard");
   }
 
   async function stageSelected(isStaging: boolean) {
@@ -590,7 +631,11 @@
 <svelte:window onkeydown={onWindowKeydown} />
 
 {#if showingImage}
-  <ImageDiffViewer filePath={$repoStore.selectedFilePath || "image"} {oldSrc} {newSrc} />
+  <LazyMount
+    load={loadImageDiffViewer}
+    name="The image comparison view"
+    props={{ filePath: $repoStore.selectedFilePath || "image", oldSrc, newSrc }}
+  />
 {:else}
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
@@ -812,7 +857,7 @@
                   {/if}
                   <span class="w-10 text-right text-textMuted/50 text-[10px] select-none shrink-0">{line.newNo ?? ""}</span>
                   <span class="text-emerald-600 dark:text-emerald-400 select-none font-bold shrink-0">+</span>
-                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
+                  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
                 </div>
               {:else if line.type === "del"}
                 <div
@@ -837,7 +882,7 @@
                   {/if}
                   <span class="w-10 text-right text-textMuted/50 text-[10px] select-none shrink-0">{line.oldNo ?? ""}</span>
                   <span class="text-rose-600 dark:text-rose-400 select-none font-bold shrink-0">-</span>
-                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
+                  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if line.segments}{#each line.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{line.content.substring(1)}{/if}</span>
                 </div>
               {:else}
                 <div class="px-3 text-textPrimary/80 flex gap-2 {wrapping ? 'items-start' : 'items-center'} hover:bg-surfaceHover/40 {wrapping ? '' : 'overflow-x-auto'}" style={wrapping ? `min-height: ${ROW_HEIGHT}px` : `height: ${ROW_HEIGHT}px`}>
@@ -846,7 +891,7 @@
                   {/if}
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.oldNo ?? line.newNo ?? ""}</span>
                   <span class="w-2 select-none shrink-0"></span>
-                  <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{line.content.startsWith(" ") ? line.content.substring(1) : line.content}</span>
+                  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{line.content.startsWith(" ") ? line.content.substring(1) : line.content}</span>
                 </div>
               {/if}
             {/if}
@@ -863,13 +908,13 @@
                 <div class="px-3 flex min-w-0 gap-2 {wrapping ? 'items-start' : 'items-center'} {wrapping ? '' : 'overflow-x-auto'} {left ? (left.type === 'del' ? 'bg-rose-500/15 text-rose-800 dark:text-rose-300' : left.type === 'add' ? '' : left.type === 'meta' || left.type === 'binary' || left.type === 'hdr' ? 'bg-surfaceHover text-textMuted' : 'text-textPrimary/80') : ''}">
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{left?.oldNo ?? ""}</span>
                   {#if left}
-                    <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if left.segments}{#each left.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{left.type === "add" || left.type === "del" ? left.content.substring(1) : left.content}{/if}</span>
+                    <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if left.segments}{#each left.segments as seg}<span class={seg.kind === "Removed" ? "bg-rose-500/35 text-rose-950 dark:text-rose-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{left.type === "add" || left.type === "del" ? left.content.substring(1) : left.content}{/if}</span>
                   {/if}
                 </div>
                 <div class="px-3 flex min-w-0 gap-2 {wrapping ? 'items-start' : 'items-center'} {wrapping ? '' : 'overflow-x-auto'} {right ? (right.type === 'add' ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300' : right.type === 'meta' || right.type === 'binary' || right.type === 'hdr' ? 'bg-surfaceHover text-textMuted italic' : 'text-textPrimary/80') : ''}">
                   <span class="w-10 text-right text-textMuted/40 text-[10px] select-none shrink-0">{right?.newNo ?? ""}</span>
                   {#if right}
-                    <span class="min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if right.segments}{#each right.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{right.type === "add" || right.type === "del" ? right.content.substring(1) : right.content}{/if}</span>
+                    <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}">{#if right.segments}{#each right.segments as seg}<span class={seg.kind === "Added" ? "bg-emerald-500/35 text-emerald-950 dark:text-emerald-100 font-semibold px-0.5 rounded" : ""}>{seg.text}</span>{/each}{:else}{right.type === "add" || right.type === "del" ? right.content.substring(1) : right.content}{/if}</span>
                   {/if}
                 </div>
               </div>
@@ -910,6 +955,10 @@
         <div class="flex gap-2 {wrapping ? 'items-start' : 'items-center'}">
           <button onclick={() => selectedLines = new Set()} class="gp-btn !py-1 !text-xs">
             Clear
+          </button>
+          <button onclick={copySelectedLines} class="gp-btn !py-1 !text-xs" title="Copy the selected lines without their diff markers">
+            <Copy size={12} />
+            <span>Copy</span>
           </button>
           <button onclick={() => stageSelected(false)} class="gp-btn !py-1 !text-xs">
             Unstage Selected ({selectedLines.size})

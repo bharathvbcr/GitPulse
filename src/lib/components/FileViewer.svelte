@@ -53,6 +53,26 @@
   import { openPath } from "@tauri-apps/plugin-opener";
   import FileTreePanel from "./files/FileTreePanel.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
+  import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
+
+  /** Id of the editor region the open-file tabs control. */
+  const EDITOR_PANE_ID = "gitpulse-editor-pane";
+  let tabStrip: HTMLDivElement | undefined = $state();
+
+  /**
+   * Arrow keys step between open files, and only the active tab is in the tab
+   * order — a ten-file strip used to cost ten Tab presses to step past.
+   */
+  function onTabStripKeydown(event: KeyboardEvent) {
+    const current = openTabs.findIndex((tab) => tab.path === activeTabPath);
+    const move = handleTablistKeydown(event.key, current, openTabs.length);
+    if (!move) return;
+    event.preventDefault();
+    const target = openTabs[move.index];
+    if (!target) return;
+    activateTab(target.path);
+    focusTabAt(tabStrip, move.index);
+  }
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
@@ -506,7 +526,14 @@
   data-pane-layout={paneLayout.mode}
 >
   <div class="flex items-center justify-between px-2 bg-surface/90 border-b border-border/70 shrink-0 h-9 gap-2">
-    <div class="flex items-center gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll" role="tablist" aria-label="Open files">
+    <div
+      bind:this={tabStrip}
+      class="flex items-center gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll"
+      role="tablist"
+      aria-label="Open files"
+      tabindex="-1"
+      onkeydown={onTabStripKeydown}
+    >
       <button
         type="button"
         onclick={() => toggleSidePane("explorer")}
@@ -533,8 +560,9 @@
           {@const tabKind = classifyFileChange($repoStore.statuses.find((s) => s.path === tab.path))}
           <div
             role="tab"
-            tabindex="0"
+            tabindex={isActive ? 0 : -1}
             aria-selected={isActive}
+            aria-controls={EDITOR_PANE_ID}
             onclick={() => activateTab(tab.path)}
             ondblclick={() => pinFile(tab.path)}
             onkeydown={(e) => {
@@ -684,7 +712,13 @@
     {/if}
 
     {#if paneLayout.editorVisible}
-      <div class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative">
+      <!-- The panel the open-file tabs control; the strip announced the
+           relationship with no referent before this id existed. -->
+      <div
+        id={EDITOR_PANE_ID}
+        role="tabpanel"
+        class="flex-1 flex flex-col min-w-0 h-full bg-background overflow-hidden relative"
+      >
         {#if isLoadingFile}
           <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
             <span>Loading file contents...</span>

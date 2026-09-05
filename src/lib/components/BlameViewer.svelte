@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { BlameLine } from "../files/types";
+  import { densityStore } from "../stores/densityStore";
+  import { rowHeight } from "../ui/density";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import { FileCode, PanelLeftClose, PanelLeftOpen, Search } from "lucide-svelte";
@@ -210,7 +212,7 @@
           </button>
         </div>
       {:else if blameLines.length > 0}
-        <VirtualList items={blameLines} rowHeight={24} overscan={15} class="h-full px-1.5 py-1">
+        <VirtualList items={blameLines} rowHeight={rowHeight("blame", $densityStore)} overscan={15} class="h-full px-1.5 py-1">
           {#snippet row(line)}
             {#if line}
               <div
@@ -234,7 +236,7 @@
                 <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{line.author_name}</span>
                 <span class="w-8 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{line.line_no}</span>
                 <span class={hitBadgeClass(coverageHits.get(line.line_no))}>{coverageHits.get(line.line_no) ?? "·"}</span>
-                <span class="px-3 whitespace-pre overflow-hidden text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
+                <span class="gp-diff-text px-3 whitespace-pre overflow-hidden text-textPrimary {coverageHitClass(coverageHits.get(line.line_no))}">{line.content}</span>
               </div>
             {/if}
           {/snippet}

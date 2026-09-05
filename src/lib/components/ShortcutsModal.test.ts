@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { COMMIT_FILTER_VIEW } from "../views/commitFilter";
+import { VIEW_REGISTRY } from "../views/viewRegistry";
 import { render } from "svelte/server";
 import ShortcutsModal from "./ShortcutsModal.svelte";
 
@@ -28,9 +30,13 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("O");
   });
 
-  it("documents that commit search switches to Graph rather than no-opping on Work", () => {
+  it("documents where commit search actually lands, not where it used to", () => {
+    // The sheet said "switches to Graph" long after Graph stopped being a
+    // view; COMMIT_FILTER_VIEW is the fact, so assert against that rather
+    // than against a second hand-written copy of it.
     const { body } = render(ShortcutsModal, { props: { isOpen: true } });
     expect(body).toContain("Search commits");
-    expect(body).toContain("switches to Graph");
+    const label = VIEW_REGISTRY[COMMIT_FILTER_VIEW].label;
+    expect(body).toContain(`switches to ${label}`);
   });
 });

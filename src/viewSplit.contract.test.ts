@@ -98,10 +98,18 @@ describe("view code splitting follows the registry", () => {
       // A view not on the exemption list may not statically import any pane;
       // an exempt one may import exactly the pane its default section renders.
       if (!EAGER_DEFAULT_PANE.includes(id as ViewTab)) {
+        // Shared section CHROME is not a pane: it carries no view content and
+        // is imported by every host by design. Narrowing this by name keeps
+        // the check on what it is actually about — a heavy pane sneaking back
+        // into the entry chunk — instead of on a spelling.
+        const SECTION_CHROME = ["ViewSectionBar", "ViewSectionPanel"];
+        const staticPanes = [...(host ?? "").matchAll(/import\s+(\w*(?:Panel|Viewer))\s+from/g)]
+          .map(([, name]) => name)
+          .filter((name) => !SECTION_CHROME.includes(name));
         expect(
-          host,
+          staticPanes,
           `the "${id}" section host statically imports a pane, putting it back in the entry chunk`,
-        ).not.toMatch(/import\s+\w*(Panel|Viewer)\s+from/);
+        ).toEqual([]);
       }
     },
   );

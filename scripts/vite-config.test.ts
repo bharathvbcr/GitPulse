@@ -11,9 +11,12 @@ describe("gitpulseManualChunk", () => {
     expect(gitpulseManualChunk("/repo/node_modules/@xterm/xterm/lib/xterm.js")).toBe(
       "vendor-xterm",
     );
-    expect(gitpulseManualChunk("/repo/node_modules/lucide-svelte/dist/icons/bug.svelte")).toBe(
-      "vendor-icons",
-    );
+    // Deliberately unclaimed: a named chunk would hoist EVERY glyph into one
+    // startup chunk, including the 120 that only lazily-loaded views import.
+    // Rollup places each icon with its importers instead.
+    expect(
+      gitpulseManualChunk("/repo/node_modules/lucide-svelte/dist/icons/bug.svelte"),
+    ).toBeUndefined();
     expect(gitpulseManualChunk("/repo/node_modules/svelte/src/internal/client/index.js")).toBe(
       "vendor-svelte",
     );

@@ -111,6 +111,73 @@ describe("App view code splitting", () => {
   });
 });
 
+/**
+ * Overlays the app does not need in order to start.
+ *
+ * None is on screen at launch and most sessions open none of them, yet all six
+ * were parsed at boot because App mounted them unconditionally to hold their
+ * `isOpen` prop. They are mounted on FIRST open and kept mounted after, so the
+ * exit transition still plays and the second open costs nothing.
+ */
+const DEFERRED_OVERLAYS = [
+  "RebaseModal",
+  "CloneModal",
+  "SettingsModal",
+  "ShortcutsModal",
+  "CommandPalette",
+  "DiagnosticsModal",
+];
+
+describe("App overlay code splitting", () => {
+  const { script, template } = scriptAndTemplate(source);
+
+  it.each(DEFERRED_OVERLAYS)("loads %s lazily rather than at startup", (overlay) => {
+    expect(
+      script,
+      `${overlay} is statically imported, which puts it back in the entry chunk`,
+    ).not.toMatch(new RegExp(`import\\s+${overlay}\\s+from`));
+    expect(script, `${overlay} has no dynamic loader`).toContain(
+      `const load${overlay} = () => import(`,
+    );
+    expect(template, `load${overlay} is declared but never rendered`).toMatch(
+      new RegExp(`load=\\{load${overlay}\\}`),
+    );
+  });
+
+  it("keeps each overlay mounted once opened so its exit transition can play", () => {
+    // Unmounting on close would cut the out: transition mid-fade and re-run
+    // the component's setup on every reopen. The latch is what makes deferral
+    // invisible rather than a new flicker.
+    for (const latch of [
+      "rebaseMounted",
+      "cloneMounted",
+      "settingsMounted",
+      "shortcutsMounted",
+      "diagnosticsMounted",
+    ]) {
+      expect(script, `${latch} latch missing`).toContain(`let ${latch} = $state(false)`);
+      expect(template, `${latch} does not gate a render`).toContain(`{#if ${latch}}`);
+    }
+  });
+
+  /**
+   * The palette registers its own ⌘K listener on mount, so before it has ever
+   * been opened that listener does not exist. Without App answering the first
+   * press, deferring the palette would silently break the chord that opens it
+   * — the failure mode of "it works on the second try, sometimes".
+   */
+  it("answers the first ⌘K itself, before the palette chunk exists", () => {
+    expect(script).toContain("if (!paletteMounted && (e.metaKey || e.ctrlKey) && e.key === \"k\")");
+    expect(script).toContain("function openCommandPalette()");
+    expect(script).toContain("paletteOpenSignal += 1");
+    expect(template).toContain("openSignal: paletteOpenSignal");
+  });
+
+  it("routes the native menu's palette action through the same arming path", () => {
+    expect(script).toContain("palette: () => openCommandPalette()");
+  });
+});
+
 describe("App overlay wiring", () => {
   it("imports every PascalCase component the template instantiates", () => {
     const { script, template } = scriptAndTemplate(source);
@@ -143,7 +210,10 @@ describe("App overlay wiring", () => {
 
   it("keeps PromptModal and DiagnosticsModal in separate crash boundaries", () => {
     const promptIdx = source.indexOf("<PromptModal");
-    const diagIdx = source.indexOf("<DiagnosticsModal");
+    // Diagnostics is deferred to its first open, so it reaches the tree
+    // through LazyMount — the boundary isolation this case is about is
+    // unchanged by that, and must stay unchanged by it.
+    const diagIdx = source.indexOf("load={loadDiagnosticsModal}");
     expect(promptIdx).toBeGreaterThan(-1);
     expect(diagIdx).toBeGreaterThan(-1);
     const between =

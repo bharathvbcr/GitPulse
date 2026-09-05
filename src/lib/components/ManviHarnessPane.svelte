@@ -227,6 +227,7 @@
 
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { createVisibleInterval } from "../dom/visibleInterval";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -309,8 +310,13 @@
       if ($repoStore.currentPath === repo) void refreshGrants(repo, false);
     },
     {
-      setInterval: (callback, delayMs) => window.setInterval(callback, delayMs),
-      clearInterval: (handle) => window.clearInterval(handle as number),
+      // Visibility-aware for the same reason the status poll is: this timer
+      // re-reads grants every ten seconds, and a hidden window has no grants
+      // display to keep current. `createVisibleInterval` starts, stops and
+      // catches up on its own, so the scheduler seam stays a plain
+      // setInterval/clearInterval pair for tests.
+      setInterval: (callback, delayMs) => createVisibleInterval(callback, delayMs),
+      clearInterval: (handle) => (handle as () => void)(),
     },
   );
   onDestroy(() => grantRefreshTimer.dispose());

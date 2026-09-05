@@ -12,7 +12,7 @@
   import { interfaceStore } from "./lib/stores/interfaceStore";
   import { toastStore } from "./lib/stores/toastStore";
   import { harnessStore } from "./lib/stores/harnessStore";
-  import { applyPlatformClass, isMacOS } from "./lib/platform";
+  import { applyPlatformClass, isMacOS, isTauri } from "./lib/platform";
   import { displayName } from "./lib/repos/paths";
   import { formatError } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
@@ -38,18 +38,16 @@
     tabForCommitSearch,
   } from "./lib/views/commitFilter";
   import { isImeComposition } from "./lib/keyboard/imeGuard";
-  import CommandPalette from "./lib/components/CommandPalette.svelte";
+  import { sectionForChord } from "./lib/views/viewShortcuts";
+  import { VIEW_PANE_ID } from "./lib/views/viewRegistry";
   import Tooltip from "./lib/components/Tooltip.svelte";
-  import RebaseModal from "./lib/components/RebaseModal.svelte";
-  import CloneModal from "./lib/components/CloneModal.svelte";
-  import SettingsModal from "./lib/components/SettingsModal.svelte";
-  import ShortcutsModal from "./lib/components/ShortcutsModal.svelte";
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import CodeView from "./lib/components/CodeView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
+  import LazyMount from "./lib/components/LazyMount.svelte";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
 
   // Views the app does not need to start. Each becomes its own chunk, so
@@ -73,7 +71,19 @@
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
-  import DiagnosticsModal from "./lib/components/DiagnosticsModal.svelte";
+
+  // Overlays. None of these is on screen at startup and most sessions open
+  // none of them, yet all six were parsed at boot because App mounted them
+  // unconditionally to hold their `isOpen` prop. They are mounted on FIRST
+  // open and kept mounted afterwards, so exit transitions still play and a
+  // second open costs nothing. Module scope for the same reason as above:
+  // LazyMount keys its cache on the loader's identity.
+  const loadRebaseModal = () => import("./lib/components/RebaseModal.svelte");
+  const loadCloneModal = () => import("./lib/components/CloneModal.svelte");
+  const loadSettingsModal = () => import("./lib/components/SettingsModal.svelte");
+  const loadShortcutsModal = () => import("./lib/components/ShortcutsModal.svelte");
+  const loadCommandPalette = () => import("./lib/components/CommandPalette.svelte");
+  const loadDiagnosticsModal = () => import("./lib/components/DiagnosticsModal.svelte");
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
@@ -99,6 +109,8 @@
     maybeNotifyUpdate,
   } from "./lib/updates/updateCheck";
   import { openExternal } from "./lib/desktop/openExternal";
+  import { applyUiScale, nativeZoomSetter } from "./lib/ui/uiScale";
+  import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askConfirm } from "./lib/stores/modalStore";
   import {
     hasUnsavedEditorDrafts,
@@ -111,6 +123,33 @@
   let isSettingsModalOpen = $state(false);
   let isShortcutsOpen = $state(false);
   let isDiagnosticsOpen = $state(false);
+
+  // One latch per overlay: false until the first open, true forever after.
+  // Unmounting on close would cut the exit transition and re-fetch nothing
+  // (the chunk is cached) while re-running the component's own setup, so the
+  // cheaper and better-behaved rule is mount-once.
+  let rebaseMounted = $state(false);
+  let cloneMounted = $state(false);
+  let settingsMounted = $state(false);
+  let shortcutsMounted = $state(false);
+  let diagnosticsMounted = $state(false);
+  // The palette owns ⌘K itself, so App has to arm it before the first press
+  // can reach it; see the global keydown handler.
+  let paletteMounted = $state(false);
+  let paletteOpenSignal = $state(0);
+
+  /** Arms the palette chunk and asks it to open once it is there. */
+  function openCommandPalette() {
+    paletteMounted = true;
+    paletteOpenSignal += 1;
+  }
+  $effect(() => {
+    if (isRebaseModalOpen) rebaseMounted = true;
+    if (isCloneModalOpen) cloneMounted = true;
+    if (isSettingsModalOpen) settingsMounted = true;
+    if (isShortcutsOpen) shortcutsMounted = true;
+    if (isDiagnosticsOpen) diagnosticsMounted = true;
+  });
   let dropActive = $state(false);
   /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
   let lastModalRepoPath: string | null = null;
@@ -136,10 +175,18 @@
     if (fleetOpen) fleetMounted = true;
   });
 
-  // Forward legacy repoStore.error to centralized toast queue
+  // Forward legacy repoStore.error to the centralized toast queue AND to the
+  // diagnostics ring.
+  //
+  // The toast alone was the only record a failed git operation left. It used
+  // to expire after eight seconds and take the message with it, so a user who
+  // looked away had nothing to report and nothing to copy. Diagnostics already
+  // captures uncaught errors, rejections and console output; a store error is
+  // the same class of event and belongs in the same log.
   $effect(() => {
     const err = $repoStore.error;
     if (err) {
+      diagnostics.error("repo:operation", err);
       toastStore.error(err);
       repoStore.setError(null);
     }
@@ -330,6 +377,14 @@
         interfaceStore.resetZoom();
         return;
       }
+      // ⌘K before the palette has ever been opened: its own listener does not
+      // exist yet, so App answers this one press and the palette takes over.
+      // Once mounted it owns the chord, including toggling closed again.
+      if (!paletteMounted && (e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        openCommandPalette();
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === "/") {
         e.preventDefault();
         isShortcutsOpen = true;
@@ -349,6 +404,24 @@
         void focusCommitSearch();
         return;
       }
+      // ⌥1…⌥n selects a section of the ACTIVE view. The consolidation left
+      // fourteen sections reachable only by mouse or by typing a palette
+      // phrase; this restores a chord for each without spending more ⌘ digits.
+      // Matched on `code` because ⌥1 on a Mac produces "¡".
+      if (!isInput && $repoStore.currentPath) {
+        const section = sectionForChord($repoStore.activeTab, {
+          alt: e.altKey,
+          ctrl: e.ctrlKey,
+          meta: e.metaKey,
+          shift: e.shiftKey,
+          code: e.code,
+        });
+        if (section) {
+          e.preventDefault();
+          repoStore.setViewSection($repoStore.activeTab, section.id);
+          return;
+        }
+      }
       if (!isInput && e.key === "?" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         isShortcutsOpen = true;
@@ -357,6 +430,14 @@
     };
     window.addEventListener("keydown", handleGlobalKeydown);
     track(() => window.removeEventListener("keydown", handleGlobalKeydown));
+
+    // Window geometry is remembered like everything else about a session.
+    // Detached from runBootSequence: a slow monitor enumeration must not delay
+    // the workspace restoring, and a refusal here is never fatal.
+    void installWindowStatePersistence(isTauri()).then(
+      (dispose) => track(dispose),
+      (error) => diagnostics.warn("boot:window-state", error),
+    );
 
     const shellHandlers: NativeShellHandlers = {
       open: () => void repoStore.pickAndOpenRepo(),
@@ -402,7 +483,7 @@
         isRebaseModalOpen = true;
       },
       quickCommit: () => void promptQuickCommit(),
-      palette: () => window.dispatchEvent(new CustomEvent("gitpulse:palette")),
+      palette: () => openCommandPalette(),
       focusFilter: () => void focusCommitSearch(),
       openRecent: (path) => void openFromExternal(path),
       openRepo: (path) => void openFromExternal(path),
@@ -533,6 +614,23 @@
     });
   });
 
+  // --- UI scale -----------------------------------------------------------
+  // Resolved once: asking the webview for its zoom setter on every preference
+  // change would import the Tauri module per keystroke of ⌘+.
+  let zoomSetter: ((scale: number) => Promise<void>) | null = null;
+  let zoomSetterResolved = false;
+
+  $effect(() => {
+    const scale = $interfaceStore.uiFontScale;
+    void (async () => {
+      if (!zoomSetterResolved) {
+        zoomSetter = await nativeZoomSetter(isTauri());
+        zoomSetterResolved = true;
+      }
+      await applyUiScale(scale, { setZoom: zoomSetter });
+    })();
+  });
+
   $effect(() => {
     void syncWindowChrome(
       repoWindowTitle($repoStore.currentPath, $repoStore.currentBranch),
@@ -581,7 +679,6 @@
 
 <div
   class="h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
-  style="--ui-font-scale: {$interfaceStore.uiFontScale};"
 >
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed}>
@@ -740,7 +837,7 @@
           <Sidebar />
         </svelte:boundary>
         <svelte:boundary failed={paneFailed}>
-          <main class="flex-1 flex flex-col min-w-0 bg-background gp-pane">
+          <main id={VIEW_PANE_ID} class="flex-1 flex flex-col min-w-0 bg-background gp-pane">
             <!-- No {#key activeTab}: keying here destroyed and rebuilt the
                  entire pane on every view switch and replayed the .gp-view
                  entrance fade — a full-screen flicker per tab. The {#if}
@@ -823,17 +920,29 @@
        and Diagnostics are isolated so a PromptModal render crash cannot take
        down the log that records it. -->
   <svelte:boundary failed={paneFailed}>
-    <RebaseModal isOpen={isRebaseModalOpen} onClose={() => (isRebaseModalOpen = false)} />
-    <CloneModal isOpen={isCloneModalOpen} onClose={() => (isCloneModalOpen = false)} />
-    <SettingsModal isOpen={isSettingsModalOpen} onClose={() => (isSettingsModalOpen = false)} />
-    <ShortcutsModal isOpen={isShortcutsOpen} onClose={() => (isShortcutsOpen = false)} />
-    <CommandPalette />
+    {#if rebaseMounted}
+      <LazyMount load={loadRebaseModal} name="The rebase planner" props={{ isOpen: isRebaseModalOpen, onClose: () => (isRebaseModalOpen = false) }} />
+    {/if}
+    {#if cloneMounted}
+      <LazyMount load={loadCloneModal} name="The clone dialog" props={{ isOpen: isCloneModalOpen, onClose: () => (isCloneModalOpen = false) }} />
+    {/if}
+    {#if settingsMounted}
+      <LazyMount load={loadSettingsModal} name="Settings" props={{ isOpen: isSettingsModalOpen, onClose: () => (isSettingsModalOpen = false) }} />
+    {/if}
+    {#if shortcutsMounted}
+      <LazyMount load={loadShortcutsModal} name="The shortcuts sheet" props={{ isOpen: isShortcutsOpen, onClose: () => (isShortcutsOpen = false) }} />
+    {/if}
+    {#if paletteMounted}
+      <LazyMount load={loadCommandPalette} name="The command palette" props={{ openSignal: paletteOpenSignal }} />
+    {/if}
     <Tooltip />
   </svelte:boundary>
   <svelte:boundary failed={paneFailed}>
     <PromptModal />
   </svelte:boundary>
   <svelte:boundary failed={paneFailed}>
-    <DiagnosticsModal isOpen={isDiagnosticsOpen} onClose={() => (isDiagnosticsOpen = false)} />
+    {#if diagnosticsMounted}
+      <LazyMount load={loadDiagnosticsModal} name="Diagnostics" props={{ isOpen: isDiagnosticsOpen, onClose: () => (isDiagnosticsOpen = false) }} />
+    {/if}
   </svelte:boundary>
 </div>

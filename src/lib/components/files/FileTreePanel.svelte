@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { densityStore } from "../../stores/densityStore";
+  import { rowHeight } from "../../ui/density";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -65,7 +67,7 @@
     selectedFile?: string | null;
   } = $props();
 
-  const ROW_HEIGHT = 24;
+  let ROW_HEIGHT = $derived(rowHeight("fileTree", $densityStore));
   const OVERSCAN = 12;
 
   type StatusFilter = "all" | "modified" | "staged" | "untracked" | "conflicted";

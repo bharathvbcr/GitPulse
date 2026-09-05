@@ -14,6 +14,16 @@ const PREV_REPO_TAB_ACCEL: &str = "Ctrl+Shift+Tab";
 /// App-menu Settings accelerator. The comma is the platform-standard ⌘, binding.
 const SETTINGS_ACCEL: &str = "CmdOrCtrl+,";
 
+/// Fleet accelerator.
+///
+/// Deliberately NOT Shift+F10, which it used to be. Shift+F10 is the platform
+/// key for "open the context menu", and `CommitRow` and `FileTreePanel` both
+/// implement it as exactly that — a native menu accelerator is consumed before
+/// the webview sees the keystroke, so binding Fleet to it took the only
+/// keyboard route to those context menus away. ⌘⇧F is free and sits beside
+/// ⌘F (Search Commits) rather than on top of a reserved chord.
+const FLEET_ACCEL: &str = "CmdOrCtrl+Shift+F";
+
 /// View-menu digit shortcuts. Repository tab actions must not reuse these.
 const VIEW_TAB_BINDINGS: &[(&str, &str, &str)] = &[
     (actions::TAB_CODE, "Code", "CmdOrCtrl+1"),
@@ -169,7 +179,7 @@ pub fn build_native_menu<R: Runtime>(
 
     let work_item = item(app, actions::TAB_WORK, "Work", Some("F10"))?;
     let sep_one = PredefinedMenuItem::separator(app)?;
-    let fleet_item = item(app, actions::FLEET, "Fleet", Some("Shift+F10"))?;
+    let fleet_item = item(app, actions::FLEET, "Fleet", Some(FLEET_ACCEL))?;
     let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
     let sep_two = PredefinedMenuItem::separator(app)?;
     let search_item = item(app, actions::FOCUS_FILTER, "Search Commits…", Some("CmdOrCtrl+F"))?;
@@ -326,6 +336,51 @@ mod tests {
                 || accel == format!("Cmd+{digit}")
                 || accel == format!("Ctrl+{digit}")
         })
+    }
+
+    /// Shift+F10 is the platform "open the context menu" key, and two
+    /// components implement it for keyboard users. A native accelerator wins
+    /// over the webview, so binding anything here to it silently disables
+    /// them.
+    #[test]
+    fn no_accelerator_claims_the_context_menu_key() {
+        assert_ne!(FLEET_ACCEL, "Shift+F10");
+        for accel in [
+            CLOSE_REPO_TAB_ACCEL,
+            REOPEN_REPO_TAB_ACCEL,
+            NEXT_REPO_TAB_ACCEL,
+            PREV_REPO_TAB_ACCEL,
+            SETTINGS_ACCEL,
+            FLEET_ACCEL,
+        ] {
+            assert!(
+                !accel.eq_ignore_ascii_case("Shift+F10"),
+                "{accel} takes the context-menu key"
+            );
+        }
+        for (_, _, accel) in VIEW_TAB_BINDINGS {
+            assert!(
+                !accel.eq_ignore_ascii_case("Shift+F10"),
+                "{accel} takes the context-menu key"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_does_not_collide_with_another_accelerator() {
+        let mut all = vec![
+            CLOSE_REPO_TAB_ACCEL,
+            REOPEN_REPO_TAB_ACCEL,
+            NEXT_REPO_TAB_ACCEL,
+            PREV_REPO_TAB_ACCEL,
+            SETTINGS_ACCEL,
+            FLEET_ACCEL,
+        ];
+        all.extend(VIEW_TAB_BINDINGS.iter().map(|(_, _, accel)| *accel));
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(before, all.len(), "two menu items share an accelerator");
     }
 
     #[test]

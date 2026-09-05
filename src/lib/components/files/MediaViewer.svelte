@@ -10,7 +10,11 @@
   import { joinWorktreePath } from "../../files/fileTree";
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
   import CodeViewer from "./CodeViewer.svelte";
-  import MarkDevViewer from "./MarkDevViewer.svelte";
+  import LazyMount from "../LazyMount.svelte";
+  // The Markdown reader and its 21 KB parser are only reachable through a
+  // .md file, and shipped in the startup chunk regardless. Module scope: the
+  // loader identity is LazyMount's cache key.
+  const loadMarkDevViewer = () => import("./MarkDevViewer.svelte");
 
   let {
     filePath,
@@ -152,14 +156,10 @@
   </div>
 {:else if isMarkdown}
   <!-- MarkDev Integrated Markdown Viewer -->
-  <MarkDevViewer
-    {filePath}
-    {blob}
-    {draftContent}
-    {dirty}
-    {onSave}
-    {onDraftChange}
-    {onRequestDiscard}
+  <LazyMount
+    load={loadMarkDevViewer}
+    name="The Markdown reader"
+    props={{ filePath, blob, draftContent, dirty, onSave, onDraftChange, onRequestDiscard }}
   />
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->

@@ -1009,6 +1009,29 @@ pub fn run_captured(
 /// additionally pins the whole behavior end to end.
 const TIMEOUT_MARKER: &str = " timed out after ";
 
+/// First sleep between `try_wait` polls, and the ceiling it grows to.
+///
+/// A fixed 15 ms sleep quantized EVERY git invocation upward by up to a full
+/// interval: a `git rev-parse` that exits in 2 ms was not observed for another
+/// 13, and GitPulse spends most of its subprocess budget on exactly these
+/// short reads — `git status` measures ~20 ms on a mid-size repository and
+/// `for-each-ref` ~10 ms, so the sleep was 75-150% overhead on the common
+/// case. It compounds through sequential chains: `list_branches` alone spawns
+/// four processes before it returns a row.
+///
+/// Starting fine and backing off keeps the fast case fast without spinning on
+/// a slow one. A `git clone` that runs for a minute reaches the ceiling after
+/// ~13 polls and then behaves exactly as before; the polls spent getting there
+/// cost well under a millisecond of CPU in total.
+const POLL_BACKOFF_START: Duration = Duration::from_micros(250);
+const POLL_BACKOFF_MAX: Duration = Duration::from_millis(15);
+
+/// Next backoff step: double, capped. Pure so the schedule is testable without
+/// spawning a process.
+fn next_poll_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(POLL_BACKOFF_MAX)
+}
+
 fn is_timeout_error(program: &str, err: &str) -> bool {
     err.starts_with(program) && err.contains(TIMEOUT_MARKER)
 }
@@ -1249,6 +1272,7 @@ pub(crate) fn run_bounded_capped(
     });
 
     let start = Instant::now();
+    let mut backoff = POLL_BACKOFF_START;
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -1258,7 +1282,8 @@ pub(crate) fn run_bounded_capped(
                     let _ = child.wait();
                     break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs()));
                 }
-                thread::sleep(Duration::from_millis(15));
+                thread::sleep(backoff);
+                backoff = next_poll_backoff(backoff);
             }
             Err(e) => break Err(format!("Failed to wait on {}: {}", label, e)),
         }
@@ -1626,6 +1651,81 @@ pub fn repo_name_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_backoff_starts_far_below_the_old_fixed_quantum() {
+        // The regression this replaces: every child was polled on a flat 15 ms
+        // schedule, so a 2 ms `git rev-parse` took 15 ms of wall clock. The
+        // first sleep has to be small enough that a fast command is observed
+        // promptly rather than on the next tick.
+        assert!(POLL_BACKOFF_START <= Duration::from_millis(1));
+        assert!(
+            POLL_BACKOFF_START > Duration::ZERO,
+            "a zero sleep is a spin"
+        );
+    }
+
+    #[test]
+    fn poll_backoff_doubles_and_stops_at_the_ceiling() {
+        let mut d = POLL_BACKOFF_START;
+        let mut steps = 0;
+        while d < POLL_BACKOFF_MAX {
+            let next = next_poll_backoff(d);
+            assert!(next > d, "backoff must make progress from {d:?}");
+            d = next;
+            steps += 1;
+            assert!(steps < 64, "backoff never reached its ceiling");
+        }
+        assert_eq!(d, POLL_BACKOFF_MAX);
+        // Saturating at the ceiling is what keeps a long clone off a hot loop.
+        assert_eq!(next_poll_backoff(POLL_BACKOFF_MAX), POLL_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn reaching_the_ceiling_costs_a_bounded_number_of_polls() {
+        // The whole ramp must be cheap: if getting to the ceiling took
+        // thousands of wakeups, the fast case would be paid for by every long
+        // running command.
+        let mut d = POLL_BACKOFF_START;
+        let mut polls = 0;
+        let mut slept = Duration::ZERO;
+        while d < POLL_BACKOFF_MAX {
+            slept += d;
+            d = next_poll_backoff(d);
+            polls += 1;
+        }
+        assert!(polls <= 16, "ramp took {polls} polls");
+        // A doubling ramp's total is about twice its last step, so the whole
+        // warm-up costs on the order of ONE old tick — not orders of magnitude
+        // more. That is the property that makes the fast case free rather than
+        // borrowed from long-running commands.
+        assert!(
+            slept <= POLL_BACKOFF_MAX * 2,
+            "the entire ramp ({slept:?}) should cost about one old tick"
+        );
+    }
+
+    #[test]
+    fn a_fast_command_returns_well_inside_the_old_quantum() {
+        // End-to-end rather than schedule-only: the constants above are only
+        // worth anything if run_bounded actually uses them. Budgeted at a
+        // third of the old flat tick, which a `true` cannot exceed unless the
+        // loop has gone back to a fixed sleep — and which stays true on a
+        // loaded machine, where the process spawn dominates either way.
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "true" });
+        if cfg!(windows) {
+            cmd.args(["/C", "exit", "0"]);
+        }
+        let started = Instant::now();
+        let run = run_bounded(cmd, "true", Duration::from_secs(5), None)
+            .expect("spawning `true` should succeed");
+        let elapsed = started.elapsed();
+        assert!(run.success);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a no-op command took {elapsed:?}, which suggests a fixed poll interval"
+        );
+    }
 
     #[test]
     fn test_sandbox_rejects_parent_dir() {

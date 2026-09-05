@@ -48,6 +48,20 @@
     type TooltipPlacement,
   } from "../canvas/graphInteraction";
   import { portal } from "../dom/portal";
+  import {
+    clampScrollTop,
+    computeWindow,
+    ensureNonEmptyWindow,
+  } from "../dom/virtualWindow";
+
+  /**
+   * Rows drawn beyond the viewport on each side.
+   *
+   * The previous math used an asymmetric 5-above / 10-total band, which meant
+   * scrolling up exposed an unpainted edge sooner than scrolling down. The
+   * shared window applies this symmetrically.
+   */
+  const COMMIT_OVERSCAN = 8;
   import { LAYERS } from "../ui/layers";
   import CommitRow, { type RefItem } from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
@@ -352,9 +366,29 @@
   });
 
   let totalCommits = $derived(filteredRows.length);
-  let startIndex = $derived(Math.max(0, Math.floor(scrollTop / rowHeight) - 5));
-  let visibleCount = $derived(Math.ceil(containerHeight / rowHeight) + 10);
-  let endIndex = $derived(Math.min(totalCommits, startIndex + visibleCount));
+
+  /**
+   * Windowing math from the shared owner rather than a third hand-rolled copy.
+   *
+   * This pane kept its own arithmetic and had drifted from it in two ways that
+   * mattered: no `clampScrollTop`, so a filter change that shrinks the list
+   * under a deep scroll anchor painted one frame of nothing before the
+   * browser's async clamp round-tripped; and no `ensureNonEmptyWindow`, so the
+   * residual float edge at the very bottom could yield an empty band. The
+   * canvas overlay is still positioned from `startIndex`, which is why the
+   * names stay — only their derivation moves.
+   */
+  let commitWindow = $derived.by(() => {
+    const clamped = clampScrollTop(scrollTop, totalCommits, rowHeight, containerHeight);
+    return ensureNonEmptyWindow(
+      computeWindow(clamped, containerHeight, totalCommits, rowHeight, COMMIT_OVERSCAN),
+      totalCommits,
+      rowHeight,
+      containerHeight,
+    );
+  });
+  let startIndex = $derived(commitWindow.start);
+  let endIndex = $derived(commitWindow.end);
   let visibleRows = $derived(filteredRows.slice(startIndex, endIndex));
 
   /**

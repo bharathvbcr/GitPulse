@@ -79,10 +79,15 @@ describe("ViewTabBar view visibility", () => {
     // Resolve is a section of Work now, and the count came with it: a merge
     // parked mid-conflict has to be visible without opening anything. Only
     // Work is suffixed — a count on every tab would say nothing.
-    expect(header(0)).toContain(">Work<");
-    expect(header(0)).not.toContain("Work (");
-    expect(header(2)).toContain("Work (2)");
-    expect(header(2)).not.toContain("Code (");
+    // Scoped to the LABEL. Tabs also carry an accelerator in their `title`
+    // ("Work (F10)"), so a bare substring search over the markup no longer
+    // distinguishes the visible suffix from the tooltip.
+    const labels = (html: string) =>
+      [...html.matchAll(/<span>([^<]*)<\/span>/g)].map(([, text]) => text);
+    expect(labels(header(0))).toContain("Work");
+    expect(labels(header(0)).some((l) => l.startsWith("Work ("))).toBe(false);
+    expect(labels(header(2))).toContain("Work (2)");
+    expect(labels(header(2)).some((l) => l.startsWith("Code ("))).toBe(false);
   });
 
   it("cannot show the conflict pin here, and does not pretend to", () => {

@@ -125,26 +125,144 @@ const COMMON_TYPES = new Set([
 /**
  * Tokenizes a single line of text with language-specific rules.
  */
-export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxToken[] {
-  if (!line) return [];
+/**
+ * What a line leaves open for the next one.
+ *
+ * The tokenizer used to start every line from a clean slate, so a construct
+ * that spans lines — a `/* … *\/` block, a template literal, a Python
+ * docstring, a Go raw string — was coloured on its opening line and then
+ * re-read as fresh code on every line after it. That is not a cosmetic
+ * shortfall: the contents of a commented-out block were highlighted as live
+ * code, which is the opposite of what a reader needs from a comment.
+ *
+ * `null` means "line starts in ordinary code". Everything else names the
+ * delimiter that is still waiting to close, so the next line can resume
+ * inside it. The Rust line counter (`analyzer/loc_counter.rs`) carries the
+ * same state for the same reason; this is the viewer's half of it.
+ */
+export type LineCarry =
+  | null
+  | { kind: "block"; close: string; type: "comment" | "string" };
+
+/** A carry-free start; exported so callers can be explicit about line one. */
+export const NO_CARRY: LineCarry = null;
+
+export interface TokenizedLine {
+  tokens: SyntaxToken[];
+  /** State to hand the NEXT line. */
+  carry: LineCarry;
+}
+
+/** Delimiters that may stay open across a newline, per language. */
+function multilineOpeners(
+  language: SupportedLanguage,
+): Array<{ open: string; close: string; type: "comment" | "string" }> {
+  switch (language) {
+    case "python":
+      return [
+        { open: '"""', close: '"""', type: "string" },
+        { open: "'''", close: "'''", type: "string" },
+      ];
+    case "go":
+      // Raw string literals span lines and hide every comment marker inside.
+      return [{ open: "`", close: "`", type: "string" }];
+    case "typescript":
+    case "javascript":
+    case "svelte":
+      return [{ open: "`", close: "`", type: "string" }];
+    default:
+      return [];
+  }
+}
+
+/** Whether this language closes a block comment with the C-style delimiter. */
+function hasBlockComments(language: SupportedLanguage): boolean {
+  return (
+    language !== "python" &&
+    language !== "shell" &&
+    language !== "yaml" &&
+    language !== "toml" &&
+    language !== "markdown" &&
+    language !== "plaintext" &&
+    language !== "diff"
+  );
+}
+
+/**
+ * Resumes a construct the previous line left open.
+ *
+ * Returns the token covering the resumed run and how much of the line it ate,
+ * plus the carry for the following line. A line entirely inside the construct
+ * is consumed whole and the carry survives unchanged.
+ */
+function resumeCarry(
+  line: string,
+  carry: NonNullable<LineCarry>,
+): { token: SyntaxToken; consumed: number; carry: LineCarry } {
+  const end = line.indexOf(carry.close);
+  if (end === -1) {
+    return {
+      token: { text: line, type: carry.type },
+      consumed: line.length,
+      carry,
+    };
+  }
+  const upto = end + carry.close.length;
+  return {
+    token: { text: line.slice(0, upto), type: carry.type },
+    consumed: upto,
+    carry: null,
+  };
+}
+
+/**
+ * Tokenizes one line, resuming whatever the previous line left open.
+ *
+ * `tokenizeLine` remains the carry-free entry point for callers that have a
+ * single line and no context (word-diff previews, a fenced snippet's first
+ * line); anything rendering a FILE should thread the returned carry, or a
+ * block comment will stop being a comment on its second line.
+ */
+export function tokenizeLineWithCarry(
+  line: string,
+  language: SupportedLanguage,
+  carry: LineCarry = null,
+): TokenizedLine {
+  if (!line) {
+    // A blank line neither opens nor closes anything: the carry passes through
+    // untouched. Returning `null` here is what used to end a block comment at
+    // the first empty line inside it.
+    return { tokens: [], carry };
+  }
   if (language === "plaintext") {
-    return [{ text: line, type: "text" }];
+    return { tokens: [{ text: line, type: "text" }], carry: null };
   }
 
   if (language === "diff") {
-    if (line.startsWith("+")) return [{ text: line, type: "attribute" }];
-    if (line.startsWith("-")) return [{ text: line, type: "operator" }];
-    if (line.startsWith("@")) return [{ text: line, type: "type" }];
-    return [{ text: line, type: "text" }];
+    if (line.startsWith("+")) return { tokens: [{ text: line, type: "attribute" }], carry: null };
+    if (line.startsWith("-")) return { tokens: [{ text: line, type: "operator" }], carry: null };
+    if (line.startsWith("@")) return { tokens: [{ text: line, type: "type" }], carry: null };
+    return { tokens: [{ text: line, type: "text" }], carry: null };
   }
 
   if (language === "json") {
-    return tokenizeJsonLine(line);
+    return { tokens: tokenizeJsonLine(line), carry: null };
   }
 
   const tokens: SyntaxToken[] = [];
   let i = 0;
   const len = line.length;
+  let openCarry: LineCarry = null;
+  const openers = multilineOpeners(language);
+
+  // Resume first: a line that begins inside a block belongs to that block,
+  // whatever its first character would otherwise mean.
+  if (carry) {
+    const resumed = resumeCarry(line, carry);
+    tokens.push(resumed.token);
+    i = resumed.consumed;
+    if (resumed.carry) return { tokens, carry: resumed.carry };
+  }
 
   while (i < len) {
     // Every token holds at least one character, so a line can never yield more
@@ -181,12 +299,15 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
         continue;
       } else {
         tokens.push({ text: line.slice(i), type: "comment" });
+        openCarry = { kind: "block", close: "-->", type: "comment" };
         break;
       }
     }
 
-    // Multi-line block comments /* ... */ on same line
-    if (char === "/" && line[i + 1] === "*") {
+    // Block comments. An unterminated one continues into the next line, which
+    // is the whole point of the carry: `/*` on its own used to comment exactly
+    // one line and leave the commented-out body highlighted as live code.
+    if (char === "/" && line[i + 1] === "*" && hasBlockComments(language)) {
       const endIdx = line.indexOf("*/", i + 2);
       if (endIdx !== -1) {
         tokens.push({ text: line.slice(i, endIdx + 2), type: "comment" });
@@ -194,7 +315,28 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
         continue;
       } else {
         tokens.push({ text: line.slice(i), type: "comment" });
+        openCarry = { kind: "block", close: "*/", type: "comment" };
         break;
+      }
+    }
+
+    // Delimiters that may stay open across a newline are checked before the
+    // single-line string scan below, which would otherwise swallow a `"""` as
+    // an empty string and leave the docstring's body reading as code.
+    if (openers.length > 0) {
+      const opener = openers.find((o) => line.startsWith(o.open, i));
+      if (opener) {
+        const end = line.indexOf(opener.close, i + opener.open.length);
+        if (end === -1) {
+          tokens.push({ text: line.slice(i), type: opener.type });
+          openCarry = { kind: "block", close: opener.close, type: opener.type };
+          i = len;
+          break;
+        }
+        const upto = end + opener.close.length;
+        tokens.push({ text: line.slice(i, upto), type: opener.type });
+        i = upto;
+        continue;
       }
     }
 
@@ -322,7 +464,77 @@ export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxT
     i++;
   }
 
-  return tokens;
+  return { tokens, carry: openCarry };
+}
+
+/**
+ * Tokenizes a line with no context.
+ *
+ * Kept for callers that genuinely have one line and nothing before it. Anything
+ * rendering a whole file must thread the carry instead — see
+ * `tokenizeLineWithCarry` and `carryPrefix`.
+ */
+export function tokenizeLine(line: string, language: SupportedLanguage): SyntaxToken[] {
+  return tokenizeLineWithCarry(line, language, null).tokens;
+}
+
+/**
+ * Line-start carries for `lines`, index-aligned, computed once.
+ *
+ * `result[n]` is the state a renderer must hand line `n`. A virtualized viewer
+ * cannot start at the top of the window and be correct — line 4,000 might sit
+ * inside a comment opened on line 12 — so the states are computed from the top
+ * and cached by the caller against the file's identity.
+ *
+ * Bounded by construction: one pass, one small object per line, and no token
+ * arrays retained.
+ */
+/**
+ * Lazily-extended carry index for a virtualized viewer.
+ *
+ * A window starting at line 4,000 still needs to know whether line 12 opened a
+ * comment, so carries cannot be computed from the top of the WINDOW. Computing
+ * them for the whole file up front is equally wrong: that is a full tokenizer
+ * pass over an 80,000-line file on every content change, to colour fifty rows.
+ *
+ * This computes forward only as far as it has been asked, and remembers. Paging
+ * to the bottom eventually costs one whole pass — once — and every scroll
+ * inside already-visited territory costs nothing.
+ */
+export function createCarryIndex(
+  lines: readonly string[],
+  language: SupportedLanguage,
+): (index: number) => LineCarry {
+  // carries[n] is the state line n STARTS in; line 0 starts clean.
+  const carries: LineCarry[] = [null];
+  let computedTo = 0;
+  return (index: number): LineCarry => {
+    if (index <= 0) return null;
+    const target = Math.min(index, lines.length);
+    while (computedTo < target) {
+      const carry = tokenizeLineWithCarry(
+        lines[computedTo] ?? "",
+        language,
+        carries[computedTo] ?? null,
+      ).carry;
+      computedTo += 1;
+      carries[computedTo] = carry;
+    }
+    return carries[target] ?? null;
+  };
+}
+
+export function carryPrefix(
+  lines: readonly string[],
+  language: SupportedLanguage,
+): LineCarry[] {
+  const carries: LineCarry[] = new Array(lines.length);
+  let carry: LineCarry = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    carries[index] = carry;
+    carry = tokenizeLineWithCarry(lines[index] ?? "", language, carry).carry;
+  }
+  return carries;
 }
 
 /** Specialized tokenizer for JSON lines. */

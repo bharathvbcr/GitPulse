@@ -1,5 +1,8 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
+  import { VIEW_PANE_ID } from "../views/viewRegistry";
+  import { viewAccelerator } from "../views/viewShortcuts";
   import type { ViewTab } from "../repos/persist";
   import { formatViewTabLabel, type ViewNavItem } from "../views/viewNav";
   import { visibleViewNav } from "../views/viewVisibility";
@@ -44,6 +47,23 @@
     return "";
   }
 
+  /**
+   * Arrow keys move between views, and only the selected tab is in the tab
+   * order. The strip declared `role="tab"` and implemented neither, so a
+   * screen-reader user was told these were tabs and then found none of the
+   * behaviour that word promises.
+   */
+  function onKeydown(event: KeyboardEvent) {
+    const current = navItems.findIndex((item) => item.id === activeTab);
+    const move = handleTablistKeydown(event.key, current, navItems.length);
+    if (!move) return;
+    event.preventDefault();
+    const target = navItems[move.index];
+    if (!target) return;
+    selectTab(target.id);
+    focusTabAt(scroller, move.index);
+  }
+
   $effect(() => {
     activeTab;
     const active = scroller?.querySelector("[data-active-view='true']");
@@ -53,17 +73,28 @@
   });
 </script>
 
-<div bind:this={scroller} class="flex items-center gap-1.5 shrink-0" role="tablist" aria-label="Views">
+<div
+  bind:this={scroller}
+  class="flex items-center gap-1.5 shrink-0"
+  role="tablist"
+  aria-label="Views"
+  tabindex="-1"
+  onkeydown={onKeydown}
+>
   <div class="gp-segmented">
     {#each navItems as item (item.id)}
       {@const active = activeTab === item.id}
+      {@const accelerator = viewAccelerator(item.id)}
       <button
         type="button"
         role="tab"
         aria-selected={active}
+        aria-controls={VIEW_PANE_ID}
+        tabindex={active ? 0 : -1}
         data-active-view={active ? "true" : "false"}
         data-active={active ? "true" : "false"}
         onclick={() => selectTab(item.id)}
+        title={accelerator ? `${item.label} (${accelerator})` : item.label}
         class="gp-seg-btn {tabClass(item, active)}"
       >
         <span>{formatViewTabLabel(item, conflictedCount)}</span>

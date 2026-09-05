@@ -2,6 +2,10 @@
   import { repoStore } from "../stores/repoStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewSectionBar from "./ViewSectionBar.svelte";
+  import ViewSectionPanel from "./ViewSectionPanel.svelte";
+
+  /** Named once: the tab and its panel must agree on the id. */
+  const view = "history" as const;
   import FilterBar from "./FilterBar.svelte";
   import CommitTable from "./CommitTable.svelte";
   import CommitDetails from "./CommitDetails.svelte";
@@ -38,18 +42,20 @@
          commit list, and the reflog table are all drawn from it. -->
     <FilterBar />
   </ViewSectionBar>
+  <ViewSectionPanel {view} {section}>
 
-  <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane
-       and replay the entrance fade on every switch, and CommitTable would
-       re-hydrate its virtual window from scratch. -->
-  {#if section === "diff"}
-    <DiffViewer />
-  {:else if section === "reflog"}
-    <LazyView load={loadReflog} name="the reflog" />
-  {:else}
-    <div class="flex-1 flex flex-col min-h-0">
-      <CommitTable />
-      <CommitDetails />
-    </div>
-  {/if}
+    <!-- Sections swap by {#if}, never by {#key}: keying would rebuild the pane
+         and replay the entrance fade on every switch, and CommitTable would
+         re-hydrate its virtual window from scratch. -->
+    {#if section === "diff"}
+      <DiffViewer />
+    {:else if section === "reflog"}
+      <LazyView load={loadReflog} name="the reflog" />
+    {:else}
+      <div class="flex-1 flex flex-col min-h-0">
+        <CommitTable />
+        <CommitDetails />
+      </div>
+    {/if}
+  </ViewSectionPanel>
 </div>

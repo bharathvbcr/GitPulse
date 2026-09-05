@@ -65,3 +65,78 @@ describe("toastStore", () => {
     expect(toasts[4].message).toBe("Message 6");
   });
 });
+
+describe("an error is not allowed to expire silently", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    toastStore.clear();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps an error up until it is dismissed", () => {
+    // The regression: errors expired after 8 s, and `repoStore.error` is
+    // routed to a toast and nowhere else — so a failed git operation left no
+    // record at all once the toast went.
+    toastStore.error("push rejected");
+    vi.advanceTimersByTime(60_000);
+    expect(get(toastStore)).toHaveLength(1);
+  });
+
+  it("still lets a caller ask for a bounded error", () => {
+    toastStore.error("transient", undefined, 1_000);
+    vi.advanceTimersByTime(1_500);
+    expect(get(toastStore)).toHaveLength(0);
+  });
+
+  it("gives an action long enough to be reached", () => {
+    // "Undo" after a branch delete rode the 4 s info default and could expire
+    // while the pointer was still travelling.
+    toastStore.action("Deleted branch", "Undo", () => {});
+    vi.advanceTimersByTime(5_000);
+    expect(get(toastStore)).toHaveLength(1);
+  });
+});
+
+describe("countdowns pause while the user is on the stack", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    toastStore.clear();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("does not dismiss while paused", () => {
+    toastStore.success("saved");
+    toastStore.pauseAll();
+    vi.advanceTimersByTime(60_000);
+    expect(get(toastStore)).toHaveLength(1);
+  });
+
+  it("restarts the clock on resume rather than resuming a stale remainder", () => {
+    toastStore.success("saved");
+    vi.advanceTimersByTime(3_000);
+    toastStore.pauseAll();
+    toastStore.resumeAll();
+    // Someone who moved to the toast is reading it; the countdown starts over.
+    vi.advanceTimersByTime(3_000);
+    expect(get(toastStore)).toHaveLength(1);
+    vi.advanceTimersByTime(1_000);
+    expect(get(toastStore)).toHaveLength(0);
+  });
+
+  it("leaves a never-expiring toast alone through a pause/resume cycle", () => {
+    toastStore.error("push rejected");
+    toastStore.pauseAll();
+    toastStore.resumeAll();
+    vi.advanceTimersByTime(60_000);
+    expect(get(toastStore)).toHaveLength(1);
+  });
+
+  it("does not resurrect a toast dismissed while paused", () => {
+    const id = toastStore.success("saved");
+    toastStore.pauseAll();
+    toastStore.dismiss(id);
+    toastStore.resumeAll();
+    vi.advanceTimersByTime(10_000);
+    expect(get(toastStore)).toHaveLength(0);
+  });
+});

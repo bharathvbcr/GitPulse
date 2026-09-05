@@ -16,7 +16,32 @@ describe("MediaViewer", () => {
   it("delegates markdown viewing to integrated MarkDevViewer", () => {
     expect(source).toContain("MarkDevViewer");
     expect(source).toContain("isMarkdown");
-    expect(source).toContain("<MarkDevViewer");
+    // The reader and its 21 KB parser are deferred rather than shipped in the
+    // startup chunk, so the delegation goes through LazyMount. The loader must
+    // stay at module scope: LazyMount keys its cache on loader identity, and
+    // an inline arrow would remount the reader on every parent update.
+    expect(source).toMatch(
+      /const loadMarkDevViewer = \(\) => import\("\.\/MarkDevViewer\.svelte"\)/,
+    );
+    expect(source).toContain("load={loadMarkDevViewer}");
+  });
+
+  it("hands the deferred markdown reader the same props it took directly", () => {
+    // A deferred component is only equivalent if nothing was dropped on the
+    // way through the prop bag.
+    const bag = source.slice(source.indexOf("load={loadMarkDevViewer}"));
+    const props = bag.slice(0, bag.indexOf("/>"));
+    for (const prop of [
+      "filePath",
+      "blob",
+      "draftContent",
+      "dirty",
+      "onSave",
+      "onDraftChange",
+      "onRequestDiscard",
+    ]) {
+      expect(props).toContain(prop);
+    }
   });
 
   it("forwards the canonical draft lifecycle to every CodeViewer surface", () => {

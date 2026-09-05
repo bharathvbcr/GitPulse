@@ -36,12 +36,25 @@ const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
  * Keep independently cacheable runtimes out of the application entry chunk.
  * Vite normalizes module ids, but replacing separators keeps this deterministic
  * when the same configuration is exercised directly on Windows.
+ *
+ * `lucide-svelte` is deliberately NOT listed. Naming a chunk here forces every
+ * module of that package into it regardless of who imports it, and because the
+ * header imports five glyphs the whole chunk then loads at startup. Measured on
+ * this tree: 402 distinct icons across 60 files, 120 of them reachable only
+ * through a `LazyView` boundary — so a third of a 176 KB chunk was parsed at
+ * boot for views the session may never open, which is precisely what splitting
+ * those views was meant to avoid. Left unlisted, Rollup's own shared-chunk pass
+ * puts glyphs used by both graphs in a common chunk and lazy-only glyphs inside
+ * the view chunk that needs them.
+ *
+ * Each icon is its own module, so this does not fragment the build the way an
+ * unsplit monolithic package would: an icon is placed with its importers.
  */
 export function gitpulseManualChunk(id: string): string | undefined {
   const normalized = id.replaceAll("\\", "/");
   if (!normalized.includes("/node_modules/")) return undefined;
   if (normalized.includes("/node_modules/@xterm/")) return "vendor-xterm";
-  if (normalized.includes("/node_modules/lucide-svelte/")) return "vendor-icons";
+  if (normalized.includes("/node_modules/lucide-svelte/")) return undefined;
   if (normalized.includes("/node_modules/svelte/")) return "vendor-svelte";
   if (normalized.includes("/node_modules/@tauri-apps/")) return "vendor-tauri";
   return "vendor";
