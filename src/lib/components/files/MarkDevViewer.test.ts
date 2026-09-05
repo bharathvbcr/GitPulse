@@ -42,10 +42,23 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("dirty");
   });
 
+  /**
+   * This was the one call site that built `${repo}/${filePath}` with no
+   * containment check at all, and swallowed the failure in a bare `catch {}`
+   * — so its escape produced no diagnostics either. Rust proves containment
+   * now, and the refusal has to reach the user.
+   */
   it("provides an action to open in MarkDev desktop application", () => {
     expect(source).toContain("openInMarkDev");
-    expect(source).toContain("openPath");
+    expect(source).toContain("openInDefaultApp");
     expect(source).toContain("Open in MarkDev");
+    expect(source).not.toContain("@tauri-apps/plugin-opener");
+    // The root and the relative path stay separate arguments — that is what
+    // stops the webview naming an absolute path. (Asserting the absence of the
+    // old `${repo}/${filePath}` literal would match the comment that explains
+    // it, so the positive form is the honest check.)
+    expect(source).toContain("openInDefaultApp(repo, filePath)");
+    expect(source).toContain("repoStore.setError(formatError(err))");
   });
 
   it("handles copy code block events and source copying", () => {

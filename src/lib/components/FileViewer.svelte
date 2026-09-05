@@ -51,13 +51,12 @@
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { askConfirm } from "../stores/modalStore";
-  import { openPath } from "@tauri-apps/plugin-opener";
+  import { openInDefaultApp } from "../desktop/openInShell";
   import FileTreePanel from "./files/FileTreePanel.svelte";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
-  import { joinWorktreePath } from "../files/fileTree";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { resolveFilePaneLayout } from "../files/filePaneLayout";
@@ -333,15 +332,14 @@
     });
   }
 
-  function openInDefaultApp() {
+  function openActiveInDefaultApp() {
     const repo = $repoStore.currentPath;
     if (!repo || !activeTabPath) return;
-    const fullPath = joinWorktreePath(repo, activeTabPath);
-    if (!fullPath) {
-      repoStore.setError("Cannot open a path outside the repository");
-      return;
-    }
-    void openPath(fullPath);
+    // Rust validates containment and rebuilds the absolute path; a failure
+    // surfaces rather than leaving a menu item that quietly does nothing.
+    void openInDefaultApp(repo, activeTabPath).catch((err) =>
+      repoStore.setError(formatError(err)),
+    );
   }
 
   async function copyActivePath() {
@@ -733,7 +731,7 @@
 
         <button
           type="button"
-          onclick={openInDefaultApp}
+          onclick={openActiveInDefaultApp}
           class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
           aria-label="Open in default application"
           title="Open in Default Application"

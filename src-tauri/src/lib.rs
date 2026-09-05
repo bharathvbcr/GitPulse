@@ -26,6 +26,7 @@ pub mod updates;
 pub mod watcher;
 
 use commands::*;
+use desktop::shell::{cmd_open_worktree_path, cmd_reveal_worktree_path};
 use desktop::{
     cmd_exit_app, cmd_resolve_git_root, cmd_set_exit_guard_ready, cmd_set_recent_menu,
     cmd_take_pending_open,
@@ -190,6 +191,8 @@ pub fn run() {
             cmd_take_pending_open,
             cmd_set_recent_menu,
             cmd_resolve_git_root,
+            cmd_open_worktree_path,
+            cmd_reveal_worktree_path,
             cmd_set_exit_guard_ready,
             cmd_exit_app,
             cmd_diagnostic_log_tail,

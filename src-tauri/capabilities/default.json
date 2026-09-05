@@ -19,6 +19,7 @@
     "core:window:allow-outer-size",
     "core:window:allow-outer-position",
     "core:window:allow-available-monitors",
+    "opener:allow-open-url",
     "opener:allow-default-urls"
   ]
 }

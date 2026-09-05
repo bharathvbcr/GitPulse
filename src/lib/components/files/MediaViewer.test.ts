@@ -58,6 +58,10 @@ describe("MediaViewer", () => {
     expect(source).toContain("blob.is_binary");
     expect(source).toContain("Offset");
     expect(source).toContain("Decoded ASCII");
-    expect(source).toContain("joinWorktreePath");
+  });
+
+  it("opens through the validated shell gate, not the opener plugin", () => {
+    expect(source).toContain("openInDefaultApp");
+    expect(source).not.toContain("@tauri-apps/plugin-opener");
   });
 });

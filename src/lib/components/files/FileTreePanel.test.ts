@@ -81,9 +81,17 @@ describe("FileTreePanel", () => {
     expect(source).toContain("createNewFolder");
   });
 
-  it("supports external opening via Tauri plugin opener", () => {
-    expect(source).toContain("openPath");
-    expect(source).toContain("revealItemInDir");
+  /**
+   * Opening and revealing go through `desktop/openInShell`, not the opener
+   * plugin. The plugin's commands take an absolute path from the webview,
+   * which made the worktree containment check optional; these hand Rust the
+   * root and the relative path separately so it can prove containment. The
+   * repo-wide version of this assertion lives in `openInShell.test.ts`.
+   */
+  it("opens and reveals through the validated shell gate, not the opener plugin", () => {
+    expect(source).toContain("openInDefaultApp");
+    expect(source).toContain("revealInFileManager");
+    expect(source).not.toContain("@tauri-apps/plugin-opener");
   });
 
   it("uses VirtualList for tree rendering and supports keyboard navigation", () => {
@@ -167,7 +175,6 @@ describe("FileTreePanel", () => {
     expect(source).toContain("parseFileQuery");
     expect(source).toContain("filterPathsByFileQuery");
     expect(source).toContain("statusPathKey");
-    expect(source).toContain("joinWorktreePath");
     expect(source).toContain("onPinFile");
   });
 

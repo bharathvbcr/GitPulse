@@ -1,5 +1,6 @@
 pub mod actions;
 mod menu;
+pub mod shell;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

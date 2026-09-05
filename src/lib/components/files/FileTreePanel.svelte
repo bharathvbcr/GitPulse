@@ -32,7 +32,6 @@
     ancestorsOf,
     buildFileTree,
     flattenFileTree,
-    joinWorktreePath,
     parentDirectoryRowIndex,
     type FileRow,
   } from "../../files/fileTree";
@@ -48,7 +47,7 @@
     summarizeStatuses,
   } from "../../files/fileStatus";
   import { copyText } from "../../desktop/clipboard";
-  import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
@@ -560,18 +559,17 @@
     closeContextMenu();
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const fullPath = joinWorktreePath(repo, filePath);
-    if (!fullPath) {
-      repoStore.setError("Cannot open a path outside the repository");
-      return;
-    }
     try {
-      await openPath(fullPath);
-    } catch {
+      await openInDefaultApp(repo, filePath);
+    } catch (openErr) {
+      // No default application for this type is ordinary (an extensionless
+      // file, say), so fall back to revealing it. If that fails too, the
+      // original failure is the one worth showing — the fallback's error
+      // describes the fallback, not why opening did not work.
       try {
-        await revealItemInDir(fullPath);
-      } catch (err) {
-        repoStore.setError(formatError(err));
+        await revealInFileManager(repo, filePath);
+      } catch {
+        repoStore.setError(formatError(openErr));
       }
     }
   }
@@ -580,13 +578,8 @@
     closeContextMenu();
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const fullPath = joinWorktreePath(repo, filePath);
-    if (!fullPath) {
-      repoStore.setError("Cannot reveal a path outside the repository");
-      return;
-    }
     try {
-      await revealItemInDir(fullPath);
+      await revealInFileManager(repo, filePath);
     } catch (err) {
       repoStore.setError(formatError(err));
     }

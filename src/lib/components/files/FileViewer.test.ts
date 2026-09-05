@@ -209,9 +209,10 @@ describe("FileViewer", () => {
     expect(source).toContain("preferredSidePane = \"explorer\";");
   });
 
-  it("writes file content via cmd_write_file_content and opens paths through joinWorktreePath", () => {
+  it("writes file content via cmd_write_file_content and opens through the shell gate", () => {
     expect(source).toContain('invoke("cmd_write_file_content"');
-    expect(source).toContain("joinWorktreePath");
+    expect(source).toContain("openInDefaultApp");
+    expect(source).not.toContain("@tauri-apps/plugin-opener");
     expect(source).toContain("formatError");
   });
 

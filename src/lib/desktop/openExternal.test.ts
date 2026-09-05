@@ -1,12 +1,36 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createOpener, openExternal } from "./openExternal";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const panelSource = (name: string) =>
-  readFileSync(join(here, "..", "components", name), "utf8");
+const frontendRoot = join(here, "..", "..");
+
+/**
+ * Every shipped frontend source. Test files are excluded: they run in Node,
+ * never in a webview, so what they import proves nothing about the app.
+ */
+function shippedSources(dir: string, out: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === "__tests__") continue;
+      shippedSources(full, out);
+    } else if (/\.(ts|js|svelte)$/.test(entry.name) && !/\.(test|spec)\./.test(entry.name)) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+/** Files whose real import statements pull in `@tauri-apps/plugin-opener`. */
+function directPluginImporters(): string[] {
+  const importer = /import\s*(?:type\s*)?\{[^}]*\}\s*from\s*["']@tauri-apps\/plugin-opener["']/;
+  return shippedSources(frontendRoot)
+    .filter((file) => importer.test(readFileSync(file, "utf8")))
+    .map((file) => relative(frontendRoot, file).split(/[\\/]/).join("/"));
+}
 
 describe("createOpener", () => {
   it("hands the URL to the injected opener and resolves when it does", async () => {
@@ -42,22 +66,34 @@ describe("openExternal canonical adoption", () => {
     expect(typeof openExternal).toBe("function");
   });
 
-  it("routes all three former copies through the shared module", () => {
-    for (const name of ["GitHubPanel.svelte", "HealthPanel.svelte", "ManviOpsPanel.svelte"]) {
-      expect(panelSource(name)).toContain('from "../desktop/openExternal"');
-    }
+  /**
+   * Derived, not hand-listed. The previous version named three panels, so the
+   * four files that later imported the plugin directly — FileViewer,
+   * MediaViewer, FileTreePanel and MarkDevViewer — were invisible to it while
+   * it reported success. A guard narrower than its own claim is worse than no
+   * guard, because it reads like coverage.
+   *
+   * One owner also means one place the ACL has to grant, which is what makes
+   * `src-tauri/tests/acl_contract.rs` able to demand that the granted command
+   * set match the used one exactly.
+   */
+  it("keeps the opener plugin behind exactly one module", () => {
+    expect(directPluginImporters()).toEqual(["lib/desktop/openExternal.ts"]);
   });
 
-  it("keeps window.open out of ManviOpsPanel — no webview-shell navigation fallback", () => {
-    const source = panelSource("ManviOpsPanel.svelte");
-    expect(source).not.toContain("window.open");
-    // The local copy must be gone; only the shared import remains.
-    expect(source).not.toContain("@tauri-apps/plugin-opener");
+  /**
+   * `window.open` inside a Tauri webview can navigate the app shell itself,
+   * and the URLs handed here come from advisory/GitHub payloads.
+   */
+  it("keeps window.open out of every shipped source", () => {
+    const offenders = shippedSources(frontendRoot)
+      .filter((file) => readFileSync(file, "utf8").includes("window.open("))
+      .map((file) => relative(frontendRoot, file).split(/[\\/]/).join("/"));
+    expect(offenders).toEqual([]);
   });
 
-  it("keeps the direct plugin import out of GitHubPanel and HealthPanel too", () => {
-    for (const name of ["GitHubPanel.svelte", "HealthPanel.svelte"]) {
-      expect(panelSource(name)).not.toContain("@tauri-apps/plugin-opener");
-    }
+  /** The scan must be able to fail, or it proves nothing. */
+  it("scans a real, populated frontend tree", () => {
+    expect(shippedSources(frontendRoot).length).toBeGreaterThan(50);
   });
 });

@@ -12,8 +12,9 @@
     Sparkles,
     WrapText,
   } from "lucide-svelte";
-  import { openPath } from "@tauri-apps/plugin-opener";
+  import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
+  import { formatError } from "../../ui/formatError";
   import { copyText } from "../../desktop/clipboard";
   import {
     renderMarkDevMarkdown,
@@ -77,11 +78,14 @@
   async function openInMarkDev() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const fullPath = `${repo}/${filePath}`;
+    // Was `${repo}/${filePath}` with no containment check and a silent catch:
+    // the one call site that could walk out of the worktree, and the one that
+    // never reported that it had failed. Rust proves containment now, and the
+    // reason surfaces instead of leaving a dead button.
     try {
-      await openPath(fullPath);
-    } catch {
-      // Graceful fallback
+      await openInDefaultApp(repo, filePath);
+    } catch (err) {
+      repoStore.setError(formatError(err));
     }
   }
 

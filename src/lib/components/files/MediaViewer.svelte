@@ -5,9 +5,9 @@
     Maximize2,
     ExternalLink,
   } from "lucide-svelte";
-  import { openPath } from "@tauri-apps/plugin-opener";
+  import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
-  import { joinWorktreePath } from "../../files/fileTree";
+  import { formatError } from "../../ui/formatError";
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
   import CodeViewer from "./CodeViewer.svelte";
   import LazyMount from "../LazyMount.svelte";
@@ -75,15 +75,12 @@
     return hexDumpRows(bytesFromBase64Prefix(blob.base64));
   });
 
-  function openInDefaultApp() {
+  function openMediaInDefaultApp() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
-    const fullPath = joinWorktreePath(repo, filePath);
-    if (!fullPath) {
-      repoStore.setError("Cannot open a path outside the repository");
-      return;
-    }
-    void openPath(fullPath);
+    void openInDefaultApp(repo, filePath).catch((err) =>
+      repoStore.setError(formatError(err)),
+    );
   }
 </script>
 
@@ -174,7 +171,7 @@
       <div class="flex items-center gap-2">
         <button
           type="button"
-          onclick={openInDefaultApp}
+          onclick={openMediaInDefaultApp}
           class="gp-btn !py-0.5 !px-2.5 flex items-center gap-1 text-[11px]"
         >
           <ExternalLink size={12} />
