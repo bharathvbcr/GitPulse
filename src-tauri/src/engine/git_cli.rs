@@ -289,7 +289,22 @@ fn is_injected_git_env(name: &str) -> bool {
         )
 }
 
+/// Reads `PATH`/`HOME` from the process and defers to
+/// [`git_command_with_env`], mirroring the [`capture_command`] /
+/// [`capture_command_with_env`] split so the environment stays injectable for
+/// tests instead of being read from under them.
 fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    git_command_with_env(repo, args, path_var.as_deref(), home.as_deref())
+}
+
+fn git_command_with_env(
+    repo: Option<&Path>,
+    args: &[&str],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Command {
     let mut cmd = Command::new("git");
     // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
     // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
@@ -347,6 +362,24 @@ fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
     // ever supposed to open. It converts a whole class of hangs into success.
     cmd.env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true");
+    // Git resolves its own helpers through the child's PATH, so a GUI launch
+    // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
+    // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
+    // `pre-commit` hook shells out to (husky's `npx`, and `node` behind it),
+    // `git-lfs`, and any external diff/merge tool. Each failure surfaced as
+    // git's own error — "cannot run gpg", a hook exiting 127 — which reads as
+    // a broken repository rather than a PATH the app chose.
+    //
+    // Set after the strip loop for the same reason the editors are: the loop
+    // only removes `GIT_*` names, but keeping every environment decision in
+    // one place after it is what stops the next added name from being quietly
+    // undone. Inherited entries stay ahead of the appended ones, so no helper
+    // that already resolved starts resolving somewhere else.
+    if !cfg!(windows) {
+        if let Some(child_path) = extended_child_path(path_var, home) {
+            cmd.env("PATH", child_path);
+        }
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -527,8 +560,16 @@ pub fn run_command_in(
 /// directories, so `Command::new("gh")` failed to resolve even though the CLI
 /// was installed — every GitHub view then reported "`gh` is not installed".
 /// Terminal launches never saw this. Superset of the convention mirrored from
-/// [`crate::harness::sidecar::resolve_binary`] with Go toolchain locations for
-/// scanners that spawn `go` themselves; nonexistent entries are harmlessly skipped.
+/// [`crate::harness::sidecar::resolve_binary`] with Go and Rust toolchain
+/// locations for scanners that spawn `go` or `cargo` themselves; nonexistent
+/// entries are harmlessly skipped.
+///
+/// `CARGO_HOME` is deliberately not consulted for the Rust entry. A custom
+/// value is set in a shell profile, and a GUI launch inherits no shell
+/// profile — so in the launch this whole mechanism exists for, reading it
+/// would find nothing. In the launches where it *is* set, PATH was inherited
+/// too and resolution never reaches this list. `~/.cargo/bin` is rustup's
+/// default and the only spelling reachable here.
 fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/opt/homebrew/bin"),
@@ -536,9 +577,19 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     ];
     if let Some(home) = home {
         dirs.push(PathBuf::from(home).join(".local/bin"));
-        // Standard GOBIN/GOPATH install locations (`go install ...` defaults).
-        dirs.push(PathBuf::from("/usr/local/go/bin"));
+    }
+    // Fixed system path, so it does not depend on knowing `home` — gating it
+    // on that withheld a still-valid directory from launchd/daemon contexts,
+    // which are exactly the ones with no inherited PATH. Kept in its original
+    // position so no existing precedence between these dirs shifts.
+    dirs.push(PathBuf::from("/usr/local/go/bin"));
+    if let Some(home) = home {
+        // Standard GOBIN/GOPATH install location (`go install ...` default).
         dirs.push(PathBuf::from(home).join("go/bin"));
+        // rustup's install root: `cargo`, `rustc`, `rustup` and every
+        // `cargo-*` subcommand binary (`cargo-audit`, `cargo-llvm-cov`) live
+        // here and nowhere a GUI-launch PATH can see.
+        dirs.push(PathBuf::from(home).join(".cargo/bin"));
     }
     dirs
 }
@@ -709,6 +760,18 @@ pub(crate) fn resolve_spawn_program_with(
     find_in_dirs(program, &dirs)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
+}
+
+/// The non-`PATH` directories [`find_external_tool`] searches, for messages
+/// that have to tell a user where a missing tool was looked for.
+///
+/// Derived from the list the lookup itself uses rather than spelled out at the
+/// message site: a hand-written list silently goes stale the moment a
+/// directory is added here, and a "we looked in X" that omits where we
+/// actually looked is a wrong answer, not a terse one.
+pub(crate) fn external_tool_fallback_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    gui_launch_fallback_dirs(home.as_deref())
 }
 
 /// Shared lookup for subsystems that need to *find* an external tool without
@@ -2345,6 +2408,166 @@ mod tests {
         );
     }
 
+    /// Git children must carry the extended PATH, with inherited entries
+    /// still ahead of the appended ones so nothing that already resolved
+    /// starts resolving somewhere else.
+    #[cfg(unix)]
+    #[test]
+    fn git_command_hands_children_the_extended_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cmd = git_command_with_env(
+            None,
+            &["status"],
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            Some(home.path().as_os_str()),
+        );
+        let path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("git children must be handed an extended PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+        assert_eq!(
+            &entries[..2],
+            [Path::new("/usr/bin"), Path::new("/bin")],
+            "inherited entries must keep their precedence: {entries:?}"
+        );
+        for fallback in [
+            PathBuf::from("/opt/homebrew/bin"),
+            home.path().join(".cargo/bin"),
+        ] {
+            assert!(
+                entries.contains(&fallback),
+                "child PATH must reach {}: {entries:?}",
+                fallback.display()
+            );
+        }
+    }
+
+    /// Regression, driven through the failure users actually hit: git resolves
+    /// its own helpers through the CHILD's PATH — `gpg` for a signed commit,
+    /// the interpreter a `pre-commit` hook shells out to, `git-lfs`, external
+    /// diff/merge tools. A GUI launch handed them the minimal
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`, so a husky-style hook exited 127 and a
+    /// signed commit failed with "cannot run gpg" on machines where both were
+    /// installed — reading as a broken repository rather than a PATH we chose.
+    ///
+    /// A real hook rather than an env assertion: the point is that git's own
+    /// child found a tool that exists in nothing but a fallback directory.
+    #[cfg(unix)]
+    #[test]
+    fn git_hooks_resolve_helpers_that_live_only_in_a_fallback_dir() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let helper = bin.join("gitpulse-fake-hook-helper");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let repo = init_test_repo(false);
+        let hooks = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        // Bare name on purpose: resolving it is the whole assertion.
+        std::fs::write(&hook, "#!/bin/sh\nexec gitpulse-fake-hook-helper\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // Identity and signing are pinned inline because the child keeps the
+        // real HOME: a developer's global `commit.gpgsign` must not decide
+        // whether this passes, and signing would block on a passphrase.
+        let mut cmd = git_command_with_env(
+            Some(repo.path()),
+            &[
+                "-c",
+                "user.name=GitPulse",
+                "-c",
+                "user.email=gitpulse@test.local",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "hook must run",
+            ],
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(home.path().as_os_str()),
+        );
+        let out = cmd.output().expect("spawn git");
+        assert!(
+            out.status.success(),
+            "pre-commit hook could not resolve a fallback-dir helper: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Regression: the same GUI-launch miss as the `gh` case above, one
+    /// directory short. `rustup` installs the whole Rust toolchain — `cargo`,
+    /// `rustc`, `rustup` itself, and cargo subcommand binaries such as
+    /// `cargo-audit` and `cargo-llvm-cov` — into `~/.cargo/bin`, which is on
+    /// no GUI-launch PATH and was in no fallback dir. Running `cargo` from the
+    /// terminal panel died with "Failed to spawn cargo: No such file or
+    /// directory (os error 2)", the dependency scanner reported the Rust
+    /// ecosystem as unscannable, and the coverage panel reported
+    /// `cargo llvm-cov` absent — on machines where all of it was installed.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_resolution_finds_rust_toolchain_in_cargo_bin() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Every Rust entry point the app spawns by bare name lives here, so
+        // one missing directory took all of them out together.
+        for tool in ["cargo", "rustc", "rustup", "cargo-audit", "cargo-llvm-cov"] {
+            let path = bin.join(tool);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+
+            // The GUI-launch PATH verbatim: this is what the bundled app gets
+            // from launchd, and it is why the fallback list has to carry the
+            // directory itself.
+            let resolved = resolve_spawn_program_with(
+                tool,
+                Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+                Some(home.path().as_os_str()),
+            );
+            assert_eq!(
+                Path::new(&resolved),
+                &path,
+                "{tool} must resolve through ~/.cargo/bin on a GUI-launch PATH"
+            );
+        }
+    }
+
+    /// A fallback directory that does not depend on the user's home must not
+    /// be gated on knowing it. `/usr/local/go/bin` is a fixed system path, so
+    /// dropping it when `home` is unset (a launchd/daemon context, where this
+    /// mechanism matters most) withheld a directory that was still valid.
+    #[cfg(unix)]
+    #[test]
+    fn gui_fallback_keeps_system_dirs_when_home_is_unknown() {
+        let dirs = gui_launch_fallback_dirs(None);
+        for system_dir in [
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/local/go/bin"),
+        ] {
+            assert!(
+                dirs.contains(&system_dir),
+                "home-independent dir must survive an unknown home: {} in {dirs:?}",
+                system_dir.display()
+            );
+        }
+        // Home-relative dirs are the only ones an unknown home may cost.
+        assert!(
+            dirs.iter().all(|d| d.is_absolute()),
+            "no relative entry may reach the search list: {dirs:?}"
+        );
+    }
+
     /// PATH order wins: a name present on the inherited PATH must not be
     /// shadowed by a fallback-directory copy. Both candidates are executable
     /// so the strict `find_in_dirs` scan considers them at all.
@@ -2505,6 +2728,10 @@ mod tests {
             // Go toolchain locations so govulncheck's own `go` spawn resolves.
             PathBuf::from("/usr/local/go/bin"),
             home.path().join("go/bin"),
+            // Rust toolchain location, for the same nested-lookup reason: a
+            // `cargo` resolved here still spawns `rustc` and its own
+            // `cargo-*` subcommand binaries out of the child's PATH.
+            home.path().join(".cargo/bin"),
         ] {
             assert!(
                 entries.contains(&fallback),
