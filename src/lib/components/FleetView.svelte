@@ -228,7 +228,7 @@
       label: "Open",
       text: `${headline.open}`,
       tally: null,
-      note: `${headline.attention} need attention`,
+      note: headline.attentionClause,
     },
     {
       key: "commits",

@@ -206,6 +206,30 @@ describe("fleetHeadline", () => {
     );
   });
 
+  it("agrees with the count when a single repository needs attention", () => {
+    // The sentence and the grid's tile read the same count, so a verb fixed to
+    // the plural misreports both surfaces at once.
+    const headline = fleetHeadline([
+      row({ path: "/a", label: "alpha", severity: "conflicts", headline: "2 files with conflicts" }),
+      row({ path: "/b", label: "beta" }),
+    ]);
+    expect(headline.sentence).toBe(
+      "1 repository of 2 needs attention — alpha: 2 files with conflicts",
+    );
+    expect(headline.attentionClause).toBe("1 needs attention");
+  });
+
+  it("keeps the clause plural for none and for many", () => {
+    expect(fleetHeadline([]).attentionClause).toBe("0 need attention");
+    expect(fleetHeadline([row(), row({ path: "/b" })]).attentionClause).toBe("0 need attention");
+    expect(
+      fleetHeadline([
+        row({ path: "/a", severity: "conflicts" }),
+        row({ path: "/b", severity: "unpushed" }),
+      ]).attentionClause,
+    ).toBe("2 need attention");
+  });
+
   it("never calls an unhydrated workspace clean", () => {
     const headline = fleetHeadline([row({ severity: "unknown", headline: "not loaded yet" })]);
     expect(headline.sentence).not.toContain("clean");

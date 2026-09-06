@@ -234,6 +234,8 @@ export interface FleetHeadline {
   readonly attention: number;
   /** Open repositories whose state could not be determined. */
   readonly unknown: number;
+  /** The attention count as a standalone clause, e.g. "1 needs attention". */
+  readonly attentionClause: string;
   readonly sentence: string;
 }
 
@@ -248,14 +250,19 @@ export function fleetHeadline(rows: readonly FleetRow[]): FleetHeadline {
   const scope = tallyScope(rows);
   const unknown = scope.filter((row) => row.severity === "unknown").length;
   const attention = scope.filter((row) => row.severity !== "clean").length;
+  // Spelled once. The sentence and the grid's tile both take the verb from
+  // here, so neither can end up reading "1 repository need attention".
+  const needs = attention === 1 ? "needs" : "need";
+  const attentionClause = `${attention} ${needs} attention`;
   if (scope.length === 0) {
-    return { open: 0, attention: 0, unknown: 0, sentence: "No repositories are open." };
+    return { open: 0, attention: 0, unknown: 0, attentionClause, sentence: "No repositories are open." };
   }
   if (attention === 0) {
     return {
       open: scope.length,
       attention,
       unknown,
+      attentionClause,
       sentence:
         scope.length === 1
           ? "One repository open, and it is clean."
@@ -268,8 +275,9 @@ export function fleetHeadline(rows: readonly FleetRow[]): FleetHeadline {
     open: scope.length,
     attention,
     unknown,
+    attentionClause,
     sentence:
-      `${plural(attention, "repository", "repositories")} of ${scope.length} need attention` +
+      `${plural(attention, "repository", "repositories")} of ${scope.length} ${needs} attention` +
       `${unknownClause} — ${worst.label}: ${worst.headline}`,
   };
 }
