@@ -36,7 +36,7 @@
   } from "lucide-svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { reportPanelError } from "../diagnostics/report";
-  import { formatRelativeTime } from "../format";
+  import { timestampFormat } from "../ui/timestampFormat";
   import EmptyState from "./EmptyState.svelte";
 
   /**
@@ -419,7 +419,7 @@
                     {#if facts && facts.lastCommitTimestamp > 0}
                       <span aria-hidden="true">·</span>
                       <span title={facts.lastSummary}>
-                        {formatRelativeTime(facts.lastCommitTimestamp)}{facts.lastAuthor ? ` by ${facts.lastAuthor}` : ""}
+                        {$timestampFormat.text(facts.lastCommitTimestamp)}{facts.lastAuthor ? ` by ${facts.lastAuthor}` : ""}
                       </span>
                     {/if}
                   </div>

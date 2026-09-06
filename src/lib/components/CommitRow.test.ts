@@ -137,3 +137,32 @@ describe("CommitRow ref chips", () => {
     expect(body).not.toContain("…");
   });
 });
+
+
+describe("CommitRow timestamp style", () => {
+  const at = (props: Record<string, unknown>) =>
+    render(CommitRow, { props: { row, ...props } }).body;
+
+  it("defaults to the relative form", () => {
+    // 1_700_000_000 is well over a year back, so any real clock renders a
+    // months-ago label; the assertion is on the shape, not on a fixed string.
+    expect(at({})).toMatch(/\d+(m|h|d|mo) ago/);
+  });
+
+  it("renders a fixed-width calendar date when asked for the absolute form", () => {
+    expect(at({ timestampStyle: "absolute" })).toMatch(/\d{4}-\d{2}-\d{2}/);
+  });
+
+  it("carries the other form in the title, so neither hides the other", () => {
+    expect(at({ timestampStyle: "absolute" })).toMatch(/title="[^"]*ago"/);
+    expect(at({ timestampStyle: "relative" })).toMatch(/title="[^"]*\d/);
+  });
+
+  it("widens the column for a date rather than truncating one", () => {
+    // A clipped date is a wrong date. The relative column is sized for
+    // "3d ago"; ten characters do not fit it.
+    expect(at({ timestampStyle: "relative" })).toContain("w-16");
+    expect(at({ timestampStyle: "absolute" })).toContain("w-[5.2rem]");
+    expect(at({ timestampStyle: "absolute", density: "compact" })).toContain("w-[4.6rem]");
+  });
+});

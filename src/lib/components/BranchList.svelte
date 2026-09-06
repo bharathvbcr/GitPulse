@@ -28,6 +28,7 @@
   import type { BranchFilterTab, BranchSection } from "../branches/types";
   import { escalateDeleteDecision } from "../branches/deleteEscalation";
   import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
+  import { interfaceStore } from "../stores/interfaceStore";
   import BranchHealthDot from "./BranchHealthDot.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
@@ -755,7 +756,7 @@
       onclick={() => selectRef(branch.name)}
       ondblclick={() => checkoutName(localNameFor(branch))}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
-      title={branchTooltip(branch)}
+      title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
       class="flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"
     >
       <GitBranch size={13} class={branch.is_current ? "text-accent shrink-0" : "text-textMuted shrink-0"} />

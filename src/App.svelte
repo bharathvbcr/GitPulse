@@ -111,6 +111,9 @@
   } from "./lib/updates/updateCheck";
   import { openExternal } from "./lib/desktop/openExternal";
   import { applyUiScale, nativeZoomSetter } from "./lib/ui/uiScale";
+  import { applyAccent } from "./lib/ui/accents";
+  import { applyTabWidth } from "./lib/ui/codeDisplay";
+  import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askConfirm } from "./lib/stores/modalStore";
   import {
@@ -630,6 +633,26 @@
       }
       await applyUiScale(scale, { setZoom: zoomSetter });
     })();
+  });
+
+  // --- display preferences ------------------------------------------------
+  // Three appearance preferences that live in the document rather than in a
+  // component: an inline `--c-accent` override, `data-motion` on <html>, and
+  // the inherited `--gp-tab-size`. Each is one write, and each re-runs from
+  // the store, so "Restore defaults" repaints the window without a reload.
+
+  // Keyed on the resolved theme as well as the choice: each accent carries a
+  // separate light and dark shade, so flipping theme has to rewrite it.
+  $effect(() => {
+    applyAccent($interfaceStore.accent, $themeStore);
+  });
+
+  $effect(() => {
+    applyReduceMotion($interfaceStore.reduceMotion);
+  });
+
+  $effect(() => {
+    applyTabWidth($interfaceStore.tabWidth);
   });
 
   $effect(() => {

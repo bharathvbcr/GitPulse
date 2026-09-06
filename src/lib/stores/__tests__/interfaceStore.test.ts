@@ -412,3 +412,139 @@ describe("interfaceStore chrome preferences", () => {
     }
   });
 });
+
+describe("interfaceStore display preferences", () => {
+  beforeEach(() => {
+    interfaceStore.reset();
+  });
+
+  it("ships the accent, motion, timestamp, diff and tab defaults", () => {
+    // Every one of these is additive: a fresh install must render exactly
+    // what it rendered before the settings existed.
+    expect(get(interfaceStore)).toMatchObject({
+      accent: "blue",
+      reduceMotion: false,
+      timestampStyle: "relative",
+      diffLayout: "unified",
+      diffWordWrap: false,
+      diffSyntaxHighlight: true,
+      diffIgnoreWhitespace: false,
+      tabWidth: 8,
+    });
+  });
+
+  it("sets each one without disturbing its neighbours", () => {
+    interfaceStore.setAccent("teal");
+    interfaceStore.setReduceMotion(true);
+    interfaceStore.setTimestampStyle("absolute");
+    interfaceStore.setDiffLayout("split");
+    interfaceStore.setDiffWordWrap(true);
+    interfaceStore.setDiffSyntaxHighlight(false);
+    interfaceStore.setDiffIgnoreWhitespace(true);
+    interfaceStore.setTabWidth(4);
+
+    expect(get(interfaceStore)).toMatchObject({
+      accent: "teal",
+      reduceMotion: true,
+      timestampStyle: "absolute",
+      diffLayout: "split",
+      diffWordWrap: true,
+      diffSyntaxHighlight: false,
+      diffIgnoreWhitespace: true,
+      tabWidth: 4,
+      // Untouched by any of the above.
+      showLanguageBar: true,
+      graphWidthMode: "balanced",
+    });
+  });
+
+  it("restores every one of them on reset", () => {
+    // "Restore defaults" has to mean the whole page, not the panel that
+    // happened to be open when the button was added.
+    interfaceStore.setAccent("rose");
+    interfaceStore.setReduceMotion(true);
+    interfaceStore.setTimestampStyle("absolute");
+    interfaceStore.setDiffLayout("split");
+    interfaceStore.setDiffWordWrap(true);
+    interfaceStore.setDiffSyntaxHighlight(false);
+    interfaceStore.setDiffIgnoreWhitespace(true);
+    interfaceStore.setTabWidth(2);
+    interfaceStore.reset();
+
+    expect(get(interfaceStore)).toMatchObject({
+      accent: "blue",
+      reduceMotion: false,
+      timestampStyle: "relative",
+      diffLayout: "unified",
+      diffWordWrap: false,
+      diffSyntaxHighlight: true,
+      diffIgnoreWhitespace: false,
+      tabWidth: 8,
+    });
+  });
+
+  it("falls back rather than trusting a corrupt display blob", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: Record<string, unknown>) => {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify(stored),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore);
+    };
+    try {
+      const bad = await load({
+        accent: "chartreuse",
+        reduceMotion: "yes",
+        timestampStyle: "iso",
+        diffLayout: "side-by-side",
+        diffWordWrap: 1,
+        diffSyntaxHighlight: null,
+        diffIgnoreWhitespace: "true",
+        tabWidth: 37,
+      });
+      expect(bad).toMatchObject({
+        accent: "blue",
+        reduceMotion: false,
+        timestampStyle: "relative",
+        diffLayout: "unified",
+        diffWordWrap: false,
+        diffSyntaxHighlight: true,
+        diffIgnoreWhitespace: false,
+        tabWidth: 8,
+      });
+
+      // The control: valid values do survive, so the cases above are not
+      // passing because the reader ignores these fields.
+      const good = await load({
+        accent: "violet",
+        reduceMotion: true,
+        timestampStyle: "absolute",
+        diffLayout: "split",
+        diffWordWrap: true,
+        diffSyntaxHighlight: false,
+        diffIgnoreWhitespace: true,
+        tabWidth: 2,
+      });
+      expect(good).toMatchObject({
+        accent: "violet",
+        reduceMotion: true,
+        timestampStyle: "absolute",
+        diffLayout: "split",
+        diffWordWrap: true,
+        diffSyntaxHighlight: false,
+        diffIgnoreWhitespace: true,
+        tabWidth: 2,
+      });
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
+  });
+});

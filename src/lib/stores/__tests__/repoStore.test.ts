@@ -4,6 +4,7 @@ import { createRepoStore, STATS_DRAIN_MAX_BATCHES, STATS_PUBLISH_EVERY, type Bra
 import { memoryStorage, STORAGE_KEY_WORKSPACE } from "../../repos/persist";
 import { STATUS_POLL_INTERVAL_MS } from "../../repos/statusPoll";
 import type { FilterState } from "../filterStore";
+import { interfaceStore } from "../interfaceStore";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -2713,3 +2714,36 @@ describe("repoStore.removeRepo", () => {
   });
 });
 
+
+
+describe("repoStore seeds the whitespace default from the preference", () => {
+  afterEach(() => interfaceStore.reset());
+
+  it("opens a repository with whitespace-only changes shown, by default", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    expect(get(store).selectedIgnoreWhitespace).toBe(false);
+  });
+
+  it("opens a repository already ignoring whitespace when the preference says so", async () => {
+    // The point of the preference: before it, the toolbar checkbox reset to
+    // off for every repository opened, every session.
+    interfaceStore.setDiffIgnoreWhitespace(true);
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    expect(get(store).selectedIgnoreWhitespace).toBe(true);
+  });
+
+  it("reads the preference per repository, so a change needs no restart", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    interfaceStore.setDiffIgnoreWhitespace(true);
+    await store.openRepo("/r/beta");
+    expect(get(store).selectedIgnoreWhitespace).toBe(true);
+
+    // And the already-open tab keeps whatever it was opened with: the
+    // preference is a starting point, not a retroactive edit.
+    store.activateTab(get(store).openTabs[0].id);
+    expect(get(store).selectedIgnoreWhitespace).toBe(false);
+  });
+});

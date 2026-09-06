@@ -28,8 +28,11 @@ html.dark {
     0 10px 28px -18px rgb(0 0 0 / 0.65);
   --shadow-pop: 0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
   --shadow-float: 0 8px 24px -12px rgb(0 0 0 / 0.55), 0 32px 90px -28px rgb(0 0 0 / 0.7);
-  --shadow-glow: 0 6px 22px -8px rgb(128 158 255 / 0.55);
-  --ring-focus: 0 0 0 3px rgb(128 158 255 / 0.28);
+  /* Derived from --c-accent, not restated: the accent is user-selectable at
+     runtime (lib/ui/accents.ts writes the triplet inline on <html>), and a
+     literal here would leave a teal window wearing a blue focus ring. */
+  --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.55);
+  --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.28);
   --brand-gradient: linear-gradient(135deg, #22d3ee 0%, #7da2ff 52%, #ab8bff 100%);
 }
 
@@ -64,8 +67,11 @@ html.light {
     0 12px 32px -20px rgb(38 46 76 / 0.25);
   --shadow-pop: 0 2px 8px -2px rgb(38 46 76 / 0.08), 0 18px 44px -16px rgb(38 46 76 / 0.22);
   --shadow-float: 0 8px 24px -12px rgb(38 46 76 / 0.12), 0 32px 90px -28px rgb(38 46 76 / 0.28);
-  --shadow-glow: 0 6px 22px -8px rgb(82 104 235 / 0.45);
-  --ring-focus: 0 0 0 3px rgb(82 104 235 / 0.22);
+  /* Derived for the same reason as the dark pair above. The light accent is
+     darker than the ring colour this replaces, which strengthens the focus
+     indicator rather than weakening it. */
+  --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.45);
+  --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.22);
   --brand-gradient: linear-gradient(135deg, #06b6d4 0%, #4f74e8 52%, #8b5cf6 100%);
 
   color-scheme: light;
@@ -145,6 +151,10 @@ html.light :where([class~="text-slate-400"], [class~="text-slate-600"]) {
 
 :root {
   --ui-font-scale: 1;
+  /* Columns a literal tab advances to. 8 is the CSS initial value, so the
+     default renders exactly what it rendered before the setting existed;
+     lib/ui/codeDisplay.ts overwrites this when the reader picks 2 or 4. */
+  --gp-tab-size: 8;
   /* Derived plain colors — the canvas graph reads these. */
   --bg-main: rgb(var(--c-bg));
   --bg-surface: rgb(var(--c-surface));
@@ -174,6 +184,10 @@ html.dark {
      exactly one of the two ever applies. */
   html {
     font-size: calc(16px * var(--ui-font-scale, 1));
+    /* `tab-size` inherits, so declaring it once on the root reaches every
+       `white-space: pre` surface — diff rows, the file viewer, blame and the
+       conflict editor — without each of them learning the preference. */
+    tab-size: var(--gp-tab-size, 8);
   }
 
   body {
@@ -182,6 +196,17 @@ html.dark {
     /* 0.75rem is the previous 12px at the default root size, now derived from
        the root so it scales with everything else instead of separately. */
     font-size: 0.75rem;
+  }
+
+  /* `hidden` has to actually hide.
+     The UA sheet's `[hidden] { display: none }` loses to any author rule that
+     sets `display`, so a Tailwind `flex`/`grid` utility on the same element
+     silently outranks it — the settings filter marked rows hidden and two of
+     them, the ones that happened to carry `flex`, kept rendering. Author-level
+     and `!important` so the attribute means what it says regardless of which
+     utilities a row picks up later. */
+  [hidden] {
+    display: none !important;
   }
 
   ::selection {
@@ -912,14 +937,18 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   position: relative;
 }
 
+/* `:not([data-motion="reduced"])` is the in-app preference: the attribute is
+   set only to ask for LESS motion, so gating the animated rules on its absence
+   makes the setting authoritative without a specificity fight against the
+   reduce rules below. See lib/motion/motionPreference.ts. */
 @media (prefers-reduced-motion: no-preference) {
-  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn) {
+  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn) {
     transition-property: color, background-color, border-color, box-shadow, transform;
     transition-duration: 180ms;
     transition-timing-function: var(--mac-liquid-ease);
   }
 
-  html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active:not(:disabled) {
+  html.macos:not([data-motion="reduced"]) :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active:not(:disabled) {
     transform: translate3d(0, 1px, 0) scale(0.97);
   }
 }
@@ -1059,20 +1088,20 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .gp-view {
+  html:not([data-motion="reduced"]) .gp-view {
     animation: gp-view-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
   }
 
-  .gp-overlay {
+  html:not([data-motion="reduced"]) .gp-overlay {
     animation: gp-overlay-in 140ms ease-out both;
   }
 
-  .gp-pop {
+  html:not([data-motion="reduced"]) .gp-pop {
     animation: gp-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
   }
 
-  html.macos .gp-view,
-  html.macos .gp-pop {
+  html.macos:not([data-motion="reduced"]) .gp-view,
+  html.macos:not([data-motion="reduced"]) .gp-pop {
     animation-duration: 260ms;
     animation-timing-function: var(--mac-liquid-ease);
     /* Release the transform layer after entrance, so fixed descendants keep
@@ -1081,27 +1110,43 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   }
 }
 
+/*
+ * Reduced motion has two triggers and needs both.
+ *
+ * The media query is the one that works before any script runs, so it stays
+ * the CSS-only guarantee for a reader whose system already asked for less.
+ * The `[data-motion="reduced"]` mirror is the in-app preference for everyone
+ * else. A media query and an attribute cannot share one selector, so the
+ * rules are written twice with identical `:is()` groups, and
+ * lib/motion/motionPreference.test.ts pins the two lists equal — one trigger
+ * can never quietly gain a rule the other lacks.
+ */
 @media (prefers-reduced-motion: reduce) {
   /* Spinners keep their glyph (static, visible) so activity indication
      survives; only the rotation/pulse motion is removed. */
-  .gp-view,
-  .gp-overlay,
-  .gp-pop,
-  .animate-pulse,
-  .animate-spin {
+  html :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
     animation: none !important;
   }
 
-  .transition-colors,
-  .transition-all,
-  .transition,
-  [class*="transition-["] {
+  html :is(.transition-colors, .transition-all, .transition, [class*="transition-["]) {
     transition: none !important;
   }
 
   html.macos :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active {
     transform: none;
   }
+}
+
+html[data-motion="reduced"] :is(.gp-view, .gp-overlay, .gp-pop, .animate-pulse, .animate-spin) {
+  animation: none !important;
+}
+
+html[data-motion="reduced"] :is(.transition-colors, .transition-all, .transition, [class*="transition-["]) {
+  transition: none !important;
+}
+
+html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, .gp-icon-btn):active {
+  transform: none;
 }
 
 @keyframes gp-view-in {
@@ -1143,11 +1188,18 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   animation-timing-function: ease;
 }
 
+/* Written out rather than grouped with `:is()`: these are pseudo-elements on
+   the root itself, which `:is()` does not accept. */
 @media (prefers-reduced-motion: reduce) {
-  ::view-transition-old(root),
-  ::view-transition-new(root) {
+  html::view-transition-old(root),
+  html::view-transition-new(root) {
     animation: none !important;
   }
+}
+
+html[data-motion="reduced"]::view-transition-old(root),
+html[data-motion="reduced"]::view-transition-new(root) {
+  animation: none !important;
 }
 
 /* Indeterminate progress strip for long graph loads. */

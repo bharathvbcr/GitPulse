@@ -27,7 +27,30 @@ export function damp(current: number, target: number, deltaMs: number, halfLifeM
 
 export type MediaMatch = Pick<Window, "matchMedia">;
 
+/**
+ * The app's own "reduce motion" preference, layered over the system one.
+ *
+ * Deliberately one-way: it can only ever ADD reduction. A user who has asked
+ * the operating system for less motion has asked every application, and a
+ * checkbox in here must not be able to overrule that — so this is a boolean
+ * that turns reduction on, never a tri-state that can turn it off.
+ *
+ * Module-level rather than threaded through every call site because the
+ * transition helpers are called from Svelte templates during a transition,
+ * where there is nothing to pass a store through.
+ */
+let reduceMotionOverride = false;
+
+export function setReduceMotionOverride(reduce: boolean): void {
+  reduceMotionOverride = reduce;
+}
+
+export function reduceMotionOverrideEnabled(): boolean {
+  return reduceMotionOverride;
+}
+
 export function prefersReducedMotion(media: MediaMatch | null = defaultMedia()): boolean {
+  if (reduceMotionOverride) return true;
   if (!media || typeof media.matchMedia !== "function") return false;
   return media.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }

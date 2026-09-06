@@ -44,3 +44,34 @@ Two rules learned the hard way:
    scenario that can actually arm the bug: StoragePanel's loop needs the effect
    to *re-run* against a cached measurement, so `mount` reports a false clean
    and `switch` is what catches it.
+
+
+## `settings.html` — the settings page's document-side behaviour
+
+Three of the Settings preferences do not live in a component at all: the accent
+writes an inline `--c-accent` on `<html>`, "reduce motion" stamps `data-motion`,
+and the tab width publishes `--gp-tab-size`. None of that is reachable from
+`environment: "node"` — there is no stylesheet, no cascade and no computed
+style — so the unit tests can only check that the appliers *would* write the
+right thing.
+
+```bash
+npx vite --config vite.harness.config.ts
+# then open:
+#   http://localhost:5188/harness/settings.html
+```
+
+The page mounts the real modal through `SettingsHost.svelte` (which owns
+`isOpen`, so the close/reopen transitions can be driven) and runs the same
+three appliers `App.svelte` runs. `window.__gp` exposes the stores and
+`window.__gpSetOpen(bool)` opens and closes the dialog. What it is for:
+
+- click a swatch, then read `getComputedStyle(document.documentElement)` —
+  `--c-accent`, `--accent-color` (the canvas graph's input), `--ring-focus` and
+  `--shadow-glow` must all move together, and the default must *remove* the
+  inline property rather than restate it;
+- toggle reduce motion and read `animationName` on a `.gp-view` element;
+- pick a tab width and read `tabSize` on a `<pre>`;
+- type in the search box and check that a filtered-out row computes to
+  `display: none` — the attribute alone is not enough, which is why app.css
+  carries `[hidden] { display: none !important }`.

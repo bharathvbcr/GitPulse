@@ -1,5 +1,5 @@
 import type { BranchInfo, TagInfo } from "./types";
-import { formatRelativeTime } from "../format";
+import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
 
 /**
  * Rich hover text for the branch tree.
@@ -19,7 +19,11 @@ function aheadBehind(branch: BranchInfo): string {
   return parts.join(", ");
 }
 
-export function branchTooltip(branch: BranchInfo, nowSec?: number): string {
+export function branchTooltip(
+  branch: BranchInfo,
+  nowSec?: number,
+  style: TimestampStyle = "relative",
+): string {
   const lines: string[] = [branch.name];
 
   const summary = branch.last_summary?.trim();
@@ -28,7 +32,7 @@ export function branchTooltip(branch: BranchInfo, nowSec?: number): string {
   const attribution = [
     branch.last_author?.trim() || null,
     branch.last_commit_timestamp
-      ? formatRelativeTime(branch.last_commit_timestamp, nowSec) || null
+      ? formatTimestamp(branch.last_commit_timestamp, style, nowSec) || null
       : null,
   ]
     .filter(Boolean)

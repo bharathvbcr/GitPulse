@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -6,6 +6,7 @@ import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
 import { filterStore, type FilterState } from "./filterStore";
 import { graphStore } from "./graphStore";
+import { interfaceStore } from "./interfaceStore";
 import type { InvokeFn } from "./graphStore";
 import {
   disambiguateLabels,
@@ -492,7 +493,12 @@ function createSession(
     selectedCommitId: extras.selectedCommitId ?? null,
     selectedFilePath: extras.selectedFilePath ?? null,
     selectedIsStaged: extras.selectedIsStaged ?? false,
-    selectedIgnoreWhitespace: extras.selectedIgnoreWhitespace ?? false,
+    // Seeded from the Settings > Diff & code preference rather than hardcoded
+    // off, so "ignore whitespace by default" survives opening the next
+    // repository. Read per session, not once at module load, so changing the
+    // preference takes effect on the next repository without a restart.
+    selectedIgnoreWhitespace:
+      extras.selectedIgnoreWhitespace ?? get(interfaceStore).diffIgnoreWhitespace,
     selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
     selectedDiffTruncated: extras.selectedDiffTruncated ?? false,

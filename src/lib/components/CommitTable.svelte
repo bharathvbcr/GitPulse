@@ -19,7 +19,7 @@
     type VisualCommitRow,
   } from "../canvas/GraphRenderer";
   import { authorIdentity } from "../authors/authorIdentity";
-  import { formatRelativeTime } from "../format";
+  import { formatTimestamp } from "../ui/timestampStyle";
   import { acquireGpu2dContext } from "../canvas/gpuContext";
   import { diagnostics } from "../diagnostics/diagnostics";
   import {
@@ -272,7 +272,9 @@
     const kind = row.is_merge ? "Merge commit" : row.is_root ? "Root commit" : "Commit";
     const parts = [
       `${kind} ${row.id.slice(0, 7)}: ${row.summary || "no commit message"}.`,
-      `By ${row.author_name || "unknown"}, ${formatRelativeTime(row.timestamp) || "unknown time"}.`,
+      `By ${row.author_name || "unknown"}, ${
+        formatTimestamp(row.timestamp, $interfaceStore.timestampStyle) || "unknown time"
+      }.`,
     ];
     if (row.is_mainline) {
       // The straight column-0 rail; named so a screen reader hears which
@@ -769,8 +771,14 @@
   // paintNow re-resolve the stylesheet at frame time. The store may flip the
   // html class inside a view-transition callback — i.e. after this effect
   // runs — so reading getComputedStyle here could cache the previous theme.
+  //
+  // The accent is the second input to that palette: the graph reads
+  // `--accent-color` for its selection ring, and an accent change writes
+  // `--c-accent` without touching the theme class. Listed here so picking a
+  // new accent repaints the graph instead of leaving one blue ring behind.
   $effect(() => {
     $themeStore;
+    $interfaceStore.accent;
     cachedTheme = null;
     gutterRect = null;
     rootRect = null;
@@ -916,6 +924,7 @@
           <CommitRow
             {row}
             density={$densityStore}
+            timestampStyle={$interfaceStore.timestampStyle}
             refs={refsByCommit.get(row.id) ?? []}
             isSelected={$repoStore.selectedCommitId === row.id}
             mergeTarget={closeTargetById.get(row.id) ?? null}

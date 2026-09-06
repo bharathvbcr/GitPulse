@@ -5,7 +5,9 @@
   import { createParseCache, type AnnotatedDiffLine } from "../diff/wordDiff";
   import { composeSpans, shiftMatches, type DiffSpan, type Range } from "../diff/highlight";
   import type { SupportedLanguage } from "../files/syntaxHighlight";
+  import { get } from "svelte/store";
   import { densityStore } from "../stores/densityStore";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { rowHeight } from "../ui/density";
 
   const parseCache = createParseCache();
@@ -161,7 +163,18 @@
    */
   const SYNTAX_MAX_LINES = 60_000;
 
-  let viewMode = $state<"unified" | "split">("unified");
+  /**
+   * Layout, wrap and syntax start from the Settings > Diff & code defaults
+   * and are the reader's to change from the toolbar afterwards.
+   *
+   * Read once at mount rather than bound to the store: the toolbar has to
+   * win for the file in front of you, and a live binding would snap the pane
+   * back to the preference the moment anything else touched it. The pane is
+   * remounted per view switch, so a changed preference is picked up the next
+   * time a diff is opened.
+   */
+  const diffDefaults = get(interfaceStore);
+  let viewMode = $state<"unified" | "split">(diffDefaults.diffLayout);
   /**
    * The file list travels with the diff.
    *
@@ -173,8 +186,8 @@
   let railWidth = $state(248);
   /** Owned here so unfolding the change picker survives a file switch. */
   let commitsOpen = $state(false);
-  let wordWrap = $state(false);
-  let syntaxOn = $state(true);
+  let wordWrap = $state(diffDefaults.diffWordWrap);
+  let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
   let selectedLines = $state<Set<number>>(new Set());
