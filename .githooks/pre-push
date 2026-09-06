@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# Refuse a release tag that would publish a tree nobody meant to ship.
+#
+# `.github/workflows/release.yml` triggers on `push: tags: v*`, checks the tag
+# out, and builds THAT tree. Every gate it runs — the version manifests, the
+# changelog section — is evaluated at the tagged commit, so a tag left behind
+# on an older commit passes all of them and publishes a self-consistent build
+# of the wrong tree. That is invisible in CI by construction: the job cannot
+# know which commit you *meant*. Only the machine holding both the tag and the
+# work can tell, which is why the check lives here and not in a workflow.
+#
+# It also refuses tag names the workflow would match but the version gate
+# cannot parse. `v*` catches `v0.03` as readily as `v0.0.6`, and a malformed
+# tag spends a runner only to fail at the first gate.
+#
+# Installed with:  git config core.hooksPath .githooks
+# Bypassed with:   git push --no-verify   (re-releasing an older commit)
+
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+head_sha=$(git rev-parse HEAD)
+status=0
+
+fail() {
+  echo "pre-push: $*" >&2
+  status=1
+}
+
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  # A deletion pushes the zero oid; there is nothing to build.
+  [ "$local_sha" = "$zero" ] && continue
+  case "$local_ref" in
+    refs/tags/v*) ;;
+    *) continue ;;
+  esac
+
+  tag=${local_ref#refs/tags/}
+
+  if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    fail "tag '$tag' matches the release workflow's 'v*' trigger but is not vMAJOR.MINOR.PATCH.
+        It would start a release run and fail at the version gate. Rename or delete it."
+    continue
+  fi
+
+  # `^{commit}` so an annotated tag reports the commit it points at rather than
+  # the tag object's own oid.
+  tag_commit=$(git rev-parse --verify "$local_sha^{commit}")
+  if [ "$tag_commit" != "$head_sha" ]; then
+    behind=$(git rev-list --count "$tag_commit..$head_sha")
+    fail "tag '$tag' points at $(git rev-parse --short "$tag_commit"), which is $behind commit(s) behind HEAD.
+        Pushing it releases that tree, not the one you have been working on, and every
+        gate in the release workflow would pass because that tree is self-consistent.
+        Move it with:  git tag -f $tag HEAD
+        Or re-release the older commit deliberately with:  git push --no-verify"
+    continue
+  fi
+
+  # The tag is HEAD, so the working tree is the released tree and the existing
+  # gates can be reused as-is rather than reimplemented against a git object.
+  if ! (cd "$repo_root" && node scripts/check-release-version.mjs --tag "$tag" >/dev/null 2>&1); then
+    fail "tag '$tag' does not match the version manifests. Run:
+        npm run check:release -- --tag $tag"
+    continue
+  fi
+
+  if ! (cd "$repo_root" && node scripts/release-notes.mjs --tag "$tag" >/dev/null 2>&1); then
+    fail "CHANGELOG.md has no section for '$tag'. The release workflow fails on this
+        after checkout; catching it here costs seconds instead of a runner."
+    continue
+  fi
+
+  echo "pre-push: $tag → $(git rev-parse --short "$tag_commit") (HEAD), manifests and changelog agree."
+done
+
+exit $status

@@ -40,9 +40,21 @@ cd GitPulse
 # 2. Install frontend dependencies
 npm install
 
-# 3. Start Tauri in development mode (hot-reloads Rust & Svelte)
+# 3. Point git at the repository's hooks (one-time, per clone)
+git config core.hooksPath .githooks
+
+# 4. Start Tauri in development mode (hot-reloads Rust & Svelte)
 npm run tauri dev
 ```
+
+> [!IMPORTANT]
+> Step 3 installs `.githooks/pre-push`, which refuses a release tag that would
+> publish the wrong tree. The release workflow triggers on `v*`, checks the tag
+> out and builds *that* tree, so a tag left behind on an older commit passes
+> every gate in CI and ships a self-consistent build of code you did not mean to
+> release — the one release failure a workflow cannot see, because it cannot
+> know which commit you meant. Deliberately re-releasing an older commit is
+> `git push --no-verify`.
 
 > [!NOTE]
 > The dev launcher automatically finds a free Vite port (5173, falling back through 5174–5193). Set `GITPULSE_DEV_PORT=<port>` to pin a custom port.
@@ -186,6 +198,7 @@ several were added after the drift had already happened.
 | `version-source-contract` | The app version being retyped anywhere outside a manifest. `codex-plugin-contract` asserted `manifest.version === "0.0.5"` against the real tree: correct the day it was written, which is why it passed review, and broken by the next `chore(release)` bump. The silent half is worse — `release-notes.test.ts` went on calling an 0.0.5 section "the current" one and passing. A hardcoded version is only catchable at the moment it is typed, because at that moment it equals `package.json`'s; the scan therefore looks for the *current* version across `scripts/`, `src/`, `src-tauri/src/` and `.github/`, and points you at `appVersion()`. It also runs `check-release-version.mjs`'s own discovery against this repository — every one of that script's tests builds a synthetic scratch tree, so the gate that stops a mismatched release had no coverage over the tree it gates. |
 | `effect-loop-contract` | A pane that crashes itself with `effect_update_depth_exceeded`. `Metric.subscribe` delivers the current snapshot *synchronously*, so a callback registered inside an `$effect` runs while that effect is still tracking: reading a `$state` there that the effect also writes makes the effect depend on its own output, and Svelte kills the pane after ~1000 passes. Two panes shipped it — PulseView's workspace LOC strip and StoragePanel's usage history, where `historyVersion += 1` is the read. Neither is visible on inspection, and the crash needs two open repositories or a warm cache to reproduce. The scan walks `src/` rather than listing the panes that subscribe today. It guards the SHAPE only — `npm test` runs `environment: "node"`, where `$effect` compiles out, so the behaviour is checked in a real browser via `harness/` (see `harness/README.md`). |
 | `harness-fixture-contract` | A stress-harness fixture that has drifted from the interface it stands in for. The harness is the only place `$effect` actually runs, so a fixture answering a shape the app no longer reads turns a verification that could not run into one that looks like it ran and passed. `cmd_get_language_stats` sat there returning `{languages, total_code_lines}` long after the command started returning `{stats, truncated, ...}`, and every harness run since had been exercising an empty language bar and reporting it fine. The field list is derived from `src/lib/fleet/types.ts` rather than restated, because a hand-copied list is the same staleness one level up. |
+| `pre-push-hook-contract` | A release tag that publishes a tree nobody meant to ship. `release.yml` triggers on `v*`, checks the tag out, and builds *that* tree — so every gate it runs (version manifests, changelog section) is evaluated at the tagged commit, and a tag left behind on an older commit passes all of them. `v0.0.6` sat 26 commits back with its own self-consistent 0.0.6 manifests and a 30-line `[0.0.6]` changelog section, so nothing in CI could have objected. The job cannot know which commit you meant; only the machine holding both the tag and the work can, which is why the check is a pre-push hook (`git config core.hooksPath .githooks`). The contract exists because an unrun hook and a passing hook look identical, and it derives the guarded glob from the workflow's own trigger so widening one without the other fails here. |
 
 Adding a contract test is preferred over adding a `check:*` script unless the
 check is something you would want to run on its own.
