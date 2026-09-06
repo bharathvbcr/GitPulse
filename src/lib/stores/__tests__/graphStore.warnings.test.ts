@@ -1,3 +1,4 @@
+import { get } from "svelte/store";
 import { describe, expect, it } from "vitest";
 import type { VisualCommitRow } from "../../canvas/GraphRenderer";
 import {
@@ -28,6 +29,15 @@ const WARNINGS = [
   "HEAD unavailable (fatal: bad object HEAD); commit graph may lack the HEAD marker",
   "ref decorations unavailable (broken for-each-ref alias); branches/tags will not be labeled",
 ];
+
+/**
+ * A completeness disclosure, not a failure: the load worked and the graph
+ * simply does not draw everything the repository holds.
+ */
+const NOTICE =
+  "36 commit(s) reachable only from refs outside branches, remotes and tags are not " +
+  'drawn. Those refs live in: refs/cmux (18 refs). Set the graph\'s ref scope to "All refs" ' +
+  "to include them.";
 
 function graphPayload(withWarnings: boolean): CommitGraphPayload {
   const base: CommitGraphPayload = {
@@ -94,6 +104,57 @@ describe("graphStore graph payload warnings", () => {
     await store.loadGraph("/repo");
 
     expect(calls).toEqual(WARNINGS.map((w): [string, string] => ["graph", `/repo: ${w}`]));
+  });
+
+  /**
+   * Regression: the disclosure that history exists outside the walked scope
+   * is TRUE, and it was written to the diagnostics ring on every launch of
+   * every repository that has agent-harness refs — a crash log filling with
+   * correct sentences. It is repository state, not a fault, and belongs on
+   * screen instead.
+   */
+  it("never files a notice as a diagnostic", async () => {
+    const { calls, diagnostics } = sinkFactory();
+    const invoke: InvokeFn = ((cmd: string) => {
+      if (cmd === "cmd_get_commit_graph")
+        return Promise.resolve({ ...graphPayload(false), notices: [NOTICE] });
+      return Promise.resolve({ id: "a", summary: "d", changed_files: [] });
+    }) as InvokeFn;
+    const store = createGraphStore({ invoke, diagnostics });
+
+    store.showRepo("/repo");
+    await store.loadGraph("/repo");
+
+    expect(calls).toEqual([]);
+    // And it is not simply dropped: the pane renders it. Reported somewhere
+    // is the whole point — silence here would make "not drawn" and "does not
+    // exist" the same thing again.
+    expect(get(store).notices).toEqual([NOTICE]);
+  });
+
+  /**
+   * Regression: notices are rendered, so they are part of "did the output
+   * change". Left out of the signature, a repository whose hidden count moved
+   * from 36 to 37 while its drawn rows stayed identical would short-circuit
+   * the republish and leave a stale number on screen.
+   */
+  it("republishes when only the notice changed", async () => {
+    const { diagnostics } = sinkFactory();
+    let notice = NOTICE;
+    const invoke: InvokeFn = ((cmd: string) => {
+      if (cmd === "cmd_get_commit_graph")
+        return Promise.resolve({ ...graphPayload(false), notices: [notice] });
+      return Promise.resolve({ id: "a", summary: "d", changed_files: [] });
+    }) as InvokeFn;
+    const store = createGraphStore({ invoke, diagnostics });
+
+    store.showRepo("/repo");
+    await store.loadGraph("/repo");
+    expect(get(store).notices).toEqual([NOTICE]);
+
+    notice = NOTICE.replace("36 commit(s)", "37 commit(s)");
+    await store.loadGraph("/repo");
+    expect(get(store).notices).toEqual([notice]);
   });
 
   // Regression: a failed best-effort details fetch used to vanish silently,

@@ -494,7 +494,7 @@
                       Namespaces outside branches, remotes and tags — agent turn
                       checkpoints, prefetch mirrors, CI pull refs — can add dozens of
                       lanes nothing in the UI can name. They are left out by default,
-                      and whatever is left out is reported in Diagnostics rather than
+                      and whatever is left out is named above the graph rather than
                       silently dropped.
                     </p>
                   </div>
