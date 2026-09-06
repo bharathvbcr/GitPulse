@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { appVersion } from "./app-version.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN = path.join(ROOT, "plugins", "gitpulse");
@@ -20,7 +21,11 @@ describe("native Codex plugin package", () => {
     expect(existsSync(manifestPath), `${manifestPath} exists`).toBe(true);
     const manifest = readJson(manifestPath);
     expect(manifest.name).toBe(path.basename(PLUGIN));
-    expect(manifest.version).toBe("0.0.5");
+    // Derived, never typed: a literal here is only ever correct until the next
+    // release bump, and the version this manifest must carry is package.json's
+    // by definition. `check-release-version.mjs` owns agreement across every
+    // manifest; this restates it for the one file this suite is about.
+    expect(manifest.version).toBe(appVersion());
     expect(manifest.skills).toBe("./skills/");
     expect(manifest.mcpServers).toBe("./.mcp.json");
   });
