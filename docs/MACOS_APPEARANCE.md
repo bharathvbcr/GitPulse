@@ -54,6 +54,17 @@ it. The diff's sticky gutter is exactly that. The exclusion list is derived
 from the components rather than written down, so a new occluder idiom fails the
 contract test instead of going transparent unnoticed.
 
+The author-chosen alphas are the same arithmetic one rung down.
+`bg-background/50` and `/60` are recesses — the base colour thinned against the
+`--c-surface` panel around them, which opaque is a nine-unit colour step and
+translucent is half a layer of coverage on top of three others. Measured over a
+white desktop, the commit-details preview sat at `rgb(22, 26, 36)` against the
+panel beside it at `rgb(34, 37, 50)`. Those become a shade, so the recess costs
+a ninth of the coverage rather than half; every one of them keeps a border or a
+layout edge doing the rest of the separating. `/80` and `/90` keep their fill,
+because those are controls and floating fields where covering what is behind is
+the point.
+
 Overflow cues follow the same rule. `from-background to-transparent` is a
 full-alpha stop, so the fades at the edges of a scroller were opaque bands on a
 translucent pane — and Tailwind's `to-transparent` is `rgb(0 0 0 / 0)`, so the

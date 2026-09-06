@@ -567,6 +567,14 @@ html.macos {
      so the plate shows through it, and fading from the base would repaint the
      one band the fade covers. A shade reads as a fade over any desktop. */
   --mac-edge-shade: rgb(0 0 0 / 0.38);
+  /* An inset area inside a panel -- a diff preview, a code block, an
+     explanation card. Over opaque paint the author asked for `--c-bg` at half
+     strength, a small COLOUR difference against `--c-surface`. Over glass the
+     same declaration is half a layer of COVERAGE, and coverage is what darkens
+     a translucent stack: it was the fourth layer over a bright desktop and
+     bottomed out near black. A shade recesses without covering, and the
+     surrounding material is already doing most of the separating. */
+  --mac-recess: rgb(0 0 0 / 0.11);
   --mac-liquid-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -593,6 +601,7 @@ html.macos.light {
   --mac-glass-boost: saturate(150%) brightness(1.02);
   --mac-shell-veil: 0.62;
   --mac-edge-shade: rgb(38 46 76 / 0.14);
+  --mac-recess: rgb(38 46 76 / 0.05);
 }
 
 /* Real window transparency. `macOSPrivateApi` + a transparent window make the
@@ -779,6 +788,30 @@ html.macos
   background-color: transparent;
 }
 
+/*
+ * The same arithmetic one rung down, where the author picked the alpha.
+ *
+ * `bg-background/50` and `/60` are recesses: the base colour thinned against
+ * the `--c-surface` panel around them, which opaque is a nine-unit colour step
+ * and translucent is half a layer of coverage on top of three others. Measured
+ * over a white desktop, the commit-details preview landed at rgb(22, 26, 36)
+ * with the panel beside it at rgb(34, 37, 50) -- a black rectangle inside a
+ * glass panel, which is what got reported.
+ *
+ * These become a shade, so the recess costs a ninth of the coverage instead of
+ * half, and every one of them keeps a border or a layout edge doing the rest.
+ * `/80` and `/90` are deliberately NOT here: those are controls and floating
+ * fields, where covering what is behind is the entire point.
+ */
+html.macos
+  :where([class~="bg-background/50"], [class~="bg-background/60"]):not(
+    [class~="sticky"],
+    [class~="absolute"],
+    [class~="fixed"]
+  ) {
+  background-color: var(--mac-recess);
+}
+
 html.macos .gp-titlebar-actions,
 html.macos .gp-welcome {
   background-color: transparent;
@@ -887,6 +920,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     --mac-fill-surface: rgb(var(--c-surface));
     --mac-fill-surface-hover: rgb(var(--c-surface-hover));
     --mac-edge-shade: rgb(var(--c-bg));
+    --mac-recess: rgb(var(--c-bg));
     --bg-main: rgb(var(--c-bg));
   }
 

@@ -191,6 +191,44 @@ describe("macOS material", () => {
     }
   });
 
+  it("turns every low-alpha base recess into a shade, and leaves the occluders alone", () => {
+    /*
+     * `bg-background/50` and `/60` are recesses — the base colour thinned
+     * against the surface panel around them. Opaque that is a colour step;
+     * translucent it is coverage, and coverage is what darkens a glass stack.
+     * `/80` and `/90` are controls and floating fields, where covering what is
+     * behind is the point, so they keep their fill.
+     *
+     * The band is derived from the components, so a new `/70` recess fails
+     * here rather than compositing to a dark rectangle nobody screenshotted.
+     */
+    const RECESS_CEILING = 60;
+    const alphas = new Set<number>();
+    for (const file of svelteFiles(componentsDir)) {
+      for (const [, alpha] of readFileSync(file, "utf8").matchAll(/bg-background\/(\d+)/g)) {
+        alphas.add(Number(alpha));
+      }
+    }
+    expect(alphas.size).toBeGreaterThan(0);
+
+    const rule = css.match(
+      /html\.macos\s+:where\(([^)]*bg-background\/[^)]*)\):not\([^)]*\)\s*\{([^}]*)\}/,
+    );
+    expect(rule?.[2], "the recess rule is missing or paints something else").toContain(
+      "var(--mac-recess)",
+    );
+    for (const alpha of [...alphas].filter((a) => a <= RECESS_CEILING)) {
+      expect(rule?.[1], `bg-background/${alpha} is a recess with no shade rule`).toContain(
+        `[class~="bg-background/${alpha}"]`,
+      );
+    }
+    for (const alpha of [...alphas].filter((a) => a > RECESS_CEILING)) {
+      expect(rule?.[1], `bg-background/${alpha} covers on purpose and must keep its fill`).not.toContain(
+        `[class~="bg-background/${alpha}"]`,
+      );
+    }
+  });
+
   it("never fades an edge from a full-alpha surface colour", () => {
     // `from-background` is alpha 1, so an overflow cue becomes an opaque band
     // at the edge of a translucent pane; Tailwind's `to-transparent` is
