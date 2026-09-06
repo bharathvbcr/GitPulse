@@ -162,11 +162,100 @@ describe("macOS material", () => {
     }
   });
 
+  /*
+   * `tauri-build` re-derives, on EVERY platform it builds, the Cargo features
+   * the config implies, and aborts when they differ from the ones declared on
+   * the `[dependencies] tauri` entry. The manifest is one file for all
+   * platforms; the config is not — Tauri merges `tauri.<platform>.conf.json`
+   * over the base. So a feature-implying key that lives only in the macOS
+   * override builds here and fails everywhere else, and a macOS `ci:local`
+   * cannot see it: the first release to carry this feature died on the Linux
+   * pre-flight with "remove the `macos-private-api` feature", before a single
+   * platform had started building.
+   *
+   * The mapping mirrors tauri-utils' `AppConfig::features()`, and both entries
+   * tauri-build checks are covered: `tauri` and its own `tauri-build`.
+   * `tray-icon` is filtered out of both sides by tauri-build, so it never
+   * participates.
+   */
+  type TauriAppConfig = {
+    macOSPrivateApi?: boolean;
+    security?: { assetProtocol?: { enable?: boolean }; pattern?: { use?: string } };
+  };
+
+  /** Every feature tauri-build manages, and the config key that implies it. */
+  const IMPLIED_BY_CONFIG: Record<string, (app: TauriAppConfig) => boolean> = {
+    "macos-private-api": (app) => app.macOSPrivateApi === true,
+    "protocol-asset": (app) => app.security?.assetProtocol?.enable === true,
+    isolation: (app) => app.security?.pattern?.use === "isolation",
+  };
+
+  /** Both entries tauri-build checks, and which features it manages on each. */
+  const ALLOWLISTED_DEPENDENCIES = [
+    {
+      crate: "tauri",
+      table: "dependencies",
+      managed: ["macos-private-api", "protocol-asset", "isolation"],
+    },
+    { crate: "tauri-build", table: "build-dependencies", managed: ["isolation"] },
+  ] as const;
+
+  /** RFC 7396 JSON Merge Patch — the rule Tauri layers platform configs with. */
+  function mergePatch(target: unknown, patch: unknown): unknown {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) return patch;
+    const merged: Record<string, unknown> =
+      target !== null && typeof target === "object" && !Array.isArray(target)
+        ? { ...(target as Record<string, unknown>) }
+        : {};
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null) delete merged[key];
+      else merged[key] = mergePatch(merged[key], value);
+    }
+    return merged;
+  }
+
+  /** The `app` config a build actually sees: base alone off macOS, merged on it. */
+  function appConfigFor(platform: "other" | "macos"): TauriAppConfig {
+    if (platform === "other") return baseConf.app;
+    return (mergePatch(baseConf, macConf) as { app: TauriAppConfig }).app;
+  }
+
+  it("declares the tauri features that EVERY platform's config implies", () => {
+    for (const { crate, table, managed } of ALLOWLISTED_DEPENDENCIES) {
+      const entry = cargoToml.match(
+        new RegExp(String.raw`^\[${table}\][\s\S]*?^${crate} = \{([^}]*)\}`, "m"),
+      )?.[1];
+      expect(entry, `no \`${crate}\` entry in [${table}]`).toBeTruthy();
+      const declared = [
+        ...(entry?.match(/features\s*=\s*\[([^\]]*)\]/)?.[1] ?? "").matchAll(/"([^"]+)"/g),
+      ]
+        .map((match) => match[1])
+        .filter((feature) => (managed as readonly string[]).includes(feature))
+        .sort();
+
+      for (const platform of ["other", "macos"] as const) {
+        const app = appConfigFor(platform);
+        const implied = Object.entries(IMPLIED_BY_CONFIG)
+          .filter(([feature, enabled]) => (managed as readonly string[]).includes(feature) && enabled(app))
+          .map(([feature]) => feature)
+          .sort();
+        const source =
+          platform === "macos" ? "tauri.conf.json ⊕ tauri.macos.conf.json" : "tauri.conf.json";
+        expect(
+          declared,
+          `on ${platform === "macos" ? "macOS" : "Linux/Windows"} the config (${source}) implies ` +
+            `[${implied}] for \`${crate}\` but [${table}] declares [${declared}]; tauri-build ` +
+            `aborts the build wherever these differ, so a key like this belongs in the BASE config.`,
+        ).toEqual(implied);
+      }
+    }
+  });
+
   it("asks for transparency, the private API and a blur material together", () => {
     // Any one of the three alone is inert: without the feature the webview is
     // opaque, without `transparent` there is nothing to see through, and
     // without an effect there is nothing behind it but the desktop unblurred.
-    expect(macConf.app.macOSPrivateApi).toBe(true);
+    expect(appConfigFor("macos").macOSPrivateApi).toBe(true);
     expect(macConf.app.windows[0].transparent).toBe(true);
     expect(macConf.app.windows[0].windowEffects.effects.length).toBeGreaterThan(0);
     // tauri-build reads the FIRST dependency table naming the crate and stops,

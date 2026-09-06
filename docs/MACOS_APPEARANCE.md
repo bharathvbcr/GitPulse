@@ -165,7 +165,7 @@ Three settings have to be present together, and any one alone is inert:
 
 | Setting | Where | Without it |
 | --- | --- | --- |
-| `macos-private-api` feature | `Cargo.toml`, macOS target only | The WKWebView stays opaque and covers the material |
+| `macos-private-api` feature | `Cargo.toml` **and** `macOSPrivateApi` in the **base** `tauri.conf.json` | The WKWebView stays opaque and covers the material |
 | `"transparent": true` | `tauri.macos.conf.json` | Nothing to see through |
 | `windowEffects` | `tauri.macos.conf.json` | The desktop shows through unblurred |
 
@@ -173,6 +173,20 @@ The feature gate is deeper than it looks: `tauri/macos-private-api` forwards
 `wry/transparent`, and wry compiles its `setOpaque(false)` call only behind
 that feature. The vibrancy itself is public API — `tauri::vibrancy` is not
 feature-gated — but with an opaque webview on top there is no way to see it.
+
+The pair has to be declared **symmetrically, on every platform**, which is why
+`macOSPrivateApi` sits in the base config beside macOS-only neighbours. On each
+platform it builds, `tauri-build` re-derives the Cargo features the merged
+config implies and aborts when they differ from the ones declared on the
+`[dependencies] tauri` entry — and it reads the first dependency table naming
+the crate, so a target-scoped entry cannot make the manifest side vary either.
+Put the key in `tauri.macos.conf.json` and macOS agrees with itself while Linux
+and Windows fail at the build script; that is invisible to a macOS `ci:local`
+run, and it cost the v0.0.6 release a pre-flight. Off macOS the feature changes
+nothing — every guard in `tauri` reads `any(not(target_os = "macos"), feature =
+"macos-private-api")`, and the feature body resolves to `wry`'s empty
+`transparent` — so declaring it everywhere is free. `mac-material-contract`
+re-derives that comparison per platform.
 
 **This forfeits Mac App Store acceptance**, which is a product decision rather
 than an implementation detail. It was previously disabled for exactly that
