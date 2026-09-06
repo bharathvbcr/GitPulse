@@ -58,9 +58,16 @@ path = "src/bin/gitpulse-hook.rs"
 # because `tauri-build` validates features against the config by reading the FIRST
 # dependency table that names the crate and stopping — a `tauri` entry in both
 # tables makes it read `features = []` here and fail the build with a mismatch it
-# cannot explain. Only macOS asks for a transparent window (see
-# `tauri.macos.conf.json`), so on Windows and Linux this compiles the wry feature
-# and never reaches it.
+# cannot explain, and with no entry here it checks EVERY target table, so one of
+# them always mismatches.
+#
+# Declared unconditionally, it must be configured unconditionally: `tauri-build`
+# runs that same check on every platform, against the config merged for THAT
+# platform. So `macOSPrivateApi` lives in the base `tauri.conf.json`, not in
+# `tauri.macos.conf.json` beside `transparent` and `windowEffects` — putting it
+# there builds on macOS and fails on Linux and Windows. Off macOS the feature is
+# inert (every guard in `tauri` reads `any(not(target_os = "macos"), feature =
+# "macos-private-api")`), so declaring it everywhere costs nothing.
 tauri = { version = "2.0.0", features = ["macos-private-api"] }
 tauri-plugin-opener = "2.0.0"
 serde = { version = "1.0", features = ["derive"] }

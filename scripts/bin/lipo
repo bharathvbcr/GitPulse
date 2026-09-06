@@ -1,78 +1,109 @@
 #!/usr/bin/env bash
 # Universal binary lipo wrapper for Tauri macOS builds.
 #
-# Tauri CLI's universal-apple-darwin workflow invokes `lipo` to stitch
-# x86_64 and aarch64 targets into a fat binary, but only executes lipo on the
-# crate's `mainBinaryName` (`gitpulse`). Its macOS application bundler, however,
-# bundles all binaries declared under `[[bin]]` in Cargo.toml (`gitpulsed`,
-# `gitpulse-mcp`), expecting each to exist in the universal target directory.
+# Tauri's `universal-apple-darwin` build lipos ONLY the crate's
+# `mainBinaryName` (`gitpulse`), but its macOS bundler copies every binary
+# declared under `[[bin]]` in Cargo.toml into GitPulse.app. Any auxiliary
+# binary that was never lipo'd is missing from the universal target dir, and
+# the build dies at bundling with `... does not exist` — naming the file, not
+# the reason. `scripts/tauri.mjs` puts this directory first on PATH for darwin
+# builds so that this wrapper runs instead of the system lipo.
 #
-# This wrapper executes the standard lipo command and then inspects whether
-# `gitpulse` was bundled. If so, it automatically builds universal fat binaries
-# for the auxiliary binaries if both architecture targets exist.
+# The helper list is DERIVED from Cargo.toml, never written down. It was a
+# hand-kept list of two, and adding a third binary (`gitpulse-hook`) broke the
+# macOS release with an error that pointed at the bundler rather than at the
+# list that had gone stale — on the one platform whose release artifact no
+# local build exercises.
 set -euo pipefail
 
-REAL_LIPO=""
-for candidate in /usr/bin/lipo /Library/Developer/CommandLineTools/usr/bin/lipo; do
-  if [ -x "$candidate" ]; then
-    # Resolve physical paths to avoid infinite loops
-    cand_real=$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")
-    self_real=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
-    if [ "$cand_real" != "$self_real" ]; then
-      REAL_LIPO="$candidate"
-      break
+self_dir=$(cd "$(dirname "$0")" && pwd -P)
+manifest="$self_dir/../../src-tauri/Cargo.toml"
+
+REAL_LIPO="${GITPULSE_REAL_LIPO:-}"
+if [ -z "$REAL_LIPO" ]; then
+  for candidate in /usr/bin/lipo /Library/Developer/CommandLineTools/usr/bin/lipo; do
+    if [ -x "$candidate" ]; then
+      # Resolve physical paths so this wrapper can never invoke itself.
+      cand_real=$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")
+      if [ "$cand_real" != "$self_dir/$(basename "$0")" ]; then
+        REAL_LIPO="$candidate"
+        break
+      fi
     fi
-  fi
-done
+  done
+fi
 
 if [ -z "$REAL_LIPO" ]; then
   echo "lipo wrapper error: could not locate system lipo executable" >&2
   exit 1
 fi
 
-# Execute primary lipo invocation
+# Every binary the bundler will copy, in manifest order.
+declared_binaries() {
+  awk '
+    /^\[\[bin\]\]/ { in_bin = 1; next }
+    /^\[/          { in_bin = 0 }
+    in_bin && /^name[[:space:]]*=/ {
+      line = $0
+      sub(/^name[[:space:]]*=[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      in_bin = 0
+    }
+  ' "$manifest"
+}
+
+# Execute the invocation Tauri actually asked for.
 "$REAL_LIPO" "$@"
 
-# Check if this invocation built gitpulse
 args=("$@")
 output=""
-for ((i=0; i<${#args[@]}; i++)); do
-  if [ "${args[i]}" = "-output" ] && [ $((i+1)) -lt ${#args[@]} ]; then
-    output="${args[i+1]}"
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[i]}" = "-output" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
+    output="${args[i + 1]}"
     break
   fi
 done
 
-if [ -n "$output" ] && [ "$(basename "$output")" = "gitpulse" ]; then
-  parent_dir=$(dirname "$output")
-  for helper in gitpulsed gitpulse-mcp; do
-    helper_out="$parent_dir/$helper"
-    helper_args=()
-    for arg in "${args[@]}"; do
-      case "$arg" in
-        */gitpulse)
-          helper_args+=("${arg%/gitpulse}/$helper")
-          ;;
-        *)
-          helper_args+=("$arg")
-          ;;
-      esac
-    done
+# Only piggy-back on the main binary's lipo: that is the one invocation that
+# tells us a universal build is under way and gives us both arch paths.
+[ -n "$output" ] || exit 0
+main_binary=$(basename "$output")
+[ -f "$manifest" ] || exit 0
+declared_binaries | grep -qx "$main_binary" || exit 0
 
-    # Verify input binaries exist before running lipo
-    inputs_exist=true
-    for arg in "${helper_args[@]}"; do
-      if [ "$arg" != "-create" ] && [ "$arg" != "-output" ] && [ "$arg" != "$helper_out" ]; then
-        if [ ! -f "$arg" ]; then
-          inputs_exist=false
-          break
-        fi
-      fi
-    done
+parent_dir=$(dirname "$output")
+status=0
+while read -r helper; do
+  [ "$helper" = "$main_binary" ] && continue
+  helper_out="$parent_dir/$helper"
 
-    if [ "$inputs_exist" = true ]; then
-      echo "[gitpulse-lipo] Creating universal binary for auxiliary tool: $helper -> $helper_out"
-      "$REAL_LIPO" "${helper_args[@]}"
-    fi
+  helper_args=()
+  missing=""
+  for arg in "${args[@]}"; do
+    case "$arg" in
+      "$output") helper_args+=("$helper_out") ;;
+      */"$main_binary")
+        helper_input="${arg%/$main_binary}/$helper"
+        [ -f "$helper_input" ] || missing="$helper_input"
+        helper_args+=("$helper_input")
+        ;;
+      *) helper_args+=("$arg") ;;
+    esac
   done
-fi
+
+  # A binary the bundler is going to ask for, that we cannot build, is a build
+  # failure. Saying so here names the cause; staying quiet defers it to the
+  # bundler, which can only report the file it could not find.
+  if [ -n "$missing" ]; then
+    echo "[gitpulse-lipo] '$helper' is declared in Cargo.toml and will be bundled," >&2
+    echo "                but $missing was not built. The bundle would fail at copy time." >&2
+    status=1
+    continue
+  fi
+
+  echo "[gitpulse-lipo] universal binary for auxiliary tool: $helper -> $helper_out"
+  "$REAL_LIPO" "${helper_args[@]}"
+done < <(declared_binaries)
+
+exit $status
