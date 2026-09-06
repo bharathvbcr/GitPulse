@@ -253,8 +253,12 @@
   let showRepoDetail = $state(false);
 </script>
 
-<div class="flex-1 overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
-  <div class="flex items-center justify-between gap-3 mb-3 max-w-6xl">
+<!-- A scroller that is a column: every band below is `mx-auto w-full max-w-6xl`,
+     so the content centres in a wide pane instead of hugging the left edge and
+     leaving a third of the window blank, and the empty states take the leftover
+     height rather than sitting under the header with the pane empty beneath. -->
+<div class="flex flex-1 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
+  <div class="flex items-center justify-between gap-3 mb-3 mx-auto w-full max-w-6xl">
     <h2 class="flex items-center gap-2 text-[13px] font-semibold min-w-0">
       <LayoutGrid size={15} class="text-accent shrink-0" />
       Work
@@ -278,7 +282,7 @@
   <!-- Where the reader is standing. First, because every other row on this
        screen is somewhere else. -->
   {#if here && $repoStore.currentPath}
-    <div class="mb-3 max-w-6xl rounded-2xl border border-border/70 bg-surface px-3.5 py-2.5 shadow-card">
+    <div class="mb-3 mx-auto w-full max-w-6xl rounded-2xl border border-border/70 bg-surface px-3.5 py-2.5 shadow-card">
       <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span class="flex items-center gap-1.5 font-medium text-[13px] min-w-0">
           <GitBranch size={14} class="text-accent shrink-0" />
@@ -376,7 +380,7 @@
     <!-- Each tile selects the rows it counted. Tiles the projection can only
          ever count as zero would be four doors to an empty room, so a zero
          tile stays readable but is not offered as a filter. -->
-    <div class="mb-3 max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-2">
+    <div class="mb-3 mx-auto w-full max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-2">
       <button
         type="button"
         aria-pressed={facet === "all"}
@@ -437,7 +441,7 @@
       </button>
     </div>
 
-    <div class="mb-3 max-w-6xl flex flex-wrap items-center gap-2">
+    <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center gap-2">
       <label class="relative flex-1 min-w-[13rem]">
         <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
         <input
@@ -477,14 +481,14 @@
 
   {#if collisionError}
     <div
-      class="mb-3 max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 mx-auto w-full max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
     </div>
   {:else if collisions && collisions.ok && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated)}
     <div
-      class="mb-3 max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <div class="flex items-start gap-2 font-medium">
         <AlertTriangle size={14} class="shrink-0 mt-px" />
@@ -518,7 +522,7 @@
        before they start reading it. -->
   {#if degraded}
     <div
-      class="mb-3 max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+      class="mb-3 mx-auto w-full max-w-6xl flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>{degraded}</span>
@@ -526,9 +530,11 @@
   {/if}
 
   {#if !$repoStore.currentPath}
-    <EmptyState icon={LayoutGrid} title="No repository open" hint="Open a repository to see the work in it." />
+    <div class="flex flex-1 items-center justify-center">
+      <EmptyState icon={LayoutGrid} title="No repository open" hint="Open a repository to see the work in it." />
+    </div>
   {:else if loading && !projection}
-    <div class="max-w-6xl space-y-2">
+    <div class="mx-auto w-full max-w-6xl space-y-2">
       <Skeleton />
       <Skeleton />
       <Skeleton />
@@ -536,26 +542,30 @@
   {:else if narrowedToNothing}
     <!-- A filter hiding every row is not the same screen as a repository with
          nothing in flight, and must never borrow its wording. -->
-    <EmptyState
-      icon={Search}
-      title="No row matches this filter"
-      hint="{projection?.rows.length ?? 0} rows are loaded; the current filter matches none of them."
-      action={{ label: "Clear filter", onClick: () => { facet = "all"; query = ""; } }}
-    />
+    <div class="flex flex-1 items-center justify-center">
+      <EmptyState
+        icon={Search}
+        title="No row matches this filter"
+        hint="{projection?.rows.length ?? 0} rows are loaded; the current filter matches none of them."
+        action={{ label: "Clear filter", onClick: () => { facet = "all"; query = ""; } }}
+      />
+    </div>
   {:else if projection && projection.rows.length === 0}
     <!-- Reaching here means git listed no worktrees at all, which is close to
          impossible for an open repository — every repository has at least its
          own. The old text blamed a missing DevCouncil store, which named a
          system most readers do not run and offered them nothing to do. -->
-    <EmptyState
-      icon={LayoutGrid}
-      title="Nothing in flight"
-      hint={projection.sources.worktrees.ok
-        ? "No worktrees, pull requests or runs were found for this repository."
-        : "The worktree list could not be read, so this screen cannot say what is in flight."}
-    />
+    <div class="flex flex-1 items-center justify-center">
+      <EmptyState
+        icon={LayoutGrid}
+        title="Nothing in flight"
+        hint={projection.sources.worktrees.ok
+          ? "No worktrees, pull requests or runs were found for this repository."
+          : "The worktree list could not be read, so this screen cannot say what is in flight."}
+      />
+    </div>
   {:else if projection}
-    <div class="max-w-6xl space-y-2">
+    <div class="mx-auto w-full max-w-6xl space-y-2">
       {#each visibleRows as row (row.key || "__unbound")}
         {@const chips = noteworthyStatuses(row.verdicts)}
         <div
@@ -764,7 +774,7 @@
   {/if}
 
   {#if $repoStore.currentPath}
-    <div class="mt-4 max-w-6xl">
+    <div class="mt-4 mx-auto w-full max-w-6xl">
       <button
         type="button"
         class="flex w-full items-center gap-1.5 rounded-xl border border-border/70 px-3 py-2 text-[11px] font-medium text-textMuted hover:bg-surfaceHover"

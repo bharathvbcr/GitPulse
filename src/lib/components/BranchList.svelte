@@ -859,7 +859,7 @@
     type="button"
     onclick={() => toggle(row.sectionId, row.section.kind)}
     aria-expanded={!closed}
-    class="bg-surface w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
+    class="w-full flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-textMuted uppercase tracking-wider hover:text-textPrimary select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
     style="height: {ROW_HEIGHT}px; contain-intrinsic-size: auto {ROW_HEIGHT}px;"
   >
     {#if closed}

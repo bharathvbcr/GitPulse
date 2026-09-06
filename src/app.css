@@ -673,8 +673,18 @@ html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
      frame, for a difference nobody can point at. Their saturation is baked
      into the field's own colours instead, which costs nothing per frame.
      Menus, popovers, toasts and dialog cards genuinely sit over commit rows,
-     diffs and tables, so for them the radius IS the effect; they keep it. */
-  html.macos :is(.gp-menu, .gp-card.shadow-float) {
+     diffs and tables, so for them the radius IS the effect; they keep it.
+
+     The tier is the float SHADOW, not the card class. `.gp-card.shadow-float`
+     named the dialogs and missed the rest: the commit tooltip carries
+     `shadow-pop`, and the toasts, coach mark and go-to-line popover carry
+     `shadow-float` without `.gp-card`. Every one of them hovers over content,
+     and the tooltip in particular was reported as unreadably see-through --
+     it was the one float in the app compositing with no blur at all. Those
+     keep `bg-surface` rather than the thinner glass fill: a dialog card sits
+     on a dimmed scrim, while a tooltip sits directly on commit rows and
+     carries denser text. */
+  html.macos :is(.gp-menu, [class~="shadow-float"], [class~="shadow-pop"]) {
     -webkit-backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
     backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
   }

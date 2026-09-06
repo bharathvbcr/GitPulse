@@ -91,8 +91,34 @@ describe("macOS material", () => {
       .filter(([, , body]) => /backdrop-filter: blur\(/.test(body))
       .map(([, selector]) => selector.trim());
 
-    expect(filtered).toEqual(["html.macos :is(.gp-menu, .gp-card.shadow-float)"]);
-    expect(filtered.join()).not.toContain(".gp-glass");
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]).not.toContain(".gp-glass");
+
+    /*
+     * A float is a surface wearing a float shadow, and the tier is derived
+     * from that rather than from a class list. Written as
+     * `.gp-card.shadow-float` it named the dialogs and silently missed every
+     * other float: the commit tooltip carries `shadow-pop`, and the toasts,
+     * the coach mark and the go-to-line popover carry `shadow-float` without
+     * `.gp-card`. The tooltip was reported as unreadably see-through — it was
+     * the one float in the app compositing with no blur at all, which looks
+     * identical to a blur that is working until you put content behind it.
+     */
+    const shadows = new Set<string>();
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      for (const [, classes] of source.matchAll(/class="([^"]*)"/g)) {
+        for (const token of classes.split(/\s+/)) {
+          if (token === "shadow-float" || token === "shadow-pop") shadows.add(token);
+        }
+      }
+    }
+    expect(shadows.size).toBeGreaterThan(0);
+    for (const shadow of shadows) {
+      expect(filtered[0], `a ${shadow} surface floats over content with no blur`).toContain(
+        `[class~="${shadow}"]`,
+      );
+    }
   });
 
   it("keeps the -webkit- prefix on every backdrop-filter it declares", () => {

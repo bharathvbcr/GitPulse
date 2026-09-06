@@ -22,7 +22,17 @@ blurred desktop plus this tint, not the tint alone.
 | Tier | Surfaces | Backdrop filter |
 | --- | --- | --- |
 | Chrome | title bar, repository strip, sidebar, status bar, workspace plate | none |
-| Float | menus, popovers, toasts, dialog cards | 34px blur, saturation and brightness boost |
+| Float | anything wearing `shadow-pop` or `shadow-float`, plus `.gp-menu` | 34px blur, saturation and brightness boost |
+
+The float tier is the **shadow**, not the card class. Written as
+`.gp-card.shadow-float` it named the dialogs and silently missed every other
+float: the commit tooltip carries `shadow-pop`, and the toasts, the coach mark
+and the go-to-line popover carry `shadow-float` without `.gp-card`. The tooltip
+was the one float in the application compositing with no blur at all, which
+looks identical to a blur that is working until content moves behind it. Those
+surfaces keep `bg-surface` rather than the thinner glass fill — a dialog card
+sits on a dimmed scrim, while a tooltip sits directly on commit rows and
+carries denser text.
 
 A backdrop filter is paid per filtered surface at roughly area × radius, on
 every composited frame. Chrome is laid out *beside* and *above* the content
