@@ -326,6 +326,17 @@ html.dark {
     box-shadow: var(--shadow-card);
   }
 
+  /* Modal scrim: the dimmed, blurred plate every dialog lays over the app.
+     Seven dialogs had each written the same four utilities inline, so there
+     was nowhere to say "on this platform, blur once" -- see the .gp-scrim
+     rule in the macOS block. Dim, alignment and selectability stay at the
+     call site, because those genuinely differ per dialog. */
+  .gp-scrim {
+    @apply fixed inset-0;
+    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: blur(4px);
+  }
+
   /* Floating menu / popover. */
   .gp-menu {
     @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
@@ -483,43 +494,170 @@ html.macos ::-webkit-scrollbar {
   height: 11px;
 }
 
-/* macOS material system. Static ambient color sits behind a bounded number
-   of glass surfaces; scrolling rows and code/graph canvases stay opaque.
+/* macOS material system. A static hue field sits behind a bounded number of
+   glass surfaces; scrolling rows and code/graph canvases stay opaque.
    WKWebView owns GPU compositing. No WebGL context, animated blur, global
-   will-change, or perpetual rendering loop is needed for these materials. */
+   will-change, or perpetual rendering loop is needed for these materials.
+
+   Why the two blur radii below differ, rather than one raised number. A
+   backdrop filter is paid per filtered surface at roughly area x radius, so
+   area and radius are traded against each other:
+
+     - CHROME (title bar, repository strip, sidebar, status bar) is large and
+       permanently on screen, but it is laid out BESIDE and ABOVE the content
+       panes, never over them, so the only thing in its backdrop is the hue
+       field. It therefore carries no filter at all: translucency and colour,
+       at no per-frame cost.
+     - FLOAT (menus, popovers, toasts, dialog cards) is small and transient and
+       sits over real content -- commit rows, diffs, tables -- where the radius
+       IS the effect. It is the only tier that is filtered.
+
+   The same arithmetic decides that a dialog blurs once instead of twice; see
+   the .gp-scrim rule further down. */
 html.macos {
-  --mac-glass-fill: rgb(var(--c-surface) / 0.76);
-  --mac-glass-edge: rgb(255 255 255 / 0.10);
-  --mac-glass-sheen: rgb(255 255 255 / 0.045);
+  /* The hue field. Android's blur samples a wallpaper; an in-app surface has
+     no wallpaper, so the colour the glass picks up is synthesised from the
+     brand ramp instead. Four blobs: three read as a plain gradient, and past
+     five they stop being separable once the blur has run over them. */
+  --mac-hue-a: 52 78 200;
+  --mac-hue-b: 12 150 170;
+  --mac-hue-c: 110 66 210;
+  --mac-hue-d: 180 50 130;
+  /* One gain knob for the whole field, so the light theme dilutes every blob
+     by the same amount instead of four alphas drifting apart. */
+  --mac-hue-gain: 1;
+  /* The blobs are deep and saturated rather than pastel, and that is a
+     contrast decision, not a taste one. Thinning the surfaces means the field
+     itself becomes the ground that muted 11px text sits on: pastel blobs at
+     these alphas lift that ground to roughly 3:1 against --c-text-muted, which
+     fails AA. Chroma at the same luminance reads as more glass, not less. */
+
+  --mac-glass-fill: rgb(var(--c-surface) / 0.4);
+  /* The workspace plate. Denser than the chrome because dense text sits
+     directly on it, thinner than opaque so the field carries under it. */
+  --mac-plate-fill: rgb(var(--c-bg) / 0.46);
+  --mac-glass-edge: rgb(255 255 255 / 0.14);
+  --mac-glass-sheen: rgb(255 255 255 / 0.05);
+  --mac-glass-shade: rgb(0 0 0 / 0.22);
+  --mac-glass-tint: rgb(var(--c-accent) / 0.07);
+  --mac-glass-blur-float: 34px;
+  --mac-glass-boost: saturate(190%) brightness(1.06);
+  --mac-shell-veil: 0.55;
   --mac-liquid-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 html.macos.light {
-  --mac-glass-fill: rgb(255 255 255 / 0.78);
-  --mac-glass-edge: rgb(var(--c-border) / 0.22);
-  --mac-glass-sheen: rgb(255 255 255 / 0.65);
+  /* Light surfaces invert the problem and are the TIGHTER of the two, not the
+     looser one. Dark text on a near-white ground has less headroom than light
+     text on a near-black one, so the same field that leaves dark-theme muted
+     text at 4.9:1 drops light-theme muted text to 4.3:1 -- measured, not
+     assumed. The gain and the fill are both pulled back here for that reason,
+     and the hues are lightened so the field still reads as colour. */
+  --mac-hue-a: 120 152 255;
+  --mac-hue-b: 46 196 214;
+  --mac-hue-c: 168 136 252;
+  --mac-hue-d: 240 122 186;
+  --mac-hue-gain: 0.5;
+  --mac-glass-fill: rgb(255 255 255 / 0.58);
+  --mac-plate-fill: rgb(255 255 255 / 0.6);
+  --mac-glass-edge: rgb(var(--c-border) / 0.24);
+  --mac-glass-sheen: rgb(255 255 255 / 0.7);
+  --mac-glass-shade: rgb(38 46 76 / 0.07);
+  --mac-glass-tint: rgb(var(--c-accent) / 0.05);
+  /* Light surfaces clip long before dark ones do: the same boost that makes
+     the dark field glow turns pastel washes into flat colour here. */
+  --mac-glass-boost: saturate(150%) brightness(1.02);
+  --mac-shell-veil: 0.62;
+}
+
+/* Real window transparency. `macOSPrivateApi` + a transparent window make the
+   WKWebView non-opaque, and an NSVisualEffectView (`underWindowBackground`)
+   blurs the actual desktop behind it -- the blur is done by the window server,
+   not by us, so it costs the app nothing per frame.
+
+   The page then has to stop painting over it. `body` carries an opaque
+   background from the base layer and `.gp-shell` carries `bg-background`;
+   either one alone covers the material completely, which is the usual way
+   this feature looks like it "did not work".
+
+   The shell keeps a VEIL rather than going fully clear, and that is the whole
+   contrast strategy. Once the desktop is the backdrop, the ground under 11px
+   muted text is a wallpaper nobody has seen -- it could be a white document.
+   The veil is the floor that makes the worst case bounded instead of unknown:
+   everything above it composites against a known colour, and only what
+   survives the veil varies. */
+html.macos,
+html.macos body {
+  background-color: transparent;
 }
 
 html.macos .gp-shell {
+  background-color: rgb(var(--c-bg) / var(--mac-shell-veil));
+  /* Painted on the shell's own background layer, beneath the opaque page
+     colour, which is where a backdrop filter still samples it from. Ellipse
+     sizes are percentages of the shell, so the field keeps its composition at
+     every window size instead of pooling in one corner. They are deliberately
+     wide enough to overlap across the middle: sized to their own corners the
+     blobs left the centre of the window at the flat base colour, which is the
+     one part of a window nobody can avoid looking at. Each blob fades to its
+     OWN colour at zero alpha rather than to the `transparent` keyword, so the
+     ramp never dips through an unrelated hue on the way out. */
   background-image:
-    radial-gradient(ellipse at 0% 12%, rgb(var(--c-accent) / 0.24), transparent 55%),
-    radial-gradient(ellipse at 85% 90%, rgb(45 175 180 / 0.12), transparent 55%);
+    radial-gradient(78% 72% at 2% 0%, rgb(var(--mac-hue-a) / calc(0.5 * var(--mac-hue-gain))), rgb(var(--mac-hue-a) / 0) 100%),
+    radial-gradient(70% 68% at 98% 6%, rgb(var(--mac-hue-c) / calc(0.42 * var(--mac-hue-gain))), rgb(var(--mac-hue-c) / 0) 100%),
+    radial-gradient(74% 70% at 88% 100%, rgb(var(--mac-hue-b) / calc(0.38 * var(--mac-hue-gain))), rgb(var(--mac-hue-b) / 0) 100%),
+    radial-gradient(64% 62% at 6% 96%, rgb(var(--mac-hue-d) / calc(0.3 * var(--mac-hue-gain))), rgb(var(--mac-hue-d) / 0) 100%);
 }
 
 html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
   /* Solid fallback is the default; translucency requires filter support. */
   background-color: rgb(var(--c-surface));
-  background-image: linear-gradient(155deg, var(--mac-glass-sheen), transparent 48%);
+  /* Two passes make the pane read as a slab rather than a tinted rectangle: a
+     specular sheen down the light-facing diagonal, and a hue wash from the
+     opposite corner that keeps colour on the glass itself when whatever is
+     behind it happens to be flat. */
+  background-image:
+    linear-gradient(155deg, var(--mac-glass-sheen), transparent 46%),
+    linear-gradient(200deg, var(--mac-glass-tint), transparent 72%);
   border-color: var(--mac-glass-edge);
-  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), var(--shadow-card);
+  box-shadow:
+    inset 0 1px 0 var(--mac-glass-sheen),
+    inset 0 -1px 0 var(--mac-glass-shade),
+    var(--shadow-card);
 }
 
 @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
     background-color: var(--mac-glass-fill);
-    -webkit-backdrop-filter: blur(20px) saturate(135%);
-    backdrop-filter: blur(20px) saturate(135%);
   }
+
+  /* Only FLOAT is filtered, and that is the whole cost model in one rule.
+     Chrome is laid out beside and above the panes, never over them, so the
+     only thing in a chrome surface's backdrop is the shell's hue field -- and
+     blurring a smooth gradient returns the same smooth gradient. The four
+     always-on filters that used to run there were paying, on every composited
+     frame, for a difference nobody can point at. Their saturation is baked
+     into the field's own colours instead, which costs nothing per frame.
+     Menus, popovers, toasts and dialog cards genuinely sit over commit rows,
+     diffs and tables, so for them the radius IS the effect; they keep it. */
+  html.macos :is(.gp-menu, .gp-card.shadow-float) {
+    -webkit-backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
+    backdrop-filter: blur(var(--mac-glass-blur-float)) var(--mac-glass-boost);
+  }
+}
+
+/* One blur per dialog, not two.
+   The scrim covers the whole viewport and the card covers a fraction of it, so
+   the scrim is by far the expensive half -- and its own backdrop filter makes
+   it a backdrop root, which leaves the card's filter sampling the scrim's flat
+   wash rather than the application behind it. Paying for a filter that cannot
+   see anything is the worst of both. Dropping it hands the effect to the
+   surface the eye is on and leaves the dim, which is what a scrim is for. */
+html.macos .gp-scrim {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  /* The dim stays each dialog's own choice; only the hue is added here. */
+  background-image: radial-gradient(120% 100% at 50% 0%, rgb(var(--mac-hue-a) / 0.1), transparent 72%);
 }
 
 html.macos .gp-titlebar-actions,
@@ -538,6 +676,12 @@ html.macos .gp-workspace {
   border: 1px solid rgb(var(--c-border) / 0.65);
   border-radius: 16px;
   box-shadow: var(--shadow-card);
+  /* Three quarters of the window is this pane. Leaving it opaque while the
+     chrome around it turned to glass is what made the result read as a dark
+     app with translucent edges rather than a translucent app. It carries no
+     backdrop filter on purpose: the only thing behind it is the shell's own
+     hue field, and blurring a smooth gradient returns the gradient. */
+  background-color: var(--mac-plate-fill);
 }
 
 html.macos .gp-sidebar {
@@ -545,7 +689,10 @@ html.macos .gp-sidebar {
 }
 
 html.macos :is(.gp-menu, .gp-card.shadow-float) {
-  box-shadow: inset 0 1px 0 var(--mac-glass-sheen), var(--shadow-float);
+  box-shadow:
+    inset 0 1px 0 var(--mac-glass-sheen),
+    inset 0 -1px 0 var(--mac-glass-shade),
+    var(--shadow-float);
 }
 
 /* A single shared-element selection glides between the four view buttons.
@@ -604,6 +751,15 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     background-image: none;
   }
 
+  /* The window itself stays transparent -- that is fixed at build time -- so
+     the only way to honour the preference is for the page to paint over it. */
+  html.macos,
+  html.macos body,
+  html.macos .gp-shell,
+  html.macos .gp-workspace {
+    background-color: rgb(var(--c-bg));
+  }
+
   html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float, .gp-liquid-tabs) {
     background: rgb(var(--c-surface));
     border-color: rgb(var(--c-border));
@@ -611,10 +767,11 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     backdrop-filter: none;
   }
 
-  html.macos .backdrop-blur-sm {
+  html.macos :is(.gp-scrim, .backdrop-blur-sm) {
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
-    background: rgb(var(--c-bg) / 0.96);
+    background-image: none;
+    background-color: rgb(var(--c-bg) / 0.96);
   }
 
   html.macos .gp-liquid-selection {

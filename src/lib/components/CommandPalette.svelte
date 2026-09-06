@@ -518,7 +518,7 @@
     onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
-    class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-start justify-center pt-24 select-none gp-gpu"
+    class="gp-scrim bg-black/40 flex items-start justify-center pt-24 select-none gp-gpu"
     style="z-index: {LAYERS.MODAL}"
   >
     <!-- Modal Card -->

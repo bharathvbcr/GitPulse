@@ -44,7 +44,24 @@ name = "gitpulse-hook"
 path = "src/bin/gitpulse-hook.rs"
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
+# `macos-private-api` is what makes the macOS glass appearance possible at all,
+# and the gate is deeper than the name suggests: it forwards `wry/transparent`,
+# and wry compiles its `setOpaque(false)` call only behind that feature. Without
+# it the WKWebView stays opaque on macOS, so the NSVisualEffectView behind it is
+# painted over and the vibrancy is invisible — the effect itself is public API
+# (`tauri::vibrancy` is not feature-gated), but nothing can see it.
+#
+# Enabling it forfeits Mac App Store acceptance. That is a product decision, not
+# an implementation detail, and docs/MACOS_APPEARANCE.md records it.
+#
+# It sits here rather than under `[target.'cfg(target_os = "macos")'.dependencies]`
+# because `tauri-build` validates features against the config by reading the FIRST
+# dependency table that names the crate and stopping — a `tauri` entry in both
+# tables makes it read `features = []` here and fail the build with a mismatch it
+# cannot explain. Only macOS asks for a transparent window (see
+# `tauri.macos.conf.json`), so on Windows and Linux this compiles the wry feature
+# and never reaches it.
+tauri = { version = "2.0.0", features = ["macos-private-api"] }
 tauri-plugin-opener = "2.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

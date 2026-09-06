@@ -61,7 +61,7 @@
 {#if open}
   <!-- Justified: Accessible backdrop dismisses modal on escape or background click -->
   <div
-    class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200"
+    class="gp-scrim bg-black/70 flex items-center justify-center p-4 animate-in fade-in duration-200"
     role="dialog"
     aria-modal="true"
     aria-labelledby="export-modal-title"
