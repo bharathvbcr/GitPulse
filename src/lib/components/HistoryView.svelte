@@ -1,5 +1,6 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
+  import { graphStore } from "../stores/graphStore";
   import { activeSectionFor } from "../views/viewRegistry";
   import ViewSectionBar from "./ViewSectionBar.svelte";
   import ViewSectionPanel from "./ViewSectionPanel.svelte";
@@ -8,6 +9,7 @@
   const view = "history" as const;
   import FilterBar from "./FilterBar.svelte";
   import CommitTable from "./CommitTable.svelte";
+  import GraphNotices from "./GraphNotices.svelte";
   import CommitDetails from "./CommitDetails.svelte";
   import DiffViewer from "./DiffViewer.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
@@ -53,6 +55,11 @@
       <LazyView load={loadReflog} name="the reflog" />
     {:else}
       <div class="flex-1 flex flex-col min-h-0">
+        <!-- What this graph is NOT drawing, above the graph it is about.
+             A repository fact, not a fault: faults go to diagnostics, and
+             filing these there too is what turned a crash log into a list of
+             true sentences. See `GraphNotes` in src-tauri/src/commands. -->
+        <GraphNotices notices={$graphStore.notices} />
         <CommitTable />
         <CommitDetails />
       </div>

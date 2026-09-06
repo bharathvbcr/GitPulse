@@ -14,7 +14,7 @@
 //! unusable, so a check that could not run can never report as one that ran.
 
 use gitpulse_lib::analyzer::CommitFilter;
-use gitpulse_lib::commands::{assemble_commit_graph, resolve_mainline_hint};
+use gitpulse_lib::commands::{assemble_commit_graph, resolve_mainline_hint, GraphNotes};
 use gitpulse_lib::engine::GitReader;
 use gitpulse_lib::graph::{
     hidden_ref_warning, list_ref_decorations, probe_hidden_history, LaneSolver, MainlineHint,
@@ -378,7 +378,7 @@ fn real_repository_filtered_graphs_stay_connected() {
             refs.clone(),
             default_branch.as_deref(),
             head.clone(),
-            Vec::new(),
+            GraphNotes::default(),
         );
         assert_eq!(payload.rows.len(), kept, "{query:?}: filtered row count");
         check_no_stub_points_at_a_loaded_row(&payload.rows);
@@ -538,7 +538,7 @@ fn real_repository_mainline_is_one_straight_rail() {
             refs.clone(),
             default_branch.as_deref(),
             head.clone(),
-            Vec::new(),
+            GraphNotes::default(),
         );
         check_no_stub_points_at_a_loaded_row(&payload.rows);
         let json = serde_json::to_string(&payload).expect("serialize payload");

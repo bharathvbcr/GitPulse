@@ -42,6 +42,13 @@ export interface PulseReport {
   total_commits_scanned: number;
   truncated: boolean;
   payload_truncated: boolean;
+  /**
+   * Why the log stream was a prefix, as a clause to render after naming the
+   * subject; null when it was whole. Hitting the byte budget and failing to
+   * read the stream to its end both set the flag above, and the banner named
+   * only the first.
+   */
+  payload_truncation_reason: string | null;
   duration_ms: number;
 }
 

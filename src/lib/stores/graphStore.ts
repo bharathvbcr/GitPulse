@@ -165,6 +165,13 @@ export interface CommitGraphPayload {
    */
   warnings?: string[];
   /**
+   * What this graph deliberately does not draw: history outside the walked
+   * ref scope, a capped label set. NOT failures — nothing went wrong, so
+   * these belong on screen rather than in the diagnostics ring. Optional:
+   * payloads from before the field existed omit it.
+   */
+  notices?: string[];
+  /**
    * The commit at the top of the pinned mainline — the straight column-0
    * rail the solver keeps for the default branch. Absent on payloads from
    * before the field existed; null only when the graph has no rows.
@@ -194,6 +201,14 @@ export interface GraphState {
   hasMore: boolean;
   /** Backend reads that failed this load (HEAD, ref decorations). */
   warnings: string[];
+  /**
+   * Completeness disclosures for an otherwise-healthy load — what the graph
+   * is not drawing, and how to change that. Rendered beside the graph; see
+   * `HistoryView`. Never sent to diagnostics: a true statement about the
+   * repository is not a fault, and filing it as one is how a bounded crash
+   * log fills with correct sentences and buries the real failure in it.
+   */
+  notices: string[];
   /** Top of the straight mainline column; null when there are no rows. */
   mainlineId: string | null;
   /** Ref the mainline is anchored on, for labelling; null when unnamed. */
@@ -218,6 +233,7 @@ interface CachedGraph {
   maxCommits: number;
   hasMore: boolean;
   warnings: string[];
+  notices: string[];
   mainlineId: string | null;
   mainlineName: string | null;
 }
@@ -239,6 +255,7 @@ function emptyVisible(
     error: null,
     hasMore: false,
     warnings: [],
+    notices: [],
     mainlineId: null,
     mainlineName: null,
   };
@@ -297,6 +314,7 @@ export function graphPayloadSignature(payload: {
   head_id: string | null;
   refs?: readonly RefDecoration[] | null;
   has_more?: boolean;
+  notices?: readonly string[] | null;
   mainline_id?: string | null;
   mainline_name?: string | null;
 }): string {
@@ -305,7 +323,14 @@ export function graphPayloadSignature(payload: {
     .join(";");
   const rows = payload.rows.map(rowSignature).join(";");
   const mainline = `${payload.mainline_id ?? ""}#${payload.mainline_name ?? ""}`;
-  return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${rows}`;
+  // Notices are part of the signature because they are RENDERED. Warnings are
+  // not: they go to the diagnostics ring, which is why they are reported
+  // before this comparison rather than through it. A notice that changed
+  // while the rows stayed put — a harness writing one more checkpoint commit,
+  // pushing "36 not drawn" to "37" — would otherwise short-circuit here and
+  // leave a stale count on screen.
+  const notices = (payload.notices ?? []).join("\u0002");
+  return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${notices}\u0001${rows}`;
 }
 
 /**
@@ -321,6 +346,7 @@ function cachedSignature(cache: {
   headId: string | null;
   refs: RefDecoration[];
   hasMore: boolean;
+  notices: string[];
   mainlineId: string | null;
   mainlineName: string | null;
 }): string {
@@ -329,6 +355,7 @@ function cachedSignature(cache: {
     head_id: cache.headId,
     refs: cache.refs,
     has_more: cache.hasMore,
+    notices: cache.notices,
     mainline_id: cache.mainlineId,
     mainline_name: cache.mainlineName,
   });
@@ -480,6 +507,7 @@ export function createGraphStore(
           maxCommits: cached.maxCommits,
           hasMore: cached.hasMore,
           warnings: cached.warnings,
+          notices: cached.notices,
           mainlineId: cached.mainlineId,
           mainlineName: cached.mainlineName,
           error: null,
@@ -546,9 +574,18 @@ export function createGraphStore(
         if (!isCurrent(repoPath, token)) return;
 
         // Assembly warnings ride along with an otherwise-good payload: each
-        // one marks a degraded facet (HEAD marker, ref labels, history the
-        // walked scope leaves out) that would otherwise render as if it were
-        // honestly empty.
+        // one marks a degraded facet (the HEAD marker, ref labels) that would
+        // otherwise render as if it were honestly empty.
+        //
+        // `payload.notices` is deliberately NOT here. A notice is a true
+        // statement about the repository — "36 commits live in refs/cmux and
+        // this scope does not draw them" — and the backend keeps it in its own
+        // list precisely so the client cannot file it as a fault again. It
+        // used to go through this path, so a workspace of agent-driven
+        // repositories wrote the same correct sentence into the crash log on
+        // every launch, and once per new checkpoint commit besides (the
+        // dedupe key below embeds the count, so 36 → 37 is a fresh entry).
+        // It renders next to the graph instead; see `HistoryView`.
         //
         // Handled BEFORE the identical-payload short-circuit below. Warnings
         // are not part of the rendered-history signature, so a degradation
@@ -617,6 +654,7 @@ export function createGraphStore(
           maxCommits: max,
           hasMore: payload.has_more === true,
           warnings: payload.warnings ?? [],
+          notices: payload.notices ?? [],
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
         };
@@ -633,6 +671,7 @@ export function createGraphStore(
             maxCommits: max,
             hasMore: next.hasMore,
             warnings: next.warnings,
+            notices: next.notices,
             mainlineId: next.mainlineId,
             mainlineName: next.mainlineName,
             error: null,

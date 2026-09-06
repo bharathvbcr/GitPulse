@@ -323,6 +323,109 @@ fn an_explicit_null_is_accepted_where_the_caller_sends_one() {
     assert!(value.get("rows").is_some(), "payload: {value}");
 }
 
+/// A repository the graph cannot fully draw: one commit is reachable only
+/// from `refs/cmux/last-turn/a`, which the default (named) scope leaves out.
+/// That is exactly the shape an agent-harness checkout has in the wild.
+fn repo_with_a_hidden_commit() -> tempfile::TempDir {
+    let dir = repo_with_change();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "."]);
+    git(&["commit", "-m", "a turn checkpoint"]);
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git on PATH");
+    let oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    // Park the tip under a custom namespace and rewind main off it, so the
+    // commit is reachable from the custom ref and from nothing else.
+    git(&["update-ref", "refs/cmux/last-turn/a", &oid]);
+    git(&["reset", "--hard", "HEAD~1"]);
+    dir
+}
+
+/// The routing contract behind [`gitpulse_lib::commands::GraphNotes`]: a
+/// repository fact and a malfunction travel in different lists, because the
+/// client files one in the fault log and shows the other on screen.
+///
+/// This repository is entirely healthy — every probe ran and answered — and
+/// its graph still cannot draw one commit. Before the split, that true
+/// sentence was pushed into the diagnostics ring on every load of every such
+/// repository, which is how a crash log fills with correct statements.
+#[test]
+fn a_healthy_load_that_hides_history_reports_a_notice_and_no_warning() {
+    let repo = repo_with_a_hidden_commit();
+    let value = invoke(
+        "cmd_get_commit_graph",
+        json!({ "repoPath": repo.path().to_string_lossy(), "maxCommits": 50 }),
+    )
+    .expect("the graph loads");
+
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    let notices = value["notices"].as_array().expect("notices array");
+    assert!(
+        warnings.is_empty(),
+        "nothing failed, so nothing is a warning: {warnings:?}"
+    );
+    let disclosure = notices
+        .iter()
+        .filter_map(|n| n.as_str())
+        .find(|n| n.contains("reachable only from refs outside"))
+        .unwrap_or_else(|| panic!("the hidden commit must still be disclosed: {notices:?}"));
+    assert!(
+        disclosure.contains("refs/cmux"),
+        "the disclosure must name where the history lives: {disclosure}"
+    );
+    assert!(
+        disclosure.contains("All refs"),
+        "and how to see it: {disclosure}"
+    );
+}
+
+/// The inverse, so the split cannot be "fixed" by moving everything: a probe
+/// that could not run is a fault and must stay in `warnings`, where the
+/// diagnostics log will pick it up.
+#[test]
+fn a_failed_probe_is_a_warning_not_a_notice() {
+    let repo = repo_with_a_hidden_commit();
+    // A repository whose HEAD cannot resolve: the walk still succeeds from
+    // the branch, but the HEAD probe fails.
+    std::fs::write(
+        repo.path().join(".git").join("HEAD"),
+        "ref: refs/heads/
+",
+    )
+    .expect("write");
+    let value = invoke(
+        "cmd_get_commit_graph",
+        json!({ "repoPath": repo.path().to_string_lossy(), "maxCommits": 50 }),
+    );
+    // Whether the load survives at all is git's call and not what is pinned
+    // here; what is pinned is that a degradation never arrives as a notice.
+    if let Ok(value) = value {
+        let notices = value["notices"].as_array().expect("notices array");
+        for notice in notices.iter().filter_map(|n| n.as_str()) {
+            assert!(
+                !notice.contains("unavailable")
+                    && !notice.contains("probe failed")
+                    && !notice.contains("thread panic"),
+                "a failure was filed as a notice: {notice}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_wrongly_typed_argument_is_refused_at_the_bridge() {
     // maxCommits is a usize; a string must not be coerced into one.

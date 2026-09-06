@@ -42,8 +42,23 @@ describe("DiffViewer truncation honesty", () => {
 
   it("tells the user which cut happened rather than one generic message", () => {
     expect(source).toContain("{#if cutByBackend}");
-    expect(source).toMatch(/larger than GitPulse reads/i);
     expect(source).toMatch(/Staging is disabled/i);
+  });
+
+  /**
+   * Regression: the backend cut has two causes — the diff was bigger than the
+   * read budget, or the engine could not read the stream to its end — and the
+   * banner asserted the first for both. "Larger than GitPulse reads in one go"
+   * sends the reader to open individual files; the other cause is a transient
+   * read failure a reload fixes. The backend now says which, and the banner
+   * renders that rather than deriving one.
+   */
+  it("renders the backend's stated cause instead of assuming the size one", () => {
+    expect(source).not.toMatch(/larger than GitPulse reads/i);
+    expect(source).toContain("selectedDiffTruncationReason");
+    expect(source).toContain("{backendCutReason}");
+    // A missing reason must still disclose the prefix, cause-neutrally.
+    expect(source).toContain('?? "is incomplete"');
   });
 });
 

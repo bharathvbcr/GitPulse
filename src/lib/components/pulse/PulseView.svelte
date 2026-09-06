@@ -338,7 +338,11 @@
       <div class="flex items-center gap-2 text-amber-500">
         <AlertCircle size={15} class="shrink-0" />
         {#if report.payload_truncated}
-          <span class="font-medium">Log output hit the payload budget.</span>
+          <!-- Named, not assumed: the flag is also set by a stream we could
+               not read to the end, which is not a budget problem. -->
+          <span class="font-medium"
+            >Log output {report.payload_truncation_reason ?? "is incomplete"}.</span
+          >
           <span class="text-textMuted hidden sm:inline">Tiles below are a prefix, not the full history. Raising the commit cap would make this worse.</span>
         {:else}
           <span class="font-medium">History bounded at {report.total_commits_scanned.toLocaleString()} commits.</span>

@@ -59,6 +59,11 @@ pub struct CommitGraphPayload {
     /// before this field deserializable.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// What this graph deliberately does not draw — see [`GraphNotes`] for why
+    /// these travel separately from `warnings`. `default` keeps payloads from
+    /// before this field deserializable.
+    #[serde(default)]
+    pub notices: Vec<String>,
     /// The commit at the top of the pinned mainline: the straight column-0
     /// rail the solver keeps for the default branch (see
     /// [`crate::graph::MainlineHint`]). `None` only when the graph has no
@@ -70,6 +75,30 @@ pub struct CommitGraphPayload {
     /// newest commit's chain was pinned instead.
     #[serde(default)]
     pub mainline_name: Option<String>,
+}
+
+/// What a graph load has to say about itself, in the two kinds that must not
+/// be confused.
+///
+/// They were one `Vec<String>` and every entry went to the diagnostics ring —
+/// the app's crash log. That put a *true statement about the repository*
+/// ("36 commits live in `refs/cmux` and this scope does not draw them") in the
+/// same place as a *malfunction*, once per repository per launch, and since
+/// the sentence embeds a commit count it minted a fresh entry every time a
+/// harness wrote another checkpoint. A bounded fault log filling with correct
+/// statements is how the one real failure in it stops being visible.
+///
+/// The rule for which list an entry belongs in: `warnings` is "GitPulse could
+/// not do this", `notices` is "GitPulse did not draw this, and here is how to
+/// change that". Only the first is a fault.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GraphNotes {
+    /// A facet that could not be read: a probe that failed, a thread that
+    /// died. Belongs in diagnostics — someone has to fix it.
+    pub warnings: Vec<String>,
+    /// A completeness disclosure about an otherwise-healthy load. Belongs on
+    /// screen, next to the graph it is about, never in the fault log.
+    pub notices: Vec<String>,
 }
 
 /// The refs that anchor the straight mainline column, resolved once per
@@ -235,7 +264,7 @@ pub fn assemble_commit_graph(
     refs: Vec<RefDecoration>,
     default_branch: Option<&str>,
     head_id: Option<String>,
-    warnings: Vec<String>,
+    notes: GraphNotes,
 ) -> CommitGraphPayload {
     let has_more = raw_commits.len() > max_commits;
     if has_more {
@@ -286,7 +315,8 @@ pub fn assemble_commit_graph(
         head_id,
         refs,
         has_more,
-        warnings,
+        warnings: notes.warnings,
+        notices: notes.notices,
         mainline_id,
         mainline_name,
     }
@@ -321,7 +351,9 @@ pub async fn cmd_get_commit_graph(
         // why the frontend normalizes the persisted preference before sending
         // it. Widening the graph beyond the refs it can label stays opt-in.
         let ref_scope = ref_scope.unwrap_or_default();
-        let mut warnings: Vec<String> = Vec::new();
+        // Two lists, not one: see [`GraphNotes`]. `warnings` is what someone
+        // has to fix; `notices` is what this graph is honestly not drawing.
+        let mut notes = GraphNotes::default();
         let repo = repo_path.clone();
         let rev = revision.clone();
         // Parsing is pure string work, so it happens BEFORE the walk: a `path:`
@@ -388,13 +420,13 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                warnings.push(format!(
+                notes.warnings.push(format!(
                     "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
                 ));
                 None
             }
             Err(_) => {
-                warnings.push(
+                notes.warnings.push(
                     "background task failed (thread panic): HEAD probe died; commit graph may \
                      lack the HEAD marker"
                         .into(),
@@ -406,20 +438,22 @@ pub async fn cmd_get_commit_graph(
             Ok(Ok(listing)) => {
                 // A capped label set must not pass for a complete one: the
                 // rows are still drawn, so silence here would leave a chip
-                // missing with nothing to explain it.
+                // missing with nothing to explain it. A notice rather than a
+                // warning — the listing succeeded and the cap is ours, so
+                // there is nothing here for anyone to fix.
                 if let Some(note) = listing.truncation_warning() {
-                    warnings.push(note);
+                    notes.notices.push(note);
                 }
                 listing.decorations
             }
             Ok(Err(err)) => {
-                warnings.push(format!(
+                notes.warnings.push(format!(
                     "ref decorations unavailable ({err}); branches/tags will not be labeled"
                 ));
                 Vec::new()
             }
             Err(_) => {
-                warnings.push(
+                notes.warnings.push(
                     "background task failed (thread panic): ref decoration walk died; \
                      branches/tags will not be labeled"
                         .into(),
@@ -433,14 +467,14 @@ pub async fn cmd_get_commit_graph(
         let default_branch = match default_branch {
             Ok(Ok(name)) => name,
             Ok(Err(err)) => {
-                warnings.push(format!(
+                notes.warnings.push(format!(
                     "default branch unresolved ({err}); the straight mainline column is \
                      anchored on a conventional branch name or HEAD"
                 ));
                 None
             }
             Err(_) => {
-                warnings.push(
+                notes.warnings.push(
                     "background task failed (thread panic): default branch probe died; the \
                      straight mainline column is anchored on a conventional branch name or HEAD"
                         .into(),
@@ -456,15 +490,15 @@ pub async fn cmd_get_commit_graph(
         match hidden {
             Ok(Ok(Some(hidden))) => {
                 if let Some(note) = crate::graph::hidden_ref_warning(&hidden) {
-                    warnings.push(note);
+                    notes.notices.push(note);
                 }
             }
             Ok(Ok(None)) => {}
-            Ok(Err(err)) => warnings.push(format!(
+            Ok(Err(err)) => notes.warnings.push(format!(
                 "hidden-ref probe failed ({err}); refs outside branches, remotes and tags may \
                  hold history this graph does not draw"
             )),
-            Err(_) => warnings.push(
+            Err(_) => notes.warnings.push(
                 "background task failed (thread panic): hidden-ref probe died; refs outside \
                  branches, remotes and tags may hold history this graph does not draw"
                     .into(),
@@ -479,7 +513,7 @@ pub async fn cmd_get_commit_graph(
             refs,
             default_branch.as_deref(),
             head_id,
-            warnings,
+            notes,
         ))
     })
     .await
@@ -2631,12 +2665,15 @@ mod tests {
     #[test]
     fn commit_graph_payload_round_trips_warnings() {
         let warning = "HEAD unavailable (bad object HEAD); commit graph may lack the HEAD marker";
+        let notice = "36 commit(s) reachable only from refs outside branches, remotes and tags \
+                      are not drawn.";
         let payload = CommitGraphPayload {
             rows: Vec::new(),
             head_id: None,
             refs: Vec::new(),
             has_more: false,
             warnings: vec![warning.to_string()],
+            notices: vec![notice.to_string()],
             mainline_id: Some("abc".to_string()),
             mainline_name: Some("main".to_string()),
         };
@@ -2647,12 +2684,16 @@ mod tests {
         );
         let back: CommitGraphPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.warnings, vec![warning]);
+        // Two lists on the wire, not one: a client that folded them back
+        // together would refile every disclosure as a fault again.
+        assert_eq!(back.notices, vec![notice]);
 
         // `folds` was shipped (and never read) by earlier builds; a payload
         // carrying it must still deserialize.
         let legacy = r#"{"rows":[],"folds":[],"head_id":null,"refs":[],"has_more":false}"#;
         let back: CommitGraphPayload = serde_json::from_str(legacy).unwrap();
         assert!(back.warnings.is_empty(), "absent field defaults to empty");
+        assert!(back.notices.is_empty(), "absent field defaults to empty");
         assert!(back.mainline_id.is_none() && back.mainline_name.is_none());
     }
 
@@ -3211,7 +3252,7 @@ mod assemble_tests {
             main_ref(),
             Some("main"),
             Some("m0".to_string()),
-            Vec::new(),
+            GraphNotes::default(),
         )
     }
 
@@ -3357,7 +3398,10 @@ mod assemble_tests {
             main_ref(),
             Some("main"),
             None,
-            vec!["HEAD unavailable".to_string()],
+            GraphNotes {
+                warnings: vec!["HEAD unavailable".to_string()],
+                ..GraphNotes::default()
+            },
         );
         assert!(payload.has_more);
         assert_eq!(ids(&payload), ["m0", "m1"]);

@@ -43,7 +43,17 @@ describe("PulseView honesty contracts", () => {
 
   it("does not deepen a payload-capped walk", () => {
     expect(source).toContain("!report?.payload_truncated");
-    expect(source).toContain("payload budget");
+  });
+
+  /**
+   * Regression: "Log output hit the payload budget" was printed whenever the
+   * stream was a prefix, including when the engine failed to read it to the
+   * end — which is not a budget problem and is not fixed by lowering the cap.
+   */
+  it("names the cause the backend reported rather than assuming the budget", () => {
+    expect(source).not.toContain("hit the payload budget");
+    expect(source).toContain("report.payload_truncation_reason");
+    expect(source).toContain('?? "is incomplete"');
   });
 
   it("scopes personal tiles behind an explicit author filter", () => {

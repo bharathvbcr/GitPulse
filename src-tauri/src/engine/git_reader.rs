@@ -1,7 +1,7 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, sandbox_join_canonical, validate_repo,
+    self, git, git_text, git_text_capped, sandbox_join_canonical, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
@@ -173,8 +173,13 @@ pub struct BlameLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffPayload {
     pub text: String,
-    /// True when the diff exceeded the budget and was cut at a line boundary.
+    /// True when the text is a prefix of the real diff, for any reason.
     pub truncated: bool,
+    /// Which reason, as a clause the viewer can render after naming its
+    /// subject; `None` when the diff is whole. Carried rather than assumed:
+    /// "larger than we read in one go" and "we could not read it to the end"
+    /// are different facts, and the banner used to assert the first for both.
+    pub truncation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,10 +307,14 @@ pub struct PulseReport {
     /// True when the commit cap dropped older history, or the byte budget
     /// cut the log stream. Either way the tiles are a prefix, not the repo.
     pub truncated: bool,
-    /// True when stdout hit [`budget::MAX_PULSE_BYTES`]. Distinct from the
-    /// commit cap so the UI can hide "Scan Deeper" — raising `-n` makes a
-    /// byte-capped walk *more* likely to fail closed.
+    /// True when the log stream was a prefix. Distinct from the commit cap so
+    /// the UI can hide "Scan Deeper" — raising `-n` makes a byte-capped walk
+    /// *more* likely to fail closed.
     pub payload_truncated: bool,
+    /// Why the stream was a prefix, when it was; `None` when it was whole.
+    /// Hitting [`budget::MAX_PULSE_BYTES`] and failing to read the stream to
+    /// its end both set the flag, and only one of them is about size.
+    pub payload_truncation_reason: Option<String>,
     pub duration_ms: u64,
 }
 
@@ -939,12 +948,12 @@ impl GitReader {
         // itself. Capped at a line boundary: a partial porcelain record would
         // parse into a `BlameLine` with fabricated fields, which is worse than
         // a short list.
-        let (stdout, truncated) = git_text_capped(
+        let (stdout, incomplete) = git_text_capped(
             &repo,
             &["blame", "--line-porcelain", "--", file_path],
             budget::MAX_BLAME_BYTES,
         )?;
-        let stdout = if truncated {
+        let stdout = if incomplete.is_some() {
             budget::drop_partial_last_line(stdout)
         } else {
             stdout
@@ -994,7 +1003,12 @@ impl GitReader {
     /// than the rows on screen imply.
     pub fn diff_payload(text: String) -> DiffPayload {
         let (text, truncated) = budget::truncate_at_line_boundary(text, budget::MAX_DIFF_BYTES);
-        DiffPayload { text, truncated }
+        DiffPayload {
+            text,
+            truncated,
+            truncation_reason: truncated
+                .then(|| Incomplete::OverCap(budget::MAX_DIFF_BYTES).describe()),
+        }
     }
 
     pub fn get_file_diff(
@@ -1032,13 +1046,14 @@ impl GitReader {
     /// Every diff read funnels here so no reader can forget the budget.
     fn capped_diff(repo: &Path, args: &[&str]) -> Result<DiffPayload, String> {
         let (text, cut_by_engine) = git_text_capped(repo, args, budget::MAX_DIFF_BYTES)?;
-        if cut_by_engine {
+        if let Some(reason) = cut_by_engine {
             // The drain stopped at a byte offset, so the last row is a
             // fragment (and, past a multi-byte character, a replacement char).
             // Drop it rather than render half a hunk line as a whole one.
             return Ok(DiffPayload {
                 text: budget::drop_partial_last_line(text),
                 truncated: true,
+                truncation_reason: Some(reason.describe()),
             });
         }
         Ok(Self::diff_payload(text))
@@ -1468,7 +1483,7 @@ impl GitReader {
         // which is a metric measuring the tooling rather than the team.
         args.extend_from_slice(crate::graph::history_rev_args(RefScope::Named));
 
-        let (stdout, payload_truncated) =
+        let (stdout, payload_incomplete) =
             match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
                 Ok(out) => out,
                 Err(e) => {
@@ -1486,6 +1501,7 @@ impl GitReader {
                             total_commits_scanned: 0,
                             truncated: false,
                             payload_truncated: false,
+                            payload_truncation_reason: None,
                             duration_ms: started.elapsed().as_millis() as u64,
                         });
                     }
@@ -1494,8 +1510,9 @@ impl GitReader {
             };
 
         let (mut commits, top_files, extensions) = parse_pulse_stream(&stdout);
+        let payload_truncated = payload_incomplete.is_some();
 
-        // A byte-capped stream ends mid-commit. Drop the last record so a
+        // A cut-off stream ends mid-commit. Drop the last record so a
         // half-parsed numstat block cannot pose as a complete commit.
         if payload_truncated && !commits.is_empty() {
             commits.pop();
@@ -1516,6 +1533,7 @@ impl GitReader {
             total_commits_scanned,
             truncated,
             payload_truncated,
+            payload_truncation_reason: payload_incomplete.map(|reason| reason.describe()),
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -3173,6 +3191,41 @@ fn b64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prefix must carry a reason, and the reason must be the shared one.
+    ///
+    /// Every surface that tells a user their diff is incomplete — the viewer's
+    /// banner, the AI explanation's warning — renders this string. If the two
+    /// truncation paths (cut in-process at the budget, cut by the engine) ever
+    /// phrase it themselves, one of them will describe a cause it does not
+    /// know, which is the defect this field exists to close.
+    #[test]
+    fn a_truncated_diff_carries_the_shared_reason_and_a_whole_one_carries_none() {
+        let whole = GitReader::diff_payload("diff --git a/a b/a\n+x\n".to_string());
+        assert!(!whole.truncated);
+        assert_eq!(
+            whole.truncation_reason, None,
+            "a complete diff must not offer an explanation for being cut"
+        );
+
+        let huge = "x".repeat(budget::MAX_DIFF_BYTES + 4096);
+        let cut = GitReader::diff_payload(huge);
+        assert!(cut.truncated, "past the budget the text is a prefix");
+        assert_eq!(
+            cut.truncation_reason,
+            Some(Incomplete::OverCap(budget::MAX_DIFF_BYTES).describe()),
+            "the in-process cut must speak with the engine's own vocabulary"
+        );
+        let reason = cut.truncation_reason.expect("just asserted");
+        assert!(
+            reason.contains("exceeded"),
+            "an over-budget diff says so: {reason}"
+        );
+        assert!(
+            !reason.contains("could not be read"),
+            "and must not claim the read failed: {reason}"
+        );
+    }
 
     fn init_stats_repo(dir: &std::path::Path) {
         let output = std::process::Command::new("git")

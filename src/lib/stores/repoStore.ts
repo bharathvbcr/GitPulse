@@ -175,6 +175,12 @@ export interface OpenRepoTab {
 export interface DiffPayload {
   text: string;
   truncated: boolean;
+  /**
+   * Why the text is a prefix, as a clause to render after naming the subject;
+   * null when the diff is whole. The banner used to assert "larger than we
+   * read in one go" for every cut, which is one of two possible causes.
+   */
+  truncation_reason: string | null;
 }
 
 export interface RepoSession {
@@ -210,6 +216,8 @@ export interface RepoSession {
    * a hunk from a prefix stages less than the rows imply.
    */
   selectedDiffTruncated: boolean;
+  /** Why it is a prefix, when it is; null when whole. See `DiffPayload`. */
+  selectedDiffTruncationReason: string | null;
   /**
    * True while a newly selected diff is still being fetched.
    *
@@ -304,6 +312,8 @@ export interface RepoState {
    * a hunk from a prefix stages less than the rows imply.
    */
   selectedDiffTruncated: boolean;
+  /** Why it is a prefix, when it is; null when whole. See `DiffPayload`. */
+  selectedDiffTruncationReason: string | null;
   /**
    * True while a newly selected diff is still being fetched.
    *
@@ -443,6 +453,7 @@ function emptyProjected(): RepoState {
     selectedIgnoreWhitespace: false,
     selectedDiff: null,
     selectedDiffTruncated: false,
+    selectedDiffTruncationReason: null,
     selectedDiffPending: false,
     activeTab: "work",
     viewSections: {},
@@ -485,6 +496,7 @@ function createSession(
     selectionKind: extras.selectionKind ?? "file",
     selectedDiff: extras.selectedDiff ?? null,
     selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
+    selectedDiffTruncationReason: extras.selectedDiffTruncationReason ?? null,
     selectedDiffPending: extras.selectedDiffPending ?? false,
     activeTab: extras.activeTab ?? "work",
     viewSections: { ...(extras.viewSections ?? {}) },
@@ -551,6 +563,7 @@ function project(internal: InternalState): RepoState {
     selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
     selectedDiff: active?.selectedDiff ?? null,
     selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
+    selectedDiffTruncationReason: active?.selectedDiffTruncationReason ?? null,
     selectedDiffPending: active?.selectedDiffPending ?? false,
     activeTab: active?.activeTab ?? "work",
     viewSections: active?.viewSections ?? {},
@@ -1769,6 +1782,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedCommitId: null,
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
+          selectedDiffTruncationReason: diff.truncation_reason ?? null,
           selectedIsStaged: isStaged,
           selectedIgnoreWhitespace: ignoreWhitespace,
           selectedDiffPending: false,
@@ -1844,6 +1858,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: null,
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
+          selectedDiffTruncationReason: diff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
           selectionKind: "commit",
@@ -1885,6 +1900,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedFilePath: filePath,
           selectedDiff: fileDiff.text,
           selectedDiffTruncated: fileDiff.truncated,
+          selectedDiffTruncationReason: fileDiff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
           selectionKind: "commit",
@@ -1925,6 +1941,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedCommitId: null,
           selectedDiff: diff.text,
           selectedDiffTruncated: diff.truncated,
+          selectedDiffTruncationReason: diff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
           selectionKind: "range",
@@ -2364,6 +2381,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedFilePath: null,
         selectedDiff: null,
         selectedDiffTruncated: false,
+        selectedDiffTruncationReason: null,
         selectedIsStaged: false,
         selectionKind: "commit",
         activeTab: "history",

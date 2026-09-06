@@ -131,7 +131,7 @@ flowchart TD
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (138 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 48 contracts (814 fields) |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 48 contracts (818 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` onto PATH via `cargo install`, so the binary agent clients spawn is tracked and refreshable rather than a hand-placed copy |
 | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asserts it reports this tree's version. Distinguishes *absent*, *unresponsive*, and *stale* from *matching* — a missing server must never read the same as a current one. Not in `ci:local`: CI does not install the server, and a check that cannot run must not look like one that passed |

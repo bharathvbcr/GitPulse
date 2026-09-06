@@ -16,6 +16,7 @@ function result(overrides: Partial<TerminalRunResult> = {}): TerminalRunResult {
     stdout_tail: "",
     stderr_tail: "",
     truncated: false,
+    truncation_reason: null,
     duration_ms: 1234,
     ...overrides,
   };

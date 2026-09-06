@@ -1713,8 +1713,13 @@
 
     <div class="flex-1 min-h-0 font-mono flex flex-col">
       {#if scanTruncated}
+        <!-- Cause-neutral on purpose. This flag has three sources — the file
+             listing came back a prefix, the entry cap stopped the classifier,
+             or a directory window dropped candidates — and only some of them
+             are caps. Saying "hit a cap" named one of the three for all of
+             them; what the reader has to act on is the same either way. -->
         <div class="px-4 py-1.5 border-b border-border bg-amber-500/10 text-amber-300 font-sans text-[11px] shrink-0">
-          The scan hit a cap before every artifact was read — missing gutters here mean unknown, not uncovered.
+          The scan did not read every artifact — missing gutters here mean unknown, not uncovered.
         </div>
       {/if}
       {#if linesTruncated}

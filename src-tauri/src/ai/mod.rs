@@ -776,7 +776,7 @@ pub fn explain_commit(
     // context, and a truncation notice inside the prompt would read as commit
     // content. The generation's own warnings carry the fact instead.
     let diff = GitReader::get_commit_diff(repo_path, commit_id)?;
-    let diff_truncated = diff.truncated;
+    let diff_truncation_reason = diff.truncation_reason.clone();
     let diff = diff.text;
     let subject = details.summary.clone();
     let author = format!("{} <{}>", details.author_name, details.author_email);
@@ -795,14 +795,16 @@ pub fn explain_commit(
     if generation.text.is_empty() {
         return Err("The model returned an empty explanation.".into());
     }
-    if diff_truncated {
+    if let Some(reason) = &diff_truncation_reason {
         // An explanation written from a prefix must not read as one written
-        // from the whole commit.
-        generation.warnings.push(
-            "This commit's diff exceeded the read budget and was truncated; the explanation \
-             covers only the part that was read."
-                .to_string(),
-        );
+        // from the whole commit — and it must not name the wrong reason for
+        // the prefix either. This said "exceeded the read budget" for every
+        // cut, including a diff the engine simply failed to read to the end,
+        // which points whoever reads the warning at the wrong remedy.
+        generation.warnings.push(format!(
+            "This commit's diff {reason}, so the explanation covers only the part that \
+             was read."
+        ));
     }
     Ok(generation)
 }

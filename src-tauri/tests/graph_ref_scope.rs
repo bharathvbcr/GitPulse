@@ -16,7 +16,7 @@
 use std::process::Command;
 
 use gitpulse_lib::analyzer::CommitFilter;
-use gitpulse_lib::commands::assemble_commit_graph;
+use gitpulse_lib::commands::{assemble_commit_graph, GraphNotes};
 use gitpulse_lib::engine::GitReader;
 use gitpulse_lib::graph::{
     hidden_ref_warning, list_ref_decorations, probe_hidden_history, RefKind, RefScope,
@@ -107,7 +107,7 @@ fn solve(repo: &str, scope: RefScope) -> gitpulse_lib::commands::CommitGraphPayl
         refs,
         Some("main"),
         head,
-        Vec::new(),
+        GraphNotes::default(),
     )
 }
 

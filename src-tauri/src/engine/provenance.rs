@@ -123,10 +123,14 @@ fn read_note<T: DeserializeOwned>(
             stderr
         });
     }
-    if run.truncated {
+    if let Some(reason) = &run.incomplete {
+        // Named rather than assumed: "exceeded the cap" and "we could not read
+        // it to the end" are different facts, and a note that is a prefix for
+        // either reason is not the note.
         return Err(format!(
-            "the note on {notes_ref} for {commit_sha} exceeded the output cap; \
-             a prefix of it is not the note"
+            "the note on {notes_ref} for {commit_sha} is incomplete (git notes show {}); \
+             a prefix of it is not the note",
+            reason.describe()
         ));
     }
     let text = String::from_utf8_lossy(&run.stdout);
@@ -572,9 +576,10 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
     // A cut-off answer stream is not a short one: the lines that did arrive
     // may be complete, but there is no way to tell which row the cut fell in,
     // so none of the sent rows may claim a resolution from it.
-    if run.truncated {
+    if let Some(reason) = &run.incomplete {
+        let why = format!("git cat-file {}", reason.describe());
         for row in sent {
-            answers[row] = Err("git cat-file output was truncated".to_string());
+            answers[row] = Err(why.clone());
         }
         return answers;
     }
@@ -616,10 +621,11 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashSet<String>, String
     }
     // A truncated listing would report noted commits as unnoted, which reads
     // downstream as "this commit was never verified".
-    if run.truncated {
+    if let Some(reason) = &run.incomplete {
         return Err(format!(
-            "git notes list output for {notes_ref} was truncated; \
-             the set of noted commits would be incomplete"
+            "git notes list {} for {notes_ref}; \
+             the set of noted commits would be incomplete",
+            reason.describe()
         ));
     }
 

@@ -14,6 +14,7 @@ function createMockReport(overrides: Partial<PulseReport> = {}): PulseReport {
     total_commits_scanned: 0,
     truncated: false,
     payload_truncated: false,
+  payload_truncation_reason: null,
     duration_ms: 12,
     ...overrides,
   };
