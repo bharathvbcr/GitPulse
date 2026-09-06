@@ -11,7 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [0.0.6] - 2026-09-05
+## [0.0.6] - 2026-09-06
 
 ### Added
 
@@ -29,6 +29,20 @@ before that tag is pushed.
 - **`gitpulse_ledger_events` returned the oldest events and a fabricated total.** The cursor was pinned at 0 against an `ORDER BY id ASC` query, so a tool described as reading history returned the fifty *oldest* events ever recorded, with no way to reach recent ones; `total` was the returned count wearing the name of the history size. It now reports `returned` and `truncated` for what they are.
 - **Insights folded "not measured" into "measured zero".** A worktree whose `git status` failed, or one past the scan cap, has `dirty_files: null` and was counted **clean** in the `dirty` aggregate; a failed agent listing rendered as "no agent sessions running"; a collision scan that failed on some worktrees still reported `ok: true` with those worktrees counted as neither scanned nor unscanned; `ChangeContext` had no failure channel at all, so four of its five probes failed into empty values that read as "nothing in flight"; per-row churn warnings were dropped, so an unreadable diff read as a file with no changes. Each now carries its own coverage, and `snapshot` has the aggregate deadline its cheaper sibling already had.
 - **`worktree_path` could name a completely unrelated repository.** `gitpulse_active_changes` and `gitpulse_change_context` never related it to `repo_path`, so B's files came back stamped with A's identity. Both now go through the same family check the ledger already used.
+- **Desktop external links, default app launching, and directory revealing were dead at runtime.** `capabilities/default.json` granted `opener:allow-default-urls`, which defined scopes for `http`/`https`/`mailto`/`tel` but left `commands.allow` empty, causing `open_url` to fail with "Command plugin:opener|open_url not allowed by ACL". `open_path` and `reveal_item_in_dir` were ungranted as well, with errors silently ignored in catch blocks or unhandled promises. Furthermore, raw path concatenation in file viewers bypassed containment checks. Opening and revealing files are now routed through a dedicated backend command (`desktop::shell`) that proves path containment against the canonicalized repository root, refusing path traversal and escaping symlinks. The frontend ACL grant is narrowed to `open_url` only. Dual contracts (`acl_contract.rs`, `openExternal.test.ts`) and a 32,000-case stress test (`shell_gate_stress.rs`) verify that frontend invocations and declared capabilities match.
+- **Six accuracy defects on the Health view, where bounded results claimed complete coverage or obscured failure causes.**
+  - Vulnerability breakdown: `formatAuditCounts` omitted `info` from its category list and parameter type, so findings counted into `total` silently disappeared from the breakdown.
+  - Unreferenced symbols: `CodeintelResponse` carries `total`, `shown`, and `truncated`; all three were dropped on arrival, so a query stopped early by token limits reported "No unreferenced symbols" — an all-clear from a partial scan.
+  - Direct vulnerability filter: printed an arbitrary floor threshold as a total count.
+  - Dependabot status: rendered the same empty blank for "checked, nothing open" and "never checked", turning an unexamined remote state into an implied all-clear.
+  - Local audit failures: an installed scanner that errored displayed a generic "Local audit incomplete" with no cause named. The panel now identifies the failing scanner and surfaces the error reason.
+  - Ecosystem breakdown: printed `slice(0, 4)` without cap disclosure, concealing backend family limits.
+  `HealthPanel.test.ts` derives count honesty rules directly from source, and `health-failure-codes-contract` verifies backend failure codes match the frontend scanner map.
+- **Catastrophic regex backtracking (ReDoS) in line search and file queries.** The catastrophic-backtracking guard admitted patterns with bounded repetition (`(?:\w|(\w+){2,4}){3}`, taking 5.0 s at 26 characters during fuzzing), ambiguous alternation (`(a|a)*`, `(?:aa|a)*`), and variable-length group bodies (`(aa?)*`), which explode exponentially on hostile inputs. The backtracking detector (`hasUnboundedNesting`) now checks for repetition multipliers ($\ge 2$), overlapping branch openings, and varying matched lengths. Adversarial fuzzing (`redos.stress.test.ts`) verifies that admitted patterns evaluate within generous millisecond budgets on hostile inputs.
+- **File tree filtering now honestly discloses partial matches when hitting time budgets.** Path filtering under complex queries or large file trees runs under a wall-clock time budget to prevent freezing the window. Previously, when a scan hit its time budget, the partial prefix was displayed as the full result. `FileTreePanel` and `fileQuery` now propagate a `truncated` flag end-to-end: the Explorer count displays `≥N files` in warning amber, the tooltip explains that a partial count is shown, and an explicit notice prompts the user to narrow the pattern.
+- **Recent repository popup menu overflow and keyboard navigation.** The recent repositories menu in `RepoTabBar.svelte` could overflow the viewport. The menu now enforces height constraints (`max-h-[min(28rem,calc(100vh-7.5rem))]`, `max-w-[calc(100vw-1rem)]`, `overflow-y-auto`, and `overscroll-contain`), and both opening and arrow-key navigation scroll focused items into view (`scrollIntoView({ block: "nearest" })`).
+- **Streaming numstat rename synchronization and bounded network git operations.** Git numstat parsing in `git_reader.rs` properly synchronizes brace-escaped and quoted rename paths. Network-facing git operations enforce execution deadlines and process group cleanup to eliminate orphaned background processes.
+- **Logging truncation safety on UTF-8 char boundaries.** Truncation in logger formatting could cut across multi-byte character sequences; truncation is now strictly aligned to valid character boundaries.
 
 ### Performance
 
@@ -37,8 +51,11 @@ before that tag is pushed.
 - **`codeintel::status` no longer materialises the whole edge table to count it.** It called `latest_edges(0.0)` and threw the rows away through `.len()` — 46 MB resident on a 13-file repository — on a call that runs on every `gitpulse_status` and every `gitpulse_insights`.
 - `cargo bench --bench mcp_protocol` reports these; it is deliberately outside `cargo test`, because a wall-clock assertion that fails on a loaded machine is worse than no check.
 
+### Internal
 
+- **The app version is guarded as single-sourced from `package.json`.** Contract tests previously asserted hardcoded version strings (`manifest.version === "0.0.5"`), which passed when written but drifted or tested stale versions after release bumps. `scripts/version-source-contract.test.ts` scans all source, test, and CI workflow files to ensure no source file hardcodes the active version literal, requiring tests to derive it dynamically from `appVersion()`, and verifies that all release manifests discovered in the tree match.
 - **Windows and macOS CI treated a check that could not run as a product failure.** Source-contract tests read files via a file URL's pathname property, which is not a filesystem path on Windows. The MCP doctor test assumed POSIX execute bits, which Node's `X_OK` ignores on Windows. Go coverage planner tests assumed `go` is on PATH; macos-26 only keeps it in the tool cache. Unix-only `real_repo` helpers were still compiled on Windows, so clippy `-D warnings` failed once Vitest started passing. The Codex plugin-path test required a `/plugins/gitpulse` suffix, which a Windows `\\?\` path does not have. The portable-path contract now catches the split pathname form, the doctor test injects `access`, Go command-shape tests force the toolchain present so a missing runtime is explained rather than failed, those helpers are gated `#[cfg(unix)]`, and the plugin-root assertion compares path components.
+
 
 ## [0.0.5] - 2026-09-05
 
