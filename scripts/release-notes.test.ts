@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { appVersion } from "./app-version.mjs";
 import { extractNotes, main, normalizeTag } from "./release-notes.mjs";
+
+const CHANGELOG_PATH = fileURLToPath(new URL("../CHANGELOG.md", import.meta.url));
 
 const CHANGELOG = `# Changelog
 
@@ -74,13 +77,28 @@ describe("release notes extraction", () => {
     expect(main(["--tag", "v0.0.3"])).toBe(0);
   });
 
-  it("extracts the current v0.0.5 section, including the language-mix fix", () => {
-    const changelog = readFileSync(fileURLToPath(new URL("../CHANGELOG.md", import.meta.url)), "utf8");
+  it("extracts the very large v0.0.5 section whole, including the language-mix fix", () => {
+    // Pinned to v0.0.5 on purpose: this is the biggest section the changelog
+    // has ever carried, and it is the size regression this exercises. It is
+    // NOT a check on the release being shipped — see the derived test below.
+    const changelog = readFileSync(CHANGELOG_PATH, "utf8");
     const result = extractNotes(changelog, "v0.0.5");
     expect(result.found).toBe(true);
     if (!result.found) return;
     expect(result.body).toContain("Language mix was ordered by category, not by share");
     expect(result.body).toContain("Release notes for this tag would have failed to publish");
     expect(result.body.length).toBeGreaterThan(48_000);
+  });
+
+  it("has notes for the version this tree is about to ship", () => {
+    // The tag a release builds is `v${package.json version}`, so this is the
+    // one section whose absence stops a release — and the one a hardcoded
+    // version can never keep pointing at. Deriving it means the check follows
+    // every bump instead of silently going on asserting about an old release.
+    const version = appVersion();
+    const result = extractNotes(readFileSync(CHANGELOG_PATH, "utf8"), `v${version}`);
+    expect(result.found, `CHANGELOG.md has no [${version}] section with a body`).toBe(true);
+    if (!result.found) return;
+    expect(result.body.trim().length).toBeGreaterThan(0);
   });
 });
