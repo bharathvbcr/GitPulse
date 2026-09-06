@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { prefersReducedMotion } from "../motion/easing";
 
 export type Theme = "dark" | "light";
 export type ThemePreference = "system" | Theme;
@@ -50,10 +51,10 @@ type ViewTransitionDocument = Document & {
 function applyWithTransition(theme: Theme) {
   if (typeof document === "undefined") return;
   const doc = document as ViewTransitionDocument;
-  const reduceMotion =
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Asked through the shared helper rather than matchMedia directly, so the
+  // in-app "reduce motion" preference silences the crossfade too. A private
+  // media check here would have honoured the system and ignored the setting.
+  const reduceMotion = prefersReducedMotion();
   if (typeof doc.startViewTransition !== "function" || reduceMotion) {
     applyResolved(theme);
     return;

@@ -466,3 +466,30 @@ describe("DiffViewer accessibility", () => {
     expect(source).toMatch(/aria-label=\{selectedLines\.has\(\s*index,?\s*\)\s*\? "Deselect line" : "Select line for patch staging"\}/);
   });
 });
+
+
+describe("DiffViewer opens at the configured defaults", () => {
+  /**
+   * Layout, wrap and syntax were fixed literals, reset on every mount. They
+   * now start from Settings > Diff & code — but only start there: the toolbar
+   * still owns the file in front of you.
+   */
+  it("seeds layout, wrap and syntax from one snapshot of the preferences", () => {
+    expect(source).toContain("const diffDefaults = get(interfaceStore);");
+    expect(source).toContain('let viewMode = $state<"unified" | "split">(diffDefaults.diffLayout);');
+    expect(source).toContain("let wordWrap = $state(diffDefaults.diffWordWrap);");
+    expect(source).toContain("let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);");
+  });
+
+  it("reads the preferences once rather than binding the toolbar to them", () => {
+    // A live `$interfaceStore.diffLayout` binding would snap the pane back to
+    // the default the moment anything else touched the store, taking the
+    // reader's toolbar choice with it. There must be no reactive read of
+    // these three fields anywhere in the component.
+    for (const field of ["diffLayout", "diffWordWrap", "diffSyntaxHighlight"]) {
+      expect(source, `${field} is read reactively`).not.toContain(
+        `$interfaceStore.${field}`,
+      );
+    }
+  });
+});

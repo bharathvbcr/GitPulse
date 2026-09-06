@@ -274,3 +274,29 @@ describe("App chrome preferences", () => {
     );
   });
 });
+
+
+describe("App display preferences", () => {
+  /**
+   * Three preferences that live in the document rather than in a component.
+   * A store field with no applier is the classic half-wired setting: it
+   * persists, it renders as selected, and it changes nothing on screen.
+   */
+  it.each([
+    ["applyAccent", "applyAccent($interfaceStore.accent, $themeStore)"],
+    ["applyReduceMotion", "applyReduceMotion($interfaceStore.reduceMotion)"],
+    ["applyTabWidth", "applyTabWidth($interfaceStore.tabWidth)"],
+  ])("applies %s from the store", (name, call) => {
+    expect(source, `${name} is never imported`).toContain(`import { ${name} }`);
+    expect(source, `${name} is imported but never called from the store`).toContain(call);
+  });
+
+  it("re-applies the accent when the resolved theme flips", () => {
+    // Each accent is a light/dark pair; keying only on the choice would leave
+    // the dark shade painted on a light window.
+    const { script } = scriptAndTemplate(source);
+    const call = script.indexOf("applyAccent($interfaceStore.accent");
+    expect(call).toBeGreaterThan(-1);
+    expect(script.slice(call)).toContain("$themeStore");
+  });
+});

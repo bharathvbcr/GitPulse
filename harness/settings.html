@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>gp-settings booting</title>
+    <style>
+      html, body { margin: 0; background: #0b0e17; color: #dfe6f5; }
+      #app { height: 900px; width: 1280px; overflow: hidden; }
+      /* A probe target for the reduced-motion rules, which key off .gp-view. */
+      #motion-probe { position: fixed; top: 0; left: 0; width: 1px; height: 1px; }
+      #tab-probe { position: fixed; top: 0; left: 2px; white-space: pre; font-family: monospace; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="motion-probe" class="gp-view"></div>
+    <pre id="tab-probe">&#9;x</pre>
+    <script type="module">
+      window.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+
+      await import("../src/app.css");
+
+      // Shaped, never blanket null: a null seam crashes component init and the
+      // torn-down effects would hide exactly what this page is here to check.
+      const mcpInfo = {
+        server_name: "gitpulse-mcp",
+        protocol_version: "2026-07-28",
+        binary_found: true,
+        binary_path: "/usr/local/bin/gitpulse-mcp",
+        binary_error: "",
+        plugin_found: true,
+        plugin_path: "/repo/.codex-plugin/plugin.json",
+        plugin_error: "",
+        plugin_manifest_json: "{}",
+        plugin_mcp_json: "{}",
+        tools: [{ name: "gitpulse_insights", title: "Repository insights" }],
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd) => (cmd === "cmd_mcp_info" ? mcpInfo : null),
+      };
+
+      const { mount } = await import("svelte");
+      const SettingsHost = (await import("./SettingsHost.svelte")).default;
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const { themeStore } = await import("../src/lib/stores/themeStore");
+      const { applyAccent } = await import("../src/lib/ui/accents");
+      const { applyTabWidth } = await import("../src/lib/ui/codeDisplay");
+      const { applyReduceMotion } = await import("../src/lib/motion/motionPreference");
+
+      // The same three appliers App.svelte runs, wired the same way. Their
+      // presence in App.svelte is pinned by src/App.test.ts; what this page
+      // checks is what they actually do to a live document.
+      let theme = "dark";
+      themeStore.subscribe((next) => {
+        theme = next;
+        applyAccent(interfaceStore.__prefs?.accent ?? "blue", theme);
+      });
+      interfaceStore.subscribe((prefs) => {
+        interfaceStore.__prefs = prefs;
+        applyAccent(prefs.accent, theme);
+        applyReduceMotion(prefs.reduceMotion);
+        applyTabWidth(prefs.tabWidth);
+      });
+
+      mount(SettingsHost, { target: document.getElementById("app") });
+
+      window.__gp = { interfaceStore, themeStore };
+      document.title = "gp-settings ready";
+    </script>
+  </body>
+</html>

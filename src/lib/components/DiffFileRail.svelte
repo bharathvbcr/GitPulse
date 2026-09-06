@@ -42,7 +42,8 @@
     type CommitEntry,
     type CommitRail,
   } from "../diff/commitRail";
-  import { formatRelativeTime, shortHash } from "../format";
+  import { shortHash } from "../format";
+  import { timestampFormat } from "../ui/timestampFormat";
   import VirtualList from "./VirtualList.svelte";
 
   let {
@@ -300,7 +301,7 @@
           <span class="min-w-0 flex-1">
             <span class="block truncate">{commitLabel(commit)}</span>
             <span class="block truncate text-[9px] opacity-70">
-              {commit.authorName} · {formatRelativeTime(commit.timestamp)}{commit.isMerge
+              {commit.authorName} · {$timestampFormat.text(commit.timestamp)}{commit.isMerge
                 ? " · merge"
                 : ""}
             </span>

@@ -1,7 +1,11 @@
 <script lang="ts">
   import type { VisualCommitRow } from "../canvas/GraphRenderer";
   import { getBranchColor } from "../canvas/Palette";
-  import { formatRelativeTime } from "../format";
+  import {
+    formatTimestamp,
+    timestampTitle,
+    type TimestampStyle,
+  } from "../ui/timestampStyle";
   import { authorColor, authorIdentity } from "../authors/authorIdentity";
   import { isKeyboardFocus } from "../dom/focusVisibility";
   import {
@@ -37,6 +41,7 @@
     row,
     isSelected = false,
     density = "spacious",
+    timestampStyle = "relative",
     refs = [],
     onSelect,
     mergeTarget = null,
@@ -46,6 +51,13 @@
     row: VisualCommitRow;
     isSelected?: boolean;
     density?: "spacious" | "compact";
+    /**
+     * Relative ("3d ago") or absolute ("2026-09-06"). A prop rather than a
+     * store read: this component renders once per visible row, and it already
+     * takes `density` — the other preference that changes its geometry — the
+     * same way.
+     */
+    timestampStyle?: TimestampStyle;
     refs?: RefItem[];
     onSelect?: () => void;
     /**
@@ -70,6 +82,7 @@
   let menuEl = $state<HTMLDivElement | undefined>();
 
   const isCompact = $derived(density === "compact");
+  const isAbsoluteTime = $derived(timestampStyle === "absolute");
   const avatar = $derived(authorIdentity(row.author_name, row.author_email));
 
   function getConventionalType(msg: string): { type: string; color: string } | null {
@@ -298,8 +311,20 @@
   <span class="{isCompact ? 'text-[10px] w-24' : 'text-[11px] w-28'} text-textMuted shrink-0 truncate text-right font-medium select-text">
     {row.author_name}
   </span>
-  <span class="{isCompact ? 'text-[10px] w-14' : 'text-[11px] w-16'} text-textMuted/70 shrink-0 text-right">
-    {formatRelativeTime(row.timestamp)}
+  <!-- Widened for the absolute style: "2026-09-06" does not fit the column a
+       relative "3d ago" needs, and a truncated date is a wrong date. The
+       title carries whichever form is not on screen. -->
+  <span
+    class="{isCompact
+      ? isAbsoluteTime
+        ? 'text-[10px] w-[4.6rem]'
+        : 'text-[10px] w-14'
+      : isAbsoluteTime
+        ? 'text-[11px] w-[5.2rem]'
+        : 'text-[11px] w-16'} text-textMuted/70 shrink-0 text-right"
+    title={timestampTitle(row.timestamp, timestampStyle)}
+  >
+    {formatTimestamp(row.timestamp, timestampStyle)}
   </span>
 
   <!-- Author Initials Avatar -->

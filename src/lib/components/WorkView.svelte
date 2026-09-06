@@ -55,7 +55,7 @@
     rowLastActivity,
     type WorkFacet,
   } from "../work/focus";
-  import { formatRelativeTime } from "../format";
+  import { timestampFormat } from "../ui/timestampFormat";
   import type { PolicyStatus } from "../stores/harnessStore";
 
   let projection = $state<WorkProjection | null>(null);
@@ -663,7 +663,7 @@
                 {#if rowLastActivity(row, $repoStore.branches)}
                   {@const activity = rowLastActivity(row, $repoStore.branches)!}
                   <span title="{activity.branch} last moved{activity.author ? ` — ${activity.author}` : ''}">
-                    {formatRelativeTime(activity.timestamp)}
+                    {$timestampFormat.text(activity.timestamp)}
                   </span>
                 {/if}
               </div>

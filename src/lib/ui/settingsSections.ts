@@ -11,6 +11,7 @@ export const SETTINGS_SECTION_IDS = [
   "layout",
   "views",
   "graph",
+  "diff",
   "analysis",
   "agents",
   "updates",
@@ -46,6 +47,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     id: "graph",
     label: "Commit graph",
     summary: "Lane spacing, graph width and the author gutter.",
+  },
+  {
+    id: "diff",
+    label: "Diff & code",
+    summary: "How a diff opens, and how code is drawn everywhere.",
   },
   {
     id: "analysis",

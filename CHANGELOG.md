@@ -11,6 +11,21 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Eight new preferences, and a way to find any of them.** Settings gained a *Diff & code* category and five appearance controls, which took the page past thirty switches — the point where grouping stops being enough, because knowing that word wrap lives under "Diff & code" means already knowing GitPulse's taxonomy. A filter box now narrows the category rail *and* the rows inside each panel, matching synonyms the labels never say ("side by side" finds the split-diff default). Every control is stamped with the catalog id it is registered under, and the catalog and the markup are compared in both directions: a control with no entry is unfindable by search, an entry with no control is a result that highlights nothing, and neither can ship.
+- **An accent colour.** Six choices tint selection, focus rings, the macOS glass and the commit graph's current-row marker. Each carries a separate light and dark shade — accent text sits on `--c-surface-hover`, which is near-black in one theme and near-white in the other, so one colour cannot be legible on both — and every pair is checked against WCAG AA by a test derived from the palette itself. `--shadow-glow` and `--ring-focus` are now expressed in terms of `--c-accent` rather than restated, so a teal window does not wear a blue focus ring; picking the default removes the override entirely and hands the theme back to the stylesheet.
+- **Reduce motion, as an in-app preference.** Deliberately one-way: leaving it off follows the system, and turning it on can only *add* reduction — a reader whose OS has asked for less motion cannot be overruled from a checkbox. It reaches both places motion is produced, the Svelte transitions and the CSS entrance animations, because either half alone is a setting that visibly half-works. The two triggers are mirrored rule for rule and a test pins the lists equal.
+- **Timestamps as dates.** Commit times can read `2026-09-06` instead of `3d ago` — fixed width, sortable, and the same in every locale, which `06/09` is not. It reaches the commit list, branch tooltips, the diff's change picker, Work and the stack through one owner; whichever form is shown, hovering gives the other, and the commit list's column widens for a date rather than truncating one.
+- **Diff defaults that survive the next file.** Layout, word wrap, syntax highlighting and ignore-whitespace were fixed literals reset on every mount, so a reader who preferred split diffs re-selected split every time. They are now preferences that a diff *opens* at; the toolbar still owns the file in front of you. The whitespace default seeds each newly opened repository, and the copy names the wrap ceiling (4,000 rows) rather than offering a switch that silently does not apply above it.
+- **Tab width — 2, 4 or 8 — everywhere code is drawn.** Declared once on the document root, where `tab-size` inherits, so the diff, the file viewer, blame and the conflict editor all follow without each learning the preference exists. 8 is the CSS initial value and stays the default, so nothing renders differently until it is asked to.
+- **Arrow keys in the settings category rail.** It has always been a `tablist` of `tab`s and was one in name only: eight separate tab stops, none of which answered the arrow keys the role promises. It is now a single tab stop with Up/Down (wrapping), Home and End.
+
+### Fixed
+
+- **`hidden` did not hide.** The UA stylesheet's `[hidden] { display: none }` loses to any author rule that sets `display`, so a Tailwind `flex` utility on the same element silently outranked it — two settings rows kept rendering while marked hidden, which the filter depends on. `[hidden]` is now enforced at author level regardless of which utilities a row picks up later.
+- **The theme segment could report a choice the app was no longer honouring.** It snapshotted the preference at mount, and ⌘-shortcuts and the native View menu change it from outside the modal; reopening now re-reads it. A control that reads as selected while something else is in force is the same failure as a setting that does nothing.
+
 ## [0.0.6] - 2026-09-06
 
 ### Added
