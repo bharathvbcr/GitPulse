@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
@@ -640,18 +640,30 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<
     })
 }
 
-fn spawn() -> Result<Sidecar, HarnessError> {
-    let binary = resolve_binary().ok_or_else(|| {
-        HarnessError::NotInstalled(
-            "no `manvi` binary on PATH, in ~/.local/bin, or named by GITPULSE_MANVI_BIN".into(),
-        )
-    })?;
+/// "Where we looked for `manvi`", read back from the lookup that did the
+/// looking.
+///
+/// The literal this replaced named only `~/.local/bin` while
+/// [`resolve_binary`] searched five directories, so it sent anyone whose
+/// `manvi` sat in a Homebrew or toolchain bin to check the wrong place. A
+/// hand-written list of search locations goes stale the moment one is added;
+/// deriving it means the message cannot disagree with the search.
+fn not_installed_message() -> String {
+    let searched = crate::engine::git_cli::external_tool_fallback_dirs()
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("no `manvi` binary on PATH, in {searched}, or named by GITPULSE_MANVI_BIN")
+}
 
-    let dir = scratch_dir()?;
-    let mut command = Command::new(&binary);
+/// The `manvi serve` invocation, built separately so its environment can be
+/// asserted without starting a sidecar.
+fn sidecar_command(binary: &str, dir: &Path) -> Command {
+    let mut command = Command::new(binary);
     command
         .args(["serve", "--posture", "host"])
-        .current_dir(&dir)
+        .current_dir(dir)
         // Both of these keep the harness out of the working tree: the first
         // stops it preparing a repository at all, the second keeps its state
         // out of whatever directory it did start in.
@@ -661,6 +673,29 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Resolving `manvi` itself is not enough: it shells out to `git` and to
+    // whatever the repository's own tooling needs, and a GUI launch would
+    // hand all of that the minimal `/usr/bin:/bin:/usr/sbin:/sbin`. Same
+    // reason the capture seam extends it — a tool found only because we
+    // searched the fallback dirs must not then fail to find its own.
+    if !cfg!(windows) {
+        let path_var = std::env::var_os("PATH");
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        if let Some(child_path) =
+            crate::engine::git_cli::extended_child_path(path_var.as_deref(), home.as_deref())
+        {
+            command.env("PATH", child_path);
+        }
+    }
+    command
+}
+
+fn spawn() -> Result<Sidecar, HarnessError> {
+    let binary =
+        resolve_binary().ok_or_else(|| HarnessError::NotInstalled(not_installed_message()))?;
+
+    let dir = scratch_dir()?;
+    let mut command = sidecar_command(&binary, &dir);
     // Its own process group, and registered, so this long-lived child dies
     // with us rather than outliving the app that started it.
     let (mut child, guard) = crate::procguard::spawn(&mut command, "manvi serve").map_err(|e| {
@@ -1433,6 +1468,55 @@ while IFS= read -r line; do
   reply "$line" '{"action":"allow","rule":"stub","severity":"info","reason":"stub allow","target":"","task_id":"","demoted":""}'
 done
 "#;
+
+    /// A sidecar found only because we searched the fallback dirs must not
+    /// then fail to find its own tools: `manvi` shells out to `git`, and a GUI
+    /// launch would otherwise hand it the minimal PATH we just worked around.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_children_inherit_the_extended_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cmd = sidecar_command("manvi", dir.path());
+        let path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("sidecar must be handed an extended PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+        for fallback in crate::engine::git_cli::external_tool_fallback_dirs() {
+            assert!(
+                entries.contains(&fallback),
+                "sidecar PATH must reach {}: {entries:?}",
+                fallback.display()
+            );
+        }
+    }
+
+    /// The "not installed" message must name every directory the lookup
+    /// actually searched. Derived on both sides from
+    /// `external_tool_fallback_dirs`, so adding a search directory without
+    /// telling the user about it fails here instead of shipping a message
+    /// that points at the wrong place.
+    #[test]
+    fn not_installed_message_names_every_searched_directory() {
+        let msg = not_installed_message();
+        let dirs = crate::engine::git_cli::external_tool_fallback_dirs();
+        assert!(
+            !dirs.is_empty(),
+            "an empty search list would make this assertion vacuous"
+        );
+        for dir in &dirs {
+            assert!(
+                msg.contains(&dir.display().to_string()),
+                "message must name searched dir {}: {msg}",
+                dir.display()
+            );
+        }
+        // The two locations that are not directories still have to be named,
+        // or the message describes only part of the lookup.
+        assert!(msg.contains("PATH"), "{msg}");
+        assert!(msg.contains("GITPULSE_MANVI_BIN"), "{msg}");
+    }
 
     /// Reentrancy is load-bearing, not a convenience: [`call_policy`] takes
     /// this guard on every test-build call, so a test that holds it across an
