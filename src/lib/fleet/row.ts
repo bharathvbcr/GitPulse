@@ -16,9 +16,11 @@ import { isLiveUpdating } from "../repos/watchState";
 import { formatAge } from "../storage/format";
 import {
   UNSCANNED,
+  deltaFrom,
   failedCell,
   readCell,
   type Cell,
+  type CommitsCellValue,
   type FleetMetrics,
   type FleetRepoFacet,
   type FleetRow,
@@ -141,11 +143,19 @@ function locCell(
   if (failure) return scanFailure(failure, at, now);
   if (!metrics || metrics.loc === null || at === null) return UNSCANNED;
   return readCell(
-    { lines: metrics.loc, language: metrics.loc_language },
+    {
+      lines: metrics.loc,
+      language: metrics.loc_language,
+      // A ledger written before breakdowns were recorded has a total and no
+      // mix. Defaulting to `[]` rather than inventing one segment keeps the
+      // bar absent, which is the truth.
+      languages: metrics.languages ?? [],
+    },
     at,
     // A capped language scan counted part of the tree. Rendering its total
     // like a complete one is presenting a sample as full coverage.
     metrics.loc_truncated,
+    deltaFrom(metrics.loc, metrics.loc_prev, metrics.loc_prev_day),
   );
 }
 
@@ -167,6 +177,7 @@ function storageCell(
     // A budget-truncated walk reports floors. Rendering them like complete
     // totals is how "we stopped counting" becomes "that is all there is".
     metrics.storage_truncated,
+    deltaFrom(metrics.storage_bytes, metrics.storage_prev_bytes, metrics.storage_prev_day),
   );
 }
 
@@ -192,6 +203,7 @@ function healthCell(
     // An audit where some target never ran found fewer vulnerabilities than
     // exist, and must not read like a clean bill of health.
     !metrics.health_complete,
+    deltaFrom(metrics.vulns_total, metrics.vulns_prev_total, metrics.vulns_prev_day),
   );
 }
 
@@ -203,24 +215,59 @@ function coverageCell(
   const at = parseStamp(metrics?.coverage_at);
   if (failure) return scanFailure(failure, at, now);
   if (!metrics || metrics.coverage_pct === null || at === null) return UNSCANNED;
-  return readCell(metrics.coverage_pct, at, metrics.coverage_truncated);
+  return readCell(
+    metrics.coverage_pct,
+    at,
+    metrics.coverage_truncated,
+    deltaFrom(metrics.coverage_pct, metrics.coverage_prev_pct, metrics.coverage_prev_day),
+  );
+}
+
+/**
+ * The commit-rhythm cell for one repository.
+ *
+ * A window whose counts are all zero is a *measured* silence — a repository
+ * nobody has touched this quarter — and it renders as a real reading of zero,
+ * not as an absence. Only a probe that could not run becomes a failure, and
+ * only a repository the sweep never reached stays unscanned. The three states
+ * mean three different things here exactly as they do in every other column.
+ */
+function commitsCell(facet: FleetRepoFacet): FleetRow["commits"] {
+  if (!facet.commits_ok || facet.commits === null) {
+    return failedCell(facet.commits_error || "the commit history could not be read");
+  }
+  const stats = facet.commits;
+  const value: CommitsCellValue = {
+    windowDays: stats.window_days,
+    commits: stats.commits,
+    authors: stats.authors,
+    activeDays: stats.active_days,
+    recent: stats.commits_7d,
+    prior: stats.commits_prior_7d,
+    daily: stats.daily,
+  };
+  // A capped walk read the newest commits and stopped. Every count above is
+  // then a floor, and the cell says so rather than letting a bounded read
+  // present itself as the whole history.
+  return readCell(value, null, stats.truncated);
 }
 
 /** Tier 1 cells for one repository, given its facet (or the sweep's failure). */
 function tierOne(
   facet: FleetRepoFacet | undefined,
   snapshotError: string | null,
-): Pick<FleetRow, "work" | "activity"> {
+): Pick<FleetRow, "work" | "activity" | "commits"> {
   if (snapshotError) {
     const failure = failedCell(snapshotError);
-    return { work: failure, activity: failure };
+    return { work: failure, activity: failure, commits: failure };
   }
-  if (!facet) return { work: UNSCANNED, activity: UNSCANNED };
+  if (!facet) return { work: UNSCANNED, activity: UNSCANNED, commits: UNSCANNED };
   if (!facet.ok) {
     const failure = failedCell(facet.error || "the repository could not be read");
-    return { work: failure, activity: failure };
+    return { work: failure, activity: failure, commits: failure };
   }
   return {
+    commits: commitsCell(facet),
     work: facet.worktrees_ok
       ? readCell(
           {
@@ -373,6 +420,7 @@ function recentRow(
     watchWarning: null,
     work: UNSCANNED,
     activity: UNSCANNED,
+    commits: UNSCANNED,
     loc: locCell(metrics, failures.loc, inputs.now),
     storage: storageCell(metrics, failures.storage, inputs.now),
     health: healthCell(metrics, failures.health, inputs.now),

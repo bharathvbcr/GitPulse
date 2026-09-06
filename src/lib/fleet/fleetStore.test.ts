@@ -16,12 +16,16 @@ function snapshot(paths: string[]): FleetSnapshot {
       agents: { ok: true, sessions: 0, kinds: [] },
       last_commit_ok: true,
       last_commit_epoch: 1_757_000_000,
+      commits_ok: true,
+      commits_error: "",
+      commits: null,
       metrics_ok: true,
       metrics_error: "",
       metrics: null,
     })),
     requested: paths.length,
     scanned: paths.length,
+    anchor_epoch: 1_757_000_000,
     truncated: false,
     duration_ms: 3,
   };
@@ -60,7 +64,7 @@ describe("the cheap sweep", () => {
     await store.refresh(["/a", "/b"]);
     expect(calls).toHaveLength(1);
     expect(calls[0].cmd).toBe("cmd_fleet_snapshot");
-    expect(calls[0].args).toEqual({ repoPaths: ["/a", "/b"] });
+    expect(calls[0].args).toEqual({ repoPaths: ["/a", "/b"], windowDays: 90 });
     expect(get(store).snapshot?.repos).toHaveLength(2);
   });
 
@@ -359,6 +363,52 @@ describe("reset", () => {
       scanning: null,
       progress: null,
       lastRun: null,
+      windowDays: 90,
     });
+  });
+});
+
+describe("the commit window", () => {
+  /** A store wired to a snapshot-only fake, for the window assertions. */
+  function windowHarness() {
+    const { fn, calls } = fakeInvoke({ cmd_fleet_snapshot: (args) => snapshot(args.repoPaths as string[]) });
+    return { store: createFleetStore({ invoke: fn }), calls };
+  }
+
+  it("defaults to 90 days and sends it with every sweep", async () => {
+    const { store, calls } = windowHarness();
+    await store.refresh(["/a"]);
+    expect(get(store).windowDays).toBe(90);
+    expect(calls[0].args).toMatchObject({ windowDays: 90 });
+  });
+
+  it("re-reads the workspace rather than relabelling the rows it already has", async () => {
+    // The whole point. A snapshot taken at 90 days cannot answer a question
+    // about 30, and leaving those rows on screen under a "30d" label is the
+    // plainest possible version of the lie this store exists to prevent.
+    const { store, calls } = windowHarness();
+    await store.refresh(["/a"]);
+    calls.length = 0;
+    await store.setWindow(30);
+    expect(get(store).windowDays).toBe(30);
+    expect(calls.filter((c) => c.cmd === "cmd_fleet_snapshot")).toHaveLength(1);
+    expect(calls[0].args).toMatchObject({ repoPaths: ["/a"], windowDays: 30 });
+  });
+
+  it("ignores a window the control does not offer", async () => {
+    const { store, calls } = windowHarness();
+    await store.refresh(["/a"]);
+    calls.length = 0;
+    await store.setWindow(7);
+    expect(get(store).windowDays, "an unoffered window changes nothing").toBe(90);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not re-sweep when the window has not actually changed", async () => {
+    const { store, calls } = windowHarness();
+    await store.refresh(["/a"]);
+    calls.length = 0;
+    await store.setWindow(90);
+    expect(calls).toHaveLength(0);
   });
 });

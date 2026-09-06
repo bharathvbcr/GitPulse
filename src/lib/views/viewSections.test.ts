@@ -4,11 +4,13 @@ import {
   VIEW_REGISTRY,
   activeSectionFor,
   defaultSectionFor,
+  describeDestination,
   isSectionOnScreen,
   resolveSection,
   sectionsFor,
 } from "./viewRegistry";
 import { RETIRED_VIEWS, isViewTab } from "../repos/persist";
+import { WIP_DESTINATIONS, WIP_REASON_KINDS } from "../repos/wipSummary";
 
 describe("view sections", () => {
   it("gives History the three lenses that were three tabs", () => {
@@ -102,6 +104,35 @@ describe("view sections", () => {
         ).toBe(retired.section);
       }
     }
+  });
+
+  it("points every work-in-progress destination at a view and section this build has", () => {
+    // The workspace roll-up sends a reader from a named repository to the
+    // pane that answers its worst reason. `setActiveTab` resolves an unknown
+    // section to the view's default rather than failing, so a renamed section
+    // would not throw — it would quietly land everyone on Overview while the
+    // row's tooltip still promised Resolve. Derived from the kind list, so a
+    // new reason cannot skip this check.
+    expect(WIP_REASON_KINDS.length).toBeGreaterThanOrEqual(6);
+    for (const kind of WIP_REASON_KINDS) {
+      const { tab, section } = WIP_DESTINATIONS[kind];
+      expect(isViewTab(tab), `${kind} lands on an unregistered view`).toBe(true);
+      expect(
+        resolveSection(tab, section),
+        `${kind} lands on a section ${tab} does not offer`,
+      ).toBe(section);
+    }
+  });
+
+  it("names a destination the way the header and section bar spell it", () => {
+    // The name travels into tooltips that promise where a click will land, so
+    // it is read out of the registry rather than written at the call site.
+    expect(describeDestination("work", "resolve")).toBe("Work → Resolve");
+    expect(describeDestination("history", "diff")).toBe("History → Diff");
+    // No section, or one this build dropped: the view's own name, never an
+    // arrow pointing at a pane that is not there.
+    expect(describeDestination("work")).toBe("Work");
+    expect(describeDestination("work", "retired-section")).toBe("Work");
   });
 
   it("keeps the registry's own section list in display order", () => {

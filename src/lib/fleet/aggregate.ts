@@ -144,6 +144,89 @@ export function byUrgency(rows: readonly FleetRow[]): FleetRow[] {
   });
 }
 
+/**
+ * What a severity band is called, when it is a heading over a list of rows.
+ *
+ * Spelled out per severity rather than derived from the enum name, so a new
+ * severity is a compile-time gap rather than a heading that reads "stash".
+ * These describe the *band*, not one repository — `repoWip` already owns the
+ * per-repository clause ("3 files with conflicts"), and this must not become a
+ * second, drifting vocabulary for the same states.
+ */
+export const SEVERITY_BAND: Readonly<Record<FleetSeverity, string>> = {
+  conflicts: "Blocked by conflicts",
+  operation: "Parked mid-operation",
+  unknown: "State unknown",
+  uncommitted: "Uncommitted work",
+  unpushed: "Unpushed commits",
+  stash: "Stashed work only",
+  clean: "Clean",
+};
+
+/** One severity band and the rows in it, worst band first. */
+export interface FleetBand {
+  readonly severity: FleetSeverity;
+  readonly label: string;
+  readonly rows: readonly FleetRow[];
+}
+
+/**
+ * Splits ordered rows into severity bands, keeping the order it was given.
+ *
+ * Deliberately does NOT sort: it is handed the output of {@link byUrgency} and
+ * only inserts the boundaries, so the grouped view and the flat view can never
+ * disagree about which repository comes first. An empty band is omitted rather
+ * than rendered as a heading over nothing.
+ *
+ * This is what lets "needs attention" stop being a mode. As a filter it made
+ * the answer to *what needs attention* a state the reader has to switch into
+ * and back out of; as bands it is simply how the list reads, and the clean
+ * repositories stay one collapsed heading away instead of behind a toggle.
+ */
+export function bandsBySeverity(rows: readonly FleetRow[]): FleetBand[] {
+  const bands: FleetBand[] = [];
+  for (const row of rows) {
+    const last = bands[bands.length - 1];
+    // Rows arrive grouped because they arrive sorted, so a band closes as soon
+    // as the severity changes. A row whose severity reappears later would open
+    // a second band of the same name — which would mean the input was not
+    // ordered, and silently merging it would hide that.
+    if (last && last.severity === row.severity) {
+      (last.rows as FleetRow[]).push(row);
+      continue;
+    }
+    bands.push({ severity: row.severity, label: SEVERITY_BAND[row.severity], rows: [row] });
+  }
+  return bands;
+}
+
+/**
+ * Which bands are actually collapsed, given what the reader asked for.
+ *
+ * `clean` is collapsed on arrival so the triage queue is the first thing on
+ * screen. That default has one failure mode, and it is severe: in a workspace
+ * where **every** repository is clean there is exactly one band, so the default
+ * collapses the only band there is and the grid renders nothing — the reader
+ * opens Fleet on a healthy workspace and is shown an explanation where their
+ * repositories should be.
+ *
+ * So the default may never empty the grid. It is a way of ordering attention,
+ * and an attention aid that hides everything is just a broken table.
+ *
+ * A collapse the reader performed themselves is honoured whatever it leaves,
+ * including nothing: that is a state they chose and can see how to undo. Only
+ * the default is constrained, because nobody chose it.
+ */
+export function effectiveCollapse(
+  bands: readonly FleetBand[],
+  collapsed: ReadonlySet<string>,
+  touched: boolean,
+): ReadonlySet<string> {
+  if (touched) return collapsed;
+  const remaining = bands.filter((band) => !collapsed.has(band.severity));
+  return remaining.length === 0 ? new Set<string>() : collapsed;
+}
+
 export interface FleetHeadline {
   /** Open repositories on the grid. */
   readonly open: number;

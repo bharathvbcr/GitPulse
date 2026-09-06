@@ -14,7 +14,7 @@ use crate::engine::worktree::{self, agent_kind, agent_session_slug, changed_path
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -680,6 +680,239 @@ pub const MAX_FLEET_REPOS: usize = 64;
 /// dashboard that never paints.
 const FLEET_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Days of history one fleet commit probe reads, when the caller says nothing.
+///
+/// Long enough that a quarter's rhythm is visible, short enough that the walk
+/// stays a fraction of a second on a busy repository. Every count in
+/// [`FleetCommitStats`] is over exactly this span — "31 commits" is not a fact
+/// until the window it was counted in travels with it, which is why
+/// `window_days` is reported back rather than assumed by the reader.
+pub const FLEET_COMMIT_WINDOW_DAYS: u32 = 90;
+
+/// The longest window a caller may ask for.
+///
+/// The walk itself is bounded by [`MAX_FLEET_COMMITS`] rather than by the
+/// window, so a longer span costs no extra `git`; the cap is on the per-repo
+/// `daily` array, which crosses IPC once per repository per sweep. At 180 days
+/// and the 64-repository cap that is 11,520 numbers, which is a payload; at an
+/// unbounded window it is whatever the caller typed.
+pub const MAX_FLEET_COMMIT_WINDOW_DAYS: u32 = 180;
+
+/// Clamps a requested window into something this probe will actually honour.
+///
+/// Zero and absurd values are corrected rather than refused: the window is a
+/// display preference, and failing a whole fleet sweep because a stale client
+/// asked for 10,000 days would be a worse answer than 180. The window that was
+/// *used* travels back on every `FleetCommitStats`, so a clamped request is
+/// visible to the caller rather than silently substituted.
+pub fn clamp_commit_window(window_days: Option<u32>) -> u32 {
+    match window_days {
+        None => FLEET_COMMIT_WINDOW_DAYS,
+        Some(days) => days.clamp(1, MAX_FLEET_COMMIT_WINDOW_DAYS),
+    }
+}
+
+/// Ceiling on commits one probe reads.
+///
+/// The walk is bounded by COUNT rather than by `--since`, and that is a
+/// deliberate, measured choice. `git log --since` prunes: it stops descending
+/// a parent chain at the first commit older than the cutoff, so a single
+/// out-of-order committer date — a cherry-pick, an imported history, a skewed
+/// clock — drops every genuine in-window commit behind it. Reproduced on git
+/// 2.50: a five-commit chain with one inverted date reported three of its four
+/// in-window commits, with nothing to say it had stopped early. Silent
+/// under-reporting is the one failure this whole surface exists to prevent.
+///
+/// Reading by count instead costs a bounded walk: measured at 90 ms for 20,000
+/// commits on a 200,000-commit repository, against 810 ms for that history in
+/// full. Across a workspace under [`FLEET_DEADLINE`] that is affordable, and
+/// it is exact for every history shape.
+///
+/// Past the cap the walk stops and `truncated` says so, which makes every
+/// count a floor rather than a total that happens to be wrong.
+const MAX_FLEET_COMMITS: usize = 20_000;
+
+/// Seconds in one bucket.
+///
+/// Buckets are rolling 24-hour spans anchored at the sweep, NOT local calendar
+/// days. This process has no timezone of its own, and picking one here would
+/// file a commit under a different day than the per-repository Pulse view —
+/// which does bucket by local calendar day — does. A span the reader can
+/// state exactly beats a "day" that means two things.
+const BUCKET_SECONDS: i64 = 86_400;
+
+/// Buckets one short-term trend covers, and the trend it is compared against.
+const TREND_BUCKETS: usize = 7;
+
+/// One repository's commit rhythm over a bounded window.
+///
+/// Cheap by construction: one `git log` that reads commit metadata and never
+/// touches a diff. The expensive churn-and-authorship version of this question
+/// is [`crate::engine::git_reader::GitReader::pulse_report`], which is what
+/// the per-repository Pulse view runs on demand for one repository at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetCommitStats {
+    /// Days the window spans, and the length of `daily`.
+    pub window_days: u32,
+    /// Unix seconds the window ends at: the moment the sweep read it.
+    ///
+    /// Bucket `i` of `daily` covers
+    /// `[anchor_epoch - (window_days - i) * 86400, anchor_epoch - (window_days - i - 1) * 86400)`.
+    /// Every repository in one sweep shares this anchor, which is what lets a
+    /// caller sum the series across repositories bucket for bucket.
+    pub anchor_epoch: i64,
+    /// Commits in the window. Always equals the sum of `daily`, so a count and
+    /// the series it summarizes can never describe different populations.
+    pub commits: u32,
+    /// Distinct author emails among those commits.
+    pub authors: u32,
+    /// Buckets carrying at least one commit.
+    pub active_days: u32,
+    /// Commits in the newest seven buckets.
+    pub commits_7d: u32,
+    /// Commits in the seven buckets before those, so a trend has something to
+    /// be a trend against rather than being drawn from one number.
+    pub commits_prior_7d: u32,
+    /// Newest commit in the window, unix seconds; zero when the window is
+    /// empty. Zero here never means "no commits ever" — a repository can be
+    /// quiet for a quarter — which is why the facet keeps its own
+    /// `last_commit_epoch` probe for exactly that case.
+    pub last_commit_epoch: i64,
+    /// One count per bucket, oldest first, exactly `window_days` long.
+    pub daily: Vec<u32>,
+    /// True when [`MAX_FLEET_COMMITS`] stopped the walk. Every count above is
+    /// then a floor, and a caller that renders it as a total is presenting a
+    /// capped sample as complete coverage.
+    pub truncated: bool,
+}
+
+fn empty_commit_stats(anchor_epoch: i64, window_days: u32) -> FleetCommitStats {
+    FleetCommitStats {
+        window_days,
+        anchor_epoch,
+        commits: 0,
+        authors: 0,
+        active_days: 0,
+        commits_7d: 0,
+        commits_prior_7d: 0,
+        last_commit_epoch: 0,
+        daily: vec![0; window_days as usize],
+        truncated: false,
+    }
+}
+
+/// Commit rhythm for one repository over [`FLEET_COMMIT_WINDOW_DAYS`].
+///
+/// A repository with no commits at all is a readable answer — an empty window,
+/// not a failed probe — so it comes back as `Ok`, exactly as
+/// [`last_commit_epoch`] treats the same case.
+/// Buckets one `git log` payload into a window's worth of counts.
+///
+/// Split from the spawn so every rule below — the bucket boundary, the
+/// out-of-window drop, the author set, the truncation flag — is a unit test
+/// against a string rather than something that needs a repository shaped just
+/// so. Two of them cannot be reached through git at all: git refuses to write
+/// a commit with a date near `i64`'s floor, and it never emits a row missing
+/// its separator. Both are still handled, and now both are still tested.
+///
+/// `parsed` is the number of rows git actually emitted, which is how
+/// truncation is detected; it is separate from the number that landed in a
+/// bucket, which is almost always smaller.
+fn bucket_commit_log(text: &str, anchor_epoch: i64, window_days: u32) -> FleetCommitStats {
+    let buckets = window_days as usize;
+    let mut daily = vec![0u32; buckets];
+    let mut authors: HashSet<&str> = HashSet::new();
+    let mut newest = 0i64;
+    let mut parsed = 0usize;
+    for line in text.lines() {
+        let Some((stamp, email)) = line.trim().split_once('\u{1f}') else {
+            continue;
+        };
+        let Ok(epoch) = stamp.trim().parse::<i64>() else {
+            continue;
+        };
+        parsed += 1;
+        // The walk covers all of history up to the cap, so most rows are older
+        // than the window. Anything outside it — including a commit stamped in
+        // the future by a skewed clock — is dropped from every count rather
+        // than folded into an edge bucket, so `commits` and `daily` always
+        // describe the same population.
+        //
+        // Saturating, not plain subtraction: `%ct` is parsed as an i64, and a
+        // corrupt stamp near the type's floor would overflow — a panic in a
+        // debug build, and a wrap into a plausible-looking bucket in a release
+        // one. Saturating puts it far outside the window, where the bounds
+        // check below drops it like any other out-of-window row.
+        let age = anchor_epoch.saturating_sub(epoch);
+        let from_newest = if age <= 0 {
+            0
+        } else {
+            (age / BUCKET_SECONDS) as usize
+        };
+        if from_newest >= buckets {
+            continue;
+        }
+        let index = buckets - 1 - from_newest;
+        daily[index] = daily[index].saturating_add(1);
+        if epoch > newest {
+            newest = epoch;
+        }
+        let email = email.trim();
+        if !email.is_empty() {
+            authors.insert(email);
+        }
+    }
+
+    let sum = |slice: &[u32]| -> u32 { slice.iter().fold(0u32, |acc, n| acc.saturating_add(*n)) };
+    let recent_from = buckets.saturating_sub(TREND_BUCKETS);
+    let prior_from = buckets.saturating_sub(TREND_BUCKETS * 2);
+    FleetCommitStats {
+        window_days,
+        anchor_epoch,
+        commits: sum(&daily),
+        authors: authors.len() as u32,
+        active_days: daily.iter().filter(|count| **count > 0).count() as u32,
+        commits_7d: sum(&daily[recent_from..]),
+        commits_prior_7d: sum(&daily[prior_from..recent_from]),
+        last_commit_epoch: newest,
+        daily,
+        truncated: parsed > MAX_FLEET_COMMITS,
+    }
+}
+
+fn fleet_commit_stats(
+    repo: &Path,
+    anchor_epoch: i64,
+    window_days: u32,
+) -> Result<FleetCommitStats, String> {
+    // One over the cap, so "we stopped early" is observable rather than
+    // indistinguishable from a repository that happens to have exactly the cap.
+    let limit = (MAX_FLEET_COMMITS + 1).to_string();
+    let text = match git_text(
+        repo,
+        &[
+            "log",
+            "--no-show-signature",
+            "-n",
+            &limit,
+            "--format=%ct%x1f%ae",
+            "--",
+        ],
+    ) {
+        Ok(text) => text,
+        Err(error) => {
+            // The same discrimination `last_commit_epoch` makes: no HEAD is an
+            // empty repository, which is data; anything else is a probe that
+            // could not run, which is not.
+            if git_text(repo, &["rev-parse", "--verify", "HEAD"]).is_err() {
+                return Ok(empty_commit_stats(anchor_epoch, window_days));
+            }
+            return Err(error);
+        }
+    };
+    Ok(bucket_commit_log(&text, anchor_epoch, window_days))
+}
+
 /// One repository's cheap facet: what can be learned in two `git` spawns.
 ///
 /// Deliberately NOT what [`snapshot`] returns. That function probes every
@@ -687,6 +920,12 @@ const FLEET_DEADLINE: Duration = Duration::from_secs(10);
 /// and cross-scans up to 16 for colliding paths — right for one repository on
 /// screen, and several hundred subprocesses when multiplied by a workspace.
 /// Everything expensive is left to the per-repository views that already do it.
+///
+/// The commit-rhythm probe added a third `git` spawn only for a repository
+/// that has been quiet for the whole window: when the window has commits it
+/// already carries the newest one, so `last_commit_epoch`'s own `git log -1`
+/// is skipped. An active workspace therefore still costs two spawns per
+/// repository, and a dormant one costs three cheap ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetRepoFacet {
     pub repo_path: String,
@@ -705,6 +944,13 @@ pub struct FleetRepoFacet {
     /// Unix seconds of the newest commit reachable from HEAD. Zero is a real
     /// answer (a repository with no commits) only when `last_commit_ok`.
     pub last_commit_epoch: i64,
+    /// Whether the commit-rhythm probe ran. False leaves `commits` `None`,
+    /// which is "we could not look" — never "this repository is quiet".
+    pub commits_ok: bool,
+    pub commits_error: String,
+    /// Commit counts over a bounded window. `Some` exactly when `commits_ok`;
+    /// an empty window inside it is a measured silence, and `None` is not.
+    pub commits: Option<FleetCommitStats>,
     /// Whether this repository's ledger could be consulted at all. False means
     /// the metric cache below is unknown, not empty.
     pub metrics_ok: bool,
@@ -718,6 +964,11 @@ pub struct FleetSnapshot {
     pub repos: Vec<FleetRepoFacet>,
     pub requested: u32,
     pub scanned: u32,
+    /// The instant every commit window in this sweep is anchored at, in unix
+    /// seconds. Carried on the snapshot as well as on each facet so a caller
+    /// summing the series across repositories can check they agree rather
+    /// than assume it.
+    pub anchor_epoch: i64,
     /// True when the repository cap or the sweep deadline stopped the walk
     /// short, so `repos` covers fewer repositories than were asked for.
     pub truncated: bool,
@@ -735,6 +986,9 @@ fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
         agents: unknown_agents(),
         last_commit_ok: false,
         last_commit_epoch: 0,
+        commits_ok: false,
+        commits_error: String::new(),
+        commits: None,
         metrics_ok: false,
         metrics_error: String::new(),
         metrics: None,
@@ -761,7 +1015,14 @@ fn last_commit_epoch(repo: &Path) -> Result<i64, String> {
     }
 }
 
-fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
+/// Reads one repository's facet, anchored at the sweep's own clock.
+///
+/// `anchor_epoch` is passed in rather than read here so every repository in
+/// one sweep buckets its commits against the same instant. Read per
+/// repository, twenty-four rows would carry twenty-four slightly different
+/// anchors and their series could no longer be summed bucket for bucket —
+/// which is exactly what the fleet-wide activity chart does with them.
+fn fleet_facet(repo_path: &str, anchor_epoch: i64, window_days: u32) -> FleetRepoFacet {
     let repo = match validate_repo(repo_path) {
         Ok(path) => path,
         Err(error) => return unreadable_facet(repo_path, error),
@@ -788,9 +1049,22 @@ fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
             Err(error) => (false, error, 0, unknown_agents()),
         };
 
-    let (last_commit_ok, last_commit) = match last_commit_epoch(&repo) {
-        Ok(epoch) => (true, epoch),
-        Err(_) => (false, 0),
+    let (commits_ok, commits_error, commits) =
+        match fleet_commit_stats(&repo, anchor_epoch, window_days) {
+            Ok(stats) => (true, String::new(), Some(stats)),
+            Err(error) => (false, error, None),
+        };
+
+    // The window probe already read the newest commit whenever the window has
+    // one, so the dedicated `git log -1` only runs for a repository that has
+    // been silent for the whole window, or whose probe failed — the two cases
+    // where the window cannot answer the question.
+    let (last_commit_ok, last_commit) = match commits.as_ref().map(|s| s.last_commit_epoch) {
+        Some(epoch) if epoch > 0 => (true, epoch),
+        _ => match last_commit_epoch(&repo) {
+            Ok(epoch) => (true, epoch),
+            Err(_) => (false, 0),
+        },
     };
 
     let (metrics_ok, metrics_error, metrics) = match crate::ledger::read_fleet_metrics(repo_path) {
@@ -811,6 +1085,9 @@ fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
         agents,
         last_commit_ok,
         last_commit_epoch: last_commit,
+        commits_ok,
+        commits_error,
+        commits,
         metrics_ok,
         metrics_error,
         metrics,
@@ -824,9 +1101,16 @@ fn fleet_facet(repo_path: &str) -> FleetRepoFacet {
 /// Duplicate paths collapse to one facet, because two tabs can name the same
 /// repository through different symlinks or letter cases and scanning it twice
 /// makes the two runs contend for the same `.git` lock.
-pub fn fleet_snapshot(repo_paths: &[String]) -> FleetSnapshot {
+pub fn fleet_snapshot(repo_paths: &[String], window_days: Option<u32>) -> FleetSnapshot {
     let started = Instant::now();
     let requested = repo_paths.len() as u32;
+    // Clamped once, here, and then shared by every facet — so a sweep cannot
+    // end up with rows on two different windows, which is the one thing that
+    // makes the per-repository series unsummable.
+    let window_days = clamp_commit_window(window_days);
+    // One clock for the whole sweep. See [`fleet_facet`]: the per-repository
+    // commit series are only summable because they share this anchor.
+    let anchor_epoch = (crate::ledger::ids::now_millis() / 1000) as i64;
 
     let mut seen = std::collections::HashSet::new();
     let mut targets: Vec<&String> = Vec::new();
@@ -849,7 +1133,7 @@ pub fn fleet_snapshot(repo_paths: &[String]) -> FleetSnapshot {
                 // never arrive looking like one that was read and found empty.
                 return unreadable_facet(path, "the fleet sweep ran out of time".to_string());
             }
-            fleet_facet(path)
+            fleet_facet(path, anchor_epoch, window_days)
         })
         .collect();
 
@@ -862,6 +1146,7 @@ pub fn fleet_snapshot(repo_paths: &[String]) -> FleetSnapshot {
         truncated: over_cap || expired.load(Ordering::Relaxed),
         requested,
         scanned,
+        anchor_epoch,
         duration_ms: started.elapsed().as_millis() as u64,
         repos,
     }
@@ -1452,10 +1737,363 @@ mod tests {
         assert_eq!(changes.total, 0);
     }
 
+    /// Commits an empty change stamped at an exact instant.
+    ///
+    /// `git_in` cannot carry environment, and a commit-rhythm test that lets
+    /// git pick "now" for every commit can only ever assert on one bucket.
+    fn commit_at(dir: &Path, message: &str, epoch: i64, email: &str) {
+        let stamp = format!("@{epoch} +0000");
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=GitPulse",
+                "-c",
+                &format!("user.email={email}"),
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ])
+            .env("GIT_AUTHOR_DATE", &stamp)
+            .env("GIT_COMMITTER_DATE", &stamp)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_EMAIL", email)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git commit");
+        assert!(
+            output.status.success(),
+            "commit {message} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn commit_stats_bucket_by_age_and_count_distinct_authors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        // Two commits today from one author, one three days back from another.
+        commit_at(dir.path(), "a", anchor - 100, "one@example.com");
+        commit_at(dir.path(), "b", anchor - 200, "one@example.com");
+        commit_at(
+            dir.path(),
+            "c",
+            anchor - 3 * 86_400 - 100,
+            "two@example.com",
+        );
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        assert_eq!(stats.window_days, FLEET_COMMIT_WINDOW_DAYS);
+        assert_eq!(stats.anchor_epoch, anchor);
+        assert_eq!(stats.daily.len(), FLEET_COMMIT_WINDOW_DAYS as usize);
+        assert_eq!(stats.commits, 3);
+        assert_eq!(stats.authors, 2, "two distinct emails");
+        assert_eq!(stats.active_days, 2, "two buckets carry commits");
+        // Newest bucket last: two today, one three buckets back.
+        let last = stats.daily.len() - 1;
+        assert_eq!(stats.daily[last], 2);
+        assert_eq!(stats.daily[last - 3], 1);
+        assert_eq!(stats.commits_7d, 3, "all three are inside the last week");
+        assert_eq!(stats.commits_prior_7d, 0);
+        assert!(!stats.truncated);
+    }
+
+    #[test]
+    fn commit_stats_report_the_count_and_the_series_as_one_population() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        for day in [0i64, 1, 8, 30, 89] {
+            commit_at(
+                dir.path(),
+                &format!("day-{day}"),
+                anchor - day * 86_400 - 60,
+                "one@example.com",
+            );
+        }
+        // A commit older than the window must not be smeared into the oldest
+        // bucket: it is outside what this report describes.
+        commit_at(
+            dir.path(),
+            "ancient",
+            anchor - 200 * 86_400,
+            "old@example.com",
+        );
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        let summed: u32 = stats.daily.iter().sum();
+        assert_eq!(
+            stats.commits, summed,
+            "the headline count and the series must describe the same commits"
+        );
+        assert_eq!(stats.commits, 5, "the out-of-window commit is excluded");
+        assert_eq!(stats.commits_7d, 2, "day 0 and day 1");
+        assert_eq!(stats.commits_prior_7d, 1, "day 8");
+        assert!(
+            !stats.daily.iter().any(|c| *c > 1),
+            "no bucket collected more than the one commit stamped into it"
+        );
+    }
+
+    /// A sweep on the default window, which is what most of these assert on.
+    fn fleet_snapshot_default(paths: &[String]) -> FleetSnapshot {
+        fleet_snapshot(paths, None)
+    }
+
+    /// One `git log --format=%ct%x1f%ae` row.
+    fn log_row(epoch: i64, email: &str) -> String {
+        format!("{epoch}\u{1f}{email}\n")
+    }
+
+    #[test]
+    fn a_corrupt_commit_stamp_cannot_overflow_the_bucket_arithmetic() {
+        // Unreachable through git, which refuses to write a date near i64's
+        // floor — which is exactly why it is tested here and not through a
+        // repository. Before the saturating subtraction this panicked in debug
+        // and wrapped into a real bucket in release.
+        let anchor = 1_800_000_000i64;
+        let text =
+            log_row(anchor - 3600, "one@example.com") + &log_row(i64::MIN + 1, "two@example.com");
+        let stats = bucket_commit_log(&text, anchor, FLEET_COMMIT_WINDOW_DAYS);
+        assert_eq!(stats.commits, 1, "only the in-window commit is counted");
+        assert_eq!(stats.authors, 1, "the corrupt row contributes no author");
+    }
+
+    #[test]
+    fn a_commit_stamped_in_the_future_lands_in_the_newest_bucket() {
+        // A skewed clock, which git will happily record. It belongs at the
+        // recent end rather than off the array.
+        let anchor = 1_800_000_000i64;
+        let stats = bucket_commit_log(
+            &log_row(anchor + 90_000, "one@example.com"),
+            anchor,
+            FLEET_COMMIT_WINDOW_DAYS,
+        );
+        assert_eq!(stats.commits, 1);
+        assert_eq!(*stats.daily.last().unwrap(), 1);
+        assert_eq!(stats.commits_7d, 1);
+    }
+
+    #[test]
+    fn a_malformed_row_is_skipped_rather_than_counted() {
+        let anchor = 1_800_000_000i64;
+        let text = format!(
+            "not-a-stamp\u{1f}one@example.com\nno-separator-at-all\n\n{}",
+            log_row(anchor - 60, "one@example.com")
+        );
+        let stats = bucket_commit_log(&text, anchor, FLEET_COMMIT_WINDOW_DAYS);
+        assert_eq!(stats.commits, 1);
+        assert!(!stats.truncated);
+    }
+
+    #[test]
+    fn a_row_with_no_author_email_still_counts_as_a_commit() {
+        // The commit happened. Only the author is unknown, and inventing an
+        // empty-string author would inflate the distinct-author count by one
+        // for every repository with an unattributed commit.
+        let anchor = 1_800_000_000i64;
+        let text = log_row(anchor - 60, "") + &log_row(anchor - 120, "one@example.com");
+        let stats = bucket_commit_log(&text, anchor, FLEET_COMMIT_WINDOW_DAYS);
+        assert_eq!(stats.commits, 2);
+        assert_eq!(stats.authors, 1);
+    }
+
+    #[test]
+    fn hitting_the_commit_cap_marks_every_count_as_a_floor() {
+        // The probe asks for one more than the cap precisely so this is
+        // observable; a repository with exactly the cap is NOT truncated.
+        let anchor = 1_800_000_000i64;
+        let at_cap: String = (0..MAX_FLEET_COMMITS)
+            .map(|i| log_row(anchor - (i as i64 % 80) * 86_400 - 60, "one@example.com"))
+            .collect();
+        assert!(!bucket_commit_log(&at_cap, anchor, FLEET_COMMIT_WINDOW_DAYS).truncated);
+
+        let over_cap = at_cap + &log_row(anchor - 60, "one@example.com");
+        let stats = bucket_commit_log(&over_cap, anchor, FLEET_COMMIT_WINDOW_DAYS);
+        assert!(stats.truncated, "a walk that hit the cap reports a floor");
+    }
+
+    #[test]
+    fn the_oldest_bucket_is_inclusive_and_the_one_past_it_is_not() {
+        let anchor = 1_800_000_000i64;
+        let window = FLEET_COMMIT_WINDOW_DAYS as i64;
+        // Last second inside the window, and the first second outside it.
+        let inside = anchor - (window * 86_400 - 1);
+        let outside = anchor - window * 86_400;
+        assert_eq!(
+            bucket_commit_log(&log_row(inside, "a@b"), anchor, FLEET_COMMIT_WINDOW_DAYS).commits,
+            1
+        );
+        assert_eq!(
+            bucket_commit_log(&log_row(outside, "a@b"), anchor, FLEET_COMMIT_WINDOW_DAYS).commits,
+            0
+        );
+    }
+
+    #[test]
+    fn commit_stats_survive_an_out_of_order_commit_date() {
+        // The regression that chose the count-bounded walk. `git log --since`
+        // prunes at the first commit older than the cutoff, so ONE inverted
+        // committer date hides every in-window commit behind it — and reports
+        // the short answer as a complete one. Verified against git 2.50: the
+        // pruning form returned three of these four in-window commits.
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        commit_at(dir.path(), "d40", anchor - 40 * 86_400, "one@example.com");
+        commit_at(
+            dir.path(),
+            "inverted",
+            anchor - 200 * 86_400,
+            "one@example.com",
+        );
+        commit_at(dir.path(), "d30", anchor - 30 * 86_400, "one@example.com");
+        commit_at(dir.path(), "d3", anchor - 3 * 86_400, "one@example.com");
+        commit_at(dir.path(), "today", anchor - 100, "one@example.com");
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        assert_eq!(
+            stats.commits, 4,
+            "every in-window commit is counted, whatever order the dates arrive in"
+        );
+        assert_eq!(stats.active_days, 4);
+    }
+
+    #[test]
+    fn commit_stats_on_an_empty_repository_are_measured_not_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let stats = fleet_commit_stats(dir.path(), 1_800_000_000, FLEET_COMMIT_WINDOW_DAYS)
+            .expect("no HEAD is an answer");
+        assert_eq!(stats.commits, 0);
+        assert_eq!(stats.last_commit_epoch, 0);
+        assert_eq!(stats.daily.len(), FLEET_COMMIT_WINDOW_DAYS as usize);
+        assert!(!stats.truncated);
+    }
+
+    #[test]
+    fn a_quiet_repository_still_reports_its_last_commit() {
+        // The window probe subsumes `git log -1` only when the window has a
+        // commit. A repository last touched a year ago must not come back
+        // looking like one whose last commit could not be read.
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        let long_ago = anchor - 400 * 86_400;
+        commit_at(dir.path(), "old", long_ago, "one@example.com");
+
+        let facet = fleet_facet(
+            dir.path().to_str().unwrap(),
+            anchor,
+            FLEET_COMMIT_WINDOW_DAYS,
+        );
+        assert!(facet.commits_ok, "{facet:?}");
+        let stats = facet.commits.as_ref().expect("ok implies Some");
+        assert_eq!(stats.commits, 0, "nothing landed inside the window");
+        assert!(facet.last_commit_ok, "the fallback probe still ran");
+        assert_eq!(facet.last_commit_epoch, long_ago);
+    }
+
+    #[test]
+    fn an_unreadable_repository_reports_commits_as_unknown_never_as_quiet() {
+        let facet = unreadable_facet("/no/such/gitpulse-fleet-repo", "gone".to_string());
+        assert!(!facet.commits_ok);
+        assert!(
+            facet.commits.is_none(),
+            "a probe that could not run must not arrive as a measured silence"
+        );
+    }
+
+    #[test]
+    fn fleet_snapshot_anchors_every_repository_at_one_instant() {
+        // The fleet-wide activity chart sums the per-repository series bucket
+        // for bucket. Two anchors a second apart would make bucket 40 of one
+        // row cover a different span than bucket 40 of the next.
+        let a = init_repo();
+        let b = init_repo();
+        let snap = fleet_snapshot_default(&[
+            a.path().to_str().unwrap().to_string(),
+            b.path().to_str().unwrap().to_string(),
+        ]);
+        assert_eq!(snap.repos.len(), 2);
+        for facet in &snap.repos {
+            let stats = facet
+                .commits
+                .as_ref()
+                .expect("both repositories are readable");
+            assert_eq!(
+                stats.anchor_epoch, snap.anchor_epoch,
+                "every facet shares the sweep's anchor"
+            );
+            assert_eq!(stats.window_days, FLEET_COMMIT_WINDOW_DAYS);
+        }
+    }
+
+    #[test]
+    fn a_requested_window_is_clamped_rather_than_refused() {
+        // The window is a display preference. Failing a whole fleet sweep
+        // because a stale client asked for ten thousand days would be a worse
+        // answer than 180 — and the window actually used is reported back, so
+        // the clamp is visible rather than silently substituted.
+        assert_eq!(clamp_commit_window(None), FLEET_COMMIT_WINDOW_DAYS);
+        assert_eq!(clamp_commit_window(Some(30)), 30);
+        assert_eq!(
+            clamp_commit_window(Some(0)),
+            1,
+            "zero buckets is not a window"
+        );
+        assert_eq!(
+            clamp_commit_window(Some(10_000)),
+            MAX_FLEET_COMMIT_WINDOW_DAYS
+        );
+    }
+
+    #[test]
+    fn a_shorter_window_reports_its_own_span_and_buckets_to_it() {
+        let anchor = 1_800_000_000i64;
+        let text = log_row(anchor - 60, "a@b") + &log_row(anchor - 40 * 86_400, "a@b");
+        let stats = bucket_commit_log(&text, anchor, 30);
+        assert_eq!(stats.window_days, 30);
+        assert_eq!(stats.daily.len(), 30);
+        assert_eq!(
+            stats.commits, 1,
+            "the 40-day-old commit is outside a 30-day window"
+        );
+    }
+
+    #[test]
+    fn every_facet_in_one_sweep_shares_the_requested_window() {
+        // Rows on two different windows cannot be summed bucket for bucket,
+        // which is exactly what the fleet activity chart does with them.
+        let a = init_repo();
+        let b = init_repo();
+        let snap = fleet_snapshot(
+            &[
+                a.path().to_str().unwrap().to_string(),
+                b.path().to_str().unwrap().to_string(),
+            ],
+            Some(30),
+        );
+        for facet in &snap.repos {
+            let stats = facet
+                .commits
+                .as_ref()
+                .expect("both repositories are readable");
+            assert_eq!(stats.window_days, 30);
+            assert_eq!(stats.daily.len(), 30);
+        }
+    }
+
     #[test]
     fn fleet_snapshot_isolates_one_bad_repository_from_the_rest() {
         let good = init_repo();
-        let snap = fleet_snapshot(&[
+        let snap = fleet_snapshot_default(&[
             good.path().to_str().unwrap().to_string(),
             "/no/such/gitpulse-fleet-repo".to_string(),
         ]);
@@ -1483,7 +2121,7 @@ mod tests {
         )
         .expect("add worktree");
 
-        let snap = fleet_snapshot(&[repo.to_string()]);
+        let snap = fleet_snapshot_default(&[repo.to_string()]);
         let facet = &snap.repos[0];
         assert!(facet.worktrees_ok);
         assert_eq!(facet.worktrees, 2);
@@ -1499,7 +2137,7 @@ mod tests {
         let repo = main.path().to_str().unwrap().to_string();
         // Two tabs can name the same repository; scanning it twice makes the
         // runs contend for the same .git lock for no gain.
-        let snap = fleet_snapshot(&[repo.clone(), repo.clone(), String::new()]);
+        let snap = fleet_snapshot_default(&[repo.clone(), repo.clone(), String::new()]);
         assert_eq!(snap.requested, 3);
         assert_eq!(snap.repos.len(), 1);
     }
@@ -1508,7 +2146,7 @@ mod tests {
     fn fleet_snapshot_reports_no_commits_as_read_rather_than_failed() {
         let dir = tempfile::TempDir::new().unwrap();
         git_in(dir.path(), &["init", "-b", "main"]);
-        let snap = fleet_snapshot(&[dir.path().to_str().unwrap().to_string()]);
+        let snap = fleet_snapshot_default(&[dir.path().to_str().unwrap().to_string()]);
         let facet = &snap.repos[0];
         assert!(facet.ok);
         // An empty repository has a readable answer — no commits — which is
@@ -1520,7 +2158,7 @@ mod tests {
     #[test]
     fn fleet_snapshot_leaves_metrics_none_until_something_is_recorded() {
         let main = init_repo();
-        let snap = fleet_snapshot(&[main.path().to_str().unwrap().to_string()]);
+        let snap = fleet_snapshot_default(&[main.path().to_str().unwrap().to_string()]);
         let facet = &snap.repos[0];
         // The ledger read ran and found nothing. `metrics_ok` is what
         // separates that from a ledger we could not open at all.
@@ -1530,7 +2168,7 @@ mod tests {
 
     #[test]
     fn fleet_snapshot_truncation_means_short_sweep_not_broken_repository() {
-        let snap = fleet_snapshot(&["/no/such/gitpulse-fleet-repo".to_string()]);
+        let snap = fleet_snapshot_default(&["/no/such/gitpulse-fleet-repo".to_string()]);
         assert!(!snap.repos[0].ok);
         // A visited-and-failed repository is reported in its facet. Setting
         // `truncated` for it would leave a caller unable to tell a sweep that
@@ -1545,7 +2183,7 @@ mod tests {
         let paths: Vec<String> = (0..MAX_FLEET_REPOS + 3)
             .map(|i| format!("{repo}/../nope-{i}"))
             .collect();
-        let snap = fleet_snapshot(&paths);
+        let snap = fleet_snapshot_default(&paths);
         assert!(snap.truncated);
         assert_eq!(snap.repos.len(), MAX_FLEET_REPOS);
     }

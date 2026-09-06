@@ -16,6 +16,7 @@
  */
 
 import type { OperationState } from "./operation";
+import type { ViewTab } from "./persist";
 import { plural } from "../format";
 
 /** The per-repository facts this summary is computed from. */
@@ -94,6 +95,55 @@ function rank(kind: WipReasonKind): number {
   // An unrecognized kind from a newer caller sorts last rather than first, so
   // it can never displace a real conflict at the top of the list.
   return index < 0 ? SEVERITY_ORDER.length : index;
+}
+
+/** The pane that answers one reason, as a view plus the lens within it. */
+export interface WipDestination {
+  readonly tab: ViewTab;
+  readonly section: string;
+}
+
+/**
+ * Where each reason is actually dealt with.
+ *
+ * Naming a repository is only half an answer: "3 files with conflicts" and "2
+ * unpushed commits" are resolved on different panes, so a roll-up that hands
+ * every row to the same destination makes the reader hunt for the thing it
+ * just told them about. Each entry below is the destination that surface
+ * already uses for the same subject — conflicts and parked operations go
+ * where the status bar's conflict counter goes, uncommitted work goes where
+ * its "N modified" goes — so the app has one answer to "show me this", not a
+ * second one that only the roll-up knows.
+ *
+ * Typed as a total record on purpose: a new `WipReasonKind` does not compile
+ * until it has somewhere to land.
+ */
+export const WIP_DESTINATIONS: Readonly<Record<WipReasonKind, WipDestination>> = {
+  conflicts: { tab: "work", section: "resolve" },
+  operation: { tab: "work", section: "resolve" },
+  // The working-tree diff, matching the status bar's modified-file count.
+  uncommitted: { tab: "history", section: "diff" },
+  // Branch, upstream and the stash are all on Work's overview.
+  unpushed: { tab: "work", section: "overview" },
+  stash: { tab: "work", section: "overview" },
+  // Nothing is known about this repository yet, so land on the page that
+  // says what it is doing rather than on a pane about a specific fact.
+  unknown: { tab: "work", section: "overview" },
+};
+
+/** Every reason kind, derived from the destination map so none can be missed. */
+export const WIP_REASON_KINDS = Object.keys(WIP_DESTINATIONS) as readonly WipReasonKind[];
+
+/**
+ * Where to send a reader who picks this repository out of the roll-up.
+ *
+ * Keyed on the highest-severity reason, which is the one the row leads with,
+ * so the pane that opens is about the line they just read. A repository with
+ * no reasons at all (never listed, but reachable through a stale click) falls
+ * back to Work rather than navigating nowhere.
+ */
+export function wipDestination(severity: WipReasonKind | null): WipDestination {
+  return severity ? WIP_DESTINATIONS[severity] : { tab: "work", section: "overview" };
 }
 
 /** Computes one repository's at-risk reasons, most severe first. */

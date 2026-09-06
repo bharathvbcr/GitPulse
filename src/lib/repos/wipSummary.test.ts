@@ -6,6 +6,9 @@ import {
   repoWip,
   shouldWarnBeforeClosing,
   summarizeWorkspace,
+  wipDestination,
+  WIP_DESTINATIONS,
+  WIP_REASON_KINDS,
   type RepoWipInput,
 } from "./wipSummary";
 
@@ -234,5 +237,76 @@ describe("bulkSkipReason", () => {
     // A fetch is safe on a dirty tree, and skipping every repository with an
     // edit in it would make workspace-wide fetch useless in practice.
     expect(bulkSkipReason(input({ changedFiles: 12 }))).toBeNull();
+  });
+});
+
+
+describe("wipDestination", () => {
+  it("sends a conflicted or parked repository to the resolver", () => {
+    // Both are the same situation from the reader's side — a repository that
+    // cannot move until someone finishes something — and Resolve is the one
+    // pane in the app that finishes it.
+    expect(wipDestination("conflicts")).toEqual({ tab: "work", section: "resolve" });
+    expect(wipDestination("operation")).toEqual({ tab: "work", section: "resolve" });
+  });
+
+  it("sends uncommitted work to the diff the status bar already opens", () => {
+    // One destination for "show me the changes", not a second one that only
+    // the workspace roll-up knows about.
+    expect(wipDestination("uncommitted")).toEqual({ tab: "history", section: "diff" });
+  });
+
+  it("sends unpushed commits, stashes and unread repositories to Work", () => {
+    for (const kind of ["unpushed", "stash", "unknown"] as const) {
+      expect(wipDestination(kind)).toEqual({ tab: "work", section: "overview" });
+    }
+  });
+
+  it("still lands somewhere for a repository with no reason at all", () => {
+    // Not reachable from a rendered row, which only lists repositories that
+    // have reasons — but a click racing a refresh must navigate rather than
+    // silently do nothing, which is the whole defect this replaced.
+    expect(wipDestination(null)).toEqual({ tab: "work", section: "overview" });
+  });
+
+  it("gives every reason kind a destination", () => {
+    // The map is typed as total, so this guards the derived list rather than
+    // the map: a kind missing from WIP_REASON_KINDS would quietly shrink
+    // every sweep that iterates it, including the registry contract test.
+    expect(WIP_REASON_KINDS.length).toBe(Object.keys(WIP_DESTINATIONS).length);
+    expect(WIP_REASON_KINDS.length).toBeGreaterThanOrEqual(6);
+    for (const kind of WIP_REASON_KINDS) {
+      expect(wipDestination(kind), `${kind} has no destination`).toBeDefined();
+    }
+  });
+
+  it("ranks every reason kind, so none leads a row by accident", () => {
+    // `rank` falls through to "last" for a kind it does not recognize, which
+    // is safe but silent: a kind added to the model and forgotten in the
+    // severity order would sort last, and the destination this file picks is
+    // keyed on whichever reason came first. One repository carrying all six
+    // proves the order covers all six.
+    const everything = repoWip(
+      input({
+        hydrated: false,
+        conflictedFiles: 1,
+        operation: parked(),
+        changedFiles: 4,
+        unpushedCommits: 2,
+        stashEntries: 1,
+      }),
+    );
+    expect(everything.reasons.map((reason) => reason.kind)).toEqual([
+      "conflicts",
+      "operation",
+      "unknown",
+      "uncommitted",
+      "unpushed",
+      "stash",
+    ]);
+    // And that ordering is over every kind the model has, not a subset.
+    expect(new Set(everything.reasons.map((r) => r.kind))).toEqual(new Set(WIP_REASON_KINDS));
+    expect(everything.severity).toBe("conflicts");
+    expect(wipDestination(everything.severity)).toEqual({ tab: "work", section: "resolve" });
   });
 });

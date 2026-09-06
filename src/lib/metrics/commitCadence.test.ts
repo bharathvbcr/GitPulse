@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  groupBuckets,
   activeDayCount,
   bucketCommitsByDay,
   MAX_BUCKETS,
@@ -131,5 +132,36 @@ describe("commit cadence bucketing", () => {
     const heights = sparklineHeights(bucketCommitsByDay(commits, 7, NOW));
     expect(Math.max(...heights)).toBe(1);
     expect(heights).toContain(0.25);
+  });
+});
+
+describe("groupBuckets", () => {
+  it("returns a series that already fits, untouched", () => {
+    expect(groupBuckets([1, 2, 3], 5)).toEqual([1, 2, 3]);
+  });
+
+  it("sums rather than sampling, so the total is preserved", () => {
+    // The whole point: a grouped chart still covers the same span and still
+    // totals what its label says. Dropping buckets to fit would make the
+    // picture and the number describe different populations.
+    const counts = Array.from({ length: 90 }, (_, i) => i % 3);
+    const grouped = groupBuckets(counts, 13);
+    const sum = (a: readonly number[]) => a.reduce((t, n) => t + n, 0);
+    expect(sum(grouped)).toBe(sum(counts));
+    expect(grouped.length).toBeLessThanOrEqual(13);
+  });
+
+  it("groups from the newest end, leaving any short group at the oldest edge", () => {
+    // 10 buckets into at most 3 bars is a group size of 4: the two recent bars
+    // are whole, and the stub lands where nobody reads closely.
+    expect(groupBuckets([1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 3)).toEqual([2, 4, 4]);
+  });
+
+  it("treats a non-finite bucket as zero instead of poisoning its group", () => {
+    expect(groupBuckets([1, Number.NaN, 2, 3], 2)).toEqual([1, 5]);
+  });
+
+  it("returns nothing for a non-positive bar budget", () => {
+    expect(groupBuckets([1, 2, 3], 0)).toEqual([]);
   });
 });

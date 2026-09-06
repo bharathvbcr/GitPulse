@@ -47,14 +47,31 @@ export function emptyMetricsInput(): FleetMetricsInput {
     health_complete: false,
     coverage_pct: null,
     coverage_truncated: false,
+    // Null, not []: an empty list would tell the ledger this call is a
+    // language scan that found nothing, and every storage scan would wipe the
+    // last language scan on its way past.
+    languages: null,
   };
 }
 
+/**
+ * The cheap sweep, over a stated commit window.
+ *
+ * `windowDays` costs no extra `git`: the commit walk is bounded by commit
+ * count rather than by date, so a longer window reads the same history and
+ * only fills a longer bucket array. Null leaves the backend's default, and
+ * anything out of range is clamped there rather than refused here — the window
+ * actually used comes back on every facet.
+ */
 export function fetchFleetSnapshot(
   repoPaths: readonly string[],
+  windowDays: number | null = null,
   invokeFn: InvokeFn = invoke,
 ): Promise<FleetSnapshot> {
-  return invokeFn<FleetSnapshot>("cmd_fleet_snapshot", { repoPaths: [...repoPaths] });
+  return invokeFn<FleetSnapshot>("cmd_fleet_snapshot", {
+    repoPaths: [...repoPaths],
+    windowDays,
+  });
 }
 
 export function recordFleetMetrics(
@@ -64,6 +81,16 @@ export function recordFleetMetrics(
 ): Promise<void> {
   return invokeFn<void>("cmd_fleet_record_metrics", { repoPath, metrics });
 }
+
+/**
+ * How many language rows one repository's scan writes back.
+ *
+ * Mirrors `MAX_FLEET_LANGUAGES` in the ledger, which enforces the same cap on
+ * the way in — this one keeps the payload small, that one keeps a caller from
+ * making the table unbounded. Sixteen leaves the six-segment bar a real
+ * remainder to fold rather than a pre-truncated list.
+ */
+export const MAX_RECORDED_LANGUAGES = 16;
 
 /**
  * Total lines and the dominant language.
@@ -89,6 +116,13 @@ export function metricsFromLanguages(report: LanguageStatsReport): FleetMetricsI
     loc: lines,
     loc_language: top?.language ?? null,
     loc_truncated: report.truncated === true,
+    // The full breakdown, largest first, so the grid can draw a mix without
+    // re-running the scan. Always a list — including the empty one, which is
+    // the measured fact that this repository has no countable source.
+    languages: [...stats]
+      .filter((stat) => Number.isFinite(stat.code_lines) && stat.code_lines > 0)
+      .sort((a, b) => b.code_lines - a.code_lines || a.language.localeCompare(b.language))
+      .slice(0, MAX_RECORDED_LANGUAGES),
   };
 }
 

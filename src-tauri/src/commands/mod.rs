@@ -3057,11 +3057,16 @@ pub async fn cmd_collision_risk(
 /// own ledger. Deliberately narrower than `cmd_insights_snapshot`, which
 /// probes every worktree and is priced for one repository on screen rather
 /// than two dozen. Per-repository failures ride in their own facet.
+///
+/// `window_days` sets the commit window. It costs no extra `git` — the walk is
+/// bounded by commit count, not by date — and is clamped rather than refused,
+/// with the window actually used reported back on every facet.
 #[tauri::command(async)]
 pub async fn cmd_fleet_snapshot(
     repo_paths: Vec<String>,
+    window_days: Option<u32>,
 ) -> Result<crate::insights::FleetSnapshot, String> {
-    off_thread(move || Ok(crate::insights::fleet_snapshot(&repo_paths))).await
+    off_thread(move || Ok(crate::insights::fleet_snapshot(&repo_paths, window_days))).await
 }
 
 /// Records one expensive scan's result in that repository's own ledger.

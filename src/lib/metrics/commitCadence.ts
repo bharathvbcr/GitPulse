@@ -145,6 +145,52 @@ export function bucketCommitsByDay(
 }
 
 /**
+ * Groups adjacent buckets so a long series fits a short bar.
+ *
+ * Summing, never sampling or truncating: the grouped series covers exactly the
+ * same span and totals exactly the same as the one it came from, so a caller
+ * can print "362 commits over 90 days" beside thirteen bars without the label
+ * and the picture describing different populations. Dropping buckets to fit
+ * would break that, and shortening the window would silently change the claim.
+ *
+ * Groups are formed from the NEWEST end, so the recent bars a reader actually
+ * studies are whole periods and any short group lands at the far, oldest edge.
+ * Returns the input unchanged when it already fits.
+ */
+export function groupBuckets(counts: readonly number[], maxBars: number): number[] {
+  if (!(maxBars > 0)) return [];
+  if (counts.length <= maxBars) return [...counts];
+  const size = Math.ceil(counts.length / maxBars);
+  const grouped: number[] = [];
+  for (let end = counts.length; end > 0; end -= size) {
+    let total = 0;
+    for (let i = Math.max(0, end - size); i < end; i += 1) {
+      const value = counts[i];
+      if (Number.isFinite(value)) total += value;
+    }
+    grouped.unshift(total);
+  }
+  return grouped;
+}
+
+/**
+ * Bar heights as fractions of a peak, in bucket order.
+ *
+ * The scaling half of a sparkline, taking bare counts so a caller that already
+ * has its series bucketed — the Fleet grid sums per-repository windows the
+ * backend bucketed — reuses this rather than growing a second one that
+ * eventually disagrees about how an empty series scales.
+ *
+ * A count of zero is 0 and a count at the peak is 1. A non-positive peak makes
+ * every height 0, so a caller draws a flat baseline instead of dividing by
+ * zero, and a non-finite count is 0 rather than a bar of NaN pixels.
+ */
+export function barHeights(counts: readonly number[], peak: number): number[] {
+  if (!(peak > 0)) return counts.map(() => 0);
+  return counts.map((count) => (Number.isFinite(count) ? Math.max(0, count) / peak : 0));
+}
+
+/**
  * Sparkline heights as fractions of the peak, in bucket order.
  *
  * A day with no commits is 0 and a day at the peak is 1. With no commits at
@@ -152,8 +198,10 @@ export function bucketCommitsByDay(
  * dividing by zero.
  */
 export function sparklineHeights(summary: CadenceSummary): number[] {
-  if (summary.peak <= 0) return summary.buckets.map(() => 0);
-  return summary.buckets.map((bucket) => bucket.count / summary.peak);
+  return barHeights(
+    summary.buckets.map((bucket) => bucket.count),
+    summary.peak,
+  );
 }
 
 /** Days per bucket count, for the "quiet since" style summary line. */

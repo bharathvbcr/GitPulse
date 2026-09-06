@@ -57,6 +57,26 @@ export interface InterfacePrefs {
    */
   fleetOpen: boolean;
   /**
+   * Whether the Fleet Pulse panel is expanded above the Fleet grid.
+   *
+   * On by default, and cheap to leave on: the panel reads only what the Tier 1
+   * sweep already fetched, so collapsing it saves layout, never work. Persisted
+   * here for the same reason `fleetOpen` is — it is a UI preference, not part
+   * of the tab arrangement.
+   */
+  fleetPulseOpen: boolean;
+  /**
+   * Fleet grid columns the reader has hidden, by sort key.
+   *
+   * Eleven columns is a lot, and someone auditing dependencies does not need
+   * Storage. Hiding one never hides a *failure*, though: the grid reports any
+   * failed cell in a hidden column above the table, because a column you
+   * cannot see is still a column that could not be read.
+   */
+  fleetHiddenColumns: string[];
+  /** Compact rows fit roughly twice as many repositories on screen. */
+  fleetCompact: boolean;
+  /**
    * Whether the terminal dock is showing beneath the active view.
    *
    * The terminal was a view until it became clear the shape was wrong: a PTY
@@ -106,6 +126,9 @@ const DEFAULTS: InterfacePrefs = {
   autoHideRepoTabs: false,
   diagnosticsButton: "always",
   fleetOpen: false,
+  fleetPulseOpen: true,
+  fleetHiddenColumns: [],
+  fleetCompact: false,
   terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   seenCoachMarks: {},
@@ -124,6 +147,7 @@ function freshDefaults(): InterfacePrefs {
   return {
     ...DEFAULTS,
     hiddenViews: [...DEFAULTS.hiddenViews],
+    fleetHiddenColumns: [...DEFAULTS.fleetHiddenColumns],
     seenCoachMarks: { ...DEFAULTS.seenCoachMarks },
   };
 }
@@ -131,6 +155,36 @@ function freshDefaults(): InterfacePrefs {
 /** Stored preferences are user data: a wrong type falls back, never throws. */
 function bool(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
+}
+
+/**
+ * Upper bound on stored column keys.
+ *
+ * The grid has eleven columns; anything past a generous multiple of that came
+ * from something other than the toggle, and an unbounded array read out of
+ * `localStorage` on every load is a slow leak nobody would notice.
+ */
+const MAX_STORED_COLUMNS = 32;
+
+/**
+ * Column keys from storage: strings only, deduped, bounded.
+ *
+ * Deliberately does not check the keys against the grid's own column list.
+ * Doing so would make this store depend on the Fleet view's internals to read
+ * a preference, and an unknown key is already harmless — the grid hides a
+ * column by looking its key up, so a stale one from an older build simply
+ * matches nothing. What must not happen is an unbounded or non-string array,
+ * and that is what this rejects.
+ */
+function columnKeys(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry === "") continue;
+    seen.add(entry);
+    if (seen.size >= MAX_STORED_COLUMNS) break;
+  }
+  return [...seen];
 }
 
 function readPrefs(): InterfacePrefs {
@@ -168,6 +222,9 @@ function readPrefs(): InterfacePrefs {
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
       fleetOpen: bool(parsed.fleetOpen, DEFAULTS.fleetOpen),
+      fleetPulseOpen: bool(parsed.fleetPulseOpen, DEFAULTS.fleetPulseOpen),
+      fleetHiddenColumns: columnKeys(parsed.fleetHiddenColumns, DEFAULTS.fleetHiddenColumns),
+      fleetCompact: bool(parsed.fleetCompact, DEFAULTS.fleetCompact),
       terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -275,6 +332,15 @@ function createInterfaceStore() {
     setAutoRunCoverage: (enabled: boolean) => patch({ autoRunCoverage: enabled }),
     setFleetOpen: (open: boolean) => patch({ fleetOpen: open }),
     toggleFleet: () => patch((prefs) => ({ fleetOpen: !prefs.fleetOpen })),
+    toggleFleetPulse: () => patch((prefs) => ({ fleetPulseOpen: !prefs.fleetPulseOpen })),
+    toggleFleetColumn: (key: string) =>
+      patch((prefs) => ({
+        fleetHiddenColumns: prefs.fleetHiddenColumns.includes(key)
+          ? prefs.fleetHiddenColumns.filter((column) => column !== key)
+          : [...prefs.fleetHiddenColumns, key],
+      })),
+    showAllFleetColumns: () => patch({ fleetHiddenColumns: [] }),
+    toggleFleetCompact: () => patch((prefs) => ({ fleetCompact: !prefs.fleetCompact })),
     setTerminalDockOpen: (open: boolean) => patch({ terminalDockOpen: open }),
     toggleTerminalDock: () =>
       patch((prefs) => ({ terminalDockOpen: !prefs.terminalDockOpen })),

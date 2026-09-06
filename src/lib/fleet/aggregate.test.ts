@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  bandsBySeverity,
+  effectiveCollapse,
   byUrgency,
   describeTally,
   fleetHeadline,
@@ -7,6 +9,8 @@ import {
   severityRank,
   tally,
   tallyScope,
+  SEVERITY_BAND,
+  type FleetBand,
 } from "./aggregate";
 import { UNSCANNED, failedCell, readCell, type FleetRow, type FleetSeverity } from "./types";
 
@@ -23,6 +27,7 @@ function row(overrides: Partial<FleetRow> = {}): FleetRow {
     watchWarning: null,
     work: UNSCANNED,
     activity: UNSCANNED,
+    commits: UNSCANNED,
     loc: UNSCANNED,
     storage: UNSCANNED,
     health: UNSCANNED,
@@ -205,5 +210,104 @@ describe("fleetHeadline", () => {
     const headline = fleetHeadline([row({ severity: "unknown", headline: "not loaded yet" })]);
     expect(headline.sentence).not.toContain("clean");
     expect(headline.sentence).toContain("not loaded yet");
+  });
+});
+
+describe("bandsBySeverity", () => {
+  it("splits ordered rows into bands, worst first, empty bands omitted", () => {
+    const rows = byUrgency([
+      row({ path: "/c", label: "c", severity: "clean" }),
+      row({ path: "/a", label: "a", severity: "conflicts" }),
+      row({ path: "/b", label: "b", severity: "uncommitted" }),
+      row({ path: "/d", label: "d", severity: "clean" }),
+    ]);
+    const bands = bandsBySeverity(rows);
+    expect(bands.map((b) => b.severity)).toEqual(["conflicts", "uncommitted", "clean"]);
+    expect(bands.map((b) => b.rows.length)).toEqual([1, 1, 2]);
+    expect(bands[0].label).toBe(SEVERITY_BAND.conflicts);
+  });
+
+  it("preserves the order it was given rather than sorting again", () => {
+    // Banding must never disagree with the flat list about which repository
+    // comes first, so it only inserts boundaries.
+    const ordered = byUrgency([
+      row({ path: "/z", label: "z", severity: "uncommitted" }),
+      row({ path: "/a", label: "a", severity: "uncommitted" }),
+    ]);
+    const flat = bandsBySeverity(ordered).flatMap((b) => b.rows.map((r) => r.label));
+    expect(flat).toEqual(ordered.map((r) => r.label));
+  });
+
+  it("names every severity, so a new one cannot render as its enum name", () => {
+    const severities: FleetSeverity[] = [
+      "conflicts",
+      "operation",
+      "unknown",
+      "uncommitted",
+      "unpushed",
+      "stash",
+      "clean",
+    ];
+    for (const severity of severities) {
+      expect(SEVERITY_BAND[severity], severity).toBeTruthy();
+      expect(SEVERITY_BAND[severity], severity).not.toBe(severity);
+    }
+  });
+
+  it("returns nothing for no rows", () => {
+    expect(bandsBySeverity([])).toEqual([]);
+  });
+
+  it("opens a second band rather than merging a severity that reappears", () => {
+    // Unsorted input is a bug in the caller. Silently merging it would hide
+    // that and produce a heading whose count does not match its rows.
+    const bands = bandsBySeverity([
+      row({ path: "/a", label: "a", severity: "clean" }),
+      row({ path: "/b", label: "b", severity: "conflicts" }),
+      row({ path: "/c", label: "c", severity: "clean" }),
+    ]);
+    expect(bands.map((b) => b.severity)).toEqual(["clean", "conflicts", "clean"]);
+  });
+});
+
+describe("effectiveCollapse", () => {
+  const band = (severity: FleetSeverity): FleetBand => ({
+    severity,
+    label: severity,
+    rows: [row({ path: `/${severity}`, label: severity, severity })],
+  });
+
+  it("collapses clean while there is a triage queue to see instead", () => {
+    const bands = [band("conflicts"), band("clean")];
+    const applied = effectiveCollapse(bands, new Set(["clean"]), false);
+    expect([...applied]).toEqual(["clean"]);
+  });
+
+  it("does not collapse the only band there is", () => {
+    // The defect this exists to prevent: an all-clean workspace has exactly one
+    // band, so collapsing `clean` by default emptied the entire grid and left
+    // the reader an explanation where their repositories should be.
+    const bands = [band("clean")];
+    const applied = effectiveCollapse(bands, new Set(["clean"]), false);
+    expect([...applied]).toEqual([]);
+  });
+
+  it("refuses any default collapse that would leave nothing on screen", () => {
+    // Stated as the general rule rather than as a special case for `clean`, so
+    // a future default that collapsed two severities cannot reintroduce it.
+    const bands = [band("stash"), band("clean")];
+    const applied = effectiveCollapse(bands, new Set(["stash", "clean"]), false);
+    expect([...applied]).toEqual([]);
+  });
+
+  it("honours a collapse the reader performed, even down to nothing", () => {
+    // A state someone chose and can see how to undo is not a defect.
+    const bands = [band("clean")];
+    const applied = effectiveCollapse(bands, new Set(["clean"]), true);
+    expect([...applied]).toEqual(["clean"]);
+  });
+
+  it("is a no-op when there are no bands at all", () => {
+    expect([...effectiveCollapse([], new Set(["clean"]), false)]).toEqual([]);
   });
 });

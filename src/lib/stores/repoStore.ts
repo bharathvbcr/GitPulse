@@ -2186,13 +2186,30 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      */
     runAcrossOpenRepos: async (
       kind: "fetch" | "pull",
-      options: RunOptions = {},
+      options: RunOptions & {
+        /**
+         * Restrict the run to these open repositories.
+         *
+         * Omitted, every open tab is visited — the workspace-header behaviour.
+         * Given, this is still the same run: a single-row fetch from the Fleet
+         * grid goes through the identical skip rules, so a repository parked
+         * mid-rebase is reported as skipped there too rather than being
+         * fetched by a second, laxer code path.
+         *
+         * A path that is not an open tab is simply absent from the targets; it
+         * is never invented into one.
+         */
+        only?: readonly string[];
+      } = {},
     ): Promise<BulkRunReport> => {
       const byPath = new Map(wipInputs().map((input) => [input.path, input]));
-      const targets: RepoTarget[] = internal.workspace.tabs.map((tab) => ({
-        path: tab.path,
-        label: byPath.get(tab.path)?.label ?? displayName(tab.path),
-      }));
+      const restrict = options.only ? new Set(options.only) : null;
+      const targets: RepoTarget[] = internal.workspace.tabs
+        .filter((tab) => restrict === null || restrict.has(tab.path))
+        .map((tab) => ({
+          path: tab.path,
+          label: byPath.get(tab.path)?.label ?? displayName(tab.path),
+        }));
       const report = await runAcrossRepos(
         targets,
         async (target) => {

@@ -4,6 +4,7 @@ import {
   fetchFleetSnapshot,
   metricsFromCoverage,
   metricsFromHealth,
+  MAX_RECORDED_LANGUAGES,
   metricsFromLanguages,
   metricsFromStorage,
   recordFleetMetrics,
@@ -35,6 +36,61 @@ describe("metricsFromLanguages", () => {
     scanned_files: 8,
     candidate_files: 8,
     ...overrides,
+  });
+
+  it("records the whole breakdown, largest first, for the fleet mix", () => {
+    const metrics = metricsFromLanguages(report());
+    expect(metrics.languages?.map((stat) => stat.language)).toEqual([
+      "Rust",
+      "TypeScript",
+      "JSON",
+    ]);
+    // The rows go through untouched: the fleet folds them with the very same
+    // `pickLanguageBarStats` the status bar uses, so anything reshaped here
+    // would be a second opinion about what a language reading is.
+    expect(metrics.languages?.[0]).toMatchObject({
+      language: "Rust",
+      color_hex: "#0",
+      category: "programming",
+      code_lines: 900,
+      file_count: 3,
+      percentage: 60,
+    });
+  });
+
+  it("caps the recorded breakdown so one repository cannot grow unbounded", () => {
+    const many = Array.from({ length: MAX_RECORDED_LANGUAGES + 5 }, (_, i) => ({
+      language: `Lang${i}`,
+      color_hex: "#0",
+      category: "programming",
+      code_lines: 1000 - i,
+      file_count: 1,
+      percentage: 1,
+    }));
+    const metrics = metricsFromLanguages(report({ stats: many }));
+    expect(metrics.languages).toHaveLength(MAX_RECORDED_LANGUAGES);
+    expect(metrics.languages?.[0].language, "the largest survive the cap").toBe("Lang0");
+  });
+
+  it("drops a language with no counted lines rather than storing an empty band", () => {
+    const metrics = metricsFromLanguages(
+      report({
+        stats: [
+          { language: "Rust", color_hex: "#0", category: "programming", code_lines: 10, file_count: 1, percentage: 100 },
+          { language: "Text", color_hex: "#1", category: "data", code_lines: 0, file_count: 1, percentage: 0 },
+        ],
+      }),
+    );
+    expect(metrics.languages?.map((stat) => stat.language)).toEqual(["Rust"]);
+  });
+
+  it("records an empty list, not null, for a repository with nothing to count", () => {
+    // The three states matter here: `null` means "this call is not about
+    // languages" and would leave a stale breakdown in place, while `[]` is the
+    // measured fact that there is nothing left to show.
+    const metrics = metricsFromLanguages(report({ stats: [] }));
+    expect(metrics.languages).toEqual([]);
+    expect(metrics.languages).not.toBeNull();
   });
 
   it("sums every language and names the largest", () => {
@@ -157,17 +213,31 @@ describe("metricsFromCoverage", () => {
 describe("the IPC seam", () => {
   it("sends the paths as a plain array the command can deserialize", async () => {
     const seen: { cmd: string; args?: Record<string, unknown> }[] = [];
-    await fetchFleetSnapshot(["/a", "/b"], async (cmd, args) => {
+    await fetchFleetSnapshot(["/a", "/b"], null, async (cmd, args) => {
       seen.push({ cmd, args });
       return null as never;
     });
-    expect(seen[0]).toEqual({ cmd: "cmd_fleet_snapshot", args: { repoPaths: ["/a", "/b"] } });
+    expect(seen[0]).toEqual({
+      cmd: "cmd_fleet_snapshot",
+      // A null window means "use the backend's default" rather than a number
+      // this side has guessed at.
+      args: { repoPaths: ["/a", "/b"], windowDays: null },
+    });
+  });
+
+  it("sends the requested commit window, and only the window it was given", async () => {
+    const seen: Record<string, unknown>[] = [];
+    await fetchFleetSnapshot(["/a"], 30, async (_cmd, args) => {
+      seen.push(args ?? {});
+      return null as never;
+    });
+    expect(seen[0].windowDays).toBe(30);
   });
 
   it("does not hand the caller's array to the backend by reference", async () => {
     const paths = ["/a"];
     let sent: string[] = [];
-    await fetchFleetSnapshot(paths, async (_cmd, args) => {
+    await fetchFleetSnapshot(paths, null, async (_cmd, args) => {
       sent = args?.repoPaths as string[];
       return null as never;
     });

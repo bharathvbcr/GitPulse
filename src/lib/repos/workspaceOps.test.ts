@@ -209,6 +209,84 @@ describe("runAcrossRepos", () => {
     expect(seen).toEqual([1, 2, 3, 4, 5]);
   });
 
+  it("announces each repository as it starts, before its work runs", async () => {
+    const events: string[] = [];
+    await runAcrossRepos(
+      targets(3),
+      async (target) => {
+        events.push(`run ${target.label}`);
+      },
+      {
+        concurrency: 1,
+        onStart: (target) => events.push(`start ${target.label}`),
+      },
+    );
+    expect(events).toEqual([
+      "start repo-0",
+      "run repo-0",
+      "start repo-1",
+      "run repo-1",
+      "start repo-2",
+      "run repo-2",
+    ]);
+  });
+
+  it("never reports more repositories in flight than the concurrency allows", async () => {
+    // The whole reason onStart exists: a sweep of twenty-four repositories at
+    // concurrency 4 is scanning four of them, and a progress display that
+    // marked all twenty-four "scanning" would be describing a machine nobody
+    // has.
+    let inFlight = 0;
+    let peak = 0;
+    await runAcrossRepos(
+      targets(12),
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight -= 1;
+      },
+      {
+        concurrency: 3,
+        onStart: () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+        },
+      },
+    );
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThan(1);
+  });
+
+  it("stays silent for a repository the run skipped before starting it", async () => {
+    // A cancelled repository was never in flight. Announcing it would leave a
+    // row stuck showing a scan that never began.
+    const signal = { aborted: false };
+    const started: string[] = [];
+    let ran = 0;
+    const report = await runAcrossRepos(
+      targets(6),
+      async () => {
+        ran += 1;
+        if (ran === 2) signal.aborted = true;
+      },
+      { concurrency: 1, signal, onStart: (target) => started.push(target.label) },
+    );
+    expect(started).toEqual(["repo-0", "repo-1"]);
+    expect(report.skipped).toBe(4);
+  });
+
+  it("announces a deduplicated path once, like every other callback", async () => {
+    const started: string[] = [];
+    await runAcrossRepos(
+      [
+        { path: "/r/a", label: "a" },
+        { path: "/r/a", label: "a (again)" },
+      ],
+      async () => {},
+      { onStart: (target) => started.push(target.path) },
+    );
+    expect(started).toEqual(["/r/a"]);
+  });
+
   it("records durations from the injected clock", async () => {
     const clock = fakeClock();
     const report = await runAcrossRepos(

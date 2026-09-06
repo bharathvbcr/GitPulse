@@ -2,9 +2,28 @@ import { describe, expect, it } from "vitest";
 import { unknownFacts, type RepoFacts } from "../repos/facts";
 import { WATCH_ACTIVE, watchFailed } from "../repos/watchState";
 import { buildFleetRows, parseStamp, placeholderRow, type FleetRowInputs } from "./row";
-import type { FleetMetrics, FleetRepoFacet, FleetSnapshot } from "./types";
+import type { FleetCommitStats, FleetMetrics, FleetRepoFacet, FleetSnapshot } from "./types";
 
 const NOW = Date.parse("2026-09-04T12:00:00Z");
+
+const WINDOW_DAYS = 90;
+
+function commitStats(overrides: Partial<FleetCommitStats> = {}): FleetCommitStats {
+  const daily = overrides.daily ?? new Array<number>(WINDOW_DAYS).fill(0);
+  return {
+    window_days: WINDOW_DAYS,
+    anchor_epoch: Math.floor(NOW / 1000),
+    commits: daily.reduce((sum, n) => sum + n, 0),
+    authors: 0,
+    active_days: daily.filter((n) => n > 0).length,
+    commits_7d: 0,
+    commits_prior_7d: 0,
+    last_commit_epoch: 0,
+    truncated: false,
+    ...overrides,
+    daily,
+  };
+}
 
 function facts(path: string, overrides: Partial<RepoFacts> = {}): RepoFacts {
   return {
@@ -39,6 +58,15 @@ function metrics(overrides: Partial<FleetMetrics> = {}): FleetMetrics {
     coverage_pct: null,
     coverage_truncated: false,
     coverage_at: null,
+    languages: [],
+    loc_prev: null,
+    loc_prev_day: null,
+    storage_prev_bytes: null,
+    storage_prev_day: null,
+    vulns_prev_total: null,
+    vulns_prev_day: null,
+    coverage_prev_pct: null,
+    coverage_prev_day: null,
     ...overrides,
   };
 }
@@ -54,6 +82,9 @@ function facet(path: string, overrides: Partial<FleetRepoFacet> = {}): FleetRepo
     agents: { ok: true, sessions: 0, kinds: [] },
     last_commit_ok: true,
     last_commit_epoch: 1_757_000_000,
+    commits_ok: true,
+    commits_error: "",
+    commits: commitStats(),
     metrics_ok: true,
     metrics_error: "",
     metrics: null,
@@ -66,6 +97,7 @@ function snapshot(facets: FleetRepoFacet[]): FleetSnapshot {
     repos: facets,
     requested: facets.length,
     scanned: facets.length,
+    anchor_epoch: Math.floor(NOW / 1000),
     truncated: false,
     duration_ms: 12,
   };
@@ -538,5 +570,151 @@ describe("placeholderRow", () => {
     for (const cell of [row.changes, row.sync, row.work, row.activity, row.loc, row.storage]) {
       expect(cell.kind).toBe("unscanned");
     }
+  });
+});
+
+describe("the commits cell", () => {
+  it("reads a window the sweep measured", () => {
+    const daily = new Array<number>(WINDOW_DAYS).fill(0);
+    daily[WINDOW_DAYS - 1] = 4;
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([
+          facet("/repo/a", {
+            commits: commitStats({ daily, authors: 2, commits_7d: 4, commits_prior_7d: 1 }),
+          }),
+        ]),
+      }),
+    );
+    const cell = rows[0].commits;
+    expect(cell.kind).toBe("read");
+    if (cell.kind !== "read") return;
+    expect(cell.value.commits).toBe(4);
+    expect(cell.value.authors).toBe(2);
+    expect(cell.value.recent).toBe(4);
+    expect(cell.value.prior).toBe(1);
+    expect(cell.value.windowDays).toBe(WINDOW_DAYS);
+    expect(cell.value.daily).toHaveLength(WINDOW_DAYS);
+  });
+
+  it("reads an empty window as a measured zero, not as an absence", () => {
+    // A repository nobody has touched this quarter HAS been measured. Showing
+    // it as "not scanned" would make a real finding — this is idle — look like
+    // a gap in the dashboard.
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([facet("/repo/a", { commits: commitStats() })]),
+      }),
+    );
+    const cell = rows[0].commits;
+    expect(cell.kind).toBe("read");
+    if (cell.kind !== "read") return;
+    expect(cell.value.commits).toBe(0);
+  });
+
+  it("reports a probe that could not run as failed, carrying its reason", () => {
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([
+          facet("/repo/a", {
+            commits_ok: false,
+            commits_error: "git is not on PATH",
+            commits: null,
+          }),
+        ]),
+      }),
+    );
+    const cell = rows[0].commits;
+    expect(cell.kind).toBe("failed");
+    if (cell.kind !== "failed") return;
+    expect(cell.reason).toContain("git is not on PATH");
+  });
+
+  it("marks a capped walk as a floor", () => {
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([facet("/repo/a", { commits: commitStats({ truncated: true }) })]),
+      }),
+    );
+    const cell = rows[0].commits;
+    expect(cell.kind === "read" && cell.partial).toBe(true);
+  });
+
+  it("is unscanned for a repository the sweep never reached", () => {
+    const rows = buildFleetRows(inputs({ open: [facts("/repo/a")], snapshot: snapshot([]) }));
+    expect(rows[0].commits.kind).toBe("unscanned");
+  });
+
+  it("is unscanned on a recents row, which has no session to measure", () => {
+    const rows = buildFleetRows(inputs({ recents: [{ path: "/old", label: "old" }] }));
+    expect(rows[0].commits.kind).toBe("unscanned");
+  });
+
+  it("fails with the sweep when the sweep itself failed", () => {
+    const rows = buildFleetRows(
+      inputs({ open: [facts("/repo/a")], snapshotError: "the backend is not answering" }),
+    );
+    const cell = rows[0].commits;
+    expect(cell.kind).toBe("failed");
+    if (cell.kind !== "failed") return;
+    expect(cell.reason).toContain("the backend is not answering");
+  });
+});
+
+describe("the loc cell carries its language breakdown", () => {
+  it("hands the cached rows through untouched", () => {
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([
+          facet("/repo/a", {
+            metrics: metrics({
+              loc: 500,
+              loc_language: "Rust",
+              loc_at: "2026-09-04T10:00:00Z",
+              languages: [
+                {
+                  language: "Rust",
+                  color_hex: "#dea584",
+                  category: "programming",
+                  code_lines: 500,
+                  file_count: 9,
+                  percentage: 100,
+                },
+              ],
+            }),
+          }),
+        ]),
+      }),
+    );
+    const cell = rows[0].loc;
+    expect(cell.kind).toBe("read");
+    if (cell.kind !== "read") return;
+    expect(cell.value.languages).toHaveLength(1);
+    expect(cell.value.languages[0].language).toBe("Rust");
+  });
+
+  it("renders a ledger with a total but no breakdown as an empty mix, not a fake one", () => {
+    // A row written before breakdowns were recorded still has a real line
+    // count. Inventing a single band for it would draw a mix nobody measured.
+    const rows = buildFleetRows(
+      inputs({
+        open: [facts("/repo/a")],
+        snapshot: snapshot([
+          facet("/repo/a", {
+            metrics: metrics({ loc: 500, loc_language: "Rust", loc_at: "2026-09-04T10:00:00Z" }),
+          }),
+        ]),
+      }),
+    );
+    const cell = rows[0].loc;
+    expect(cell.kind).toBe("read");
+    if (cell.kind !== "read") return;
+    expect(cell.value.lines).toBe(500);
+    expect(cell.value.languages).toEqual([]);
   });
 });

@@ -33,13 +33,28 @@ import {
 } from "../repos/workspaceOps";
 import { fetchFleetSnapshot, recordFleetMetrics, scanRepoFamily, type InvokeFn } from "./client";
 import type { ScanFailures } from "./row";
-import { FAMILY_CONCURRENCY, type FleetSnapshot, type ScanFamily } from "./types";
+import {
+  COMMIT_WINDOWS,
+  DEFAULT_COMMIT_WINDOW,
+  FAMILY_CONCURRENCY,
+  type FleetSnapshot,
+  type ScanFamily,
+} from "./types";
 
 /** How a family's sweep is progressing, for the button that started it. */
 export interface ScanProgress {
   readonly family: ScanFamily;
   readonly done: number;
   readonly total: number;
+  /**
+   * Repository paths in flight right now — never the whole target list.
+   *
+   * A sweep runs `FAMILY_CONCURRENCY[family]` repositories at a time, so
+   * marking every target as scanning would show two dozen rows working while
+   * two of them are. A repository still in the queue keeps whatever its cell
+   * already said, which is the truth: nothing has happened to it yet.
+   */
+  readonly running: readonly string[];
 }
 
 export interface FleetState {
@@ -54,11 +69,24 @@ export interface FleetState {
   readonly progress: ScanProgress | null;
   /** The last finished sweep, kept so its skips and failures stay readable. */
   readonly lastRun: { readonly family: ScanFamily; readonly report: BulkRunReport } | null;
+  /** The commit window the next sweep will ask for, in days. */
+  readonly windowDays: number;
 }
 
 export interface FleetStore extends Readable<FleetState> {
   /** Runs the cheap sweep over these paths. Safe to call on every grid open. */
   refresh(repoPaths: readonly string[]): Promise<void>;
+  /**
+   * Changes the commit window and re-sweeps at it.
+   *
+   * The window lives here rather than in the view because it is a property of
+   * the data the store holds: a snapshot read at 30 days cannot answer a
+   * question about 90, and leaving the old rows on screen under a new label
+   * would be the plainest possible version of the lie this directory exists to
+   * prevent. Re-reading is cheap — the commit walk is bounded by count, not by
+   * date — so the window changes by fetching, never by reinterpreting.
+   */
+  setWindow(days: number): Promise<void>;
   /** Scans one repository for one family, then records and re-reads it. */
   scanOne(family: ScanFamily, repoPath: string): Promise<void>;
   /** Scans every listed repository for one family, bounded and cancellable. */
@@ -82,6 +110,7 @@ const INITIAL: FleetState = {
   scanning: null,
   progress: null,
   lastRun: null,
+  windowDays: DEFAULT_COMMIT_WINDOW,
 };
 
 function withFailure(
@@ -129,7 +158,7 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
     inflight = guard;
     update((s) => ({ ...s, snapshotLoading: true }));
     try {
-      const snapshot = await fetchFleetSnapshot(repoPaths, call);
+      const snapshot = await fetchFleetSnapshot(repoPaths, get({ subscribe }).windowDays, call);
       if (!guard.isLive()) return;
       update((s) => ({ ...s, snapshot, snapshotLoading: false, snapshotError: null }));
     } catch (err: unknown) {
@@ -154,13 +183,29 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
   }
 
   async function scanOne(family: ScanFamily, repoPath: string): Promise<void> {
-    update((s) => ({ ...s, scanFailures: withoutFailure(s.scanFailures, repoPath, family) }));
+    // A single-repository scan is a sweep of one, and says so through the same
+    // fields. That is not cosmetic: `scanAll` refuses to start while `scanning`
+    // is set, so claiming the slot is what stops a toolbar sweep from being
+    // launched on top of a cell scan and blowing through both concurrency caps.
+    if (get({ subscribe }).scanning !== null) return;
+    update((s) => ({
+      ...s,
+      scanning: family,
+      progress: { family, done: 0, total: 1, running: [repoPath] },
+      scanFailures: withoutFailure(s.scanFailures, repoPath, family),
+    }));
     try {
       await runOne(family, repoPath);
+      update((s) => ({ ...s, scanning: null, progress: null }));
     } catch (err: unknown) {
       const reason = formatError(err);
       reportPanelError("fleet", err);
-      update((s) => ({ ...s, scanFailures: withFailure(s.scanFailures, repoPath, family, reason) }));
+      update((s) => ({
+        ...s,
+        scanning: null,
+        progress: null,
+        scanFailures: withFailure(s.scanFailures, repoPath, family, reason),
+      }));
     }
     // Re-read whatever the sweep last covered so the new value lands with its
     // stamp, whether the scan succeeded or not.
@@ -181,7 +226,7 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
     update((s) => ({
       ...s,
       scanning: family,
-      progress: { family, done: 0, total: targets.length },
+      progress: { family, done: 0, total: targets.length, running: [] },
       // A repository about to be re-scanned starts from no recorded failure,
       // or a retry would look like it failed again before it ran.
       scanFailures: targets.reduce(
@@ -190,11 +235,35 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
       ),
     }));
 
+    // `running` is maintained by the two callbacks together rather than
+    // derived from `done`: with a concurrency of two, "done 7 of 24" says
+    // nothing about *which* two are working, and the grid needs the paths.
     const options: RunOptions = {
       concurrency: FAMILY_CONCURRENCY[family],
       signal: token,
-      onProgress: (done, total) => {
-        update((s) => ({ ...s, progress: { family, done, total } }));
+      onStart: (target) => {
+        update((s) =>
+          s.progress === null
+            ? s
+            : {
+                ...s,
+                progress: { ...s.progress, running: [...s.progress.running, target.path] },
+              },
+        );
+      },
+      onProgress: (done, total, latest) => {
+        update((s) => ({
+          ...s,
+          progress: {
+            family,
+            done,
+            total,
+            // Remove one occurrence, not every match: the same path cannot be
+            // in flight twice (targets are deduped), but filtering by identity
+            // keeps that true even if a caller ever repeats one.
+            running: (s.progress?.running ?? []).filter((path) => path !== latest.path),
+          },
+        }));
       },
     };
 
@@ -227,9 +296,19 @@ export function createFleetStore(deps: FleetStoreDeps = {}): FleetStore {
     if (cancelToken) cancelToken.aborted = true;
   }
 
+  async function setWindow(days: number): Promise<void> {
+    // Only a window the control actually offers, and only a real change: a
+    // stray value would otherwise re-sweep the workspace for nothing.
+    if (!COMMIT_WINDOWS.includes(days)) return;
+    if (get({ subscribe }).windowDays === days) return;
+    update((s) => ({ ...s, windowDays: days }));
+    await refresh(lastPaths);
+  }
+
   return {
     subscribe,
     refresh,
+    setWindow,
     scanOne,
     scanAll,
     cancelScan,

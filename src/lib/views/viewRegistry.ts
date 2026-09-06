@@ -134,6 +134,21 @@ export function sectionsFor(id: ViewTab): readonly ViewSection[] {
 }
 
 /**
+ * A destination's name, the way the header and section bar spell it.
+ *
+ * For UI elsewhere in the app that sends the reader to a pane and has to say
+ * where they are about to land ("Work → Resolve"). Derived from the registry
+ * rather than written out at the call site, so renaming a section renames
+ * every promise made about it. An unknown section id degrades to the view's
+ * own name instead of inventing one.
+ */
+export function describeDestination(id: ViewTab, section?: string | null): string {
+  const view = VIEW_REGISTRY[id];
+  const found = section ? sectionsFor(id).find((entry) => entry.id === section) : undefined;
+  return found ? `${view.label} → ${found.label}` : view.label;
+}
+
+/**
  * The section a view opens on when nothing else is remembered: its first.
  * Null for a view with no sections, which is not the same as "the first of
  * none" — callers branch on it to decide whether to draw a control at all.

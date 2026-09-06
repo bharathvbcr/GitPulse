@@ -161,6 +161,76 @@ describe("interfaceStore", () => {
     }
   });
 
+  it("opens Fleet Pulse by default, and remembers being closed", () => {
+    // The panel is the answer to "what changed", so it opens; a reader who
+    // shuts it has said they want the grid, and must not get it back tomorrow.
+    expect(get(interfaceStore).fleetPulseOpen).toBe(true);
+    interfaceStore.toggleFleetPulse();
+    expect(get(interfaceStore).fleetPulseOpen).toBe(false);
+  });
+
+  it("shows every column until one is hidden", () => {
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual([]);
+    interfaceStore.toggleFleetColumn("storage");
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual(["storage"]);
+    interfaceStore.toggleFleetColumn("health");
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual(["storage", "health"]);
+    interfaceStore.toggleFleetColumn("storage");
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual(["health"]);
+  });
+
+  it("brings everything back in one action", () => {
+    // Hiding columns one at a time and having to unhide them one at a time is
+    // how a reader ends up with a grid missing a column they forgot about.
+    for (const key of ["storage", "health", "coverage"]) interfaceStore.toggleFleetColumn(key);
+    interfaceStore.showAllFleetColumns();
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual([]);
+  });
+
+  it("toggles density without touching anything else", () => {
+    interfaceStore.toggleFleetColumn("storage");
+    interfaceStore.toggleFleetCompact();
+    expect(get(interfaceStore).fleetCompact).toBe(true);
+    expect(get(interfaceStore).fleetHiddenColumns).toEqual(["storage"]);
+    interfaceStore.toggleFleetCompact();
+    expect(get(interfaceStore).fleetCompact).toBe(false);
+  });
+
+  it("refuses an unbounded or non-string column list from storage", async () => {
+    // A corrupt blob must not be able to grow the hidden set without limit, or
+    // put non-strings where the grid will look keys up.
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({
+          fleetHiddenColumns: [
+            ...Array.from({ length: 500 }, (_, i) => `col-${i}`),
+            42,
+            null,
+            "",
+            "storage",
+            "storage",
+          ],
+        }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const reloaded = (await import("../interfaceStore")).interfaceStore;
+      const hidden = get(reloaded).fleetHiddenColumns;
+      expect(hidden.length).toBeLessThanOrEqual(32);
+      expect(hidden.every((key) => typeof key === "string" && key !== "")).toBe(true);
+      expect(new Set(hidden).size).toBe(hidden.length);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
   it("toggles automatic coverage generation", () => {
     interfaceStore.setAutoRunCoverage(true);
     expect(get(interfaceStore).autoRunCoverage).toBe(true);

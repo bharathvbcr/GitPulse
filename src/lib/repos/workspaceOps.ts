@@ -82,6 +82,19 @@ export interface RunOptions {
   concurrency?: number;
   /** Cooperative cancellation. Checked before each repository starts. */
   signal?: { aborted: boolean };
+  /**
+   * Called as each repository is about to run, for progress rendering.
+   *
+   * Distinct from `onProgress`, and the distinction is the point: a run visits
+   * `concurrency` repositories at a time, so between the two callbacks a
+   * caller can tell the handful actually in flight from the queue behind them.
+   * Marking every target as "running" the moment a sweep starts would show
+   * twenty-four repositories being scanned while two of them are.
+   *
+   * Never fires for a repository the run skips before starting it — a
+   * cancelled repository was never in flight.
+   */
+  onStart?: (target: RepoTarget) => void;
   /** Called after each repository settles, for progress rendering. */
   onProgress?: (done: number, total: number, latest: RepoTaskResult) => void;
   /** Injectable clock; the default is monotonic where available. */
@@ -158,6 +171,7 @@ export async function runAcrossRepos(
       };
     } else {
       const taskStart = now();
+      options.onStart?.(target);
       try {
         const outcome = await task(target);
         const durationMs = Math.max(0, now() - taskStart);

@@ -112,6 +112,25 @@ CREATE TABLE IF NOT EXISTS fleet_metrics (
   coverage_truncated        INTEGER NOT NULL DEFAULT 0,
   coverage_at               TEXT
 );
+CREATE TABLE IF NOT EXISTS fleet_history (
+  repo_path                 TEXT NOT NULL,
+  day                       TEXT NOT NULL,
+  loc                       INTEGER,
+  storage_bytes             INTEGER,
+  vulns_total               INTEGER,
+  coverage_pct              REAL,
+  PRIMARY KEY (repo_path, day)
+);
+CREATE TABLE IF NOT EXISTS fleet_languages (
+  repo_path                 TEXT NOT NULL,
+  language                  TEXT NOT NULL,
+  color_hex                 TEXT NOT NULL,
+  category                  TEXT NOT NULL,
+  code_lines                INTEGER NOT NULL,
+  file_count                INTEGER NOT NULL,
+  percentage                REAL NOT NULL,
+  PRIMARY KEY (repo_path, language)
+);
 "#;
 
 /// This build's event schema version, written into every row.
@@ -1581,6 +1600,52 @@ pub struct FleetMetrics {
     pub coverage_pct: Option<f64>,
     pub coverage_truncated: bool,
     pub coverage_at: Option<String>,
+    /// The language breakdown recorded by the same scan that set `loc`.
+    ///
+    /// Empty means no breakdown is on file — either nothing was ever scanned,
+    /// or the row predates this table. It never means "this repository has no
+    /// languages": that case is a scan that ran and stored an empty list, and
+    /// `loc_at` is what tells the two apart.
+    pub languages: Vec<FleetLanguageStat>,
+
+    /* ── The previous measurement, so a number can carry a direction ─────── */
+    //
+    // Same shape as every family above: a value and the day it was taken,
+    // together or not at all. `None` means there is no earlier measurement on
+    // file — a first scan, or a build predating `fleet_history` — and a caller
+    // must render no delta rather than a delta of zero, because "unchanged" and
+    // "never measured before" are the two facts this whole file exists to keep
+    // apart.
+    //
+    // Deliberately the *previous distinct day*, not "a week ago": nobody
+    // guarantees a scan happened a week ago, and interpolating one would invent
+    // a measurement. The day travels so the delta can name its own baseline —
+    // "+180 MB since Sep 2" rather than an unqualified arrow.
+    pub loc_prev: Option<i64>,
+    pub loc_prev_day: Option<String>,
+    pub storage_prev_bytes: Option<i64>,
+    pub storage_prev_day: Option<String>,
+    pub vulns_prev_total: Option<i64>,
+    pub vulns_prev_day: Option<String>,
+    pub coverage_prev_pct: Option<f64>,
+    pub coverage_prev_day: Option<String>,
+}
+
+/// One language's share of a repository, as the Fleet grid caches it.
+///
+/// Mirrors [`crate::engine::git_reader::RepoLanguageStat`] field for field on
+/// purpose: the frontend folds these through the same
+/// `pickLanguageBarStats` the per-repository language bar uses, and a shape
+/// that needed adapting would be a second, drifting definition of what a
+/// language reading is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetLanguageStat {
+    pub language: String,
+    pub color_hex: String,
+    pub category: String,
+    pub code_lines: i64,
+    pub file_count: i64,
+    pub percentage: f64,
 }
 
 /// One family's freshly scanned numbers, on their way into the ledger.
@@ -1606,6 +1671,15 @@ pub struct FleetMetricsInput {
     pub health_complete: bool,
     pub coverage_pct: Option<f64>,
     pub coverage_truncated: bool,
+    /// The breakdown this call recorded, if it is a language scan.
+    ///
+    /// Three states, deliberately: `None` is "this call is not about
+    /// languages" and leaves the stored breakdown alone, `Some(vec![])` is "a
+    /// scan ran and found nothing" and clears it, and a non-empty list
+    /// replaces it. Collapsing the first two would make every storage scan
+    /// quietly erase the last language scan.
+    #[serde(default)]
+    pub languages: Option<Vec<FleetLanguageStat>>,
 }
 
 fn fleet_metrics_from_row(row: &Row<'_>) -> rusqlite::Result<FleetMetrics> {
@@ -1631,8 +1705,60 @@ fn fleet_metrics_from_row(row: &Row<'_>) -> rusqlite::Result<FleetMetrics> {
         coverage_pct: row.get(18)?,
         coverage_truncated: row.get::<_, i64>(19)? != 0,
         coverage_at: row.get(20)?,
+        // Filled by the caller from `fleet_languages` and `fleet_history`;
+        // this mapper only sees the metrics row.
+        languages: Vec::new(),
+        loc_prev: None,
+        loc_prev_day: None,
+        storage_prev_bytes: None,
+        storage_prev_day: None,
+        vulns_prev_total: None,
+        vulns_prev_day: None,
+        coverage_prev_pct: None,
+        coverage_prev_day: None,
     })
 }
+
+/// How many days of history one lookup reads before giving up on a baseline.
+///
+/// The read wants the newest earlier measurement per family, and families are
+/// scanned independently — a repository whose storage was scanned yesterday
+/// and whose coverage was last scanned in March needs enough rows to find
+/// both. Sixty days is generous for that and still a bounded read; past it a
+/// family simply reports no baseline, which renders as no delta rather than as
+/// a wrong one.
+const FLEET_HISTORY_LOOKBACK_DAYS: usize = 60;
+
+/// The UTC calendar day an ISO-8601 stamp falls on, `YYYY-MM-DD`.
+///
+/// UTC rather than local, matching every other day the ledger records: a
+/// machine that crosses midnight during a trip must not file two scans of the
+/// same afternoon under two different days.
+fn utc_day(iso: &str) -> String {
+    iso.chars().take(10).collect()
+}
+
+/// How many language rows one repository may cache.
+///
+/// The frontend draws six plus an aggregate, and folds the tail itself. The
+/// cap is here as well so a caller cannot make one repository's breakdown
+/// unbounded, and it is generous enough that the fold still has real
+/// remainders to work with rather than a pre-truncated list.
+pub const MAX_FLEET_LANGUAGES: usize = 16;
+
+fn fleet_language_from_row(row: &Row<'_>) -> rusqlite::Result<FleetLanguageStat> {
+    Ok(FleetLanguageStat {
+        language: row.get(0)?,
+        color_hex: row.get(1)?,
+        category: row.get(2)?,
+        code_lines: row.get(3)?,
+        file_count: row.get(4)?,
+        percentage: row.get(5)?,
+    })
+}
+
+const FLEET_LANGUAGE_COLUMNS: &str =
+    "language, color_hex, category, code_lines, file_count, percentage";
 
 const FLEET_METRICS_COLUMNS: &str = "repo_path, loc, loc_language, loc_truncated, loc_at, \
      storage_bytes, storage_git_bytes, storage_reclaimable_bytes, storage_truncated, storage_at, \
@@ -1720,8 +1846,112 @@ pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<
             ],
         )
         .map_err(|e| LedgerError::new("insert_fleet_metrics_failed", e.to_string()))?;
+        write_fleet_languages(conn, &repo_identity, input.languages.as_deref())?;
+        write_fleet_history(conn, &repo_identity, &utc_day(&now), input)?;
         Ok(())
     })
+}
+
+/// Records today's value for whichever family this call carries.
+///
+/// Deliberately part of the scan write rather than a scheduled job: history
+/// then accrues exactly when a measurement is taken, and **a day nobody
+/// scanned has no row at all**. That is what keeps a flat line honest — it
+/// means "not measured", never "unchanged", and no background task can quietly
+/// fill the gap with a repeat of yesterday's number.
+///
+/// Rescanning the same family twice in a day overwrites the day's value rather
+/// than appending, so a day holds one measurement per family: the latest.
+fn write_fleet_history(
+    conn: &Connection,
+    repo_identity: &str,
+    day: &str,
+    input: &FleetMetricsInput,
+) -> Result<(), LedgerError> {
+    // Nothing measurable in this call — a languages-only write, say — leaves
+    // the day's row untouched rather than creating an all-null one that would
+    // read as a day something was measured.
+    if input.loc.is_none()
+        && input.storage_bytes.is_none()
+        && input.vulns_total.is_none()
+        && input.coverage_pct.is_none()
+    {
+        return Ok(());
+    }
+    conn.execute(
+        r#"
+        INSERT INTO fleet_history (repo_path, day, loc, storage_bytes, vulns_total, coverage_pct)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(repo_path, day) DO UPDATE SET
+            loc           = COALESCE(excluded.loc, fleet_history.loc),
+            storage_bytes = COALESCE(excluded.storage_bytes, fleet_history.storage_bytes),
+            vulns_total   = COALESCE(excluded.vulns_total, fleet_history.vulns_total),
+            coverage_pct  = COALESCE(excluded.coverage_pct, fleet_history.coverage_pct)
+        "#,
+        params![
+            repo_identity,
+            day,
+            input.loc,
+            input.storage_bytes,
+            input.vulns_total,
+            input.coverage_pct,
+        ],
+    )
+    .map_err(|e| LedgerError::new("insert_fleet_history_failed", e.to_string()))?;
+    Ok(())
+}
+
+/// Replaces one repository's cached language breakdown, or leaves it alone.
+///
+/// `None` means this call was not a language scan. Only a `Some` clears and
+/// rewrites, so the four families stay as independent here as the `COALESCE`s
+/// above make them for the scalar columns.
+fn write_fleet_languages(
+    conn: &Connection,
+    repo_identity: &str,
+    languages: Option<&[FleetLanguageStat]>,
+) -> Result<(), LedgerError> {
+    let Some(languages) = languages else {
+        return Ok(());
+    };
+    // Delete-then-insert inside one transaction, so a failure part-way cannot
+    // leave a repository with half of one scan and half of the last.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| LedgerError::new("fleet_languages_tx_failed", e.to_string()))?;
+    tx.execute(
+        "DELETE FROM fleet_languages WHERE repo_path = ?1",
+        params![repo_identity],
+    )
+    .map_err(|e| LedgerError::new("delete_fleet_languages_failed", e.to_string()))?;
+    for stat in languages.iter().take(MAX_FLEET_LANGUAGES) {
+        tx.execute(
+            r#"
+            INSERT INTO fleet_languages
+                (repo_path, language, color_hex, category, code_lines, file_count, percentage)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(repo_path, language) DO UPDATE SET
+                color_hex  = excluded.color_hex,
+                category   = excluded.category,
+                code_lines = excluded.code_lines,
+                file_count = excluded.file_count,
+                percentage = excluded.percentage
+            "#,
+            params![
+                repo_identity,
+                redact::text(&stat.language),
+                redact::text(&stat.color_hex),
+                redact::text(&stat.category),
+                stat.code_lines,
+                stat.file_count,
+                stat.percentage,
+            ],
+        )
+        .map_err(|e| LedgerError::new("insert_fleet_languages_failed", e.to_string()))?;
+    }
+    tx.commit()
+        .map_err(|e| LedgerError::new("fleet_languages_commit_failed", e.to_string()))?;
+    Ok(())
 }
 
 /// Reads one repository's cached metrics, creating nothing.
@@ -1772,8 +2002,162 @@ pub fn read_fleet_metrics(repo_path: &str) -> Result<Option<FleetMetrics>, Ledge
         // Hand back the path the caller asked about, not the redacted identity
         // the row is keyed by.
         metrics.repo_path.clone_from(&canonical_repo_path);
+        // Same read-only connection, same repository: a breakdown that cannot
+        // be read is an error, not an empty list, for the same reason the
+        // metrics row itself is.
+        metrics.languages = read_fleet_languages(&conn, &repo_identity)?;
+        read_fleet_baselines(&conn, &repo_identity, metrics)?;
     }
     Ok(found)
+}
+
+/// Fills in each family's previous measurement, from `fleet_history`.
+///
+/// "Previous" means the newest row on a day *strictly before* the newest day
+/// on file for that family — so rescanning twice today shows no delta, which
+/// is correct: nothing has changed since the last measurement, because this is
+/// the last measurement.
+///
+/// A family with no earlier row is left `None` and renders as no delta. That is
+/// not the same as a delta of zero, and it is exactly the distinction a first
+/// scan needs: an arrow saying "unchanged" the first time you ever measure
+/// something is a claim about a past that was never observed.
+fn read_fleet_baselines(
+    conn: &Connection,
+    repo_identity: &str,
+    metrics: &mut FleetMetrics,
+) -> Result<(), LedgerError> {
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fleet_history'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| LedgerError::new("fleet_history_query_failed", e.to_string()))?;
+    if has_table == 0 {
+        return Ok(());
+    }
+    // One bounded read, folded per family below, rather than four queries that
+    // each walk the same index.
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT day, loc, storage_bytes, vulns_total, coverage_pct FROM fleet_history              WHERE repo_path = ?1 ORDER BY day DESC LIMIT {FLEET_HISTORY_LOOKBACK_DAYS}"
+        ))
+        .map_err(|e| LedgerError::new("fleet_history_query_failed", e.to_string()))?;
+    let rows = stmt
+        .query_map(params![repo_identity], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        })
+        .map_err(|e| LedgerError::new("fleet_history_query_failed", e.to_string()))?;
+
+    // Newest first. For each family the first row carrying a value is its
+    // latest day, and the next distinct day carrying one is its baseline.
+    let mut latest_day: [Option<String>; 4] = [None, None, None, None];
+    for row in rows {
+        let (day, loc, storage, vulns, coverage) =
+            row.map_err(|e| LedgerError::new("fleet_history_row_failed", e.to_string()))?;
+        if let Some(value) = loc {
+            fill(
+                &mut latest_day[0],
+                &day,
+                &mut metrics.loc_prev,
+                &mut metrics.loc_prev_day,
+                value,
+            );
+        }
+        if let Some(value) = storage {
+            fill(
+                &mut latest_day[1],
+                &day,
+                &mut metrics.storage_prev_bytes,
+                &mut metrics.storage_prev_day,
+                value,
+            );
+        }
+        if let Some(value) = vulns {
+            fill(
+                &mut latest_day[2],
+                &day,
+                &mut metrics.vulns_prev_total,
+                &mut metrics.vulns_prev_day,
+                value,
+            );
+        }
+        if let Some(value) = coverage {
+            if latest_day[3].is_none() {
+                latest_day[3] = Some(day.clone());
+            } else if metrics.coverage_prev_pct.is_none()
+                && latest_day[3].as_deref() != Some(day.as_str())
+            {
+                metrics.coverage_prev_pct = Some(value);
+                metrics.coverage_prev_day = Some(day.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records the first row for a family as its latest day, and the first row on
+/// a *different* day as its baseline. Anything after that is older still and
+/// is ignored.
+fn fill(
+    latest_day: &mut Option<String>,
+    day: &str,
+    prev_value: &mut Option<i64>,
+    prev_day: &mut Option<String>,
+    value: i64,
+) {
+    if latest_day.is_none() {
+        *latest_day = Some(day.to_string());
+        return;
+    }
+    if prev_value.is_none() && latest_day.as_deref() != Some(day) {
+        *prev_value = Some(value);
+        *prev_day = Some(day.to_string());
+    }
+}
+
+/// The cached language breakdown for one repository, largest first.
+///
+/// Returns an empty list for a ledger written before `fleet_languages`
+/// existed. That is the same fact as a repository whose `loc` was never
+/// scanned — no breakdown on file — and the caller distinguishes it from a
+/// measured absence through `loc_at`, exactly as it does for every other
+/// family.
+fn read_fleet_languages(
+    conn: &Connection,
+    repo_identity: &str,
+) -> Result<Vec<FleetLanguageStat>, LedgerError> {
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fleet_languages'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| LedgerError::new("fleet_languages_query_failed", e.to_string()))?;
+    if has_table == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {FLEET_LANGUAGE_COLUMNS} FROM fleet_languages \
+             WHERE repo_path = ?1 ORDER BY code_lines DESC, language ASC LIMIT {MAX_FLEET_LANGUAGES}"
+        ))
+        .map_err(|e| LedgerError::new("fleet_languages_query_failed", e.to_string()))?;
+    let rows = stmt
+        .query_map(params![repo_identity], fleet_language_from_row)
+        .map_err(|e| LedgerError::new("fleet_languages_query_failed", e.to_string()))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| LedgerError::new("fleet_languages_row_failed", e.to_string()))?);
+    }
+    Ok(out)
 }
 
 /// Test-only helpers that need the private registry.
@@ -1884,6 +2268,445 @@ mod tests {
         // directory into it.
         assert_eq!(before, after, "reading metrics must not create .devcouncil");
         assert!(!dir.path().join(".devcouncil").exists());
+    }
+
+    fn language(name: &str, lines: i64, pct: f64) -> FleetLanguageStat {
+        FleetLanguageStat {
+            language: name.to_string(),
+            color_hex: "#dea584".to_string(),
+            category: "programming".to_string(),
+            code_lines: lines,
+            file_count: 3,
+            percentage: pct,
+        }
+    }
+
+    /// Writes a metrics row and files its history under an explicit day.
+    ///
+    /// The production write always stamps *today*, which is right and is what
+    /// makes a baseline honest — but it leaves no way to test a baseline
+    /// without waiting a day. This moves the row the write just made onto the
+    /// day the test means, merging rather than inserting so two scans "on the
+    /// same day" behave exactly as two scans on one real day would.
+    fn save_on_day(repo: &str, day: &str, input: &FleetMetricsInput) {
+        let repo_identity = redact::text(&canonical_repo(repo));
+        let today = utc_day(&ids::iso8601_utc(ids::now_millis()));
+        save_fleet_metrics(repo, input).expect("save");
+        with_conn(repo, |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO fleet_history (repo_path, day, loc, storage_bytes, vulns_total, coverage_pct)
+                SELECT repo_path, ?2, loc, storage_bytes, vulns_total, coverage_pct
+                  FROM fleet_history WHERE repo_path = ?1 AND day = ?3
+                ON CONFLICT(repo_path, day) DO UPDATE SET
+                    loc           = COALESCE(excluded.loc, fleet_history.loc),
+                    storage_bytes = COALESCE(excluded.storage_bytes, fleet_history.storage_bytes),
+                    vulns_total   = COALESCE(excluded.vulns_total, fleet_history.vulns_total),
+                    coverage_pct  = COALESCE(excluded.coverage_pct, fleet_history.coverage_pct)
+                "#,
+                params![&repo_identity, day, &today],
+            )
+            .map_err(|e| LedgerError::new("reday_failed", e.to_string()))?;
+            if day != today {
+                conn.execute(
+                    "DELETE FROM fleet_history WHERE repo_path = ?1 AND day = ?2",
+                    params![&repo_identity, &today],
+                )
+                .map_err(|e| LedgerError::new("reday_cleanup_failed", e.to_string()))?;
+            }
+            Ok(())
+        })
+        .expect("re-day");
+    }
+
+    #[test]
+    fn a_first_scan_reports_no_baseline_rather_than_a_delta_of_zero() {
+        // "Unchanged" the first time you ever measure something is a claim
+        // about a past nobody observed.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                storage_bytes: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.storage_bytes, Some(1_000));
+        assert!(found.storage_prev_bytes.is_none());
+        assert!(found.storage_prev_day.is_none());
+    }
+
+    #[test]
+    fn the_baseline_is_the_previous_day_a_family_was_measured() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_on_day(
+            repo,
+            "2026-08-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_000),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_500),
+                ..Default::default()
+            },
+        );
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.storage_bytes, Some(1_500));
+        assert_eq!(found.storage_prev_bytes, Some(1_000));
+        assert_eq!(found.storage_prev_day.as_deref(), Some("2026-08-01"));
+    }
+
+    #[test]
+    fn rescanning_the_same_day_leaves_the_baseline_where_it_was() {
+        // Two scans on one day are one measurement: the latest. A baseline of
+        // "this morning's value" would show a delta for work that is the same
+        // measurement taken twice.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_on_day(
+            repo,
+            "2026-08-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_000),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_500),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_700),
+                ..Default::default()
+            },
+        );
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.storage_bytes, Some(1_700));
+        assert_eq!(
+            found.storage_prev_bytes,
+            Some(1_000),
+            "still yesterday's value"
+        );
+        assert_eq!(found.storage_prev_day.as_deref(), Some("2026-08-01"));
+    }
+
+    #[test]
+    fn each_family_keeps_its_own_baseline_day() {
+        // Families are scanned independently, so a repository can have a
+        // storage baseline from yesterday and a coverage baseline from March.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_on_day(
+            repo,
+            "2026-03-01",
+            &FleetMetricsInput {
+                coverage_pct: Some(50.0),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-08-31",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_000),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-01",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_500),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-02",
+            &FleetMetricsInput {
+                coverage_pct: Some(70.0),
+                ..Default::default()
+            },
+        );
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.storage_prev_day.as_deref(), Some("2026-08-31"));
+        assert_eq!(found.coverage_prev_pct, Some(50.0));
+        assert_eq!(found.coverage_prev_day.as_deref(), Some("2026-03-01"));
+    }
+
+    #[test]
+    fn a_scan_of_one_family_never_records_a_history_value_for_another() {
+        // The COALESCE that keeps the families independent in `fleet_metrics`
+        // has to hold for history too, or a storage scan would file a repeat of
+        // last week's coverage under today and invent a flat line.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_on_day(
+            repo,
+            "2026-09-01",
+            &FleetMetricsInput {
+                coverage_pct: Some(70.0),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-02",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_000),
+                ..Default::default()
+            },
+        );
+        save_on_day(
+            repo,
+            "2026-09-03",
+            &FleetMetricsInput {
+                storage_bytes: Some(1_200),
+                ..Default::default()
+            },
+        );
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert!(
+            found.coverage_prev_pct.is_none(),
+            "coverage was measured once; there is no earlier coverage day to compare with"
+        );
+    }
+
+    #[test]
+    fn a_languages_only_write_records_no_history_day() {
+        // An all-null history row would read as a day on which something was
+        // measured, and would become a baseline that means nothing.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                languages: Some(vec![language("Rust", 10, 100.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+        let rows: i64 = with_conn(repo, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM fleet_history", [], |row| row.get(0))
+                .map_err(|e| LedgerError::new("count_failed", e.to_string()))
+        })
+        .expect("count");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn a_ledger_predating_the_history_table_reads_as_no_baseline_not_an_error() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(10),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+        with_conn(repo, |conn| {
+            conn.execute("DROP TABLE IF EXISTS fleet_history", [])
+                .map_err(|e| LedgerError::new("drop_failed", e.to_string()))?;
+            Ok(())
+        })
+        .expect("drop");
+        tests_support::reset_registry();
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.loc, Some(10));
+        assert!(found.loc_prev.is_none());
+    }
+
+    #[test]
+    fn fleet_languages_round_trip_largest_first() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(300),
+                loc_language: Some("Rust".to_string()),
+                languages: Some(vec![
+                    language("TypeScript", 100, 33.3),
+                    language("Rust", 200, 66.7),
+                ]),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        let names: Vec<&str> = found
+            .languages
+            .iter()
+            .map(|stat| stat.language.as_str())
+            .collect();
+        assert_eq!(names, vec!["Rust", "TypeScript"], "largest first");
+        assert_eq!(found.languages[0].code_lines, 200);
+        assert_eq!(found.languages[0].category, "programming");
+        assert_eq!(found.languages[0].file_count, 3);
+    }
+
+    #[test]
+    fn a_scan_of_another_family_leaves_the_language_breakdown_alone() {
+        // The `None` case. A storage scan carries no languages, and quietly
+        // erasing the last language scan is exactly the cross-family erasure
+        // the COALESCEs prevent for the scalar columns.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(300),
+                languages: Some(vec![language("Rust", 200, 100.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("save loc");
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                storage_bytes: Some(1024),
+                ..Default::default()
+            },
+        )
+        .expect("save storage");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.storage_bytes, Some(1024));
+        assert_eq!(found.languages.len(), 1, "the breakdown survived");
+    }
+
+    #[test]
+    fn a_language_scan_that_found_nothing_clears_the_breakdown() {
+        // The `Some(vec![])` case, which is a different fact from `None`: a
+        // repository emptied of source has no languages, and leaving last
+        // week's list on the row would report code that is no longer there.
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(300),
+                languages: Some(vec![language("Rust", 200, 100.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("save loc");
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(0),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .expect("save empty loc");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert!(found.languages.is_empty());
+    }
+
+    #[test]
+    fn a_rescan_replaces_the_breakdown_rather_than_accumulating_it() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(300),
+                languages: Some(vec![language("Rust", 200, 66.0), language("Go", 100, 34.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("first scan");
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(200),
+                languages: Some(vec![language("Rust", 200, 100.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("second scan");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(
+            found.languages.len(),
+            1,
+            "a language that is gone must not linger from the previous scan"
+        );
+        assert_eq!(found.languages[0].language, "Rust");
+    }
+
+    #[test]
+    fn the_breakdown_is_capped_so_one_repository_cannot_grow_without_bound() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        let many: Vec<FleetLanguageStat> = (0..MAX_FLEET_LANGUAGES + 8)
+            .map(|i| language(&format!("Lang{i}"), (1000 - i) as i64, 1.0))
+            .collect();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(9000),
+                languages: Some(many),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.languages.len(), MAX_FLEET_LANGUAGES);
+    }
+
+    #[test]
+    fn a_ledger_predating_the_language_table_reads_as_no_breakdown_not_an_error() {
+        let dir = temp_repo();
+        let repo = dir.path().to_str().unwrap();
+        save_fleet_metrics(
+            repo,
+            &FleetMetricsInput {
+                loc: Some(300),
+                languages: Some(vec![language("Rust", 200, 100.0)]),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+        with_conn(repo, |conn| {
+            conn.execute("DROP TABLE IF EXISTS fleet_languages", [])
+                .map_err(|e| LedgerError::new("drop_failed", e.to_string()))?;
+            Ok(())
+        })
+        .expect("drop");
+        tests_support::reset_registry();
+
+        let found = read_fleet_metrics(repo).expect("read").expect("a row");
+        assert_eq!(found.loc, Some(300), "the metrics row still reads");
+        assert!(found.languages.is_empty());
     }
 
     #[test]

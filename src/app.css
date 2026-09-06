@@ -374,6 +374,20 @@ html.dark {
   }
 
   /*
+   * The floor mark: a measurement that is a lower bound, not a total.
+   *
+   * One owner for what had been a lone 10px `≥` glyph repeated at three call
+   * sites. The glyph stays — it is compact and precise — but the underline is
+   * what makes the mark survive being skimmed past, because it scales with
+   * whatever it qualifies instead of sitting beside it at a fixed size. Dashed
+   * rather than solid so it never reads as an underline for emphasis, and
+   * amber because it is the same caution the partial-scan notices use.
+   */
+  .gp-floor {
+    @apply border-b border-dashed border-amber-500/70 dark:border-amber-400/60;
+  }
+
+  /*
    * Native <select>, wearing the app's own chrome. The platform widget drew a
    * grey system box with a system arrow inside a soft-bubble panel; keeping
    * the element (and its free keyboard handling, its screen-reader role, its
