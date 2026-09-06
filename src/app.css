@@ -148,6 +148,10 @@ html.light :where([class~="text-slate-400"], [class~="text-slate-600"]) {
   /* Derived plain colors — the canvas graph reads these. */
   --bg-main: rgb(var(--c-bg));
   --bg-surface: rgb(var(--c-surface));
+  /* What xterm paints behind its cells. Kept apart from `--bg-surface`
+     because that token has a second runtime reader -- the graph's node stroke
+     -- and a stroke is not a fill. */
+  --bg-terminal: rgb(var(--c-surface));
   --bg-surface-hover: rgb(var(--c-surface-hover));
   --border-color: rgb(var(--c-border));
   --accent-color: rgb(var(--c-accent));
@@ -575,6 +579,11 @@ html.macos {
      bottomed out near black. A shade recesses without covering, and the
      surrounding material is already doing most of the separating. */
   --mac-recess: rgb(0 0 0 / 0.11);
+  /* The terminal's surface is the plate its mount div already paints
+     (`bg-surface`, so it thins and goes opaque with every other panel). xterm
+     paints nothing on top: a second translucent fill there would be the same
+     double-coverage the panes were just cured of. */
+  --bg-terminal: transparent;
   --mac-liquid-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -822,6 +831,15 @@ html.macos
   background-color: var(--mac-recess);
 }
 
+/* xterm.css hard-codes `background-color: #000` on its viewport, with the note
+   "On OS X this is required in order for the scroll bar to appear fully
+   opaque". That is a black slab under a translucent terminal, and it is the
+   reason a transparent theme colour alone changes nothing. The scrollbar keeps
+   a defined ground either way: the mount div's own plate is right behind it. */
+html.macos .xterm .xterm-viewport {
+  background-color: transparent;
+}
+
 html.macos .gp-titlebar-actions,
 html.macos .gp-welcome {
   background-color: transparent;
@@ -932,6 +950,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     --mac-edge-shade: rgb(var(--c-bg));
     --mac-recess: rgb(var(--c-bg));
     --bg-main: rgb(var(--c-bg));
+    --bg-terminal: rgb(var(--c-surface));
   }
 
   html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float, .gp-liquid-tabs) {

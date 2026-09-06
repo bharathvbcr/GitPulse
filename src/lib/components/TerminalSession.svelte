@@ -31,6 +31,34 @@
       Math.round(proposed.rows) !== Math.round(current.rows)
     );
   }
+  /**
+   * A colour xterm will accept for a translucent surface.
+   *
+   * `css.toColor` in @xterm/xterm 6.0.0 parses `#rgb`, `#rgba`, `#rrggbb` and
+   * `#rrggbbaa` itself and sends everything else through a canvas probe that
+   * THROWS `css.toColor: Unsupported css format` when the sampled alpha is not
+   * 255. `getComputedStyle` normalises a translucent token to
+   * `rgba(20, 26, 41, 0.5)`, which takes exactly that path — so the alpha has to
+   * be re-spelled as hex here, at the boundary the constraint belongs to, rather
+   * than left for the terminal to parse and reject.
+   *
+   * Anything already hex, or any form this cannot read, is passed through
+   * untouched: xterm's own parser is a better judge of it than a guess is.
+   */
+  export function hexColor(value: string): string {
+    // `transparent` is a keyword, not a function, and it takes the canvas path
+    // too -- where it samples alpha 0 and throws just as `rgba(…, 0.5)` does.
+    if (value === "transparent") return "#00000000";
+    const channels = value.match(/^rgba?\(([^)]+)\)$/i);
+    if (!channels) return value;
+    const parts = channels[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+    if (parts.length < 3 || parts.slice(0, 3).some((n) => !Number.isFinite(n))) return value;
+    const alpha = parts.length > 3 && Number.isFinite(parts[3]) ? parts[3] : 1;
+    const byte = (n: number) =>
+      Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+    const opacity = alpha >= 1 ? "" : byte(alpha * 255);
+    return `#${parts.slice(0, 3).map(byte).join("")}${opacity}`;
+  }
 </script>
 
 <script lang="ts">
@@ -100,9 +128,11 @@
     const v = (name: string, fallback: string) =>
       css.getPropertyValue(name).trim() || fallback;
     return {
-      background: v("--bg-surface", "#141a29"),
+      background: hexColor(v("--bg-terminal", "#141a29")),
       foreground: v("--text-primary", "#e9edf8"),
       cursor: v("--accent-color", "#809eff"),
+      // The glyph drawn INSIDE a block cursor, so it is a foreground and stays
+      // opaque even when the surface behind it does not.
       cursorAccent: v("--bg-surface", "#141a29"),
       selectionBackground: "rgb(128 158 255 / 0.32)",
     };
@@ -117,6 +147,11 @@
       cursorBlink: true,
       convertEol: false,
       theme: termTheme(),
+      // Required before `open()` for a non-opaque background, and not
+      // changeable afterwards. Its documented cost is the texture-atlas
+      // renderers; this terminal loads only the fit addon, so the DOM renderer
+      // draws the background as a plain CSS colour.
+      allowTransparency: true,
       scrollback: 5000,
     });
     fitAddon = new FitAddon();

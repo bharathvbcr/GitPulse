@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { shouldRefit } from "./TerminalSession.svelte";
+import { hexColor, shouldRefit } from "./TerminalSession.svelte";
 
 /**
  * These contracts moved here with the PTY itself when tabs arrived: they were
@@ -163,5 +163,51 @@ describe("TerminalSession PTY contracts", () => {
     const body = source.slice(handlerIdx, source.indexOf("term = created;"));
     expect(body).toContain('event.type !== "keydown"');
     expect(body).toContain("return !onChord(event);");
+  });
+});
+
+/**
+ * xterm parses `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` itself and pushes anything
+ * else through a canvas probe that throws when the sampled alpha is not 255
+ * (`css.toColor`, @xterm/xterm 6.0.0). `getComputedStyle` returns a
+ * translucent token as `rgba(...)`, which is exactly the form that throws — so
+ * a terminal on a glass surface depends on this conversion, not on taste.
+ */
+describe("TerminalSession surface colour", () => {
+  it("re-spells a translucent computed colour as hex xterm can parse", () => {
+    expect(hexColor("rgba(20, 26, 41, 0.5)")).toBe("#141a2980");
+    expect(hexColor("rgb(20 26 41 / 0.5)")).toBe("#141a2980");
+  });
+
+  it("drops the alpha byte when the surface is opaque", () => {
+    // `#rrggbb` and `#rrggbbaa` are both accepted; the shorter one keeps the
+    // opaque case identical to what the terminal was given before.
+    expect(hexColor("rgb(20, 26, 41)")).toBe("#141a29");
+    expect(hexColor("rgba(20, 26, 41, 1)")).toBe("#141a29");
+  });
+
+  it("spells the transparent keyword as hex too", () => {
+    // `transparent` is a keyword rather than a function, and it takes the same
+    // canvas path — where it samples alpha 0 and throws exactly as a
+    // translucent `rgba()` does.
+    expect(hexColor("transparent")).toBe("#00000000");
+  });
+
+  it("passes through anything it cannot read rather than guessing", () => {
+    // xterm's parser handles far more than this does; mangling a colour it
+    // would have understood is worse than handing it over untouched.
+    expect(hexColor("#141a29")).toBe("#141a29");
+    expect(hexColor("color-mix(in srgb, red, blue)")).toBe("color-mix(in srgb, red, blue)");
+    expect(hexColor("rgb(20, 26)")).toBe("rgb(20, 26)");
+  });
+
+  it("reads the terminal's own token, and asks for transparency support", () => {
+    // `--bg-surface` has a second runtime reader — the graph's node stroke —
+    // and a stroke is not a fill. `allowTransparency` must be set before
+    // `open()`, so it belongs in the constructor options.
+    expect(source).toContain('hexColor(v("--bg-terminal"');
+    expect(source).toContain("allowTransparency: true");
+    // The block cursor's glyph colour is a foreground and stays opaque.
+    expect(source).toContain('cursorAccent: v("--bg-surface"');
   });
 });

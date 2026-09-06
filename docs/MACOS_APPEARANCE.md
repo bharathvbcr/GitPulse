@@ -82,6 +82,38 @@ ramp travelled through black and fringed on light themes. `.gp-edge-fade` fades
 one colour to its own zero, and on macOS fades a shade rather than a colour,
 because the gutter deliberately stopped painting a colour to fade from.
 
+### The two surfaces CSS cannot reach
+
+Everything above is one file: `src/app.css` owns the material, and every rule
+here lands in it. Two surfaces paint themselves outside CSS and each needs a
+token there plus a one-line adapter at its own boundary.
+
+The **graph canvas** is a 2D context: `--bg-main` resolving to `transparent`
+tells the renderer to take an alpha backing store, clear each frame rather than
+fill it, and cut node haloes with `destination-out`.
+
+The **terminal** is xterm.js, which paints its own background from a theme
+object. `--bg-terminal` resolving to `transparent` makes it paint nothing, so
+the surface is the plate its mount div already carries (`bg-surface`, which
+thins and goes opaque with every other panel) — a second translucent fill from
+the terminal would be the same double coverage the panes were cured of. The
+token is deliberately not `--bg-surface`, which has a second runtime reader:
+the graph's node *stroke*, and a stroke is not a fill.
+
+Three things are load-bearing at that boundary, and none of them is cosmetic:
+
+- `allowTransparency` must be set before `open()` and cannot be changed later.
+- The colour must be **hex**. `css.toColor` in @xterm/xterm 6.0.0 parses
+  `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` itself and pushes everything else
+  through a canvas probe that *throws* when the sampled alpha is not 255 —
+  measured in WebKit, `rgba(20, 26, 41, 0.5)` samples alpha 128 and the
+  `transparent` keyword samples 0, while `getComputedStyle` hands back exactly
+  those forms. `hexColor()` re-spells them at the call site.
+- xterm.css hard-codes `background-color: #000` on its viewport ("On OS X this
+  is required in order for the scroll bar to appear fully opaque"). That black
+  slab is why a transparent theme colour alone changes nothing on screen, and
+  it is overridden for the same reason the terminal is translucent at all.
+
 ### One blur per dialog
 
 `backdrop-filter` makes its element a **backdrop root**. A full-viewport scrim
