@@ -6,7 +6,8 @@ use crate::coverage_toolchain::{
     VENV_DIR_NAMES,
 };
 use crate::engine::git_cli::{
-    run_captured, sandbox_join, sandbox_join_canonical, validate_repo, RunOutcome,
+    extended_child_path, resolve_spawn_program_with, run_captured, sandbox_join,
+    sandbox_join_canonical, validate_repo, RunOutcome,
 };
 use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -165,6 +166,169 @@ fn default_shell() -> String {
     }
 }
 
+/// Shells that accept `-l` as "start as a login shell".
+///
+/// A closed set rather than "append `-l` to whatever `$SHELL` names": an
+/// unknown shell handed an unknown flag fails to start at all, and a terminal
+/// that will not open is strictly worse than one with a short `PATH`.
+const LOGIN_FLAG_SHELLS: &[&str] = &[
+    "zsh", "bash", "sh", "dash", "ksh", "mksh", "fish", "tcsh", "csh",
+];
+
+/// The login flag `shell` must be started with, or `None` to start it plain.
+///
+/// A GUI-launched macOS app inherits launchd's environment, not the user's, so
+/// none of the shell's startup files have run and `PATH` is the bare
+/// `/usr/bin:/bin:/usr/sbin:/sbin`. zsh reads `~/.zprofile` — where Homebrew's
+/// `brew shellenv` and the user's `export PATH=…` lines conventionally live —
+/// only for a LOGIN shell, so a plain interactive spawn produced a shell whose
+/// own `~/.zshrc` died on the first line that called an installed tool.
+/// Terminal.app, iTerm2 and VS Code all default to a login shell for exactly
+/// this reason. Interactivity needs no flag: both families read it off the tty,
+/// which a PTY session always has.
+fn login_flag(shell: &str) -> Option<&'static str> {
+    if cfg!(windows) {
+        return None;
+    }
+    let name = std::path::Path::new(shell).file_name()?.to_str()?;
+    LOGIN_FLAG_SHELLS.contains(&name).then_some("-l")
+}
+
+/// Terminal-identity variables the child needs that a GUI launch does not set.
+///
+/// Returns only what must be ADDED: an inherited value always wins, because a
+/// build started from a real terminal — or a deliberate override from the
+/// caller — knows more about the user's environment than a default does.
+///
+/// `TERM` is the one that breaks visibly. `CommandBuilder` copies the parent
+/// environment verbatim (plus a `SHELL` backfill) and never sets `TERM`, and a
+/// macOS `.app` launched from Finder or the Dock has none — so the shell
+/// believes it has no terminal at all. `clear` fails with "TERM environment
+/// variable not set" and every full-screen program (an agent CLI, `less`,
+/// `vim`, anything ncurses) degrades or refuses to start. The value names what
+/// the frontend actually implements: xterm.js is an xterm-256color emulator,
+/// with 24-bit colour, which is what `COLORTERM` advertises.
+///
+/// `inject_locale` is a UTF-8 floor, not a language choice, and callers pass it
+/// only on macOS. With no locale at all a child runs in the C locale, where
+/// every non-ASCII byte in a path, branch name or commit message renders as
+/// mojibake; `en_US.UTF-8` is guaranteed present there, whereas on Linux an
+/// ungenerated locale would make things worse than the C locale it replaced.
+fn missing_terminal_env(
+    lookup: impl Fn(&str) -> Option<String>,
+    inject_locale: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let is_set = |name: &str| lookup(name).is_some_and(|value| !value.trim().is_empty());
+    let mut env = Vec::new();
+    if !is_set("TERM") {
+        env.push(("TERM", "xterm-256color"));
+    }
+    if !is_set("COLORTERM") {
+        env.push(("COLORTERM", "truecolor"));
+    }
+    if inject_locale && !is_set("LANG") && !is_set("LC_ALL") && !is_set("LC_CTYPE") {
+        env.push(("LANG", "en_US.UTF-8"));
+    }
+    env
+}
+
+/// The environment view one PTY session is constructed against.
+///
+/// Production reads the process. Tests build a Finder/Dock-style minimal one,
+/// so GUI-launch behaviour is exercised without mutating process state — the
+/// same seam shape [`crate::analyzer::deps::ScanOptions`] uses, for the same
+/// reason: the bugs this repairs only exist in an environment the test process
+/// does not have.
+struct PtyEnv {
+    vars: HashMap<String, String>,
+    /// True on the one platform where a missing locale is both real (launchd
+    /// hands GUI apps none) and safely repairable (`en_US.UTF-8` always
+    /// exists there).
+    inject_locale: bool,
+}
+
+impl PtyEnv {
+    fn from_process() -> Self {
+        Self {
+            vars: std::env::vars().collect(),
+            inject_locale: cfg!(target_os = "macos"),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.vars.get(name).cloned()
+    }
+
+    fn os(&self, name: &str) -> Option<std::ffi::OsString> {
+        self.vars.get(name).map(std::ffi::OsString::from)
+    }
+
+    fn home(&self) -> Option<std::ffi::OsString> {
+        self.os("HOME").or_else(|| self.os("USERPROFILE"))
+    }
+}
+
+/// The command one PTY session runs, plus the binary the requested name
+/// actually resolved to.
+struct PtyCommand {
+    cmd: CommandBuilder,
+    /// Absolute where resolution found it, the requested name where it did
+    /// not — never a guess dressed up as a location.
+    resolved: String,
+}
+
+/// Builds the command for one PTY session.
+///
+/// Split out of [`spawn_session`] because everything that was wrong here is
+/// decided before any process exists: which binary a bare name resolves to,
+/// whether the shell starts as a login shell, and which variables the child
+/// inherits. A `CommandBuilder` is fully inspectable, so all three are
+/// testable without a PTY, an `AppHandle`, or an agent CLI on the host.
+fn build_pty_command(
+    shell: &str,
+    is_default_shell: bool,
+    args: Option<&[String]>,
+    env: Option<&HashMap<String, String>>,
+    cwd: &std::path::Path,
+    pty_env: &PtyEnv,
+) -> PtyCommand {
+    // PATH repair for GUI launches, through the same owner every other
+    // subsystem resolves spawns with (`git_cli`, written because
+    // Finder-launched builds reported installed tools as missing). Two
+    // distinct needs: a bare agent-CLI name is one THIS process must resolve,
+    // and the child's own lookups — a login shell's rc file calling `brew`, an
+    // agent CLI shelling out to `node` — must see the same directories.
+    let home = pty_env.home();
+    let child_path = extended_child_path(pty_env.os("PATH").as_deref(), home.as_deref());
+    let resolved = resolve_spawn_program_with(shell, child_path.as_deref(), home.as_deref());
+
+    let mut cmd = CommandBuilder::new(&resolved);
+    // Only the user's own shell gets the login flag; an agent CLI handed `-l`
+    // would fail to start.
+    if is_default_shell {
+        if let Some(flag) = login_flag(&resolved) {
+            cmd.arg(flag);
+        }
+    }
+    for arg in args.unwrap_or_default() {
+        cmd.arg(arg);
+    }
+    // Order matters: defaults first, then PATH, then the caller's map, so an
+    // explicit value from the IPC caller always wins over anything defaulted
+    // here.
+    for (key, value) in missing_terminal_env(|name| pty_env.get(name), pty_env.inject_locale) {
+        cmd.env(key, value);
+    }
+    if let Some(ref path) = child_path {
+        cmd.env("PATH", path);
+    }
+    for (key, value) in env.into_iter().flatten() {
+        cmd.env(key, value);
+    }
+    cmd.cwd(cwd);
+    PtyCommand { cmd, resolved }
+}
+
 static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Snapshot of the parts of [`portable_pty::ExitStatus`] the exit event
@@ -241,21 +405,20 @@ pub fn spawn_session(
         .openpty(size)
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    let shell = program
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(default_shell);
-    let mut cmd = CommandBuilder::new(&shell);
-    if let Some(ref args_vec) = args {
-        for arg in args_vec {
-            cmd.arg(arg);
-        }
-    }
-    if let Some(ref env_map) = env {
-        for (k, v) in env_map {
-            cmd.env(k, v);
-        }
-    }
-    cmd.cwd(&repo);
+    let requested = program.filter(|p| !p.trim().is_empty());
+    // A caller-supplied program is an agent CLI (`claude`, `codex`, …); no
+    // program means the user's own shell, and only that starts as a login
+    // shell.
+    let is_default_shell = requested.is_none();
+    let shell = requested.unwrap_or_else(default_shell);
+    let PtyCommand { cmd, resolved } = build_pty_command(
+        &shell,
+        is_default_shell,
+        args.as_deref(),
+        env.as_ref(),
+        &repo,
+        &PtyEnv::from_process(),
+    );
 
     // The child handle is owned: the killer is split off for SessionEntry
     // (kill_session), and the child itself moves into the reader thread,
@@ -409,8 +572,11 @@ pub fn spawn_session(
     let _ = crate::ledger::record(draft);
 
     Ok(TerminalSpawned {
+        // The resolved path, not the requested name: on a GUI launch these
+        // differ, and "which binary is this session running" is the question
+        // the status row and the harness journal are actually asking.
+        shell: resolved,
         id: session_id,
-        shell,
         cwd: repo.to_string_lossy().into_owned(),
     })
 }
@@ -3044,6 +3210,279 @@ mod tests {
         assert!(
             reserve_session(&state).is_ok(),
             "released slots must be reusable"
+        );
+    }
+
+    // -- interactive PTY environment (GUI-launch repairs) ---------------------
+
+    /// A Finder/Dock-style launch: launchd's minimal PATH, no TERM, no locale.
+    fn gui_launch_env(home: &std::path::Path) -> PtyEnv {
+        PtyEnv {
+            vars: HashMap::from([
+                (
+                    "PATH".to_string(),
+                    "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+                ),
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+            ]),
+            inject_locale: true,
+        }
+    }
+
+    fn env_of(cmd: &CommandBuilder, key: &str) -> Option<String> {
+        cmd.get_env(key).map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn argv_of(cmd: &CommandBuilder) -> Vec<String> {
+        cmd.get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The defect the user saw first: `clear` reporting "TERM environment
+    /// variable not set". `CommandBuilder` copies the parent environment
+    /// verbatim and never sets TERM, and a GUI-launched app has none — so the
+    /// shell believed it had no terminal at all while xterm.js sat there
+    /// implementing a full one.
+    #[test]
+    fn gui_launched_session_declares_the_terminal_it_actually_has() {
+        let home = tempfile::tempdir().unwrap();
+        let cmd = build_pty_command(
+            "/bin/zsh",
+            true,
+            None,
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        )
+        .cmd;
+        assert_eq!(env_of(&cmd, "TERM").as_deref(), Some("xterm-256color"));
+        assert_eq!(env_of(&cmd, "COLORTERM").as_deref(), Some("truecolor"));
+        assert_eq!(env_of(&cmd, "LANG").as_deref(), Some("en_US.UTF-8"));
+    }
+
+    /// An inherited value is better information than a default: a build
+    /// started from a real terminal already has the truth. "Wins" here means
+    /// *nothing is added* — the child then inherits it untouched. Asserted
+    /// against the explicitly-set set rather than the effective environment,
+    /// because `CommandBuilder`'s base is the real process and only the
+    /// overlay is this function's decision to make.
+    #[test]
+    fn an_inherited_terminal_env_is_left_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let mut inherited = gui_launch_env(home.path());
+        inherited
+            .vars
+            .insert("TERM".to_string(), "screen-256color".to_string());
+        inherited
+            .vars
+            .insert("LANG".to_string(), "de_DE.UTF-8".to_string());
+        let cmd = build_pty_command("/bin/zsh", true, None, None, home.path(), &inherited).cmd;
+        let overlay: HashMap<&str, &str> = cmd.iter_extra_env_as_str().collect();
+        assert!(!overlay.contains_key("TERM"), "overlay: {overlay:?}");
+        assert!(!overlay.contains_key("LANG"), "overlay: {overlay:?}");
+        // COLORTERM was genuinely absent, so it is still repaired.
+        assert_eq!(overlay.get("COLORTERM"), Some(&"truecolor"));
+    }
+
+    /// An IPC caller that names a value meant it, including a value that
+    /// contradicts the default.
+    #[test]
+    fn a_caller_supplied_value_overrides_the_default() {
+        let home = tempfile::tempdir().unwrap();
+        let caller = HashMap::from([("TERM".to_string(), "dumb".to_string())]);
+        let cmd = build_pty_command(
+            "/bin/zsh",
+            true,
+            None,
+            Some(&caller),
+            home.path(),
+            &gui_launch_env(home.path()),
+        )
+        .cmd;
+        assert_eq!(env_of(&cmd, "TERM").as_deref(), Some("dumb"));
+    }
+
+    /// An empty inherited value is not a value: `TERM=` leaves the child just
+    /// as terminal-less as no TERM at all.
+    #[test]
+    fn blank_inherited_terminal_env_is_treated_as_unset() {
+        let vars = HashMap::from([("TERM".to_string(), "  ".to_string())]);
+        let injected = missing_terminal_env(|n| vars.get(n).cloned(), false);
+        assert!(injected.contains(&("TERM", "xterm-256color")));
+    }
+
+    /// A locale is repaired only where the repair is safe. On Linux an
+    /// ungenerated `en_US.UTF-8` makes every child warn — worse than the C
+    /// locale it replaced — so only macOS, whose GUI launches genuinely have
+    /// no locale and which always ships that one, gets it.
+    #[test]
+    fn locale_is_injected_only_where_it_is_guaranteed_to_exist() {
+        let empty: HashMap<String, String> = HashMap::new();
+        let names = |inject| {
+            missing_terminal_env(|n| empty.get(n).cloned(), inject)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(true).contains(&"LANG"));
+        assert!(!names(false).contains(&"LANG"));
+    }
+
+    /// Any locale variable already in force means the child has one; adding
+    /// LANG beside an inherited LC_ALL would silently change its meaning.
+    #[test]
+    fn any_inherited_locale_variable_suppresses_the_floor() {
+        for name in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            let vars = HashMap::from([(name.to_string(), "de_DE.UTF-8".to_string())]);
+            let injected = missing_terminal_env(|n| vars.get(n).cloned(), true);
+            assert!(
+                !injected.iter().any(|(k, _)| *k == "LANG"),
+                "{name} already sets the locale"
+            );
+        }
+    }
+
+    /// The second defect: the shell started non-login, so zsh never read
+    /// `~/.zprofile` — where `brew shellenv` and the user's PATH exports live
+    /// — and `~/.zshrc` then died on its first call to an installed tool.
+    #[test]
+    fn the_user_shell_starts_as_a_login_shell() {
+        let home = tempfile::tempdir().unwrap();
+        let cmd = build_pty_command(
+            "/bin/zsh",
+            true,
+            None,
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        )
+        .cmd;
+        assert_eq!(
+            argv_of(&cmd),
+            vec!["/bin/zsh".to_string(), "-l".to_string()]
+        );
+    }
+
+    /// An agent CLI is not a shell: `claude -l` would fail to start.
+    #[test]
+    fn an_agent_cli_never_receives_the_login_flag() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cmd = build_pty_command(
+            "claude",
+            false,
+            Some(&["--resume".to_string()]),
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        );
+        assert!(
+            !argv_of(&cmd.cmd).contains(&"-l".to_string()),
+            "argv: {:?}",
+            argv_of(&cmd.cmd)
+        );
+        assert_eq!(
+            argv_of(&cmd.cmd).last().map(String::as_str),
+            Some("--resume")
+        );
+    }
+
+    /// The third defect: agent launchers were bare names resolved against the
+    /// app's own PATH, which under a GUI launch omits every directory a CLI is
+    /// installed into. GitPulse already owns this repair for every other
+    /// subsystem; the terminal simply was not using it.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_cli_outside_the_gui_path_still_resolves_and_the_child_can_find_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let built = build_pty_command(
+            "codex",
+            false,
+            None,
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        );
+        // Resolved for this process...
+        assert_eq!(built.resolved, codex.to_string_lossy());
+        assert_eq!(
+            argv_of(&built.cmd).first().map(String::as_str),
+            Some(&*built.resolved)
+        );
+        // ...and reachable by the child's own nested lookups.
+        let child_path = env_of(&built.cmd, "PATH").expect("child PATH is set");
+        assert!(
+            std::env::split_paths(&child_path).any(|p| p == bin),
+            "child PATH {child_path} must contain {}",
+            bin.display()
+        );
+        // The inherited entries are still there, ahead of the fallbacks.
+        assert!(std::env::split_paths(&child_path).any(|p| p == std::path::Path::new("/usr/bin")));
+    }
+
+    /// A name that resolves nowhere passes through unchanged, so the spawn
+    /// failure keeps naming the tool the user asked for rather than a path
+    /// nothing was ever installed at.
+    #[test]
+    fn an_unresolvable_program_is_not_given_an_invented_location() {
+        let home = tempfile::tempdir().unwrap();
+        let built = build_pty_command(
+            "definitely-not-installed-xyzzy",
+            false,
+            None,
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        );
+        assert_eq!(built.resolved, "definitely-not-installed-xyzzy");
+    }
+
+    /// The flag is applied from a closed set: an unrecognised `$SHELL` handed
+    /// an unknown flag would not start at all, and a terminal that will not
+    /// open is worse than one with a short PATH.
+    #[cfg(unix)]
+    #[test]
+    fn login_flag_covers_known_shells_only() {
+        for shell in ["/bin/zsh", "/bin/bash", "/opt/homebrew/bin/fish", "sh"] {
+            assert_eq!(login_flag(shell), Some("-l"), "{shell}");
+        }
+        for other in ["/usr/local/bin/nu", "/usr/bin/python3", "", "/"] {
+            assert_eq!(login_flag(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn every_pty_session_runs_in_the_repository() {
+        let home = tempfile::tempdir().unwrap();
+        let cmd = build_pty_command(
+            "/bin/zsh",
+            true,
+            None,
+            None,
+            home.path(),
+            &gui_launch_env(home.path()),
+        )
+        .cmd;
+        assert_eq!(
+            cmd.get_cwd().map(std::path::PathBuf::from),
+            Some(home.path().to_path_buf())
         );
     }
 

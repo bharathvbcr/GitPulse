@@ -1,61 +1,8 @@
-<script module lang="ts">
-  interface TermDims {
-    cols: number;
-    rows: number;
-  }
-
-  /**
-   * Every real fit relayouts the grid and fires the PTY resize IPC, while
-   * ResizeObserver also callbacks on pure style repaints and zero-size
-   * (hidden / mid-layout) states. Refit only when the proposed grid differs
-   * from the live one; an unusable proposal skips rather than guesses.
-   */
-  export function shouldRefit(
-    current: TermDims | null,
-    proposed?: TermDims | null,
-  ): boolean {
-    if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
-      return false;
-    }
-    if (!current || !Number.isFinite(current.cols) || !Number.isFinite(current.rows)) {
-      return true;
-    }
-    return (
-      Math.round(proposed.cols) !== Math.round(current.cols) ||
-      Math.round(proposed.rows) !== Math.round(current.rows)
-    );
-  }
-
-  export type AttachAction = "open" | "adopt" | "skip";
-
-  /**
-   * xterm's open() is once-only: on an already-opened terminal it
-   * early-returns without moving the DOM node, so a swapped container would
-   * leave the buffer hanging off a detached parent (empty box, dead keys).
-   * All of xterm's listeners live inside its own element subtree, so
-   * physically re-parenting that element is safe; only the first attach may
-   * use open().
-   */
-  export function planAttach(
-    openedParent: Element | null | undefined,
-    container: Element,
-  ): AttachAction {
-    if (!openedParent) return "open";
-    return openedParent === container ? "skip" : "adopt";
-  }
-</script>
-
 <script lang="ts">
-  import { onMount, tick, untrack } from "svelte";
+  import { onMount, tick } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
-  // The class is named Terminal; aliased because lucide exports an icon of
-  // the same name below.
-  import { Terminal as XTerm } from "@xterm/xterm";
-  import { FitAddon } from "@xterm/addon-fit";
-  import "@xterm/xterm/css/xterm.css";
   import {
     Terminal,
     Play,
@@ -67,21 +14,31 @@
     Shield,
     Clock,
     SquareTerminal,
-    RotateCw,
     ListChecks,
+    X,
   } from "lucide-svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
-  import type {
-    TerminalRunResult,
-    TerminalSpawned,
-    TerminalOutputPayload,
-    TerminalExitPayload,
-  } from "../terminal/runResult";
-  import { themeStore } from "../stores/themeStore";
+  import type { TerminalRunResult } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
-  import { createListenerTracker } from "../dom/listenerTracker";
+  import TerminalSession from "./TerminalSession.svelte";
+  import {
+    LAUNCHERS,
+    MAX_TERMINAL_TABS,
+    activateTab,
+    canOpenTab,
+    closeTab,
+    cycleTab,
+    initialState,
+    launcherLabel,
+    openTab,
+    setTabTitle,
+    tabLabel,
+    terminalTabChord,
+    type LauncherKind,
+    type TabState,
+  } from "../terminal/tabs";
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
@@ -106,303 +63,81 @@
 
   let inputEl = $state<HTMLInputElement | null>(null);
   let scrollContainer = $state<HTMLDivElement | null>(null);
-
-  // ---------------------------------------------------------------------
-  // Interactive shell (PTY) — a real shell per repository. It runs OUTSIDE
-  // the MANVI gate by nature: a shell can execute anything, so claiming
-  // gate coverage here would be a check that cannot run reporting what a
-  // check that ran reports. The bounded Console tab is the gated surface.
-  // ---------------------------------------------------------------------
-  type PtyMode = "shell" | "console";
-  let mode = $state<PtyMode>("shell");
-  let ptyContainer = $state<HTMLDivElement | null>(null);
-  let ptySessionId = $state<string | null>(null);
-  let ptyShell = $state<string>("");
-  let ptyExited = $state(false);
-  let ptyError = $state<string | null>(null);
-  let ptySpawning = $state(false);
-
-  /** Non-reactive handles: events and observers must not tear down with runes. */
-  let term: XTerm | null = null;
-  let fitAddon: FitAddon | null = null;
-  let resizeObserver: ResizeObserver | null = null;
-  // Tracker, not a bare array: listen() promises can resolve after cleanup
-  // ran (fast tab switch remount), and a late unlisten must fire immediately
-  // instead of landing in a drained array and leaking for the webview life.
-  const unlisteners = createListenerTracker();
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Output that arrives between spawn request and id assignment. */
-  let earlyOutput: { id: string; bytes: Uint8Array }[] = [];
-
-  function termTheme(): Record<string, string> {
-    const css = getComputedStyle(document.documentElement);
-    const v = (name: string, fallback: string) =>
-      css.getPropertyValue(name).trim() || fallback;
-    return {
-      background: v("--bg-surface", "#141a29"),
-      foreground: v("--text-primary", "#e9edf8"),
-      cursor: v("--accent-color", "#809eff"),
-      cursorAccent: v("--bg-surface", "#141a29"),
-      selectionBackground: "rgb(128 158 255 / 0.32)",
-    };
-  }
-
-  /** Creates the single XTerm instance for this panel's lifetime. It does
-   * NOT bind a container: attachment is the attach effect's job, so the
-   * buffer survives Shell↔Console toggles that swap ptyContainer nodes. */
-  function ensureTerm(): XTerm | null {
-    if (term) return term;
-    const created = new XTerm({
-      fontFamily:
-        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
-      fontSize: 12,
-      cursorBlink: true,
-      convertEol: false,
-      theme: termTheme(),
-      scrollback: 5000,
-    });
-    fitAddon = new FitAddon();
-    created.loadAddon(fitAddon);
-    created.onData((data) => {
-      if (ptySessionId && !ptyExited) {
-        void invoke("cmd_terminal_write", { sessionId: ptySessionId, data }).catch(() => {});
-      }
-    });
-    created.onResize(({ cols, rows }) => {
-      if (ptySessionId && !ptyExited) {
-        void invoke("cmd_terminal_resize", { sessionId: ptySessionId, rows, cols }).catch(() => {});
-      }
-    });
-    term = created;
-    return term;
-  }
-
-  function refitIfResized() {
-    if (!fitAddon || !term) return;
-    try {
-      const proposed = fitAddon.proposeDimensions();
-      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed)) return;
-      fitAddon.fit();
-    } catch {
-      /* container collapsed; refit when it has size again */
-    }
-  }
-
-  function writePty(bytes: Uint8Array) {
-    term?.write(bytes);
-  }
-
-  function base64ToBytes(b64: string): Uint8Array {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
-  }
-
-  async function killPty(sessionId: string | null) {
-    if (!sessionId) return;
-    try {
-      await invoke("cmd_terminal_kill", { sessionId });
-    } catch {
-      /* already gone — the exit event or backend reap handled it */
-    }
-  }
-
-  type LauncherKind = "shell" | "claude" | "manvi" | "codex";
-  let launcher = $state<LauncherKind>("shell");
-
-  function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
-    switch (kind) {
-      case "claude":
-        return { program: "claude", args: [] };
-      case "manvi":
-        return { program: "manvi", args: [] };
-      case "codex":
-        return { program: "codex", args: [] };
-      default:
-        return {};
-    }
-  }
-
-  function selectLauncher(kind: LauncherKind) {
-    launcher = kind;
-    void restartPty();
-  }
-
-  async function restartPty() {
-    const path = $repoStore.currentPath;
-    if (path) await spawnPty(path);
-  }
-
-  async function spawnPty(repoPath: string) {
-    if (!ensureTerm() || !term) return;
-    const epoch = ++spawnEpoch;
-    ptySpawning = true;
-    ptyError = null;
-    ptyExited = false;
-    ptySessionId = null;
-    earlyOutput = [];
-    term.reset();
-    try {
-      const dims = fitAddon?.proposeDimensions();
-      const cfg = launcherConfig(launcher);
-      const spawned = await invoke<TerminalSpawned>(
-        "cmd_terminal_spawn",
-        {
-          repoPath,
-          rows: Math.max(dims?.rows ?? 24, 2),
-          cols: Math.max(dims?.cols ?? 80, 2),
-          program: cfg.program,
-          args: cfg.args,
-        },
-      );
-      if (epoch !== spawnEpoch) {
-        // Superseded while pending (repo/mode change, retry, or unmount):
-        // the backend session exists but its owner is gone — kill it here
-        // instead of leaking an orphaned shell.
-        void killPty(spawned.id);
-        return;
-      }
-      ptySessionId = spawned.id;
-      liveCleanupTarget = spawned.id;
-      ptyShell = spawned.shell;
-      for (const chunk of earlyOutput) {
-        if (chunk.id === spawned.id) writePty(chunk.bytes);
-      }
-      earlyOutput = [];
-      harnessStore.recordAction({
-        repoPath,
-        kind: "terminal-session",
-        label: `${launcher === "shell" ? "Interactive shell" : `Agent (${launcher})`} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
-        ok: true,
-      });
-    } catch (err) {
-      // A stale spawn's failure belongs to no live owner; the current one
-      // owns the error surface.
-      if (epoch === spawnEpoch) ptyError = formatError(err);
-    } finally {
-      if (epoch === spawnEpoch) {
-        ptySpawning = false;
-        term?.focus();
-      }
-    }
-  }
 
   onMount(() => {
     inputEl?.focus();
-    void Promise.all([
-      listen<TerminalOutputPayload>("terminal-output", (event) => {
-        const bytes = base64ToBytes(event.payload.data_b64);
-        if (ptySessionId === event.payload.id) {
-          writePty(bytes);
-        } else if (ptySessionId === null && ptySpawning) {
-          earlyOutput.push({ id: event.payload.id, bytes });
-          if (earlyOutput.length > 64) earlyOutput.shift();
-        }
-      }),
-      listen<TerminalExitPayload>(
-        "terminal-exit",
-        (event) => {
-          if (ptySessionId !== event.payload.id) return;
-          ptyExited = true;
-          ptySessionId = null;
-          const why =
-            event.payload.signal ||
-            (event.payload.exit_code === null ? "exited" : `exit ${event.payload.exit_code}`);
-          term?.writeln(`\r\n\u001b[2m[shell closed — ${why}]\u001b[0m`);
-        },
-      ),
-    ]).then((unlistenFns) => {
-      for (const fn of unlistenFns) unlisteners.track(fn);
-    });
     return () => {
-      unlisteners.dispose();
       if (copiedResetTimer !== null) {
         clearTimeout(copiedResetTimer);
         copiedResetTimer = null;
       }
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-      spawnEpoch += 1; // a spawn landing after unmount must kill itself
-      void killPty(ptySessionId);
-      ptySessionId = null;
-      term?.dispose();
-      term = null;
-      fitAddon = null;
     };
   });
 
+  // ---------------------------------------------------------------------
+  // Interactive shells (PTY), one per tab. They run OUTSIDE the MANVI gate by
+  // nature: a shell can execute anything, so claiming gate coverage here would
+  // be a check that cannot run reporting what a check that ran reports. The
+  // bounded Console tab is the gated surface.
+  //
+  // Session ownership lives in TerminalSession, one instance per tab. This
+  // component owns only the strip: which tabs exist, which is focused, and
+  // what each is called. The repository boundary is App's `{#key currentPath}`
+  // — a repo switch remounts this panel, and every session dies with its own
+  // component rather than through a lifecycle effect here that had to be
+  // memoised against repoStore's ~6s republish.
+  // ---------------------------------------------------------------------
+  type PtyMode = "shell" | "console";
+  let mode = $state<PtyMode>("shell");
+  let tabState = $state<TabState>(initialState());
+  let sessions = $state<Record<string, TerminalSession | undefined>>({});
+
+  const repoPath = $derived($repoStore.currentPath);
+
+  function newTab(launcher: LauncherKind) {
+    if (!canOpenTab(tabState)) return;
+    tabState = openTab(tabState, launcher);
+  }
+
+  function selectTab(id: string) {
+    tabState = activateTab(tabState, id);
+  }
+
   /**
-   * Keeps the one XTerm attached to whichever container node the Shell
-   * layout currently rendered. Declared above the lifecycle effect so that
-   * on first mount open() has run (and proposeDimensions() is meaningful)
-   * before spawnPty reads it. Session state is read untracked on purpose:
-   * a session id arriving must not re-run attachment.
+   * Closing drops the component, whose teardown kills the shell. Emptying the
+   * strip is allowed and leaves the empty state, which offers a new tab — a
+   * terminal that silently respawns what you just closed is worse than one
+   * that waits to be asked.
+   */
+  function dropTab(id: string) {
+    tabState = closeTab(tabState, id);
+    const { [id]: _gone, ...rest } = sessions;
+    sessions = rest;
+  }
+
+  function handleChord(event: KeyboardEvent): boolean {
+    if (mode !== "shell") return false;
+    const chord = terminalTabChord(event);
+    if (!chord) return false;
+    event.preventDefault();
+    if (chord === "new") newTab("shell");
+    else if (chord === "close" && tabState.activeId) dropTab(tabState.activeId);
+    else if (chord === "next") tabState = cycleTab(tabState, 1);
+    else if (chord === "prev") tabState = cycleTab(tabState, -1);
+    return true;
+  }
+
+  /**
+   * A hidden xterm cannot lay out, so a tab that becomes active has to be told
+   * to refit — its ResizeObserver only fires after the browser recomputes
+   * layout, and the grid it would paint until then is the stale one.
    */
   $effect(() => {
-    const container = ptyContainer;
-    if (!container) return;
-    const t = ensureTerm();
-    if (!t) return;
-    const action = planAttach(t.element?.parentElement ?? null, container);
-    if (action === "open") {
-      t.open(container);
-    } else if (action === "adopt" && t.element) {
-      container.replaceChildren(t.element);
-    }
-    if (!resizeObserver) {
-      resizeObserver = new ResizeObserver(refitIfResized);
-    }
-    // Reconnect per container: the previous node may stay detached forever,
-    // and observing a dead node would silence every future refit.
-    resizeObserver.disconnect();
-    resizeObserver.observe(container);
-    refitIfResized();
-    // Focus is safe after re-parenting — xterm's textarea moves with its
-    // element — but only worth stealing when a shell is actually live.
-    if (action === "adopt" && untrack(() => ptySessionId !== null && !ptyExited)) {
-      t.focus();
-    }
-  });
-
-  /** Theme flips re-resolve the palette from CSS variables; construction
-   * already read them once, this keeps a live buffer in sync afterwards.
-   * The store may flip the html class inside a view-transition callback
-   * after this effect runs; the next emission re-syncs, matching how
-   * CommitTable treats its cached theme. */
-  $effect(() => {
-    $themeStore;
-    if (term) term.options.theme = termTheme();
-  });
-
-  /** One live session per repository: switching repos (or leaving the shell
-   * tab) kills the old session before a new one spawns. The session id is
-   * deliberately kept out of $state here — an effect that read it would
-   * re-run on its own spawn and tear down what it just created. */
-  let liveCleanupTarget: string | null = null;
-  /** Bumped whenever a pending spawn's owner goes away, so the spawn kills
-   * its backend session instead of adopting it into a dead lifecycle. */
-  let spawnEpoch = 0;
-  /**
-   * Lifecycle inputs the PTY actually depends on ("shell:<path>" or null).
-   * repoStore publishes a fresh object on every status poll (~6s) and stats
-   * drain, and any $repoStore read re-runs this effect — killing and
-   * respawning the user's live shell per emission would be catastrophic, so
-   * teardown fires only when mode or repo path genuinely change.
-   */
-  let ptyLifecycleKey: string | null = null;
-  $effect(() => {
-    const path = $repoStore.currentPath;
-    const key = mode === "shell" && path ? `shell:${path}` : null;
-    if (key === ptyLifecycleKey) return;
-    ptyLifecycleKey = key;
-    // Genuine lifecycle change: orphan any pending spawn, then drop the
-    // session (if any) owned by the previous inputs before spawning anew.
-    spawnEpoch += 1;
-    void killPty(liveCleanupTarget);
-    liveCleanupTarget = null;
-    if (key && path) void spawnPty(path);
+    const id = tabState.activeId;
+    if (mode !== "shell" || !id) return;
+    sessions[id]?.reveal();
   });
 
   const QUICK_COMMANDS = [
@@ -589,40 +324,6 @@
         </button>
       </div>
       {#if mode === "shell"}
-        <div class="flex items-center gap-1 bg-surface border border-border/60 rounded-full p-0.5 text-[10px]">
-          <button
-            type="button"
-            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'shell' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => selectLauncher('shell')}
-            title="Interactive system shell"
-          >
-            Shell
-          </button>
-          <button
-            type="button"
-            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'claude' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => selectLauncher('claude')}
-            title="Launch Claude Code agent CLI in this worktree"
-          >
-            Claude
-          </button>
-          <button
-            type="button"
-            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'manvi' ? 'bg-emerald-500/20 text-emerald-300 font-medium' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => selectLauncher('manvi')}
-            title="Launch Manvi CLI in this worktree"
-          >
-            Manvi
-          </button>
-          <button
-            type="button"
-            class="px-2 py-0.5 rounded-full transition-colors {launcher === 'codex' ? 'bg-sky-500/20 text-sky-300 font-medium' : 'text-textMuted hover:text-textPrimary'}"
-            onclick={() => selectLauncher('codex')}
-            title="Launch Codex CLI in this worktree"
-          >
-            Codex
-          </button>
-        </div>
         <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface border border-border/60 text-[10px] text-textMuted">
           <AlertCircle size={11} class="text-amber-400 shrink-0" />
           <span>unguarded: a shell runs outside the MANVI gate</span>
@@ -647,39 +348,108 @@
     </div>
   </div>
 
-  {#if mode === "shell"}
-    <!-- Interactive shell: a real PTY streamed over events. -->
-    <div class="flex-1 min-h-0 p-3">
+  <!-- Tab strip + sessions. Rendered in BOTH modes and merely hidden in
+       Console, because unmounting a session kills the shell — the same
+       hide-don't-kill rule TerminalDock applies to the whole dock. -->
+    <div
+      class="shrink-0 flex items-stretch gap-2 px-2 h-8 border-b border-border/60 bg-surface/40"
+      class:hidden={mode !== "shell"}
+    >
+      <!-- Only the tabs scroll. The launcher group sat inside the scroller
+           behind an `ml-auto`, so past a handful of tabs the way to open one
+           more scrolled off the right edge. -->
       <div
-        bind:this={ptyContainer}
-        class="h-full w-full rounded-xl border border-border/70 bg-surface overflow-hidden p-1.5"
-      ></div>
-    </div>
-    {#if ptyError || ptyExited || ptySpawning || ptyShell}
-      <!-- One fixed-height status row: spawn/error/exited/info content swaps
-           inside it, so the terminal's box never resizes (and the
-           ResizeObserver never refits) merely because the text rotated. -->
-      <div class="shrink-0 border-t border-border/60 bg-surface/60 flex items-center gap-2 px-4 h-8">
-        {#if ptySpawning}
-          <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
-          <span class="text-textMuted text-[11px]">Starting shell…</span>
-        {:else if ptyError}
-          <AlertCircle size={13} class="text-rose-400 shrink-0" />
-          <span class="text-rose-300 flex-1 truncate text-[11px]">{ptyError}</span>
-          <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => void restartPty()}>
-            <RotateCw size={12} /> Retry
+        class="flex-1 min-w-0 flex items-stretch gap-1 overflow-x-auto"
+        role="tablist"
+        aria-label="Terminal sessions"
+      >
+      {#each tabState.tabs as tab (tab.id)}
+        <div
+          class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-[11px] shrink-0 transition-colors {tab.id ===
+          tabState.activeId
+            ? 'bg-surface border-accent/50 text-textPrimary'
+            : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab.id === tabState.activeId}
+            class="max-w-[14rem] truncate"
+            onclick={() => selectTab(tab.id)}
+            title={`${launcherLabel(tab.launcher)} — ${tabLabel(tab)}`}
+          >
+            {tabLabel(tab)}
           </button>
-        {:else if ptyExited}
-          <span class="text-textMuted flex-1 text-[11px]">The shell session ended.</span>
-          <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => void restartPty()}>
-            <RotateCw size={12} /> Restart shell
+          <button
+            type="button"
+            class="p-0.5 rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
+            onclick={() => dropTab(tab.id)}
+            aria-label={`Close ${tabLabel(tab)}`}
+            title="Close this session (⌃⇧W) — the process is terminated"
+          >
+            <X size={11} />
           </button>
-        {:else}
-          <span class="text-[10px] text-textMuted font-mono truncate">{ptyShell} · cwd {$repoStore.currentPath ?? ""}</span>
-        {/if}
+        </div>
+      {/each}
       </div>
-    {/if}
-  {:else}
+
+      <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">
+        <span class="text-[10px] text-textMuted uppercase tracking-wider">New</span>
+        {#each LAUNCHERS as launcher (launcher.kind)}
+          <button
+            type="button"
+            class="px-2 py-0.5 my-1 rounded-full text-[10px] border border-border/60 text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            disabled={!canOpenTab(tabState)}
+            onclick={() => newTab(launcher.kind)}
+            title={canOpenTab(tabState)
+              ? launcher.kind === "shell"
+                ? "Open another interactive shell (⌃⇧T)"
+                : `Open a new tab running the ${launcher.label} CLI in this worktree`
+              : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one first`}
+          >
+            {launcher.label}
+          </button>
+        {/each}
+      </div>
+    </div>
+
+    <div class="flex-1 min-h-0 relative" class:hidden={mode !== "shell"}>
+      {#if !repoPath}
+        <div class="h-full flex items-center justify-center text-textMuted text-xs">
+          Open a repository to start a shell.
+        </div>
+      {:else if tabState.tabs.length === 0}
+        <div class="h-full flex flex-col items-center justify-center gap-3 text-textMuted text-xs">
+          <span>No sessions open.</span>
+          <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => newTab("shell")}>
+            <SquareTerminal size={12} /> New shell
+          </button>
+        </div>
+      {:else}
+        {#each tabState.tabs as tab (tab.id)}
+          <!-- Absolute so hidden siblings keep their box: a session laid out
+               at zero height would have its xterm reflow to a 1-row grid and
+               tell the shell about it. -->
+          <div
+            class="absolute inset-0"
+            class:hidden={tab.id !== tabState.activeId}
+            role="tabpanel"
+            aria-label={tabLabel(tab)}
+          >
+            <TerminalSession
+              bind:this={sessions[tab.id]}
+              repoPath={repoPath}
+              launcher={tab.launcher}
+              active={tab.id === tabState.activeId && mode === "shell"}
+              onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
+              onChord={handleChord}
+            />
+          </div>
+        {/each}
+      {/if}
+    </div>
+
+  {#if mode === "console"}
   <!-- Output Area -->
   <div
     bind:this={scrollContainer}

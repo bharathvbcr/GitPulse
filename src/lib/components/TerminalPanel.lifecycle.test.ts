@@ -3,20 +3,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const source = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "TerminalPanel.svelte"),
-  "utf8"
-);
+const here = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(here, "TerminalPanel.svelte"), "utf8");
+const app = readFileSync(join(here, "..", "..", "App.svelte"), "utf8");
 
-describe("TerminalPanel PTY lifecycle hygiene", () => {
-  it("unwinds listeners that resolve after teardown (no leak on early unmount)", () => {
-    expect(source).toContain("createListenerTracker()");
-    expect(source).toContain("unlisteners.track(fn)");
-  });
-
-  it("disposes unlisteners on cleanup", () => {
-    const cleanupIdx = source.indexOf("unlisteners.dispose();");
-    expect(cleanupIdx).toBeGreaterThan(-1);
+describe("TerminalPanel lifecycle hygiene", () => {
+  it("owns no event subscription of its own", () => {
+    // `terminal-output`/`terminal-exit` are process-wide events carrying a
+    // session id. One listener per tab would decode every chunk once per open
+    // tab; ptyBus subscribes once and routes by id, and its own tests cover
+    // the late-resolving-listen race this panel used a tracker for.
+    expect(source).not.toContain('from "@tauri-apps/api/event"');
+    expect(source).not.toContain("createListenerTracker");
   });
 
   it("clears a pending copy-reset timer on teardown and before re-arming", () => {
@@ -35,5 +33,19 @@ describe("TerminalPanel PTY lifecycle hygiene", () => {
     // The guard runs before any Enter/Arrow handling.
     const enterIdx = source.indexOf('e.key === "Enter"', handlerIdx);
     expect(enterIdx).toBeGreaterThan(guardIdx);
+  });
+});
+
+describe("terminal repository boundary", () => {
+  it("is App's key on the current repository path", () => {
+    // The panel no longer carries a repo-keyed teardown effect, so this is
+    // the single thing that ends every session on a repo switch. If the key
+    // moves inside the dock, shells would survive into the wrong repository
+    // and keep running commands against a path the user has left.
+    const keyIdx = app.indexOf("{#key $repoStore.currentPath}");
+    expect(keyIdx).toBeGreaterThan(-1);
+    const dockIdx = app.indexOf("<TerminalDock");
+    expect(dockIdx).toBeGreaterThan(keyIdx);
+    expect(app.indexOf("{/key}")).toBeGreaterThan(dockIdx);
   });
 });

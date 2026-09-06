@@ -644,7 +644,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// Returns `None` when the joined value cannot be built (an entry with a
 /// disallowed character); the caller then leaves the inherited PATH untouched
 /// rather than degrading the child to an empty one.
-fn extended_child_path(
+pub(crate) fn extended_child_path(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<std::ffi::OsString> {
