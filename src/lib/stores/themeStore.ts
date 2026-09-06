@@ -39,7 +39,7 @@ function applyResolved(theme: Theme) {
 }
 
 type ViewTransitionDocument = Document & {
-  startViewTransition?: (update: () => void) => unknown;
+  startViewTransition?: (update: () => void) => ViewTransition;
 };
 
 /**
@@ -58,7 +58,15 @@ function applyWithTransition(theme: Theme) {
     applyResolved(theme);
     return;
   }
-  doc.startViewTransition(() => applyResolved(theme));
+  const transition = doc.startViewTransition(() => applyResolved(theme));
+  // `ready` rejects whenever the crossfade cannot begin: a flip that supersedes
+  // this one inside the 220ms window skips it, and a window that is not being
+  // rendered (minimised, occluded, hidden tab) never starts one at all. The
+  // theme still lands through the update callback either way, so a skipped
+  // crossfade is a normal outcome and not an error worth surfacing. `finished`
+  // is deliberately left alone: per spec it rejects only when the update
+  // callback itself throws, which would be a real defect and should stay loud.
+  void transition.ready.catch(() => {});
 }
 
 export function createThemeStore() {
