@@ -79,12 +79,26 @@ export function syncCanvasBackingStore(
   return resized;
 }
 
-export function fillOpaqueBackground(
+/**
+ * Start a graph frame from a known state.
+ *
+ * This is the frame's CLEAR, not decoration, which is why it cannot simply be
+ * skipped when the surface is transparent: an alpha canvas keeps last frame's
+ * pixels, so dropping the fill without putting a clear in its place smears the
+ * graph as it scrolls. An opaque surface is reset by painting the colour
+ * behind it; a transparent one is reset by erasing to nothing so the page
+ * shows through. `null` means the latter.
+ */
+export function resetGraphSurface(
   ctx: CanvasRenderingContext2D,
   cssWidth: number,
   cssHeight: number,
-  color: string,
+  color: string | null,
 ): void {
+  if (color === null) {
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    return;
+  }
   ctx.fillStyle = color;
   ctx.fillRect(0, 0, cssWidth, cssHeight);
 }

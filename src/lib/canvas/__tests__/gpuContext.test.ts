@@ -4,7 +4,7 @@ import {
   acquireGpu2dContext,
   backingStoreSize,
   syncCanvasBackingStore,
-  fillOpaqueBackground,
+  resetGraphSurface,
 } from "../gpuContext";
 
 function mockContext(overrides: Partial<CanvasRenderingContext2D> = {}) {
@@ -13,6 +13,7 @@ function mockContext(overrides: Partial<CanvasRenderingContext2D> = {}) {
     imageSmoothingQuality: "low",
     setTransform: vi.fn(),
     fillRect: vi.fn(),
+    clearRect: vi.fn(),
     fillStyle: "",
     ...overrides,
   } as unknown as CanvasRenderingContext2D;
@@ -73,8 +74,17 @@ describe("gpu canvas context", () => {
 
   it("fills the CSS rectangle so an opaque context has no uncleared pixels", () => {
     const ctx = mockContext();
-    fillOpaqueBackground(ctx, 120, 40, "#0d1117");
+    resetGraphSurface(ctx, 120, 40, "#0d1117");
     expect(ctx.fillStyle).toBe("#0d1117");
     expect(ctx.fillRect).toHaveBeenCalledWith(0, 0, 120, 40);
+  });
+
+  it("erases instead of filling when the surface is transparent", () => {
+    // The reset is the frame's clear. A transparent surface that is merely
+    // not filled keeps the previous frame and smears the graph as it scrolls.
+    const ctx = mockContext();
+    resetGraphSurface(ctx, 120, 40, null);
+    expect(ctx.clearRect).toHaveBeenCalledWith(0, 0, 120, 40);
+    expect(ctx.fillRect).not.toHaveBeenCalled();
   });
 });

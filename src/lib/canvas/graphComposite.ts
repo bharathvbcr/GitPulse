@@ -1,6 +1,6 @@
 import type { GraphRenderer, GraphTheme, VisualCommitRow } from "./GraphRenderer";
 import { themeSignatureOf, type GraphStaticCache } from "./graphCache";
-import { fillOpaqueBackground, syncCanvasBackingStore } from "./gpuContext";
+import { resetGraphSurface, syncCanvasBackingStore } from "./gpuContext";
 
 /**
  * Per-frame composition of the commit graph onto the visible canvas.
@@ -54,7 +54,7 @@ export function paintGraphFrame(
 ): boolean {
   const { rowHeight } = renderer.getConfig();
   syncCanvasBackingStore(canvas, ctx, req.widthCss, req.heightCss, req.dpr);
-  fillOpaqueBackground(ctx, req.widthCss, req.heightCss, req.theme.background);
+  resetGraphSurface(ctx, req.widthCss, req.heightCss, req.theme.background);
 
   // Any changed input drops the strips inside the cache.
   cache.sync(

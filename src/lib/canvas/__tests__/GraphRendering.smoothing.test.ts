@@ -342,6 +342,70 @@ describe("graph smoothing", () => {
     expect(theme.selection).toBeTruthy();
   });
 
+  it("reads `transparent` as no background rather than as a colour", () => {
+    // The stylesheet is the single place that decides whether the graph sits
+    // on a surface or on the page. `transparent` is how it says the latter;
+    // treating it as a colour paints the string and fails silently.
+    const styles = {
+      getPropertyValue: (name: string) => (name === "--bg-main" ? " transparent " : "#123456"),
+    };
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("getComputedStyle", () => styles);
+    try {
+      const glass = themeFromCss({} as Element);
+      expect(glass.background).toBeNull();
+      expect(glass.nodeStroke).toBe("#123456");
+
+      const opaqueStyles = { getPropertyValue: () => "#0d1117" };
+      vi.stubGlobal("getComputedStyle", () => opaqueStyles);
+      expect(themeFromCss({} as Element).background).toBe("#0d1117");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("erases the node cutout instead of painting it when there is no background", () => {
+    // A colour-matched disc is a hole only on an opaque surface. Over glass
+    // the same disc is a dark blob, so the cutout has to erase.
+    const composites: string[] = [];
+    const ctx = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      closePath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      bezierCurveTo: vi.fn(),
+      arc: vi.fn(),
+      fill: vi.fn(() => composites.push(ctx.globalCompositeOperation)),
+      stroke: vi.fn(),
+      globalAlpha: 1,
+      globalCompositeOperation: "source-over",
+      imageSmoothingEnabled: true,
+      lineWidth: 2,
+      lineCap: "round",
+      lineJoin: "round",
+      strokeStyle: "",
+      fillStyle: "",
+      canvas: { height: 600, width: 240 } as HTMLCanvasElement,
+    };
+    const renderer = new GraphRenderer();
+    const rows = [row({ id: "a" })];
+
+    renderer.render(ctx as unknown as CanvasRenderingContext2D, rows, 0, rows.length, 0, undefined, {
+      theme: { ...DEFAULT_THEME, background: null },
+    });
+    expect(composites).toContain("destination-out");
+    // The mode is restored, or every later fill on the frame erases too.
+    expect(ctx.globalCompositeOperation).toBe("source-over");
+
+    composites.length = 0;
+    renderer.render(ctx as unknown as CanvasRenderingContext2D, rows, 0, rows.length, 0, undefined, {
+      theme: { ...DEFAULT_THEME },
+    });
+    expect(composites).not.toContain("destination-out");
+  });
+
   it("sizes the gutter to the deepest lane in the history", () => {
     const renderer = new GraphRenderer();
     const narrow = renderer.measureWidth([row({ id: "a" })]);

@@ -68,6 +68,8 @@ function fakeSurfaceFactory() {
     const ctx = {
       setTransform: vi.fn(),
       // Full op surface: some painters run real GraphRenderer.render against it.
+      fillRect: vi.fn(),
+      clearRect: vi.fn(),
       save: vi.fn(),
       restore: vi.fn(),
       beginPath: vi.fn(),
@@ -528,13 +530,40 @@ describe("surface release hygiene", () => {
     expect(cache.stats().liveStrips).toBe(0);
   });
 
+  it("gives a strip an alpha channel exactly when there is no background to be opaque with", () => {
+    // An opaque strip zero-initialises to black, so a strip with no colour to
+    // prime itself with would blit a black rectangle over the glass behind
+    // the graph. Before this, `alpha: false` was hardcoded.
+    const seen: boolean[] = [];
+    const { factory } = fakeSurfaceFactory();
+    const trackedFactory: SurfaceFactory = (w, h, dpr, opaque) => {
+      seen.push(opaque);
+      return factory(w, h, dpr, opaque);
+    };
+    const cache = createGraphStaticCache(recordingPainter().painter, trackedFactory, {
+      stripCssHeight: 20,
+      maxStrips: 4,
+    });
+
+    cache.sync(inputs({ backgroundCssColor: "#0d1117" }), { rowHeight: 20, totalRows: 4 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 40));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((opaque) => opaque)).toBe(true);
+
+    seen.length = 0;
+    cache.sync(inputs({ backgroundCssColor: null }), { rowHeight: 20, totalRows: 4 });
+    cache.paint(recordingTarget().ctx, paintReq(0, 40));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((opaque) => opaque)).toBe(false);
+  });
+
   it("LRU eviction releases evictees while the cap bounds live memory", () => {
     const { factory, surfaces, released } = fakeSurfaceFactory();
     // Peak concurrency: how many factory surfaces were alive at once. Room is
     // made *before* each new allocation, so it must never exceed the cap.
     let peakLive = 0;
-    const trackedFactory: SurfaceFactory = (w, h, dpr) => {
-      const surface = factory(w, h, dpr);
+    const trackedFactory: SurfaceFactory = (w, h, dpr, opaque) => {
+      const surface = factory(w, h, dpr, opaque);
       peakLive = Math.max(peakLive, surfaces.length - released.length);
       return surface;
     };

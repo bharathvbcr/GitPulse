@@ -451,7 +451,11 @@
     if (!canvas) return null;
     if (attachedCanvas !== canvas) {
       attachedCanvas = canvas;
-      gpuCtx = acquireGpu2dContext(canvas, true);
+      // An opaque backing store skips per-pixel blending, which is why it is
+      // the default — but it also paints every pixel, so the graph cannot sit
+      // on glass while it is on. The stylesheet decides, through the same
+      // `--bg-main` the theme already reads.
+      gpuCtx = acquireGpu2dContext(canvas, currentTheme().background !== null);
     }
     return gpuCtx;
   }

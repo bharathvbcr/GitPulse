@@ -60,8 +60,17 @@ export interface GraphRenderConfig {
  * discs over a light theme.
  */
 export interface GraphTheme {
-  /** The colour behind the graph; used for the cutout under each node. */
-  background: string;
+  /**
+   * The colour behind the graph, or `null` when the surface is transparent
+   * and the page shows through it.
+   *
+   * One field used to serve two jobs that are only the same job on an opaque
+   * canvas: the colour to paint the surface, and the colour to punch a cutout
+   * with. Over a translucent surface there is no colour that equals "what is
+   * behind", so a colour-matched disc stops being a hole and becomes a dark
+   * blob. `null` routes the cutouts through a real erase instead.
+   */
+  background: string | null;
   /** Thin outline that separates a node from its own lane. */
   nodeStroke: string;
   /** Ring drawn around the selected commit. */
@@ -95,8 +104,10 @@ export const DENSITY_CONFIGS: Record<DensityMode, GraphRenderConfig> = {
 
 export const DEFAULT_CONFIG: GraphRenderConfig = DENSITY_CONFIGS.spacious;
 
+const OPAQUE_FALLBACK_BACKGROUND = "#0d1117";
+
 export const DEFAULT_THEME: GraphTheme = {
-  background: "#0d1117",
+  background: OPAQUE_FALLBACK_BACKGROUND,
   nodeStroke: "#161b22",
   selection: "#58a6ff",
   head: "#f0f6fc",
@@ -107,6 +118,11 @@ export const DEFAULT_THEME: GraphTheme = {
  * Reads the theme out of the stylesheet, so the graph follows the light/dark
  * switch without a second source of truth for the palette.
  */
+function readBackground(read: (name: string, fallback: string) => string): string | null {
+  const value = read("--bg-main", OPAQUE_FALLBACK_BACKGROUND);
+  return value === "transparent" ? null : value;
+}
+
 export function themeFromCss(element?: Element | null): GraphTheme {
   if (typeof window === "undefined" || typeof getComputedStyle !== "function") {
     return { ...DEFAULT_THEME };
@@ -117,7 +133,9 @@ export function themeFromCss(element?: Element | null): GraphTheme {
     return value.length > 0 ? value : fallback;
   };
   return {
-    background: read("--bg-main", DEFAULT_THEME.background),
+    // `transparent` is how the stylesheet says "the page shows through here",
+    // which is the macOS glass case; every other value is a real colour.
+    background: readBackground(read),
     nodeStroke: read("--bg-surface", DEFAULT_THEME.nodeStroke),
     selection: read("--accent-color", DEFAULT_THEME.selection),
     head: read("--text-primary", DEFAULT_THEME.head),
@@ -1012,7 +1030,29 @@ export class GraphRenderer {
     }
   }
 
-  /** The background disc punched under a node so lanes do not touch it. */
+  /**
+   * Punch a hole in what has already been drawn.
+   *
+   * On an opaque surface that is a disc in the colour behind the graph. On a
+   * transparent one the same disc would be a visible blob, so the hole is cut
+   * with `destination-out`, which erases rather than paints. Both leave the
+   * surface behind showing through; only one of them can do it over glass.
+   */
+  private knockOut(ctx: CanvasRenderingContext2D, theme: GraphTheme, cut: () => void): void {
+    if (theme.background !== null) {
+      ctx.fillStyle = theme.background;
+      cut();
+      return;
+    }
+    const previous = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = "destination-out";
+    // Any opaque colour erases; only the alpha channel is consulted.
+    ctx.fillStyle = "#000";
+    cut();
+    ctx.globalCompositeOperation = previous;
+  }
+
+  /** The disc punched under a node so lanes do not touch it. */
   private paintNodeCutout(
     ctx: CanvasRenderingContext2D,
     x: number,
@@ -1020,10 +1060,11 @@ export class GraphRenderer {
     r: number,
     theme: GraphTheme,
   ): void {
-    ctx.fillStyle = theme.background;
-    ctx.beginPath();
-    ctx.arc(x, y, r + 2.5, 0, Math.PI * 2);
-    ctx.fill();
+    this.knockOut(ctx, theme, () => {
+      ctx.beginPath();
+      ctx.arc(x, y, r + 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
   }
 
   /**
@@ -1052,10 +1093,11 @@ export class GraphRenderer {
     // A merge is hollow and a root is ringed: two shapes a reader can tell
     // apart at a glance, in either theme, without a legend.
     if (row.is_merge) {
-      ctx.fillStyle = theme.background;
-      ctx.beginPath();
-      ctx.arc(x, y, Math.max(1.4, r * 0.42), 0, Math.PI * 2);
-      ctx.fill();
+      this.knockOut(ctx, theme, () => {
+        ctx.beginPath();
+        ctx.arc(x, y, Math.max(1.4, r * 0.42), 0, Math.PI * 2);
+        ctx.fill();
+      });
     } else if (row.is_root) {
       ctx.strokeStyle = color;
       ctx.lineWidth = 1;

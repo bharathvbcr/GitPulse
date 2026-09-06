@@ -660,6 +660,68 @@ html.macos .gp-scrim {
   background-image: radial-gradient(120% 100% at 50% 0%, rgb(var(--mac-hue-a) / 0.1), transparent 72%);
 }
 
+/*
+ * Every surface, not just the ones wearing a glass class.
+ *
+ * The glass classes cover the chrome and the workspace plate. Everything else
+ * — the commit composer, branch cards, detail panes, dropdown bodies, the
+ * hundreds of ordinary panels — paints its background through three bare
+ * Tailwind utilities and a handful of `gp-*` component classes, and those
+ * compile to alpha 1. The result was glass chrome wrapped around opaque
+ * rectangles: translucency that stops halfway reads as broken rather than as
+ * a decision, which is exactly how it was reported.
+ *
+ * There are 439 of those call sites. Editing them is not a fix, it is 439
+ * chances to miss one; the tokens are the owner. `[class~=...]` matches the
+ * BARE utility only, so `bg-surface/60` and friends keep the alpha their
+ * author chose, and `:where()` keeps this at one class of specificity so any
+ * component rule that means something specific still wins.
+ *
+ * Surfaces stack, and that is the point: a panel inside a pane inside the
+ * plate inside the veil ends up nearly solid, while a lone panel stays airy.
+ * Depth does the work that a single global alpha cannot.
+ */
+html.macos {
+  --mac-fill-bg: rgb(var(--c-bg) / 0.42);
+  --mac-fill-surface: rgb(var(--c-surface) / 0.5);
+  /* Hover and selection have to survive being translucent: they are a
+     DIFFERENCE against whatever they sit on, and thinning both sides equally
+     erases the difference. This one stays dense on purpose. */
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.78);
+
+  /*
+   * The graph canvas, which is the one surface CSS cannot make translucent on
+   * its own: a 2D context with an opaque backing store paints every pixel it
+   * owns, so the gutter stayed a hard rectangle in the middle of a glass pane
+   * no matter what the stylesheet said.
+   *
+   * `--bg-main` is read at runtime by the renderer and is the single place
+   * that decides. `transparent` tells it to take an alpha backing store, clear
+   * each frame instead of filling it, and cut its node haloes with
+   * `destination-out` — a colour-matched disc is a hole only when there is a
+   * colour to match, and over glass it is just a dark blob.
+   */
+  --bg-main: transparent;
+}
+
+html.macos.light {
+  --mac-fill-bg: rgb(var(--c-bg) / 0.52);
+  --mac-fill-surface: rgb(var(--c-surface) / 0.6);
+  --mac-fill-surface-hover: rgb(var(--c-surface-hover) / 0.82);
+}
+
+html.macos :where([class~="bg-background"], .gp-field, .gp-select) {
+  background-color: var(--mac-fill-bg);
+}
+
+html.macos :where([class~="bg-surface"], .gp-card, .gp-btn, .gp-keycap) {
+  background-color: var(--mac-fill-surface);
+}
+
+html.macos :where([class~="bg-surfaceHover"], .gp-pill) {
+  background-color: var(--mac-fill-surface-hover);
+}
+
 html.macos .gp-titlebar-actions,
 html.macos .gp-welcome {
   background-color: transparent;
@@ -758,6 +820,16 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
   html.macos .gp-shell,
   html.macos .gp-workspace {
     background-color: rgb(var(--c-bg));
+  }
+
+  /* Surfaces and the graph go back to solid together; a translucent panel on
+     an opaque shell is the half-finished state this preference exists to
+     avoid. The renderer re-reads `--bg-main` on the next theme change. */
+  html.macos {
+    --mac-fill-bg: rgb(var(--c-bg));
+    --mac-fill-surface: rgb(var(--c-surface));
+    --mac-fill-surface-hover: rgb(var(--c-surface-hover));
+    --bg-main: rgb(var(--c-bg));
   }
 
   html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float, .gp-liquid-tabs) {

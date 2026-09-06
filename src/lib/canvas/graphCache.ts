@@ -27,12 +27,13 @@ export interface GraphCacheInputs {
   /** Device pixel ratio the strips are rasterized at. */
   dpr: number;
   /**
-   * Theme background painted into each strip before geometry. Strip surfaces
-   * are opaque (`alpha:false`) and zero-initialize to black; without this
+   * Theme background painted into each strip before geometry, or `null` when
+   * the graph surface is transparent and the page shows through. An opaque
+   * strip (`alpha:false`) zero-initializes to black; without this
    * fill every blit pastes black bands over the themed visible canvas —
    * glaring on light themes, banding/strobing as strips evict on dark ones.
    */
-  backgroundCssColor?: string;
+  backgroundCssColor?: string | null;
   /**
    * Whether the author-avatar column is baked into the strips. Toggling it
    * must drop every tile or half the graph carries avatars and half does not
@@ -106,6 +107,7 @@ export type SurfaceFactory = (
   cssWidth: number,
   cssHeight: number,
   dpr: number,
+  opaque: boolean,
 ) => CachedSurface | null;
 
 /**
@@ -116,13 +118,14 @@ export function createOffscreenSurface(
   cssWidth: number,
   cssHeight: number,
   dpr: number,
+  opaque = true,
 ): CachedSurface | null {
   if (typeof document === "undefined") return null;
   const canvas = document.createElement("canvas");
   const size = backingStoreSize(cssWidth, cssHeight, dpr);
   canvas.width = size.width;
   canvas.height = size.height;
-  const ctx = canvas.getContext("2d", { alpha: false });
+  const ctx = canvas.getContext("2d", { alpha: !opaque });
   if (!ctx) return null;
   tuneGpu2dContext(ctx);
   return { canvas, ctx };
@@ -261,7 +264,11 @@ export function createGraphStaticCache(
     }
 
     const cssHeight = rowCount * rowHeight;
-    const surface = createSurface(inputs.cssWidth, cssHeight, inputs.dpr);
+    // A strip is opaque exactly when the page gave it a colour to be opaque
+    // WITH. Without one it has to keep its alpha channel, or the blit paints
+    // black over the glass behind the graph.
+    const opaque = Boolean(inputs.backgroundCssColor);
+    const surface = createSurface(inputs.cssWidth, cssHeight, inputs.dpr, opaque);
     if (!surface) return null;
 
     const scale = inputs.dpr > 0 ? inputs.dpr : 1;
