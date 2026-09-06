@@ -715,6 +715,21 @@
    * Prefers the run's own summary. Falls back to the detail's first line for
    * statuses that carry no run result (a tokenization refusal, an IPC error).
    */
+  /*
+   * The list is flat and every path shares a prefix, so right-truncating the
+   * whole path renders rows that are identical up to the ellipsis
+   * ("rust-port/crates/devmap-e…") and tells the reader nothing. Putting the
+   * file name first means truncation eats the directory instead, which is the
+   * half that repeats. `DiffFileRail` shows a name with the path on the title
+   * for the same reason.
+   */
+  function pathLabel(path: string): { name: string; dir: string } {
+    const cut = path.lastIndexOf("/");
+    return cut === -1
+      ? { name: path, dir: "" }
+      : { name: path.slice(cut + 1), dir: path.slice(0, cut) };
+  }
+
   function briefDetail(detail: string | undefined): string {
     if (!detail) return "";
     const firstLine = detail.split("\n")[0]?.trim() ?? "";
@@ -1597,6 +1612,7 @@
         <VirtualList items={report.files} rowHeight={rowHeight("coverageFile", $densityStore)} overscan={20} class="flex-1">
           {#snippet row(file)}
             {#if file}
+              {@const label = pathLabel(file.path)}
               <button
                 type="button"
                 onclick={() => selectFile(file.path)}
@@ -1604,7 +1620,11 @@
                 class="w-full px-2.5 rounded-full text-left flex items-center gap-2 transition-colors {selectedPath === file.path ? 'bg-accent/15 ring-1 ring-inset ring-accent/30' : 'hover:bg-surfaceHover'}"
               >
                 <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {file.color_hex}"></span>
-                <span class="flex-1 truncate font-mono text-[11px] text-textPrimary">{file.path}</span>
+                <span class="min-w-0 flex-1 truncate font-mono text-[11px] text-textPrimary" title={file.path}
+                  >{label.name}{#if label.dir}<span class="ml-1.5 text-[10px] text-textMuted"
+                      >{label.dir}</span
+                    >{/if}</span
+                >
                 <span class="tabular-nums shrink-0" style="color: {coverageBarColor(file.percentage)}">{formatCoveragePercent(file.percentage)}</span>
               </button>
             {/if}

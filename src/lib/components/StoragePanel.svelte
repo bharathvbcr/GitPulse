@@ -742,7 +742,7 @@
               <polyline
                 points={sparkPoints}
                 fill="none"
-                stroke="var(--accent, #8b5cf6)"
+                stroke="var(--accent-color, #8b5cf6)"
                 stroke-width="1.2"
                 vector-effect="non-scaling-stroke"
               />

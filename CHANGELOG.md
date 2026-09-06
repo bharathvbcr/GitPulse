@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The storage trend sparkline ignored the chosen accent and always drew the same purple.** It
+  read `var(--accent, #8b5cf6)`, and `--accent` is defined nowhere — the token is `--accent-color`.
+  A misspelt custom property is invisible in a way a misspelt class is not: CSS resolves to the
+  literal after the comma and paints a plausible colour, so the line looked designed rather than
+  broken. A sweep of every `var()` and every scripted token read across `src/` found this as the
+  only unresolved reference of 51; `src/lib/ui/cssTokens.contract.test.ts` now holds both surfaces
+  to tokens something actually defines.
+- **Every row in the coverage file list read the same, because the paths were truncated from the
+  wrong end.** The list is flat and the paths share a prefix, so right-truncating the whole path
+  produced rows identical up to the ellipsis (`rust-port/crates/devmap-e…`) and clipped away the
+  file name, which is the only part that distinguishes them. The name now comes first with the
+  directory dimmed after it, so truncation eats the half that repeats, and the full path is on the
+  row's tooltip — the same shape `DiffFileRail` already used.
+
 ## [0.0.6] - 2026-09-06
 
 ### Added
