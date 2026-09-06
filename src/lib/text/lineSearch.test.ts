@@ -41,6 +41,89 @@ describe("buildMatcher", () => {
     expect(buildMatcher("(a+)+")).not.toBeNull();
   });
 
+  /**
+   * Ambiguous alternation under a quantifier contains no nested quantifier,
+   * so the original rule passed it through. Measured on V8 before the guard
+   * covered it: `(a|a)*$` took 6.3 s against 28 characters and quadruples
+   * every two more; `(?:aa|a)*$` took 2.1 s at 38.
+   */
+  it("refuses a quantified group whose branches can start alike", () => {
+    for (const pattern of [
+      "(a|a)*",
+      "(a|a)+",
+      "(?:aa|a)*",
+      "([a-z]|[a-z][a-z])*",
+      "(a|b|ab)*",
+      "(a|)*",
+      "(\\d|\\w)+",
+    ]) {
+      expect(hasUnboundedNesting(pattern), pattern).toBe(true);
+      expect(buildMatcher(pattern, { regex: true }), pattern).toBeNull();
+    }
+  });
+
+  it("still allows alternation whose branches cannot start alike", () => {
+    for (const pattern of ["(foo|bar)+", "(a|b)*", "(src|lib)/", "(\\d+)", "(?:x|y)+"]) {
+      expect(hasUnboundedNesting(pattern), pattern).toBe(false);
+      expect(buildMatcher(pattern, { regex: true }), pattern).not.toBeNull();
+    }
+  });
+
+  /**
+   * Bounded repetition is still repetition. The rule once recognized only
+   * `*`, `+` and `{n,}`, so a group repeated `{n}` or `{n,m}` times bypassed
+   * every check beneath it. Found by fuzzing, not by reading:
+   * `(?:\w|(\w+){2,4}){3}$` was admitted twice over — neither `{3}` nor
+   * `{2,4}` registered — and takes 5.0 s at 26 characters, tripling every two.
+   */
+  it("treats {n} and {n,m} repetition as repetition", () => {
+    for (const pattern of [
+      "(?:\\w|(\\w+){2,4}){3}",
+      "(\\w+){2,4}",
+      "(a+){2}",
+      "(?:a|a){3}",
+      "(a|a){2,5}",
+    ]) {
+      expect(hasUnboundedNesting(pattern), pattern).toBe(true);
+    }
+  });
+
+  it("does not treat at-most-once repetition as repetition", () => {
+    // One iteration has no partition to get wrong, so these stay usable.
+    for (const pattern of ["(ab){1}", "(ab)?", "(ab){0,1}", "(a+){1}", "(a|a)?"]) {
+      expect(hasUnboundedNesting(pattern), pattern).toBe(false);
+    }
+  });
+
+  /**
+   * The guard is a static approximation, so the property that matters is not
+   * "every bad pattern is named" but "every pattern it ADMITS actually runs
+   * fast". This drives the admitted ones against the input shape that makes
+   * backtracking explode — a long run the pattern can split many ways,
+   * ending in a character it cannot match.
+   */
+  it("every pattern it admits runs fast on an adversarial input", () => {
+    const admitted = [
+      "(foo|bar)+$",
+      "(a|b)*$",
+      "(\\d+)$",
+      "a*$",
+      "x?$",
+      "(?:x|y)+$",
+      "[a-z]+$",
+      "^src/.*\\.ts$",
+    ];
+    const hostile = "a".repeat(40) + "!";
+    for (const pattern of admitted) {
+      expect(hasUnboundedNesting(pattern), pattern).toBe(false);
+      const matcher = buildMatcher(pattern, { regex: true });
+      expect(matcher, pattern).not.toBeNull();
+      const started = performance.now();
+      matcher?.test(hostile);
+      expect(performance.now() - started, pattern).toBeLessThan(50);
+    }
+  });
+
   it("treats an empty or blank query as no question asked", () => {
     expect(buildMatcher("")).toBeNull();
     expect(buildMatcher("   ")).toBeNull();

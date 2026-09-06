@@ -714,6 +714,12 @@ describe("the unbounded-nesting guard flags the right shapes", () => {
       "(\\d{2,})*",
       "x((ab+)*)y*",
       "(?:(a+)+)",
+      // Moved up from the "reasonable to type" list below, which had it
+      // wrong: a body that can match 1-3 characters, repeated, makes the
+      // engine try every partition. Measured at /(a{1,3})+$/ against a run
+      // of "a" ending in "!": 0.6 ms at 18 characters, 491 ms at 28,
+      // 4,812 ms at 32 — tripling every two. Bounded is not the same as safe.
+      "(a{1,3})+",
     ]) {
       expect(hasUnboundedNesting(pattern), pattern).toBe(true);
     }
@@ -736,9 +742,24 @@ describe("the unbounded-nesting guard flags the right shapes", () => {
       "[+*]+",
       "(unclosed",
       "a)b",
-      "(a{1,3})+",
     ]) {
       expect(hasUnboundedNesting(pattern), pattern).toBe(false);
+      // Being left alone is only correct if the pattern really is fast, so
+      // the claim is measured rather than asserted. Each of these runs in
+      // ~0.01 ms against the input shape that makes backtracking explode.
+      // The list deliberately includes uncompilable entries (`(unclosed`,
+      // `a)b`) to prove the guard does not throw on malformed input; those
+      // have no runtime to measure.
+      let matcher: RegExp | null = null;
+      try {
+        matcher = new RegExp(pattern);
+      } catch {
+        matcher = null;
+      }
+      if (!matcher) continue;
+      const started = performance.now();
+      matcher.test("a".repeat(30) + "!");
+      expect(performance.now() - started, pattern).toBeLessThan(100);
     }
   });
 });

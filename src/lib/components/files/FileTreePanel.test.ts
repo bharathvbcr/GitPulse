@@ -178,6 +178,21 @@ describe("FileTreePanel", () => {
     expect(source).toContain("onPinFile");
   });
 
+  /**
+   * The path scan runs under a wall-clock budget, so a pathological filter
+   * yields a PREFIX of the matches instead of freezing the window. A prefix
+   * rendered as though it were the whole answer is a tree that lies about
+   * what is in the repository, so the panel has to consume the flag and say
+   * so — in the count and in a caption, not just in a tooltip.
+   */
+  it("says when the filter stopped at its budget instead of showing a partial tree as complete", () => {
+    expect(source).toContain("filterResult.truncated");
+    expect(source).toContain("filterTruncated");
+    // The count becomes a floor, not a total.
+    expect(source).toContain("{#if filterTruncated}≥{/if}{filteredPaths.length}");
+    expect(source).toContain("Filter stopped at its time budget");
+  });
+
   it("supports zero-config store fallbacks for shared explorer selection", () => {
     expect(source).toContain("onSelectFile?: (path: string) => void");
     expect(source).toContain("repoStore.selectFilePath(path)");

@@ -215,8 +215,16 @@
     ),
   );
 
-  let filteredPaths = $derived.by(() => {
-    let result = filterPathsByFileQuery(listedPaths, parsedQuery);
+  /**
+   * Filtering carries its own honesty flag: the path scan runs under a
+   * wall-clock budget, so a pathological pattern yields a PREFIX of the
+   * matches rather than freezing the window. A prefix rendered as if it were
+   * the whole answer is a tree that silently lies about what is in the
+   * repository, so the count and the caption both say when it happened.
+   */
+  let filterResult = $derived.by(() => {
+    const scanned = filterPathsByFileQuery(listedPaths, parsedQuery);
+    let result = scanned.paths;
 
     const pillScope =
       statusFilter === "conflicted"
@@ -234,8 +242,12 @@
       result = result.filter((p) => p.toLowerCase().endsWith(ext));
     }
 
-    return result;
+    return { paths: result, truncated: scanned.truncated };
   });
+
+  let filteredPaths = $derived(filterResult.paths);
+  /** The scan hit its time budget; the listing below is a prefix. */
+  let filterTruncated = $derived(filterResult.truncated);
 
   let isFiltering = $derived(
     debouncedQuery.trim().length > 0 || statusFilter !== "all" || selectedExt !== null
@@ -769,8 +781,15 @@
   <div class="flex items-center justify-between gap-1 px-2.5 h-9 shrink-0 border-b border-border/60 bg-surface/80">
     <div class="flex items-baseline gap-1.5 min-w-0">
       <span class="text-[11px] font-bold uppercase tracking-wider text-textMuted">Explorer</span>
-      <span class="text-[10px] text-textMuted/80 tabular-nums font-mono" title="{filteredPaths.length} of {listedPaths.length} files shown">
-        {filteredPaths.length}{#if isFiltering}<span class="text-textMuted/60">/{listedPaths.length}</span>{/if}
+      <span
+        class="text-[10px] tabular-nums font-mono {filterTruncated ? 'text-amber-400' : 'text-textMuted/80'}"
+        title={filterTruncated
+          ? `At least ${filteredPaths.length} of ${listedPaths.length} files match — the filter stopped at its time budget, so this is a partial count`
+          : `${filteredPaths.length} of ${listedPaths.length} files shown`}
+      >
+        {#if filterTruncated}≥{/if}{filteredPaths.length}{#if isFiltering}<span
+            class="text-textMuted/60">/{listedPaths.length}</span
+          >{/if}
       </span>
     </div>
     <div class="flex items-center gap-0.5 shrink-0">
@@ -851,6 +870,10 @@
     -->
     {#if parsedQuery.error}
       <p class="text-[10px] text-rose-400 px-1">{parsedQuery.error}</p>
+    {:else if filterTruncated}
+      <p class="text-[10px] text-amber-400 px-1">
+        Filter stopped at its time budget — showing partial results. Narrow the pattern.
+      </p>
     {:else if queryFocused}
       <p class="text-[10px] text-textMuted/70 px-1.5 leading-snug">{QUERY_SYNTAX}</p>
     {/if}

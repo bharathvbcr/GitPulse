@@ -53,21 +53,37 @@ export const DEFAULT_MAX_MILLIS = 400;
 export const EMPTY_SEARCH: SearchResult = { matches: [], truncated: false, invalid: false };
 
 /**
- * Detects the exponential-backtracking shape: a quantifier applied to a group
- * that itself contains an unbounded quantifier — `(a+)+`, `([a-z]*\s*)+`,
- * `(\d{2,})*`.
+ * Detects the two exponential-backtracking shapes that hang a search box.
  *
- * This is not a general safety analysis and does not claim to be. It catches
- * the one family that actually hangs a search box, and it is worth catching:
- * `(a+)+c` against twenty-eight characters took **111 seconds** in this
- * repository's own stress run, and a JavaScript regex is not interruptible,
- * so no timeout, budget or worker cancellation can shorten it once `exec`
- * has started. Refusing the pattern with a message is the only thing that
- * keeps the window responsive.
+ * 1. **Nested quantifier** — a quantifier applied to a group that itself
+ *    contains an unbounded quantifier: `(a+)+`, `([a-z]*\s*)+`, `(\d{2,})*`.
+ * 2. **Ambiguous alternation under a quantifier** — a quantified group whose
+ *    branches can match the same text, so the engine has to try every way of
+ *    splitting the input between them: `(a|a)*`, `(?:aa|a)*`,
+ *    `([a-z]|[a-z][a-z])*`.
  *
- * Deliberately conservative about what it flags: a quantified group whose
- * body has no unbounded quantifier (`(foo|bar)+`), and an unbounded
- * quantifier inside an unquantified group (`(\d+)`), are both left alone.
+ * Family 2 was measured on this repository's own code and is not theoretical:
+ * `(a|a)*$` took **6.3 s against a 28-character string** and quadruples every
+ * two characters, and `(?:aa|a)*$` took 2.1 s at 38. It contains no nested
+ * quantifier at all, so the original rule passed it straight through.
+ *
+ * A JavaScript regex is not interruptible: once `exec` has started, no
+ * timeout, budget or worker cancellation can shorten it. Refusing the pattern
+ * is the only thing that keeps the window responsive — which is also why this
+ * predicate is not the only defence. It is a static approximation, the app
+ * runs on WKWebView (JavaScriptCore) rather than the V8 these numbers were
+ * measured on, and no static check classifies backtracking in general. The
+ * callers that scan many strings therefore also carry a wall-clock budget, so
+ * a pattern this misses costs one string rather than the whole scan.
+ *
+ * Deliberately conservative in BOTH directions, and the asymmetry is
+ * intentional. Left alone: an unbounded quantifier inside an *unquantified*
+ * group (`(\d+)`), and a quantified group whose branches cannot start with
+ * the same character (`(foo|bar)+`). Refused even though a given engine may
+ * optimize them today: branches that merely *could* overlap, such as
+ * `(a|b|ab)*` (`a` also starts `ab`) and any pair involving a character
+ * class. Refusing a rare working pattern costs one error message; admitting
+ * one that blows up costs the window.
  */
 export function hasUnboundedNesting(pattern: string): boolean {
   const opens: number[] = [];
@@ -93,19 +109,153 @@ export function hasUnboundedNesting(pattern: string): boolean {
     if (ch !== ")") continue;
     const start = opens.pop();
     if (start === undefined) continue;
-    const next = pattern[i + 1];
-    const quantified =
-      next === "*" ||
-      next === "+" ||
-      (next === "{" && /^\{\d*,\s*\}/.test(pattern.slice(i + 1)));
-    if (!quantified) continue;
-    if (bodyHasUnboundedQuantifier(pattern.slice(start + 1, i))) return true;
+    if (!groupRepeats(pattern, i)) continue;
+    // The opener (`?:`, `?=`, `?<name>`) is syntax, not something the group
+    // matches. Stripped once, here, so neither check below can mistake the
+    // `?` in `(?:x|y)+` for a quantifier and refuse a safe pattern.
+    const body = pattern.slice(start + 1, i).replace(GROUP_PREFIX, "");
+    if (bodyIsVariableLength(body)) return true;
+    if (alternationIsAmbiguous(body)) return true;
   }
   return false;
 }
 
-/** True when `body` contains `*`, `+` or `{n,}` outside a character class. */
-function bodyHasUnboundedQuantifier(body: string): boolean {
+/**
+ * True when the quantifier after a group's `)` can run the group MORE THAN
+ * ONCE — the precondition for every backtracking blow-up below it, because
+ * one iteration has no partition to get wrong.
+ *
+ * Bounded repetition counts. The original rule recognized only `*`, `+` and
+ * `{n,}`, so `{n}` and `{n,m}` slipped past every check underneath it — and
+ * a fixed count multiplies ambiguity just as well as an open one. This
+ * repository's fuzz run surfaced `(?:\w|(\w+){2,4}){3}$`, which the old rule
+ * admitted twice over (neither `{3}` nor `{2,4}` registered as a quantifier)
+ * and which takes **5.0 s at 26 characters**, roughly tripling every two.
+ *
+ * `?` and `{0,1}` are deliberately not repetition: at most one iteration.
+ */
+function groupRepeats(pattern: string, closeIndex: number): boolean {
+  const next = pattern[closeIndex + 1];
+  if (next === "*" || next === "+") return true;
+  if (next !== "{") return false;
+  const brace = /^\{(\d*)(?:,(\d*))?\}/.exec(pattern.slice(closeIndex + 1));
+  if (!brace) return false;
+  const min = brace[1] === "" ? 0 : Number(brace[1]);
+  if (brace[2] === undefined) return min >= 2; // {n}
+  if (brace[2] === "") return true; // {n,}
+  return Number(brace[2]) >= 2; // {n,m}
+}
+
+/** Group openers that are not part of the matched body: `?:`, `?=`, `?<name>`. */
+const GROUP_PREFIX = /^\?(?::|=|!|<[=!]|<[A-Za-z_$][\w$]*>)/;
+
+/**
+ * True when a quantified group's branches can begin with the same character,
+ * which is what makes the repetition ambiguous and the backtracking
+ * exponential. A single branch cannot be ambiguous with anything, so an
+ * alternation-free body is always false here and is judged only by
+ * {@link bodyHasUnboundedQuantifier}.
+ */
+function alternationIsAmbiguous(rawBody: string): boolean {
+  const body = rawBody.replace(GROUP_PREFIX, "");
+  const branches = splitTopLevelAlternatives(body);
+  if (branches.length < 2) return false;
+  const atoms = branches.map(firstAtom);
+  for (let i = 0; i < atoms.length; i += 1) {
+    for (let j = i + 1; j < atoms.length; j += 1) {
+      if (atomsCanOverlap(atoms[i], atoms[j])) return true;
+    }
+  }
+  return false;
+}
+
+/** Splits on `|` at nesting depth zero, respecting escapes and classes. */
+function splitTopLevelAlternatives(body: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let inClass = false;
+  let current = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch === "\\") {
+      current += ch + (body[i + 1] ?? "");
+      i += 1;
+      continue;
+    }
+    if (inClass) {
+      current += ch;
+      if (ch === "]") inClass = false;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      current += ch;
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    if (ch === ")") depth -= 1;
+    if (ch === "|" && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+}
+
+/**
+ * What a branch can start with. `wide` means "could be anything" — an empty
+ * branch (which makes the whole group nullable), a nested group, a wildcard,
+ * or an anchor. Every `wide` overlaps everything, so it fails closed.
+ */
+type FirstAtom =
+  | { kind: "char"; value: string }
+  | { kind: "class" }
+  | { kind: "wide" };
+
+function firstAtom(branch: string): FirstAtom {
+  if (branch.length === 0) return { kind: "wide" };
+  const ch = branch[0];
+  if (ch === "\\") {
+    const next = branch[1];
+    if (next === undefined) return { kind: "wide" };
+    // Shorthand classes cover many characters; a literal escape is one.
+    return /[dDwWsSbB]/.test(next) ? { kind: "class" } : { kind: "char", value: next };
+  }
+  if (ch === "[") return { kind: "class" };
+  if (ch === "." || ch === "(" || ch === "^" || ch === "$") return { kind: "wide" };
+  return { kind: "char", value: ch };
+}
+
+/**
+ * Whether two branch openings can accept the same character. Character-class
+ * membership is not computed: proving `[a-z]` and `[0-9]` disjoint would mean
+ * parsing ranges, negation and escapes, and getting that subtly wrong is how
+ * a guard silently stops guarding. Any class is therefore assumed to overlap.
+ */
+function atomsCanOverlap(a: FirstAtom, b: FirstAtom): boolean {
+  if (a.kind === "wide" || b.kind === "wide") return true;
+  if (a.kind === "char" && b.kind === "char") return a.value === b.value;
+  return true;
+}
+
+/**
+ * True when `body` can match runs of DIFFERENT lengths.
+ *
+ * Repeating a variable-length body is what forces the engine to try every way
+ * of partitioning the input among the iterations. Unboundedness is not the
+ * property that matters — `(aa?)*` is bounded at two characters per iteration
+ * and still took 132 ms against 24 characters in this repository's fuzz run,
+ * because "a" and "aa" are both legal iterations and every split has to be
+ * explored. `?` and `{n,m}` are therefore as disqualifying as `*` and `+`;
+ * only a fixed `{n}` leaves the body one length.
+ *
+ * A quantifier character never legally follows `(`, so one that does is a
+ * group opener (`(?:…)`) rather than a repetition, and is skipped.
+ */
+function bodyIsVariableLength(body: string): boolean {
   let inClass = false;
   for (let i = 0; i < body.length; i += 1) {
     const ch = body[i];
@@ -121,8 +271,14 @@ function bodyHasUnboundedQuantifier(body: string): boolean {
       inClass = true;
       continue;
     }
-    if (ch === "*" || ch === "+") return true;
-    if (ch === "{" && /^\{\d*,\s*\}/.test(body.slice(i))) return true;
+    const opensGroup = i > 0 && body[i - 1] === "(";
+    if ((ch === "*" || ch === "+") && !opensGroup) return true;
+    if (ch === "?" && !opensGroup) return true;
+    if (ch === "{") {
+      const brace = /^\{(\d*),(\d*)\}/.exec(body.slice(i));
+      // `{n,}` and `{n,m}` with n !== m both vary; a bare `{n}` does not.
+      if (brace && brace[1] !== brace[2]) return true;
+    }
   }
   return false;
 }

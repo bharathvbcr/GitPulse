@@ -14,17 +14,3 @@
 
 /** Quiet window before a typed query is scanned. */
 export const SEARCH_DEBOUNCE_MS = 120;
-
-/**
- * How a capped match count is written.
- *
- * A capped scan must not present itself as a complete one: "5000 matches" and
- * "5000+ matches" are different claims, and only the second is true when the
- * scan stopped at its ceiling.
- */
-export function matchCountLabel(found: number, cap: number, current: number): string {
-  if (found === 0) return "0 matches";
-  const capped = found >= cap;
-  const total = capped ? `${cap}+` : String(found);
-  return `${current + 1} of ${total}`;
-}

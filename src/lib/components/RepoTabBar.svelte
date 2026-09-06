@@ -105,6 +105,7 @@
     window.setTimeout(() => {
       const first = element?.querySelector<HTMLElement>('[role="menuitem"]');
       (first ?? element)?.focus();
+      first?.scrollIntoView?.({ block: "nearest" });
     }, 0);
   }
 
@@ -173,6 +174,7 @@
     if (next === null) return;
     e.preventDefault();
     items[next]?.focus();
+    items[next]?.scrollIntoView?.({ block: "nearest" });
   }
 
   function isTypingTarget(target: EventTarget | null): boolean {
@@ -327,7 +329,7 @@
 </script>
 
 {#if $repoStore.openTabs.length > 0}
-  <div class="gp-glass gp-repo-tabs h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
+  <div class="gp-glass gp-repo-tabs relative z-20 h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button
@@ -468,44 +470,46 @@
           aria-label="Recent repositories"
           tabindex="-1"
           onkeydown={handlePopupKeydown}
-          class="absolute right-0 top-full mt-1.5 w-80 gp-menu gp-pop"
+          class="absolute right-0 top-full mt-1.5 w-80 max-w-[calc(100vw-1rem)] gp-menu gp-pop flex flex-col max-h-[min(28rem,calc(100vh-7.5rem))] shadow-float"
           style="z-index: {LAYERS.MENU}"
         >
-          <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted">
+          <div class="px-2 pt-1 pb-1.5 text-[10px] uppercase tracking-wider text-textMuted shrink-0">
             Recent repositories
           </div>
           {#if $repoStore.recentRepos.length === 0}
             <div class="px-3 py-2 text-textMuted">No recent repositories</div>
           {:else}
-            {#each $repoStore.recentRepos as path}
-              <div class="flex items-center gap-1 px-0.5">
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={() => {
-                    recentsOpen = false;
-                    void repoStore.openRepo(path);
-                  }}
-                  class="flex-1 min-w-0 px-2 py-1.5 text-left hover:bg-surfaceHover rounded-lg transition-colors"
-                >
-                  <div class="truncate text-textPrimary">{displayName(path)}</div>
-                  <div class="truncate text-[10px] text-textMuted font-mono">{path}</div>
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  aria-label={`Remove ${displayName(path)} from recent repositories`}
-                  title="Remove from recents"
-                  onclick={() => repoStore.removeRecent(path)}
-                  class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover"
-                >
-                  <X size={11} />
-                </button>
-              </div>
-            {/each}
+            <div class="overflow-y-auto min-h-0 flex-1 overscroll-contain space-y-0.5">
+              {#each $repoStore.recentRepos as path}
+                <div class="flex items-center gap-1 px-0.5">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onclick={() => {
+                      recentsOpen = false;
+                      void repoStore.openRepo(path);
+                    }}
+                    class="flex-1 min-w-0 px-2 py-1.5 text-left hover:bg-surfaceHover rounded-lg transition-colors"
+                  >
+                    <div class="truncate text-textPrimary">{displayName(path)}</div>
+                    <div class="truncate text-[10px] text-textMuted font-mono">{path}</div>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    aria-label={`Remove ${displayName(path)} from recent repositories`}
+                    title="Remove from recents"
+                    onclick={() => repoStore.removeRecent(path)}
+                    class="p-1 rounded-full text-textMuted hover:text-rose-400 hover:bg-surfaceHover shrink-0"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              {/each}
+            </div>
           {/if}
           {#if unusedRecents.length === 0 && $repoStore.recentRepos.length > 0}
-            <div class="px-3 py-1.5 text-[10px] text-textMuted">All recents are already open</div>
+            <div class="px-3 py-1.5 text-[10px] text-textMuted shrink-0 border-t border-border/40">All recents are already open</div>
           {/if}
         </div>
       {/if}

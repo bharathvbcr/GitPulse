@@ -1,28 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { matchCountLabel, SEARCH_DEBOUNCE_MS } from "./searchLimits";
+import { SEARCH_DEBOUNCE_MS } from "./searchLimits";
 import { DEFAULT_MAX_MATCHES, findMatches } from "../text/lineSearch";
 
 const viewer = readFileSync(
   new URL("../components/files/CodeViewer.svelte", import.meta.url),
   "utf8",
 );
-
-describe("matchCountLabel", () => {
-  it("reports an exact count when the scan finished", () => {
-    expect(matchCountLabel(12, 5000, 0)).toBe("1 of 12");
-  });
-
-  it("marks a capped count as a floor, never as the whole truth", () => {
-    // A scan that stopped at its ceiling has not counted the matches; saying
-    // "5000" would present a bounded sample as complete coverage.
-    expect(matchCountLabel(5000, 5000, 3)).toBe("4 of 5000+");
-  });
-
-  it("says nothing found rather than 1 of 0", () => {
-    expect(matchCountLabel(0, 5000, 0)).toBe("0 matches");
-  });
-});
 
 describe("in-file search is bounded and debounced", () => {
   it("scans a debounced copy of the query, not the bound input", () => {

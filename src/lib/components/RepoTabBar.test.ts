@@ -87,4 +87,19 @@ describe("RepoTabBar", () => {
     const { warnings } = compile(source, { generate: "client" });
     expect(warnings.filter(({ code }) => code.startsWith("a11y_"))).toEqual([]);
   });
+
+  it("elevates the tab bar stacking context so dropdowns are not clipped beneath workspace panes", () => {
+    expect(source).toMatch(/class="[^"]*gp-repo-tabs[^"]*relative[^"]*z-20/);
+  });
+
+  it("bounds recent repositories dropdown height and enables scrolling to prevent viewport clipping", () => {
+    const recentsMenu = source.slice(
+      source.indexOf('id="recent-repositories-menu"'),
+      source.indexOf("<!-- Workspace-wide actions"),
+    );
+    expect(recentsMenu).toContain("max-h-");
+    expect(recentsMenu).toContain("overflow-y-auto");
+    expect(recentsMenu).toContain("shrink-0");
+  });
 });
+

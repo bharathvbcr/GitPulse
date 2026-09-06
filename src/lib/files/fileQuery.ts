@@ -14,6 +14,7 @@
  */
 
 import { fuzzyMatch } from "../branches/groupBranches";
+import { hasUnboundedNesting } from "../text/lineSearch";
 
 export type FileQueryKind = "all" | "substring" | "glob" | "regex" | "fuzzy";
 
@@ -174,17 +175,86 @@ export function matchesFileQuery(path: string, query: FileQuery): boolean {
   }
 }
 
-export function filterPathsByFileQuery(paths: readonly string[], query: FileQuery): string[] {
-  if (query.error) return [];
-  if (query.kind === "all" && !query.ext) return [...paths];
-  return paths.filter((path) => matchesFileQuery(path, query));
+/** Wall-clock ceiling for one filter pass over the path list. */
+export const DEFAULT_FILTER_MAX_MILLIS = 200;
+
+export interface FilteredPaths {
+  paths: string[];
+  /**
+   * True when the wall-clock budget stopped the scan before the end, so
+   * `paths` is a prefix of the answer rather than the answer. The explorer
+   * says so rather than presenting a partial tree as a complete one.
+   */
+  truncated: boolean;
 }
 
+/**
+ * Filters the path list, under a wall-clock budget.
+ *
+ * The budget is the backstop behind {@link compileRegex}'s static refusal,
+ * and it exists because that refusal cannot be complete. Classifying
+ * catastrophic backtracking in general is undecidable in practice; the
+ * predicate is an approximation tuned against measurements taken on V8, while
+ * the shipped app runs on WKWebView's JavaScriptCore, whose regex engine
+ * optimizes different shapes. A pattern that slips through therefore costs
+ * one path's worth of backtracking instead of a hundred thousand — the
+ * difference between a slow filter and a dead window.
+ *
+ * It cannot make a single `test` call return sooner: a JavaScript regex is
+ * not interruptible. Both defences are needed, and neither is claimed to be
+ * sufficient alone.
+ */
+export function filterPathsByFileQuery(
+  paths: readonly string[],
+  query: FileQuery,
+  options: { maxMillis?: number } = {},
+): FilteredPaths {
+  if (query.error) return { paths: [], truncated: false };
+  if (query.kind === "all" && !query.ext) return { paths: [...paths], truncated: false };
+  const deadline = Date.now() + Math.max(1, options.maxMillis ?? DEFAULT_FILTER_MAX_MILLIS);
+  const kept: string[] = [];
+  for (let i = 0; i < paths.length; i += 1) {
+    // Checked every 256 paths, matching `lineSearch`: `Date.now()` on a
+    // 100,000-path loop is itself measurable, and the overshoot is not.
+    if ((i & 0xff) === 0 && i > 0 && Date.now() > deadline) {
+      return { paths: kept, truncated: true };
+    }
+    if (matchesFileQuery(paths[i], query)) kept.push(paths[i]);
+  }
+  return { paths: kept, truncated: false };
+}
+
+/**
+ * Compiles a user-typed `/pattern/flags`, refusing the shapes that hang.
+ *
+ * A quantified group wrapping an unbounded quantifier — `(a+)+`, `(\w+)+`,
+ * `([a-z]+)*` — backtracks exponentially, and every compiled pattern here is
+ * then run against **every path in the repository** by
+ * {@link filterPathsByFileQuery}, whose stated contract is 100,000 paths. A
+ * JavaScript regex is not interruptible: once `test` has started, no timeout,
+ * budget or worker cancellation can shorten it. Refusing to compile is the
+ * only thing that keeps the window responsive.
+ *
+ * Measured on this module before the guard: ONE 45-character path took 1.4 s
+ * for `(a+)+$` and 2.7 s for `(\w+)+$`; fifty of them took 9 s.
+ *
+ * The predicate is imported rather than reimplemented — `lineSearch` already
+ * makes this exact call for the diff and file-viewer search boxes, and it is
+ * the same question with the same answer. This box was simply never wired to
+ * it, so the one search surface that scans the most strings was the one left
+ * unguarded.
+ */
 function compileRegex(
   body: string,
   flags: string,
 ): { regex: RegExp | null; error: string | null } {
   if (!body) return { regex: null, error: "Empty regular expression" };
+  if (hasUnboundedNesting(body)) {
+    return {
+      regex: null,
+      error: "Pattern can backtrack exponentially — remove the nested repeat",
+    };
+  }
   const safeFlags = flags.replace(/[^ims]/g, "");
   try {
     return { regex: new RegExp(body, safeFlags), error: null };
