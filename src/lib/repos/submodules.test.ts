@@ -175,6 +175,13 @@ describe("describeSubmodules", () => {
     expect(describeSubmodules(list)).toBe("2 of 3 submodules need attention.");
   });
 
+  it("agrees with the count when a lone submodule needs attention", () => {
+    // The noun follows the total and the verb follows the broken count; they
+    // are two different numbers and only the verb was getting one of them.
+    const list = [sub({ path: "a", state: "Conflicted" }), sub({ path: "b" })];
+    expect(describeSubmodules(list)).toBe("1 of 2 submodules needs attention.");
+  });
+
   it("uses the singular for a lone broken submodule", () => {
     expect(describeSubmodules([sub({ state: "Uninitialized" })])).toBe(
       "1 of 1 submodule not initialized.",

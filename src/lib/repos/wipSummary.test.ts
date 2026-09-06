@@ -230,6 +230,12 @@ describe("bulkSkipReason", () => {
     expect(bulkSkipReason(input({ conflictedFiles: 2 }))).toBe("2 files still have conflicts.");
   });
 
+  it("agrees with the count when a single file is conflicted", () => {
+    // The reason is rendered verbatim in the workspace sweep list, so the
+    // verb has to follow the noun rather than assuming the plural case.
+    expect(bulkSkipReason(input({ conflictedFiles: 1 }))).toBe("1 file still has conflicts.");
+  });
+
   it("does not skip merely because the tree is dirty", () => {
     // A fetch is safe on a dirty tree, and skipping every repository with an
     // edit in it would make workspace-wide fetch useless in practice.

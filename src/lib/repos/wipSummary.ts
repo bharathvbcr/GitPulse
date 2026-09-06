@@ -231,7 +231,8 @@ export function bulkSkipReason(input: RepoWipInput): string | null {
     return `A ${input.operation.operation.kind === "Merge" ? "merge" : "git operation"} is in progress here.`;
   }
   if (input.conflictedFiles > 0) {
-    return `${plural(input.conflictedFiles, "file")} still have conflicts.`;
+    const count = input.conflictedFiles;
+    return `${plural(count, "file")} still ${count === 1 ? "has" : "have"} conflicts.`;
   }
   return null;
 }

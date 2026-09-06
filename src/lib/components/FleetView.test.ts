@@ -39,6 +39,16 @@ describe("FleetView", () => {
     expect(body).toContain("No repositories are open.");
     expect(body).toContain("No repositories yet");
   });
+
+  it("takes the attention clause from the headline rather than re-spelling it", () => {
+    // The tile restates a count fleetHeadline already owns. Spelling the
+    // clause here too is how it came to read "1 need attention" beside a
+    // sentence that read correctly.
+    expect(source).toContain("{headline.attentionClause}");
+    expect(source).not.toMatch(/\{headline\.attention\}\s*need/);
+    // And the field is populated on the empty path this render exercises.
+    expect(render(FleetView).body).toContain("0 need attention");
+  });
 });
 
 describe("applyFilter", () => {

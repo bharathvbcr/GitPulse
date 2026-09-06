@@ -213,7 +213,8 @@ export function describeSubmodules(subs: readonly SubmoduleInfo[]): string {
   if (uninitialized === needing.length) {
     return `${uninitialized} of ${subs.length} submodule${subs.length === 1 ? "" : "s"} not initialized.`;
   }
-  return `${needing.length} of ${subs.length} submodule${subs.length === 1 ? "" : "s"} need attention.`;
+  const verb = needing.length === 1 ? "needs" : "need";
+  return `${needing.length} of ${subs.length} submodule${subs.length === 1 ? "" : "s"} ${verb} attention.`;
 }
 
 /**

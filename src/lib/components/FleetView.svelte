@@ -241,7 +241,7 @@
         <div class="text-[10px] uppercase tracking-wider text-textMuted">Open</div>
         <div class="text-sm font-semibold text-textPrimary tabular-nums">{headline.open}</div>
         <div class="text-[10px] text-textMuted">
-          {headline.attention} need attention
+          {headline.attentionClause}
         </div>
       </div>
       <div class="gp-card rounded-lg px-3 py-2">
