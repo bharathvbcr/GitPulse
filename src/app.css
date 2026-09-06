@@ -337,6 +337,25 @@ html.dark {
     backdrop-filter: blur(4px);
   }
 
+  /* Horizontal-overflow cue at the edges of a scroller. Written inline as
+     `from-background to-transparent`, which has two faults: Tailwind's
+     `to-transparent` is `rgb(0 0 0 / 0)`, so the ramp travels through black
+     and fringes on light themes, and `from-background` is a full-alpha stop --
+     an opaque band at each edge of a pane that is otherwise translucent. Both
+     ends fade one colour to its own zero instead, and macOS swaps the colour
+     for a shade, because the gutter deliberately stopped painting the base. */
+  .gp-edge-fade {
+    @apply pointer-events-none absolute inset-y-0 z-20 w-8;
+  }
+  .gp-edge-fade-start {
+    left: 0;
+    background-image: linear-gradient(to right, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
+  }
+  .gp-edge-fade-end {
+    right: 0;
+    background-image: linear-gradient(to left, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
+  }
+
   /* Floating menu / popover. */
   .gp-menu {
     @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
@@ -543,6 +562,11 @@ html.macos {
   --mac-glass-blur-float: 34px;
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
+  /* The horizontal-overflow cue at the edges of the graph gutter. It cannot
+     be the base colour here: the gutter stopped painting the base precisely
+     so the plate shows through it, and fading from the base would repaint the
+     one band the fade covers. A shade reads as a fade over any desktop. */
+  --mac-edge-shade: rgb(0 0 0 / 0.38);
   --mac-liquid-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -568,6 +592,7 @@ html.macos.light {
      the dark field glow turns pastel washes into flat colour here. */
   --mac-glass-boost: saturate(150%) brightness(1.02);
   --mac-shell-veil: 0.62;
+  --mac-edge-shade: rgb(38 46 76 / 0.14);
 }
 
 /* Real window transparency. `macOSPrivateApi` + a transparent window make the
@@ -722,6 +747,38 @@ html.macos :where([class~="bg-surfaceHover"], .gp-pill) {
   background-color: var(--mac-fill-surface-hover);
 }
 
+html.macos .gp-edge-fade-start {
+  background-image: linear-gradient(to right, var(--mac-edge-shade), rgb(0 0 0 / 0));
+}
+
+html.macos .gp-edge-fade-end {
+  background-image: linear-gradient(to left, var(--mac-edge-shade), rgb(0 0 0 / 0));
+}
+
+/*
+ * A base plate inside a base plate is not depth, it is a repaint.
+ *
+ * Stacking DIFFERENT materials is the point of the ladder above -- a card on a
+ * pane on the plate should read as three things. Stacking the SAME colour is
+ * not depth at all: it is a container repainting a colour that is already
+ * behind it, which was free when both were opaque and is a visible darkening
+ * once neither is. The graph gutter is the case that got reported: it carries
+ * `bg-background` three lines below the pane that already carries it, so it
+ * composited to 8.2% desktop against the commit list's 14.1% beside it and
+ * read as a hard rectangle in the middle of the glass.
+ *
+ * Occluders are the exception and have to stay painted: a `sticky`, `absolute`
+ * or `fixed` element that shares its parent's colour is not repainting the
+ * ground, it is covering content that scrolls under it -- the diff's sticky
+ * gutter is exactly that, and going transparent there would let code slide
+ * through it.
+ */
+html.macos
+  :where([class~="bg-background"])
+  :where([class~="bg-background"]):not([class~="sticky"], [class~="absolute"], [class~="fixed"]) {
+  background-color: transparent;
+}
+
 html.macos .gp-titlebar-actions,
 html.macos .gp-welcome {
   background-color: transparent;
@@ -829,6 +886,7 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     --mac-fill-bg: rgb(var(--c-bg));
     --mac-fill-surface: rgb(var(--c-surface));
     --mac-fill-surface-hover: rgb(var(--c-surface-hover));
+    --mac-edge-shade: rgb(var(--c-bg));
     --bg-main: rgb(var(--c-bg));
   }
 

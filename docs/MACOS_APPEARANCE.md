@@ -10,9 +10,8 @@ The title bar, repository strip, sidebar, status bar, workspace plate,
 floating menus, dialogs, and welcome card use a shared glass material. A
 static hue field — four wide, saturated radial blobs spanning the whole shell
 — is what the translucent surfaces show. The main workspace has a 16px rounded
-outline and an 8px inset; code, diffs, tables, and graph canvases retain their
-opaque backgrounds and existing virtualization. Traffic-light spacing and
-native window dragging are retained.
+outline and an 8px inset. Traffic-light spacing and native window dragging are
+retained.
 
 The field sits over the real desktop rather than replacing it: window
 transparency is on (see below), so what shows through a surface is the
@@ -35,6 +34,32 @@ field's own colours instead, at no per-frame cost. Float surfaces do sit over
 commit rows, diffs and tables, so for them the radius is the effect, and they
 are the only tier that is filtered. Nothing is filtered until a menu, toast or
 dialog is actually on screen.
+
+### Stacking, and what is not stacking
+
+Surfaces compound: a card on a pane on the plate inside the veil ends up denser
+than a lone panel, and that is deliberate — depth does work a single global
+alpha cannot. Repainting the *same* colour is not depth. A container that
+paints `bg-background` inside another that already paints it is putting the
+base colour on top of the base colour, which costs nothing while both are
+opaque and darkens visibly once neither is.
+
+The graph gutter was that case: it carried `bg-background` three lines below
+the pane that already carried it, so it composited 8.2% of the desktop against
+the commit list's 14.1% beside it, and read as a hard rectangle in the middle
+of the glass. A nested base plate is therefore transparent on macOS, with one
+exception — a `sticky`, `absolute` or `fixed` element sharing its parent's
+colour is not repainting the ground, it is covering content that scrolls under
+it. The diff's sticky gutter is exactly that. The exclusion list is derived
+from the components rather than written down, so a new occluder idiom fails the
+contract test instead of going transparent unnoticed.
+
+Overflow cues follow the same rule. `from-background to-transparent` is a
+full-alpha stop, so the fades at the edges of a scroller were opaque bands on a
+translucent pane — and Tailwind's `to-transparent` is `rgb(0 0 0 / 0)`, so the
+ramp travelled through black and fringed on light themes. `.gp-edge-fade` fades
+one colour to its own zero, and on macOS fades a shade rather than a colour,
+because the gutter deliberately stopped painting a colour to fade from.
 
 ### One blur per dialog
 
@@ -62,7 +87,17 @@ probe rects, `--c-text-muted` holds **4.86:1 – 6.82:1** on dark chrome and
 **4.58:1 – 4.90:1** on light chrome, with body text at 11:1 or better on both.
 Light is the tighter of the two — dark text on a near-white ground has less
 headroom than light text on a near-black one — which is why the light theme
-dilutes the field and thickens the fill. The dark blobs are deep and saturated
+dilutes the field and thickens the fill.
+
+**Both measurements were taken over a white desktop, which is the worst case
+for the dark theme and the best case for the light one.** The light theme over
+a *dark* desktop has not been measured. A CSS-only model of the stack puts
+muted text at 3.5:1 on light chrome there, but that model omits both the
+`NSVisualEffectView` and the hue field, each of which only adds opacity, so it
+is a lower bound rather than a result: it can fail to prove safety and cannot
+establish a failure. The same model puts dark chrome at 2.9:1 where the running
+app measures 4.74:1, which is the size of the gap. Settling the light case
+needs a measurement, not a tighter model. The dark blobs are deep and saturated
 rather than pastel for the same reason: chroma reads as glass without raising
 the luminance that muted text is measured against.
 
@@ -152,12 +187,15 @@ See [Svelte transitions](https://svelte.dev/docs/svelte/transition) and
 
 ## Verification
 
-`scripts/mac-material-contract.test.ts` pins both material rules against the
+`scripts/mac-material-contract.test.ts` pins the material rules against the
 source: every full-screen scrim routes through `.gp-scrim` and none re-adds a
-`backdrop-blur-*` utility beside it, and the only filtered selector inside the
-`@supports` block is the float tier. Its first assertion checks that the scrim
-discovery found anything at all — written without it, the scrim rules passed
-against zero matches the moment the dialogs adopted the class.
+`backdrop-blur-*` utility beside it, the only filtered selector inside the
+`@supports` block is the float tier, a nested base plate is transparent, every
+positioning keyword that actually appears beside `bg-background` is exempted
+from that rule, and no component fades an edge from a full-alpha surface
+colour. Two of those assertions are discovery-based and check that they found
+anything at all — written without it, the scrim rules passed against zero
+matches the moment the dialogs adopted the class.
 
 `src/lib/ui/macAppearance.test.ts` covers platform boundaries, Mac transition
 timings, changing reduced-motion preferences, and rendered selection semantics.

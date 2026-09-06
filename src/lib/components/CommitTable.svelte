@@ -895,10 +895,10 @@
       </div>
     </div>
     {#if graphOverflow.showStartFade}
-      <div class="pointer-events-none absolute inset-y-0 left-0 z-20 w-8 bg-gradient-to-r from-background to-transparent"></div>
+      <div class="gp-edge-fade gp-edge-fade-start"></div>
     {/if}
     {#if graphOverflow.showEndFade}
-      <div class="pointer-events-none absolute inset-y-0 right-0 z-20 w-8 bg-gradient-to-l from-background to-transparent"></div>
+      <div class="gp-edge-fade gp-edge-fade-end"></div>
     {/if}
   </div>
 

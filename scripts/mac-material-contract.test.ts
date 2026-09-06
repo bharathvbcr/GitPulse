@@ -148,6 +148,67 @@ describe("macOS material", () => {
     expect(cargoToml).toMatch(/^\[dependencies\][\s\S]*?^tauri = \{[^}]*macos-private-api/m);
   });
 
+  /*
+   * A base plate inside a base plate is a repaint, not depth — free while both
+   * were opaque, a visible darkening once neither is. The graph gutter is the
+   * case that was reported. The exception is an OCCLUDER: a positioned element
+   * sharing its parent's colour is covering content that scrolls under it, not
+   * repainting the ground, so it has to stay filled.
+   *
+   * The exclusion list is derived rather than written down: every positioning
+   * keyword that actually appears beside `bg-background` in a component must
+   * be in it, so a new occluder idiom fails here instead of going transparent
+   * in a view nobody screenshotted.
+   */
+  const POSITIONING = ["sticky", "absolute", "fixed"] as const;
+
+  const nestedRule =
+    css.match(
+      /html\.macos\s+:where\(\[class~="bg-background"\]\)\s+:where\(\[class~="bg-background"\]\):not\(([^)]*)\)\s*\{([^}]*)\}/,
+    ) ?? null;
+
+  it("stops a base plate from repainting the base plate it sits in", () => {
+    expect(nestedRule, "the nested bg-background rule is missing from app.css").not.toBeNull();
+    expect(nestedRule?.[2]).toContain("background-color: transparent");
+  });
+
+  it("keeps every positioned occluder painted", () => {
+    const used = new Set<string>();
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      for (const [, classes] of source.matchAll(/class="([^"]*\bbg-background\b[^"]*)"/g)) {
+        for (const keyword of POSITIONING) {
+          if (new RegExp(`(^|[\\s:])${keyword}(\\s|$)`).test(classes)) used.add(keyword);
+        }
+      }
+    }
+    // If nothing is discovered the assertion below is vacuous; the diff's
+    // sticky gutter means at least one occluder exists today.
+    expect(used.size).toBeGreaterThan(0);
+    for (const keyword of used) {
+      expect(nestedRule?.[1], `an occluder uses "${keyword}" but the rule does not exempt it`)
+        .toContain(`[class~="${keyword}"]`);
+    }
+  });
+
+  it("never fades an edge from a full-alpha surface colour", () => {
+    // `from-background` is alpha 1, so an overflow cue becomes an opaque band
+    // at the edge of a translucent pane; Tailwind's `to-transparent` is
+    // `rgb(0 0 0 / 0)`, so the ramp also travels through black on light
+    // themes. `.gp-edge-fade` owns both ends instead.
+    const strays: string[] = [];
+    for (const file of svelteFiles(componentsDir)) {
+      const source = readFileSync(file, "utf8");
+      if (/\b(?:from|via|to)-(?:background|surface|surfaceHover)\b/.test(source)) {
+        strays.push(relative(componentsDir, file).split(sep).join("/"));
+      }
+    }
+    expect(strays).toEqual([]);
+    expect(css).toMatch(/\.gp-edge-fade-start \{/);
+    expect(css).toMatch(/\.gp-edge-fade-end \{/);
+    expect(css).toMatch(/html\.macos \.gp-edge-fade-start \{[^}]*var\(--mac-edge-shade\)/);
+  });
+
   it("keeps a veil under the content so an unknown desktop cannot set the contrast", () => {
     // Measured over a pure white desktop: muted text held 4.74:1 at worst.
     // A fully clear shell would hand that number to the wallpaper.
