@@ -283,6 +283,18 @@ describe("CoverageViewer flicker contracts", () => {
     expect(source).toContain("this file's absence may be incomplete rather than a real zero");
   });
 
+  /**
+   * Regression: the banner said the scan "hit a cap". That flag has three
+   * sources — a prefix from the file listing (itself either an over-cap read
+   * or a stream the engine could not finish), the classifier's entry cap, and
+   * a directory window dropping candidates — so the sentence named one cause
+   * for all of them. The disclosure has to stay; the invented cause does not.
+   */
+  it("discloses the incomplete scan without asserting which cause", () => {
+    expect(source).not.toContain("hit a cap before every artifact was read");
+    expect(source).toContain("The scan did not read every artifact");
+  });
+
   it("retains selections case-insensitively and echoes auto-picks to the session", () => {
     const scanBody = source.slice(
       source.indexOf("function applyReport("),

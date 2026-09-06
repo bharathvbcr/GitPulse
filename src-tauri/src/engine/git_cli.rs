@@ -371,8 +371,11 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// tolerates a prefix (coverage family detection), where failing the whole
 /// scan would be worse than reading part of the listing.
 pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), String> {
-    let (bytes, truncated) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+    let (bytes, incomplete) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
+    Ok((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        incomplete.is_some(),
+    ))
 }
 
 /// Runs `git` with an explicit stdout budget, returning the text plus whether
@@ -382,9 +385,13 @@ pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), St
 /// error: a diff too large to render is still worth showing the head of, so
 /// long as the caller says so rather than presenting a prefix as the whole
 /// thing. See [`crate::engine::budget`] for the budgets themselves.
-pub fn git_text_capped(repo: &Path, args: &[&str], cap: usize) -> Result<(String, bool), String> {
-    let (bytes, truncated) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+pub fn git_text_capped(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(String, Option<Incomplete>), String> {
+    let (bytes, incomplete) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
 }
 
 /// Runs `git` in `repo` and hands back the finished run *whatever* its exit
@@ -915,8 +922,8 @@ pub(crate) fn capture_command_with_env(
     let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
 
     let out = run_bounded(cmd, program, timeout, None)?;
-    if out.truncated {
-        return Err(format!("{} output exceeded cap", program));
+    if let Some(reason) = &out.incomplete {
+        return Err(format!("{} output {}", program, reason.describe()));
     }
     Ok(CapturedOutput {
         stdout: out.stdout,
@@ -946,9 +953,13 @@ pub struct CapturedRun {
     pub stderr_tail: String,
     pub success: bool,
     pub status_code: i32,
-    /// True when output hit [`MAX_OUTPUT_BYTES`] and was cut — the tails are
-    /// what survived, and the flag says so rather than implying completeness.
+    /// True when the tails are a prefix, for any of the reasons below.
     pub truncated: bool,
+    /// Which reason, in one clause. `None` when nothing was cut. Carried
+    /// beside the flag because "we stopped reading at the display budget" and
+    /// "we never finished reading" are different facts, and a surface that
+    /// renders one sentence for both asserts a cause it cannot know.
+    pub truncation_reason: Option<String>,
 }
 
 /// Outcome of [`run_captured`]. A timeout is an outcome, not an error: the
@@ -990,13 +1001,27 @@ pub fn run_captured(
     // regression test below pins this contract so a rewording cannot silently
     // turn timeouts into spawn errors again.
     match run_bounded(cmd, program, timeout, None) {
-        Ok(out) => Ok(RunOutcome::Finished(CapturedRun {
-            stdout_tail: byte_tail(&out.stdout, tail_cap),
-            stderr_tail: byte_tail(&out.stderr, tail_cap),
-            success: out.success,
-            status_code: out.status_code,
-            truncated: out.truncated || out.stdout.len() > tail_cap || out.stderr.len() > tail_cap,
-        })),
+        Ok(out) => {
+            // The drain's own reason wins: it describes the whole stream. The
+            // display cap only says this VIEW is a tail, which is a weaker and
+            // separate claim.
+            let cut_for_display = out.stdout.len() > tail_cap || out.stderr.len() > tail_cap;
+            let truncation_reason =
+                out.incomplete
+                    .as_ref()
+                    .map(Incomplete::describe)
+                    .or_else(|| {
+                        cut_for_display.then(|| format!("only the last {tail_cap} bytes are shown"))
+                    });
+            Ok(RunOutcome::Finished(CapturedRun {
+                stdout_tail: byte_tail(&out.stdout, tail_cap),
+                stderr_tail: byte_tail(&out.stderr, tail_cap),
+                success: out.success,
+                status_code: out.status_code,
+                truncated: truncation_reason.is_some(),
+                truncation_reason,
+            }))
+        }
         Err(e) if is_timeout_error(program, &e) => Ok(RunOutcome::TimedOut(timeout)),
         Err(e) => Err(e),
     }
@@ -1064,6 +1089,47 @@ enum Stop {
     Undelivered(String),
 }
 
+/// Why captured stdout is a prefix of what the child actually wrote.
+///
+/// This exists because a single `truncated: bool` was asked to mean two
+/// unrelated things — "the child said more than the budget allowed" and "we
+/// never finished reading it" — and the callers that turn the flag into a
+/// sentence could only name one of them. They named the wrong one: a
+/// `for-each-ref` whose entire output was 1,482 bytes was reported to the user
+/// as `output exceeded 64 MB`, because the drain thread missed its delivery
+/// window on a loaded machine. A check that could not run must not report the
+/// same way as one that ran and found too much.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incomplete {
+    /// stdout reached the caller's byte budget; the rest was dropped. The
+    /// amount missing is unknown but the child was read to the end of the cap.
+    OverCap(usize),
+    /// The reader never handed its result over inside the grace window, so how
+    /// much is missing — if anything — is unknown. See [`collect_drained`].
+    Unread(String),
+}
+
+impl Incomplete {
+    /// The clause a caller appends after naming its subject — "git blame
+    /// output", "This diff", "Log output". Deliberately subject-free so one
+    /// renderer serves an error string, an AI warning and two UI banners
+    /// without any of them re-deriving the cause and getting it wrong.
+    ///
+    /// Both arms say what happened; neither invents a cause.
+    pub fn describe(&self) -> String {
+        match self {
+            // Whole MiB when the budget is one, exact bytes otherwise: a
+            // 512 KiB cap rendered as "exceeded 0 MB" reads as a bug in the
+            // message rather than a fact about the output.
+            Incomplete::OverCap(cap) if *cap >= 1024 * 1024 => {
+                format!("exceeded {} MB", cap / (1024 * 1024))
+            }
+            Incomplete::OverCap(cap) => format!("exceeded {cap} bytes"),
+            Incomplete::Unread(why) => format!("could not be read to the end ({why})"),
+        }
+    }
+}
+
 /// What [`run_bounded`] observed, before a caller shapes its own errors.
 #[derive(Debug)]
 pub(crate) struct BoundedRun {
@@ -1071,8 +1137,10 @@ pub(crate) struct BoundedRun {
     pub stderr: Vec<u8>,
     pub success: bool,
     pub status_code: i32,
-    /// True when stdout was cut off at [`MAX_OUTPUT_BYTES`].
-    pub truncated: bool,
+    /// Why `stdout` is a prefix, when it is; `None` when it is the whole
+    /// stream. Carried as a reason rather than a flag so no caller has to
+    /// guess which of the two causes it is looking at.
+    pub incomplete: Option<Incomplete>,
 }
 
 /// Ceiling on how many child processes this engine keeps alive at once.
@@ -1310,15 +1378,16 @@ pub(crate) fn run_bounded_capped(
             // every caller past this point parses what it is handed as the
             // whole answer. A broken read is a fault and fails the run; an
             // undelivered one is the documented grandchild case, where the
-            // child's status is still good — that reports as truncation, which
-            // is the flag callers already treat as "this is a prefix".
+            // child's status is still good — that reports as a prefix, and
+            // carries its reason so no caller has to guess at one.
+            let mut unread: Option<String> = None;
             match stdout.stop.take() {
                 Some(Stop::Broken(e)) => return Err(format!("Failed to read {label} output: {e}")),
                 Some(Stop::Undelivered(e)) => {
-                    stdout.truncated = true;
                     stderr
                         .bytes
                         .extend_from_slice(format!("\n[stdout incomplete: {e}]").as_bytes());
+                    unread = Some(e);
                 }
                 None => {}
             }
@@ -1330,12 +1399,22 @@ pub(crate) fn run_bounded_capped(
                     .bytes
                     .extend_from_slice(format!("\n[stderr incomplete: {e}]").as_bytes());
             }
+            // The two are mutually exclusive in practice — `truncated` can only
+            // be set by a drain that DID deliver — but the order is fixed
+            // rather than left to chance: an over-cap read is the stronger,
+            // more specific claim and is the one worth reporting if both ever
+            // arrive together.
+            let incomplete = if stdout.truncated {
+                Some(Incomplete::OverCap(stdout_cap))
+            } else {
+                unread.map(Incomplete::Unread)
+            };
             Ok(BoundedRun {
                 stdout: stdout.bytes,
                 stderr: stderr.bytes,
                 success: status.success(),
                 status_code: status.code().unwrap_or(-1),
-                truncated: stdout.truncated,
+                incomplete,
             })
         }
         Err(e) => {
@@ -1418,7 +1497,7 @@ fn git_run(
     args: &[&str],
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
-) -> Result<(Vec<u8>, bool), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
     git_run_capped(repo, args, timeout, stdin_bytes, MAX_OUTPUT_BYTES)
 }
 
@@ -1428,7 +1507,7 @@ fn git_run_capped(
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
-) -> Result<(Vec<u8>, bool), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
     let mut attempts = 0;
@@ -1438,7 +1517,7 @@ fn git_run_capped(
         let cmd = git_command(repo, args);
         let out = run_bounded_capped(cmd, &label, timeout, stdin_bytes, stdout_cap)?;
         if out.success {
-            return Ok((out.stdout, out.truncated));
+            return Ok((out.stdout, out.incomplete));
         }
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !err.is_empty() {
@@ -1479,13 +1558,9 @@ fn git_timeout(
     stdin_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let sub = args.first().unwrap_or(&"");
-    let (stdout, truncated) = git_run(repo, args, timeout, stdin_bytes)?;
-    if truncated {
-        return Err(format!(
-            "git {} output exceeded {} MB",
-            sub,
-            MAX_OUTPUT_BYTES / (1024 * 1024)
-        ));
+    let (stdout, incomplete) = git_run(repo, args, timeout, stdin_bytes)?;
+    if let Some(reason) = &incomplete {
+        return Err(format!("git {} output {}", sub, reason.describe()));
     }
     Ok(stdout)
 }
@@ -1700,25 +1775,79 @@ mod tests {
         );
     }
 
+    /// End-to-end rather than schedule-only: the constants above are only worth
+    /// anything if `run_bounded` actually uses them.
+    ///
+    /// Measured against this machine's OWN bare spawn-and-reap, not against an
+    /// absolute wall clock. The previous form asserted `< 200 ms` and was wrong
+    /// in both directions. It never protected the property it named — a
+    /// reintroduced flat 15 ms tick costs about 20 ms end to end and sails
+    /// through a 200 ms budget — and it was a claim about a machine the test
+    /// does not own, so a host busy with something else failed it for reasons
+    /// that had nothing to do with the poll schedule. A test that cannot fail
+    /// for its stated reason but can fail for unrelated ones is worse than no
+    /// test: it spends the credibility of the suite on noise.
+    ///
+    /// A ratio survives load because contention inflates both sides together.
     #[test]
-    fn a_fast_command_returns_well_inside_the_old_quantum() {
-        // End-to-end rather than schedule-only: the constants above are only
-        // worth anything if run_bounded actually uses them. Budgeted at a
-        // third of the old flat tick, which a `true` cannot exceed unless the
-        // loop has gone back to a fixed sleep — and which stays true on a
-        // loaded machine, where the process spawn dominates either way.
-        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "true" });
-        if cfg!(windows) {
-            cmd.args(["/C", "exit", "0"]);
+    fn a_fast_command_is_not_delayed_by_a_fixed_poll_quantum() {
+        fn no_op() -> Command {
+            let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "true" });
+            if cfg!(windows) {
+                cmd.args(["/C", "exit", "0"]);
+            }
+            cmd
         }
-        let started = Instant::now();
-        let run = run_bounded(cmd, "true", Duration::from_secs(5), None)
-            .expect("spawning `true` should succeed");
-        let elapsed = started.elapsed();
-        assert!(run.success);
+        /// Spawn, reap, and nothing else: the floor `run_bounded` is allowed
+        /// to approach but not to add a sleep on top of.
+        fn bare() -> Duration {
+            let started = Instant::now();
+            let mut cmd = no_op();
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().expect("spawning the no-op should succeed");
+            let status = child.wait().expect("waiting on the no-op should succeed");
+            assert!(status.success());
+            started.elapsed()
+        }
+        fn through_run_bounded() -> Duration {
+            let started = Instant::now();
+            let run = run_bounded(no_op(), "no-op", Duration::from_secs(5), None)
+                .expect("spawning the no-op should succeed");
+            assert!(run.success);
+            started.elapsed()
+        }
+
+        // Best-of-N on both sides, sampled alternately so warm-up and
+        // scheduler drift land on each equally. The minimum is the sample
+        // least contaminated by whatever else the box is doing, and it is the
+        // only statistic here that stays stable under contention: measured
+        // with every core saturated, the two minima are the same to the
+        // nanosecond, while the medians drift apart by ~1.5 ms.
+        const SAMPLES: usize = 12;
+        let mut bare_best = Duration::MAX;
+        let mut bounded_best = Duration::MAX;
+        for i in 0..SAMPLES {
+            if i % 2 == 0 {
+                bare_best = bare_best.min(bare());
+                bounded_best = bounded_best.min(through_run_bounded());
+            } else {
+                bounded_best = bounded_best.min(through_run_bounded());
+                bare_best = bare_best.min(bare());
+            }
+        }
+
+        // Comfortably above the ~1 ms of gate, thread and channel work
+        // `run_bounded` genuinely adds, and comfortably below the flat
+        // POLL_BACKOFF_MAX tick this exists to catch.
+        const SLACK: Duration = Duration::from_millis(8);
         assert!(
-            elapsed < Duration::from_millis(200),
-            "a no-op command took {elapsed:?}, which suggests a fixed poll interval"
+            bounded_best <= bare_best + SLACK,
+            "run_bounded added {:?} on top of a bare spawn+reap ({bare_best:?} -> \
+             {bounded_best:?}); a flat {POLL_BACKOFF_MAX:?} poll would add about that much, \
+             so the backoff ramp is not being used",
+            bounded_best.saturating_sub(bare_best)
         );
     }
 
@@ -2893,13 +3022,71 @@ mod tests {
         // what was collected is a prefix of unknown length and must not be
         // handed on as the child's complete output.
         assert!(
-            out.truncated,
+            out.incomplete.is_some(),
             "an undelivered drain must report as a prefix, not as the whole stream"
         );
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("stdout incomplete"),
             "and it must say why: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+        // And it must be the RIGHT prefix reason. `sh` printed nothing at all,
+        // so anything that classifies this as an over-cap read is inventing a
+        // cause — which is exactly how a 1,482-byte `for-each-ref` reached a
+        // user's diagnostics log as "output exceeded 64 MB".
+        assert!(
+            matches!(out.incomplete, Some(Incomplete::Unread(_))),
+            "an unread stream is not an over-cap one: {:?}",
+            out.incomplete
+        );
+    }
+
+    /// The end-to-end shape of the same defect: a caller that turns a prefix
+    /// into an error must name what happened. `capture_command` is the seam
+    /// every non-git tool goes through, and it shares `git_timeout`'s bug.
+    #[cfg(unix)]
+    #[test]
+    fn an_unread_stream_is_not_reported_as_an_over_cap_one() {
+        // Exits 0 immediately; the backgrounded child inherits the pipe write
+        // ends, so EOF never arrives and the drain misses its window.
+        let err = capture_command(
+            "sh",
+            &["-c", "sleep 30 & exit 0"],
+            None,
+            Duration::from_secs(5),
+            &[],
+        )
+        .expect_err("a stdout of unknown completeness must not pass as complete");
+        assert!(
+            !err.contains("exceeded"),
+            "nothing was printed, so nothing exceeded any cap: {err}"
+        );
+        assert!(
+            err.contains("could not be read to the end"),
+            "the error must name the real cause: {err}"
+        );
+    }
+
+    /// The other arm still reads the way it always did, so fixing the wrong
+    /// message did not cost the right one.
+    #[test]
+    fn an_over_cap_stream_still_reports_its_budget() {
+        assert_eq!(
+            Incomplete::OverCap(MAX_OUTPUT_BYTES).describe(),
+            "exceeded 64 MB"
+        );
+        // A sub-megabyte budget must not round to "exceeded 0 MB".
+        assert_eq!(Incomplete::OverCap(8_192).describe(), "exceeded 8192 bytes");
+        assert!(Incomplete::Unread("reader did not finish".into())
+            .describe()
+            .contains("could not be read to the end"));
+        // The clause carries no subject of its own, so a caller that names one
+        // cannot end up saying "output output exceeded 64 MB".
+        assert!(
+            !Incomplete::OverCap(MAX_OUTPUT_BYTES)
+                .describe()
+                .contains("output"),
+            "describe() must stay subject-free; callers supply the subject"
         );
     }
 
@@ -3003,7 +3190,7 @@ mod tests {
             .expect("a non-zero exit is not a failure to run");
         assert!(!run.success, "git said no");
         assert_ne!(run.status_code, 0);
-        assert!(!run.truncated);
+        assert!(run.incomplete.is_none());
 
         // A successful run still reports success and carries stdout.
         let ok = git_captured(repo, &["rev-parse", "--is-inside-work-tree"]).expect("ran");

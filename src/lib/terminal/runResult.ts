@@ -19,6 +19,13 @@ export interface TerminalRunResult {
   stdout_tail: string;
   stderr_tail: string;
   truncated: boolean;
+  /**
+   * Why the tails are a prefix, when they are. Rendered instead of a guess:
+   * "we stopped at the display budget" and "we never finished reading the
+   * stream" are different facts, and one sentence for both asserts a cause
+   * the UI cannot know.
+   */
+  truncation_reason: string | null;
   duration_ms: number;
 }
 

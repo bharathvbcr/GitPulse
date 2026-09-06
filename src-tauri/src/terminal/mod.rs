@@ -75,6 +75,10 @@ pub struct TerminalRunResult {
     pub stdout_tail: String,
     pub stderr_tail: String,
     pub truncated: bool,
+    /// Why the tails are a prefix, when they are; `None` when they are whole.
+    /// The UI renders this rather than assuming the cause: an output that
+    /// could not be read to the end is not an output that was too big.
+    pub truncation_reason: Option<String>,
     pub duration_ms: u64,
 }
 
@@ -589,6 +593,7 @@ fn run_terminal_inner(
             stdout_tail: run.stdout_tail,
             stderr_tail: run.stderr_tail,
             truncated: run.truncated,
+            truncation_reason: run.truncation_reason,
             duration_ms,
         }),
         Ok(RunOutcome::TimedOut(dur)) => Ok(TerminalRunResult {
@@ -600,6 +605,7 @@ fn run_terminal_inner(
             stdout_tail: String::new(),
             stderr_tail: format!("Command timed out after {}s", dur.as_secs()),
             truncated: false,
+            truncation_reason: None,
             duration_ms,
         }),
         Err(e) => Err(e),

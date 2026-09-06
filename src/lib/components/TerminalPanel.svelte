@@ -798,8 +798,12 @@
                 <div class="text-textMuted italic">(No output produced)</div>
               {/if}
               {#if entry.result.truncated}
+                <!-- The backend says WHY. It used to say "exceeded cap" for
+                     every prefix, including a stream we simply never finished
+                     reading — a cause the UI is in no position to assert. -->
                 <div class="text-amber-400 text-[10px] pt-1">
-                  [Output exceeded cap; tail shown above]
+                  [Output is incomplete: {entry.result.truncation_reason ??
+                    "reason unavailable"}]
                 </div>
               {/if}
             {:else if entry.error}

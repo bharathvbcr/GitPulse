@@ -234,3 +234,22 @@ describe("TerminalPanel listener lifecycle hygiene", () => {
     expect(source.indexOf("clearTimeout(copiedResetTimer)", start)).toBeGreaterThan(start);
   });
 });
+
+/**
+ * Regression: the amber strip asserted a cause. `[Output exceeded cap]` was
+ * printed for every prefix — including a stream the engine never finished
+ * reading, whose byte count was often zero. The backend now says which, and
+ * the panel renders that instead of guessing.
+ */
+describe("TerminalPanel truncation disclosure", () => {
+  it("renders the backend's reason rather than naming a cap", () => {
+    expect(source).toContain("entry.result.truncation_reason");
+    expect(source).not.toContain("Output exceeded cap");
+  });
+
+  it("still discloses the prefix when the reason is missing", () => {
+    // A prefix with no explanation is still a prefix; silence would let it
+    // read as the whole output.
+    expect(source).toContain('"reason unavailable"');
+  });
+});

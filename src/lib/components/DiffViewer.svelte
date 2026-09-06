@@ -222,6 +222,10 @@
   // on screen a prefix, and every consequence — the notice, the staging
   // lockout — follows from that fact rather than from which cut caused it.
   let cutByBackend = $derived($repoStore.selectedDiffTruncated);
+  /** Falls back to the cause-neutral phrasing rather than inventing one. */
+  let backendCutReason = $derived(
+    $repoStore.selectedDiffTruncationReason ?? "is incomplete",
+  );
   let cutByRenderer = $derived(allLines.length > MAX_RENDER_LINES);
   let truncatedSource = $derived(cutByBackend || cutByRenderer);
   let lines = $derived(cutByRenderer ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
@@ -1259,7 +1263,10 @@
       <span>⚠</span>
       <span>
         {#if cutByBackend}
-          This diff is larger than GitPulse reads in one go — showing the first
+          <!-- The backend says WHY. This asserted "larger than we read in one
+               go" for every backend cut, including a diff the engine failed to
+               read to the end — which sends the reader after the wrong remedy. -->
+          This diff {backendCutReason} — showing the first
           {contentLineCount.toLocaleString()} lines. Open individual files from the
           rail to see the rest. Staging is disabled here because a partial diff
           would stage less than these rows show.
