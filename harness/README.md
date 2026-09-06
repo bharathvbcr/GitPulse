@@ -20,9 +20,18 @@ every 250 ms so a run that wedges the renderer still reports (a severe loop
 never reaches the final assignment — that is how the StoragePanel defect
 presented).
 
-- `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `LoopCanary`
-- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos`
+- `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `FleetView` |
+  `TerminalPanel` | `LoopCanary`
+- `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs`
+- `termtabs` drives the terminal strip through the real DOM (open / switch / close),
+  because that state is internal to the component. Pair it with `TerminalPanel`:
+  every open mounts an xterm into a visible box and hides the previous one, which
+  is the only place the reveal effects can form a loop. Named apart from the
+  `tabs` count parameter below, which means repositories, not terminal sessions.
 - `tabs`, `cycles`
+- `css=1` — load the real stylesheet, for *looking* at a component instead of
+  only stressing it. Off by default: a behaviour run should not depend on
+  Tailwind having compiled.
 
 Two rules learned the hard way:
 

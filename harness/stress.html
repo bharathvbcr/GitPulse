@@ -20,6 +20,11 @@
       const TABS = Number(q.get("tabs") ?? 4);
       const CYCLES = Number(q.get("cycles") ?? 25);
 
+      // `?css=1` loads the real stylesheet, for looking at a component rather
+      // than only stressing it. Off by default: the rig's job is behaviour, and
+      // a run should not depend on Tailwind having compiled.
+      if (q.get("css") === "1") await import("../src/app.css");
+
       const ALL_REPOS = [
         "/r/DevCouncil", "/r/scholarlm", "/r/DevPrism", "/r/MLSystemsLab",
         "/r/DevType", "/r/BINN", "/r/MarkDev", "/r/Manvi",
@@ -28,16 +33,93 @@
       // ---- fixtures ------------------------------------------------------
       // Shaped, never blanket null: a null seam crashes component init, and the
       // torn-down effects would HIDE a loop rather than reveal one.
+      // Complete LanguageStatsReport, per src/lib/language/barStats.ts. This
+      // fixture used to answer `{ languages, total_code_lines, ... }`, which is
+      // a shape the app has not sent for some time: every consumer reads
+      // `report.stats`, so the seam quietly returned an empty breakdown and any
+      // component driven by it sat inert -- a harness that detects nothing,
+      // reported as a clean run.
+      let ptySeq = 0;
       let langCounter = 0;
       const langStats = () => ({
-        languages: [
-          { language: "Rust", code_lines: 41000 + (langCounter % 7), percentage: 62, color_hex: "#dea584", category: "code", file_count: 300, other_languages: [] },
-          { language: "TypeScript", code_lines: 25000, percentage: 38, color_hex: "#3178c6", category: "code", file_count: 400, other_languages: [] },
+        stats: [
+          { language: "Rust", code_lines: 41000 + (langCounter++ % 7), percentage: 62, color_hex: "#dea584", category: "programming", file_count: 300 },
+          { language: "TypeScript", code_lines: 25000, percentage: 38, color_hex: "#3178c6", category: "programming", file_count: 400 },
         ],
-        total_code_lines: 66000 + (langCounter++ % 7),
-        total_files: 700, truncated: false,
-        generated_at_epoch_secs: Math.floor(Date.now() / 1000),
+        truncated: false,
+        scanned_files: 700,
+        candidate_files: 700,
       });
+      // Complete FleetSnapshot, per src/lib/fleet/types.ts. Every repository in
+      // one sweep shares `anchor_epoch` -- the grid's activity chart sums the
+      // per-repository series bucket for bucket, and a fixture that varied the
+      // anchor per row would exercise only the mismatch path.
+      const FLEET_WINDOW = 90;
+      const fleetSnapshot = (args) => {
+        const anchor = Math.floor(Date.now() / 1000);
+        const paths = Array.isArray(args?.repoPaths) ? args.repoPaths : [];
+        return {
+          anchor_epoch: anchor,
+          requested: paths.length,
+          scanned: paths.length,
+          truncated: false,
+          duration_ms: 18,
+          repos: paths.map((repo_path, i) => {
+            const daily = Array.from({ length: FLEET_WINDOW }, (_, d) =>
+              (d + i) % 5 === 0 ? ((d + i) % 4) + 1 : 0,
+            );
+            const sum = (from, to) => daily.slice(from, to).reduce((a, b) => a + b, 0);
+            return {
+              repo_path, ok: true, error: "",
+              worktrees_ok: true, worktrees_error: "", worktrees: 1 + (i % 3),
+              agents: { ok: true, sessions: i % 2, kinds: i % 2 ? [{ kind: "claude", sessions: 1 }] : [] },
+              last_commit_ok: true, last_commit_epoch: anchor - i * 3600,
+              commits_ok: true, commits_error: "",
+              commits: {
+                window_days: FLEET_WINDOW,
+                anchor_epoch: anchor,
+                commits: sum(0, FLEET_WINDOW),
+                authors: 1 + (i % 3),
+                active_days: daily.filter((n) => n > 0).length,
+                commits_7d: sum(FLEET_WINDOW - 7, FLEET_WINDOW),
+                commits_prior_7d: sum(FLEET_WINDOW - 14, FLEET_WINDOW - 7),
+                last_commit_epoch: anchor - i * 3600,
+                daily,
+                truncated: i === 2,
+              },
+              metrics_ok: true, metrics_error: "",
+              metrics: {
+                repo_path,
+                loc: 66000 + i, loc_language: "Rust", loc_truncated: false,
+                loc_at: new Date().toISOString(),
+                storage_bytes: 1e9, storage_git_bytes: 4e8, storage_reclaimable_bytes: 3e8,
+                storage_truncated: false, storage_at: new Date().toISOString(),
+                vulns_critical: 0, vulns_high: 0, vulns_moderate: 0, vulns_low: 1,
+                vulns_unknown: 0, vulns_total: 1, health_complete: true,
+                health_at: new Date().toISOString(),
+                coverage_pct: 80, coverage_truncated: false,
+                coverage_at: new Date().toISOString(),
+                // Baselines from `fleet_history`. Repo 0 deliberately has none:
+                // a first scan has no direction, and the grid must render it
+                // with no chip at all rather than a "+0" claiming a past
+                // nobody measured.
+                loc_prev: i === 0 ? null : 66000 + i - 400 * i,
+                loc_prev_day: i === 0 ? null : "2026-08-01",
+                storage_prev_bytes: i === 0 ? null : 1e9 + 5e7,
+                storage_prev_day: i === 0 ? null : "2026-08-14",
+                vulns_prev_total: i === 0 ? null : 1 + (i % 3),
+                vulns_prev_day: i === 0 ? null : "2026-08-20",
+                coverage_prev_pct: i === 0 ? null : 80 - (i % 4) + 2,
+                coverage_prev_day: i === 0 ? null : "2026-07-30",
+                languages: [
+                  { language: "Rust", color_hex: "#dea584", category: "programming", code_lines: 41000, file_count: 300, percentage: 62 },
+                  { language: "TypeScript", color_hex: "#3178c6", category: "programming", code_lines: 25000, file_count: 400, percentage: 38 },
+                ],
+              },
+            };
+          }),
+        };
+      };
       // Complete CoverageReport, per src/lib/coverage/types.ts.
       const coverageReport = () => ({
         families: [{ family: "rust", languages: ["Rust"], color_hex: "#dea584",
@@ -110,6 +192,8 @@
       const FIXTURES = {
         cmd_resolve_repo: (a) => ({ path: a?.path, name: String(a?.path ?? "").split("/").pop(), is_bare: false }),
         cmd_get_language_stats: langStats,
+        cmd_fleet_snapshot: fleetSnapshot,
+        cmd_fleet_record_metrics: () => null,
         cmd_scan_coverage: coverageReport,
         cmd_storage_scan: storageReport,
         cmd_get_pulse_report: pulseReport,
@@ -135,6 +219,18 @@
         cmd_list_branches: () => [], cmd_list_tags: () => [], cmd_get_status: () => [],
         cmd_list_remotes: () => [], cmd_list_submodules: () => [], cmd_stash_list: () => [],
         cmd_branch_stats: () => ({}),
+        // Complete TerminalSpawned, per src/lib/terminal/runResult.ts. A null
+        // here would leave every session with `spawned.id === undefined`: the
+        // strip would still render, and a harness that exercises no live
+        // session detects nothing while reporting a clean run.
+        cmd_terminal_spawn: (args) => ({
+          id: `term-harness-${++ptySeq}`,
+          shell: args?.program ? `/opt/homebrew/bin/${args.program}` : "/bin/zsh",
+          cwd: args?.repoPath ?? ALL_REPOS[0],
+        }),
+        cmd_terminal_write: () => null,
+        cmd_terminal_resize: () => null,
+        cmd_terminal_kill: () => null,
       };
       window.__TAURI_INTERNALS__ = {
         invoke: async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null),
@@ -166,6 +262,8 @@
         StoragePanel: () => import("../src/lib/components/StoragePanel.svelte"),
         HealthPanel: () => import("../src/lib/components/HealthPanel.svelte"),
         CoverageViewer: () => import("../src/lib/components/CoverageViewer.svelte"),
+        FleetView: () => import("../src/lib/components/FleetView.svelte"),
+        TerminalPanel: () => import("../src/lib/components/TerminalPanel.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
       };
       const Component = (await LOADERS[COMPONENT]()).default;
@@ -236,6 +334,37 @@
           await sleep(6);
           cycles++;
         }
+      } else if (SCENARIO === "termtabs") {
+        // Terminal-tab churn, driven through the real DOM because the strip's
+        // state is internal to the component. Every open mounts an xterm into
+        // a visible box and hides the previous one; every switch reveals a
+        // box that had no layout while hidden. Those are exactly the moments
+        // the reveal effects run, and the only place a loop could form.
+        const click = (node) => node?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        // The launcher group sits OUTSIDE the tablist (only tabs belong in
+        // one), so it is found on the strip row rather than within the list.
+        const strip = () => target.querySelector('[role="tablist"]')?.parentElement;
+        const newButtons = () => [...(strip()?.querySelectorAll("button") ?? [])].filter(
+          (b) => b.getAttribute("role") !== "tab" && !b.hasAttribute("aria-label") && !b.disabled,
+        );
+        const tabButtons = () => [...(strip()?.querySelectorAll('button[role="tab"]') ?? [])];
+        const closeButtons = () => [...(strip()?.querySelectorAll('button[aria-label^="Close "]') ?? [])];
+        for (let i = 0; i < CYCLES; i++) {
+          const openers = newButtons();
+          if (openers.length) click(openers[i % openers.length]);
+          await sleep(10);
+          const tabs = tabButtons();
+          if (tabs.length) click(tabs[i % tabs.length]);
+          await sleep(10);
+          // Close on a cadence that lets the strip both grow and shrink, so
+          // the ceiling and the empty state are both reached over a long run.
+          if (i % 3 === 2) {
+            const closers = closeButtons();
+            if (closers.length) click(closers[i % closers.length]);
+            await sleep(10);
+          }
+          cycles++;
+        }
       } else if (SCENARIO === "remount") {
         for (let i = 0; i < CYCLES; i++) {
           if (instance) await unmount(instance);
@@ -264,6 +393,9 @@
         stripMatchesTabs: strip.length === 0 ? "n/a" : JSON.stringify(strip) === JSON.stringify(openPaths),
         otherCrashes: [...new Set(crashes.filter((c) => !c.includes("effect_update_depth_exceeded")))].slice(0, 4),
         renderedChars: target.textContent.trim().length,
+        terminalTabs: target.querySelectorAll('[role="tablist"] button[role="tab"]').length,
+        terminalPanels: target.querySelectorAll('[role="tabpanel"]').length,
+        xtermScreens: target.querySelectorAll(".xterm-screen").length,
       };
       document.title = `gp-stress done ${COMPONENT}/${SCENARIO} depth=${depthCount()} chars=${window.__gpResult.renderedChars}`;
     </script>
