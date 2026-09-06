@@ -269,11 +269,38 @@ sessions survive and nothing re-hydrates on the way back.
   open*, and shows only what its own ledger already recorded — never a live
   number it cannot have.
 - **Three tiers, priced honestly.** Changes, sync, conflicts, stash and parked
-  operations are already in memory and cost nothing. Worktrees, agent sessions
-  and last activity cost two `git` calls per repository and refresh whenever
-  the set of open repositories changes. Lines of code, disk usage, dependency
-  audits and coverage cost minutes and **never run on their own** — the same
-  opt-in posture as automatic coverage generation and the release check.
+  operations are already in memory and cost nothing. Worktrees, agent sessions,
+  commit rhythm and last activity cost two `git` calls per repository — three
+  for one that has been quiet all quarter — and refresh whenever the set of
+  open repositories changes. Lines of code, language mix, disk usage,
+  dependency audits and coverage cost minutes and **never run on their own** —
+  the same opt-in posture as automatic coverage generation and the release
+  check.
+- **Fleet Pulse.** A collapsible panel above the grid showing the workspace's
+  commit rhythm: every open repository's 90-day commit series summed bucket for
+  bucket into one chart, the 7-day trend against the 7 days before it, which
+  repositories are moving and which have gone silent for the whole window, and
+  the fleet's language mix drawn from the cached language scans. Everything in
+  it carries what it could not count: a repository whose history failed to read
+  is named in the coverage clause rather than flattening the chart, and a
+  percentage is never stated against an empty prior period — "5 in 7d, after
+  none in the 7 before", never "+100%".
+- **Commit statistics per repository.** A sparkline of the last 90 days, the
+  window total, and how many of those commits landed in the last 7. Author
+  counts and active days ride in the tooltip. A repository nobody has touched
+  this quarter renders a measured zero — a real finding — never "not scanned".
+- **Language statistics.** The Lines column carries the repository's language
+  mix as a proportional bar under its total, and the Pulse panel merges every
+  cached breakdown into one fleet mix. Shares are recomputed from summed lines
+  rather than averaged: a 200-line all-Rust repository and a 200,000-line
+  all-TypeScript one do not make a workspace that is half Rust.
+- **Sort, search, and scan one repository.** Any column sorts, and repositories
+  with no measurement stay at the bottom in *both* directions — "not scanned"
+  is not a low score. The filter box matches name, path, branch and any
+  language in the mix, as plain text rather than a pattern. And every "not
+  scanned" or "could not read" cell is itself the button that scans just that
+  repository for just that column, so filling one gap does not mean re-running
+  a sweep across the whole workspace.
 - **Every cell has three states, never two.** A measured value, *not scanned*,
   or *could not read* with its reason. A repository nobody has audited shows
   "not scanned", never a reassuring zero; an audit that ran but could not
@@ -291,6 +318,49 @@ sessions survive and nothing re-hydrates on the way back.
   spawn your package manager) and reports successes, failures and skips
   separately, attributing each failure to the repository and column it
   happened in.
+- **Change since the last measurement.** Where the ledger holds an earlier
+  reading, a cell carries a small chip saying how far it moved and names the day
+  it is measuring from — families are scanned independently, so "since
+  yesterday" is often months wrong on the same row. Direction is coloured by the
+  column's own goal, not by the sign: fewer vulnerabilities is an improvement,
+  less coverage is not, and more lines of code is neither. A first scan shows no
+  chip at all, because "unchanged" the first time something is measured is a
+  claim about a past nobody observed. The baseline is the previous distinct day
+  that family was actually measured; a day nobody scanned has no row, and none
+  is interpolated.
+- **A rescan never blanks what it is replacing.** A cell being rescanned keeps
+  showing its last measurement with a running marker beside it; only the two
+  absent states, which have nothing to preserve, are replaced by *scanning*. And
+  a *queued* repository is not a scanning one — the marker follows the handful
+  actually in flight, so a sweep of twenty-four never claims to be scanning all
+  twenty-four at once.
+- **Severity bands instead of a filter.** The grid groups itself by severity —
+  *Blocked by conflicts*, *Parked mid-operation*, *Uncommitted work* — worst
+  first, so "what needs attention" is how the list reads rather than a mode to
+  switch into and back out of. The bands only insert boundaries into the
+  existing order; the grouped and flat views can never disagree about which
+  repository comes first.
+- **Columns you can hide, and a notice when hiding costs you something.**
+  Every measurable column can be hidden and the grid can be made compact, both
+  remembered across restarts. Repository and severity are not on the menu — a
+  grid of measurements with nothing to attribute them to is not a smaller grid.
+  If a hidden column is concealing a *could not read*, the grid says so by
+  column and by count, because letting a failure vanish with its column is the
+  same lie as a blank cell, one level up.
+- **Bulk and single fetch.** Fetch or pull every open repository at a bounded
+  width, or fetch one row from its own control; the single-row path goes through
+  the identical skip rules, so a repository with no remote is skipped and said
+  to be skipped either way.
+- **A commit window you choose.** 30, 90 or 180 days, applied to the whole
+  sweep at once. Every repository in a sweep shares one anchor instant, which is
+  what makes the per-repository series summable bucket for bucket; a series
+  recorded against a different window is counted as mismatched rather than
+  silently mis-added.
+- **Keyboard.** With focus anywhere in Fleet: `/` jumps to the filter, `s`
+  cycles the sort through the columns actually on screen, `p` toggles Pulse, `r`
+  refreshes, and `1`–`9` jump to a row. Text fields keep every key — the
+  shortcuts never intercept typing — and each one is an accelerator for an
+  action that also has a real control.
 - **Remove from Fleet (`Delete` / `Backspace` or remove icon).** Any open or
   recent repository can be removed directly from the Fleet grid. Removing an
   open repository closes its tab and drops it from the workspace; removing a
@@ -332,7 +402,23 @@ Reflog, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control,
 or by name from the command palette.
 
-### 6.3 Navigation & Search
+### 6.3 Inside Fleet
+
+These fire while focus is anywhere in the Fleet grid, and never while typing:
+a text field keeps every key, and modified or IME-composing keys are left
+alone. Each is an accelerator for something that also has a visible control.
+
+| Action | macOS | Windows / Linux |
+| --- | --- | --- |
+| **Filter repositories** | `/` | `/` |
+| **Clear filter, return to grid** | `Esc` | `Esc` |
+| **Cycle sort through visible columns** | `s` | `s` |
+| **Toggle Fleet Pulse** | `p` | `p` |
+| **Refresh the sweep** | `r` | `r` |
+| **Jump to row 1–9** | `1`–`9` | `1`–`9` |
+| **Remove repository from Fleet** | `Delete` / `⌫` | `Delete` / `Backspace` |
+
+### 6.4 Navigation & Search
 
 | Action | macOS | Windows / Linux |
 | --- | --- | --- |
@@ -344,7 +430,7 @@ or by name from the command palette.
 | **Reset Zoom** | `⌘ 0` | `Ctrl+0` |
 | **Toggle Dark / Light Theme** | `⌘ ⇧ T` | `Ctrl+Shift+T` |
 
-### 6.4 Git Operations & Workflow
+### 6.5 Git Operations & Workflow
 
 | Action | macOS | Windows / Linux |
 | --- | --- | --- |
@@ -357,7 +443,7 @@ or by name from the command palette.
 | **Navigate List Items** | `↑` / `↓` | `↑` / `↓` |
 | **Select / Execute Item** | `Enter` | `Enter` |
 
-### 6.5 Command Palette Modes
+### 6.6 Command Palette Modes
 
 | Prefix | Mode | Description |
 | --- | --- | --- |
