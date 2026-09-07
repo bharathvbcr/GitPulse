@@ -2518,28 +2518,44 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let bin = home.path().join(".cargo/bin");
         std::fs::create_dir_all(&bin).unwrap();
-        // Every Rust entry point the app spawns by bare name lives here, so
-        // one missing directory took all of them out together.
-        for tool in ["cargo", "rustc", "rustup", "cargo-audit", "cargo-llvm-cov"] {
-            let path = bin.join(tool);
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
 
-            // The GUI-launch PATH verbatim: this is what the bundled app gets
-            // from launchd, and it is why the fallback list has to carry the
-            // directory itself.
-            let resolved = resolve_spawn_program_with(
-                tool,
-                Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
-                Some(home.path().as_os_str()),
-            );
-            assert_eq!(
-                Path::new(&resolved),
-                &path,
-                "{tool} must resolve through ~/.cargo/bin on a GUI-launch PATH"
-            );
-        }
+        // Half the regression: the directory has to be in the list at all.
+        // Every Rust entry point the app spawns by bare name — `cargo`,
+        // `rustc`, `rustup`, and `cargo-*` subcommands like `cargo-audit` and
+        // `cargo-llvm-cov` — lives in this one directory, so its absence took
+        // all of them out together. Asserting the list directly is the only
+        // part of that claim the host cannot influence.
+        assert!(
+            gui_launch_fallback_dirs(Some(home.path().as_os_str())).contains(&bin),
+            "~/.cargo/bin must be a GUI-launch fallback directory"
+        );
+
+        // The other half: resolution has to walk far enough to reach it. It is
+        // the LAST entry, behind real system directories (`/opt/homebrew/bin`,
+        // `/usr/local/bin`) that this test cannot sandbox — so probing with a
+        // real tool name measures the host, not the code. A macOS runner with
+        // a Homebrew `rustup` resolved `/opt/homebrew/bin/rustup`, which is
+        // the correct answer on that machine, and failed a test that meant to
+        // ask something else. A name no machine can have crosses every earlier
+        // directory and can only be found in the last one.
+        let probe = "gitpulse-cargo-bin-probe";
+        let path = bin.join(probe);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // The GUI-launch PATH verbatim: this is what the bundled app gets from
+        // launchd, and it is why the fallback list has to carry the directory.
+        let resolved = resolve_spawn_program_with(
+            probe,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(home.path().as_os_str()),
+        );
+        assert_eq!(
+            Path::new(&resolved),
+            &path,
+            "resolution must reach ~/.cargo/bin on a GUI-launch PATH"
+        );
     }
 
     /// A fallback directory that does not depend on the user's home must not

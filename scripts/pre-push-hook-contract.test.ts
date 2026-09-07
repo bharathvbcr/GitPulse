@@ -16,6 +16,26 @@ import { describe, expect, it } from "vitest";
  * renamed gate or a widened trigger fails this rather than the release.
  */
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+/**
+ * Git reaches a hook through a shell — on Windows the `sh` bundled with Git for
+ * Windows, because a file with a shebang is not directly executable there.
+ * `execFileSync(".githooks/pre-push")` therefore died with ENOENT on the
+ * Windows leg of CI, failing a check that had not run. Invoking bash by name is
+ * both how git actually reaches the hook and the one spelling that works on all
+ * three platforms; a relative path keeps Git Bash from having to read a
+ * backslashed Windows path. Where there is no bash at all the case is SKIPPED
+ * rather than passed, because a check that could not run must never look like
+ * one that ran and passed.
+ */
+const hasBash = (() => {
+  try {
+    execFileSync("bash", ["-c", "exit 0"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 const hook = readFileSync(new URL("../.githooks/pre-push", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
 
@@ -58,10 +78,10 @@ describe("pre-push release hook", () => {
     expect(hook).toContain("--no-verify");
   });
 
-  it("lets a branch push through untouched", () => {
+  it.skipIf(!hasBash)("lets a branch push through untouched", () => {
     // A hook that blocks ordinary pushes gets uninstalled, and then guards
     // nothing at all.
-    const result = execFileSync(".githooks/pre-push", {
+    const result = execFileSync("bash", [".githooks/pre-push"], {
       cwd: REPO_ROOT,
       input: `refs/heads/main ${"a".repeat(40)} refs/heads/main ${"b".repeat(40)}\n`,
       encoding: "utf8",

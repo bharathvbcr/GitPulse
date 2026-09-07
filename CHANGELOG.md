@@ -27,6 +27,22 @@ before that tag is pushed.
   directory dimmed after it, so truncation eats the half that repeats, and the full path is on the
   row's tooltip — the same shape `DiffFileRail` already used.
 
+### Internal
+
+- **CI was red on `main` for two checks that could not run, on platforms where nothing was wrong.**
+  `pre-push-hook-contract` executed `.githooks/pre-push` directly, and Windows cannot exec a file
+  by its shebang — `spawnSync ENOENT` failed a case that had never started. Git reaches hooks
+  through a shell there (the `sh` bundled with Git for Windows), so the case now invokes `bash` by
+  name with a relative path, which is both how git runs the hook and the one spelling that works on
+  all three platforms; without any bash it is skipped rather than passed.
+  `spawn_resolution_finds_rust_toolchain_in_cargo_bin` asserted that `rustup` resolves to a fixture
+  in a temporary `~/.cargo/bin`, but that directory is the *last* GUI-launch fallback, behind real
+  system directories the test cannot sandbox. A macOS runner with a Homebrew `rustup` resolved
+  `/opt/homebrew/bin/rustup` — the right answer on that machine — and failed a test that meant to
+  ask something else. The regression is now asserted where the host cannot reach it (the directory
+  is in `gui_launch_fallback_dirs`) plus one uniquely-named probe proving resolution walks that far.
+  Neither production path changed; the fallback ordering is deliberate and still stands.
+
 ## [0.0.6] - 2026-09-06
 
 ### Added
