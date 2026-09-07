@@ -29,6 +29,15 @@ before that tag is pushed.
 
 ### Internal
 
+- **Windows clippy failed on unix-only test and bench code, and had been hidden behind an earlier
+  failing step.** `-D warnings` promotes `unused_imports` and `dead_code` to errors, and six items
+  reachable only from `#[cfg(unix)]` code were declared ungated: two imports in the `analyzer::deps`
+  tests, two in the `procguard` tests, the `Registration::slot` test accessor, and the whole
+  preamble of `benches/process_spawn.rs` (whose `not(unix)` main deliberately measures nothing).
+  Each is now gated to the platform that uses it. CI steps also stopped at the first failure, so
+  this sat invisible behind a Vitest failure on the same leg and each fix revealed the next one a
+  push later; the independent checks now run under `!cancelled()` so one run reports all of them —
+  the reasoning `--no-fail-fast` already applied to cargo, one level up.
 - **CI was red on `main` for two checks that could not run, on platforms where nothing was wrong.**
   `pre-push-hook-contract` executed `.githooks/pre-push` directly, and Windows cannot exec a file
   by its shebang — `spawnSync ENOENT` failed a case that had never started. Git reaches hooks

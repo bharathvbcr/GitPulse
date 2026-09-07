@@ -25,12 +25,21 @@
 //! `/usr/bin/true` is the subject: the point is to measure the spawn, not the
 //! program.
 
+// Everything below the doc comment measures process groups, which only exist
+// on Unix; the `not(unix)` main prints why there is nothing to measure and
+// touches none of it. Ungated, all of it is dead code on Windows and fails
+// clippy's `-D warnings` there.
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const SAMPLES: usize = 200;
+#[cfg(unix)]
 const WARMUP: usize = 20;
 
+#[cfg(unix)]
 struct Row {
     name: &'static str,
     p50: Duration,

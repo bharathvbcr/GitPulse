@@ -203,7 +203,9 @@ impl Registration {
         *lock(&self.slot.pid)
     }
 
-    #[cfg(test)]
+    // Reached only from the unix-gated tests, so `#[cfg(test)]` alone leaves it
+    // dead on a Windows test build.
+    #[cfg(all(test, unix))]
     fn slot(&self) -> Slot {
         Arc::clone(&self.slot)
     }
@@ -826,7 +828,11 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `#[cfg(unix)]` cases below spawn and signal real children, so on
+    // Windows these are unused imports and clippy's `-D warnings` rejects them.
+    #[cfg(unix)]
     use std::process::{Child, Stdio};
+    #[cfg(unix)]
     use std::sync::mpsc;
 
     /// Process-level liveness, which is not the same question as

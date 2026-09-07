@@ -2759,8 +2759,12 @@ fn leading_major(s: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Command` is used by every case; `fs` and `TempDir` only by the
+    // `#[cfg(unix)]` ones, so ungated they are unused imports on Windows.
+    #[cfg(unix)]
     use std::fs;
     use std::process::Command;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     use crate::test_support::{git_repo, write};

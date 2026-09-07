@@ -56,30 +56,41 @@ jobs:
       # workflows here instead. Linux-only: the result is platform-independent
       # and the download script targets Linux/macOS.
       - name: Install actionlint
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
         shell: bash
 
       - name: Workflow Lint
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: ./actionlint -color
 
+      # Every check below is independent: each needs only the checkout and the
+      # toolchain, never the step before it. Without `!cancelled()` the first
+      # failure hides all of them, so a red build reports one problem per push
+      # and each fix reveals the next. That is how a Windows clippy failure sat
+      # invisible behind a Vitest failure on the same leg. Same reasoning as
+      # `--no-fail-fast` below, applied one level up.
       - name: IPC Contract Check
+        if: ${{ !cancelled() }}
         run: npm run check:ipc
 
       - name: Coverage Type Contract Check
+        if: ${{ !cancelled() }}
         run: npm run check:types
 
       # No --tag on a CI build: with the flag absent the gate still requires
       # all five version manifests to agree and simply skips the tag
       # comparison. release.yml passes --tag "$RELEASE_TAG" at tag time.
       - name: Release Version Gate
+        if: ${{ !cancelled() }}
         run: npm run check:release
 
       - name: Frontend Svelte Check
+        if: ${{ !cancelled() }}
         run: npm run check
 
       - name: Frontend Unit Tests (Vitest)
+        if: ${{ !cancelled() }}
         run: npm test
 
       # Backlog B2, investigated and declined. The frontend bundle is
@@ -100,15 +111,19 @@ jobs:
       #
       # Revisit if the bundle grows enough that the build stops being cheap.
       - name: Frontend Vite Build
+        if: ${{ !cancelled() }}
         run: npm run build
 
       - name: Rust Cargo Format Check
+        if: ${{ !cancelled() }}
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Rust Cargo Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Rust Unit & Integration Tests
+        if: ${{ !cancelled() }}
         # --no-fail-fast: without it cargo stops at the first failing test
         # BINARY, so every later one -- the whole tests/ directory -- is
         # skipped and the job reports one failure when there may be several.
