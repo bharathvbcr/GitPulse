@@ -70,7 +70,7 @@
     Trash2,
     Trees,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
@@ -575,7 +575,7 @@
       <div class="flex items-center gap-1.5 shrink-0">
         <button
           type="button"
-          class="gp-btn !py-1 !px-2 !text-[11px]"
+          class="gp-btn py-1! px-2! text-[11px]!"
           onclick={() => void fleetStore.refresh(sweepPaths)}
           disabled={$fleetStore.snapshotLoading}
           title="Re-read worktrees, agent sessions, commit history and last activity. Cheap: two git calls per repository, three for one that has been quiet all quarter."
@@ -647,7 +647,7 @@
     <!-- Same shape as the History filter, so the one search box in the app
          does not have two appearances. -->
     <div
-      class="flex items-center gap-1.5 w-56 bg-background border border-border/80 rounded-full px-2.5 py-0.5 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)]"
+      class="flex items-center gap-1.5 w-56 bg-background border border-border/80 rounded-full px-2.5 py-0.5 transition-colors duration-150 focus-within:border-accent/60 focus-within:shadow-(--ring-focus)"
     >
       <Search size={12} class="text-textMuted shrink-0" />
       <label class="sr-only" for="gitpulse-fleet-filter">
@@ -658,7 +658,7 @@
         type="text"
         bind:value={query}
         placeholder="Filter by name, branch, language…"
-        class="w-full bg-transparent text-textPrimary placeholder:text-textMuted/60 text-[11px] focus:outline-none"
+        class="w-full bg-transparent text-textPrimary placeholder:text-textMuted/60 text-[11px] focus:outline-hidden"
         data-testid="fleet-search"
       />
       {#if query !== ""}
@@ -667,7 +667,7 @@
           onclick={() => (query = "")}
           aria-label="Clear repository filter"
           title="Clear filter"
-          class="gp-icon-btn !p-0.5"
+          class="gp-icon-btn p-0.5!"
         >
           <X size={11} />
         </button>
@@ -690,7 +690,7 @@
       </span>
       <button
         type="button"
-        class="gp-btn !py-1 !px-2 !text-[11px]"
+        class="gp-btn py-1! px-2! text-[11px]!"
         onclick={() => {
           if (syncToken) syncToken.aborted = true;
         }}
@@ -700,7 +700,7 @@
     {:else}
       <button
         type="button"
-        class="gp-btn !py-1 !px-2 !text-[11px]"
+        class="gp-btn py-1! px-2! text-[11px]!"
         disabled={targets.length === 0 || $fleetStore.scanning !== null}
         onclick={() => void syncAll("fetch")}
         title="Fetch every open repository. Repositories parked mid-operation, still loading, or holding conflicts are skipped and reported as skipped — never counted as fetched."
@@ -710,7 +710,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn !py-1 !px-2 !text-[11px]"
+        class="gp-btn py-1! px-2! text-[11px]!"
         disabled={targets.length === 0 || $fleetStore.scanning !== null}
         onclick={() => void syncAll("pull")}
         title="Pull every open repository. Same skip rules as Fetch all: nothing with uncommitted work or a parked operation is touched."
@@ -726,7 +726,7 @@
     <div class="relative">
       <button
         type="button"
-        class="gp-btn !py-1 !px-2 !text-[11px]"
+        class="gp-btn py-1! px-2! text-[11px]!"
         aria-expanded={columnMenuOpen}
         aria-haspopup="true"
         onclick={() => (columnMenuOpen = !columnMenuOpen)}
@@ -751,7 +751,7 @@
             {#if column}
               <button
                 type="button"
-                class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
                 role="switch"
                 aria-checked={!hiddenColumns.has(key)}
                 onclick={() => interfaceStore.toggleFleetColumn(key)}
@@ -768,7 +768,7 @@
           <div class="border-t border-border/60 mt-1 pt-1 flex flex-col gap-0.5">
             <button
               type="button"
-              class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+              class="flex items-center gap-2 px-1.5 py-1 rounded text-[11px] text-left hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
               role="switch"
               aria-checked={$interfaceStore.fleetCompact}
               onclick={() => interfaceStore.toggleFleetCompact()}
@@ -782,7 +782,7 @@
             </button>
             <button
               type="button"
-              class="px-1.5 py-1 rounded text-[11px] text-left text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50"
+              class="px-1.5 py-1 rounded text-[11px] text-left text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50"
               disabled={hiddenColumns.size === 0}
               onclick={() => interfaceStore.showAllFleetColumns()}
             >
@@ -797,14 +797,14 @@
       <span class="text-[11px] text-textMuted tabular-nums" role="status">
         {FAMILY_LABEL[$fleetStore.scanning]}: {$fleetStore.progress.done}/{$fleetStore.progress.total}
       </span>
-      <button type="button" class="gp-btn !py-1 !px-2 !text-[11px]" onclick={() => fleetStore.cancelScan()}>
+      <button type="button" class="gp-btn py-1! px-2! text-[11px]!" onclick={() => fleetStore.cancelScan()}>
         Stop
       </button>
     {:else}
       {#each SCAN_FAMILIES as family (family)}
         <button
           type="button"
-          class="gp-btn !py-1 !px-2 !text-[11px]"
+          class="gp-btn py-1! px-2! text-[11px]!"
           disabled={targets.length === 0 || syncing !== null}
           onclick={() => void sweep(family)}
           title="Run this scan across every open repository. Nothing here runs on its own — storage walks the whole tree and the audit spawns your package manager. To fill in one repository, click its cell instead."
@@ -895,7 +895,7 @@
               >
                 <button
                   type="button"
-                  class="inline-flex items-center gap-1 hover:text-textPrimary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded {column.align ===
+                  class="inline-flex items-center gap-1 hover:text-textPrimary transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded {column.align ===
                   'right'
                     ? 'flex-row-reverse'
                     : ''} {sort.key === column.key ? 'text-textPrimary' : ''}"
@@ -929,7 +929,7 @@
               <!-- Repository: stripe, label, branch, and why it is here. -->
               <td class="{cellPad} align-top">
                 <div
-                  class="flex items-start gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
+                  class="flex items-start gap-2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
                   role="button"
                   tabindex={index === focusedIndex ? 0 : -1}
                   data-fleet-row={index}
@@ -945,7 +945,7 @@
                     <span class="flex items-center gap-1.5">
                       <span class="font-medium text-textPrimary truncate">{row.label}</span>
                       {#if row.presence === "recent"}
-                        <span class="gp-chip !py-0 !px-1 !text-[9px]">not open</span>
+                        <span class="gp-chip py-0! px-1! text-[9px]!">not open</span>
                       {/if}
                       {#if row.watchWarning}
                         <CircleAlert
@@ -958,7 +958,7 @@
                     <span class="flex items-center gap-1 text-[10px] text-textMuted">
                       {#if row.branch}
                         <GitBranch size={9} class="shrink-0" />
-                        <span class="truncate max-w-[10rem]">{row.branch}</span>
+                        <span class="truncate max-w-40">{row.branch}</span>
                         <span aria-hidden="true">·</span>
                       {/if}
                       <span class="truncate">{row.headline}</span>
@@ -1008,7 +1008,7 @@
                            "↓3" is exactly where someone decides to fetch. -->
                       <button
                         type="button"
-                        class="p-0.5 rounded text-textMuted/60 hover:text-accent hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40"
+                        class="p-0.5 rounded text-textMuted/60 hover:text-accent hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40"
                         disabled={syncing !== null || $fleetStore.scanning !== null}
                         title="Fetch {row.label}"
                         aria-label="Fetch {row.label}"
@@ -1111,7 +1111,7 @@
                   deltaGoal="neutral"
                 >
                   {#if row.loc.kind === "read"}
-                    <span class="inline-flex flex-col items-end gap-0.5 min-w-[5rem]">
+                    <span class="inline-flex flex-col items-end gap-0.5 min-w-20">
                       <span class="inline-flex items-baseline gap-1">
                         <span class="text-textPrimary">{row.loc.value.lines.toLocaleString()}</span>
                         {#if row.loc.value.language}
@@ -1203,7 +1203,7 @@
               <td class="{cellPad} align-top text-right">
                 <button
                   type="button"
-                  class="p-1 rounded text-textMuted hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                  class="p-1 rounded text-textMuted hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
                   title={row.presence === "open"
                     ? `Remove ${row.label} from Fleet (closes repository)`
                     : `Remove ${row.label} from Fleet`}
@@ -1239,7 +1239,7 @@
                 >
                   <button
                     type="button"
-                    class="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-semibold text-textMuted hover:text-textPrimary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
+                    class="inline-flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-semibold text-textMuted hover:text-textPrimary transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
                     aria-expanded={!bandCollapsed}
                     onclick={() => toggleBand(band.severity)}
                     data-testid="fleet-band-toggle"

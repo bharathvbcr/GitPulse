@@ -68,13 +68,15 @@ path = "src/bin/gitpulse-hook.rs"
 # there builds on macOS and fails on Linux and Windows. Off macOS the feature is
 # inert (every guard in `tauri` reads `any(not(target_os = "macos"), feature =
 # "macos-private-api")`), so declaring it everywhere costs nothing.
-tauri = { version = "2.0.0", features = ["macos-private-api"] }
-tauri-plugin-opener = "2.0.0"
+# Latest crates.io is 2.11.5 (2026-07-01). `dev` (rev below) is the unpublished
+# 2.12 line: urlpattern 0.6 and wry 0.56. GTK3 is still the Linux webview.
+tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = ["macos-private-api"] }
+tauri-plugin-opener = "2.5.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rayon = "1.10"
-notify = "8.0"
-regex = "1.10"
+rayon = "1.12"
+notify = "8.2"
+regex = "1.13"
 rfd = "0.17"
 portable-pty = "0.9"
 base64 = "0.23"
@@ -82,6 +84,9 @@ log = "0.4"
 
 # Phase 1 ledger. WAL SQLite is the durable substrate for the action history;
 # the bundled feature avoids depending on a system libsqlite3.
+#
+# Kept at 0.31 to match vendored `dc-store` / `devmap-store` (do not bump here
+# without re-vendoring those crates against the same rusqlite line).
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Vendored copies, under `vendored/`, so a lone checkout of GitPulse builds.
@@ -114,6 +119,12 @@ dc-store = { path = "vendored/dc-store" }
 # self-retirement are all things not to have.
 devmap-query = { path = "vendored/devmap-query", default-features = false }
 devmap-store = { path = "vendored/devmap-store", default-features = false }
+devmap-resolve = { path = "vendored/devmap-resolve", default-features = false }
+
+# MarkDev's Markdown parse + tree-sitter highlight core. Default features off
+# so cbindgen / the C ABI stay out of this build; `highlight` pulls the six
+# grammars DiffViewer and CodeViewer dispatch to for rust/js/ts/python/json/shell.
+markdev = { path = "vendored/markdev", default-features = false, features = ["highlight"] }
 
 # Process-group control for children we spawn (`src/procguard`).
 #
@@ -129,15 +140,15 @@ devmap-store = { path = "vendored/devmap-store", default-features = false }
 libc = "0.2"
 
 [build-dependencies]
-tauri-build = { version = "2.0.0", features = [] }
+tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = [] }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"
 # Tauri's own headless test runtime (MockRuntime). Not a new third-party
 # dependency — it enables a feature of the tauri crate already in
 # [dependencies] — and it is what lets tests drive commands through the real
 # IPC bridge instead of calling the functions directly.
-tauri = { version = "2.0.0", features = ["test"] }
+tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = ["test"] }
 
 # `build_native_menu` can only run on the process main thread (muda creates
 # NSMenuItem there and panics anywhere else), and a libtest harness runs every
@@ -171,3 +182,24 @@ lto = "thin"
 # names nothing is not a stack trace. "debuginfo" drops the bulk (the debug
 # info) and keeps the names the panic hook's capture is written to produce.
 strip = "debuginfo"
+
+# urlpattern 0.3 (unic-ucd-ident and friends, RUSTSEC-2025-0075/0080/0081/0098/0100)
+# is still what crates.io tauri-utils 2.9.3 declares. urlpattern 0.6 dropped those
+# crates and was merged into Tauri `dev` as PR #15660 (2026-07-06) but has not
+# shipped as tauri-utils 2.10 / tauri 2.12. Patch the parent crate from that
+# unpublished line rather than spoofing a leaf version.
+#
+# GTK3 (gtk 0.18 / glib 0.18.5, RUSTSEC-2024-0411–0420 / 0429) is unchanged on
+# this rev: wry 0.56.1 and tauri `dev` still depend on gtk 0.18. The gtk4/webkit6
+# ports (wry#1767, tao#1258, tauri#14684) are unmerged as of 2026-09-07.
+[patch.crates-io]
+# One git rev for the whole Tauri family so crates.io plugins (opener) and
+# unpublished 2.12 crates share a single `tauri_runtime::Runtime` trait.
+tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-plugin = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-runtime = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-runtime-wry = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }

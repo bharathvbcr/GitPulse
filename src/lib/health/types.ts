@@ -132,3 +132,38 @@ export interface DependabotReport {
   truncated: boolean;
   error?: string | null;
 }
+
+/** One open GitHub code scanning alert. Mirrors `CodeScanningAlertInfo`. */
+export interface CodeScanningAlertInfo {
+  number: number;
+  rule_id: string;
+  rule_name: string;
+  /** Prefer GitHub `security_severity_level`; else CodeQL `rule.severity`. */
+  severity: string;
+  state: string;
+  tool: string;
+  tool_version: string;
+  title: string;
+  path: string;
+  /** 0 when GitHub omitted `most_recent_instance.location.start_line`. */
+  start_line: number;
+  url: string;
+  dismissed_reason: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Result of fetching code scanning alerts for the opened repository.
+ * Same fail-closed contract as Dependabot: `available: false` with an `error`
+ * is "could not check", never an empty success.
+ */
+export interface CodeScanningReport {
+  available: boolean;
+  cli_present: boolean;
+  is_github_remote: boolean;
+  slug: string;
+  alerts: CodeScanningAlertInfo[];
+  truncated: boolean;
+  error?: string | null;
+}

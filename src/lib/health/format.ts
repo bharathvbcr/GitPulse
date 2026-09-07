@@ -8,6 +8,10 @@ export function normalizeSeverity(severity: string): AuditSeverity {
   if (key === "moderate" || key === "medium") {
     return "moderate";
   }
+  // CodeQL `rule.severity` when GitHub omitted `security_severity_level`.
+  if (key === "error") return "high";
+  if (key === "warning") return "moderate";
+  if (key === "note" || key === "none") return "info";
   return "info";
 }
 

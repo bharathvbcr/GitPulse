@@ -55,12 +55,28 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
 });
 
 describe("TerminalPanel session ownership", () => {
+  it("binds to the path it was given, not to the live currentPath", () => {
+    // A hidden panel that still read $repoStore.currentPath would display
+    // and journal against whichever repo the user had switched to, while its
+    // PTY was still sitting in the worktree it was spawned in.
+    expect(source).not.toContain("$repoStore.currentPath");
+    expect(source).not.toContain("repoStore");
+    expect(source).toContain("repoPath = null");
+  });
+
+  it("refits the visible session when its host is shown again", () => {
+    const body = source.slice(source.indexOf("$effect(() => {", source.indexOf("function handleChord")));
+    expect(body).toContain("if (!visible || mode !== \"shell\") return");
+    expect(body).toContain("sessions[id]?.reveal()");
+  });
+
   it("holds no PTY lifecycle of its own", () => {
     // The memo guard this replaces existed because an effect reading
     // $repoStore re-ran on every ~6s status poll and would have killed the
     // user's live shell per emission. There is no such effect now: a session
-    // lives and dies with its own component, and the repository boundary is
-    // App's `{#key $repoStore.currentPath}` around the dock.
+    // lives and dies with its own component. The dock keeps one panel per
+    // visited repository tab, bound to that tab's path, so a switch cannot
+    // retarget a hidden shell either.
     expect(source).not.toContain("ptyLifecycleKey");
     expect(source).not.toContain("spawnEpoch");
     expect(source).not.toContain("liveCleanupTarget");

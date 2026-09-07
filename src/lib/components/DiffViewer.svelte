@@ -3,7 +3,7 @@
   // changes, so unrelated store publications cost O(1) and the exact parsed
   // row objects survive (keeping memoized word-diff segments attached).
   import { createParseCache, type AnnotatedDiffLine } from "../diff/wordDiff";
-  import { composeSpans, shiftMatches, type DiffSpan, type Range } from "../diff/highlight";
+  import { composeLineSpans, shiftMatches, type DiffSpan, type Range } from "../diff/highlight";
   import type { SupportedLanguage } from "../files/syntaxHighlight";
   import { get } from "svelte/store";
   import { densityStore } from "../stores/densityStore";
@@ -35,7 +35,7 @@
       .join(",")}`;
     const hit = spanCache.get(line);
     if (hit && hit.sig === sig) return hit.spans;
-    const spans = composeSpans(
+    const spans = composeLineSpans(
       text,
       language,
       line.segments,
@@ -77,7 +77,7 @@
     Search,
     WrapText,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import LazyMount from "./LazyMount.svelte";
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
@@ -131,7 +131,22 @@
     type LineMatch,
   } from "../text/lineSearch";
   import { detectLanguageFromPath, tokenClass } from "../files/syntaxHighlight";
-  import { getImpact } from "../codeintel/client";
+  import {
+    getImpactAtRung,
+    getImpactLayeredMany,
+    cancelCodeintelQuery,
+    newCodeintelCancelToken,
+  } from "../codeintel/client";
+  import { previewMarkers } from "../codeintel/previewStore";
+  import {
+    composeLayeredImpacts,
+    emptyComposedBlast,
+    type ComposedBlastRadius,
+  } from "../codeintel/blastCompose";
+  import { rungParam } from "../codeintel/rungFilter";
+  import type { CodeintelRung, CodeintelRungHistogram } from "../codeintel/types";
+  import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
+  import RungFilterControl from "./RungFilterControl.svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
 
@@ -203,27 +218,59 @@
   let searchInput = $state<HTMLInputElement>();
 
   let impactEdges = $state(0);
+  let impactAvailable = $state(true);
+  let impactReason = $state<string | null>(null);
+  let impactWalkIncomplete = $state<string | null>(null);
+  let impactRungs = $state<CodeintelRungHistogram | null>(null);
   let impactGuard: AsyncGuard | null = null;
+  /** Flat impact uses min_rung; change-set layered blast does not. */
+  let minRung = $state<"all" | CodeintelRung>("all");
+
+  let changeSetBlast = $state<ComposedBlastRadius | null>(null);
+  let changeSetBlastLoading = $state(false);
+  let changeSetBlastGuard: AsyncGuard | null = null;
 
   $effect(() => {
     const repoPath = $repoStore.currentPath;
     const filePath = $repoStore.selectedFilePath;
+    const rung = rungParam(minRung);
     impactGuard?.cancel();
     if (!repoPath || !filePath) {
       impactEdges = 0;
+      impactAvailable = true;
+      impactReason = null;
+      impactWalkIncomplete = null;
+      impactRungs = null;
       return;
     }
     // Guarded: a slow answer for the file you just left must not overwrite
-    // the badge for the file you are now reading.
+    // the badge for the file you are now reading. Cancel the Rust walk too —
+    // ignoring the answer alone leaves the traversal on the blocking pool.
     const guard = createAsyncGuard();
-    impactGuard = guard;
-    void getImpact(repoPath, filePath, 20)
+    const cancelToken = newCodeintelCancelToken();
+    impactGuard = {
+      isLive: () => guard.isLive(),
+      cancel: () => {
+        guard.cancel();
+        void cancelCodeintelQuery(cancelToken);
+      },
+    };
+    void getImpactAtRung(repoPath, filePath, 20, rung, cancelToken)
       .then((res) => {
         if (!guard.isLive()) return;
-        impactEdges = res.available ? res.items.length : 0;
+        impactAvailable = res.available;
+        impactReason = res.reason ?? null;
+        impactEdges = res.available ? res.total : 0;
+        impactWalkIncomplete = res.walk_incomplete ?? null;
+        impactRungs = res.rungs ?? null;
       })
       .catch(() => {
-        if (guard.isLive()) impactEdges = 0;
+        if (!guard.isLive()) return;
+        impactEdges = 0;
+        impactAvailable = false;
+        impactReason = "impact request failed";
+        impactWalkIncomplete = null;
+        impactRungs = null;
       });
   });
 
@@ -569,6 +616,49 @@
   const commitRail = $derived(buildCommitRail($graphStore.rows));
 
   const hasRail = $derived(rail.entries.length > 0 || commitRail.entries.length > 0);
+
+  // A3: layered blast over the files in this change set (no min_rung).
+  let changeSetPathsKey = $derived(
+    rail.entries
+      .map((e) => e.path)
+      .sort()
+      .join("\0"),
+  );
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const paths = rail.entries.map((e) => e.path);
+    void changeSetPathsKey;
+    changeSetBlastGuard?.cancel();
+    if (!repo || paths.length === 0) {
+      changeSetBlast = null;
+      changeSetBlastLoading = false;
+      return;
+    }
+    const guard = createAsyncGuard();
+    const cancelToken = newCodeintelCancelToken();
+    changeSetBlastGuard = {
+      isLive: () => guard.isLive(),
+      cancel: () => {
+        guard.cancel();
+        void cancelCodeintelQuery(cancelToken);
+      },
+    };
+    changeSetBlastLoading = true;
+    void getImpactLayeredMany(repo, paths, 800, cancelToken)
+      .then((results) => {
+        if (!guard.isLive()) return;
+        changeSetBlast = composeLayeredImpacts(results, paths);
+        changeSetBlastLoading = false;
+      })
+      .catch(() => {
+        if (!guard.isLive()) return;
+        changeSetBlast = emptyComposedBlast("layered impact request failed");
+        changeSetBlastLoading = false;
+      });
+  });
+
+  $effect(() => () => changeSetBlastGuard?.cancel());
 
   /**
    * Alt+Arrow steps between files; Alt+PageUp/PageDown between changes.
@@ -1014,14 +1104,27 @@
         {isStaged ? "staged" : "unstaged"}
       </span>
     {/if}
-    {#if impactEdges > 0}
+    {#if !impactAvailable}
+      <span
+        class="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 dark:text-amber-400"
+        title={impactReason ?? "impact unavailable"}
+      >
+        impact unavailable
+      </span>
+    {:else if impactEdges > 0}
       <span
         class="shrink-0 rounded-full border border-accent/30 bg-accent/15 px-2 py-0.5 text-[10px] text-accent"
-        title={`${impactEdges} downstream callers/dependencies affected by this file in devmap`}
+        title={`${impactEdges} downstream callers/dependencies affected by this file in devmap${
+          impactWalkIncomplete ? ` · walk incomplete: ${impactWalkIncomplete}` : ""
+        }`}
       >
         {impactEdges} {impactEdges === 1 ? "affected caller" : "affected callers"}
       </span>
     {/if}
+    {#if impactWalkIncomplete}
+      <span class="shrink-0 text-[9px] text-amber-500" title={impactWalkIncomplete}>walk incomplete</span>
+    {/if}
+    <RungFilterControl bind:minRung histogram={impactRungs} layeredImpactActive={false} />
 
     <div class="ml-auto flex shrink-0 items-center gap-2">
       <!-- Step between the files of this commit (or of the working tree)
@@ -1032,7 +1135,7 @@
         <div class="flex items-center gap-1">
           <button
             type="button"
-            class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+            class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
             disabled={!prevFile}
             onclick={() => prevFile && openRailEntry(prevFile)}
             title="Previous file (Alt+↑)"
@@ -1045,7 +1148,7 @@
           </span>
           <button
             type="button"
-            class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+            class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
             disabled={!nextFile}
             onclick={() => nextFile && openRailEntry(nextFile)}
             title="Next file (Alt+↓)"
@@ -1059,7 +1162,7 @@
       {#if isWorkingTreeFile}
         <button
           onclick={() => $repoStore.selectedFilePath && (isStaged ? repoStore.unstageFile($repoStore.selectedFilePath) : repoStore.stageFile($repoStore.selectedFilePath))}
-          class="gp-btn-primary !py-1"
+          class="gp-btn-primary py-1!"
         >
           <Check size={13} />
           <span>{isStaged ? "Unstage File" : "Stage File"}</span>
@@ -1076,7 +1179,7 @@
     {#if !railOpen && hasRail}
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-[11px] text-textMuted"
+        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
         onclick={() => (railOpen = true)}
         title="Show the file list"
       >
@@ -1087,7 +1190,7 @@
 
     <button
       type="button"
-      class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-[11px] {searchOpen
+      class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] {searchOpen
         ? 'border-accent/60 bg-accent/10 text-accent'
         : 'text-textMuted'}"
       aria-pressed={searchOpen}
@@ -1101,7 +1204,7 @@
     <div class="flex items-center gap-1">
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 text-textMuted"
+        class="gp-btn py-0.5! px-1.5! text-textMuted"
         onclick={() => stepChange(-1)}
         title="Previous change (Alt+PageUp)"
         aria-label="Previous change"
@@ -1110,7 +1213,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 text-textMuted"
+        class="gp-btn py-0.5! px-1.5! text-textMuted"
         onclick={() => stepChange(1)}
         title="Next change (Alt+PageDown)"
         aria-label="Next change"
@@ -1122,7 +1225,7 @@
     <div class="ml-auto flex items-center gap-2">
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-[11px] text-textMuted"
+        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
         onclick={copyPatch}
         disabled={!$repoStore.selectedDiff}
         title="Copy the whole patch as unified diff text"
@@ -1143,7 +1246,7 @@
         title={syntaxAvailable
           ? "Colour the code by language"
           : `Syntax colouring is off above ${SYNTAX_MAX_LINES.toLocaleString()} lines — this diff has ${lines.length.toLocaleString()}.`}
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-[11px] disabled:opacity-40 {syntaxActive
+        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] disabled:opacity-40 {syntaxActive
           ? 'border-accent/60 bg-accent/10 font-semibold text-accent'
           : 'text-textMuted'}"
         aria-label="Toggle syntax colouring"
@@ -1160,7 +1263,7 @@
         title={wrapAvailable
           ? "Wrap long lines"
           : `Wrapping is unavailable above ${WRAP_MAX_LINES.toLocaleString()} lines — this diff has ${renderedRowCount.toLocaleString()}. Wrapped rows vary in height and cannot be windowed, so the whole diff would render at once.`}
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1.5 text-[11px] disabled:opacity-40 {wrapping
+        class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] disabled:opacity-40 {wrapping
           ? 'border-accent/60 bg-accent/10 font-semibold text-accent'
           : 'text-textMuted'}"
         aria-label="Toggle word wrap"
@@ -1210,7 +1313,7 @@
         bind:this={searchInput}
         bind:value={searchQuery}
         type="text"
-        class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-none placeholder:text-textMuted/60"
+        class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
         placeholder="Find in this diff…"
         aria-label="Find in this diff"
       />
@@ -1221,7 +1324,7 @@
       </span>
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 text-[10px] {searchCase ? 'border-accent/60 text-accent' : 'text-textMuted'}"
+        class="gp-btn py-0.5! px-1.5! text-[10px] {searchCase ? 'border-accent/60 text-accent' : 'text-textMuted'}"
         aria-pressed={searchCase}
         onclick={() => (searchCase = !searchCase)}
         title="Match case"
@@ -1230,7 +1333,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 font-mono text-[10px] {searchRegex ? 'border-accent/60 text-accent' : 'text-textMuted'}"
+        class="gp-btn py-0.5! px-1.5! font-mono text-[10px] {searchRegex ? 'border-accent/60 text-accent' : 'text-textMuted'}"
         aria-pressed={searchRegex}
         onclick={() => (searchRegex = !searchRegex)}
         title="Regular expression"
@@ -1239,7 +1342,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+        class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
         disabled={search.matches.length === 0}
         onclick={() => stepSearch(-1)}
         title="Previous match (Shift+F3)"
@@ -1249,7 +1352,7 @@
       </button>
       <button
         type="button"
-        class="gp-btn !py-0.5 !px-1.5 disabled:opacity-40"
+        class="gp-btn py-0.5! px-1.5! disabled:opacity-40"
         disabled={search.matches.length === 0}
         onclick={() => stepSearch(1)}
         title="Next match (F3)"
@@ -1259,7 +1362,7 @@
       </button>
       <button
         type="button"
-        class="gp-icon-btn !p-1"
+        class="gp-icon-btn p-1!"
         onclick={closeSearch}
         title="Close find"
         aria-label="Close find"
@@ -1290,6 +1393,16 @@
     </div>
   {/if}
 
+  {#if rail.entries.length > 0}
+    <div class="mx-3 mt-2 shrink-0">
+      <BlastRadiusPanel
+        blast={changeSetBlast}
+        loading={changeSetBlastLoading}
+        title="Change-set blast radius"
+      />
+    </div>
+  {/if}
+
   <!-- The frame is constant: the rail and the toolbars survive an empty diff,
        an image, and a pending fetch. Before this, each of those replaced the
        whole pane, so a clean merge or a `.png` left the reader with no way to
@@ -1303,6 +1416,7 @@
         currentIsStaged={$repoStore.selectedIsStaged}
         selectedCommitId={$repoStore.selectedCommitId}
         workingTreeCount={$repoStore.statuses.length}
+        previewMarkers={$previewMarkers}
         onOpen={openRailEntry}
         onPickCommit={pickCommit}
         onPickWorkingTree={pickWorkingTree}
@@ -1454,20 +1568,20 @@
         {selectedLines.size} line{selectedLines.size === 1 ? "" : "s"} selected
       </span>
       <div class="flex items-center gap-2">
-        <button onclick={() => (selectedLines = new Set())} class="gp-btn !py-1 !text-xs">
+        <button onclick={() => (selectedLines = new Set())} class="gp-btn py-1! text-xs!">
           Clear
         </button>
-        <button onclick={copySelectedLines} class="gp-btn !py-1 !text-xs" title="Copy the selected lines without their diff markers">
+        <button onclick={copySelectedLines} class="gp-btn py-1! text-xs!" title="Copy the selected lines without their diff markers">
           <Copy size={12} />
           <span>Copy</span>
         </button>
         {#if isStaged}
-          <button onclick={() => stageSelected(false)} class="gp-btn-primary !py-1 !text-xs" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
             <Check size={12} />
             <span>Unstage Selected ({selectedLines.size})</span>
           </button>
         {:else}
-          <button onclick={() => stageSelected(true)} class="gp-btn-primary !py-1 !text-xs" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
             <Check size={12} />
             <span>Stage Selected ({selectedLines.size})</span>
           </button>
@@ -1486,7 +1600,7 @@
        `onLinePointerDown` looks for to tell a text drag from a line-range
        drag. Both layouts render through this one snippet, so the marker
        cannot be present on some rows and missing on others. -->
-  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}"
+  <span class="gp-diff-text min-w-0 {wrapping ? 'whitespace-pre-wrap wrap-break-word' : 'whitespace-pre'}"
     >{#each rowSpans(line, index) as span}<span
         class="{syntaxActive ? tokenClass(span.token) : ''} {span.changed
           ? line.type === 'del'

@@ -214,6 +214,46 @@ export function reorderTab(ws: WorkspaceTabs, fromIndex: number, toIndex: number
   return { ...ws, tabs };
 }
 
+/**
+ * Moves the tab with `id` to `toIndex`. Unknown ids and out-of-range
+ * destinations are no-ops so a stale menu or drag cannot shuffle the strip.
+ */
+export function moveTabTo(ws: WorkspaceTabs, id: string, toIndex: number): WorkspaceTabs {
+  const fromIndex = ws.tabs.findIndex((tab) => tab.id === id);
+  if (fromIndex < 0) return ws;
+  return reorderTab(ws, fromIndex, toIndex);
+}
+
+/** Adjacent step. Past-the-end deltas are no-ops, same as `reorderTab`. */
+export function moveTabBy(ws: WorkspaceTabs, id: string, delta: number): WorkspaceTabs {
+  const fromIndex = ws.tabs.findIndex((tab) => tab.id === id);
+  if (fromIndex < 0 || delta === 0 || !Number.isInteger(delta)) return ws;
+  return reorderTab(ws, fromIndex, fromIndex + delta);
+}
+
+/**
+ * Drop onto a tab's left (`before`) or right half: the index `reorderTab`
+ * should receive, or null when the drop would not change order (self or the
+ * immediate neighbor gap).
+ */
+export function dropReorderIndex(
+  fromIndex: number,
+  targetIndex: number,
+  before: boolean,
+): number | null {
+  if (
+    fromIndex < 0 ||
+    targetIndex < 0 ||
+    !Number.isInteger(fromIndex) ||
+    !Number.isInteger(targetIndex)
+  ) {
+    return null;
+  }
+  const insertAt = before ? targetIndex : targetIndex + 1;
+  if (insertAt === fromIndex || insertAt === fromIndex + 1) return null;
+  return insertAt > fromIndex ? insertAt - 1 : insertAt;
+}
+
 export function pinTab(ws: WorkspaceTabs, id: string, pinned: boolean): WorkspaceTabs {
   if (!ws.tabs.some((tab) => tab.id === id)) return ws;
   return {

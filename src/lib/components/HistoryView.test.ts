@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { render } from "svelte/server";
+import ViewSectionBar from "./ViewSectionBar.svelte";
+import { destinationGuide, tipGuideKey } from "../views/viewGuide";
+import { sectionsFor } from "../views/viewRegistry";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (name: string) => readFileSync(join(here, name), "utf8");
@@ -59,6 +63,21 @@ describe("ViewSectionBar", () => {
     // the bar used to declare role="tab" with no tabpanel anywhere in the app.
     expect(sectionBar).toContain('aria-selected={props["aria-selected"]}');
     expect(sectionBar).toContain('aria-controls={props["aria-controls"]}');
+  });
+
+  it("ships a destination guide instead of a label-only title", () => {
+    expect(sectionBar).toContain("data-tip-guide={guideKey}");
+    expect(sectionBar).not.toContain('title="{section.label}');
+    for (const view of ["work", "code", "history", "insights"] as const) {
+      const body = render(ViewSectionBar, { props: { view } }).body;
+      for (const section of sectionsFor(view)) {
+        const key = tipGuideKey(view, section.id);
+        const guide = destinationGuide(key);
+        expect(guide, key).not.toBeNull();
+        expect(body, key).toContain(`data-tip-guide="${key}"`);
+        expect(body, key).toContain(guide!.summary);
+      }
+    }
   });
 });
 

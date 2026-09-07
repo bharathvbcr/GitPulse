@@ -329,10 +329,29 @@ describe("DiffViewer store-emission memo guards", () => {
   });
 
   it("drops a stale impact answer instead of letting it overwrite the current file", () => {
-    const idx = source.indexOf("getImpact(repoPath, filePath");
+    const idx = source.indexOf("getImpactAtRung(repoPath, filePath");
     expect(idx).toBeGreaterThan(-1);
-    expect(source.slice(idx - 400, idx)).toContain("createAsyncGuard()");
+    expect(source.slice(idx - 500, idx)).toContain("createAsyncGuard()");
+    expect(source.slice(idx - 500, idx)).toContain("cancelCodeintelQuery");
+    expect(source.slice(idx - 500, idx)).toContain("newCodeintelCancelToken");
     expect(source.slice(idx, idx + 300)).toContain("guard.isLive()");
+  });
+
+  it("loads change-set blast via getImpactLayeredMany and shows omitted counts", () => {
+    expect(source).toContain("getImpactLayeredMany");
+    expect(source).toContain("composeLayeredImpacts");
+    expect(source).toContain("BlastRadiusPanel");
+  });
+
+  it("offers min_rung on flat impact and keeps layered blast separate", () => {
+    expect(source).toContain("RungFilterControl");
+    expect(source).toContain("bind:minRung");
+    expect(source).toContain("getImpactAtRung");
+    expect(source).toContain('title="Change-set blast radius"');
+  });
+
+  it("passes shared preview markers into the file rail", () => {
+    expect(source).toContain("previewMarkers={$previewMarkers}");
   });
 });
 

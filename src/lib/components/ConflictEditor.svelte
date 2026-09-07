@@ -92,7 +92,7 @@
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
   import { harnessStore } from "../stores/harnessStore";
-  import { Check, ShieldAlert, AlertTriangle } from "lucide-svelte";
+  import { Check, ShieldAlert, AlertTriangle } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import OperationBanner from "./OperationBanner.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -396,7 +396,7 @@
         <select
           bind:value={selectedFile}
           disabled={isSaving}
-          class="bg-background border border-border/80 rounded-full px-3 py-1 text-xs text-textPrimary focus:outline-none focus:border-accent/60 font-mono transition-colors"
+          class="bg-background border border-border/80 rounded-full px-3 py-1 text-xs text-textPrimary focus:outline-hidden focus:border-accent/60 font-mono transition-colors"
         >
           {#each conflictedFiles as f}
             <option value={f.path}>{f.path}</option>
@@ -435,7 +435,7 @@
       <button
         onclick={saveResolved}
         disabled={hasUnresolved || isSaving || !resolvedPreview || parsedDoc?.file_path !== selectedFile}
-        class="gp-btn-success !py-1.5"
+        class="gp-btn-success py-1.5!"
         title={hasUnresolved ? "Resolve all conflicts before saving" : "Save and stage resolved file"}
       >
         <Check size={14} />
@@ -518,7 +518,7 @@
                 rows={3}
                 placeholder="Type the exact content this conflict should resolve to…"
                 disabled={isSaving}
-                class="w-full resize-y bg-background border border-border/80 rounded-lg p-2 text-xs font-mono text-textPrimary focus:outline-none focus:border-accent/60"
+                class="w-full resize-y bg-background border border-border/80 rounded-lg p-2 text-xs font-mono text-textPrimary focus:outline-hidden focus:border-accent/60"
                 value={customText(chunk)}
                 oninput={(event) => onCustomInput(chunk.chunk_index, (event.target as HTMLTextAreaElement).value)}
               ></textarea>

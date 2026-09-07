@@ -100,7 +100,34 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
         .git_ignore(true)
         .build();
     for result in walker {
-        let entry = result?;
+        let entry = match result {
+            Ok(entry) => entry,
+            // Stepped over when it names a path below the root, for the reason
+            // `collect_sources_with_report` gives — and one more of its own.
+            // This is the *second* walk of the same tree on the build path
+            // (`main.rs`: `resolver.index_go_modules(&collect_go_modules(path)?)`),
+            // so fixing only the first left `devmap build` exiting 1 on a
+            // `chmod 000` directory exactly as before, after discovery had
+            // already recorded that directory as a refusal and carried on.
+            //
+            // Nothing is recorded here: this walk has no report to record into,
+            // and the loss is already disclosed by the discovery pass over the
+            // same tree. A second entry for the same directory would double
+            // count it. Go modules are enrichment — a directory this cannot
+            // open holds no `go.mod` it can read, and the map is still worth
+            // having without it.
+            Err(error) => {
+                if crate::walk_error_path(&error)
+                    .and_then(|path| path.strip_prefix(root).ok())
+                    .is_none_or(|relative| relative.as_os_str().is_empty())
+                {
+                    // Names the root, or names nothing: about the pass rather
+                    // than about an entry under it, and not steppable.
+                    return Err(error.into());
+                }
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;

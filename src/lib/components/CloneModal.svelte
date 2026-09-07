@@ -12,7 +12,7 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { reportPanelError } from "../diagnostics/report";
-  import { Download, FolderOpen, Check } from "lucide-svelte";
+  import { Download, FolderOpen, Check } from "@lucide/svelte";
 
   let {
     isOpen = false,
@@ -117,7 +117,7 @@
             <button
               onclick={pickTargetDir}
               title="Choose directory"
-              class="gp-btn !px-2.5 !py-1.5 shrink-0"
+              class="gp-btn px-2.5! py-1.5! shrink-0"
             >
               <FolderOpen size={14} />
             </button>

@@ -25,7 +25,7 @@
     Loader2,
     Plus,
     Trash2,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import {
     describeRemotes,
     carriesEmbeddedCredential,
@@ -297,7 +297,7 @@
         </div>
         <button
           type="button"
-          class="gp-btn !py-1 !px-2 !text-[11px]"
+          class="gp-btn py-1! px-2! text-[11px]!"
           onclick={() => void load()}
           disabled={busy !== null}
           title="Reload remotes and submodules"
@@ -361,7 +361,7 @@
               <div class="mt-2 flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
-                  class="gp-btn !py-1 !px-2.5 !text-[11px]"
+                  class="gp-btn py-1! px-2.5! text-[11px]!"
                   disabled={busy !== null}
                   onclick={() => {
                     editingRemote = remote.name;
@@ -375,7 +375,7 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn !py-1 !px-2.5 !text-[11px]"
+                  class="gp-btn py-1! px-2.5! text-[11px]!"
                   disabled={busy !== null}
                   onclick={() => {
                     renamingRemote = remote.name;
@@ -389,8 +389,8 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn !py-1 !px-2.5 !text-[11px] {armed?.key === pruneKey
-                    ? '!border-red-500/60 !text-red-600 dark:!text-red-400'
+                  class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === pruneKey
+                    ? 'border-red-500/60! text-red-600! dark:text-red-400!'
                     : ''}"
                   disabled={busy !== null}
                   onclick={() => activateRemote({ kind: "prune", name: remote.name })}
@@ -399,8 +399,8 @@
                 </button>
                 <button
                   type="button"
-                  class="gp-btn !py-1 !px-2.5 !text-[11px] {armed?.key === removeKey
-                    ? '!border-red-500/60 !text-red-600 dark:!text-red-400'
+                  class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === removeKey
+                    ? 'border-red-500/60! text-red-600! dark:text-red-400!'
                     : ''}"
                   disabled={busy !== null}
                   onclick={() => activateRemote({ kind: "remove", name: remote.name })}
@@ -409,7 +409,7 @@
                   {armed?.key === removeKey ? "Confirm remove" : "Remove"}
                 </button>
                 {#if armed?.kind === "remote" && (armed.key === pruneKey || armed.key === removeKey || armed.key === setKey)}
-                  <button type="button" class="gp-btn !py-1 !px-2.5 !text-[11px]" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
@@ -423,12 +423,12 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono !text-[11px]"
+                    class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
                     bind:value={editUrl}
                     aria-label="New URL for {remote.name}"
                     placeholder="https://github.com/owner/repo.git"
                   />
-                  <button type="submit" class="gp-btn-primary !py-1 !px-2.5 !text-[11px]" disabled={busy !== null}>
+                  <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]!" disabled={busy !== null}>
                     {armed?.key === setKey ? "Confirm URL" : "Apply URL"}
                   </button>
                 </form>
@@ -442,12 +442,12 @@
                   }}
                 >
                   <input
-                    class="gp-input min-w-0 flex-1 font-mono !text-[11px]"
+                    class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
                     bind:value={renameTo}
                     aria-label="New name for {remote.name}"
                     placeholder="upstream"
                   />
-                  <button type="submit" class="gp-btn-primary !py-1 !px-2.5 !text-[11px]" disabled={busy !== null}>
+                  <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]!" disabled={busy !== null}>
                     Apply name
                   </button>
                 </form>
@@ -478,18 +478,18 @@
       >
         <div class="flex flex-wrap items-center gap-1.5">
           <input
-            class="gp-input w-28 font-mono !text-[11px]"
+            class="gp-input w-28 font-mono text-[11px]!"
             bind:value={addName}
             aria-label="Remote name"
             placeholder="origin"
           />
           <input
-            class="gp-input min-w-0 flex-1 font-mono !text-[11px]"
+            class="gp-input min-w-0 flex-1 font-mono text-[11px]!"
             bind:value={addUrl}
             aria-label="Remote URL"
             placeholder="https://github.com/owner/repo.git"
           />
-          <button type="submit" class="gp-btn-primary !py-1 !px-2.5 !text-[11px] inline-flex items-center gap-1" disabled={busy !== null}>
+          <button type="submit" class="gp-btn-primary py-1! px-2.5! text-[11px]! inline-flex items-center gap-1" disabled={busy !== null}>
             {#if busy === "remote-add"}<Loader2 size={11} class="animate-spin" />{/if}
             <Plus size={11} />
             Add remote
@@ -515,7 +515,7 @@
           {#if syncable.length > 0}
             <button
               type="button"
-              class="gp-btn !py-1 !px-2.5 !text-[11px] inline-flex items-center gap-1.5"
+              class="gp-btn py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5"
               disabled={busy !== null}
               onclick={() =>
                 activateSubmodule({ kind: "sync", path: null, recursive: true })}
@@ -527,7 +527,7 @@
           {#if initializable.length > 0}
             <button
               type="button"
-              class="gp-btn-primary !py-1 !px-2.5 !text-[11px] inline-flex items-center gap-1.5"
+              class="gp-btn-primary py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5"
               disabled={busy !== null}
               onclick={() =>
                 activateSubmodule({ kind: "update", path: null, recursive: true })}
@@ -584,7 +584,7 @@
               {:else if canInitialize(sub)}
                 <button
                   type="button"
-                  class="gp-btn !mt-1.5 !py-1 !px-2.5 !text-[11px]"
+                  class="gp-btn mt-1.5! py-1! px-2.5! text-[11px]!"
                   disabled={busy !== null}
                   onclick={() =>
                     activateSubmodule({ kind: "update", path: sub.path, recursive: true })}
@@ -596,7 +596,7 @@
                 {#if canSync(sub)}
                   <button
                     type="button"
-                    class="gp-btn !py-1 !px-2.5 !text-[11px]"
+                    class="gp-btn py-1! px-2.5! text-[11px]!"
                     disabled={busy !== null}
                     onclick={() =>
                       activateSubmodule({ kind: "sync", path: sub.path, recursive: false })}
@@ -608,8 +608,8 @@
                   {@const deinitKey = `submodule-deinit-${sub.path}`}
                   <button
                     type="button"
-                    class="gp-btn !py-1 !px-2.5 !text-[11px] {armed?.key === deinitKey
-                      ? '!border-red-500/60 !text-red-600 dark:!text-red-400'
+                    class="gp-btn py-1! px-2.5! text-[11px]! {armed?.key === deinitKey
+                      ? 'border-red-500/60! text-red-600! dark:text-red-400!'
                       : ''}"
                     disabled={busy !== null}
                     onclick={() =>
@@ -619,7 +619,7 @@
                   </button>
                 {/if}
                 {#if armed?.kind === "submodule" && armed.change.kind === "deinit" && armed.change.path === sub.path}
-                  <button type="button" class="gp-btn !py-1 !px-2.5 !text-[11px]" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}
@@ -666,8 +666,8 @@
                   {@const isArmed = armed?.kind === "stash" && armed.key === key}
                   <button
                     type="button"
-                    class="{action === 'apply' ? 'gp-btn-primary' : 'gp-btn'} !py-1 !px-2.5 !text-[11px] inline-flex items-center gap-1.5 {isArmed
-                      ? '!border-red-500/60 !text-red-600 dark:!text-red-400'
+                    class="{action === 'apply' ? 'gp-btn-primary' : 'gp-btn'} py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5 {isArmed
+                      ? 'border-red-500/60! text-red-600! dark:text-red-400!'
                       : ''}"
                     disabled={busy !== null}
                     title={stashActionConsequence(action)}
@@ -681,7 +681,7 @@
                   </button>
                 {/each}
                 {#if armed?.kind === "stash" && armed.oid === entry.oid}
-                  <button type="button" class="gp-btn !py-1 !px-2.5 !text-[11px]" onclick={() => (armed = null)}>
+                  <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => (armed = null)}>
                     Cancel
                   </button>
                 {/if}

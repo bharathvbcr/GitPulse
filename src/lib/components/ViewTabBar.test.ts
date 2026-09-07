@@ -8,6 +8,7 @@ import ViewTabBar from "./ViewTabBar.svelte";
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
 import { VIEW_NAV } from "../views/viewNav";
+import { destinationGuide, tipGuideKey } from "../views/viewGuide";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "ViewTabBar.svelte"),
@@ -79,9 +80,10 @@ describe("ViewTabBar view visibility", () => {
     // Resolve is a section of Work now, and the count came with it: a merge
     // parked mid-conflict has to be visible without opening anything. Only
     // Work is suffixed — a count on every tab would say nothing.
-    // Scoped to the LABEL. Tabs also carry an accelerator in their `title`
-    // ("Work (F10)"), so a bare substring search over the markup no longer
-    // distinguishes the visible suffix from the tooltip.
+    // Scoped to the LABEL. The glanceable tooltip lives in a visually-hidden
+    // description and on `data-tip-guide`, not in a `title` that used to
+    // repeat "Work (F10)" — a bare substring search over the markup would
+    // still mix the visible suffix with that copy.
     const labels = (html: string) =>
       [...html.matchAll(/<span>([^<]*)<\/span>/g)].map(([, text]) => text);
     expect(labels(header(0))).toContain("Work");
@@ -101,5 +103,18 @@ describe("ViewTabBar view visibility", () => {
     repoStore.setActiveTab("history");
     expect(get(repoStore).activeTab).toBe("work");
     expect(header(0)).toContain(">Work<");
+  });
+
+  it("ships a destination guide instead of a label-only title", () => {
+    const body = header();
+    for (const item of VIEW_NAV) {
+      const key = tipGuideKey(item.id);
+      const guide = destinationGuide(key);
+      expect(guide, item.id).not.toBeNull();
+      expect(body, `guide attr: ${item.id}`).toContain(`data-tip-guide="${key}"`);
+      expect(body, `summary: ${item.id}`).toContain(guide!.summary);
+    }
+    expect(source).not.toContain("title={accelerator");
+    expect(source).not.toContain("title={item.label");
   });
 });

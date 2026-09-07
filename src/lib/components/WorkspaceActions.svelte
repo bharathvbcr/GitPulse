@@ -36,7 +36,7 @@
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
-  import { CloudDownload, Loader2, AlertTriangle, CircleCheck, X } from "lucide-svelte";
+  import { CloudDownload, Loader2, AlertTriangle, CircleCheck, X } from "@lucide/svelte";
 
   let running = $state<"fetch" | "pull" | null>(null);
   let progress = $state<{ done: number; total: number } | null>(null);
@@ -160,7 +160,7 @@
   <div class="flex items-center gap-1">
     <button
       type="button"
-      class="gp-btn !py-1 !px-2 !text-[11px] inline-flex items-center gap-1.5"
+      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5"
       disabled={running !== null}
       onclick={() => void run("fetch")}
       title="Fetch every open repository. Repositories that are mid-merge or hold conflicts are skipped and reported."
@@ -182,7 +182,7 @@
     {#if running && cancelToken}
       <button
         type="button"
-        class="gp-btn !py-1 !px-2 !text-[11px]"
+        class="gp-btn py-1! px-2! text-[11px]!"
         onclick={() => {
           if (cancelToken) cancelToken.aborted = true;
         }}
@@ -195,9 +195,9 @@
     <button
       type="button"
       data-workspace-wip-trigger
-      class="gp-btn !py-1 !px-2 !text-[11px] inline-flex items-center gap-1.5 {wip.allClear
-        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? '!border-accent/50 !bg-surfaceHover !text-textPrimary' : ''}`
-        : `!border-amber-500/50 !bg-amber-500/20 text-amber-700 hover:!bg-amber-500/30 hover:!border-amber-500/70 dark:text-amber-300 dark:!bg-amber-500/25 dark:hover:!bg-amber-500/35 ${detailsOpen ? '!border-amber-500/70 !bg-amber-500/30 dark:!bg-amber-500/40 ring-1 ring-amber-500/40' : ''}`}"
+      class="gp-btn py-1! px-2! text-[11px]! inline-flex items-center gap-1.5 {wip.allClear
+        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? 'border-accent/50! bg-surfaceHover! text-textPrimary!' : ''}`
+        : `border-amber-500/50! bg-amber-500/20! text-amber-700 hover:bg-amber-500/30! hover:border-amber-500/70! dark:text-amber-300 dark:bg-amber-500/25! dark:hover:bg-amber-500/35! ${detailsOpen ? 'border-amber-500/70! bg-amber-500/30! dark:bg-amber-500/40! ring-1 ring-amber-500/40' : ''}`}"
       onclick={() => (detailsOpen = !detailsOpen)}
       title={describeWorkspace(wip)}
       aria-haspopup="dialog"

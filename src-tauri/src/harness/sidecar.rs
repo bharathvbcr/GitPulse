@@ -487,10 +487,28 @@ fn create_scratch_under(root: &std::path::Path, unique: &str) -> Result<PathBuf,
     Ok(dir)
 }
 
-/// Resolves the `manvi` binary: explicit override, then the shared
-/// PATH + GUI-fallback search (one canonical owner of those semantics, in
-/// [`crate::engine::git_cli`]).
+/// Resolves the `manvi` binary (cached, including negative answers).
+///
+/// Order: test override → `GITPULSE_MANVI_BIN` (refuse if set but missing) →
+/// saved config → shared PATH + GUI-fallback search.
 pub fn resolve_binary() -> Option<String> {
+    #[cfg(test)]
+    if let Some(explicit) = test_binary_override() {
+        return Some(explicit);
+    }
+    if let Ok(explicit) = std::env::var("GITPULSE_MANVI_BIN") {
+        let path = PathBuf::from(&explicit);
+        // A path somebody typed is a statement: do not search past a typo.
+        return if path.is_file() { Some(explicit) } else { None };
+    }
+    crate::tool_capability::resolve_cached(crate::tool_install::ExternalTool::Manvi, || {
+        resolve_binary_uncached().ok_or_else(resolve_binary_absence)
+    })
+    .ok()
+}
+
+/// Uncached resolve used by the capability cache and by tool_install status.
+pub fn resolve_binary_uncached() -> Option<String> {
     #[cfg(test)]
     if let Some(explicit) = test_binary_override() {
         return Some(explicit);
@@ -499,8 +517,29 @@ pub fn resolve_binary() -> Option<String> {
         let path = PathBuf::from(&explicit);
         return if path.is_file() { Some(explicit) } else { None };
     }
+    if let Some(saved) = crate::tool_config::saved_binary(crate::tool_install::ExternalTool::Manvi)
+    {
+        return Some(saved);
+    }
     let bin_name = if cfg!(windows) { "manvi.exe" } else { "manvi" };
+    if let Ok(app_bin) = crate::tool_install::release::app_bin_dir() {
+        let candidate = app_bin.join(bin_name);
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+    }
     crate::engine::git_cli::find_external_tool(bin_name)
+}
+
+/// Why [`resolve_binary`] returned `None` — broken override vs absent.
+pub fn resolve_binary_absence() -> String {
+    if let Ok(explicit) = std::env::var("GITPULSE_MANVI_BIN") {
+        let path = PathBuf::from(&explicit);
+        if !path.is_file() {
+            return format!("GITPULSE_MANVI_BIN is set to {explicit}, but that path is not a file");
+        }
+    }
+    not_installed_message()
 }
 
 /// Test seam: a binary path [`resolve_binary`] returns ahead of every real
@@ -692,7 +731,7 @@ fn sidecar_command(binary: &str, dir: &Path) -> Command {
 
 fn spawn() -> Result<Sidecar, HarnessError> {
     let binary =
-        resolve_binary().ok_or_else(|| HarnessError::NotInstalled(not_installed_message()))?;
+        resolve_binary().ok_or_else(|| HarnessError::NotInstalled(resolve_binary_absence()))?;
 
     let dir = scratch_dir()?;
     let mut command = sidecar_command(&binary, &dir);
@@ -1490,6 +1529,26 @@ done
                 fallback.display()
             );
         }
+    }
+
+    #[test]
+    fn broken_manvi_bin_override_is_named_not_silent_absent() {
+        let _lock = test_serial();
+        unsafe {
+            std::env::set_var("GITPULSE_MANVI_BIN", "/no/such/manvi-override");
+        }
+        let msg = resolve_binary_absence();
+        unsafe {
+            std::env::remove_var("GITPULSE_MANVI_BIN");
+        }
+        assert!(
+            msg.contains("GITPULSE_MANVI_BIN") && msg.contains("not a file"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("PATH"),
+            "must not look like a PATH miss: {msg}"
+        );
     }
 
     /// The "not installed" message must name every directory the lookup

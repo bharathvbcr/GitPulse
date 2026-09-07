@@ -41,4 +41,17 @@ describe("CommandPalette", () => {
     expect(source).toContain("LanguageLogo");
     expect(source).toContain("filePath={cmd.filePath}");
   });
+
+  it("offers commands to move the active repository tab", () => {
+    expect(source).toContain('id: "move_tab_left"');
+    expect(source).toContain('id: "move_tab_right"');
+    expect(source).toContain("Move Repository Tab Left");
+    expect(source).toContain("Move Repository Tab Right");
+    expect(source).toContain("repoStore.moveTabBy");
+  });
+
+  it("points help at Map docs / link candidates", () => {
+    expect(source).toContain("help_map_docs");
+    expect(source).toContain("cross-repo link candidates");
+  });
 });

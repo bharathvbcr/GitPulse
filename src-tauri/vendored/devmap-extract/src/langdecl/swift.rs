@@ -105,8 +105,7 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         // `Payload.text("z")` is already recorded as a call, and without the
         // case there is no node it could ever resolve to.
         "simple_identifier"
-            if node
-                .parent()
+            if crate::treesitter::bounded_parent(node)
                 .is_some_and(|parent| parent.kind() == "enum_entry")
                 && is_named_child(node, "name") =>
         {
@@ -118,7 +117,7 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
 
 /// Whether `node` occupies `field` on its own parent.
 fn is_named_child(node: Node, field: &str) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = crate::treesitter::bounded_parent(node) else {
         return false;
     };
     let mut cursor = parent.walk();
@@ -361,14 +360,14 @@ pub(crate) fn exemption(
 
 /// Whether the type enclosing `node` inherits `XCTestCase`.
 fn enclosing_type_is_xctest(node: Node, source: &str) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
         if owner_identity(parent, source).is_some() {
             return inherited_types(parent, source)
                 .iter()
                 .any(|name| name == "XCTestCase");
         }
-        ancestor = parent.parent();
+        ancestor = crate::treesitter::bounded_parent(parent);
     }
     false
 }

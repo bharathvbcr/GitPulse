@@ -129,7 +129,11 @@ describe("an upstream it cannot see is not an upstream that agrees", () => {
    * clean one.
    */
   it("reports unavailable, never matches, when the sibling is absent", () => {
-    const result = check({ GITPULSE_MANVI_ROOT: "/nonexistent/manvi", GITPULSE_DEVCOUNCIL_ROOT: "/nonexistent/dc" });
+    const result = check({
+      GITPULSE_MANVI_ROOT: "/nonexistent/manvi",
+      GITPULSE_DEVCOUNCIL_ROOT: "/nonexistent/dc",
+      GITPULSE_MARKDEV_ROOT: "/nonexistent/markdev",
+    });
     expect(result.crates.length).toBeGreaterThan(0);
     for (const crate of result.crates) {
       expect(crate.upstream, `${crate.name}`).toBe("unavailable");
@@ -147,11 +151,13 @@ describe("an upstream it cannot see is not an upstream that agrees", () => {
     try {
       process.env.GITPULSE_MANVI_ROOT = "/nonexistent/manvi";
       process.env.GITPULSE_DEVCOUNCIL_ROOT = "/nonexistent/dc";
+      process.env.GITPULSE_MARKDEV_ROOT = "/nonexistent/markdev";
       expect(main(["--check"])).toBe(0);
     } finally {
       console.log = original;
       delete process.env.GITPULSE_MANVI_ROOT;
       delete process.env.GITPULSE_DEVCOUNCIL_ROOT;
+      delete process.env.GITPULSE_MARKDEV_ROOT;
     }
     expect(logged.join("\n")).toContain("not a clean bill of health");
   });
@@ -273,8 +279,12 @@ unsafe_code = "forbid"
 
 describe("the source table", () => {
   it("lets both upstream roots be overridden", () => {
-    const configured = sources({ GITPULSE_MANVI_ROOT: "/a", GITPULSE_DEVCOUNCIL_ROOT: "/b" });
-    expect(configured.map((s) => s.root)).toEqual(["/a", "/b"]);
+    const configured = sources({
+      GITPULSE_MANVI_ROOT: "/a",
+      GITPULSE_DEVCOUNCIL_ROOT: "/b",
+      GITPULSE_MARKDEV_ROOT: "/c",
+    });
+    expect(configured.map((s) => s.root)).toEqual(["/a", "/b", "/c"]);
   });
 
   it("covers every crate that is vendored", () => {

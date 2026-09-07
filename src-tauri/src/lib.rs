@@ -5,7 +5,9 @@ pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
 pub mod desktop;
+pub mod devmap;
 pub mod diff;
+pub mod docs;
 pub mod engine;
 pub mod github;
 pub mod grants;
@@ -17,18 +19,24 @@ pub mod insights;
 pub mod ledger;
 pub mod limits;
 pub mod logging;
+pub mod markdown;
 pub mod mcp;
 pub mod ndjson;
 pub mod ops;
 pub mod procguard;
 pub mod stack;
 pub mod storage;
+pub mod syntax;
 pub mod tasks;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod tool_capability;
+pub mod tool_config;
+pub mod tool_install;
 pub mod updates;
 pub mod watcher;
+pub mod workspace_registry;
 
 use commands::*;
 use desktop::shell::{cmd_open_worktree_path, cmd_reveal_worktree_path};
@@ -82,6 +90,7 @@ pub fn run() {
             // Installed before anything can mutate, so the first guarded action
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
+            crate::tool_install::set_app_handle(app.handle().clone());
             if let Err(e) = desktop::install_menu(app.handle()) {
                 log::error!(target: "setup", "menu installation failed: {e}");
                 return Err(e.into());
@@ -110,6 +119,7 @@ pub fn run() {
             cmd_get_file_blob,
             cmd_write_file_content,
             cmd_compute_word_diff,
+            cmd_syntax_highlight,
             cmd_stage_file,
             cmd_unstage_file,
             cmd_stage_selective_patch,
@@ -169,6 +179,7 @@ pub fn run() {
             cmd_discard_changes,
             cmd_github_context,
             cmd_github_dependabot_alerts,
+            cmd_github_code_scanning_alerts,
             cmd_github_create_issue,
             cmd_github_checkout_pr,
             cmd_github_workflows,
@@ -228,11 +239,55 @@ pub fn run() {
             cmd_codeintel_search,
             cmd_codeintel_impact,
             cmd_codeintel_dead_symbols,
+            cmd_codeintel_dependencies,
+            cmd_codeintel_trace,
+            cmd_codeintel_neighbors,
+            cmd_codeintel_explore,
+            cmd_codeintel_affected_tests,
+            cmd_codeintel_clones,
+            cmd_codeintel_impact_layered,
+            cmd_codeintel_impact_layered_many,
+            cmd_codeintel_impact_at_rung,
+            cmd_codeintel_cancel,
+            cmd_devmap_build,
+            cmd_devmap_refresh,
+            cmd_devmap_maybe_refresh,
+            cmd_devmap_status,
+            cmd_devmap_preview,
+            cmd_devmap_preview_many,
+            cmd_devmap_repo_map,
+            cmd_devmap_viz,
+            cmd_devmap_map_preview,
+            cmd_workspace_register,
+            cmd_workspace_unregister,
+            cmd_workspace_list,
+            cmd_workspace_sync,
+            cmd_workspace_search,
+            cmd_workspace_link_candidates,
             cmd_insights_snapshot,
             cmd_collision_risk,
             cmd_fleet_snapshot,
             cmd_fleet_record_metrics,
+            cmd_markdown_parse,
+            cmd_markdown_render,
+            cmd_docs_refresh,
+            cmd_docs_status,
+            cmd_docs_search,
+            cmd_docs_broken_links,
+            cmd_docs_backlinks,
+            cmd_docs_graph,
+            cmd_docs_rename,
             cmd_mcp_info,
+            cmd_external_tools_status,
+            cmd_external_tool_install,
+            cmd_external_tool_install_cancel,
+            cmd_tool_config_get,
+            cmd_tool_config_save,
+            cmd_tool_ladder,
+            cmd_tool_preflight,
+            cmd_tool_verify,
+            cmd_onboarding_clone_source,
+            cmd_tool_capability_refresh,
             cmd_check_app_update,
         ])
         .build(context())

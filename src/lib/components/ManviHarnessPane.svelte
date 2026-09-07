@@ -265,7 +265,9 @@
     Wrench,
     Percent,
     Gauge,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
+  import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import { openSetupWizard } from "../tools/onboardingStore";
 
   let branchSuggestion = $state<string>("");
   let branchWarnings = $state<string[]>([]);
@@ -536,7 +538,7 @@
       <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">MANVI harness</h3>
       <button
         onclick={() => harnessStore.reconnect()}
-        class="gp-btn !py-1 !text-[11px]"
+        class="gp-btn py-1! text-[11px]!"
         title="Restart the MANVI sidecar and sweep for model servers again"
       >
         <RefreshCw size={12} class={$harnessStore.isProbing ? "animate-spin" : ""} />
@@ -549,7 +551,7 @@
           <ShieldAlert size={14} />
           <span>Latest MANVI status request failed</span>
         </div>
-        <p class="text-textMuted leading-relaxed break-words">
+        <p class="text-textMuted leading-relaxed wrap-break-word">
           {redactDiagnosticText(harnessError)} Any previously displayed connection state may be stale;
           press Reconnect to check again.
         </p>
@@ -582,6 +584,18 @@
           {harnessPermissionSummary(harness)} Install MANVI, or point
           <span class="font-mono">GITPULSE_MANVI_BIN</span> at the binary, then press Reconnect.
         </p>
+        <button
+          type="button"
+          class="gp-btn text-[11px] px-2 py-0.5"
+          onclick={() => openSetupWizard("manvi", "explain")}
+        >
+          Set up manvi
+        </button>
+        <ExternalToolsPanel
+          only="manvi"
+          compact
+          onInstalled={() => harnessStore.reconnect()}
+        />
       </div>
     {:else if permissionMode === "blocked"}
       <div class="rounded-xl border border-rose-500/30 bg-rose-500/5 p-3 space-y-1.5">
@@ -974,7 +988,7 @@
           <div class="text-[10px] font-semibold uppercase tracking-wider {status.badgeClass}">
             {status.label}
           </div>
-          <p class="mt-1 text-[11px] text-textMuted leading-relaxed break-words">
+          <p class="mt-1 text-[11px] text-textMuted leading-relaxed wrap-break-word">
             {status.detail}
           </p>
         </div>

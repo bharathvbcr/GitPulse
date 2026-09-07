@@ -30,7 +30,7 @@
     ChevronRight,
     Plug,
     Layers,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import RepoPanel from "./RepoPanel.svelte";
@@ -300,7 +300,7 @@
             no upstream
           </span>
         {:else if here.upstream.gone}
-          <span class="gp-pill !border-rose-500/30 !bg-rose-500/10 !text-rose-700 dark:!text-rose-300 font-mono"
+          <span class="gp-pill border-rose-500/30! bg-rose-500/10! text-rose-700! dark:text-rose-300! font-mono"
             title="{here.upstream.name} no longer exists on the remote">
             upstream gone
           </span>
@@ -442,10 +442,10 @@
     </div>
 
     <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center gap-2">
-      <label class="relative flex-1 min-w-[13rem]">
+      <label class="relative flex-1 min-w-52">
         <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
         <input
-          class="gp-field w-full !pl-7 !py-1"
+          class="gp-field w-full pl-7! py-1!"
           type="search"
           placeholder="Filter by branch, path, task or pull request"
           aria-label="Filter work rows"

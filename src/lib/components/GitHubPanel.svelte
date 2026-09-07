@@ -24,7 +24,7 @@
   import { filterStore } from "../stores/filterStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
-    Github,
+    FolderGit2,
     GitPullRequest,
     ExternalLink,
     Play,
@@ -40,7 +40,7 @@
     Plus,
     Search,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
@@ -515,7 +515,7 @@
   <div class="flex items-start justify-between gap-3 mb-3">
     <div class="min-w-0">
       <h2 class="flex items-center gap-2 text-sm font-semibold text-textPrimary min-w-0">
-        <Github size={16} class="text-accent shrink-0" />
+        <FolderGit2 size={16} class="text-accent shrink-0" />
         Remote
         {#if ctx?.owner}
           {#if ctx.html_url}
@@ -612,6 +612,23 @@
           <X size={13} />
         </button>
       </div>
+      {#if ciReport.test_scope?.reason}
+        <p
+          class="mx-3 mb-1 text-[11px] font-mono leading-snug {ciReport.test_scope.fail_closed
+            ? 'text-amber-700 dark:text-amber-300'
+            : 'text-textMuted'}"
+          title={ciReport.test_scope.reason}
+        >
+          {#if ciReport.test_scope.fail_closed}
+            full suite — {ciReport.test_scope.reason}
+          {:else}
+            affected: {ciReport.test_scope.test_files.length} test file(s)
+            {#if ciReport.test_scope.seeds.length > 0}
+              from {ciReport.test_scope.seeds.length} changed path(s)
+            {/if}
+          {/if}
+        </p>
+      {/if}
       {#if ciReportOpen}
         <div class="space-y-1 px-3">
           {#each ciReport.steps as step (step.name)}
@@ -733,17 +750,17 @@
                     data-active={prFacet === candidate ? "true" : "false"}
                     disabled={candidate !== "all" && prCounts[candidate] === 0}
                     onclick={() => (prFacet = candidate)}
-                    class="gp-seg-btn !text-[11px] !py-0.5 disabled:opacity-40 disabled:cursor-default"
+                    class="gp-seg-btn text-[11px]! py-0.5! disabled:opacity-40 disabled:cursor-default"
                   >
                     {PR_FACET_LABELS[candidate]}
                     <span class="ml-1 font-mono text-[10px] opacity-70">{prCounts[candidate]}</span>
                   </button>
                 {/each}
               </div>
-              <label class="relative flex-1 min-w-[11rem]">
+              <label class="relative flex-1 min-w-44">
                 <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
                 <input
-                  class="gp-field w-full !pl-7"
+                  class="gp-field w-full pl-7!"
                   type="search"
                   placeholder="Filter by number, title or branch"
                   aria-label="Filter pull requests"
@@ -751,7 +768,7 @@
                 />
               </label>
               {#if prFilterOn}
-                <button type="button" class="gp-btn !py-1 !px-2.5 !text-[11px]" onclick={clearPrFilter}>
+                <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={clearPrFilter}>
                   Clear
                 </button>
               {/if}
@@ -833,7 +850,7 @@
               <label class="relative w-48">
                 <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
                 <input
-                  class="gp-field w-full !pl-7 !py-0.5"
+                  class="gp-field w-full pl-7! py-0.5!"
                   type="search"
                   placeholder="Filter issues"
                   aria-label="Filter issues"
@@ -932,7 +949,7 @@
                     <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                       <Workflow size={14} class="text-accent shrink-0" />
                       <span class="truncate">{wf.name}</span>
-                      <span class="gp-pill {isWorkflowDispatchable(wf.state) ? '!border-emerald-500/30 !bg-emerald-500/10 !text-emerald-600 dark:!text-emerald-400' : ''}">
+                      <span class="gp-pill {isWorkflowDispatchable(wf.state) ? 'border-emerald-500/30! bg-emerald-500/10! text-emerald-600! dark:text-emerald-400!' : ''}">
                         {workflowStateLabel(wf.state)}
                       </span>
                     </div>
@@ -967,7 +984,7 @@
             {#if $repoStore.currentBranch && ctx.workflow_runs.length > 0}
               <button
                 type="button"
-                class="gp-pill hover:text-accent {runsThisBranch ? '!border-accent/50 !bg-accent/10 !text-accent' : ''}"
+                class="gp-pill hover:text-accent {runsThisBranch ? 'border-accent/50! bg-accent/10! text-accent!' : ''}"
                 aria-pressed={runsThisBranch}
                 onclick={() => (runsThisBranch = !runsThisBranch)}
                 title="Only runs whose head branch is {$repoStore.currentBranch}"
@@ -1080,10 +1097,10 @@
                         <span class="truncate">{release.name}</span>
                       {/if}
                       {#if release.is_latest}
-                        <span class="gp-pill !border-emerald-500/30 !bg-emerald-500/10 !text-emerald-600 dark:!text-emerald-400">latest</span>
+                        <span class="gp-pill border-emerald-500/30! bg-emerald-500/10! text-emerald-600! dark:text-emerald-400!">latest</span>
                       {/if}
                       {#if release.is_prerelease}
-                        <span class="gp-pill !border-amber-500/30 !bg-amber-500/10 !text-amber-600 dark:!text-amber-400">pre-release</span>
+                        <span class="gp-pill border-amber-500/30! bg-amber-500/10! text-amber-600! dark:text-amber-400!">pre-release</span>
                       {/if}
                       {#if release.is_draft}
                         <span class="gp-pill">draft</span>

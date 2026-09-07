@@ -1,10 +1,18 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { tipTextOf, tooltipAnchorFromTarget } from "../dom/tipText";
+  import {
+    tipGuideOf,
+    tipTextOf,
+    TOOLTIP_ANCHOR_SELECTOR,
+    tooltipAnchorFromTarget,
+  } from "../dom/tipText";
+  import { destinationGuide, type DestinationGuide } from "../views/viewGuide";
   import { LAYERS } from "../ui/layers";
+  import ViewGuideCard from "./ViewGuideCard.svelte";
 
   /**
-   * Global styled tooltip — mounted once, upgrades every `title=` in the app.
+   * Global styled tooltip — mounted once, upgrades every `title=` in the app
+   * and every `data-tip-guide` destination card.
    *
    * Rather than migrating dozens of call sites to a custom attribute, this
    * intercepts hovers/focuses on anything carrying a `title`, moves the text
@@ -13,6 +21,10 @@
    * into `aria-label` for icon-only controls, so stripping `title` never
    * erases an accessible name (see dom/tipText.ts). Svelte re-applying
    * `title` on a re-render is harmless: the next hover migrates it again.
+   *
+   * View and section tabs skip `title` entirely and carry `data-tip-guide`
+   * instead: a one-line "Work (F10)" does not tell a new user what the pane
+   * is. Those resolve through the view catalog into ViewGuideCard.
    *
    * Shows after a short delay, follows neither mouse nor scroll (scroll hides),
    * flips above the anchor near the viewport bottom, and clamps horizontally.
@@ -28,6 +40,7 @@
   let visible = $state(false);
   let placed = $state(false);
   let text = $state("");
+  let guide = $state<DestinationGuide | null>(null);
   let left = $state(0);
   let top = $state(0);
   let bubble: HTMLDivElement | undefined = $state();
@@ -53,6 +66,8 @@
     activeEl = null;
     visible = false;
     placed = false;
+    guide = null;
+    text = "";
   }
 
   function reveal() {
@@ -73,8 +88,10 @@
   function scheduleShow(el: HTMLElement, delayMs: number) {
     hide();
     activeEl = el;
-    text = tipTextOf(el);
-    if (!text.trim()) return;
+    const key = tipGuideOf(el);
+    guide = key ? destinationGuide(key) : null;
+    text = guide ? "" : tipTextOf(el);
+    if (!guide && !text.trim()) return;
     timer = setTimeout(() => {
       visible = true;
       placed = false;
@@ -97,7 +114,7 @@
   function onMouseOut(event: MouseEvent) {
     if (!activeEl) return;
     const related = event.relatedTarget;
-    if (related instanceof Element && related.closest("[title], [data-tip-text]") === activeEl) {
+    if (related instanceof Element && related.closest(TOOLTIP_ANCHOR_SELECTOR) === activeEl) {
       return;
     }
     hide();
@@ -145,11 +162,17 @@
   <div
     bind:this={bubble}
     role="tooltip"
-    class="gp-pop pointer-events-none fixed max-w-xs whitespace-pre-line rounded-lg border border-border/80 bg-surface px-2.5 py-1.5 text-[11px] leading-snug text-textPrimary shadow-pop {placed
+    class="gp-pop pointer-events-none fixed border border-border/80 bg-surface text-[11px] leading-snug text-textPrimary shadow-pop {guide
+      ? 'w-72 overflow-hidden rounded-xl p-0'
+      : 'max-w-xs whitespace-pre-line rounded-lg px-2.5 py-1.5'} {placed
       ? 'opacity-100'
       : 'opacity-0'}"
     style="left: {left}px; top: {top}px; z-index: {LAYERS.TOOLTIP}"
   >
-    {text}
+    {#if guide}
+      <ViewGuideCard {guide} />
+    {:else}
+      {text}
+    {/if}
   </div>
 {/if}

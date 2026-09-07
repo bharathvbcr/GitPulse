@@ -15,7 +15,7 @@ Ensure you have the following tools installed on your development machine:
 | **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `npm run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
 | **actionlint** | latest | Lints the GitHub Actions workflows in `npm run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
 | **Git** | any maintained release | Not just for version control: GitPulse shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
-| **GitHub CLI** (`gh`) | optional | Only the GitHub panel (PRs, issues, workflow runs, Dependabot alerts) uses it. Everything else works without it. |
+| **GitHub CLI** (`gh`) | optional | The GitHub panel (PRs, issues, workflow runs) and Health (Dependabot and code scanning alerts) use it. Everything else works without it. |
 
 **Platform toolchains** — Tauri builds a native binary, so each OS needs its own:
 
@@ -139,11 +139,12 @@ flowchart TD
 
 | Command | Purpose |
 | --- | --- |
-| `npm run check` | Runs `svelte-check` and `tsc` type validation |
+| `npm run check` | Runs `svelte-check` (classic TypeScript 6 for Svelte) and `tsgo` type validation on `tsconfig.node.json` |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (139 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `npm run check:ipc` | Verifies the Rust `cmd_*` registry (185 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
-| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 48 contracts (834 fields) |
+| `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so a schema-19 store cannot silently go dead again |
+| `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 49 contracts (858 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `npm run mcp:install` | Installs `gitpulse-mcp` onto PATH via `cargo install`, so the binary agent clients spawn is tracked and refreshable rather than a hand-placed copy |
 | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asserts it reports this tree's version. Distinguishes *absent*, *unresponsive*, and *stale* from *matching* — a missing server must never read the same as a current one. Not in `ci:local`: CI does not install the server, and a check that cannot run must not look like one that passed |
@@ -189,6 +190,7 @@ several were added after the drift had already happened.
 | `codex-plugin-contract` | The native Codex manifest, repo marketplace entry, or Tauri resource map disappearing or pointing at a second package root. It also pins the portable `.mcp.json` and shared skill paths. |
 | `portable-paths.contract` | A `file:` URL's `pathname` used as a filesystem path. It is a real path on macOS and Linux and "/D:/a/repo/…" on Windows, so it passes review and every local run, then fails only on the Windows runner — and fails silently in the worse half of the cases: fed to a directory scan it returns `[]`, and the assertions built on it pass while checking nothing. Two of the three Windows CI failures on 2026-09-03 were this. |
 | `fleet-surface-contract` | The workspace-wide Fleet dashboard becoming unreachable. Every repository view is kept reachable by `view-menu-contract`, which walks the view registry — but Fleet is deliberately not a `ViewTab` (a ViewTab is stored on the active repository's session and its pane lives inside `{#key currentPath}`), so none of that machinery covers it. This pins its three entry points, the Rust/TypeScript agreement on its action id, and the rule that it is swapped by hiding rather than unmounting: an `{#if}`/`{:else}` swap would destroy the repository subtree on every toggle and kill the live terminal PTY inside it. |
+| `advisory-lockfile-contract` | Cargo.lock rolling back to urlpattern 0.3 (and the unic-* crates cargo-audit flags) or the frontend returning to the deprecated `lucide-svelte` package. The Health scan would catch this only after the next advisory refresh. |
 | `documented-counts-contract` | A count in the docs drifting from the code. The Rust test total was understated fourfold before this existed. |
 | `conventional-grammar-contract` | The frontend and `analyzer/conventional.rs` disagreeing about what counts as a Conventional Commit. Pulse's hygiene metric carried its own regex with a fixed 11-type vocabulary, so `wip:` and `fix(build system): x` counted for the commit badges and the `type:` filter but not for the metric. The pattern is re-derived from the Rust source rather than restated. |
 | `architecture-docs-contract` | The architecture docs describing a dependency the manifest does not have. |
@@ -221,12 +223,12 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (139 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (185 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
     ├── harness/          MANVI policy gate, sidecar protocol
-    ├── github/           gh CLI integration (PRs, issues, runs, Dependabot)
+    ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
     ├── mcp/              Read-only MCP tool surface and control-plane snapshots
@@ -263,10 +265,11 @@ whatever an interrupted one did not finish and writes it exactly once.
 
 ### Vendored crates
 
-GitPulse links eight Rust crates it does not own — `dc-verify`, `dc-store` and
-`dc-glob` from Manvi, and five `devmap-*` crates from DevCouncil. They used to
+GitPulse links nine Rust crates it does not own — `dc-verify`, `dc-store` and
+`dc-glob` from Manvi, five `devmap-*` crates from DevCouncil, and `markdev`
+from MarkDev (parse/highlight with default features off). They used to
 be reached by relative path (`../../../../../Manvi/crates/…`), which meant a
-checkout of GitPulse alone did not build: it needed two unrelated repositories
+checkout of GitPulse alone did not build: it needed unrelated repositories
 present, at the right depth, on every machine and every CI runner.
 
 They are copied into `src-tauri/vendored/` instead, with

@@ -2,15 +2,16 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { firstScriptBlock } from "./lib/dom/markupText";
 
 const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "App.svelte"), "utf8");
 
 function scriptAndTemplate(svelte: string): { script: string; template: string } {
-  const match = svelte.match(/<script\b[^>]*>([\s\S]*?)<\/script>/);
-  if (!match || match.index === undefined) {
+  const block = firstScriptBlock(svelte);
+  if (!block) {
     throw new Error("App.svelte is missing a script block");
   }
-  return { script: match[1], template: svelte.slice(match.index + match[0].length) };
+  return { script: block.inner, template: block.after };
 }
 
 function importedBindings(script: string): Set<string> {

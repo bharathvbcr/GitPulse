@@ -11,7 +11,7 @@
     Clock,
     Sparkles,
     WrapText,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
   import { formatError } from "../../ui/formatError";
@@ -22,7 +22,8 @@
     extractDocumentOutline,
     type DocumentStats,
     type MarkdownHeading,
-  } from "../../files/markDevParser";
+  } from "../../files/markdevRender";
+  import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
 
@@ -60,9 +61,39 @@
 
   let sourceContent = $derived(blob.text || "");
   let rawContent = $derived(draftContent ?? sourceContent);
-  let renderedHtml = $derived(renderMarkDevMarkdown(rawContent));
+  let renderedHtml = $state("");
   let stats = $derived<DocumentStats>(calculateDocumentStats(rawContent));
   let outline = $derived<MarkdownHeading[]>(extractDocumentOutline(rawContent));
+  let backlinks = $state<DocBacklink[]>([]);
+
+  $effect(() => {
+    const content = rawContent;
+    let cancelled = false;
+    void renderMarkDevMarkdown(content).then((html) => {
+      if (!cancelled) renderedHtml = html;
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const path = filePath;
+    let cancelled = false;
+    backlinks = [];
+    if (!repo || !path) return;
+    void docsBacklinks(repo, path)
+      .then((hits) => {
+        if (!cancelled) backlinks = hits;
+      })
+      .catch(() => {
+        if (!cancelled) backlinks = [];
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   let previewContainerEl: HTMLDivElement | undefined = $state();
 
@@ -110,10 +141,10 @@
         if (!target.isConnected) return;
         const originalText = target.innerText;
         target.innerText = "Copied ✓";
-        target.classList.add("!text-emerald-400", "!border-emerald-500/50");
+        target.classList.add("text-emerald-400!", "border-emerald-500/50!");
         setTimeout(() => {
           target.innerText = originalText;
-          target.classList.remove("!text-emerald-400", "!border-emerald-500/50");
+          target.classList.remove("text-emerald-400!", "border-emerald-500/50!");
         }, 1800);
       }
     }
@@ -134,7 +165,7 @@
   <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 gp-section-edge bg-surface/80 shrink-0 select-none gap-2">
     <!-- Left: MarkDev Brand & Outline Toggle -->
     <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-border/70 shadow-sm">
+      <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-border/70 shadow-xs">
         <MarkDevLogo size={15} />
         <span class="font-bold text-textPrimary tracking-tight text-[11px]">MarkDev</span>
         <span class="text-[9px] font-mono uppercase px-1 py-0.2 rounded bg-accent/20 text-accent font-semibold">.MD</span>
@@ -145,7 +176,7 @@
           type="button"
           onclick={() => (showOutline = !showOutline)}
           title="{showOutline ? 'Hide' : 'Show'} Table of Contents"
-          class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px] {showOutline ? 'border-accent/60 bg-accent/15 text-accent font-semibold' : ''}"
+          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] {showOutline ? 'border-accent/60 bg-accent/15 text-accent font-semibold' : ''}"
         >
           <ListTree size={12} />
           <span>Outline</span>
@@ -212,7 +243,7 @@
         <button
           type="button"
           onclick={() => (wordWrap = !wordWrap)}
-          class="gp-icon-btn !p-1.5 {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+          class="gp-icon-btn p-1.5! {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
           title="Toggle Word Wrap"
         >
           <WrapText size={12} />
@@ -222,7 +253,7 @@
       <button
         type="button"
         onclick={handleCopySource}
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px]"
+        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px]"
         title="Copy raw markdown text"
       >
         {#if copiedSource}
@@ -237,7 +268,7 @@
       <button
         type="button"
         onclick={openInMarkDev}
-        class="gp-btn-primary !py-0.5 !px-2.5 flex items-center gap-1 text-[11px]"
+        class="gp-btn-primary py-0.5! px-2.5! flex items-center gap-1 text-[11px]"
         title="Open in MarkDev desktop application or default editor"
       >
         <ExternalLink size={11} />
@@ -277,10 +308,25 @@
       <!-- Fully Rendered View -->
       <div
         bind:this={previewContainerEl}
-        class="flex-1 min-h-0 p-8 overflow-y-auto gp-scroll bg-background select-text {wordWrap ? 'break-words' : ''}"
+        class="flex-1 min-h-0 p-8 overflow-y-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
       >
         <div class="gp-card p-8 border-border/60 max-w-4xl mx-auto shadow-card">
           {@html renderedHtml}
+          {#if backlinks.length > 0}
+            <div class="mt-8 pt-4 border-t border-border/60">
+              <div class="text-[10px] font-mono uppercase tracking-wider text-textMuted mb-2 font-bold">
+                Backlinks ({backlinks.length})
+              </div>
+              <ul class="space-y-1.5">
+                {#each backlinks as link (link.path + ":" + link.line)}
+                  <li class="text-[11px]">
+                    <span class="font-mono text-accent">{link.path}</span>
+                    <span class="text-textMuted"> — {link.context}</span>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
         </div>
       </div>
     {:else if viewMode === "raw"}
@@ -315,7 +361,7 @@
         <!-- Right: Live Rendered Preview Pane -->
         <div
           bind:this={previewContainerEl}
-          class="flex-1 min-w-0 h-full p-6 overflow-y-auto gp-scroll bg-background/60 select-text {wordWrap ? 'break-words' : ''}"
+          class="flex-1 min-w-0 h-full p-6 overflow-y-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
         >
           <div class="gp-card p-6 border-border/60 max-w-2xl mx-auto shadow-card">
             {@html renderedHtml}

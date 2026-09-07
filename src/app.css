@@ -1,8 +1,342 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Dark-mode utilities must match both the themed document element and its
+   descendants — a descendant-only selector misses the root. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: rgb(var(--c-bg));
+  --color-surface: rgb(var(--c-surface));
+  --color-surfaceHover: rgb(var(--c-surface-hover));
+  --color-border: rgb(var(--c-border));
+  --color-accent: rgb(var(--c-accent));
+  --color-textPrimary: rgb(var(--c-text));
+  --color-textMuted: rgb(var(--c-text-muted));
+}
+
+/* Inline so Tailwind does not emit `--shadow-card` (and friends) on :root,
+   which would clobber the light/dark runtime tokens defined below. */
+@theme inline {
+  --shadow-card: var(--shadow-card);
+  --shadow-pop: var(--shadow-pop);
+  --shadow-float: var(--shadow-float);
+  --shadow-glow: var(--shadow-glow);
+}
 
 /*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: currentcolor;
+  }
+}
+
+@utility gp-btn {
+  /* Pill button (secondary). */
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border border-border/70 bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-xs transition-[color,background-color,border-color,box-shadow] duration-150;
+  &:hover {
+    @apply border-accent/50 bg-surfaceHover;
+  }
+  &:active {
+    transform: scale(0.97);
+  }
+  &:disabled {
+    @apply cursor-not-allowed opacity-40;
+  }
+}
+
+@utility gp-btn-primary {
+  /* Pill button (primary): brand gradient with a soft halo. */
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
+  background-image: var(--brand-gradient);
+  box-shadow: var(--shadow-glow);
+  &:hover {
+    filter: brightness(1.08);
+  }
+  &:active {
+    transform: scale(0.97);
+  }
+  &:disabled {
+    @apply cursor-not-allowed opacity-40;
+    filter: none;
+    box-shadow: none;
+  }
+}
+
+@utility gp-btn-success {
+  /* Pill button (success): same geometry as primary, green ramp. */
+  @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
+  background-image: linear-gradient(135deg, #34d399, #059669);
+  box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
+  &:hover {
+    filter: brightness(1.08);
+  }
+  &:active {
+    transform: scale(0.97);
+  }
+  &:disabled {
+    @apply cursor-not-allowed opacity-40;
+    filter: none;
+    box-shadow: none;
+  }
+}
+
+@utility gp-icon-btn {
+  /* Round icon button (ghost). */
+  @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
+  &:hover {
+    @apply bg-surfaceHover text-textPrimary;
+  }
+  &:active {
+    transform: scale(0.94);
+  }
+}
+
+@utility gp-pill {
+  /* Small status chip: a count, a label, a state.
+     Written by a dozen call sites across the GitHub, MANVI and Stack panes
+     and never defined, so every one of them rendered as bare inline text
+     with the `!bg-…`/`!text-…` overrides beside it landing on nothing. */
+  @apply inline-flex select-none items-center gap-1 rounded-full border border-border/70 bg-surfaceHover px-1.5 py-0.5 text-[10px] font-medium leading-none text-textMuted;
+}
+
+@utility gp-card {
+  /* Elevated card. */
+  @apply rounded-2xl border border-border/70 bg-surface;
+  box-shadow: var(--shadow-card);
+}
+
+@utility gp-scrim {
+  /* Modal scrim: the dimmed, blurred plate every dialog lays over the app.
+     Seven dialogs had each written the same four utilities inline, so there
+     was nowhere to say "on this platform, blur once" -- see the .gp-scrim
+     rule in the macOS block. Dim, alignment and selectability stay at the
+     call site, because those genuinely differ per dialog. */
+  @apply fixed inset-0;
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+
+@utility gp-edge-fade {
+  /* Overflow cue at the edges of a scroller. Written inline as
+     `from-background to-transparent`, which has two faults: Tailwind's
+     `to-transparent` is `rgb(0 0 0 / 0)`, so the ramp travels through black
+     and fringes on light themes, and `from-background` is a full-alpha stop --
+     an opaque band at each edge of a pane that is otherwise translucent. Both
+     ends fade one colour to its own zero instead, and macOS swaps the colour
+     for a shade, because the gutter deliberately stopped painting the base.
+     The fade is pointer-events-none so the graph (and any other host) still
+     receives clicks through it; the chevron button re-enables pointer events. */
+  @apply pointer-events-none absolute inset-y-0 z-20 flex w-8 items-center justify-center;
+}
+
+@utility gp-edge-fade-start {
+  left: 0;
+  background-image: linear-gradient(
+    to right,
+    rgb(var(--c-bg)),
+    rgb(var(--c-bg) / 0)
+  );
+}
+
+@utility gp-edge-fade-end {
+  right: 0;
+  background-image: linear-gradient(
+    to left,
+    rgb(var(--c-bg)),
+    rgb(var(--c-bg) / 0)
+  );
+}
+
+@utility gp-edge-fade-y {
+  @apply pointer-events-none absolute inset-x-0 z-20 flex h-8 items-center justify-center;
+}
+
+@utility gp-edge-fade-top {
+  top: 0;
+  background-image: linear-gradient(
+    to bottom,
+    rgb(var(--c-bg)),
+    rgb(var(--c-bg) / 0)
+  );
+}
+
+@utility gp-edge-fade-bottom {
+  bottom: 0;
+  background-image: linear-gradient(
+    to top,
+    rgb(var(--c-bg)),
+    rgb(var(--c-bg) / 0)
+  );
+}
+
+@utility gp-scroll-cue-btn {
+  @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-surface/90 text-textMuted;
+  &:hover {
+    @apply bg-surfaceHover text-textPrimary;
+  }
+}
+
+@utility gp-menu {
+  /* Floating menu / popover. */
+  @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
+  box-shadow: var(--shadow-pop);
+}
+
+@utility gp-menu-item {
+  @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-textPrimary transition-colors duration-100;
+  &:hover {
+    @apply bg-surfaceHover;
+  }
+}
+
+@utility gp-separator {
+  /* Soft centered pill. A bare `border-t` ran the full width of a section
+     and read as a hard rule; forty percent wide, two pixels tall, and faded,
+     it still marks a break without boxing the content. */
+  display: block;
+  width: 40%;
+  height: 2px;
+  margin-block: 0.5rem;
+  margin-inline: auto;
+  border-radius: 9999px;
+  background: rgb(var(--c-border) / 0.4);
+}
+
+@utility gp-menu-sep {
+  /* The same pill, narrowed for a context menu. A full-width hairline in a
+     compact menu looked like a second border on the card; this stays inside
+     the padding. Vertical rhythm matches the old `my-1`. */
+  display: block;
+  width: 80%;
+  height: 1px;
+  margin-block: 0.25rem;
+  margin-inline: auto;
+  border-radius: 9999px;
+  background: rgb(var(--c-border) / 0.4);
+}
+
+@utility gp-section-edge {
+  /* Panel header and footer edges. `border-t` / `border-b` still draw the
+     1px geometry; `border-image` fades the colour at the sides so the edge
+     does not read as a hard box. Pair this class with those utilities — it
+     is not a substitute for them. `border-image` ignores `border-radius`;
+     call sites inside overflow-clipped cards are rectangular already. */
+  border-image: linear-gradient(
+      to right,
+      transparent,
+      rgb(var(--c-border) / 0.5) 20%,
+      rgb(var(--c-border) / 0.5) 80%,
+      transparent
+    )
+    1;
+}
+
+@utility gp-segmented {
+  /* Segmented control: a pill track with a raised active bubble. */
+  @apply inline-flex select-none items-center gap-0.5 rounded-full border border-border/70 bg-background/70 p-0.5;
+}
+
+@utility gp-seg-btn {
+  @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
+  &:hover {
+    @apply text-textPrimary;
+  }
+  &[data-active='true'] {
+    @apply bg-surface font-semibold text-accent;
+    box-shadow:
+      0 1px 3px rgb(0 0 0 / 0.25),
+      inset 0 1px 0 rgb(255 255 255 / 0.05);
+  }
+  html.light &[data-active='true'] {
+    box-shadow:
+      0 1px 3px rgb(38 46 76 / 0.16),
+      inset 0 1px 0 rgb(255 255 255 / 0.8);
+  }
+}
+
+@utility gp-field {
+  /* Rounded input field. */
+  @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
+  &:focus {
+    @apply outline-hidden border-accent/60;
+    box-shadow: var(--ring-focus);
+  }
+}
+
+@utility gp-field-multi {
+  @apply rounded-xl;
+}
+
+@utility gp-chip {
+  /* Small pill chip. */
+  @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border border-border/70 px-2 py-0.5 text-[11px] leading-none;
+}
+
+@utility gp-floor {
+  /*
+   * The floor mark: a measurement that is a lower bound, not a total.
+   *
+   * One owner for what had been a lone 10px `≥` glyph repeated at three call
+   * sites. The glyph stays — it is compact and precise — but the underline is
+   * what makes the mark survive being skimmed past, because it scales with
+   * whatever it qualifies instead of sitting beside it at a fixed size. Dashed
+   * rather than solid so it never reads as an underline for emphasis, and
+   * amber because it is the same caution the partial-scan notices use.
+   */
+  @apply border-b border-dashed border-amber-500/70 dark:border-amber-400/60;
+}
+
+@utility gp-select {
+  /*
+   * Native <select>, wearing the app's own chrome. The platform widget drew a
+   * grey system box with a system arrow inside a soft-bubble panel; keeping
+   * the element (and its free keyboard handling, its screen-reader role, its
+   * native popup) while replacing only the painting is strictly better than
+   * rebuilding a listbox. `appearance: none` drops the arrow, so one is drawn
+   * back as a background chevron and room is reserved for it on the right.
+   */
+  @apply cursor-pointer truncate rounded-lg border border-border/70 bg-background py-0.5 pl-2 pr-6 text-textPrimary;
+  appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, rgb(var(--c-text-muted)) 50%),
+    linear-gradient(135deg, rgb(var(--c-text-muted)) 50%, transparent 50%);
+  background-position:
+    right 11px center,
+    right 7px center;
+  background-size:
+    4px 4px,
+    4px 4px;
+  background-repeat: no-repeat;
+
+  &:hover {
+    @apply border-border;
+  }
+
+  &:focus-visible {
+    @apply border-accent/70 outline-hidden;
+    box-shadow: var(--ring-focus);
+  }
+}
+
+@utility gp-keycap {
+  /* Keycap hint. */
+  @apply inline-flex items-center rounded-md border border-border/80 bg-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-textMuted;
+  box-shadow: 0 1.5px 0 rgb(var(--c-border));
+}
+
+@layer utilities {
+  /*
  * GitPulse design tokens — "soft bubble" language.
  *
  * Two parallel sets live here on purpose:
@@ -13,164 +347,268 @@
  *    exactly one source of truth per channel.
  */
 
-:root,
-html.dark {
-  --c-bg: 11 14 23;
-  --c-surface: 20 26 41;
-  --c-surface-hover: 31 39 58;
-  --c-border: 44 54 78;
-  --c-accent: 128 158 255;
-  --c-text: 233 237 248;
-  --c-text-muted: 148 161 190;
+  :root,
+  html.dark {
+    --c-bg: 11 14 23;
+    --c-surface: 20 26 41;
+    --c-surface-hover: 31 39 58;
+    --c-border: 44 54 78;
+    --c-accent: 128 158 255;
+    --c-text: 233 237 248;
+    --c-text-muted: 148 161 190;
 
-  /* Elevation. Soft, layered, low-contrast — bubbles, not boxes. */
-  --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3),
-    0 10px 28px -18px rgb(0 0 0 / 0.65);
-  --shadow-pop: 0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
-  --shadow-float: 0 8px 24px -12px rgb(0 0 0 / 0.55), 0 32px 90px -28px rgb(0 0 0 / 0.7);
-  /* Derived from --c-accent, not restated: the accent is user-selectable at
+    /* Elevation. Soft, layered, low-contrast — bubbles, not boxes. */
+    --shadow-card:
+      inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3),
+      0 10px 28px -18px rgb(0 0 0 / 0.65);
+    --shadow-pop:
+      0 2px 8px -2px rgb(0 0 0 / 0.4), 0 18px 44px -16px rgb(0 0 0 / 0.6);
+    --shadow-float:
+      0 8px 24px -12px rgb(0 0 0 / 0.55), 0 32px 90px -28px rgb(0 0 0 / 0.7);
+    /* Derived from --c-accent, not restated: the accent is user-selectable at
      runtime (lib/ui/accents.ts writes the triplet inline on <html>), and a
      literal here would leave a teal window wearing a blue focus ring. */
-  --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.55);
-  --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.28);
-  --brand-gradient: linear-gradient(135deg, #22d3ee 0%, #7da2ff 52%, #ab8bff 100%);
-}
+    --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.55);
+    --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.28);
+    --brand-gradient: linear-gradient(
+      135deg,
+      #22d3ee 0%,
+      #7da2ff 52%,
+      #ab8bff 100%
+    );
+  }
 
-html.light {
-  --c-bg: 243 244 250;
-  --c-surface: 255 255 255;
-  --c-surface-hover: 236 238 248;
-  --c-border: 96 104 136;
-  --c-accent: 48 64 175;
-  --c-text: 34 40 62;
-  --c-text-muted: 99 108 134;
+  html.light {
+    --c-bg: 243 244 250;
+    --c-surface: 255 255 255;
+    --c-surface-hover: 236 238 248;
+    --c-border: 96 104 136;
+    --c-accent: 48 64 175;
+    --c-text: 34 40 62;
+    --c-text-muted: 99 108 134;
 
-  /* Light-theme semantic colors are deliberately darker than Tailwind's
+    /* Light-theme semantic colors are deliberately darker than Tailwind's
      dark-surface ramps so status text remains legible on every light card. */
-  --c-status-amber: 146 64 14;
-  --c-status-emerald: 6 95 70;
-  --c-status-rose: 159 18 57;
-  --c-status-red: 153 27 27;
-  --c-status-sky: 7 89 133;
-  --c-status-cyan: 21 94 117;
-  --c-status-purple: 107 33 168;
-  --c-status-green: 22 101 52;
-  --c-status-orange: 154 52 18;
-  --c-status-teal: 17 94 89;
-  --c-status-indigo: 55 48 163;
-  --c-status-blue: 29 78 216;
-  --c-status-yellow: 133 77 14;
-  --c-status-zinc: 82 82 91;
-  --c-status-slate: 71 85 105;
+    --c-status-amber: 146 64 14;
+    --c-status-emerald: 6 95 70;
+    --c-status-rose: 159 18 57;
+    --c-status-red: 153 27 27;
+    --c-status-sky: 7 89 133;
+    --c-status-cyan: 21 94 117;
+    --c-status-purple: 107 33 168;
+    --c-status-green: 22 101 52;
+    --c-status-orange: 154 52 18;
+    --c-status-teal: 17 94 89;
+    --c-status-indigo: 55 48 163;
+    --c-status-blue: 29 78 216;
+    --c-status-yellow: 133 77 14;
+    --c-status-zinc: 82 82 91;
+    --c-status-slate: 71 85 105;
 
-  --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
-    0 12px 32px -20px rgb(38 46 76 / 0.25);
-  --shadow-pop: 0 2px 8px -2px rgb(38 46 76 / 0.08), 0 18px 44px -16px rgb(38 46 76 / 0.22);
-  --shadow-float: 0 8px 24px -12px rgb(38 46 76 / 0.12), 0 32px 90px -28px rgb(38 46 76 / 0.28);
-  /* Derived for the same reason as the dark pair above. The light accent is
+    --shadow-card:
+      inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(38 46 76 / 0.06),
+      0 12px 32px -20px rgb(38 46 76 / 0.25);
+    --shadow-pop:
+      0 2px 8px -2px rgb(38 46 76 / 0.08),
+      0 18px 44px -16px rgb(38 46 76 / 0.22);
+    --shadow-float:
+      0 8px 24px -12px rgb(38 46 76 / 0.12),
+      0 32px 90px -28px rgb(38 46 76 / 0.28);
+    /* Derived for the same reason as the dark pair above. The light accent is
      darker than the ring colour this replaces, which strengthens the focus
      indicator rather than weakening it. */
-  --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.45);
-  --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.22);
-  --brand-gradient: linear-gradient(135deg, #06b6d4 0%, #4f74e8 52%, #8b5cf6 100%);
+    --shadow-glow: 0 6px 22px -8px rgb(var(--c-accent) / 0.45);
+    --ring-focus: 0 0 0 3px rgb(var(--c-accent) / 0.22);
+    --brand-gradient: linear-gradient(
+      135deg,
+      #06b6d4 0%,
+      #4f74e8 52%,
+      #8b5cf6 100%
+    );
 
-  color-scheme: light;
-}
+    color-scheme: light;
+  }
 
-/* Tailwind's opacity modifiers are tuned for the dark palette. On light
+  /* Tailwind's opacity modifiers are tuned for the dark palette. On light
    surfaces they can make otherwise-accessible foregrounds translucent. Keep
    semantic text opaque in light mode and route status ramps through the
    contrast-checked tokens above. */
-html.light :where([class~="text-textMuted/40"], [class~="text-textMuted/50"], [class~="text-textMuted/60"], [class~="text-textMuted/70"], [class~="text-textMuted/80"]) {
-  color: rgb(var(--c-text-muted));
-}
+  html.light
+    :where(
+      [class~='text-textMuted/40'],
+      [class~='text-textMuted/50'],
+      [class~='text-textMuted/60'],
+      [class~='text-textMuted/70'],
+      [class~='text-textMuted/80']
+    ) {
+    color: rgb(var(--c-text-muted));
+  }
 
-html.light :where([class~="text-accent/60"], [class~="text-accent/70"], [class~="text-accent/80"]) {
-  color: rgb(var(--c-accent));
-}
+  html.light
+    :where(
+      [class~='text-accent/60'],
+      [class~='text-accent/70'],
+      [class~='text-accent/80']
+    ) {
+    color: rgb(var(--c-accent));
+  }
 
-html.light :where([class~="text-amber-200"], [class~="text-amber-300"], [class~="text-amber-300/80"], [class~="text-amber-300/90"], [class~="text-amber-400"], [class~="text-amber-400/80"], [class~="text-amber-400/90"], [class~="text-amber-500"], [class~="text-amber-600"]) {
-  color: rgb(var(--c-status-amber));
-}
+  html.light
+    :where(
+      [class~='text-amber-200'],
+      [class~='text-amber-300'],
+      [class~='text-amber-300/80'],
+      [class~='text-amber-300/90'],
+      [class~='text-amber-400'],
+      [class~='text-amber-400/80'],
+      [class~='text-amber-400/90'],
+      [class~='text-amber-500'],
+      [class~='text-amber-600']
+    ) {
+    color: rgb(var(--c-status-amber));
+  }
 
-html.light :where([class~="text-emerald-300"], [class~="text-emerald-400"], [class~="text-emerald-400/80"], [class~="text-emerald-400/90"], [class~="text-emerald-500"], [class~="text-emerald-500/80"], [class~="text-emerald-600"]) {
-  color: rgb(var(--c-status-emerald));
-}
+  html.light
+    :where(
+      [class~='text-emerald-300'],
+      [class~='text-emerald-400'],
+      [class~='text-emerald-400/80'],
+      [class~='text-emerald-400/90'],
+      [class~='text-emerald-500'],
+      [class~='text-emerald-500/80'],
+      [class~='text-emerald-600']
+    ) {
+    color: rgb(var(--c-status-emerald));
+  }
 
-html.light :where([class~="text-rose-200"], [class~="text-rose-300"], [class~="text-rose-300/90"], [class~="text-rose-400"], [class~="text-rose-400/90"], [class~="text-rose-500"], [class~="text-rose-600"]) {
-  color: rgb(var(--c-status-rose));
-}
+  html.light
+    :where(
+      [class~='text-rose-200'],
+      [class~='text-rose-300'],
+      [class~='text-rose-300/90'],
+      [class~='text-rose-400'],
+      [class~='text-rose-400/90'],
+      [class~='text-rose-500'],
+      [class~='text-rose-600']
+    ) {
+    color: rgb(var(--c-status-rose));
+  }
 
-html.light :where([class~="text-red-300"], [class~="text-red-400"], [class~="text-red-400/80"], [class~="text-red-600"]) {
-  color: rgb(var(--c-status-red));
-}
+  html.light
+    :where(
+      [class~='text-red-300'],
+      [class~='text-red-400'],
+      [class~='text-red-400/80'],
+      [class~='text-red-600']
+    ) {
+    color: rgb(var(--c-status-red));
+  }
 
-html.light :where([class~="text-sky-300"], [class~="text-sky-400"], [class~="text-sky-600"]) {
-  color: rgb(var(--c-status-sky));
-}
+  html.light
+    :where(
+      [class~='text-sky-300'],
+      [class~='text-sky-400'],
+      [class~='text-sky-600']
+    ) {
+    color: rgb(var(--c-status-sky));
+  }
 
-html.light :where([class~="text-cyan-300"], [class~="text-cyan-400"], [class~="text-cyan-400/80"]) {
-  color: rgb(var(--c-status-cyan));
-}
+  html.light
+    :where(
+      [class~='text-cyan-300'],
+      [class~='text-cyan-400'],
+      [class~='text-cyan-400/80']
+    ) {
+    color: rgb(var(--c-status-cyan));
+  }
 
-html.light :where([class~="text-purple-200"], [class~="text-purple-300"], [class~="text-purple-300/80"], [class~="text-purple-400"], [class~="text-purple-600"]) {
-  color: rgb(var(--c-status-purple));
-}
+  html.light
+    :where(
+      [class~='text-purple-200'],
+      [class~='text-purple-300'],
+      [class~='text-purple-300/80'],
+      [class~='text-purple-400'],
+      [class~='text-purple-600']
+    ) {
+    color: rgb(var(--c-status-purple));
+  }
 
-html.light :where([class~="text-green-300"], [class~="text-green-400"], [class~="text-green-400/80"]) {
-  color: rgb(var(--c-status-green));
-}
+  html.light
+    :where(
+      [class~='text-green-300'],
+      [class~='text-green-400'],
+      [class~='text-green-400/80']
+    ) {
+    color: rgb(var(--c-status-green));
+  }
 
-html.light :where([class~="text-orange-300"], [class~="text-orange-400"], [class~="text-orange-600"]) {
-  color: rgb(var(--c-status-orange));
-}
+  html.light
+    :where(
+      [class~='text-orange-300'],
+      [class~='text-orange-400'],
+      [class~='text-orange-600']
+    ) {
+    color: rgb(var(--c-status-orange));
+  }
 
-html.light :where([class~="text-teal-400"], [class~="text-teal-600"]) {
-  color: rgb(var(--c-status-teal));
-}
+  html.light :where([class~='text-teal-400'], [class~='text-teal-600']) {
+    color: rgb(var(--c-status-teal));
+  }
 
-html.light :where([class~="text-indigo-300"], [class~="text-indigo-400"], [class~="text-indigo-600"]) {
-  color: rgb(var(--c-status-indigo));
-}
+  html.light
+    :where(
+      [class~='text-indigo-300'],
+      [class~='text-indigo-400'],
+      [class~='text-indigo-600']
+    ) {
+    color: rgb(var(--c-status-indigo));
+  }
 
-html.light :where([class~="text-blue-200"], [class~="text-blue-300"], [class~="text-blue-300/80"], [class~="text-blue-400"]) {
-  color: rgb(var(--c-status-blue));
-}
+  html.light
+    :where(
+      [class~='text-blue-200'],
+      [class~='text-blue-300'],
+      [class~='text-blue-300/80'],
+      [class~='text-blue-400']
+    ) {
+    color: rgb(var(--c-status-blue));
+  }
 
-html.light :where([class~="text-yellow-300"]) {
-  color: rgb(var(--c-status-yellow));
-}
+  html.light :where([class~='text-yellow-300']) {
+    color: rgb(var(--c-status-yellow));
+  }
 
-html.light :where([class~="text-zinc-400"], [class~="text-zinc-600"]) {
-  color: rgb(var(--c-status-zinc));
-}
+  html.light :where([class~='text-zinc-400'], [class~='text-zinc-600']) {
+    color: rgb(var(--c-status-zinc));
+  }
 
-html.light :where([class~="text-slate-400"], [class~="text-slate-600"]) {
-  color: rgb(var(--c-status-slate));
-}
+  html.light :where([class~='text-slate-400'], [class~='text-slate-600']) {
+    color: rgb(var(--c-status-slate));
+  }
 
-:root {
-  --ui-font-scale: 1;
-  /* Columns a literal tab advances to. 8 is the CSS initial value, so the
+  :root {
+    --ui-font-scale: 1;
+    /* Columns a literal tab advances to. 8 is the CSS initial value, so the
      default renders exactly what it rendered before the setting existed;
      lib/ui/codeDisplay.ts overwrites this when the reader picks 2 or 4. */
-  --gp-tab-size: 8;
-  /* Derived plain colors — the canvas graph reads these. */
-  --bg-main: rgb(var(--c-bg));
-  --bg-surface: rgb(var(--c-surface));
-  /* What xterm paints behind its cells. Kept apart from `--bg-surface`
+    --gp-tab-size: 8;
+    /* Derived plain colors — the canvas graph reads these. */
+    --bg-main: rgb(var(--c-bg));
+    --bg-surface: rgb(var(--c-surface));
+    /* What xterm paints behind its cells. Kept apart from `--bg-surface`
      because that token has a second runtime reader -- the graph's node stroke
      -- and a stroke is not a fill. */
-  --bg-terminal: rgb(var(--c-surface));
-  --bg-surface-hover: rgb(var(--c-surface-hover));
-  --border-color: rgb(var(--c-border));
-  --accent-color: rgb(var(--c-accent));
-  --text-primary: rgb(var(--c-text));
-  --text-muted: rgb(var(--c-text-muted));
-}
+    --bg-terminal: rgb(var(--c-surface));
+    --bg-surface-hover: rgb(var(--c-surface-hover));
+    --border-color: rgb(var(--c-border));
+    --accent-color: rgb(var(--c-accent));
+    --text-primary: rgb(var(--c-text));
+    --text-muted: rgb(var(--c-text-muted));
+  }
 
-html.dark {
-  color-scheme: dark;
+  html.dark {
+    color-scheme: dark;
+  }
 }
 
 @layer base {
@@ -224,7 +662,8 @@ html.dark {
   }
 }
 
-/*
+@layer utilities {
+  /*
  * Forced colours (Windows High Contrast) and high-contrast preferences.
  *
  * The base focus style is `outline: none` plus a `box-shadow` ring. Forced
@@ -234,324 +673,60 @@ html.dark {
  * system's own Highlight colour rather than a token, because in forced-colours
  * mode the palette belongs to the user, not to us.
  */
-@media (forced-colors: active) {
-  button:focus-visible,
-  [role="button"]:focus-visible,
-  [role="tab"]:focus-visible,
-  [role="option"]:focus-visible,
-  a:focus-visible,
-  [tabindex]:focus-visible,
-  input:focus-visible,
-  textarea:focus-visible,
-  select:focus-visible,
-  .gp-focus-flash:focus-visible {
-    outline: 2px solid Highlight;
-    outline-offset: 2px;
-  }
+  @media (forced-colors: active) {
+    button:focus-visible,
+    [role="button"]:focus-visible,
+    [role="tab"]:focus-visible,
+    [role="option"]:focus-visible,
+    a:focus-visible,
+    [tabindex]:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    .gp-focus-flash:focus-visible {
+      outline: 2px solid Highlight;
+      outline-offset: 2px;
+    }
 
-  /* Meaning carried only by a translucent tint is lost when the system
+    /* Meaning carried only by a translucent tint is lost when the system
      replaces every background. Keep the shapes readable as structure. */
-  .gp-card,
-  .gp-menu,
-  .gp-chip,
-  .gp-keycap,
-  .gp-segmented,
-  .gp-btn,
-  .gp-btn-primary,
-  .gp-btn-success,
-  .gp-field,
-  .gp-separator,
-  .gp-menu-sep {
-    border: 1px solid CanvasText;
-  }
+    .gp-card,
+    .gp-menu,
+    .gp-chip,
+    .gp-keycap,
+    .gp-segmented,
+    .gp-btn,
+    .gp-btn-primary,
+    .gp-btn-success,
+    .gp-field,
+    .gp-separator,
+    .gp-menu-sep {
+      border: 1px solid CanvasText;
+    }
 
-  /* Gradient-fade edges vanish when the system owns the palette; a solid
+    /* Gradient-fade edges vanish when the system owns the palette; a solid
      CanvasText border is the floor so the panel break still reads. */
-  .gp-section-edge {
-    border-image: none;
-    border-color: CanvasText;
+    .gp-section-edge {
+      border-image: none;
+      border-color: CanvasText;
+    }
+
+    .gp-seg-btn[data-active='true'] {
+      outline: 2px solid Highlight;
+      outline-offset: -2px;
+    }
   }
 
-  .gp-seg-btn[data-active="true"] {
-    outline: 2px solid Highlight;
-    outline-offset: -2px;
-  }
-}
-
-/* A user asking for more contrast gets a thicker, opaque ring rather than the
+  /* A user asking for more contrast gets a thicker, opaque ring rather than the
    soft translucent halo the default theme uses. */
-@media (prefers-contrast: more) {
-  :root {
-    --ring-focus: 0 0 0 3px rgb(var(--c-accent));
+  @media (prefers-contrast: more) {
+    :root {
+      --ring-focus: 0 0 0 3px rgb(var(--c-accent));
+    }
   }
-}
 
-/* Bubble primitives shared across views. One owner per shape keeps the
+  /* Bubble primitives shared across views. One owner per shape keeps the
    geometry consistent; components compose these instead of re-deriving them. */
-@layer components {
-  /* Pill button (secondary). */
-  .gp-btn {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full border border-border/70 bg-surface px-3 py-1 text-xs font-medium text-textPrimary shadow-sm transition-[color,background-color,border-color,box-shadow] duration-150;
-  }
-  .gp-btn:hover {
-    @apply border-accent/50 bg-surfaceHover;
-  }
-  .gp-btn:active {
-    transform: scale(0.97);
-  }
-  .gp-btn:disabled {
-    @apply cursor-not-allowed opacity-40;
-  }
-
-  /* Pill button (primary): brand gradient with a soft halo. */
-  .gp-btn-primary {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
-    background-image: var(--brand-gradient);
-    box-shadow: var(--shadow-glow);
-  }
-  .gp-btn-primary:hover {
-    filter: brightness(1.08);
-  }
-  .gp-btn-primary:active {
-    transform: scale(0.97);
-  }
-  .gp-btn-primary:disabled {
-    @apply cursor-not-allowed opacity-40;
-    filter: none;
-    box-shadow: none;
-  }
-
-  /* Pill button (success): same geometry as primary, green ramp. */
-  .gp-btn-success {
-    @apply inline-flex select-none items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold text-white transition-[color,background-color,border-color,box-shadow] duration-150;
-    background-image: linear-gradient(135deg, #34d399, #059669);
-    box-shadow: 0 6px 22px -8px rgb(16 185 129 / 0.55);
-  }
-  .gp-btn-success:hover {
-    filter: brightness(1.08);
-  }
-  .gp-btn-success:active {
-    transform: scale(0.97);
-  }
-  .gp-btn-success:disabled {
-    @apply cursor-not-allowed opacity-40;
-    filter: none;
-    box-shadow: none;
-  }
-
-  /* Round icon button (ghost). */
-  .gp-icon-btn {
-    @apply inline-flex select-none items-center justify-center rounded-full p-1.5 text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
-  }
-  .gp-icon-btn:hover {
-    @apply bg-surfaceHover text-textPrimary;
-  }
-  .gp-icon-btn:active {
-    transform: scale(0.94);
-  }
-
-  /* Small status chip: a count, a label, a state.
-     Written by a dozen call sites across the GitHub, MANVI and Stack panes
-     and never defined, so every one of them rendered as bare inline text
-     with the `!bg-…`/`!text-…` overrides beside it landing on nothing. */
-  .gp-pill {
-    @apply inline-flex select-none items-center gap-1 rounded-full border border-border/70 bg-surfaceHover px-1.5 py-0.5 text-[10px] font-medium leading-none text-textMuted;
-  }
-
-  /* Elevated card. */
-  .gp-card {
-    @apply rounded-2xl border border-border/70 bg-surface;
-    box-shadow: var(--shadow-card);
-  }
-
-  /* Modal scrim: the dimmed, blurred plate every dialog lays over the app.
-     Seven dialogs had each written the same four utilities inline, so there
-     was nowhere to say "on this platform, blur once" -- see the .gp-scrim
-     rule in the macOS block. Dim, alignment and selectability stay at the
-     call site, because those genuinely differ per dialog. */
-  .gp-scrim {
-    @apply fixed inset-0;
-    -webkit-backdrop-filter: blur(4px);
-    backdrop-filter: blur(4px);
-  }
-
-  /* Overflow cue at the edges of a scroller. Written inline as
-     `from-background to-transparent`, which has two faults: Tailwind's
-     `to-transparent` is `rgb(0 0 0 / 0)`, so the ramp travels through black
-     and fringes on light themes, and `from-background` is a full-alpha stop --
-     an opaque band at each edge of a pane that is otherwise translucent. Both
-     ends fade one colour to its own zero instead, and macOS swaps the colour
-     for a shade, because the gutter deliberately stopped painting the base.
-     The fade is pointer-events-none so the graph (and any other host) still
-     receives clicks through it; the chevron button re-enables pointer events. */
-  .gp-edge-fade {
-    @apply pointer-events-none absolute inset-y-0 z-20 flex w-8 items-center justify-center;
-  }
-  .gp-edge-fade-start {
-    left: 0;
-    background-image: linear-gradient(to right, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
-  }
-  .gp-edge-fade-end {
-    right: 0;
-    background-image: linear-gradient(to left, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
-  }
-  .gp-edge-fade-y {
-    @apply pointer-events-none absolute inset-x-0 z-20 flex h-8 items-center justify-center;
-  }
-  .gp-edge-fade-top {
-    top: 0;
-    background-image: linear-gradient(to bottom, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
-  }
-  .gp-edge-fade-bottom {
-    bottom: 0;
-    background-image: linear-gradient(to top, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
-  }
-  .gp-scroll-cue-btn {
-    @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-surface/90 text-textMuted;
-  }
-  .gp-scroll-cue-btn:hover {
-    @apply bg-surfaceHover text-textPrimary;
-  }
-
-  /* Floating menu / popover. */
-  .gp-menu {
-    @apply overflow-hidden rounded-xl border border-border/80 bg-surface p-1;
-    box-shadow: var(--shadow-pop);
-  }
-  .gp-menu-item {
-    @apply flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-textPrimary transition-colors duration-100;
-  }
-  .gp-menu-item:hover {
-    @apply bg-surfaceHover;
-  }
-
-  /* Soft centered pill. A bare `border-t` ran the full width of a section
-     and read as a hard rule; forty percent wide, two pixels tall, and faded,
-     it still marks a break without boxing the content. */
-  .gp-separator {
-    display: block;
-    width: 40%;
-    height: 2px;
-    margin-block: 0.5rem;
-    margin-inline: auto;
-    border-radius: 9999px;
-    background: rgb(var(--c-border) / 0.4);
-  }
-
-  /* The same pill, narrowed for a context menu. A full-width hairline in a
-     compact menu looked like a second border on the card; this stays inside
-     the padding. Vertical rhythm matches the old `my-1`. */
-  .gp-menu-sep {
-    display: block;
-    width: 80%;
-    height: 1px;
-    margin-block: 0.25rem;
-    margin-inline: auto;
-    border-radius: 9999px;
-    background: rgb(var(--c-border) / 0.4);
-  }
-
-  /* Panel header and footer edges. `border-t` / `border-b` still draw the
-     1px geometry; `border-image` fades the colour at the sides so the edge
-     does not read as a hard box. Pair this class with those utilities — it
-     is not a substitute for them. `border-image` ignores `border-radius`;
-     call sites inside overflow-clipped cards are rectangular already. */
-  .gp-section-edge {
-    border-image: linear-gradient(
-        to right,
-        transparent,
-        rgb(var(--c-border) / 0.5) 20%,
-        rgb(var(--c-border) / 0.5) 80%,
-        transparent
-      )
-      1;
-  }
-
-  /* Segmented control: a pill track with a raised active bubble. */
-  .gp-segmented {
-    @apply inline-flex select-none items-center gap-0.5 rounded-full border border-border/70 bg-background/70 p-0.5;
-  }
-  .gp-seg-btn {
-    @apply rounded-full px-2.5 py-1 text-xs text-textMuted transition-[color,background-color,border-color,box-shadow] duration-150;
-  }
-  .gp-seg-btn:hover {
-    @apply text-textPrimary;
-  }
-  .gp-seg-btn[data-active="true"] {
-    @apply bg-surface font-semibold text-accent;
-    box-shadow: 0 1px 3px rgb(0 0 0 / 0.25), inset 0 1px 0 rgb(255 255 255 / 0.05);
-  }
-  html.light .gp-seg-btn[data-active="true"] {
-    box-shadow: 0 1px 3px rgb(38 46 76 / 0.16), inset 0 1px 0 rgb(255 255 255 / 0.8);
-  }
-
-  /* Rounded input field. */
-  .gp-field {
-    @apply rounded-full border border-border/80 bg-background px-3 py-1 text-xs text-textPrimary placeholder:text-textMuted/60 transition-colors duration-150;
-  }
-  .gp-field:focus {
-    @apply outline-none border-accent/60;
-    box-shadow: var(--ring-focus);
-  }
-  .gp-field-multi {
-    @apply rounded-xl;
-  }
-
-  /* Small pill chip. */
-  .gp-chip {
-    @apply inline-flex max-w-full select-none items-center gap-1 truncate rounded-full border border-border/70 px-2 py-0.5 text-[11px] leading-none;
-  }
-
-  /*
-   * The floor mark: a measurement that is a lower bound, not a total.
-   *
-   * One owner for what had been a lone 10px `≥` glyph repeated at three call
-   * sites. The glyph stays — it is compact and precise — but the underline is
-   * what makes the mark survive being skimmed past, because it scales with
-   * whatever it qualifies instead of sitting beside it at a fixed size. Dashed
-   * rather than solid so it never reads as an underline for emphasis, and
-   * amber because it is the same caution the partial-scan notices use.
-   */
-  .gp-floor {
-    @apply border-b border-dashed border-amber-500/70 dark:border-amber-400/60;
-  }
-
-  /*
-   * Native <select>, wearing the app's own chrome. The platform widget drew a
-   * grey system box with a system arrow inside a soft-bubble panel; keeping
-   * the element (and its free keyboard handling, its screen-reader role, its
-   * native popup) while replacing only the painting is strictly better than
-   * rebuilding a listbox. `appearance: none` drops the arrow, so one is drawn
-   * back as a background chevron and room is reserved for it on the right.
-   */
-  .gp-select {
-    @apply cursor-pointer truncate rounded-lg border border-border/70 bg-background py-0.5 pl-2 pr-6 text-textPrimary;
-    appearance: none;
-    background-image: linear-gradient(45deg, transparent 50%, rgb(var(--c-text-muted)) 50%),
-      linear-gradient(135deg, rgb(var(--c-text-muted)) 50%, transparent 50%);
-    background-position:
-      right 11px center,
-      right 7px center;
-    background-size:
-      4px 4px,
-      4px 4px;
-    background-repeat: no-repeat;
-  }
-
-  .gp-select:hover {
-    @apply border-border;
-  }
-
-  .gp-select:focus-visible {
-    @apply border-accent/70 outline-none;
-    box-shadow: var(--ring-focus);
-  }
-
-  /* Keycap hint. */
-  .gp-keycap {
-    @apply inline-flex items-center rounded-md border border-border/80 bg-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-textMuted;
-    box-shadow: 0 1.5px 0 rgb(var(--c-border));
-  }
 }
 
 /* Pill range sliders (image-diff swipe/onion controls and future ones). */

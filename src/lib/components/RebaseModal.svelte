@@ -15,7 +15,7 @@
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { reportPanelError } from "../diagnostics/report";
-  import { GitMerge, Check, AlertCircle } from "lucide-svelte";
+  import { GitMerge, Check, AlertCircle } from "@lucide/svelte";
 
   let {
     isOpen = false,
@@ -143,7 +143,7 @@
           <input
             type="text"
             bind:value={ontoBranch}
-            class="gp-field !w-28 font-mono"
+            class="gp-field w-28! font-mono"
           />
         </div>
       </div>
@@ -162,7 +162,7 @@
             <select
               bind:value={commit.action}
               onchange={() => (planDirty = true)}
-              class="bg-surface border border-border/80 rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none focus:border-accent/60 font-medium transition-colors"
+              class="bg-surface border border-border/80 rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-hidden focus:border-accent/60 font-medium transition-colors"
             >
               <option value="Pick">pick</option>
               <option value="Squash">squash</option>
@@ -174,7 +174,7 @@
               type="text"
               bind:value={commit.summary}
               oninput={() => (planDirty = true)}
-              class="flex-1 bg-transparent border-b border-transparent focus:border-border text-xs text-textPrimary focus:outline-none px-1"
+              class="flex-1 bg-transparent border-b border-transparent focus:border-border text-xs text-textPrimary focus:outline-hidden px-1"
             />
           </div>
         {/each}

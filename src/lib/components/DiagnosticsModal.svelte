@@ -62,7 +62,7 @@
     withPersistedLogSection,
   } from "../diagnostics/report";
   import { unreadablePersistedLog, type PersistedLog } from "../diagnostics/types";
-  import { TriangleAlert, CircleAlert, ClipboardCopy, Trash2, Activity, Check } from "lucide-svelte";
+  import { TriangleAlert, CircleAlert, ClipboardCopy, Trash2, Activity, Check } from "@lucide/svelte";
 
   let {
     isOpen = false,
@@ -305,17 +305,17 @@
             {#if backendStatus === "degraded" || backendStatus === "unavailable"}
               <button
                 type="button"
-                class="gp-btn !py-0.5 !px-2 ml-auto"
+                class="gp-btn py-0.5! px-2! ml-auto"
                 onclick={() => void beginBackendLoad()}
               >Retry</button>
             {/if}
           </div>
 
           {#if memoryReadError}
-            <p class="text-[11px] text-amber-300 break-words">Current-session log could not be read: {memoryReadError}</p>
+            <p class="text-[11px] text-amber-300 wrap-break-word">Current-session log could not be read: {memoryReadError}</p>
           {/if}
           {#if persistedLog?.degraded}
-            <p class="text-[11px] text-amber-300 break-words">Durable log is incomplete: {persistedLog.degraded}</p>
+            <p class="text-[11px] text-amber-300 wrap-break-word">Durable log is incomplete: {persistedLog.degraded}</p>
           {/if}
           {#if persistedLog?.path}
             <p class="text-[10px] text-textMuted font-mono break-all">Durable log: {persistedLog.path}</p>
@@ -324,13 +324,13 @@
           {#if backendLines.length > 0}
             <details open={$diagnostics.length === 0}>
               <summary class="cursor-pointer text-[11px] text-textMuted">Current session ({backendLines.length} lines)</summary>
-              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-textPrimary select-text">{backendLines.join("\n")}</pre>
+              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed text-textPrimary select-text">{backendLines.join("\n")}</pre>
             </details>
           {/if}
           {#if persistedLog && persistedLog.lines.length > 0}
             <details open={$diagnostics.length === 0}>
               <summary class="cursor-pointer text-[11px] text-textMuted">Durable history ({persistedLog.lines.length} lines)</summary>
-              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-textPrimary select-text">{persistedLog.lines.join("\n")}</pre>
+              <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[10px] leading-relaxed text-textPrimary select-text">{persistedLog.lines.join("\n")}</pre>
             </details>
           {/if}
         </section>
@@ -379,7 +379,7 @@
                 >×{entry.count}{entry.varied ? " differing" : ""}</span>
               {/if}
             </div>
-            <pre class="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-textPrimary m-0">{entry.message}</pre>
+            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-[11px] leading-relaxed text-textPrimary m-0">{entry.message}</pre>
           </div>
         {:else}
           <div class="py-10 text-center text-textMuted" role="status">

@@ -21,8 +21,8 @@ use crate::engine::{
 };
 use crate::github::{
     checkout_pull_request, create_issue, discover_github_remote, issue_create_argv,
-    load_dependabot_alerts, load_github_context, pr_checkout_argv, validate_issue_payload,
-    DependabotReport, GitHubContext,
+    load_code_scanning_alerts, load_dependabot_alerts, load_github_context, pr_checkout_argv,
+    validate_issue_payload, CodeScanningReport, DependabotReport, GitHubContext,
 };
 use crate::graph::{
     mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
@@ -624,6 +624,19 @@ pub async fn cmd_write_file_content(
 #[tauri::command(async)]
 pub fn cmd_compute_word_diff(old_line: String, new_line: String) -> IntraLineDiff {
     compute_word_diff(&old_line, &new_line)
+}
+
+/// Tree-sitter syntax highlight spans for one document (UTF-16 offsets).
+///
+/// Languages MarkDev has no grammar for return an empty list — the frontend
+/// owner then keeps its regex tokenizer. Oversized or malformed input is an
+/// error so a truncated answer cannot look complete.
+#[tauri::command(async)]
+pub async fn cmd_syntax_highlight(
+    language: String,
+    code: String,
+) -> Result<Vec<crate::syntax::SyntaxHighlightSpan>, String> {
+    off_thread(move || crate::syntax::highlight(&language, &code)).await
 }
 
 #[tauri::command(async)]
@@ -1597,6 +1610,24 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
     off_thread(move || Ok::<_, String>(load_dependabot_alerts(&repo_path)))
         .await
         .unwrap_or_else(|e| DependabotReport {
+            available: false,
+            cli_present: false,
+            is_github_remote: false,
+            slug: String::new(),
+            alerts: Vec::new(),
+            truncated: false,
+            error: Some(e),
+        })
+}
+
+/// Open GitHub code scanning alerts for the Health view, via `gh api`. Like
+/// [`cmd_github_dependabot_alerts`], the report carries its own error state
+/// instead of rejecting: "could not check" must stay distinct from "no alerts".
+#[tauri::command(async)]
+pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningReport {
+    off_thread(move || Ok::<_, String>(load_code_scanning_alerts(&repo_path)))
+        .await
+        .unwrap_or_else(|e| CodeScanningReport {
             available: false,
             cli_present: false,
             is_github_remote: false,
@@ -3070,8 +3101,16 @@ pub async fn cmd_codeintel_impact(
     repo_path: String,
     target: String,
     token_budget: Option<u32>,
+    cancel_token: Option<String>,
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
-    off_thread(move || Ok(crate::codeintel::impact(&repo_path, &target, token_budget))).await
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result =
+            crate::codeintel::impact_at_rung(&repo_path, &target, token_budget, None, Some(cancel));
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        Ok(result)
+    })
+    .await
 }
 
 /// Dead code analysis across the repository.
@@ -3081,6 +3120,341 @@ pub async fn cmd_codeintel_dead_symbols(
     token_budget: Option<u32>,
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelDeadSymbol>, String> {
     off_thread(move || Ok(crate::codeintel::dead_symbols(&repo_path, token_budget))).await
+}
+
+/// File dependencies for a path.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_dependencies(
+    repo_path: String,
+    file_path: String,
+    token_budget: Option<u32>,
+    min_rung: Option<String>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::dependencies_at_rung(
+            &repo_path,
+            &file_path,
+            token_budget,
+            min_rung.as_deref(),
+            None,
+        ))
+    })
+    .await
+}
+
+/// Trace a path between two symbols.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_trace(
+    repo_path: String,
+    from: String,
+    to: String,
+    token_budget: Option<u32>,
+    min_rung: Option<String>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::trace_between_at_rung(
+            &repo_path,
+            &from,
+            &to,
+            token_budget,
+            min_rung.as_deref(),
+            None,
+        ))
+    })
+    .await
+}
+
+/// Callers and callees for one or more targets.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_neighbors(
+    repo_path: String,
+    targets: Vec<String>,
+    token_budget: Option<u32>,
+    min_rung: Option<String>,
+) -> Result<Vec<crate::codeintel::CodeintelNeighbors>, String> {
+    off_thread(move || {
+        crate::codeintel::neighbors(&repo_path, &targets, token_budget, min_rung.as_deref())
+    })
+    .await
+}
+
+/// Explore a symbol: definitions plus blast radius.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_explore(
+    repo_path: String,
+    query: String,
+    token_budget: Option<u32>,
+    limit: Option<u32>,
+) -> Result<crate::codeintel::CodeintelExplore, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::explore(
+            &repo_path,
+            &query,
+            token_budget,
+            limit,
+        ))
+    })
+    .await
+}
+
+/// Affected test files for a seed set (fail-closed metadata included).
+#[tauri::command(async)]
+pub async fn cmd_codeintel_affected_tests(
+    repo_path: String,
+    targets: Vec<String>,
+    token_budget: Option<u32>,
+    max_depth: Option<usize>,
+) -> Result<crate::codeintel::CodeintelAffectedTests, String> {
+    off_thread(move || {
+        Ok(crate::codeintel::affected_tests(
+            &repo_path,
+            &targets,
+            token_budget,
+            max_depth,
+        ))
+    })
+    .await
+}
+
+/// Duplicate-code groups.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_clones(
+    repo_path: String,
+    token_budget: Option<u32>,
+) -> Result<crate::codeintel::CodeintelClones, String> {
+    off_thread(move || Ok(crate::codeintel::clones(&repo_path, token_budget))).await
+}
+
+/// Layered blast radius for one target (do not combine with min_rung).
+#[tauri::command(async)]
+pub async fn cmd_codeintel_impact_layered(
+    repo_path: String,
+    target: String,
+    token_budget: Option<u32>,
+    cancel_token: Option<String>,
+) -> Result<crate::codeintel::CodeintelLayeredImpact, String> {
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result = crate::codeintel::impact_layered_with_cancel(
+            &repo_path,
+            &target,
+            token_budget,
+            Some(cancel),
+        );
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        Ok(result)
+    })
+    .await
+}
+
+/// Layered blast radius composed over many changed-file seeds.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_impact_layered_many(
+    repo_path: String,
+    targets: Vec<String>,
+    token_budget: Option<u32>,
+    cancel_token: Option<String>,
+) -> Result<Vec<crate::codeintel::CodeintelLayeredImpact>, String> {
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result = crate::codeintel::impact_layered_many_with_cancel(
+            &repo_path,
+            &targets,
+            token_budget,
+            Some(cancel),
+        );
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        Ok(result)
+    })
+    .await
+}
+
+/// Impact with an optional resolution-rung floor.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_impact_at_rung(
+    repo_path: String,
+    target: String,
+    token_budget: Option<u32>,
+    min_rung: Option<String>,
+    cancel_token: Option<String>,
+) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result = crate::codeintel::impact_at_rung(
+            &repo_path,
+            &target,
+            token_budget,
+            min_rung.as_deref(),
+            Some(cancel),
+        );
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        Ok(result)
+    })
+    .await
+}
+
+/// Trip an in-flight codeintel walk (file switch / dismiss). Timeout also
+/// trips the same flag; this is the user-driven half.
+#[tauri::command(async)]
+pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, String> {
+    Ok(crate::codeintel::cancel_query(&cancel_token))
+}
+
+/// Build the code map via the installed `devmap` CLI.
+#[tauri::command(async)]
+pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
+    off_thread(move || crate::devmap::build(&repo_path)).await
+}
+
+/// Incremental refresh via the installed `devmap` CLI.
+#[tauri::command(async)]
+pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::BuildOutcome, String> {
+    off_thread(move || crate::devmap::refresh(&repo_path)).await
+}
+
+/// Watcher-driven live index: refresh only when stale, schema-ok, and idle.
+///
+/// `repo_changed` should be true when this follows a `repo-changed` event —
+/// that folds the working-tree dirty signal into effective freshness so a
+/// store with an empty pending queue still rebuilds after a settled write.
+#[tauri::command(async)]
+pub async fn cmd_devmap_maybe_refresh(
+    repo_path: String,
+    repo_changed: Option<bool>,
+) -> Result<crate::devmap::LiveRefreshOutcome, String> {
+    off_thread(move || {
+        Ok(crate::devmap::maybe_refresh(
+            &repo_path,
+            repo_changed.unwrap_or(true),
+        ))
+    })
+    .await
+}
+
+/// `devmap status --json` via the CLI.
+#[tauri::command(async)]
+pub async fn cmd_devmap_status(repo_path: String) -> Result<crate::devmap::CliStatus, String> {
+    off_thread(move || Ok(crate::devmap::cli_status(&repo_path))).await
+}
+
+/// Preview what an unsaved buffer would break (`devmap preview`).
+#[tauri::command(async)]
+pub async fn cmd_devmap_preview(
+    repo_path: String,
+    file_path: String,
+    content: String,
+) -> Result<crate::devmap::PreviewFileResult, String> {
+    off_thread(move || Ok(crate::devmap::preview(&repo_path, &file_path, &content))).await
+}
+
+/// Preview many changed files; cancellable between files via a shared flag.
+#[tauri::command(async)]
+pub async fn cmd_devmap_preview_many(
+    repo_path: String,
+    files: Vec<(String, String)>,
+) -> Result<crate::devmap::PreviewOutcome, String> {
+    off_thread(move || Ok(crate::devmap::preview_many(&repo_path, &files, || false))).await
+}
+
+/// Read `.devcouncil/repo_map.json` into GitPulse's typed navigator mirror.
+#[tauri::command(async)]
+pub async fn cmd_devmap_repo_map(repo_path: String) -> Result<crate::devmap::RepoMapLoad, String> {
+    off_thread(move || Ok(crate::devmap::load_repo_map(&repo_path))).await
+}
+
+/// Code-graph canvas payload via `devmap_query::viz::build_payload`.
+///
+/// Reads on-disk `code_graph.json`, ranks nodes by degree, and caps at
+/// `max_nodes` (default 1500). The payload always reports
+/// `counts.nodes_truncated` — a capped picture is never the whole graph.
+#[tauri::command(async)]
+pub async fn cmd_devmap_viz(
+    repo_path: String,
+    symbols: Option<bool>,
+    max_nodes: Option<usize>,
+) -> Result<crate::devmap::GraphVizLoad, String> {
+    off_thread(move || {
+        Ok(crate::devmap::load_code_graph_viz(
+            &repo_path, symbols, max_nodes,
+        ))
+    })
+    .await
+}
+
+/// Subsystem map-preview payload via `map_preview::build_preview_payload`.
+#[tauri::command(async)]
+pub async fn cmd_devmap_map_preview(
+    repo_path: String,
+) -> Result<crate::devmap::GraphVizLoad, String> {
+    off_thread(move || Ok(crate::devmap::load_map_preview(&repo_path))).await
+}
+
+// --- multi-repo workspace registry (devmap workspace.json) ------------
+
+/// Register one repository in the workspace registry rooted at `registry_root`.
+#[tauri::command(async)]
+pub async fn cmd_workspace_register(
+    registry_root: String,
+    repo_path: String,
+    name: Option<String>,
+) -> Result<crate::workspace_registry::WorkspaceRegisterResult, String> {
+    off_thread(move || {
+        crate::workspace_registry::register(&registry_root, &repo_path, name.as_deref())
+    })
+    .await
+}
+
+/// Remove a repository from the workspace registry by name.
+#[tauri::command(async)]
+pub async fn cmd_workspace_unregister(
+    registry_root: String,
+    name: String,
+) -> Result<crate::workspace_registry::WorkspaceUnregisterResult, String> {
+    off_thread(move || crate::workspace_registry::unregister(&registry_root, &name)).await
+}
+
+/// List repositories in the workspace registry.
+#[tauri::command(async)]
+pub async fn cmd_workspace_list(
+    registry_root: String,
+) -> Result<crate::workspace_registry::WorkspaceSnapshot, String> {
+    off_thread(move || crate::workspace_registry::list(&registry_root)).await
+}
+
+/// Replace the registry so it matches the open-tab set (plus the registry host).
+#[tauri::command(async)]
+pub async fn cmd_workspace_sync(
+    registry_root: String,
+    repo_paths: Vec<String>,
+) -> Result<crate::workspace_registry::WorkspaceSnapshot, String> {
+    off_thread(move || crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)).await
+}
+
+/// Cross-repo symbol search. `semantic: true` uses TF-IDF name ranking — not AI.
+#[tauri::command(async)]
+pub async fn cmd_workspace_search(
+    registry_root: String,
+    query: String,
+    token_budget: Option<u32>,
+    semantic: Option<bool>,
+) -> Result<crate::workspace_registry::WorkspaceSearchResult, String> {
+    off_thread(move || {
+        crate::workspace_registry::search(
+            &registry_root,
+            &query,
+            token_budget,
+            semantic.unwrap_or(false),
+        )
+    })
+    .await
+}
+
+/// Declared cross-repo import links among registered repositories.
+#[tauri::command(async)]
+pub async fn cmd_workspace_link_candidates(
+    registry_root: String,
+) -> Result<crate::workspace_registry::WorkspaceLinksResult, String> {
+    off_thread(move || crate::workspace_registry::link_candidates(&registry_root)).await
 }
 
 /// One-shot Work-view snapshot: worktrees, agent sessions, collisions, ledger, code graph.
@@ -3135,10 +3509,176 @@ pub async fn cmd_fleet_record_metrics(
     .await
 }
 
+/// Parses markdown into MarkDev's flat model with resolved string lookups.
+#[tauri::command(async)]
+pub async fn cmd_markdown_parse(text: String) -> Result<crate::markdown::ParsedMarkdown, String> {
+    off_thread(move || crate::markdown::parse(&text)).await
+}
+
+/// Renders markdown to safe HTML via the MarkDev flat model.
+#[tauri::command(async)]
+pub async fn cmd_markdown_render(text: String) -> Result<String, String> {
+    off_thread(move || crate::markdown::render(&text)).await
+}
+
+/// Rebuilds the repo doc vault from `git ls-files '*.md'`.
+#[tauri::command(async)]
+pub async fn cmd_docs_refresh(repo_path: String) -> Result<crate::docs::DocsStatus, String> {
+    off_thread(move || crate::docs::refresh(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_docs_status(repo_path: String) -> Result<crate::docs::DocsStatus, String> {
+    off_thread(move || crate::docs::status(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_docs_search(
+    repo_path: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<markdev::vault::SearchHit>, String> {
+    off_thread(move || {
+        crate::docs::search(
+            &repo_path,
+            &query,
+            limit.unwrap_or(crate::docs::DEFAULT_SEARCH_LIMIT as u32) as usize,
+        )
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_docs_broken_links(
+    repo_path: String,
+) -> Result<Vec<crate::docs::BrokenLink>, String> {
+    off_thread(move || crate::docs::broken_links(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_docs_backlinks(
+    repo_path: String,
+    path: String,
+) -> Result<Vec<markdev::vault::Backlink>, String> {
+    off_thread(move || crate::docs::backlinks(&repo_path, &path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_docs_graph(
+    repo_path: String,
+    focus: Option<String>,
+    depth: Option<u32>,
+    tag: Option<String>,
+    folder: Option<String>,
+) -> Result<markdev::vault::Graph, String> {
+    off_thread(move || {
+        crate::docs::graph(
+            &repo_path,
+            focus.as_deref(),
+            depth.unwrap_or(0),
+            tag.as_deref(),
+            folder.as_deref(),
+        )
+    })
+    .await
+}
+
+/// Link-preserving markdown rename: `git mv` + staged `rewrite_links_in` edits.
+#[tauri::command(async)]
+pub async fn cmd_docs_rename(
+    repo_path: String,
+    from: String,
+    to: String,
+) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
+    off_thread(move || {
+        let argv = ["git", "mv", "--", from.as_str(), to.as_str()];
+        let policy = guard(&repo_path, &argv)?;
+        let outcome = crate::docs::rename_doc(&repo_path, &from, &to)?;
+        Ok(Guarded {
+            policy,
+            output: outcome,
+        })
+    })
+    .await
+}
+
 /// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.
 #[tauri::command]
 pub fn cmd_mcp_info() -> crate::insights::McpInfo {
     crate::insights::mcp_info()
+}
+
+/// Probe whether `devmap` / `manvi` are installed, which path answered, and
+/// whether a sibling checkout can feed an in-app install.
+#[tauri::command(async)]
+pub async fn cmd_external_tools_status() -> Result<crate::tool_install::ToolsStatus, String> {
+    off_thread(|| Ok(crate::tool_install::status_all())).await
+}
+
+/// Install or force-update `devmap` or `manvi` via the install ladder.
+#[tauri::command(async)]
+pub async fn cmd_external_tool_install(
+    tool: crate::tool_install::ExternalTool,
+    rung: Option<crate::tool_install::InstallRung>,
+) -> Result<crate::tool_install::InstallOutcome, String> {
+    off_thread(move || Ok(crate::tool_install::install_with_rung(tool, rung))).await
+}
+
+/// Cancel an in-flight [`cmd_external_tool_install`]. Best-effort: kills the
+/// install process group when one is running.
+#[tauri::command]
+pub fn cmd_external_tool_install_cancel() {
+    crate::tool_install::request_cancel();
+}
+
+#[tauri::command(async)]
+pub async fn cmd_tool_config_get() -> Result<crate::tool_config::ToolConfigView, String> {
+    off_thread(crate::tool_config::view).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_tool_config_save(
+    config: crate::tool_config::ToolConfig,
+) -> Result<crate::tool_config::ToolConfigView, String> {
+    off_thread(move || {
+        crate::tool_config::save(&config)?;
+        crate::tool_config::view()
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_tool_ladder(
+    tool: crate::tool_install::ExternalTool,
+) -> Result<crate::tool_install::LadderAssessment, String> {
+    off_thread(move || Ok(crate::tool_install::assess_ladder(tool))).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_tool_preflight(
+    tool: crate::tool_install::ExternalTool,
+) -> Result<crate::tool_install::PreflightReport, String> {
+    off_thread(move || Ok(crate::tool_install::preflight(tool))).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_tool_verify(
+    tool: crate::tool_install::ExternalTool,
+) -> Result<crate::tool_install::VerifyReport, String> {
+    off_thread(move || Ok(crate::tool_install::verify_connected(tool))).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_onboarding_clone_source(
+    tool: crate::tool_install::ExternalTool,
+    parent_dir: String,
+) -> Result<crate::tool_install::CloneSourceOutcome, String> {
+    off_thread(move || Ok(crate::tool_install::clone_source(tool, &parent_dir))).await
+}
+
+#[tauri::command]
+pub fn cmd_tool_capability_refresh() {
+    crate::tool_capability::invalidate_all();
 }
 
 /// The harness's grant ledger for this repository.

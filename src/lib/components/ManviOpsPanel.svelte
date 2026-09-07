@@ -19,7 +19,7 @@
     ShieldCheck,
     Tag,
     Trash2,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
@@ -522,7 +522,7 @@
         {/if}
         <div class="gp-segmented" role="group" aria-label="MANVI view">
           {#each MANVI_PANE_LIST as entry (entry.id)}
-            <button type="button" aria-pressed={pane === entry.id} data-active={pane === entry.id ? "true" : "false"} class="gp-seg-btn !text-[11px] !py-1" onclick={() => (pane = entry.id)}>{entry.label}</button>
+            <button type="button" aria-pressed={pane === entry.id} data-active={pane === entry.id ? "true" : "false"} class="gp-seg-btn text-[11px]! py-1!" onclick={() => (pane = entry.id)}>{entry.label}</button>
           {/each}
         </div>
       </div>
@@ -754,10 +754,10 @@
                     <span class="text-textMuted truncate max-w-xs">{release.name}</span>
                   {/if}
                   {#if release.is_latest}
-                    <span class="gp-pill !bg-emerald-500/10 !text-emerald-400 !border-emerald-500/30">latest</span>
+                    <span class="gp-pill bg-emerald-500/10! text-emerald-400! border-emerald-500/30!">latest</span>
                   {/if}
                   {#if release.is_prerelease}
-                    <span class="gp-pill !bg-amber-500/10 !text-amber-400 !border-amber-500/30">pre-release</span>
+                    <span class="gp-pill bg-amber-500/10! text-amber-400! border-amber-500/30!">pre-release</span>
                   {/if}
                   {#if release.is_draft}
                     <span class="gp-pill">draft</span>

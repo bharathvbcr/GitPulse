@@ -61,7 +61,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "agents",
     label: "Agents",
-    summary: "The read-only MCP surface agents connect through.",
+    summary: "MCP for agents, and installing the devmap / manvi CLIs.",
   },
   {
     id: "updates",

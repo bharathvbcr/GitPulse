@@ -11,6 +11,95 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **In-app install / update for `devmap` and `manvi`.** Settings → Agents lists both
+  CLIs with the path that answered (or an honest missing/broken-override reason), and
+  Install / Update runs the documented command against a sibling checkout
+  (`cargo install --path …/devmap-cli --locked --force`, `go -C …/manvi install ./cmd/manvi`).
+  Code → Map offers the same for `devmap` when status is unavailable; the MANVI harness
+  pane offers it when the sidecar is not installed. Progress is cancellable; broken
+  `GITPULSE_*_BIN` / `GITPULSE_*_ROOT` values are refused rather than searched past.
+  Override source roots with `GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_MANVI_ROOT`.
+
+### Changed
+
+- **Dependency refresh (2026-09-07).** Frontend floors raised to current stable
+  (`svelte` ^5.57.0, `@tauri-apps/api` ^2.11.1, `@tauri-apps/cli` ^2.11.4,
+  `@tauri-apps/plugin-opener` ^2.5.5). Rust direct reqs raised where already
+  resolved (`rayon` 1.12, `notify` 8.2, `regex` 1.13, `tempfile` 3.27) and
+  `cargo update` pulled latest compatible transitive crates. Intentionally
+  unchanged: classic `typescript@~6.0.3` + `@typescript/native-preview@7.0.0-dev.20260707.2`
+  (svelte-check peers still ^5|^6; tsgo split preserved), Tauri git pin
+  `406feea…` (crates.io still 2.11.5; unpublished 2.12 line keeps urlpattern 0.6),
+  `rusqlite` 0.31 (vendored `dc-store` / `devmap-store`), `notify` 8.x (9.0 is RC),
+  `libc` 0.2 (1.0 is alpha). No rust-toolchain pin; toolchain left alone. No
+  re-vendor.
+
+- **Typecheck uses `tsgo` (TypeScript 7 native preview) for Node/script configs.**
+  `npm run check` still runs `svelte-check` against classic `typescript@~6.0.3`
+  because `svelte-check@4.7.6` peers only `typescript` ^5|^6 and does not drive
+  tsgo. The former `tsc -p tsconfig.node.json --noEmit` step is now
+  `npm run typecheck` → `tsgo -p tsconfig.node.json --noEmit` via
+  `@typescript/native-preview@7.0.0-dev.20260707.2`. App `.svelte` typing
+  remains on svelte-check until it accepts TypeScript 7 / tsgo.
+
+### Added
+
+- **DevMap code intelligence works again at store schema 19, with a handshake that names drift.** The
+  vendored `devmap-*` crates now match the on-disk `.devcouncil/codeintel/devmap.sqlite` stores every
+  sibling repo already builds (schema 19). A mismatched build reports *map built by schema N, this
+  build reads M* rather than a raw SQLite refusal, and `npm run check:vendor-schema` fails `ci:local`
+  when the installed `devmap` CLI and the vendored constant disagree.
+
+- **Build, refresh, status, and edit preview are driven by the installed `devmap` CLI.** GitPulse still
+  queries the store in-process; it shells out for indexing (`build` / incremental refresh / `status
+  --json` / `preview --file … --content -`). Lookup reports *which* path answered (env override vs
+  `PATH` / `~/.cargo/bin`), refuses a configured path that does not resolve, bounds wall clock and
+  stdout, and refuses a second build for the same repo while one is in flight.
+
+- **Pre-commit blast radius: what this commit would break.** The commit composer and the diff file rail
+  share one `devmap preview` batch over staged paths. Each file carries parse status, degradation,
+  compared-against, and broken callers — and a walk that stopped early or a file with no grammar is
+  marked unreliable rather than shown as "nothing breaks".
+
+- **CI:local can scope tests to the change set, and fails closed to the full suite.** Affected-test
+  seeds come from the working-tree status; results are test *files*, chunked at the kernel's neighbor
+  target cap. A stale map, incomplete walk, or unmatched seed runs the full suite and says so — the
+  GitHub CI panel never badges a fail-closed full suite as "affected tests passed".
+
+- **Layered blast radius and a resolution-rung filter on Diff.** Change-set impact is composed over
+  changed files by hop (`impact_layered`), rendering each band's sample *and* `nodes_omitted` /
+  `node_count`. Flat impact offers a min-rung filter plus a rung histogram ("what you did not see");
+  the control is suppressed wherever layered impact is active, because the kernel refuses that pairing.
+
+- **Code → Map: subsystem navigator, code/doc graph canvas, and repo docs.** A third Code section
+  (`⌥3` when Code is active) reads `.devcouncil/repo_map.json` with capped samples named as such,
+  draws code-graph and map-preview canvases (and a MarkDev doc graph), and searches tracked markdown
+  plus broken links / cross-repo link candidates. Freshness comes from `devmap status`; Build /
+  Refresh live on the status strip.
+
+- **The code map refreshes from the file watcher.** Debounced `repo-changed` events ask for an
+  incremental refresh when status says the index is stale, with the same single-build-per-repo guard.
+
+- **MarkDev's Rust core owns markdown parse/render and dual-backend highlighting.** The file viewer
+  uses the flat UTF-16 model (no TypeScript reimplementation). Tree-sitter covers rust / JS / TS /
+  Python / JSON / shell; everything else stays on the existing regex tokenizer under one owner in
+  `diff/highlight.ts`. Commit message bodies and MANVI verdict detail render through the same path.
+  The docs vault is built from `git ls-files` of markdown (not a filesystem walk), with backlinks in
+  the viewer; rename is `git mv` plus staged link rewrites via MarkDev's pure rewriter.
+
+- **Open tabs register in DevMap's workspace for cross-repo search.** Palette `::` searches symbols
+  across registered repos (trailing `~` requests TF-IDF name ranking); bare `:` stays single-repo.
+  Truncation and unavailable repos are named on the result strip.
+
+### Honesty (read these as product rules, not caveats)
+
+- `walk_incomplete` means the list is a floor, not a complete answer.
+- Capped samples carry shown/total/truncated (repo map, graph legend, docs search, broken links).
+- Schema mismatch and missing/`devmap` binary failures are named; they are not empty "all clear" panels.
+- Affected-tests scoping that cannot prove coverage runs the full suite and says why.
+
 ## [0.0.7] - 2026-09-06
 
 ### Added

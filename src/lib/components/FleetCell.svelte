@@ -9,7 +9,7 @@
    * component means one vocabulary — a value, a hollow "not scanned", or a
    * red "could not read" carrying its reason — across every column.
    */
-  import { AlertTriangle } from "lucide-svelte";
+  import { AlertTriangle } from "@lucide/svelte";
   import { formatAge } from "../storage/format";
   import { describeDelta, deltaTone, formatDelta, type DeltaGoal, type DeltaUnit } from "../fleet/format";
   import type { Cell } from "../fleet/types";
@@ -158,7 +158,7 @@
         }
       : undefined}
     class="flex items-center gap-1 {alignClass} text-textMuted/70 text-[11px] italic w-full {onScan
-      ? 'hover:text-accent hover:not-italic focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
+      ? 'hover:text-accent hover:not-italic focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
       : ''}"
     title={onScan
       ? `${label} has not been scanned for this repository. Click to scan just this one.`
@@ -180,7 +180,7 @@
         }
       : undefined}
     class="flex items-center gap-1 {alignClass} text-rose-600 dark:text-rose-400 text-[11px] w-full {onScan
-      ? 'hover:text-rose-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
+      ? 'hover:text-rose-500 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded'
       : ''}"
     title={onScan
       ? `${label} could not be read: ${cell.reason}. Click to try this repository again.`

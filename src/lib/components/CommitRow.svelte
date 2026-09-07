@@ -21,7 +21,7 @@
     GitCommit,
     Undo2,
     Hash,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
   import { repoStore } from "../stores/repoStore";
@@ -227,7 +227,7 @@
   aria-pressed={isSelected}
   aria-haspopup="menu"
   aria-expanded={isMenuOpen}
-  class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg group {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-sm' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
+  class="{isCompact ? 'h-[26px] px-2.5 gap-2 text-[11px]' : 'h-9 px-3 gap-3 text-xs'} flex items-center cursor-pointer select-none transition-[color,background-color,border-color,box-shadow] duration-150 rounded-lg group {isSelected ? 'bg-accent/15 text-textPrimary font-medium ring-1 ring-inset ring-accent/35 shadow-xs' : 'hover:bg-surfaceHover/70 text-textPrimary/90'}"
 >
   <!-- Short SHA with interactive Copy Button -->
   <button
@@ -261,13 +261,13 @@
 
     {#each refs as r}
       {#if r.kind === "head"}
-        <span class="inline-flex items-center gap-1 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded-full border border-accent bg-accent/25 text-accent shadow-sm">
+        <span class="inline-flex items-center gap-1 text-[9px] font-mono font-bold px-1.5 py-0.5 rounded-full border border-accent bg-accent/25 text-accent shadow-xs">
           <Compass size={10} />
           HEAD
         </span>
       {:else if r.kind === "current-branch"}
         <span
-          class="inline-flex items-center gap-1 text-[9px] font-mono font-semibold px-2 py-0.5 rounded-full border shadow-sm"
+          class="inline-flex items-center gap-1 text-[9px] font-mono font-semibold px-2 py-0.5 rounded-full border shadow-xs"
           style="border-color: {getBranchColor(row.color_index)}; color: {getBranchColor(row.color_index)};"
         >
           <GitBranch size={10} />
@@ -349,7 +349,7 @@
 
   <!-- Author Initials Avatar -->
   <div
-    class="{isCompact ? 'w-3.5 h-3.5 text-[8px]' : 'w-4.5 h-4.5 text-[10px]'} rounded-full flex items-center justify-center text-white font-bold shrink-0 shadow-sm ring-1 ring-background"
+    class="{isCompact ? 'w-3.5 h-3.5 text-[8px]' : 'w-4.5 h-4.5 text-[10px]'} rounded-full flex items-center justify-center text-white font-bold shrink-0 shadow-xs ring-1 ring-background"
     style="background-color: {authorColor(avatar.hue)}"
     title="{row.author_name || 'Unknown'}{row.author_email ? ` <${row.author_email}>` : ''}"
   >
@@ -362,7 +362,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    class="fixed z-50 min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-none shadow-float"
+    class="fixed z-50 min-w-48 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden shadow-float"
     style="left: {menuPos.left}px; top: {menuPos.top}px; z-index: {LAYERS.MENU};"
     role="menu"
     aria-orientation="vertical"

@@ -1,0 +1,53 @@
+[package]
+name = "markdev"
+version = "0.1.0"
+edition = "2021"
+description = "Native Markdown core for MarkDev — parsing, indexing, and search"
+license = "MIT"
+
+[lib]
+name = "markdev"
+crate-type = ["staticlib", "lib"]
+
+[features]
+default = ["ffi", "highlight"]
+# Gates the C ABI and the cbindgen header build. GitPulse links this crate as a
+# library and never needs either, so it depends with default-features = false.
+ffi = ["dep:cbindgen"]
+# Gates tree-sitter highlighting. Optional so consumers that only want the
+# parse model do not pull six grammar crates; GitPulse enables it for E1.
+highlight = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-highlight",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-swift",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-json",
+    "dep:tree-sitter-bash",
+]
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html", "simd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Syntax highlighting for fenced code blocks. tree-sitter rather than a
+# hand-rolled tokenizer: real grammars get raw strings, nested templates, and
+# regex literals right, which a regex-based highlighter never quite does.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-highlight = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-swift = { version = "0.7", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+
+[build-dependencies]
+cbindgen = { version = "0.29", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

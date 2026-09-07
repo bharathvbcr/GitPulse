@@ -44,10 +44,23 @@ export function isWorkflowDispatchable(state: string): boolean {
 }
 
 /** One-line verdict for a local-CI report, mirroring CI badge semantics. */
-export function ciLocalVerdict(report: { passed: number; failed: number; skipped: number }): string {
-  if (report.failed > 0) return `failed (${report.failed} step${report.failed === 1 ? "" : "s"})`;
-  if (report.skipped > 0) return `passed with ${report.skipped} skipped`;
-  return `passed (${report.passed} steps)`;
+export function ciLocalVerdict(report: {
+  passed: number;
+  failed: number;
+  skipped: number;
+  test_scope?: { mode: string; fail_closed: boolean } | null;
+}): string {
+  const scopeLabel =
+    report.test_scope?.mode === "affected" && !report.test_scope.fail_closed
+      ? "affected tests"
+      : "full suite";
+  if (report.failed > 0) {
+    return `${scopeLabel} failed (${report.failed} step${report.failed === 1 ? "" : "s"})`;
+  }
+  if (report.skipped > 0) {
+    return `${scopeLabel} passed with ${report.skipped} skipped`;
+  }
+  return `${scopeLabel} passed (${report.passed} steps)`;
 }
 
 /**

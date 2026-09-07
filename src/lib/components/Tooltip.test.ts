@@ -11,6 +11,16 @@ const source = readFileSync(
 describe("Tooltip canvas hover", () => {
   it("resolves anchors through tooltipAnchorFromTarget so a canvas does not inherit a gutter title", () => {
     expect(source).toContain("tooltipAnchorFromTarget");
+    expect(source).toContain("TOOLTIP_ANCHOR_SELECTOR");
     expect(source).not.toContain('target.closest<HTMLElement>("[title], [data-tip-text]")');
+    expect(source).not.toContain('related.closest("[title], [data-tip-text]")');
+  });
+});
+
+describe("Tooltip destination guides", () => {
+  it("renders ViewGuideCard when the anchor carries data-tip-guide", () => {
+    expect(source).toContain("destinationGuide");
+    expect(source).toContain("ViewGuideCard");
+    expect(source).toContain("tipGuideOf");
   });
 });

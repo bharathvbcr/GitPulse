@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import OperationBanner, { armedLabel } from "./OperationBanner.svelte";
+import { stripMarkupComments } from "../dom/markupText";
 import { IDLE_OPERATION, type OperationState, type RepoOperation } from "../repos/operation";
 
 function op(extra: Partial<RepoOperation> = {}): RepoOperation {
@@ -28,7 +29,7 @@ describe("OperationBanner", () => {
     });
     // SSR still emits its hydration comment markers; what matters is that no
     // element or text reaches the page.
-    expect(body.replace(/<!--.*?-->/g, "").trim()).toBe("");
+    expect(stripMarkupComments(body).trim()).toBe("");
   });
 
   it("states the operation and the next step", () => {

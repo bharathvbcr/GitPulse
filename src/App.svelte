@@ -6,6 +6,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { repoStore } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
+  import { liveIndex } from "./lib/codeintel/liveIndex";
+  import { onDocsRepoChanged } from "./lib/docs/liveVault";
   import { graphStore } from "./lib/stores/graphStore";
   import { themeStore } from "./lib/stores/themeStore";
   import { filterStore } from "./lib/stores/filterStore";
@@ -46,6 +48,16 @@
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
+  import SetupWizard from "./lib/components/onboarding/SetupWizard.svelte";
+  import {
+    dismissFirstRun,
+    onboardingStore,
+    openSetupWizard,
+    refreshToolConfig,
+    refreshToolsStatus,
+  } from "./lib/tools/onboardingStore";
+
+  const showFirstRunCard = onboardingStore.showFirstRunCard;
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import CodeView from "./lib/components/CodeView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
@@ -70,6 +82,7 @@
   const loadManviOpsPanel = () => import("./lib/components/ManviOpsPanel.svelte");
   const loadReflogViewer = () => import("./lib/components/ReflogViewer.svelte");
   const loadBlameViewer = () => import("./lib/components/BlameViewer.svelte");
+  const loadRepoMapPanel = () => import("./lib/components/RepoMapPanel.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
@@ -96,7 +109,7 @@
     Download,
     Clock,
     Bug,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import {
     GRAPH_FETCH_DEBOUNCE_MS,
     createGraphFetchScheduler,
@@ -165,15 +178,17 @@
   // The terminal is a dock beneath the active view, not a view of its own: a
   // PTY has to survive a view switch, so this pane was already mounted once
   // and hidden thereafter — a page you could never leave without closing.
-  // TerminalDock owns the mount-once-keep-mounted rule; the outer
-  // {#key currentPath} still tears the session down on a real repo switch.
+  // TerminalDock owns the mount-once-keep-mounted rule, including across
+  // repository tabs (one panel per visited tab). The {#key currentPath}
+  // around the git UI remounts Sidebar/views/StatusBar; the dock sits
+  // outside that key so a tab switch cannot kill the shell.
   const terminalDockOpen = $derived($interfaceStore.terminalDockOpen);
 
   // --- fleet keep-alive -----------------------------------------------------
   // Fleet is workspace-scoped, so it sits BESIDE the repository pane rather
   // than inside it, and the two are swapped by hiding — never by unmounting.
   // Rendering Fleet as an {:else} of the repo block would destroy the
-  // {#key currentPath} subtree on every toggle, which kills the live terminal
+  // repository surface on every toggle, which kills the live terminal
   // PTY it contains and re-hydrates every open tab on the way back.
   const fleetOpen = $derived($interfaceStore.fleetOpen);
   let fleetMounted = $state(false);
@@ -361,6 +376,11 @@
     };
     window.addEventListener("gitpulse:settings", openSettings);
     track(() => window.removeEventListener("gitpulse:settings", openSettings));
+    const openToolsSetup = () => openSetupWizard("devmap", "explain");
+    window.addEventListener("gitpulse:setup-tools", openToolsSetup);
+    track(() => window.removeEventListener("gitpulse:setup-tools", openToolsSetup));
+    void refreshToolsStatus();
+    void refreshToolConfig();
 
     const handleGlobalKeydown = (e: KeyboardEvent) => {
       const isInput =
@@ -519,6 +539,10 @@
           // own debounce and cost floor, so a checkout storm becomes one
           // re-measurement per metric rather than one per file event.
           if (path) repoMetrics.invalidate(path);
+          // Live index: gated incremental `devmap build` when the map is stale
+          // (or the watcher dirty signal forces it) and no build is in flight.
+          if (path) liveIndex.onRepoChanged(path);
+          if (path) onDocsRepoChanged(path);
         },
         listenRepoChanged: (changed) =>
           listen<RepoChangedPayload>("repo-changed", (event) =>
@@ -733,7 +757,7 @@
              way, so the label is decoration, never the only cue. -->
         <button
           onclick={() => repoStore.pickAndOpenRepo()}
-          class="gp-btn !py-1 shrink-0"
+          class="gp-btn py-1! shrink-0"
           title="Open a repository"
           aria-label="Open a repository"
         >
@@ -742,7 +766,7 @@
         </button>
         <button
           onclick={() => (isCloneModalOpen = true)}
-          class="gp-btn !py-1 shrink-0"
+          class="gp-btn py-1! shrink-0"
           title="Clone a repository"
           aria-label="Clone a repository"
         >
@@ -813,7 +837,7 @@
       <!-- Ambient brand glow behind the hero card. -->
       <div
         aria-hidden="true"
-        class="pointer-events-none absolute -top-32 left-1/2 h-96 w-[36rem] -translate-x-1/2 rounded-full opacity-25 blur-3xl"
+        class="pointer-events-none absolute -top-32 left-1/2 h-96 w-xl -translate-x-1/2 rounded-full opacity-25 blur-3xl"
         style="background: var(--brand-gradient);"
       ></div>
       <div class="gp-welcome-card gp-glass gp-view max-w-md w-full flex flex-col items-center text-center space-y-6 relative">
@@ -827,12 +851,12 @@
         <div class="w-full flex gap-3">
           <button
             onclick={() => repoStore.pickAndOpenRepo()}
-            class="gp-btn-primary flex-1 !py-2.5 !px-4 !text-xs"
+            class="gp-btn-primary flex-1 py-2.5! px-4! text-xs!"
           >
             <FolderOpen size={15} />
             <span>Open Repository</span>
           </button>
-          <button onclick={() => (isCloneModalOpen = true)} class="gp-btn flex-1 !py-2.5 !px-4">
+          <button onclick={() => (isCloneModalOpen = true)} class="gp-btn flex-1 py-2.5! px-4!">
             <Download size={15} />
             <span>Clone Repo</span>
           </button>
@@ -848,7 +872,7 @@
               {#each $repoStore.recentRepos as repo}
                 <button
                   onclick={() => repoStore.openRepo(repo)}
-                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-sm hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
+                  class="w-full px-3.5 py-2 rounded-full bg-surface border border-border/70 hover:border-accent/60 shadow-xs hover:shadow-card flex items-center justify-between text-xs text-textPrimary transition-[color,background-color,border-color,box-shadow] duration-150 text-left"
                 >
                   <span class="font-medium truncate">{displayName(repo)}</span>
                   <span class="text-[10px] text-textMuted font-mono truncate max-w-xs">{repo}</span>
@@ -860,17 +884,19 @@
       </div>
     </div>
   {:else}
-    {#key $repoStore.currentPath}
       <div class="flex-1 flex overflow-hidden">
+        {#key $repoStore.currentPath}
         <svelte:boundary failed={paneFailed}>
           <Sidebar />
         </svelte:boundary>
+        {/key}
         <svelte:boundary failed={paneFailed}>
           <main id={VIEW_PANE_ID} class="gp-workspace flex-1 flex flex-col min-w-0 bg-background gp-pane">
             <!-- No {#key activeTab}: keying here destroyed and rebuilt the
                  entire pane on every view switch and replayed the .gp-view
                  entrance fade — a full-screen flicker per tab. The {#if}
                  chain alone swaps panes; state lives in stores. -->
+            {#key $repoStore.currentPath}
             <div class="gp-view flex-1 flex flex-col min-h-0">
               {#if $repoStore.activeTab === "work"}
                 <WorkspaceView
@@ -880,7 +906,7 @@
                   loadManvi={loadManviOpsPanel}
                 />
               {:else if $repoStore.activeTab === "code"}
-                <CodeView loadBlame={loadBlameViewer} />
+                <CodeView loadBlame={loadBlameViewer} loadMap={loadRepoMapPanel} />
               {:else if $repoStore.activeTab === "history"}
                 <HistoryView loadReflog={loadReflogViewer} />
               {:else if $repoStore.activeTab === "insights"}
@@ -892,10 +918,12 @@
                 />
               {/if}
             </div>
+            {/key}
             <!-- The terminal sits under the view rather than replacing it, so
                  a command's output can be read against the thing that
                  prompted it. A crash in the shell must not take the view with
-                 it, hence its own boundary. -->
+                 it, hence its own boundary. Outside the {#key} so a repository
+                 tab switch cannot unmount the PTY. -->
             <svelte:boundary failed={paneFailed}>
               <TerminalDock
                 open={terminalDockOpen}
@@ -908,8 +936,9 @@
       </div>
 
       <!-- Bottom Ambient Status Bar -->
+      {#key $repoStore.currentPath}
       <StatusBar onOpenShortcuts={() => (isShortcutsOpen = true)} />
-    {/key}
+      {/key}
 
     <!-- First-run coach mark onboarding tip -->
     <CoachMark
@@ -919,8 +948,39 @@
       shortcut="⌘K"
       class="bottom-10 right-6"
     />
+
+    {#if $showFirstRunCard}
+      <div
+        class="gp-pop gp-card fixed bottom-10 left-6 z-30 max-w-sm rounded-2xl border border-accent/40 bg-surface p-3 shadow-float"
+        role="status"
+      >
+        <div class="text-xs font-bold text-textPrimary mb-1">Optional tools</div>
+        <p class="text-[11px] text-textMuted leading-relaxed mb-2">
+          Install <span class="font-mono">devmap</span> (Code → Map) and
+          <span class="font-mono">manvi</span> (policy) when you want them — GitPulse works without either.
+        </p>
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            class="gp-btn text-[11px] px-2 py-0.5"
+            onclick={() => openSetupWizard("devmap", "explain")}
+          >
+            Set up
+          </button>
+          <button
+            type="button"
+            class="text-[11px] text-textMuted hover:text-textPrimary"
+            onclick={() => void dismissFirstRun()}
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    {/if}
   {/if}
   </div>
+
+  <SetupWizard />
 
   {#if fleetMounted}
     <!-- Workspace-scoped, so it survives repository switches; hidden rather

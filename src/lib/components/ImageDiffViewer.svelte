@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Image } from "lucide-svelte";
+  import { Image } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
 
   let {
@@ -29,21 +29,21 @@
         onclick={() => (mode = "2up")}
         aria-pressed={mode === "2up"}
         data-active={mode === "2up" ? "true" : "false"}
-        class="gp-seg-btn !py-0.5 !text-[11px]"
+        class="gp-seg-btn py-0.5! text-[11px]!"
       >2-Up</button>
       <button
         type="button"
         onclick={() => (mode = "swipe")}
         aria-pressed={mode === "swipe"}
         data-active={mode === "swipe" ? "true" : "false"}
-        class="gp-seg-btn !py-0.5 !text-[11px]"
+        class="gp-seg-btn py-0.5! text-[11px]!"
       >Swipe</button>
       <button
         type="button"
         onclick={() => (mode = "onion")}
         aria-pressed={mode === "onion"}
         data-active={mode === "onion" ? "true" : "false"}
-        class="gp-seg-btn !py-0.5 !text-[11px]"
+        class="gp-seg-btn py-0.5! text-[11px]!"
       >Onion Skin</button>
     </div>
   </div>
@@ -75,7 +75,7 @@
         </div>
       </div>
     {:else if mode === "swipe"}
-      <div class="flex flex-col items-center gap-4 w-[28rem]">
+      <div class="flex flex-col items-center gap-4 w-md">
         <div class="w-80 h-80 bg-surface border border-border/70 rounded-2xl shadow-card relative overflow-hidden">
           {#if newSrc}
             <img src={newSrc} alt={`After version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />
@@ -96,7 +96,7 @@
         />
       </div>
     {:else}
-      <div class="flex flex-col items-center gap-4 w-[28rem]">
+      <div class="flex flex-col items-center gap-4 w-md">
         <div class="w-80 h-80 bg-surface border border-border/70 rounded-2xl shadow-card relative overflow-hidden">
           {#if oldSrc}
             <img src={oldSrc} alt={`Before version of ${filePath}`} class="absolute inset-0 w-full h-full object-contain" />

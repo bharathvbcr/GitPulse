@@ -20,10 +20,13 @@ use tree_sitter::Node;
 
 pub(crate) mod csharp;
 pub(crate) mod dart;
+pub mod erlang;
 pub(crate) mod java;
 pub(crate) mod jvm_dotnet;
 pub(crate) mod kotlin;
 pub mod lua;
+pub mod nix;
+pub mod pascal;
 pub(crate) mod php;
 pub mod r;
 pub(crate) mod ruby;
@@ -38,6 +41,9 @@ pub mod scala;
 /// divergence independently — a Java method in an `interface` emits `F::I.d`
 /// while that helper answers `F::d`, and every such row is an orphaned edge.
 pub(crate) mod scope;
+pub mod shell;
+pub mod solidity;
+pub mod sql;
 pub mod swift;
 
 /// Route one node to its language's call extractor.
@@ -57,41 +63,26 @@ pub(crate) fn extract_calls(
     match lang {
         "csharp" => csharp::extract_csharp_call(node, source, file_symbol_name, calls, references),
         "dart" => dart::extract_dart_call(node, source, file_symbol_name, calls, references),
+        "erlang" => erlang::extract_erlang_call(node, source, file_symbol_name, calls, references),
         "java" => java::extract_java_call(node, source, file_symbol_name, calls, references),
         "kotlin" => kotlin::extract_kotlin_call(node, source, file_symbol_name, calls, references),
         // Luau is a Lua superset and shares its node kinds; verified identical
         // by the agent that wrote the module against both grammars.
         "lua" | "luau" => lua::extract_lua_call(node, source, file_symbol_name, calls, references),
+        "nix" => nix::extract_nix_call(node, source, file_symbol_name, calls, references),
+        "pascal" => pascal::extract_pascal_call(node, source, file_symbol_name, calls, references),
         "php" => php::extract_php_calls(node, source, file_symbol_name, calls, references),
         "r" => r::extract_r_call(node, source, file_symbol_name, calls, references),
         "ruby" => ruby::extract_ruby_calls(node, source, file_symbol_name, calls, references),
         "scala" => scala::extract_scala_call(node, source, file_symbol_name, calls, references),
+        // `detect_language` maps `.sh`, `.bash` and `.zsh` to one key; all three
+        // are parsed by `tree-sitter-bash`, so one arm serves the family.
+        "shell" => shell::extract_shell_call(node, source, file_symbol_name, calls, references),
+        "solidity" => {
+            solidity::extract_solidity_call(node, source, file_symbol_name, calls, references)
+        }
+        "sql" => sql::extract_sql_call(node, source, file_symbol_name, calls, references),
         "swift" => swift::extract_swift_call(node, source, file_symbol_name, calls, references),
         _ => {}
-    }
-}
-
-/// Languages whose calls this module extracts.
-///
-/// Read by the coverage report so "this language has no call graph" is a stated
-/// fact rather than an indistinguishable zero. Kept sorted; the test pins it.
-pub const CALL_EXTRACTION_LANGUAGES: &[&str] = &[
-    "csharp", "dart", "java", "kotlin", "lua", "luau", "php", "r", "ruby", "scala", "swift",
-];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_covered_language_list_is_sorted_and_unique() {
-        let mut sorted = CALL_EXTRACTION_LANGUAGES.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.as_slice(),
-            CALL_EXTRACTION_LANGUAGES,
-            "the list is binary-searched and reported to consumers; keep it sorted and unique"
-        );
     }
 }

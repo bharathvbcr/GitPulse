@@ -56,6 +56,46 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
     "LineCounts",
     { reason: "returned only by an orphaned command", orphanCommand: "cmd_count_loc" },
   ],
+  [
+    "GraphVizLoad",
+    {
+      reason:
+        "payload is serde_json::Value from viz::build_payload / map_preview; shape pinned by Rust unit tests and TS GraphVizPayload consumers",
+    },
+  ],
+  // Optional-tools ladder + codeintel/docs surfaces landed ahead of CONTRACTS rows.
+  // Each has a TS mirror; add named contracts before removing from this list.
+  ["Backlink", { reason: "MarkDev docs IPC; mirrored in src/lib/docs — pending CONTRACTS row" }],
+  ["BrokenLink", { reason: "MarkDev docs IPC; mirrored in src/lib/docs — pending CONTRACTS row" }],
+  ["BuildOutcome", { reason: "devmap build/refresh outcome; pending CONTRACTS row" }],
+  ["CliStatus", { reason: "devmap CLI probe; pending CONTRACTS row" }],
+  ["CloneSourceOutcome", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["CodeintelAffectedTests", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CodeintelClones", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CodeintelExplore", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CodeintelLayeredImpact", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CodeintelNeighbors", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["DocRenameOutcome", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
+  ["DocsStatus", { reason: "MarkDev docs IPC; pending CONTRACTS row" }],
+  ["Graph", { reason: "MarkDev vault graph JSON; pending CONTRACTS row" }],
+  ["InstallOutcome", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["LadderAssessment", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["LiveRefreshOutcome", { reason: "devmap live refresh; pending CONTRACTS row" }],
+  ["ParsedMarkdown", { reason: "MarkDev parse IPC; pending CONTRACTS row" }],
+  ["PreflightReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["PreviewFileResult", { reason: "devmap preview file envelope; pending CONTRACTS row" }],
+  ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],
+  ["RepoMapLoad", { reason: "repo map panel load; pending CONTRACTS row" }],
+  ["SearchHit", { reason: "MarkDev / vault search hit; pending CONTRACTS row" }],
+  ["SyntaxHighlightSpan", { reason: "syntax highlight IPC; pending CONTRACTS row" }],
+  ["ToolConfigView", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["ToolsStatus", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["VerifyReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
+  ["WorkspaceLinksResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
+  ["WorkspaceRegisterResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
+  ["WorkspaceSearchResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
+  ["WorkspaceSnapshot", { reason: "workspace registry IPC; pending CONTRACTS row" }],
+  ["WorkspaceUnregisterResult", { reason: "workspace registry IPC; pending CONTRACTS row" }],
 ]);
 
 /**

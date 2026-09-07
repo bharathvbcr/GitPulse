@@ -3,7 +3,7 @@
   import type { HeatmapDay, PulseCommitSummary } from "../../pulse/types";
   import { repoStore } from "../../stores/repoStore";
   import { filterStore } from "../../stores/filterStore";
-  import { Activity, Flame, Hash } from "lucide-svelte";
+  import { Activity, Flame, Hash } from "@lucide/svelte";
 
   let {
     commits = [],
@@ -71,7 +71,7 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col gap-3">
+<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-3">
   <div class="flex items-center justify-between border-b border-border/50 pb-2.5">
     <div class="flex items-center gap-2">
       <Activity size={15} class="text-accent shrink-0" />
@@ -84,7 +84,7 @@
         type="button"
         onclick={() => (mode = "count")}
         class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1.5 {mode === 'count'
-          ? 'bg-surface font-medium text-textPrimary shadow-sm'
+          ? 'bg-surface font-medium text-textPrimary shadow-xs'
           : 'text-textMuted hover:text-textPrimary'}"
       >
         <Hash size={12} />
@@ -94,7 +94,7 @@
         type="button"
         onclick={() => (mode = "churn")}
         class="px-2.5 py-1 rounded-md transition-colors flex items-center gap-1.5 {mode === 'churn'
-          ? 'bg-surface font-medium text-textPrimary shadow-sm'
+          ? 'bg-surface font-medium text-textPrimary shadow-xs'
           : 'text-textMuted hover:text-textPrimary'}"
       >
         <Flame size={12} />

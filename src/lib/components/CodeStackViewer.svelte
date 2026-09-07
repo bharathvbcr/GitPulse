@@ -33,7 +33,7 @@
     ArrowUpFromLine,
     CircleAlert,
     Info,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { reportPanelError } from "../diagnostics/report";
   import { timestampFormat } from "../ui/timestampFormat";
@@ -322,7 +322,7 @@
   {#if loadError}
     <div role="alert" class="mb-3 max-w-3xl p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300 flex items-center justify-between gap-3">
       <span class="min-w-0 truncate" title={loadError}>Failed to load stack: {loadError}</span>
-      <button onclick={() => loadStack()} disabled={isLoading || restackingKey !== null} class="gp-btn shrink-0 !py-1 !px-2.5 !text-[11px]">
+      <button onclick={() => loadStack()} disabled={isLoading || restackingKey !== null} class="gp-btn shrink-0 py-1! px-2.5! text-[11px]!">
         <RefreshCw size={12} class={isLoading ? "animate-spin" : ""} />
         <span>Retry</span>
       </button>
@@ -432,7 +432,7 @@
                   <button
                     onclick={() => restack(node)}
                     disabled={restackingKey !== null}
-                    class="gp-btn !py-1 !px-2.5 !text-[11px]"
+                    class="gp-btn py-1! px-2.5! text-[11px]!"
                     title="Rebase {node.branch_name} onto {node.parent_branch_name}{plan.length > 1
                       ? `, then the ${plan.length - 1} branch${plan.length === 2 ? '' : 'es'} stacked above it`
                       : ''}"
@@ -455,7 +455,7 @@
                   <button
                     onclick={() => repoStore.checkoutBranch(node.branch_name)}
                     disabled={restackingKey !== null}
-                    class="gp-btn !py-1 !px-2.5 !text-[11px]"
+                    class="gp-btn py-1! px-2.5! text-[11px]!"
                   >
                     Checkout
                   </button>
@@ -507,7 +507,7 @@
         {#each unplaced as name (name)}
           <button
             type="button"
-            class="gp-pill !text-[10px] font-mono hover:text-accent"
+            class="gp-pill text-[10px]! font-mono hover:text-accent"
             disabled={restackingKey !== null}
             onclick={() => repoStore.checkoutBranch(name)}
             title="Checkout {name}"

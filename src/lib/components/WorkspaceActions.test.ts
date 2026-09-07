@@ -85,7 +85,7 @@ describe("the work-in-progress roll-up panel", () => {
     expect(source).toContain("border-rose-500/30 bg-rose-500/10");
     expect(source).toContain('title="Close (Esc)"');
     // Replaced, not accumulated: the old bottom button is gone.
-    expect(source).not.toContain('class="gp-btn mt-2 !py-1 !px-2 !text-[11px] w-full"');
+    expect(source).not.toContain('class="gp-btn mt-2 py-1! px-2! text-[11px]! w-full"');
   });
 
   it("styles the trigger as a defined pill button, not a bare transparent element", () => {

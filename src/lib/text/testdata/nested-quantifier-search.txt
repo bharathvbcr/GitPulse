@@ -1,0 +1,6 @@
+# Search patterns whose nesting can backtrack exponentially.
+# Loaded by tests so this source tree does not embed a ReDoS regular expression.
+(a+)+c
+([a-z]+\s*)+$
+(\d{2,})*x
+((ab)*)*c

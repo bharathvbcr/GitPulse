@@ -63,10 +63,46 @@ describe("isWorkflowDispatchable", () => {
 
 describe("ciLocalVerdict", () => {
   it("fails loudly first, then reports skips, then plain passes", () => {
-    expect(ciLocalVerdict({ passed: 2, failed: 1, skipped: 3 })).toBe("failed (1 step)");
-    expect(ciLocalVerdict({ passed: 1, failed: 2, skipped: 0 })).toBe("failed (2 steps)");
-    expect(ciLocalVerdict({ passed: 5, failed: 0, skipped: 1 })).toBe("passed with 1 skipped");
-    expect(ciLocalVerdict({ passed: 6, failed: 0, skipped: 0 })).toBe("passed (6 steps)");
+    expect(ciLocalVerdict({ passed: 2, failed: 1, skipped: 3 })).toBe(
+      "full suite failed (1 step)",
+    );
+    expect(ciLocalVerdict({ passed: 1, failed: 2, skipped: 0 })).toBe(
+      "full suite failed (2 steps)",
+    );
+    expect(ciLocalVerdict({ passed: 5, failed: 0, skipped: 1 })).toBe(
+      "full suite passed with 1 skipped",
+    );
+    expect(ciLocalVerdict({ passed: 6, failed: 0, skipped: 0 })).toBe(
+      "full suite passed (6 steps)",
+    );
+  });
+
+  it("never badges affected tests from a fail-closed full suite", () => {
+    expect(
+      ciLocalVerdict({
+        passed: 3,
+        failed: 0,
+        skipped: 0,
+        test_scope: { mode: "full_suite", fail_closed: true },
+      }),
+    ).toBe("full suite passed (3 steps)");
+    expect(
+      ciLocalVerdict({
+        passed: 2,
+        failed: 0,
+        skipped: 0,
+        test_scope: { mode: "affected", fail_closed: false },
+      }),
+    ).toBe("affected tests passed (2 steps)");
+    // Fail-closed with mode still saying affected must not claim the badge.
+    expect(
+      ciLocalVerdict({
+        passed: 2,
+        failed: 0,
+        skipped: 0,
+        test_scope: { mode: "affected", fail_closed: true },
+      }),
+    ).toBe("full suite passed (2 steps)");
   });
 });
 

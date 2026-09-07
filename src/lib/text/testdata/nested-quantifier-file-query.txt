@@ -1,0 +1,6 @@
+# File-query strings (`/body/`) whose bodies nest unbounded quantifiers.
+# Loaded by tests so this source tree does not embed a ReDoS regular expression.
+/(a+)+$/
+/(\w+)+$/
+/([a-z]+)*$/
+/(\d{2,})*$/

@@ -338,6 +338,42 @@ describe("repoStore tabs", () => {
     expect(get(store).currentPath).toBe("/r/a");
   });
 
+  it("reorders tabs by id without changing the active repository, and persists the order", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = memoryStorage();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage,
+        caseInsensitive: true,
+        graph: makeGraph().api,
+        filter: makeFilter(),
+      });
+      await store.openRepo("/r/a");
+      await store.openRepo("/r/b");
+      await store.openRepo("/r/c");
+      const activeId = get(store).activeTabId;
+      const first = get(store).openTabs[0];
+      store.moveTab(first.id, 2);
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/c", "/r/a"]);
+      expect(get(store).activeTabId).toBe(activeId);
+      store.moveTabBy(first.id, -1);
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
+      store.moveTab("missing", 0);
+      store.moveTabBy(first.id, 0);
+      expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
+      vi.advanceTimersByTime(300);
+      const persisted = JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
+        tabs?: Array<{ path: string }>;
+        activePath?: string;
+      };
+      expect(persisted.tabs?.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
+      expect(persisted.activePath).toBe("/r/c");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("restores persisted tabs, view, and the previously active repo", async () => {
     const storage = memoryStorage({
       [STORAGE_KEY_WORKSPACE]: JSON.stringify({

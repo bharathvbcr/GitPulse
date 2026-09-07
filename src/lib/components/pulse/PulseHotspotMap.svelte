@@ -2,7 +2,7 @@
   import { computeHotspotRisks } from "../../pulse/metrics";
   import type { HotspotRiskItem, PulseFileChurn } from "../../pulse/types";
   import type { CoverageReport } from "../../coverage/types";
-  import { Flame, FileCode } from "lucide-svelte";
+  import { Flame, FileCode } from "@lucide/svelte";
 
   let {
     topFiles = [],
@@ -52,7 +52,7 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col gap-4">
+<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
   <!-- Header & Risk Summary Banner -->
   <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/40 pb-3">
     <div>
@@ -116,7 +116,7 @@
         type="text"
         placeholder="Filter hotspots by filename..."
         bind:value={searchFilter}
-        class="w-full bg-surface text-textPrimary text-xs rounded-lg px-3 py-1.5 border border-border/70 focus:outline-none focus:border-accent"
+        class="w-full bg-surface text-textPrimary text-xs rounded-lg px-3 py-1.5 border border-border/70 focus:outline-hidden focus:border-accent"
       />
     </div>
     {#if selectedLevel !== "all" || searchFilter}

@@ -15,7 +15,7 @@
     Unlock,
     Sparkles,
     AlertTriangle,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { agentKind, agentSessionSlug, isAgentWorktree } from "../work/agentWorktree";
 
 
@@ -334,23 +334,23 @@
         bind:value={newPath}
         placeholder="/absolute/path for the worktree"
         required
-        class="w-full bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-none focus:border-accent/60 transition-colors"
+        class="w-full bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
       />
       <div class="flex gap-1.5">
         <input
           bind:value={newBranch}
           placeholder="new branch (optional)"
-          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-none focus:border-accent/60 transition-colors"
+          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
         <input
           bind:value={startPoint}
           placeholder="start point"
-          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-none focus:border-accent/60 transition-colors"
+          class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
       </div>
       <div class="flex items-center justify-between">
         <span class="text-[9px] text-textMuted">No branch name creates a detached checkout.</span>
-        <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary !px-2 !py-0.5 !text-[10px]">
+        <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary px-2! py-0.5! text-[10px]!">
           {isCreating ? "Adding…" : "Add"}
         </button>
       </div>
@@ -495,7 +495,7 @@
                 >unbind</button>
               {:else if taskView.leases.length > 0}
                 <select
-                  class="text-[9px] bg-transparent text-textMuted border border-border/60 rounded-full px-1 py-px hover:text-accent focus:outline-none focus:border-accent/60"
+                  class="text-[9px] bg-transparent text-textMuted border border-border/60 rounded-full px-1 py-px hover:text-accent focus:outline-hidden focus:border-accent/60"
                   aria-label="Bind {wt.name} to a task"
                   onchange={(e) => {
                     const id = (e.currentTarget as HTMLSelectElement).value;

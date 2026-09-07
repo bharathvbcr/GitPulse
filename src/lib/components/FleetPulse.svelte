@@ -22,7 +22,7 @@
     TrendingUp,
     Trash2,
     Users,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import type { FleetPulse, FleetLanguageMix } from "../fleet/pulse";
   import { describePulseCoverage, TREND_DAYS } from "../fleet/pulse";
   import { foldFleetLanguages } from "../fleet/languages";
@@ -90,7 +90,7 @@
   <div class="flex items-center gap-2">
     <button
       type="button"
-      class="flex items-center gap-1.5 text-textPrimary hover:text-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
+      class="flex items-center gap-1.5 text-textPrimary hover:text-accent transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 rounded"
       aria-expanded={open}
       onclick={() => onToggle?.()}
       data-testid="fleet-pulse-toggle"
@@ -131,7 +131,7 @@
       {#each COMMIT_WINDOWS as days (days)}
         <button
           type="button"
-          class="px-1.5 py-0.5 rounded text-[10px] tabular-nums transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50 {days ===
+          class="px-1.5 py-0.5 rounded text-[10px] tabular-nums transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-50 {days ===
           windowDays
             ? 'bg-accent/15 text-accent font-semibold'
             : 'text-textMuted hover:text-textPrimary hover:bg-surfaceHover'}"
@@ -201,7 +201,7 @@
                 <li>
                   <button
                     type="button"
-                    class="w-full flex items-center gap-1.5 text-[11px] text-left rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                    class="w-full flex items-center gap-1.5 text-[11px] text-left rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
                     onclick={() => onSelect?.(repo.path)}
                     title="{repo.path} — {repo.commits} commits in the window"
                   >
@@ -230,14 +230,14 @@
                   <li class="flex items-center gap-1">
                     <button
                       type="button"
-                      class="flex-1 min-w-0 text-left text-[11px] truncate text-textPrimary rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                      class="flex-1 min-w-0 text-left text-[11px] truncate text-textPrimary rounded px-1 py-0.5 hover:bg-surfaceHover focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
                       onclick={() => onSelect?.(repo.path)}
                       title="{repo.path} — no commits in the window. Click to find its row."
                       >{repo.label}</button
                     >
                     <button
                       type="button"
-                      class="p-0.5 rounded text-textMuted/60 hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+                      class="p-0.5 rounded text-textMuted/60 hover:text-rose-400 hover:bg-surfaceHover transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/60"
                       title="Remove {repo.label} from Fleet (closes the repository)"
                       aria-label="Remove {repo.label} from Fleet"
                       data-testid="fleet-dormant-remove"

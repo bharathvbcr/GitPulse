@@ -26,7 +26,7 @@
     Pencil,
     Rows3,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { churnLabel, truncationNote, type FileRail, type RailEntry } from "../diff/fileRail";
   import {
     activeRowIndex,
@@ -46,6 +46,7 @@
   import { timestampFormat } from "../ui/timestampFormat";
   import VirtualList from "./VirtualList.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import type { PreviewMarker } from "../codeintel/previewSummary";
 
   let {
     rail,
@@ -61,6 +62,8 @@
     width = 248,
     onResize,
     commitsOpen = $bindable(false),
+    /** A1 markers from the shared preview store — not a second query path. */
+    previewMarkers = null,
   }: {
     rail: FileRail;
     /** Recent commits, so moving BETWEEN changes needs no trip to Graph. */
@@ -84,6 +87,7 @@
      * to anything that renders the component once.
      */
     commitsOpen?: boolean;
+    previewMarkers?: Map<string, PreviewMarker> | null;
   } = $props();
 
   /** Row height for the windowed file list; must match the row's own height. */
@@ -257,7 +261,7 @@
     </button>
     <button
       type="button"
-      class="gp-icon-btn !p-1"
+      class="gp-icon-btn p-1!"
       onclick={onCollapse}
       title="Hide the file list"
       aria-label="Hide the file list"
@@ -327,10 +331,10 @@
       {rail.source === "commit" ? "Commit files" : "Changed files"}
     </span>
     <span class="ml-auto text-[10px] tabular-nums text-textMuted">{rail.entries.length}</span>
-    <div class="gp-segmented !p-0.5" role="group" aria-label="File list layout">
+    <div class="gp-segmented p-0.5!" role="group" aria-label="File list layout">
       <button
         type="button"
-        class="gp-seg-btn !px-1.5 !py-0.5"
+        class="gp-seg-btn px-1.5! py-0.5!"
         aria-pressed={mode === "list"}
         data-active={mode === "list" ? "true" : "false"}
         title="Flat list, in the order git reports"
@@ -340,7 +344,7 @@
       </button>
       <button
         type="button"
-        class="gp-seg-btn !px-1.5 !py-0.5"
+        class="gp-seg-btn px-1.5! py-0.5!"
         aria-pressed={mode === "tree"}
         data-active={mode === "tree" ? "true" : "false"}
         title="Group by directory"
@@ -356,7 +360,7 @@
     <input
       bind:value={query}
       type="text"
-      class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-none placeholder:text-textMuted/60"
+      class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
       placeholder="Filter files…"
       aria-label="Filter files in this diff"
       onkeydown={(e) => {
@@ -369,7 +373,7 @@
     {#if query}
       <button
         type="button"
-        class="gp-icon-btn !p-0.5"
+        class="gp-icon-btn p-0.5!"
         onclick={() => (query = "")}
         title="Clear the filter"
         aria-label="Clear the filter"
@@ -412,6 +416,7 @@
     {:else if row?.kind === "file"}
       {@const active = isActiveRow(row, index)}
       {@const churn = churnLabel(row.entry)}
+      {@const marker = previewMarkers?.get(row.entry.path) ?? null}
       <button
         type="button"
         class="flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] hover:bg-surfaceHover {active
@@ -419,7 +424,7 @@
           : 'text-textMuted'}"
         style="height: {ROW_HEIGHT}px; padding-left: {8 + row.depth * 10}px"
         aria-current={active ? "true" : undefined}
-        title={row.title}
+        title={marker ? `${row.title} — ${marker.title}` : row.title}
         onclick={() => onOpen(row.entry)}
       >
         <span class="w-3 shrink-0 font-mono text-[10px] {statusTone(row.entry.statusCode)}">
@@ -431,6 +436,17 @@
           {/if}
           <span class="shrink-0 truncate">{row.name}</span>
         </span>
+        {#if marker && marker.kind !== "clean"}
+          <span
+            class="shrink-0 rounded px-0.5 font-mono text-[9px] tabular-nums {marker.kind === 'breaks'
+              ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
+              : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}"
+            title={marker.title}
+            data-preview-marker={marker.kind}
+          >
+            {marker.label}
+          </span>
+        {/if}
         {#if rail.source === "worktree" && row.entry.isStaged}
           <span class="shrink-0 text-[9px] text-emerald-600 dark:text-emerald-400">staged</span>
         {/if}

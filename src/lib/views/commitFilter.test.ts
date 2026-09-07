@@ -38,13 +38,14 @@ describe("commit-search chord", () => {
     expect(isCommitSearchChord({ key: "f" })).toBe(false);
   });
 
-  it("leaves Code to the in-file search, in both of its sections", () => {
-    // Blame is a section of Code and its lines are the Explorer's lines, so
-    // ⌘F must not mean one thing on a file and something else on that same
-    // file one click later.
+  it("leaves Code to the in-file search, in all of its sections", () => {
+    // Blame and Map are sections of Code. Blame's lines are the Explorer's
+    // lines; Map has no commit list. ⌘F must not mean one thing on a file and
+    // something else one click later.
     expect(ownsCommitSearchChord("code")).toBe(false);
     expect(ownsCommitSearchChord("code", "explorer")).toBe(false);
     expect(ownsCommitSearchChord("code", "blame")).toBe(false);
+    expect(ownsCommitSearchChord("code", "map")).toBe(false);
   });
 
   it("leaves History's diff to its own find bar, and keeps the rest", () => {

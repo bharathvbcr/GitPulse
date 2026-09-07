@@ -18,7 +18,7 @@ describe("GitHubPanel", () => {
     // stays legible from the mark and the owner/repo link beside it, both of
     // which need a context this render has not got.
     expect(body).toContain("Remote");
-    expect(body).toContain("lucide-github");
+    expect(body).toContain("lucide-folder-git-2");
     expect(body).toContain("Run CI locally");
     expect(body).toContain("Refresh");
   });
@@ -93,6 +93,12 @@ describe("GitHubPanel guarded-action contracts", () => {
     // Assignment happens only while this run is still the live one.
     const after = source.indexOf("guard.isLive()", invokeIdx);
     expect(after).toBeGreaterThan(-1);
+  });
+
+  it("surfaces fail-closed full-suite reasons from test_scope", () => {
+    expect(source).toContain("ciReport.test_scope");
+    expect(source).toContain("fail_closed");
+    expect(source).toContain("full suite —");
   });
 
   it("surfaces backend degradation instead of clean-looking empty states", () => {

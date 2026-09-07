@@ -32,6 +32,18 @@ const NO_TS_MIRROR = new Map<string, string>([
     "RebaseActionKind",
     "modelled in the UI as PlannerAction plus a separate wire union, because Reword carries a payload and serializes as an object rather than a bare string",
   ],
+  [
+    "CapabilityAnswer",
+    "process-local cache only; IPC returns ToolStatus.installed / reason, never this enum",
+  ],
+  [
+    "ReleaseAvailability",
+    "internal ladder probe; the wizard sees RungStatus.available / block, never this enum",
+  ],
+  [
+    "ConfigPathStaleReason",
+    "ToolConfigView.stale.reason is typed as string in TS; the UI does not branch on the variant",
+  ],
 ]);
 
 /** serde's rename_all, for the rules this repo uses. */

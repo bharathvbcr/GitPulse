@@ -122,8 +122,8 @@ describe("macOS material", () => {
   });
 
   it("keeps the -webkit- prefix on every backdrop-filter it declares", () => {
-    // WKWebView needed the prefix before Safari 18; autoprefixer is configured
-    // to keep authored prefixes, not to add missing ones.
+    // WKWebView needed the prefix before Safari 18; the declarations are
+    // authored in pairs so a missing -webkit- copy cannot ship.
     const declarations = [...css.matchAll(/^(\s*)(-webkit-)?backdrop-filter:/gm)];
     const unprefixed = declarations.filter(([, , prefix]) => !prefix).length;
     const prefixed = declarations.length - unprefixed;

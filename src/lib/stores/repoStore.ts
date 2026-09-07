@@ -28,7 +28,8 @@ import {
   openTab,
   pinTab as pinWorkspaceTab,
   removeRecent as removeWorkspaceRecent,
-  reorderTab,
+  moveTabBy as moveWorkspaceTabBy,
+  moveTabTo as moveWorkspaceTabTo,
   type WorkspaceTabs,
 } from "../repos/tabModel";
 import {
@@ -40,6 +41,7 @@ import {
   type StorageLike,
   type ViewTab,
 } from "../repos/persist";
+import { scheduleWorkspaceSync } from "../codeintel/workspaceSync";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
 import { summarizeBulkOutcome } from "../repos/bulkOps";
 import type { StashAction, StashEntry } from "../repos/stash";
@@ -783,6 +785,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let lastPersistedPayload: string | null = null;
   /** Recents payload last handed to the native menu; IPC fires only on change. */
   let lastSentRecentsJson: string | null = null;
+  /** Last open-tab set synced into workspace.json — skip no-op publishes. */
+  let lastWorkspaceSyncKey: string | null = null;
   let pendingPersist: { data: PersistedWorkspace; recents: string[] } | null =
     null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -799,6 +803,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   function publish() {
     set(project(internal));
     persist();
+    const active = internal.workspace.activeId
+      ? internal.sessions[internal.workspace.activeId]
+      : undefined;
+    const paths = internal.workspace.tabs.map((tab) => tab.path);
+    const syncKey = JSON.stringify({
+      root: active?.path ?? null,
+      paths,
+    });
+    if (syncKey !== lastWorkspaceSyncKey) {
+      lastWorkspaceSyncKey = syncKey;
+      scheduleWorkspaceSync(active?.path ?? null, paths);
+    }
   }
 
   /**
@@ -1620,7 +1636,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (tab) await store.activateTab(tab.id);
     },
     reorderTabs: (fromIndex: number, toIndex: number) => {
-      replaceWorkspace(reorderTab(internal.workspace, fromIndex, toIndex));
+      const tab = internal.workspace.tabs[fromIndex];
+      if (tab) store.moveTab(tab.id, toIndex);
+    },
+    moveTab: (id: string, toIndex: number) => {
+      const next = moveWorkspaceTabTo(internal.workspace, id, toIndex);
+      if (next === internal.workspace) return;
+      replaceWorkspace(next);
+      publish();
+    },
+    moveTabBy: (id: string, delta: number) => {
+      const next = moveWorkspaceTabBy(internal.workspace, id, delta);
+      if (next === internal.workspace) return;
+      replaceWorkspace(next);
       publish();
     },
     pinTab: (id: string, pinned: boolean) => {

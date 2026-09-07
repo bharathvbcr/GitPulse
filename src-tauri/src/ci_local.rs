@@ -70,13 +70,79 @@ pub struct CiLocalReport {
     /// the note failed".
     #[serde(default)]
     pub not_recorded_reason: String,
+    /// How test steps were scoped — affected files vs full suite — and why.
+    ///
+    /// Absent from older clients; always present on new reports so a pass
+    /// from a fail-closed full suite cannot be read as "affected tests passed".
+    #[serde(default)]
+    pub test_scope: CiTestScope,
+}
+
+/// How the planner scoped test steps for one CI:local run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiTestScope {
+    /// `affected` when path-filtered; `full_suite` otherwise (including every
+    /// fail-closed path).
+    pub mode: String,
+    /// Why the full suite was chosen, or a short description of the filter.
+    /// Never empty when `fail_closed` is true — the reason is the product.
+    pub reason: String,
+    /// Changed-file seeds that fed `affected_tests`.
+    pub seeds: Vec<String>,
+    /// Test **files** that will run when `mode` is `affected`; empty on full suite.
+    pub test_files: Vec<String>,
+    /// True when the graph could not be trusted and the full suite was offered.
+    pub fail_closed: bool,
+}
+
+impl Default for CiTestScope {
+    fn default() -> Self {
+        Self {
+            mode: "full_suite".into(),
+            reason: String::new(),
+            seeds: Vec::new(),
+            test_files: Vec::new(),
+            fail_closed: false,
+        }
+    }
+}
+
+impl CiTestScope {
+    fn full_suite(reason: impl Into<String>, seeds: Vec<String>) -> Self {
+        Self {
+            mode: "full_suite".into(),
+            reason: reason.into(),
+            seeds,
+            test_files: Vec::new(),
+            fail_closed: true,
+        }
+    }
+
+    fn affected(test_files: Vec<String>, seeds: Vec<String>) -> Self {
+        let n = test_files.len();
+        Self {
+            mode: "affected".into(),
+            reason: format!("running {n} test file(s) reached by the changed-file set"),
+            seeds,
+            test_files,
+            fail_closed: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CiStep {
-    pub name: &'static str,
+    pub name: String,
     pub program: String,
     pub args: Vec<String>,
+}
+
+/// Planned pipeline plus the test-scope decision HealthPanel / coverage can read
+/// without re-deriving it from argv.
+#[derive(Debug, Clone)]
+pub struct CiPlan {
+    pub steps: Vec<CiStep>,
+    pub test_scope: CiTestScope,
 }
 
 impl CiStep {
@@ -108,21 +174,25 @@ fn find_cargo_manifest(repo_root: &Path) -> Option<PathBuf> {
 /// Plans the steps this checkout would run, purely from its manifests.
 /// No toolchain probing happens here: a missing binary surfaces as that
 /// step's failure when it runs, exactly like CI on a broken runner image.
+///
+/// Prefer [`plan_ci_with_affected`] when changed-file seeds are known — that
+/// path can narrow test steps to the files the code map reaches, or fall back
+/// to this full suite loudly when the graph cannot be trusted.
 pub fn plan_ci_steps(repo_root: &Path) -> Vec<CiStep> {
     let mut steps = Vec::new();
     if repo_root.join("package.json").is_file() {
         steps.push(CiStep {
-            name: "Frontend type-check",
+            name: "Frontend type-check".into(),
             program: npm_program().to_string(),
             args: vec!["run".into(), "check".into()],
         });
         steps.push(CiStep {
-            name: "Frontend unit tests",
+            name: "Frontend unit tests".into(),
             program: npm_program().to_string(),
             args: vec!["test".into()],
         });
         steps.push(CiStep {
-            name: "Frontend build",
+            name: "Frontend build".into(),
             program: npm_program().to_string(),
             args: vec!["run".into(), "build".into()],
         });
@@ -130,7 +200,7 @@ pub fn plan_ci_steps(repo_root: &Path) -> Vec<CiStep> {
     if let Some(manifest) = find_cargo_manifest(repo_root) {
         let manifest = manifest.to_string_lossy().to_string();
         steps.push(CiStep {
-            name: "Rust format check",
+            name: "Rust format check".into(),
             program: "cargo".into(),
             args: vec![
                 "fmt".into(),
@@ -142,7 +212,7 @@ pub fn plan_ci_steps(repo_root: &Path) -> Vec<CiStep> {
             ],
         });
         steps.push(CiStep {
-            name: "Rust lint (clippy)",
+            name: "Rust lint (clippy)".into(),
             program: "cargo".into(),
             args: vec![
                 "clippy".into(),
@@ -155,12 +225,376 @@ pub fn plan_ci_steps(repo_root: &Path) -> Vec<CiStep> {
             ],
         });
         steps.push(CiStep {
-            name: "Rust tests",
+            name: "Rust tests".into(),
             program: "cargo".into(),
             args: vec!["test".into(), "--manifest-path".into(), manifest],
         });
     }
+    if python_test_runner_available(repo_root) {
+        steps.push(CiStep {
+            name: "Python tests".into(),
+            program: "pytest".into(),
+            args: Vec::new(),
+        });
+    }
     steps
+}
+
+/// True when this checkout looks like it has a pytest-driven suite the
+/// planner can invoke without inventing a toolchain.
+fn python_test_runner_available(repo_root: &Path) -> bool {
+    repo_root.join("pytest.ini").is_file()
+        || repo_root.join("conftest.py").is_file()
+        || repo_root
+            .join("pyproject.toml")
+            .is_file()
+            .then(|| std::fs::read_to_string(repo_root.join("pyproject.toml")).ok())
+            .flatten()
+            .is_some_and(|text| text.contains("[tool.pytest") || text.contains("pytest"))
+}
+
+/// Changed-file paths that seed affected-tests: current path plus rename source.
+pub fn seed_paths_from_statuses(statuses: &[crate::engine::git_reader::FileStatus]) -> Vec<String> {
+    let mut seeds = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        if let Some(old) = status.old_path.as_ref() {
+            if !old.is_empty() {
+                seeds.push(old.clone());
+            }
+        }
+        if !status.path.is_empty() {
+            seeds.push(status.path.clone());
+        }
+    }
+    seeds.sort();
+    seeds.dedup();
+    seeds
+}
+
+/// Ecosystem a test **file** path belongs to, for runner filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TestRunnerFamily {
+    Frontend,
+    Rust,
+    Python,
+}
+
+fn test_runner_family(path: &str) -> Option<TestRunnerFamily> {
+    let lower = path.replace('\\', "/").to_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    if file.ends_with(".py") {
+        Some(TestRunnerFamily::Python)
+    } else if file.ends_with(".rs") {
+        Some(TestRunnerFamily::Rust)
+    } else if file.ends_with(".ts")
+        || file.ends_with(".tsx")
+        || file.ends_with(".js")
+        || file.ends_with(".jsx")
+        || file.ends_with(".mts")
+        || file.ends_with(".cts")
+        || file.ends_with(".svelte")
+    {
+        Some(TestRunnerFamily::Frontend)
+    } else {
+        None
+    }
+}
+
+fn is_test_step_name(name: &str) -> bool {
+    matches!(name, "Frontend unit tests" | "Rust tests" | "Python tests")
+        || name.starts_with("Frontend unit tests (")
+        || name.starts_with("Rust tests (")
+        || name.starts_with("Python tests (")
+}
+
+fn annotate_full_suite_steps(steps: &mut [CiStep], reason: &str) {
+    let short = if reason.chars().count() > 120 {
+        format!("{}…", reason.chars().take(119).collect::<String>())
+    } else {
+        reason.to_string()
+    };
+    for step in steps.iter_mut() {
+        if is_test_step_name(&step.name) && !step.name.contains("full suite") {
+            step.name = format!("{} (full suite — {short})", base_test_step_name(&step.name));
+        }
+    }
+}
+
+fn base_test_step_name(name: &str) -> &str {
+    if name.starts_with("Frontend unit tests") {
+        "Frontend unit tests"
+    } else if name.starts_with("Rust tests") {
+        "Rust tests"
+    } else if name.starts_with("Python tests") {
+        "Python tests"
+    } else {
+        name
+    }
+}
+
+/// Cargo integration-test target name for `tests/foo.rs` → `foo`.
+fn rust_integration_test_name(path: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let file = norm.rsplit('/').next()?;
+    if !file.ends_with(".rs") {
+        return None;
+    }
+    let parent = norm.rsplit_once('/')?.0;
+    let in_tests_dir = parent == "tests" || parent.ends_with("/tests");
+    if !in_tests_dir {
+        return None;
+    }
+    Some(file.trim_end_matches(".rs").replace('-', "_"))
+}
+
+fn frontend_test_args(paths: &[String]) -> Vec<String> {
+    let mut args = vec!["test".into(), "--".into()];
+    args.extend(paths.iter().cloned());
+    args
+}
+
+fn rust_test_args(manifest: &str, paths: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "test".into(),
+        "--manifest-path".into(),
+        manifest.to_string(),
+    ];
+    let mut integration = Vec::new();
+    let mut filters = Vec::new();
+    for path in paths {
+        if let Some(name) = rust_integration_test_name(path) {
+            integration.push(name);
+        } else if let Some(stem) = Path::new(path).file_stem() {
+            filters.push(stem.to_string_lossy().replace('-', "_"));
+        }
+    }
+    integration.sort();
+    integration.dedup();
+    filters.sort();
+    filters.dedup();
+    for name in &integration {
+        args.push("--test".into());
+        args.push(name.clone());
+    }
+    if !filters.is_empty() {
+        args.push("--".into());
+        // One OR-ish filter is not expressible; pass the first and rely on
+        // cargo's substring match. Multiple unit-test files fall back via the
+        // uncovered-family check when we cannot name them as `--test` targets.
+        if integration.is_empty() && filters.len() == 1 {
+            args.push(filters[0].clone());
+        } else if integration.is_empty() {
+            // Multiple lib-unit paths: cargo has no multi-file path filter.
+            // Callers must fail closed before reaching here.
+            args.push(filters.join("|"));
+        }
+    }
+    args
+}
+
+fn python_test_args(paths: &[String]) -> Vec<String> {
+    paths.to_vec()
+}
+
+/// Compose a plan from an already-fetched affected-tests report.
+///
+/// Separated from the IO that builds the report so every fail-closed branch is
+/// reachable without a real map.
+pub fn plan_ci_from_affected(
+    repo_root: &Path,
+    seeds: &[String],
+    affected: &crate::codeintel::CodeintelAffectedTests,
+) -> CiPlan {
+    let mut steps = plan_ci_steps(repo_root);
+    let seed_owned = seeds.to_vec();
+
+    if seeds.is_empty() {
+        let reason = "no changed files to seed affected tests — running the full suite";
+        annotate_full_suite_steps(&mut steps, reason);
+        return CiPlan {
+            steps,
+            test_scope: CiTestScope::full_suite(reason, seed_owned),
+        };
+    }
+
+    if affected.fail_closed {
+        let reason = affected
+            .fail_closed_reason
+            .clone()
+            .or_else(|| affected.reason.clone())
+            .unwrap_or_else(|| "affected-tests graph is untrusted".into());
+        let loud = format!("affected tests unavailable — full suite: {reason}");
+        annotate_full_suite_steps(&mut steps, &loud);
+        return CiPlan {
+            steps,
+            test_scope: CiTestScope::full_suite(loud, seed_owned),
+        };
+    }
+
+    let test_files: Vec<String> = affected
+        .tests
+        .items
+        .iter()
+        .map(|t| t.path.replace('\\', "/"))
+        .collect();
+
+    if test_files.is_empty() {
+        let reason =
+            "affected-tests walk completed but reached no test files — running the full suite";
+        annotate_full_suite_steps(&mut steps, reason);
+        return CiPlan {
+            steps,
+            test_scope: CiTestScope::full_suite(reason, seed_owned),
+        };
+    }
+
+    let mut by_family: std::collections::BTreeMap<TestRunnerFamily, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut uncovered = Vec::new();
+    for path in &test_files {
+        match test_runner_family(path) {
+            Some(family) => by_family.entry(family).or_default().push(path.clone()),
+            None => uncovered.push(path.clone()),
+        }
+    }
+    if !uncovered.is_empty() {
+        let reason = format!(
+            "affected test file(s) have no planned runner: {} — running the full suite",
+            uncovered.join(", ")
+        );
+        annotate_full_suite_steps(&mut steps, &reason);
+        return CiPlan {
+            steps,
+            test_scope: CiTestScope::full_suite(reason, seed_owned),
+        };
+    }
+
+    // Multiple Rust unit-test files (not integration targets) cannot be
+    // expressed as a single honest cargo filter — fail closed rather than
+    // pretend `|` joins module paths.
+    if let Some(rust_paths) = by_family.get(&TestRunnerFamily::Rust) {
+        let unit_only: Vec<_> = rust_paths
+            .iter()
+            .filter(|p| rust_integration_test_name(p).is_none())
+            .collect();
+        if unit_only.len() > 1 {
+            let reason = format!(
+                "affected Rust unit-test files cannot be path-filtered together ({}) — running the full suite",
+                unit_only
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            annotate_full_suite_steps(&mut steps, &reason);
+            return CiPlan {
+                steps,
+                test_scope: CiTestScope::full_suite(reason, seed_owned),
+            };
+        }
+    }
+
+    let has_frontend = steps.iter().any(|s| s.name == "Frontend unit tests");
+    let has_rust = steps.iter().any(|s| s.name == "Rust tests");
+    let has_python = steps.iter().any(|s| s.name == "Python tests");
+    for family in by_family.keys() {
+        let covered = match family {
+            TestRunnerFamily::Frontend => has_frontend,
+            TestRunnerFamily::Rust => has_rust,
+            TestRunnerFamily::Python => has_python,
+        };
+        if !covered {
+            let reason = match family {
+                TestRunnerFamily::Frontend => {
+                    "affected Frontend test file(s) but no matching CI runner is planned — running the full suite"
+                }
+                TestRunnerFamily::Rust => {
+                    "affected Rust test file(s) but no matching CI runner is planned — running the full suite"
+                }
+                TestRunnerFamily::Python => {
+                    "affected Python test file(s) but no matching CI runner is planned — running the full suite"
+                }
+            }
+            .to_string();
+            annotate_full_suite_steps(&mut steps, &reason);
+            return CiPlan {
+                steps,
+                test_scope: CiTestScope::full_suite(reason, seed_owned),
+            };
+        }
+    }
+
+    let manifest = find_cargo_manifest(repo_root).map(|p| p.to_string_lossy().to_string());
+    steps.retain(|s| {
+        if !is_test_step_name(&s.name) {
+            return true;
+        }
+        match base_test_step_name(&s.name) {
+            "Frontend unit tests" => by_family.contains_key(&TestRunnerFamily::Frontend),
+            "Rust tests" => by_family.contains_key(&TestRunnerFamily::Rust),
+            "Python tests" => by_family.contains_key(&TestRunnerFamily::Python),
+            _ => true,
+        }
+    });
+
+    for step in steps.iter_mut() {
+        match base_test_step_name(&step.name) {
+            "Frontend unit tests" => {
+                if let Some(paths) = by_family.get(&TestRunnerFamily::Frontend) {
+                    step.name = format!("Frontend unit tests ({} affected)", paths.len());
+                    step.args = frontend_test_args(paths);
+                }
+            }
+            "Rust tests" => {
+                if let (Some(paths), Some(manifest)) =
+                    (by_family.get(&TestRunnerFamily::Rust), manifest.as_deref())
+                {
+                    step.name = format!("Rust tests ({} affected)", paths.len());
+                    step.args = rust_test_args(manifest, paths);
+                }
+            }
+            "Python tests" => {
+                if let Some(paths) = by_family.get(&TestRunnerFamily::Python) {
+                    step.name = format!("Python tests ({} affected)", paths.len());
+                    step.args = python_test_args(paths);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    CiPlan {
+        steps,
+        test_scope: CiTestScope::affected(test_files, seed_owned),
+    }
+}
+
+/// Seed from changed paths, query affected tests, and plan — or fall back to
+/// the full suite with a loud reason when the graph is partial.
+pub fn plan_ci_with_affected(repo_root: &Path, seeds: &[String]) -> CiPlan {
+    if seeds.is_empty() {
+        return plan_ci_from_affected(
+            repo_root,
+            seeds,
+            &crate::codeintel::CodeintelAffectedTests {
+                available: false,
+                reason: Some("no seeds provided".into()),
+                targets: Vec::new(),
+                tests: crate::codeintel::CodeintelResponse::unavailable("no targets"),
+                blast_radius: crate::codeintel::CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: Vec::new(),
+                    layers: crate::codeintel::CodeintelResponse::unavailable("no targets"),
+                    total_impacted: 0,
+                },
+                fail_closed: true,
+                fail_closed_reason: Some("no seeds provided".into()),
+            },
+        );
+    }
+    let repo_str = repo_root.to_string_lossy();
+    let affected = crate::codeintel::affected_tests(&repo_str, seeds, None, None);
+    plan_ci_from_affected(repo_root, seeds, &affected)
 }
 
 /// Quieter, non-interactive npm output without disabling lifecycle scripts
@@ -251,14 +685,39 @@ fn skipped_result(step: &CiStep) -> CiStepResult {
 pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
     let repo = validate_repo(repo_path)?;
     let started = Instant::now();
-    let plan = plan_ci_steps(&repo);
-    if plan.is_empty() {
+    let seeds = match crate::engine::git_reader::GitReader::get_status(repo_path) {
+        Ok(statuses) => seed_paths_from_statuses(&statuses),
+        Err(e) => {
+            // Not knowing the changed-file set is the same class of failure as
+            // an unmatched seed: never narrow tests on a guess.
+            let mut steps = plan_ci_steps(&repo);
+            if steps.is_empty() {
+                return Err(
+                    "No supported CI manifests found (expected package.json and/or Cargo.toml)"
+                        .into(),
+                );
+            }
+            let reason = format!("could not read git status to seed affected tests: {e}");
+            annotate_full_suite_steps(&mut steps, &reason);
+            let plan = CiPlan {
+                steps,
+                test_scope: CiTestScope::full_suite(reason, Vec::new()),
+            };
+            return Ok(finish_run(&repo, plan, started));
+        }
+    };
+    let plan = plan_ci_with_affected(&repo, &seeds);
+    if plan.steps.is_empty() {
         return Err(
             "No supported CI manifests found (expected package.json and/or Cargo.toml)".into(),
         );
     }
+    Ok(finish_run(&repo, plan, started))
+}
 
-    let results = run_plan(plan, |step| {
+fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
+    let test_scope = plan.test_scope.clone();
+    let results = run_plan(plan.steps, |step| {
         let step_started = Instant::now();
         let arg_refs: Vec<&str> = step.args.iter().map(String::as_str).collect();
 
@@ -293,7 +752,7 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
         let outcome = capture_command(
             &step.program,
             &arg_refs,
-            Some(&repo),
+            Some(repo),
             STEP_TIMEOUT,
             NPM_CI_ENV,
         );
@@ -304,11 +763,12 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
     let mut report = summarize(
         results,
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        test_scope,
     );
-    let (recorded_commit, not_recorded_reason) = record_verification(&repo, &report);
+    let (recorded_commit, not_recorded_reason) = record_verification(repo, &report);
     report.recorded_commit = recorded_commit;
     report.not_recorded_reason = not_recorded_reason;
-    Ok(report)
+    report
 }
 
 /// Walk the plan, stopping at the first step that does not pass.
@@ -342,7 +802,11 @@ fn run_plan(
 /// The frontend colours its header red on `failed > 0` alone, so miscounting
 /// a skipped step as failed — or a failed one as skipped — is the difference
 /// between a run that reads as broken and one that reads as fine.
-fn summarize(results: Vec<CiStepResult>, total_duration_ms: u64) -> CiLocalReport {
+fn summarize(
+    results: Vec<CiStepResult>,
+    total_duration_ms: u64,
+    test_scope: CiTestScope,
+) -> CiLocalReport {
     CiLocalReport {
         passed: results.iter().filter(|r| r.status == "passed").count(),
         failed: results.iter().filter(|r| r.status == "failed").count(),
@@ -351,6 +815,7 @@ fn summarize(results: Vec<CiStepResult>, total_duration_ms: u64) -> CiLocalRepor
         total_duration_ms,
         recorded_commit: String::new(),
         not_recorded_reason: String::new(),
+        test_scope,
     }
 }
 
@@ -451,7 +916,7 @@ mod tests {
     /// was taken on trust.
     fn step() -> CiStep {
         CiStep {
-            name: "Frontend unit tests",
+            name: "Frontend unit tests".into(),
             program: "npm".into(),
             args: vec!["test".into()],
         }
@@ -546,7 +1011,7 @@ mod tests {
         names
             .iter()
             .map(|name| CiStep {
-                name,
+                name: (*name).into(),
                 program: "npm".into(),
                 args: vec!["test".into()],
             })
@@ -559,9 +1024,9 @@ mod tests {
     /// than assumed from the output.
     #[test]
     fn a_failure_skips_every_later_step_without_running_it() {
-        let mut attempted: Vec<&str> = Vec::new();
+        let mut attempted: Vec<String> = Vec::new();
         let results = run_plan(plan_of(&["one", "two", "three"]), |step| {
-            attempted.push(step.name);
+            attempted.push(step.name.clone());
             let outcome = if step.name == "two" {
                 Ok(captured(false, 1, "", "Error: boom"))
             } else {
@@ -572,7 +1037,7 @@ mod tests {
 
         assert_eq!(
             attempted,
-            vec!["one", "two"],
+            vec!["one".to_string(), "two".to_string()],
             "the third step must never be spawned"
         );
         let statuses: Vec<&str> = results.iter().map(|r| r.status.as_str()).collect();
@@ -621,7 +1086,7 @@ mod tests {
             };
             (outcome, 1)
         });
-        let report = summarize(results, 4_200);
+        let report = summarize(results, 4_200, CiTestScope::default());
 
         assert_eq!(report.passed, 1);
         assert_eq!(report.failed, 1);
@@ -706,7 +1171,7 @@ mod tests {
     #[test]
     fn rendered_command_quotes_arguments_with_spaces() {
         let step = CiStep {
-            name: "x",
+            name: "x".into(),
             program: "cargo".into(),
             args: vec![
                 "fmt".into(),
@@ -748,6 +1213,228 @@ mod tests {
         assert!(
             err.contains("No supported CI manifests"),
             "empty plan should name the reason, got: {err}"
+        );
+    }
+
+    fn ok_affected(paths: &[&str]) -> crate::codeintel::CodeintelAffectedTests {
+        let items: Vec<_> = paths
+            .iter()
+            .map(|path| crate::codeintel::CodeintelAffectedTest {
+                path: (*path).into(),
+                depth: 1,
+                symbols: vec!["probe".into()],
+                reached_symbols: 1,
+            })
+            .collect();
+        let shown = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        crate::codeintel::CodeintelAffectedTests {
+            available: true,
+            reason: None,
+            targets: vec!["src/lib.rs".into()],
+            tests: crate::codeintel::CodeintelResponse::ok(items, shown, shown, false),
+            blast_radius: crate::codeintel::CodeintelBlastRadius {
+                seeds: vec!["src/lib.rs".into()],
+                unmatched_targets: Vec::new(),
+                layers: crate::codeintel::CodeintelResponse::ok(Vec::new(), 0, 0, false),
+                total_impacted: 1,
+            },
+            fail_closed: false,
+            fail_closed_reason: None,
+        }
+    }
+
+    fn fail_closed_affected(reason: &str) -> crate::codeintel::CodeintelAffectedTests {
+        crate::codeintel::CodeintelAffectedTests {
+            available: false,
+            reason: Some(reason.into()),
+            targets: vec!["src/lib.rs".into()],
+            tests: crate::codeintel::CodeintelResponse::unavailable(reason),
+            blast_radius: crate::codeintel::CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: vec!["src/lib.rs".into()],
+                layers: crate::codeintel::CodeintelResponse::unavailable(reason),
+                total_impacted: 0,
+            },
+            fail_closed: true,
+            fail_closed_reason: Some(reason.into()),
+        }
+    }
+
+    /// Empty seeds must never narrow the suite — that would badge a skip as a
+    /// targeted pass.
+    #[test]
+    fn empty_seeds_fail_closed_to_the_full_suite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let plan = plan_ci_from_affected(dir.path(), &[], &fail_closed_affected("no seeds"));
+        assert_eq!(plan.test_scope.mode, "full_suite");
+        assert!(plan.test_scope.fail_closed);
+        assert!(
+            plan.test_scope.reason.contains("no changed files")
+                || plan.test_scope.reason.contains("full suite"),
+            "{}",
+            plan.test_scope.reason
+        );
+        let test_step = plan
+            .steps
+            .iter()
+            .find(|s| s.name.contains("Frontend unit tests"))
+            .expect("frontend tests planned");
+        assert!(
+            test_step.name.contains("full suite"),
+            "step name must say full suite loudly: {}",
+            test_step.name
+        );
+        assert_eq!(test_step.args, vec!["test".to_string()]);
+    }
+
+    /// fail_closed from the graph must keep the full suite and name why — never
+    /// a path-filtered command that looks like an affected-tests pass.
+    #[test]
+    fn fail_closed_graph_keeps_full_suite_and_says_why() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let seeds = vec!["src/lib.rs".into()];
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &seeds,
+            &fail_closed_affected("2 seed(s) matched nothing in the map"),
+        );
+        assert!(plan.test_scope.fail_closed);
+        assert_eq!(plan.test_scope.mode, "full_suite");
+        assert!(
+            plan.test_scope.reason.contains("matched nothing"),
+            "{}",
+            plan.test_scope.reason
+        );
+        let rust = plan
+            .steps
+            .iter()
+            .find(|s| s.name.contains("Rust tests"))
+            .expect("rust tests");
+        assert!(rust.name.contains("full suite"), "{}", rust.name);
+        assert!(
+            !rust.args.iter().any(|a| a == "--test"),
+            "must not path-filter when fail-closed: {:?}",
+            rust.args
+        );
+    }
+
+    #[test]
+    fn affected_frontend_paths_filter_npm_test() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let seeds = vec!["src/lib/foo.ts".into()];
+        let plan =
+            plan_ci_from_affected(dir.path(), &seeds, &ok_affected(&["src/lib/foo.test.ts"]));
+        assert!(!plan.test_scope.fail_closed);
+        assert_eq!(plan.test_scope.mode, "affected");
+        assert_eq!(
+            plan.test_scope.test_files,
+            vec!["src/lib/foo.test.ts".to_string()]
+        );
+        let test_step = plan
+            .steps
+            .iter()
+            .find(|s| s.name.starts_with("Frontend unit tests"))
+            .expect("frontend tests");
+        assert!(test_step.name.contains("1 affected"), "{}", test_step.name);
+        assert_eq!(
+            test_step.args,
+            vec![
+                "test".to_string(),
+                "--".to_string(),
+                "src/lib/foo.test.ts".to_string()
+            ]
+        );
+        // Non-test steps stay.
+        assert!(plan.steps.iter().any(|s| s.name == "Frontend type-check"));
+        assert!(plan.steps.iter().any(|s| s.name == "Frontend build"));
+    }
+
+    #[test]
+    fn affected_rust_integration_tests_use_cargo_test_filter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let seeds = vec!["src/lib.rs".into()];
+        let plan = plan_ci_from_affected(dir.path(), &seeds, &ok_affected(&["tests/smoke.rs"]));
+        assert_eq!(plan.test_scope.mode, "affected");
+        let rust = plan
+            .steps
+            .iter()
+            .find(|s| s.name.starts_with("Rust tests"))
+            .expect("rust tests");
+        assert!(rust
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--test" && w[1] == "smoke"));
+    }
+
+    #[test]
+    fn uncovered_test_family_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Only npm — no cargo, no pytest. A .rs affected test cannot run.
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/x.rs".into()],
+            &ok_affected(&["tests/x.rs"]),
+        );
+        assert!(plan.test_scope.fail_closed);
+        assert!(
+            plan.test_scope.reason.contains("no matching CI runner")
+                || plan.test_scope.reason.contains("full suite"),
+            "{}",
+            plan.test_scope.reason
+        );
+    }
+
+    #[test]
+    fn multiple_rust_unit_test_files_fail_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/a.rs".into()],
+            &ok_affected(&["src/a.rs", "src/b.rs"]),
+        );
+        assert!(plan.test_scope.fail_closed, "{}", plan.test_scope.reason);
+        assert!(
+            plan.test_scope.reason.contains("cannot be path-filtered"),
+            "{}",
+            plan.test_scope.reason
+        );
+    }
+
+    #[test]
+    fn seed_paths_include_rename_sources() {
+        let statuses = vec![crate::engine::git_reader::FileStatus {
+            path: "src/new.rs".into(),
+            old_path: Some("src/old.rs".into()),
+            status_code: "R".into(),
+            is_staged: true,
+            is_conflicted: false,
+            additions: 1,
+            deletions: 1,
+            warnings: Vec::new(),
+        }];
+        let seeds = seed_paths_from_statuses(&statuses);
+        assert_eq!(
+            seeds,
+            vec!["src/new.rs".to_string(), "src/old.rs".to_string()]
         );
     }
 }
@@ -854,7 +1541,7 @@ mod verification_note_tests {
                 duration_ms: 5,
             })
             .collect();
-        summarize(steps, 10)
+        summarize(steps, 10, CiTestScope::default())
     }
 
     fn head(dir: &std::path::Path) -> String {
@@ -988,7 +1675,7 @@ mod verification_note_tests {
             "a status this build does not recognise is not a pass"
         );
         assert_eq!(
-            run_verdict(&summarize(Vec::new(), 0)),
+            run_verdict(&summarize(Vec::new(), 0, CiTestScope::default())),
             "passed",
             "an empty plan cannot reach here: run_ci_local refuses it earlier"
         );

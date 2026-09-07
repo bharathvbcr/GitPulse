@@ -16,7 +16,7 @@
     Clock,
     CheckCircle2,
     Flame,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { formatAge } from "../../storage/format";
   import { askConfirm } from "../../stores/modalStore";
   import { promptQuickCommit } from "../../commit/quickCommit";
@@ -221,7 +221,7 @@
         type="button"
         onclick={handleRefresh}
         title="Sync Status"
-        class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
       >
         <RefreshCw size={12} class={isRefreshing || $repoStore.isLoading ? "animate-spin" : ""} />
       </button>
@@ -245,19 +245,19 @@
       </div>
 
       <div class="grid grid-cols-2 gap-2">
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-sm flex flex-col">
+        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
           <span class="text-[10px] text-textMuted">Staged</span>
           <span class="text-base font-bold text-emerald-400 tabular-nums">{stagedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-sm flex flex-col">
+        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
           <span class="text-[10px] text-textMuted">Modified</span>
           <span class="text-base font-bold text-amber-400 tabular-nums">{unstagedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-sm flex flex-col">
+        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
           <span class="text-[10px] text-textMuted">Untracked</span>
           <span class="text-base font-bold text-cyan-400 tabular-nums">{untrackedFiles.length}</span>
         </div>
-        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-sm flex flex-col">
+        <div class="p-2.5 rounded-xl border border-border/70 bg-surface/60 shadow-xs flex flex-col">
           <span class="text-[10px] text-textMuted">Conflicted</span>
           <span class="text-base font-bold {conflictedFiles.length > 0 ? 'text-rose-400' : 'text-textMuted'} tabular-nums">{conflictedFiles.length}</span>
         </div>
@@ -269,7 +269,7 @@
             <button
               type="button"
               onclick={stageAll}
-              class="gp-btn flex-1 !py-1 !text-[11px] justify-center text-emerald-300 font-semibold"
+              class="gp-btn flex-1 py-1! text-[11px]! justify-center text-emerald-300 font-semibold"
             >
               <Check size={11} />
               <span>Stage All</span>
@@ -279,7 +279,7 @@
             <button
               type="button"
               onclick={unstageAll}
-              class="gp-btn flex-1 !py-1 !text-[11px] justify-center text-amber-300 font-semibold"
+              class="gp-btn flex-1 py-1! text-[11px]! justify-center text-amber-300 font-semibold"
             >
               <Undo2 size={11} />
               <span>Unstage All</span>
@@ -287,7 +287,7 @@
             <button
               type="button"
               onclick={() => void promptQuickCommit()}
-              class="gp-btn-primary flex-1 !py-1 !text-[11px] justify-center"
+              class="gp-btn-primary flex-1 py-1! text-[11px]! justify-center"
             >
               <GitCommit size={11} />
               <span>Commit</span>
@@ -319,7 +319,7 @@
             {@const kind = classifyFileChange(s)}
             <div
               class="p-2 rounded-xl border transition-all flex items-center justify-between gap-2 {isSelected
-                ? 'border-accent/60 bg-accent/10 shadow-sm'
+                ? 'border-accent/60 bg-accent/10 shadow-xs'
                 : 'border-border/60 bg-surface/50 hover:border-border'}"
             >
               <button
@@ -421,7 +421,7 @@
             <button
               type="button"
               onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('history', 'diff'); }}
-              class="gp-btn flex-1 !py-1 !text-[10px] justify-center"
+              class="gp-btn flex-1 py-1! text-[10px]! justify-center"
             >
               <Layers size={11} class="text-cyan-400" />
               <span>Diff</span>
@@ -429,7 +429,7 @@
             <button
               type="button"
               onclick={() => { repoStore.selectFilePath(selectedFile); repoStore.setActiveTab('code', 'blame'); }}
-              class="gp-btn flex-1 !py-1 !text-[10px] justify-center"
+              class="gp-btn flex-1 py-1! text-[10px]! justify-center"
             >
               <GitCommit size={11} class="text-purple-400" />
               <span>Blame</span>

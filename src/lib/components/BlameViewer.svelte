@@ -4,7 +4,7 @@
   import { rowHeight } from "../ui/density";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { FileCode, PanelLeftClose, PanelLeftOpen, Search } from "lucide-svelte";
+  import { FileCode, PanelLeftClose, PanelLeftOpen, Search } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
@@ -207,7 +207,7 @@
       {:else if errorMsg}
         <div class="h-full flex flex-col items-center justify-center gap-3 text-rose-400 font-sans text-xs p-4 text-center">
           <span class="max-w-md">{errorMsg}</span>
-          <button type="button" onclick={retryBlame} class="gp-btn !py-1 !px-3 text-[11px]">
+          <button type="button" onclick={retryBlame} class="gp-btn py-1! px-3! text-[11px]">
             Retry
           </button>
         </div>

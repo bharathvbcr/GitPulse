@@ -24,7 +24,7 @@
 </script>
 
 <script lang="ts">
-  import { EyeOff, ChevronDown, ChevronRight } from "lucide-svelte";
+  import { EyeOff, ChevronDown, ChevronRight } from "@lucide/svelte";
 
   /**
    * Completeness disclosures for a healthy graph load: history outside the
@@ -85,7 +85,7 @@
     {#if expanded}
       <ul class="mt-1 space-y-0.5 pl-[26px]">
         {#each notices as notice (notice)}
-          <li class="break-words">{notice}</li>
+          <li class="wrap-break-word">{notice}</li>
         {/each}
       </ul>
     {/if}

@@ -65,7 +65,7 @@
           data-testid="fleet-total-shortfall">{clause}</span
         >
       {:else if clause}
-        <span class="text-[10px] text-textMuted truncate max-w-[12rem]" title={clause}>
+        <span class="text-[10px] text-textMuted truncate max-w-48" title={clause}>
           {clause}
         </span>
       {/if}

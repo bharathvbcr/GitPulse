@@ -28,6 +28,106 @@ pub enum SymbolKind {
     Community,
 }
 
+impl SymbolKind {
+    /// The canonical name of this kind, as persisted.
+    ///
+    /// The store has always written `format!("{:?}", kind)`, which makes the
+    /// `Debug` derive an on-disk format: renaming a variant would silently
+    /// change what every future generation records, and there is no inverse to
+    /// read it back with. This pair states the mapping on purpose. The strings
+    /// are exactly what `Debug` produced, so no existing database or query
+    /// changes meaning — `debug_and_canonical_names_agree` holds them to that.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymbolKind::File => "File",
+            SymbolKind::Module => "Module",
+            SymbolKind::Class => "Class",
+            SymbolKind::Struct => "Struct",
+            SymbolKind::Enum => "Enum",
+            SymbolKind::Interface => "Interface",
+            SymbolKind::Trait => "Trait",
+            SymbolKind::Function => "Function",
+            SymbolKind::Method => "Method",
+            SymbolKind::Field => "Field",
+            SymbolKind::Variable => "Variable",
+            SymbolKind::Route => "Route",
+            SymbolKind::Endpoint => "Endpoint",
+            SymbolKind::EventSubscriber => "EventSubscriber",
+            SymbolKind::Dependency => "Dependency",
+            SymbolKind::Subsystem => "Subsystem",
+            SymbolKind::Community => "Community",
+        }
+    }
+
+    /// Every variant, so a round-trip test cannot silently miss a new one.
+    pub const ALL: &'static [SymbolKind] = &[
+        SymbolKind::File,
+        SymbolKind::Module,
+        SymbolKind::Class,
+        SymbolKind::Struct,
+        SymbolKind::Enum,
+        SymbolKind::Interface,
+        SymbolKind::Trait,
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Field,
+        SymbolKind::Variable,
+        SymbolKind::Route,
+        SymbolKind::Endpoint,
+        SymbolKind::EventSubscriber,
+        SymbolKind::Dependency,
+        SymbolKind::Subsystem,
+        SymbolKind::Community,
+    ];
+
+    /// Read a persisted kind back, or `None` for a name this build does not
+    /// know. `None` rather than a `File` fallback: a row written by a newer
+    /// binary carries a kind this one cannot interpret, and quietly relabelling
+    /// it would put a fabricated kind into a report.
+    pub fn from_persisted(name: &str) -> Option<SymbolKind> {
+        SymbolKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == name)
+    }
+}
+
+#[cfg(test)]
+mod symbol_kind_name_tests {
+    use super::SymbolKind;
+
+    /// The store wrote `Debug` output for years. If `as_str` ever disagrees
+    /// with it, this build starts writing names the previous one cannot read.
+    #[test]
+    fn debug_and_canonical_names_agree() {
+        for kind in SymbolKind::ALL {
+            assert_eq!(
+                format!("{kind:?}"),
+                kind.as_str(),
+                "canonical name diverged from the persisted Debug form"
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips() {
+        for kind in SymbolKind::ALL {
+            assert_eq!(
+                SymbolKind::from_persisted(kind.as_str()),
+                Some(*kind),
+                "{kind:?} does not read back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_not_guessed_at() {
+        assert_eq!(SymbolKind::from_persisted("Coroutine"), None);
+        assert_eq!(SymbolKind::from_persisted("function"), None);
+        assert_eq!(SymbolKind::from_persisted(""), None);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     Imports,
@@ -227,18 +327,119 @@ pub struct Span {
 impl Span {
     /// Convert byte offsets to a one-based inclusive line range at the query
     /// boundary. Extraction and storage remain UTF-8-safe byte based.
+    ///
+    /// The single-span form of [`LineIndex::line_range`], which owns the
+    /// arithmetic; a loop over every span in one file builds the index once.
     pub fn line_range(&self, source: &str) -> (u32, u32) {
-        let start = self.start_byte.min(source.len());
-        let end = self.end_byte.min(source.len());
-        let line_number = |offset: usize| -> u32 {
-            source.as_bytes()[..offset]
-                .iter()
-                .filter(|&&byte| byte == b'\n')
-                .count()
-                .saturating_add(1)
-                .min(u32::MAX as usize) as u32
-        };
-        (line_number(start), line_number(end))
+        LineIndex::new(source).line_range(self)
+    }
+}
+
+/// The newline offsets of one source text, built once so every span in the
+/// file converts to lines by binary search instead of a scan from the top.
+///
+/// One owner for the arithmetic: a line is one plus the newlines before the
+/// offset, and an offset past the end is on the last line. [`Span::line_range`]
+/// delegates here for a single span. The artifact's node loop used to pay the
+/// scan from the top of the file twice per symbol — `2k` passes over a file
+/// with `k` symbols, 100 ms of every export on this repository — where one
+/// pass and `2k` binary searches answer the same.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    len: usize,
+    newlines: Vec<usize>,
+}
+
+impl LineIndex {
+    pub fn new(source: &str) -> Self {
+        let newlines = source
+            .bytes()
+            .enumerate()
+            .filter(|&(_, byte)| byte == b'\n')
+            .map(|(at, _)| at)
+            .collect();
+        Self {
+            len: source.len(),
+            newlines,
+        }
+    }
+
+    /// Length in bytes of the text the table was built from — the clamp a
+    /// caller applies to a span recorded against a longer version of it.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One-based line holding `offset`; an offset past the end is the last line.
+    pub fn line_at(&self, offset: usize) -> u32 {
+        let offset = offset.min(self.len);
+        self.newlines
+            .partition_point(|&at| at < offset)
+            .saturating_add(1)
+            .min(u32::MAX as usize) as u32
+    }
+
+    pub fn line_range(&self, span: &Span) -> (u32, u32) {
+        (self.line_at(span.start_byte), self.line_at(span.end_byte))
+    }
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::{LineIndex, Span};
+
+    /// The arithmetic `Span::line_range` has always stated: one plus the
+    /// newlines in the prefix, offsets past the end clamped to the end.
+    fn scanned(source: &str, offset: usize) -> u32 {
+        source.as_bytes()[..offset.min(source.len())]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count() as u32
+            + 1
+    }
+
+    #[test]
+    fn a_line_index_answers_exactly_what_a_scan_of_the_prefix_does() {
+        let sources = [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\r\nb\r\n",
+            "\n\n\n",
+            "fn a() {}\n// \u{1F980} ferris r\u{e9}\nfn b() {}\n",
+        ];
+        for source in sources {
+            let index = LineIndex::new(source);
+            for start in 0..=source.len() + 3 {
+                assert_eq!(
+                    index.line_at(start),
+                    scanned(source, start),
+                    "{source:?} offset {start}"
+                );
+                for end in 0..=source.len() + 3 {
+                    let span = Span {
+                        start_byte: start,
+                        end_byte: end,
+                    };
+                    assert_eq!(
+                        index.line_range(&span),
+                        span.line_range(source),
+                        "{source:?} span {start}..{end}"
+                    );
+                    assert_eq!(
+                        index.line_range(&span),
+                        (scanned(source, start), scanned(source, end)),
+                        "{source:?} span {start}..{end}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -251,9 +452,21 @@ pub struct TextRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscoverySkipReason {
     NonSource,
-    Oversized { bytes: u64, limit: u64 },
+    Oversized {
+        bytes: u64,
+        limit: u64,
+    },
     NonUtf8Path,
-    Unreadable { reason: String },
+    Unreadable {
+        reason: String,
+    },
+    /// A symlink inside the tree whose target is not, or whose target could not
+    /// be resolved to say either way. The bytes belong to somebody else's
+    /// directory, and reading them puts a file the repository does not contain
+    /// into a graph that claims to describe it.
+    EscapesRoot {
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -262,11 +475,158 @@ pub struct DiscoveryReport {
     pub skipped_paths: Vec<(String, DiscoverySkipReason)>,
 }
 
+/// One wording for one refusal.
+///
+/// The drain reports what it refused in prose an operator reads out of
+/// `devmap status`; the cold walk reports the same facts as this enum. Spelling
+/// them separately is how "resolves outside the repository" and "not a regular
+/// file or directory" came to describe the same symlink.
+impl std::fmt::Display for DiscoverySkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscoverySkipReason::NonSource => write!(f, "not an indexable source path"),
+            DiscoverySkipReason::Oversized { bytes, limit } => write!(
+                f,
+                "{bytes} bytes exceeds the {limit} byte source ceiling, so extraction \
+                 can never succeed"
+            ),
+            DiscoverySkipReason::NonUtf8Path => {
+                write!(f, "a path that is not representable as UTF-8")
+            }
+            DiscoverySkipReason::Unreadable { reason } => write!(f, "unreadable: {reason}"),
+            DiscoverySkipReason::EscapesRoot { target } => write!(
+                f,
+                "a symlink the repository does not contain ({target}), which discovery refuses"
+            ),
+        }
+    }
+}
+
+impl DiscoverySkipReason {
+    /// Is this skip a hole in the graph, or the ordinary case?
+    ///
+    /// `NonSource` is a README beside the code, or a pruned build cache: the
+    /// walker was *meant* to pass it over, and counting it as coverage loss
+    /// would leave every repository permanently degraded — a marker that is
+    /// always on tells a reader nothing. Every other variant is a file this
+    /// indexer was meant to read and could not, so whatever it declared or
+    /// called is absent from the graph and cannot be reasoned about.
+    ///
+    /// This predicate is the *only* place that distinction is drawn. It was
+    /// previously an inline closure in the CLI's build path, which meant the
+    /// daemon — the other consumer of a [`DiscoveryReport`] — had no way to
+    /// agree with it except by copying it, and a copy that drifts turns one of
+    /// the two paths back into a silent lie.
+    ///
+    /// Written as an exhaustive `match` rather than `!matches!(.., NonSource)`
+    /// on purpose: a skip reason added later stops compiling here until someone
+    /// decides which side of the line it falls on. The default a wildcard would
+    /// pick — "not a refusal" — is the one that loses coverage silently.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            DiscoverySkipReason::NonSource => false,
+            DiscoverySkipReason::Oversized { .. }
+            | DiscoverySkipReason::NonUtf8Path
+            | DiscoverySkipReason::Unreadable { .. }
+            // A refusal, not an ordinary pass-over: unlike a symlink to a file
+            // inside the tree — which the walk reaches under its real name
+            // anyway — nothing else in the graph accounts for these bytes. The
+            // path was a source this indexer was pointed at and declined to
+            // read, which is the definition on this side of the line.
+            | DiscoverySkipReason::EscapesRoot { .. } => true,
+        }
+    }
+
+    /// Does this refusal say the path is not the repository's at all?
+    ///
+    /// The distinction decides what happens to rows a previous generation
+    /// wrote for the path. `Oversized` and `Unreadable` are about *this
+    /// attempt*: the file may shrink, or regain `+r`, and until it does its
+    /// last good extraction is the best description of it the graph has, so the
+    /// rows are kept. `EscapesRoot` is about the path itself — the bytes belong
+    /// to somebody else's directory — and a `devmap build` writes no rows for
+    /// it, so a drain that kept them would leave the graph claiming symbols the
+    /// build path had already stopped claiming, which is the disagreement
+    /// between the two walks that this rule exists to end.
+    pub fn is_containment_refusal(&self) -> bool {
+        matches!(self, DiscoverySkipReason::EscapesRoot { .. })
+    }
+}
+
+impl DiscoveryReport {
+    /// The skipped paths that are genuine coverage loss, in discovery order.
+    pub fn refusals(&self) -> impl Iterator<Item = &(String, DiscoverySkipReason)> {
+        self.skipped_paths
+            .iter()
+            .filter(|(_, reason)| reason.is_refusal())
+    }
+
+    /// How many files discovery was meant to read and could not.
+    pub fn refused_count(&self) -> usize {
+        self.refusals().count()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParseOutcome {
     Clean,
-    Partial { error_ranges: Vec<TextRange> },
-    Failed { reason: String },
+    Partial {
+        error_ranges: Vec<TextRange>,
+    },
+    Failed {
+        reason: String,
+    },
+    /// The symbol list is **not a complete authoritative extraction** of this
+    /// file. Two producers: no grammar was available and declarations were
+    /// recovered by pattern (see [`crate::fallback`]), or the file was parsed
+    /// properly but only a prefix of it was submitted to the parser (a notebook
+    /// past [`crate::notebook`]'s cell cap).
+    ///
+    /// What both have in common is the only thing consumers act on: absence of
+    /// a symbol here is not evidence the file does not declare it, so dead-code
+    /// analysis must not treat this file's silence as a fact.
+    ///
+    /// Distinct from `Failed` because the two answer different questions and
+    /// consumers act on them differently: `Failed` means the file contributed
+    /// nothing and is retried on every build, while this means the file
+    /// contributed named symbols that were matched rather than parsed. Folding
+    /// it into `Partial` would be worse still — that variant means tree-sitter
+    /// parsed the file and flagged error ranges, a much stronger claim than
+    /// anything this tier can make.
+    Fallback {
+        reason: String,
+    },
+    /// No parse was attempted, by decision rather than by failure. `reason`
+    /// names the decision.
+    ///
+    /// Distinct from `Failed`, which this used to be reported as, and the two
+    /// differ in every way a consumer acts on:
+    ///
+    /// * **`Failed` is a symptom.** It says the extractor tried and could not,
+    ///   so a `Failed` count is a number a maintainer is meant to investigate.
+    ///   A vendored minified bundle inflating that count permanently is the
+    ///   same defect [`ExtractionEngine::NotApplicable`] was added to fix —
+    ///   294 of 1,310 files reported as parse failures, hiding the 16 real
+    ///   ones — arriving by a different route.
+    /// * **`Failed` is not cache-admitted** (`cache::cache_admits`), because a
+    ///   failure may not recur and is worth retrying. A skip is a stable
+    ///   verdict about the file's *name and shape*: retrying it every build
+    ///   re-decides an unchanged fact and logs a retry for something that will
+    ///   never succeed.
+    /// * **`Failed`'s reason is written at the moment of failure**, so for a
+    ///   budget overrun it records which phase the deadline landed in — a
+    ///   detail that varies with machine load, which is how two extractions of
+    ///   identical bytes came to disagree. A skip's reason is a function of the
+    ///   path alone.
+    ///
+    /// Like `Failed`, no declarations are recovered and the `File` node is
+    /// still emitted: the file is not parsed, which is not the same as the file
+    /// not existing. Unlike `Fallback`, nothing here was matched by pattern
+    /// either — the symbol list is empty rather than approximate, so a consumer
+    /// must not read this file's silence as evidence about what it declares.
+    Skipped {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,8 +636,42 @@ pub enum ExtractionEngine {
         grammar_version: u32,
     },
     ConfigScanner,
+    /// Declarations recovered by line pattern because no grammar is linked for
+    /// `requested_language`. Symbols carry names and spans but no calls,
+    /// imports or nesting.
+    RegexFallback {
+        requested_language: String,
+    },
     Unavailable {
         requested_language: String,
+    },
+    /// No grammar ran, and none was ever expected: `language` is a prose or
+    /// data format that declares nothing.
+    ///
+    /// Distinct from [`Self::Unavailable`], which means a grammar was wanted
+    /// and was not there — a `.proto` or `.ps1` this build cannot parse is a
+    /// gap in coverage, and a `.md` is not. Without the distinction the two
+    /// were indistinguishable, and `history.parse_failed` reported 294 of this
+    /// repository's 1,310 files as parse failures when every one of them was
+    /// Markdown, JSON, YAML, config or HTML. That count hid the 16 files a
+    /// grammar *did* parse and flag errors in, which is the number a reader
+    /// acts on.
+    ///
+    /// The file is still a `File` node and still a valid edge target. "We
+    /// cannot parse declarations out of this" is not "this file does not
+    /// exist".
+    NotApplicable {
+        language: String,
+    },
+    /// Code reconstructed from a Jupyter notebook's code cells and parsed with
+    /// the kernel's grammar, then relocated back into the raw `.ipynb`.
+    ///
+    /// Distinct from `TreeSitter` because the parse ran over a buffer that does
+    /// not exist on disk: symbols are real declarations, but the notebook is
+    /// not a file the grammar could read directly, and a consumer comparing
+    /// engines should be able to see that.
+    Notebook {
+        kernel_language: String,
     },
 }
 
@@ -300,6 +694,47 @@ pub struct ExtractedSymbol {
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_symbol: Option<String>,
+    /// Body identity for clone detection, or `None` when none was computed.
+    ///
+    /// `None` is load-bearing and means exactly one thing: no signature exists
+    /// for this symbol. That covers a body under the size floor, a symbol kind
+    /// with no comparable body, and a file recovered by the regex fallback
+    /// rather than a grammar. It never means "no duplicates" — a reader that
+    /// treats absence as a negative finding is reading a fact that was never
+    /// recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_signature: Option<BodySignature>,
+    /// Hash of the declaration with its body excluded — the part of a symbol a
+    /// caller depends on. `None` when the grammar gives the declaration no
+    /// `body` field to exclude, so there is nothing to separate.
+    ///
+    /// Unlike [`Self::body_signature`] this is computed for *every* symbol, not
+    /// only those above the size floor: a one-line accessor whose parameter
+    /// list changes breaks its callers exactly as thoroughly as a large one.
+    ///
+    /// **In-memory only — never serialised.** The one consumer, `preview`,
+    /// extracts both the buffer and the current file on disk in the same
+    /// process, so it always has two freshly computed values. Persisting it
+    /// would add a column, a schema version and a cache-invalidation bump to
+    /// carry a number nothing reads back.
+    #[serde(default, skip_serializing)]
+    pub declaration_hash: Option<u64>,
+}
+
+/// Two hashes of one symbol body, from [`crate::clonesig`].
+///
+/// Kept in the model rather than beside the walk that computes it so the query
+/// half of the workspace can read signatures back without the `parse` feature
+/// and its thirty-odd grammars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BodySignature {
+    /// Node kinds *and* leaf text: the same code (Type-1 clone).
+    pub exact: u64,
+    /// Node kinds only: the same shape under renaming (Type-2 clone).
+    pub structural: u64,
+    /// Non-comment nodes hashed. The weight behind a match — a 500-node
+    /// collision is evidence, a 24-node one is a coincidence waiting to happen.
+    pub nodes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,7 +863,19 @@ pub enum ReferenceKind {
     /// dispatch needs the bare type name and provenance needs the qualifier
     /// (SC25).
     TypeQualifier,
+    /// A supertype named in a declaration: a base class, or any supertype in a
+    /// language whose syntax does not separate the two. `enclosing_symbol`
+    /// carries the *declaring* type, so the edge has both endpoints.
     Heritage,
+    /// A supertype the declaration explicitly states it implements.
+    ///
+    /// Emitted only where the grammar says so — Java's `super_interfaces`,
+    /// TypeScript's `implements_clause`, PHP's `class_interface_clause`,
+    /// Dart's `interfaces`, Objective-C's protocol list, Rust's
+    /// `impl Trait for Type`. C#, Swift, Kotlin, Python and Solidity use one
+    /// syntax for both and yield [`Self::Heritage`], because inferring the
+    /// distinction would mean guessing from a naming convention.
+    HeritageInterface,
     Decorator,
     JsxTag,
     /// Identifier in expression/value position (JSX prop, object shorthand, …).
@@ -482,6 +929,29 @@ pub struct ExtractedRoute {
     pub span: Span,
 }
 
+impl ExtractedRoute {
+    /// The route's identity in the graph.
+    ///
+    /// A route is a node like any other and needs an id in the same
+    /// `file::name` shape the rest of them use: `devmap-resolve` names it as
+    /// the source of the `HandlesRoute` edge, `devmap-query` names it on the
+    /// node it emits, and `api_routes` reads the verb back off it. The three
+    /// must agree, so the format lives here and nowhere else — a second
+    /// `format!` in any of them is how they drift apart in silence.
+    ///
+    /// The file is part of the identity because the method and path are not
+    /// unique without it: two blueprints each declaring `GET /health` are two
+    /// routes, and collapsing them would drop a node and strand its edge.
+    ///
+    /// The verb never contains a space or a colon, so a reader can recover it
+    /// from the id by taking the token before the first space and then
+    /// everything after its last `::` — which is what `api_routes` does, and
+    /// why a path containing `::` cannot confuse it.
+    pub fn node_id(&self, file_path: &str) -> String {
+        format!("{}::{} {}", file_path, self.http_method, self.path_pattern)
+    }
+}
+
 /// Evidence that something outside the resolvable call graph reaches a symbol.
 ///
 /// `target_symbol` carries the scope: a file-level annotation targets the file
@@ -498,6 +968,16 @@ pub struct WiringAnnotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WiringKind {
     ScriptEntry,
+    /// A file the toolchain compiles as a root — a Cargo crate root, build
+    /// script, `bin/`, `examples/` or `benches/` target.
+    ///
+    /// A claim about the *file* and nothing inside it. Nothing in the source
+    /// imports a target root and nothing should, so it is never an unwired
+    /// candidate; but its symbols are ordinary code, and an unused helper in
+    /// `src/bin/tool.rs` is exactly as dead as one anywhere else. That is why
+    /// this is its own kind rather than a `ScriptEntry`, which exempts every
+    /// symbol in the file it names.
+    TargetRoot,
     Launcher,
     ReExportPackage,
     FrameworkDecorator,
@@ -513,6 +993,44 @@ pub enum WiringKind {
     /// explicit call anywhere in the corpus (`func init`, `#[test]`,
     /// `componentDidMount`, `pytest_*`, …).
     RuntimeEntryPoint,
+    /// The author declared this file intentionally unwired, with the
+    /// `devcouncil: allow-unwired` marker.
+    ///
+    /// The Python side has honoured this since it was introduced; the kernel
+    /// did not, so `dev map dead` and `unwired_candidates` reported files whose
+    /// author had already answered the question. An explicit human declaration
+    /// outranks a static inference, and one implementation should decide what
+    /// "wired" means.
+    AllowUnwired,
+    /// A dynamic reference to another file that no import edge records.
+    ///
+    /// `target_symbol` carries one normalized module form of the reference —
+    /// `importlib.import_module("pkg.mod")`, `import('./App')`,
+    /// `new Worker(new URL('./w.js', import.meta.url))`, `python -m pkg.mod`.
+    /// The annotation lives on the file that *makes* the reference; the join
+    /// that clears the file being referenced happens in `devmap-analyze`, where
+    /// the whole corpus is in scope.
+    ///
+    /// This is the one thing the Python wiring module held that the kernel
+    /// lacked, and it is real false-positive protection: a lazily imported
+    /// plugin, a code-split route and a worker entry point are all reachable
+    /// and all invisible to an import-edge walk.
+    DynamicImport,
+    /// A config file declares this *symbol* as a program entry point.
+    ///
+    /// `target_symbol` is a resolved symbol identity — `pkg/mod.py::func` for
+    /// `[project.scripts] cli = "pkg.mod:func"` — not the manifest's own path.
+    /// The annotation lives on the manifest that makes the declaration and the
+    /// join that clears the symbol happens in `devmap-analyze`, where the whole
+    /// corpus is in scope; that is the same shape [`WiringKind::DynamicImport`]
+    /// uses, and for the same reason.
+    ///
+    /// Distinct from [`WiringKind::ScriptEntry`], which is a claim about the
+    /// *file* and exempts every symbol in it. A manifest declares no symbols,
+    /// so `ScriptEntry` on a `pyproject.toml` exempted nothing at all and the
+    /// function a console script names stayed a dead-symbol candidate at the
+    /// tier agents are told to act on.
+    ConfigEntryPoint,
 }
 
 /// One `m(...)` entry of a `type X interface { ... }` declaration.
@@ -649,6 +1167,95 @@ pub struct Extraction {
 }
 
 impl Extraction {
+    /// Whether this file is a genuine parse **failure** — one the extractor
+    /// tried to read declarations out of and could not.
+    ///
+    /// The canonical answer, because it was previously spelled inline as
+    /// `matches!(parse_outcome, ParseOutcome::Failed { .. })` and that is not
+    /// the same question. A prose or data format reports `Failed` for want of a
+    /// grammar that does not exist and never will; counting those made
+    /// `history.parse_failed` read 294 on this repository, all of it Markdown,
+    /// JSON, YAML, config and HTML, and buried the 16 files a grammar actually
+    /// parsed and flagged errors in.
+    ///
+    /// Asked of the *engine*, not of the language. `"notebook"` is one of the
+    /// non-declarative languages, but a malformed `.ipynb` is a real failure —
+    /// its engine records `Unavailable`, meaning a grammar was wanted and did
+    /// not get to run, while a `.md` records
+    /// [`ExtractionEngine::NotApplicable`]. A language-keyed classifier would
+    /// silently swallow the notebook case.
+    ///
+    /// `Partial` is deliberately not a failure here: it means tree-sitter
+    /// parsed the file and reported error ranges, which is a weaker and much
+    /// more common claim, tracked separately.
+    pub fn is_parse_failure(&self) -> bool {
+        matches!(self.parse_outcome, ParseOutcome::Failed { .. })
+            && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
+    }
+
+    /// Whether a grammar actually read this file.
+    ///
+    /// The other half of the same line [`Self::is_parse_failure`] draws, and
+    /// the one that decides whether a file is *in the population* a coverage
+    /// question is asked about at all. Prose and data formats are not: no
+    /// grammar read them, none ever will, and they declare nothing that could
+    /// be called dead or stranded.
+    ///
+    /// The canonical owner, because two crates were answering it and one of
+    /// them was not asking. `devmap-analyze` charges `ExtractionGap::ImportBlind`
+    /// only for files this returns `true` for; `devmap-query`'s
+    /// `unwired_candidates` charged everything that survived the parse-failure
+    /// branch, which for prose is `false` by design. So the same fact — "this
+    /// file's language has no import extractor" — was published as 71 by
+    /// `devmap status` and as 355 by the manifest beside it, on this
+    /// repository, for the same generation.
+    ///
+    /// `RegexFallback` and `Unavailable` are excluded: a grammar was *wanted*
+    /// there and did not run, which is a failure and is charged as one.
+    pub fn grammar_read_this_file(&self) -> bool {
+        matches!(
+            self.engine,
+            ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+        ) && matches!(
+            self.parse_outcome,
+            ParseOutcome::Clean | ParseOutcome::Partial { .. }
+        )
+    }
+
+    /// What the extractor could observe **in this file**, as opposed to in a
+    /// language named by a string.
+    ///
+    /// The canonical owner for every coverage charge. `capabilities_for_language`
+    /// answers about a grammar key, and for one engine that key is not the
+    /// grammar that ran: a `.ipynb` stores `language: "notebook"` while the
+    /// parse ran under the kernel's grammar, so `extraction.imports` and
+    /// `extraction.calls` are filled by `notebook.rs` and
+    /// `grammar_read_this_file()` reports `true`.
+    ///
+    /// The registry's own row said so — `("notebook", Capabilities::NONE)` with
+    /// the comment "its capabilities are that grammar's, resolved per file
+    /// rather than declared here" — and nothing resolved it, because nothing
+    /// could: every charge site had only the string. The consequence for every
+    /// clean notebook was four wrong answers at once. It was charged both
+    /// `CallBlind` and `ImportBlind` with the reason "`notebook` has no call
+    /// extractor in this build"; dropped from `files_with_call_extraction`, so
+    /// it left the denominator of the blind share while staying in its
+    /// numerator; made `file_is_call_blind`, so every symbol in it took the
+    /// call-blind ceiling; and counted into `unwired_candidates`'
+    /// `excluded_import_blind`.
+    ///
+    /// Asking the *extraction* is the fix, and it is the fix for the class: any
+    /// future engine that re-dispatches to another grammar answers here rather
+    /// than at four call sites that would each have to remember.
+    pub fn capabilities(&self) -> crate::languages::Capabilities {
+        match &self.engine {
+            ExtractionEngine::Notebook { kernel_language } => {
+                crate::languages::capabilities_for_language(kernel_language)
+            }
+            _ => crate::languages::capabilities_for_language(&self.language),
+        }
+    }
+
     /// Method `qualified_name` to declared parameter count, for the Go
     /// interface-satisfaction join.
     pub fn go_method_param_counts(&self) -> BTreeMap<&str, usize> {
@@ -888,11 +1495,18 @@ mod go_interface_exemption_tests {
             docstring: None,
             signature: None,
             parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
         }
     }
 
     /// A real extraction to mutate, so the fixture cannot drift from the
     /// struct the pipeline actually produces.
+    // Needs a real extraction, so it needs a grammar. Without `parse` the
+    // crate has no `extract_file` at all, and an ungated test made the whole
+    // lib-test target fail to compile — which is why the configuration
+    // GitPulse actually embeds had never had its tests run.
+    #[cfg(feature = "parse")]
     fn base_extraction() -> Extraction {
         crate::extract_file("fixture.go", "package main\n")
     }
@@ -995,6 +1609,7 @@ mod go_interface_exemption_tests {
     /// `""` or `"xyzzy"`. The join above looks up `symbol.qualified_name`, so a
     /// wrong key silently drops every method out of the arity check.
     #[test]
+    #[cfg(feature = "parse")]
     fn param_counts_are_keyed_by_qualified_name() {
         let mut extraction = base_extraction();
         extraction.go_method_params = vec![
@@ -1029,6 +1644,7 @@ mod go_interface_exemption_tests {
     /// store, so nothing errors; the graph just loses every type annotation and
     /// name use while double-counting calls.
     #[test]
+    #[cfg(feature = "parse")]
     fn durable_store_drops_call_kind_references_only() {
         let reference = |kind: ReferenceKind, name: &str| ExtractedReference {
             name: name.into(),
@@ -1078,6 +1694,7 @@ mod go_interface_exemption_tests {
     /// recomputed it. Measured on a 1,610-file tree: 172,161 edges against a
     /// cold 172,046, stable across further rebuilds.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_receiver_binding_survives_durable_persist() {
         let extraction = crate::extract_file(
             "app.py",

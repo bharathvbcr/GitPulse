@@ -2,7 +2,9 @@
 name = "devmap-analyze"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "Graph analysis: dead code, clones, PDG, and coverage over a persisted map"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }
@@ -10,9 +12,124 @@ devmap-resolve = { path = "../devmap-resolve", default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
+# `pdgsrc` walks a Python tree to build the statement tree `pdg` consumes. Both
+# are already workspace dependencies built for `devmap-extract`, so nothing new
+# enters the tree; they are optional here so the `parse`-off shape an embedder
+# links stays free of grammars.
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
 
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
-parse = ["devmap-extract/parse", "devmap-resolve/parse"]
+parse = [
+    "devmap-extract/parse",
+    "devmap-resolve/parse",
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's test
+# suite did not compile in it: these targets import items that are
+# `#[cfg(feature = "parse")]`, and one unresolved import fails a whole target,
+# so `cargo test -p devmap-analyze --no-default-features` returned a build
+# error instead of results. A build error reads as "not meant to be tested",
+# which is how it survived — no test had ever run in that configuration.
+#
+# `required-features` skips these when `parse` is off rather than failing the
+# build. Nothing changes with default features on, where `parse` is enabled.
+
+[[test]]
+name = "c_family_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "discovery_refusals_are_coverage_loss"
+required-features = ["parse"]
+
+[[test]]
+name = "extraction_coverage_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "go_build_variant_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "member_use_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "receiver_qualified_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "test_phase3_analysis"
+required-features = ["parse"]
+
+[[test]]
+name = "liveness_honesty_over_the_hard_shapes"
+required-features = ["parse"]
+
+[[test]]
+name = "labelled_corpus_precision"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_baseline"
+required-features = ["parse"]
+
+[[test]]
+name = "exemption_seams"
+required-features = ["parse"]
+
+[[test]]
+name = "clusters_read_the_defect_ledger"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_cap_is_graded"
+required-features = ["parse"]
+
+[[test]]
+name = "dead_clusters"
+required-features = ["parse"]
+
+[[test]]
+name = "graded_cap_under_hostile_input"
+required-features = ["parse"]
+
+[[test]]
+name = "heritage_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "reexport_chain_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate"
+required-features = ["parse"]
+
+[[test]]
+name = "unresolved_namesake_veto"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_cap_at_repository_scale"
+required-features = ["parse"]
+
+[[test]]
+name = "exemptions_reach_both_passes"
+required-features = ["parse"]
+
+[[test]]
+name = "a_notebook_is_not_call_blind"
+required-features = ["parse"]
+
+[[test]]
+name = "a_console_script_entry_reaches_its_function"
+required-features = ["parse"]

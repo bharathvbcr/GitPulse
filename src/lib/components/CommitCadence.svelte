@@ -35,7 +35,7 @@
 
 {#if summary.buckets.length > 0}
   <span
-    class="inline-flex items-end gap-[1px] h-3 shrink-0"
+    class="inline-flex items-end gap-px h-3 shrink-0"
     role="img"
     aria-label={label}
     title={label}

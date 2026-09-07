@@ -1,7 +1,7 @@
 <script lang="ts">
   import { computePeriodCompare } from "../../pulse/metrics";
   import type { PulseCommitSummary } from "../../pulse/types";
-  import { ArrowUpRight, ArrowDownRight, Minus, TrendingUp } from "lucide-svelte";
+  import { ArrowUpRight, ArrowDownRight, Minus, TrendingUp } from "@lucide/svelte";
 
   let {
     commits = [],

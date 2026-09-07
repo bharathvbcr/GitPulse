@@ -1,7 +1,7 @@
 <script lang="ts">
   import { computeHygiene } from "../../pulse/metrics";
   import type { PulseCommitSummary } from "../../pulse/types";
-  import { CheckCircle2, GitMerge, KeyRound, Scale, Users } from "lucide-svelte";
+  import { CheckCircle2, GitMerge, KeyRound, Scale, Users } from "@lucide/svelte";
 
   let {
     commits = [],
@@ -14,7 +14,7 @@
 
 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
   <!-- Conventional Commits -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Conventional</span>
       <CheckCircle2 size={14} class="text-accent shrink-0" />
@@ -28,7 +28,7 @@
   </div>
 
   <!-- Median Commit Size -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Median Churn</span>
       <Scale size={14} class="text-accent shrink-0" />
@@ -43,7 +43,7 @@
   </div>
 
   <!-- Signed Commits -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Signed (GPG)</span>
       <KeyRound size={14} class="text-accent shrink-0" />
@@ -57,7 +57,7 @@
   </div>
 
   <!-- Merge Commit % -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Merge Commits</span>
       <GitMerge size={14} class="text-accent shrink-0" />
@@ -71,7 +71,7 @@
   </div>
 
   <!-- Co-authored Rate -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between col-span-2 sm:col-span-1">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between col-span-2 sm:col-span-1">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Co-Authored</span>
       <Users size={14} class="text-accent shrink-0" />

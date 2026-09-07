@@ -202,7 +202,7 @@ fn scala_infix_call<'tree>(node: Node<'tree>, source: &str) -> Option<ScalaCall<
 fn scala_assignment_binding(node: Node, source: &str) -> Option<String> {
     let mut current = node;
     for _ in 0..4 {
-        let parent = current.parent()?;
+        let parent = crate::treesitter::bounded_parent(current)?;
         match parent.kind() {
             "val_definition" | "var_definition" => {
                 let value = parent.child_by_field_name("value")?;

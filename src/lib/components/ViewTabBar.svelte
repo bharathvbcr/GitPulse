@@ -2,7 +2,7 @@
   import { repoStore } from "../stores/repoStore";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { VIEW_PANE_ID } from "../views/viewRegistry";
-  import { viewAccelerator } from "../views/viewShortcuts";
+  import { destinationGuide, tipGuideDescId, tipGuideKey } from "../views/viewGuide";
   import type { ViewTab } from "../repos/persist";
   import { formatViewTabLabel, type ViewNavItem } from "../views/viewNav";
   import { visibleViewNav } from "../views/viewVisibility";
@@ -50,7 +50,7 @@
   function tabClass(item: ViewNavItem, active: boolean): string {
     const warning = item.id === "work" && conflictedCount > 0;
     if (active && warning) {
-      return "!text-amber-400";
+      return "text-amber-400!";
     }
     return "";
   }
@@ -81,28 +81,39 @@
   });
 </script>
 
-<div
-  bind:this={scroller}
-  class="flex items-center gap-1.5 shrink-0"
-  role="tablist"
-  aria-label="Views"
-  tabindex="-1"
-  onkeydown={onKeydown}
->
+<div class="relative shrink-0">
+  <div class="sr-only">
+    {#each navItems as item (item.id)}
+      {@const guide = destinationGuide(tipGuideKey(item.id))}
+      {#if guide}
+        <span id={tipGuideDescId(tipGuideKey(item.id))}>{guide.summary}</span>
+      {/if}
+    {/each}
+  </div>
+  <div
+    bind:this={scroller}
+    class="flex items-center gap-1.5 shrink-0"
+    role="tablist"
+    aria-label="Views"
+    tabindex="-1"
+    onkeydown={onKeydown}
+  >
   <div class="gp-segmented" class:gp-liquid-tabs={macos}>
     {#each navItems as item (item.id)}
       {@const active = activeTab === item.id}
-      {@const accelerator = viewAccelerator(item.id)}
+      {@const guideKey = tipGuideKey(item.id)}
+      {@const guide = destinationGuide(guideKey)}
       <button
         type="button"
         role="tab"
         aria-selected={active}
         aria-controls={VIEW_PANE_ID}
+        aria-describedby={guide ? tipGuideDescId(guideKey) : undefined}
         tabindex={active ? 0 : -1}
         data-active-view={active ? "true" : "false"}
         data-active={active ? "true" : "false"}
+        data-tip-guide={guideKey}
         onclick={() => selectTab(item.id)}
-        title={accelerator ? `${item.label} (${accelerator})` : item.label}
         class="gp-seg-btn {tabClass(item, active)}"
       >
         {#if macos && active}
@@ -124,5 +135,6 @@
         {/if}
       </button>
     {/each}
+  </div>
   </div>
 </div>

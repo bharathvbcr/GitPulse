@@ -35,7 +35,7 @@
     Check,
     X,
     Bug,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { diagnostics } from "../diagnostics/diagnostics";
@@ -1361,7 +1361,7 @@
       </div>
       <button
         type="button"
-        class="gp-icon-btn !p-1 hover:text-accent"
+        class="gp-icon-btn p-1! hover:text-accent"
         class:text-emerald-400={reportCopied}
         title={reportCopied ? "Coverage report copied" : "Copy coverage report"}
         aria-label={reportCopied ? "Coverage report copied" : "Copy coverage report"}
@@ -1376,7 +1376,7 @@
       </button>
       <button
         type="button"
-        class="gp-icon-btn !p-1 hover:text-accent"
+        class="gp-icon-btn p-1! hover:text-accent"
         class:text-accent={aiOpen}
         title="MANVI: analyze coverage with the local model"
         onclick={() => (aiOpen = !aiOpen)}
@@ -1386,7 +1386,7 @@
       </button>
       <button
         type="button"
-        class="gp-icon-btn !p-1 hover:text-accent"
+        class="gp-icon-btn p-1! hover:text-accent"
         title="Create a guarded GitHub issue from this coverage snapshot"
         onclick={() => void reportCoverageIssue()}
         disabled={!report || issueSubmitting || isScanning || generating || runningAll || runningMissing || anyScriptRunning}
@@ -1400,7 +1400,7 @@
       {#if missingPipelines.length > 0}
         <button
           type="button"
-          class="gp-btn-primary !py-1 !px-2.5 !text-[11px]"
+          class="gp-btn-primary py-1! px-2.5! text-[11px]!"
           title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
           onclick={() => void runMissingCoverage()}
           disabled={runningMissing || runningAll || anyScriptRunning || isScanning || issueSubmitting}
@@ -1416,7 +1416,7 @@
       {/if}
       <button
         type="button"
-        class="gp-icon-btn !p-1 hover:text-accent"
+        class="gp-icon-btn p-1! hover:text-accent"
         title="Rescan coverage artifacts"
         onclick={rescan}
         disabled={isScanning}
@@ -1432,7 +1432,7 @@
       <button
         type="button"
         onclick={() => void copyScanError()}
-        class="gp-btn !py-0.5 !px-2 !text-[10px] shrink-0"
+        class="gp-btn py-0.5! px-2! text-[10px]! shrink-0"
         title="Copy scan error"
       >
         {#if scanErrorCopied}
@@ -1453,7 +1453,7 @@
       {:else}
         <span class="text-emerald-400 truncate">{issueNotice}</span>
         {#if issueUrl}
-          <button type="button" class="gp-btn !py-0.5 !px-2 !text-[10px] shrink-0" onclick={() => void openCoverageIssue()}>
+          <button type="button" class="gp-btn py-0.5! px-2! text-[10px]! shrink-0" onclick={() => void openCoverageIssue()}>
             Open issue
           </button>
         {/if}
@@ -1643,7 +1643,7 @@
               {/if}
               <button
                 type="button"
-                class="gp-btn-primary !py-1.5"
+                class="gp-btn-primary py-1.5!"
                 title={view.durationHint || "Generate missing coverage artifacts with MANVI"}
                 onclick={() => void runCoverageFamily(view.family)}
                 disabled={runControlsDisabled}
@@ -1661,7 +1661,7 @@
           {#if missingPipelines.length > 1}
             <button
               type="button"
-              class="gp-btn !py-1.5"
+              class="gp-btn py-1.5!"
               title="Generate each missing language with MANVI. Rust needs cargo-llvm-cov; a full run can take several minutes."
               onclick={() => void runMissingCoverage()}
               disabled={runControlsDisabled}
@@ -1696,7 +1696,7 @@
           <button
             type="button"
             onclick={() => void copyScanError()}
-            class="gp-btn !py-1 !text-[11px]"
+            class="gp-btn py-1! text-[11px]!"
             title="Copy scan error diagnostics"
           >
             {#if scanErrorCopied}
@@ -1790,7 +1790,7 @@
     </div>
 
     {#if aiOpen && report}
-      <aside class="w-[22rem] shrink-0 border-l border-border/60 flex flex-col bg-surface/30 overflow-hidden font-sans">
+      <aside class="w-88 shrink-0 border-l border-border/60 flex flex-col bg-surface/30 overflow-hidden font-sans">
         <div class="px-3 py-2 border-b border-border/60 space-y-2 shrink-0">
           <h3 class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-textMuted">
             <Sparkles size={11} class="text-accent" />
@@ -1846,7 +1846,7 @@
             {/if}
             <div class="whitespace-pre-wrap select-all leading-relaxed text-textSecondary">{aiGeneration.text}</div>
             <div class="flex justify-end">
-              <button type="button" onclick={copyGeneration} class="gp-btn !py-1 !text-[11px]" title="Copy the analysis">
+              <button type="button" onclick={copyGeneration} class="gp-btn py-1! text-[11px]!" title="Copy the analysis">
                 <Clipboard size={12} />
                 {generationCopied ? "Copied" : "Copy"}
               </button>
@@ -1860,7 +1860,7 @@
                     type="button"
                     onclick={runAllSteps}
                     disabled={runningAll || runningMissing || issueSubmitting || Object.values(stepResults).some((r) => r.running)}
-                    class="gp-btn-primary !py-1 !text-[11px]"
+                    class="gp-btn-primary py-1! text-[11px]!"
                     title="Execute all executable steps sequentially, stopping at the first failure"
                   >
                     {#if runningAll}
@@ -1891,7 +1891,7 @@
                           type="button"
                           onclick={() => void runStep(step, beginOps())}
                           disabled={res?.running || runningAll || runningMissing || issueSubmitting}
-                          class="gp-btn !py-1 !px-2.5 text-xs shrink-0 disabled:opacity-50"
+                          class="gp-btn py-1! px-2.5! text-xs shrink-0 disabled:opacity-50"
                           title="Execute this command step directly"
                         >
                           {#if res?.running}

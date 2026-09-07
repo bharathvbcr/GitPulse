@@ -3,7 +3,7 @@
   import { copyText } from "../../desktop/clipboard";
   import { trapFocus } from "../../ui/focusTrap";
   import { LAYERS } from "../../ui/layers";
-  import { X, Copy, Download, Check, TriangleAlert } from "lucide-svelte";
+  import { X, Copy, Download, Check, TriangleAlert } from "@lucide/svelte";
 
   let {
     open = false,

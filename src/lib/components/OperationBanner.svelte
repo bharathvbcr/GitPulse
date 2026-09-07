@@ -26,7 +26,7 @@
     type OperationAction,
     type OperationState,
   } from "../repos/operation";
-  import { AlertTriangle, GitMerge, HelpCircle, Loader2 } from "lucide-svelte";
+  import { AlertTriangle, GitMerge, HelpCircle, Loader2 } from "@lucide/svelte";
 
   // Named `operationState`, not `state`: a prop called `state` shadows the
   // `$state` rune inside the same module and silently turns every reactive
@@ -107,7 +107,7 @@
   </div>
 {:else if operation}
   <div
-    class="gp-card gp-pop rounded-xl border-accent/40 bg-accent/[0.06] px-3.5 py-3"
+    class="gp-card gp-pop rounded-xl border-accent/40 bg-accent/6 px-3.5 py-3"
     role="status"
     aria-live="polite"
   >
@@ -137,7 +137,7 @@
             {#each operation.warnings as warning (warning)}
               <li class="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
                 <AlertTriangle size={11} class="mt-0.5 shrink-0" />
-                <span class="min-w-0 break-words">{warning}</span>
+                <span class="min-w-0 wrap-break-word">{warning}</span>
               </li>
             {/each}
           </ul>
@@ -159,8 +159,8 @@
               aria-label={armedLabel(label, isArmed)}
               class="{action === 'continue'
                 ? 'gp-btn-primary'
-                : 'gp-btn'} !py-1 !px-2.5 !text-[11px] inline-flex items-center gap-1.5 {isArmed
-                ? '!border-red-500/60 !text-red-600 dark:!text-red-400'
+                : 'gp-btn'} py-1! px-2.5! text-[11px]! inline-flex items-center gap-1.5 {isArmed
+                ? 'border-red-500/60! text-red-600! dark:text-red-400!'
                 : ''}"
             >
               {#if busy === action}
@@ -174,7 +174,7 @@
             <button
               type="button"
               onclick={() => (armed = null)}
-              class="gp-btn !py-1 !px-2.5 !text-[11px]"
+              class="gp-btn py-1! px-2.5! text-[11px]!"
             >
               Cancel
             </button>

@@ -72,7 +72,7 @@
 
 {#if bars.length > 0}
   <span
-    class="inline-flex items-end gap-[1px] shrink-0"
+    class="inline-flex items-end gap-px shrink-0"
     style="height: {height}px"
     role="img"
     aria-label={description}

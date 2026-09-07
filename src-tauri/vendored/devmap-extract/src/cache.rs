@@ -1,4 +1,6 @@
-use crate::model::{Extraction, ParseOutcome};
+#[cfg(feature = "parse")]
+use crate::model::Extraction;
+use crate::model::ParseOutcome;
 
 /// Analyzer version baked into cache keys (S14 / X7 admission contract).
 pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -126,7 +128,160 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// functions sharing the name `function`, and an `is_exported` that says nothing
 /// — every one of which is a join key or a dead-code verdict, so reusing it
 /// would silently restore the defects this version fixes.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "25";
+/// v26 adds tier-2 declaration recovery: a file whose language has no linked
+/// grammar now contributes pattern-matched symbols instead of nothing, and is
+/// marked `ExtractionEngine::RegexFallback` / `ParseOutcome::Fallback` so a
+/// consumer can tell a matched symbol from a parsed one. A v25 payload for such
+/// a file carries an empty symbol list under a real content hash, so reusing it
+/// would leave every `.proto`, `.ps1` and `.vb` in the tree permanently
+/// invisible while looking freshly indexed.
+/// v27 adds `body_signature`: a Type-1 and Type-2 hash of each symbol body,
+/// computed from the parse tree. A v26 payload has the field absent, which
+/// `serde(default)` reads back as `None` — and `None` means "no signature was
+/// computed", which is exactly what a clone report would then conclude about
+/// every cached file. Without the bump the first incremental build after this
+/// change would report clones found only among the handful of files that
+/// happened to be edited, and report it as a whole-repository answer.
+/// v28 splits `ExtractionEngine::NotApplicable` out of `Unavailable` (K5): a
+/// prose or data format has no grammar *by design*, and a `.proto` this build
+/// cannot parse is a gap in coverage. Both were `Unavailable` before, so a v27
+/// payload cannot say which it is — and `Extraction::is_parse_failure` asks
+/// exactly that. Reusing v27 rows would keep reporting every Markdown file in
+/// the repository as a parse failure while the classifier that stops doing so
+/// sits right beside them.
+/// v29 moves the fallback scan's truncation count out of `diagnostics` and into
+/// the `ParseOutcome::Fallback` reason. `for_durable_store` clears
+/// `diagnostics` before the payload reaches `generation_files.extraction_json`
+/// and this cache, and nothing in the workspace reads that field in production,
+/// so a v28 row for a 2,500-declaration file says "2000 declaration(s)
+/// recovered by pattern" with no trace of the 500 that were dropped. Reusing
+/// those rows would keep serving a prefix under a reason that reads as a set.
+/// v31 moves the notebook cell cap and the unlocatable-symbol count out of
+/// `diagnostics` and into the `ParseOutcome::Fallback` reason, for exactly the
+/// reason v29 did it for the pattern scanner: `for_durable_store` clears
+/// `diagnostics`, so a v29 row for a 6,000-cell notebook says `Clean` with no
+/// trace of the 1,000 cells never read. It also adds the pattern scanner's
+/// `skipped_long_lines` to that reason — a v29 row for a file with an
+/// over-long declaration line reports only what it kept. Reusing either would
+/// keep serving a prefix under an outcome that reads as a set.
+/// v31 also reads the `<script>` blocks of Svelte, Vue, Astro and Liquid files
+/// (`crate::embedded`). A v29 payload for any of those four is the outer
+/// grammar's answer alone: one `File` node, no imports, no calls, no exports,
+/// under `ParseOutcome::Clean` — a complete-looking result over a file whose
+/// entire code half was never read. Reusing those rows would leave every
+/// component in the tree permanently symbol-less while looking freshly indexed,
+/// and would keep reporting `Clean` for a block that fails to parse.
+/// Both landed independently as "v30"; the merged tree carries both
+/// behaviours, so it is v31. A single bump covering two changes is
+/// correct — the version answers "may a stored row be reused?", and
+/// either change on its own already answers no.
+/// v32 adds two things to the payload that a v31 row cannot contain, and by
+/// the same rule either one on its own already answers no:
+///
+/// * **Heritage references (W1.2).** `heritage.rs` pushes
+///   `ReferenceKind::Heritage` and `HeritageInterface` for `extends` /
+///   `implements` / `impl … for` across fifteen languages, which the resolver
+///   turns into `Extends` and `Implements` edges. A v31 row has none of them,
+///   so every subtype relation in a cached file is simply absent — and a
+///   polymorphic override reached only through its base type then reads as
+///   uncalled, which is a delete-this verdict built on an edge that was never
+///   extracted.
+/// * **Wiring annotations (W3.3).** `WiringKind::AllowUnwired` records the
+///   author's explicit `devcouncil: allow-unwired` declaration and
+///   `WiringKind::DynamicImport` records the file forms an `importlib`,
+///   `import('./x')` or worker-URL reference names. A v31 row carries neither,
+///   so a cached file that declares itself intentionally unwired is reported
+///   unwired anyway, and a lazily imported module stays invisible to the
+///   liveness join.
+///
+/// Both are additive to the payload, which is exactly why the bump is
+/// necessary: nothing about a v31 row *looks* stale, so without it a warm cache
+/// serves a complete-looking extraction with the new evidence silently missing.
+/// v33 adds `imports` for nineteen grammar keys that had none (W0.3 move 2):
+/// the whole C family, the JVM family, Dart, PHP, Ruby, Lua, Luau, R, Nix,
+/// Pascal, Solidity, Erlang, CFML and HCL. Before it the extractor had five
+/// `imports.push` sites in total and no `#include` handler anywhere, so a v32
+/// row for any file in those languages carries an **empty** import list — not a
+/// partial one, and not one marked incomplete.
+///
+/// That is the worst shape a stale row can have here, because the consumer is
+/// `unwired_candidates`, whose whole question is whether an inbound `Imports`
+/// edge exists. A reused v32 row answers "nothing imports this file" with the
+/// full confidence of a fresh extraction, for every header, every Java class
+/// and every Terraform module in a warm cache — a delete-this verdict resting
+/// on evidence that was never collected. The capability bit moved in the same
+/// change, so the coverage machinery would no longer even charge the file as
+/// import-blind: it would look examined and be blind.
+///
+/// v33 also adds `WiringKind::TargetRoot` for Cargo target roots — crate roots,
+/// build scripts, `bin/`, `examples/` and `benches/` — which a v32 row cannot
+/// carry either, and which decides whether a file is an entry root. One bump
+/// covers both for the reason the v31 note records: the version answers "may a
+/// stored row be reused?", and either change on its own already answers no.
+///
+/// v33 stops parsing minified bundles (`wiring::is_minified_bundle`) and
+/// reports them `ParseOutcome::Skipped`. Every v32 row for such a file is one
+/// of the three answers the coin flip produced — `Clean` with several hundred
+/// mangled symbols, `Partial`, or `Failed` with a budget reason — and each is a
+/// claim this build no longer makes. The `Clean` rows are the reason the bump
+/// is not optional: they are cache-admitted, they look freshly indexed, and
+/// they would keep publishing a minifier's `t`, `e` and `n` as declarations of
+/// the repository long after the extractor stopped producing them.
+///
+/// v34 (X40) changes the payload in two ways, both of which a v33 row gets
+/// wrong rather than merely misses. `scope_locals` now carries a callable's
+/// **type parameters**, so a v33 row asserts that `read<T>` binds no `T` — the
+/// classifier reads that set as complete and files the generic in the tier
+/// reserved for probable defects. And `references` no longer carries the
+/// inferred-type placeholder `_`, so a v33 row still holds one reference per
+/// turbofish argument, each of which resolves to nothing by construction.
+/// Reusing either would leave a warm cache reporting the old classification
+/// with no sign that it is the old one.
+///
+/// v35 (X41) changes what a Rust `use` statement contributes. A v34 row for a
+/// `.rs` file carries one import per statement whose `module_specifier` is the
+/// statement's own source text (`"tree_sitter::{Language, Node, Parser}"`) and
+/// whose `imported_names` is empty — a specifier that matches no file and binds
+/// no name. The rows are not merely thinner: they are the shape that made every
+/// `.rs` file in a warm cache report zero `Imports` edges and zero `External`
+/// classifications while looking completely indexed.
+///
+/// v36 (X44) changes what `receiver_expr` means, on calls and on references
+/// alike. A v35 row carries `get_node_text` of the receiver node, whole: the
+/// entire left-hand expression of a chained call, newlines included — 13,387
+/// such rows on this repository, 4,973 of them multi-line, the longest 38,644
+/// characters. A v36 row carries the receiver's *identity* — the callee name of
+/// an inner call, a bounded dotted path otherwise. That is a different string
+/// for the same source, so mixing generations would put two spellings of one
+/// receiver in one ledger and split every grouping over it without saying so.
+///
+/// v37 (K) changes which wiring annotations a file carries, and a v36 row
+/// carries the old answers with nothing about it looking stale — the shape the
+/// v31 note calls the reason a bump is not optional. A wiring annotation is an
+/// *exemption*: reusing a stale one either hides a real finding or publishes a
+/// delete-this verdict about code a framework reaches.
+///
+/// * `is_test_path` no longer returns early on the `/src/test/` and
+///   `/src/androidTest/` layouts, so a dotfile there is no longer annotated
+///   `TestFile` — a v36 row exempts every one of them from liveness.
+/// * `is_wiring_decorator` matches a dotted hint as a prefix and a bare hint as
+///   a whole segment instead of as a substring, so a v36 row can carry a
+///   `FrameworkDecorator` for `@multitask` or `@preregister` — and that
+///   annotation exempts every symbol in its file.
+/// * `is_generated_path` gains `*_pb2_grpc.pyi` and requires `.go` after
+///   `zz_generated`, so a v36 row is wrong in both directions: missing a
+///   `GeneratedFile` on a gRPC type stub, and carrying one on a `.txt`.
+/// * `WiringKind::ConfigEntryPoint` is new. A v36 `pyproject.toml` row carries
+///   only the file-scoped `ScriptEntry`, so every console-script entry
+///   function stays a dead-symbol candidate at the `extracted` tier —
+///   a confident proposal to delete a program's entry point.
+///
+/// Each on its own already answers "no" to "may a stored row be reused?", by
+/// the rule the v31 note records. All four are the sharpest shape of stale:
+/// they change an *exemption*, so a reused row either hides a real finding or
+/// publishes a delete-this verdict about code a framework reaches, and nothing
+/// about the row looks old.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "37";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -136,6 +291,12 @@ pub struct CacheKey {
     pub analyzer_version: String,
 }
 
+/// Building a key means asking "may a payload extracted by *this* build be
+/// reused", and only a build with grammars can answer it. The struct itself
+/// stays available with `parse` off: a query-only consumer reads
+/// `grammar_version` / `analyzer_version` off stored rows, it just cannot
+/// compute what its own build would stamp, because it stamps nothing.
+#[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {
         Self::for_content_hash(language, crate::content_hash(source))
@@ -169,6 +330,13 @@ impl CacheKey {
 /// `save_generation_with_metadata` — 65,615 stored against 65,798 analysed.
 /// Anything that decides whether a stored payload may be reused must ask this
 /// function rather than assemble the string itself.
+/// Needs a compiled grammar to answer, so it exists only with `parse` on.
+///
+/// `devmap-store` already guards this: its own `current_payload_identity`
+/// returns `Option` and documents that this one is `#[cfg(feature = "parse")]`.
+/// The gate that comment relies on had been lost, so `--no-default-features`
+/// did not build and the wrapper guarded a condition that could not arise.
+#[cfg(feature = "parse")]
 pub fn current_payload_identity(language: &str) -> (String, String) {
     (
         grammar_version_for(language),
@@ -177,7 +345,39 @@ pub fn current_payload_identity(language: &str) -> (String, String) {
 }
 
 /// Real compiled grammar semver — never a constant placeholder (closes S14).
+///
+/// For a template language this also names the grammars that parse its embedded
+/// `<script>` blocks, because the payload depends on them: a `.svelte` file's
+/// symbols, calls and imports now come out of `tree-sitter-typescript`, and
+/// keying only on `tree-sitter-svelte-ng` would serve a cached extraction back
+/// unchanged across a TypeScript grammar bump that changes every one of them.
+/// The embedded list is read from [`crate::languages::LanguageSpec::embedded`]
+/// through [`crate::embedded::permitted_embedded_languages`] rather than
+/// restated here, so the identity can never name a different set from the one
+/// extraction routes to.
+#[cfg(feature = "parse")]
 pub fn grammar_version_for(language: &str) -> String {
+    let base = base_grammar_identity(language);
+    let embedded = crate::embedded::permitted_embedded_languages(language);
+    if embedded.is_empty() {
+        return base;
+    }
+    let embedded: Vec<String> = embedded
+        .into_iter()
+        .map(base_grammar_identity)
+        .collect::<Vec<_>>();
+    format!("{base}+embedded[{}]", embedded.join(","))
+}
+
+/// The identity of `language`'s own compiled grammar, with no embedded
+/// component.
+///
+/// Split out from [`grammar_version_for`] so the embedded suffix is built from
+/// a function that cannot itself consult the embedded list: one level, and a
+/// registry entry that named its own language could not send this into
+/// unbounded recursion.
+#[cfg(feature = "parse")]
+pub(crate) fn base_grammar_identity(language: &str) -> String {
     let (package, package_version, variant, grammar): (&str, &str, &str, tree_sitter::Language) =
         match language {
             "python" => (
@@ -400,6 +600,10 @@ pub fn cache_admits(outcome: &ParseOutcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Grammar-dependent. `cache_admits` is not, and its test below runs in both
+    // configurations on purpose: gating a whole test module because part of it
+    // needs a grammar is coverage removed from the shape an embedder ships.
+    #[cfg(feature = "parse")]
     use crate::extract_file;
 
     #[test]
@@ -419,6 +623,7 @@ mod tests {
     /// languages means one language's payload can be served for another's file.
     /// The existing test only compared Python against JavaScript.
     #[test]
+    #[cfg(feature = "parse")]
     fn every_linked_grammar_has_a_distinct_real_identity() {
         let linked = [
             "python",
@@ -482,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_s14_grammar_version_is_language_specific() {
         let py = grammar_version_for("python");
         let js = grammar_version_for("javascript");
@@ -492,6 +698,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_s14_cache_key_uses_compiled_grammar_package_and_variant() {
         let ts = grammar_version_for("typescript");
         let tsx = grammar_version_for("tsx");
@@ -503,6 +710,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_cache_key_changes_with_content_hash() {
         let a = extract_file("a.py", "def a(): pass\n");
         let b = extract_file("b.py", "def b(): pass\n");
@@ -510,6 +718,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn extraction_schema_version_is_part_of_cache_identity() {
         let ext = extract_file("worker.py", "worker = Worker()\n");
         let key = CacheKey::for_extraction(&ext);

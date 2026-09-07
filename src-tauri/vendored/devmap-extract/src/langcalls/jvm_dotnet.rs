@@ -48,7 +48,7 @@ use tree_sitter::Node;
 /// direction (SC9).
 pub(super) fn assigned_binding(mut node: Node, source: &str) -> Option<String> {
     for _ in 0..4 {
-        node = node.parent()?;
+        node = crate::treesitter::bounded_parent(node)?;
         let target = match node.kind() {
             // Java, C#
             "variable_declarator" => node.child_by_field_name("name"),

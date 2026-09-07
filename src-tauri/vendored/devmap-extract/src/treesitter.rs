@@ -2,7 +2,7 @@ use crate::content_hash;
 use crate::frameworks::extract_framework_routes;
 use crate::model::*;
 use crate::wiring::extract_wiring_annotations;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tree_sitter::{Language, Node, Parser};
 
@@ -58,10 +58,60 @@ fn is_metal_path(path: &str) -> bool {
         == Some(crate::languages::ExtractorId::Metal)
 }
 
-pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
-    let mut parser = Parser::new();
+/// How long one file may spend inside tree-sitter before the parse is abandoned.
+///
+/// Measured, not guessed. A 4,000-byte C++ source consisting of 2,000 nested
+/// braces takes **131 seconds** to parse (`tree-sitter-cpp` 0.23, release
+/// build); the same input costs Ruby 8.8 s and Python 58 ms. Generated,
+/// minified and machine-emitted sources hit exactly this shape, and until now a
+/// single such file stalled the whole build with no diagnostic — a `dev map` on
+/// a repository containing one would look like a hang, and a daemon rebuild
+/// would hold its lock for the duration.
+///
+/// Five seconds is far above any legitimate file measured on the corpora in
+/// this repository (the slowest real source parses in single-digit
+/// milliseconds) and far below the pathological case.
+pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let ts_lang: Option<(&str, Language)> = match lang {
+/// Grammars deliberately not routed to, and why.
+///
+/// `cobol`: the vendored grammar **does not terminate** on malformed input —
+/// `"a\0b\0c\n"` (six bytes) and `"\u{feff}????\n"` each ran past three minutes,
+/// while the same 14 hostile inputs across the other 34 grammars complete in
+/// 5.03 s total. No in-process bound stops it: tree-sitter's progress callback
+/// is never reached from inside a scanner that is spinning, and a spinning
+/// thread cannot be killed. One `.cbl` file with a stray NUL or a mangled
+/// header hung `dev map` outright and left a daemon holding its writer lock.
+///
+/// Unlinking costs nothing measurable, which is what settled it: on a realistic
+/// COBOL program the grammar parsed `Clean` and yielded **only the File node**
+/// — zero declarations, zero calls — and the bounded fallback scanner recovers
+/// nothing either. COBOL was already one of the twelve languages with no call
+/// extraction. Files still get a File node and stay addressable as edge
+/// targets.
+///
+/// Re-linking requires a grammar that terminates, proven against
+/// `devmap-extract/tests/adversarial_corpus.rs`.
+const UNSAFE_GRAMMARS: &[(&str, &str)] = &[(
+    "cobol",
+    "the vendored tree-sitter-cobol grammar does not terminate on malformed \
+     input and cannot be bounded in-process; it yielded no declarations or \
+     calls even on well-formed source, so it is not linked",
+)];
+
+/// The grammar this build parses `lang` with, and the key it records.
+///
+/// Hoisted out of `extract_treesitter_with_budget` so it has a name and a
+/// second caller. `langimports` needs the same table to prove, per language,
+/// that an import node kind it matches is a kind the linked grammar actually
+/// produces — a claim that was previously only checkable by running the whole
+/// extractor and inferring the answer from what came out.
+///
+/// The returned `&'static str` is the *grammar* key, which is not always the
+/// language key: ArkTS answers `typescript` and Metal answers `cpp`, because
+/// they reuse those grammars.
+pub(crate) fn grammar_for(lang: &str) -> Option<(&'static str, Language)> {
+    match lang {
         "python" => Some(("python", tree_sitter_python::LANGUAGE.into())),
         "javascript" => Some(("javascript", tree_sitter_javascript::LANGUAGE.into())),
         "typescript" => Some((
@@ -73,7 +123,6 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
         "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
         "hcl" => Some(("hcl", tree_sitter_hcl::LANGUAGE.into())),
         "vue" => Some(("vue", vendored::vue())),
-        "cobol" => Some(("cobol", vendored::cobol())),
         "liquid" => Some(("liquid", vendored::liquid())),
         "astro" => Some(("astro", tree_sitter_astro_next::LANGUAGE.into())),
         "kotlin" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
@@ -102,11 +151,295 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
         "shell" => Some(("shell", tree_sitter_bash::LANGUAGE.into())),
         "sql" => Some(("sql", tree_sitter_sequel::LANGUAGE.into())),
         _ => None,
+    }
+}
+
+/// Language keys that have a [`grammar_for`] arm.
+///
+/// Kept beside the match so a new arm without an entry here fails
+/// [`linked_grammar_keys_cover_every_grammar_for_arm`]. Hosts compare
+/// [`linked_grammar_count`] against a vendored expectation; the count is
+/// derived from this list rather than asserted, so it cannot silently drift.
+const GRAMMAR_LANGUAGE_KEYS: &[&str] = &[
+    "python",
+    "javascript",
+    "typescript",
+    "tsx",
+    "rust",
+    "go",
+    "hcl",
+    "vue",
+    "liquid",
+    "astro",
+    "kotlin",
+    "svelte",
+    "java",
+    "csharp",
+    "php",
+    "ruby",
+    "c",
+    "cpp",
+    "objc",
+    "cuda",
+    "swift",
+    "scala",
+    "dart",
+    "pascal",
+    "lua",
+    "luau",
+    "r",
+    "cfml",
+    "erlang",
+    "solidity",
+    "nix",
+    "shell",
+    "sql",
+];
+
+/// Distinct tree-sitter grammar keys this binary can load.
+///
+/// Excludes languages refused by [`UNSAFE_GRAMMARS`]: those still have a
+/// generated parser in the tree, but this build will not route to them.
+/// Hosts (GitPulse, the Python seam) compare this number against the count
+/// they expect from the same revision, so a binary built without a grammar
+/// cannot claim the same capability as one that has it.
+pub fn linked_grammar_count() -> usize {
+    linked_grammar_keys().len()
+}
+
+/// The grammar keys behind [`linked_grammar_count`], sorted and deduplicated.
+pub fn linked_grammar_keys() -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = GRAMMAR_LANGUAGE_KEYS
+        .iter()
+        .filter(|lang| {
+            !UNSAFE_GRAMMARS
+                .iter()
+                .any(|(unsafe_lang, _)| unsafe_lang == *lang)
+        })
+        .filter_map(|lang| grammar_for(lang).map(|(grammar, _)| grammar))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
+    extract_treesitter_with_budget(path, lang, source, DEFAULT_PARSE_BUDGET)
+}
+
+/// What a bounded parse attempt produced.
+///
+/// Distinguishing these is the point: before, "no grammar arm for this
+/// language", "the grammar is linked but refused to load", and "the parser gave
+/// up" all fell through to the same `unavailable_extraction`, which then
+/// asserted *"no linked tree-sitter grammar for {lang}"* — false for the last
+/// two, and in the grammar-load case exactly what a tree-sitter ABI regression
+/// would look like while the build stayed green.
+enum ParseAttempt {
+    Parsed(tree_sitter::Tree),
+    /// The parser exceeded its budget and was cancelled.
+    Budget(std::time::Duration),
+    /// `set_language` refused a grammar that *is* linked.
+    GrammarLoadFailed,
+    /// The parser returned no tree for a reason it did not name.
+    NoTree,
+}
+
+fn parse_within_budget(
+    parser: &mut Parser,
+    source: &str,
+    deadline: std::time::Instant,
+) -> ParseAttempt {
+    let started = std::time::Instant::now();
+    let mut over_budget = false;
+    let tree = {
+        // The progress callback is polled by tree-sitter during the parse and
+        // returning `true` cancels it; this is the only way to bound a parse
+        // that has already entered a pathological state.
+        //
+        // Against the *shared* deadline, not a budget of its own: the parse is
+        // the first phase of the file's extraction, not a separately funded
+        // one.
+        let mut cancel = |_: &tree_sitter::ParseState| -> bool {
+            if std::time::Instant::now() >= deadline {
+                over_budget = true;
+                return true;
+            }
+            false
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut cancel);
+        let bytes = source.as_bytes();
+        parser.parse_with_options(
+            &mut |offset: usize, _| {
+                if offset < bytes.len() {
+                    &bytes[offset..]
+                } else {
+                    &[][..]
+                }
+            },
+            None,
+            Some(options),
+        )
     };
+    match tree {
+        Some(tree) if !over_budget => ParseAttempt::Parsed(tree),
+        // A cancelled parse can still hand back a partial tree. It describes a
+        // prefix of the file, so accepting it would publish a truncated symbol
+        // set as a complete one — the shape this codebase treats as worse than
+        // a visible failure.
+        _ if over_budget => ParseAttempt::Budget(started.elapsed()),
+        _ => ParseAttempt::NoTree,
+    }
+}
+
+pub fn extract_treesitter_with_budget(
+    path: &str,
+    lang: &str,
+    source: &str,
+    budget: std::time::Duration,
+) -> Extraction {
+    // One deadline for the whole call, taken once.
+    //
+    // It used to be two: the parse was given `budget`, and then the walk was
+    // given `Instant::now() + budget` *after* the parse had already spent its
+    // own, so a file could legitimately consume twice the budget its caller
+    // asked for and still be published `Clean`. Everything after the walk —
+    // `go_method_sets`, the Python passes, the framework matcher, `clonesig` —
+    // had no deadline at all. `budget` is what the caller is promised; this is
+    // the only clock that decides whether the promise was kept.
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+    let _budget = BudgetGuard::arm(deadline);
+
+    // Before anything else: a language whose grammar is deliberately not linked
+    // must be refused here, not fall through to `unavailable_extraction`. That
+    // path's reason — "no linked tree-sitter grammar for {lang}" — is true but
+    // useless: it reads as "upstream has no grammar", which is why VB.NET is
+    // absent, and would leave a maintainer free to re-link a grammar that hangs.
+    if let Some(why) = UNSAFE_GRAMMARS
+        .iter()
+        .find(|(unsafe_lang, _)| *unsafe_lang == lang)
+        .map(|(_, why)| *why)
+    {
+        return refused_extraction(path, lang, source, why.to_string());
+    }
+
+    // And a *file* whose shape makes the budget the thing that decides the
+    // answer. `UNSAFE_GRAMMARS` above refuses by language; this refuses by
+    // path, and for the same underlying reason — a parse whose cost is not
+    // bounded by anything the extractor controls.
+    //
+    // A minified bundle is the one shape that reliably reaches the boundary: it
+    // is dense syntax with no line structure, it is large, and it is committed
+    // outside the `node_modules/` and `dist/` directories discovery already
+    // refuses. The real one in this project's tree — 177,599 bytes over five
+    // lines — cost 4.7–5.0 s against a 5 s budget, so which of `Clean`,
+    // `Partial` and `Failed` it published depended on the load average. That is
+    // 449 symbols appearing and disappearing between builds, and a dead-code
+    // verdict changing with them.
+    //
+    // Declining costs nothing, because there was nothing to lose. Every
+    // identifier in the file is a minifier's single letter: `t`, `e`, `n`. As
+    // search results they are noise, as call edges they resolve to nothing, and
+    // as dead-code candidates they are already exempt — `is_vendored_path`
+    // matches the same file and hangs the annotation that exempts it.
+    if crate::wiring::is_minified_bundle(path) {
+        return skipped_extraction(
+            path,
+            lang,
+            source,
+            "not parsed: minified bundle, whose only declarations are a \
+             minifier's mangled names"
+                .to_string(),
+        );
+    }
+
+    let mut parser = Parser::new();
+
+    let ts_lang: Option<(&str, Language)> = grammar_for(lang);
 
     if let Some((grammar, ts_l)) = ts_lang {
-        if parser.set_language(&ts_l).is_ok() {
-            if let Some(tree) = parser.parse(source, None) {
+        // A NUL byte means this is not source text, and some grammars do not
+        // merely mis-parse it — they hang. Measured: `"a\0b\0c\n"`, six bytes,
+        // ran for over three minutes in `tree-sitter-cobol` with no sign of
+        // terminating, and the parse budget could not stop it because the
+        // progress callback is never reached from inside a scanner that is
+        // spinning. A `.cbl` file with a stray NUL would hang `dev map`
+        // outright, and a daemon would hold its lock forever.
+        //
+        // Rejecting at the boundary is the only bound that holds for every
+        // grammar, including a vendored one whose scanner this repository does
+        // not control. It is also correct on its own terms: a file containing a
+        // NUL is binary, and every extractor here assumes text.
+        if source.as_bytes().contains(&0) {
+            return refused_extraction(
+                path,
+                lang,
+                source,
+                format!(
+                    "source contains a NUL byte at offset {} and is not text; refused before \
+                     parsing because some grammars do not terminate on it",
+                    source.as_bytes().iter().position(|b| *b == 0).unwrap_or(0)
+                ),
+            );
+        }
+        let attempt = if parser.set_language(&ts_l).is_ok() {
+            parse_within_budget(&mut parser, source, deadline)
+        } else {
+            ParseAttempt::GrammarLoadFailed
+        };
+        match &attempt {
+            ParseAttempt::Budget(elapsed) => {
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "parse of {} bytes exceeded the {:?} budget for grammar {grammar} \
+                         (stopped at {elapsed:?}); no symbols are claimed for this file",
+                        source.len(),
+                        budget
+                    ),
+                );
+            }
+            ParseAttempt::GrammarLoadFailed => {
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "grammar {grammar} for {lang} is linked but failed to load; this is a \
+                         grammar/ABI fault, not an absent grammar"
+                    ),
+                );
+            }
+            ParseAttempt::NoTree => {
+                // The variant that exists to name "the parser returned no tree
+                // and did not say why" was the one not routed to the refusal
+                // path. Falling through published every file of the language as
+                // `RegexFallback` with the reason "no linked tree-sitter grammar
+                // for {lang}" — false, cache-admitted under a real content hash,
+                // and exempting the whole language from dead-code analysis while
+                // the build stayed green. That is the exact scenario
+                // `refused_extraction`'s own doc warns about.
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "grammar {grammar} for {lang} returned no tree and named no reason; \
+                         no symbols are claimed for this file"
+                    ),
+                );
+            }
+            ParseAttempt::Parsed(_) => {}
+        }
+        if let ParseAttempt::Parsed(tree) = attempt {
+            {
+                // The budget covers parse *and* walk *and* everything after it.
+                // Measured: a 4,000-byte C++ file of 2,000 nested braces parses
+                // in 3 ms and then spends 199 s in the walk, so bounding the
+                // parse alone bounds nothing that actually hurts.
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
@@ -131,13 +464,25 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     docstring: None,
                     signature: None,
                     parent_symbol: None,
+                    body_signature: None,
+                    declaration_hash: None,
                 });
 
                 // File-level wiring first, so a file-scoped exemption always
                 // precedes the symbol-scoped ones and stays the file's reason.
                 let mut wiring = extract_wiring_annotations(path, source);
 
-                walk_tree(
+                // Every phase below shares one refusal, so a file cut short
+                // in the tail cannot be reported differently from one cut short
+                // in the walk.
+                let over_budget = |phase: &str| {
+                    format!(
+                        "extraction of {} bytes exceeded the {budget:?} budget for grammar \
+                         {grammar} while {phase}; no symbols are claimed for this file",
+                        source.len()
+                    )
+                };
+                let walk_completed = walk_tree(
                     root,
                     source,
                     lang,
@@ -148,7 +493,20 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     &mut exports,
                     &mut references,
                     &mut wiring,
+                    deadline,
                 );
+                if !walk_completed {
+                    // The partial `symbols`/`calls` collected so far describe a
+                    // prefix of the tree. Publishing them would be a truncated
+                    // extraction wearing a clean outcome, and every consumer
+                    // reads an absent symbol as one that does not exist.
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("walking the syntax tree"),
+                    );
+                }
 
                 let (go_interface_methods, go_method_params) = if lang == "go" {
                     let sets = go_method_sets(root, source, &file_symbol_name);
@@ -157,6 +515,31 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                 } else {
                     (Vec::new(), Vec::new())
                 };
+                if extraction_overran(deadline) {
+                    // Labelled by what actually ran for *this* language. The
+                    // block above is gated on `lang == "go"`, so naming it
+                    // unconditionally reported a Python file as having spent
+                    // its budget "deriving Go method sets" — a stage that did
+                    // not execute, for a language that has no method sets. The
+                    // refusal was right and the accounting was not, which sends
+                    // a maintainer after a pass that never ran.
+                    //
+                    // For every other language the only work between
+                    // `walk_tree`'s last deadline check and here is the walk's
+                    // own tail: the clock is read every `DEADLINE_CHECK_STRIDE`
+                    // nodes, so a walk can return `true` having crossed the
+                    // deadline within the following stride.
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget(if lang == "go" {
+                            "deriving Go method sets"
+                        } else {
+                            "finishing the syntax-tree walk"
+                        }),
+                    );
+                }
 
                 if lang == "python" {
                     let declared = python_all_exports(source);
@@ -219,7 +602,30 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
 
-                return Extraction {
+                // Body signatures are stamped here, after every language arm
+                // has finished pushing symbols, rather than inside `walk_tree`.
+                // The walk emits symbols from more than thirty grammar-specific
+                // branches; hashing in each is thirty chances to add a grammar
+                // later and silently omit its signatures.
+                crate::clonesig::stamp_signatures(&mut symbols, root, source);
+                crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
+
+                // The last gate before the file is published. Everything above
+                // has either finished or latched `WALK_OVERRAN`; this is what
+                // stops a run that went past its budget from being handed out
+                // as a complete read of the file.
+                if extraction_overran(deadline) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("stamping signatures"),
+                    );
+                }
+
+                // Bound rather than returned: the embedded-script merge below
+                // still has to run, and it mutates this value in place.
+                let mut extraction = Extraction {
                     file_path: path.to_string(),
                     language: lang.to_string(),
                     content_hash,
@@ -248,6 +654,29 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     source_code: Some(source.to_string()),
                 };
+
+                // The code inside a template language's `<script>` blocks, in
+                // the outer file's own coordinates. Last, and after
+                // `collect_scope_locals`, for two reasons: each inner parse
+                // clears the per-scope local cache that call reuses, and the
+                // merge restores the orderings established just above. For
+                // every language whose registry entry declares no embedded
+                // languages — all but Svelte, Vue, Astro and Liquid — this
+                // returns after one registry lookup.
+                // The one clock, not a second one started here. This used to
+                // pass a deadline computed inside the arm as
+                // `Instant::now() + budget`, which restarted the budget after
+                // the parse had already spent part of it. `deadline` is the
+                // clock `BudgetGuard` is armed with and the one every other
+                // stage checks.
+                crate::embedded::merge_embedded_scripts(
+                    &mut extraction,
+                    root,
+                    source,
+                    lang,
+                    deadline,
+                );
+                return extraction;
             }
         }
     }
@@ -262,12 +691,57 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
 /// `is_metal` opts a `.metal` file into the second benign class — see
 /// [`is_benign_metal_qualifier`]. It is a language fact, not a grammar fact, so
 /// it cannot be read off the grammar key: Metal and C++ share `"cpp"`.
+/// Push every child of `node` onto a traversal worklist.
+///
+/// **Never iterate children by index.** `Node::child(i)` walks the sibling
+/// chain from the first child on every call, so `for i in 0..node.child_count()`
+/// is O(n^2) in the number of children. That is not a theoretical cost: a
+/// degenerate parse gives the root one child per token, and a 140 KB file of
+/// `"fn (((("` produced a root with 100,000 children. Walking it by index took
+/// **37 s**; walking the same tree with a `TreeCursor` visited the same nodes in
+/// **2.5 ms**. The whole 873x parse-budget overrun measured in
+/// `tests/budget_is_a_real_bound.rs` was this, not tree-sitter.
+///
+/// A `TreeCursor` steps to the next sibling in O(1), so these helpers are
+/// linear. They exist so the fast form has one owner and the slow form has one
+/// place to be warned about.
+fn push_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            worklist.push(cursor.node());
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// [`push_children`], but pushed last-child-first.
+///
+/// Callers that `pop()` from the worklist get first-child-first — document
+/// order — which several walks depend on for deterministic output (R4).
+fn push_children_reversed<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mark = worklist.len();
+    push_children(node, worklist);
+    worklist[mark..].reverse();
+}
+
+/// [`push_children`] over named children only.
+fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        worklist.push(child);
+    }
+}
+
 fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
     if !root.has_error() {
         return ParseOutcome::Clean;
     }
     let mut error_ranges = Vec::new();
     let mut stack = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
         if (node.is_error() || node.is_missing())
             && !is_benign_jsx_ampersand(node, source)
@@ -278,10 +752,15 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
                 end_byte: node.end_byte(),
             });
         }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
                 if child.has_error() {
                     stack.push(child);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
                 }
             }
         }
@@ -485,7 +964,7 @@ fn is_benign_jsx_ampersand(node: Node, source: &str) -> bool {
     if !text.contains('&') || text.contains('<') || text.contains('{') || text.contains('}') {
         return false;
     }
-    let mut current = node.parent();
+    let mut current = bounded_parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -497,7 +976,7 @@ fn is_benign_jsx_ampersand(node: Node, source: &str) -> bool {
         ) {
             return true;
         }
-        current = parent.parent();
+        current = bounded_parent(parent);
     }
     false
 }
@@ -726,23 +1205,281 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
     aliases
 }
 
-fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
+/// Extraction for a language with no linked grammar.
+///
+/// Emits the `File` node, then tries tier-2 pattern recovery for declarations.
+///
+/// A file that reached here used to contribute *no nodes whatsoever*: the
+/// `File` node was pushed only on the tree-sitter path above, so there was no
+/// symbol, no span, and nothing for an edge to point at. On two real trees that
+/// silently swallowed every `.proto`, `.ps1`, `.vb`, `.vue` and `.metal` file
+/// in them. Both halves are closed now — the file is always addressable, and
+/// its declarations are recovered when the language has any to recover.
+///
+/// The two *declaration* outcomes stay labelled differently on purpose. When
+/// the scanner finds declarations the file reports `RegexFallback` /
+/// `ParseOutcome::Fallback`, so no consumer can mistake a pattern-matched
+/// symbol for a parsed one. When it finds none the outcome stays `Failed`,
+/// because no declaration was recovered and the `File` node is not a
+/// declaration — reporting success on the strength of it would be the lie the
+/// labelling exists to prevent.
+///
+/// A parse this build *refused to complete*, reported as such.
+///
+/// Distinct from `unavailable_extraction`, which answers "there is no grammar
+/// for this language". Here a grammar exists and something went wrong with it —
+/// a budget overrun or a load fault — and saying "no linked tree-sitter grammar
+/// for {lang}" would be false. It matters most for the case that looks like
+/// nothing: a tree-sitter ABI break would otherwise downgrade every file of a
+/// language to regex fallback, be cache-admitted, exempt them all from
+/// dead-code analysis, and leave the build green.
+///
+/// No declarations are recovered by pattern here. A file whose parse was
+/// abandoned has an unknown structure, and a pattern scan over it would produce
+/// a plausible-looking symbol set that nothing verified.
+fn refused_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+    unparsed_extraction(
+        path,
+        lang,
+        source,
+        ExtractionEngine::Unavailable {
+            requested_language: lang.to_string(),
+        },
+        ParseOutcome::Failed { reason },
+    )
+}
+
+/// A parse this build **chose not to attempt**, reported as such.
+///
+/// Distinct from `refused_extraction` in both fields, and both differences are
+/// the same claim: nothing went wrong here. The engine is `NotApplicable`
+/// rather than `Unavailable` because no grammar was wanted — one exists and is
+/// linked, and asking it was simply not worth the clock — and the outcome is
+/// `Skipped` rather than `Failed` because "we did not try" is not a symptom a
+/// maintainer should be sent to investigate, and because a decision about a
+/// file's name is a stable verdict that may be cached.
+///
+/// Shares its body with the refusal path deliberately. Both emit the `File`
+/// node and the wiring annotations and claim nothing else; when that shape was
+/// two copies, one of them was fixed and the other was not.
+fn skipped_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+    unparsed_extraction(
+        path,
+        lang,
+        source,
+        ExtractionEngine::NotApplicable {
+            language: lang.to_string(),
+        },
+        ParseOutcome::Skipped { reason },
+    )
+}
+
+/// The `File`-node-only extraction both no-parse paths publish.
+fn unparsed_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    engine: ExtractionEngine,
+    parse_outcome: ParseOutcome,
+) -> Extraction {
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
         content_hash: content_hash(source),
-        engine: ExtractionEngine::Unavailable {
-            requested_language: lang.to_string(),
-        },
-        parse_outcome: ParseOutcome::Failed {
-            reason: format!("no linked tree-sitter grammar for {lang}"),
-        },
-        symbols: Vec::new(),
+        engine,
+        parse_outcome,
+        // The File node is still emitted: being unable to parse a file is not a
+        // reason to deny it exists, and every edge that targets it needs a node.
+        symbols: vec![ExtractedSymbol {
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            qualified_name: path.to_string(),
+            kind: SymbolKind::File,
+            span: Span {
+                start_byte: 0,
+                end_byte: source.len(),
+            },
+            is_exported: true,
+            docstring: None,
+            signature: None,
+            parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
+        }],
         imports: Vec::new(),
         calls: Vec::new(),
         exports: Vec::new(),
         references: Vec::new(),
         diagnostics: Vec::new(),
+        routes: Vec::new(),
+        wiring: extract_wiring_annotations(path, source),
+        go_package: None,
+        go_build_constrained: false,
+        go_interface_methods: Vec::new(),
+        go_method_params: Vec::new(),
+        scope_locals: Vec::new(),
+        source_code: Some(source.to_string()),
+    }
+}
+
+fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
+    // Whether a grammar was ever expected for this format. A `.proto` or `.ps1`
+    // with no linked grammar is a gap in coverage; a `.md` is not, and K5 is
+    // the record of what conflating them cost — 294 of 1,310 files reported as
+    // parse failures, all prose and data, hiding the 16 real ones.
+    let declarative = crate::fallback::applies_to(lang);
+    let scan = if declarative {
+        crate::fallback::scan_declarations(path, source)
+    } else {
+        // Prose and data formats declare nothing; see
+        // `fallback::NON_DECLARATIVE_LANGUAGES` for what scanning them produced.
+        crate::fallback::FallbackScan {
+            symbols: Vec::new(),
+            truncated: 0,
+            skipped_long_lines: 0,
+        }
+    };
+    let recovered_count = scan.symbols.len();
+    let recovered = recovered_count > 0;
+
+    // The `File` node, which this path used to omit entirely.
+    //
+    // It is pushed on the tree-sitter path above as the first symbol of every
+    // parsed file, but that push sits *inside* the `if let Some(ts_lang)` block,
+    // so a file with no linked grammar was recorded in `generation_files` and
+    // contributed nothing to the graph: not addressable by a file-level query,
+    // and unusable as the target of any edge. That is placement, not design —
+    // nothing downstream wants a nodeless file.
+    //
+    // Emitted for *every* grammarless file, including the prose and data
+    // formats that get no declaration scan. Being unable to recover a file's
+    // declarations is not a reason to deny that the file exists; a Markdown
+    // document that something links to still has to be a valid edge target.
+    //
+    // Safe against the dead-code surface by construction: `File` nodes are
+    // exempt in `liveness.rs` (both the Go duplicate-identity count and the
+    // dead-symbol sweep) and are skipped as `Contains` sources in the resolver,
+    // so this widens what the graph can address without adding a single
+    // dead-symbol candidate.
+    let mut symbols = Vec::with_capacity(scan.symbols.len() + 1);
+    symbols.push(ExtractedSymbol {
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        qualified_name: path.to_string(),
+        kind: SymbolKind::File,
+        span: Span {
+            start_byte: 0,
+            end_byte: source.len(),
+        },
+        is_exported: true,
+        docstring: None,
+        signature: None,
+        parent_symbol: None,
+        // A file has no body to fingerprint; clone detection is over symbol
+        // bodies, and `None` means "not computed", never "no duplicates".
+        body_signature: None,
+        declaration_hash: None,
+    });
+    symbols.extend(scan.symbols);
+    let mut diagnostics: Vec<String> = Vec::new();
+    if scan.truncated > 0 {
+        // Reported, not silently dropped: the symbol list is a prefix, and a
+        // consumer that reads it as complete would conclude the rest of the
+        // file declares nothing.
+        diagnostics.push(format!(
+            "fallback declaration scan stopped at {} symbols; {} more were dropped",
+            crate::fallback::MAX_FALLBACK_SYMBOLS,
+            scan.truncated
+        ));
+    }
+    Extraction {
+        file_path: path.to_string(),
+        language: lang.to_string(),
+        content_hash: content_hash(source),
+        engine: match (recovered, declarative) {
+            (true, _) => ExtractionEngine::RegexFallback {
+                requested_language: lang.to_string(),
+            },
+            // A grammar was wanted for this language and was not there: a real
+            // gap, and `Extraction::is_parse_failure` counts it.
+            (false, true) => ExtractionEngine::Unavailable {
+                requested_language: lang.to_string(),
+            },
+            // Prose or data. No grammar was ever expected, so this is not a
+            // failure to report — see `ExtractionEngine::NotApplicable`.
+            (false, false) => ExtractionEngine::NotApplicable {
+                language: lang.to_string(),
+            },
+        },
+        parse_outcome: match (recovered, declarative) {
+            // The dropped count rides on the *reason*, not on `diagnostics`.
+            // `for_durable_store` clears `diagnostics` before the payload is
+            // written to `generation_files.extraction_json` and the extraction
+            // cache, and nothing in the workspace reads that field in
+            // production — so the truncation the scanner correctly computed was
+            // erased on the way to storage, and the stored record of a 2,500
+            // declaration file read as a complete recovery of 2,000. A
+            // truncation is part of the result, not a note about it.
+            (true, _) => ParseOutcome::Fallback {
+                reason: {
+                    // Two different ways to lose a declaration, and they are
+                    // not interchangeable. The scan cap drops declarations the
+                    // scanner *counted*, so the true total is known exactly.
+                    // A skipped line was never pattern-matched at all, so how
+                    // many declarations it held is unknown — which makes the
+                    // total a lower bound, and saying so is the whole point.
+                    let counted_total = recovered_count + scan.truncated;
+                    let mut caveats = Vec::new();
+                    if scan.truncated > 0 {
+                        caveats.push(format!("{} dropped at the scan cap", scan.truncated));
+                    }
+                    if scan.skipped_long_lines > 0 {
+                        caveats.push(format!(
+                            "{} line(s) over {} bytes never scanned, so the total is a lower \
+                             bound",
+                            scan.skipped_long_lines,
+                            crate::fallback::MAX_LINE_BYTES
+                        ));
+                    }
+                    // The "X of Y" form is used only when Y is genuinely
+                    // known — that is, when every declaration was counted and
+                    // some were dropped afterwards. If a line was never
+                    // scanned, printing "2 of 2" would state a total the
+                    // scanner cannot know, which is the same overclaim in a
+                    // smaller font.
+                    let counted = if scan.truncated > 0 {
+                        format!("{recovered_count} of {counted_total} declaration(s)")
+                    } else {
+                        format!("{recovered_count} declaration(s)")
+                    };
+                    if caveats.is_empty() {
+                        format!(
+                            "no linked tree-sitter grammar for {lang}; {counted} recovered by \
+                             pattern"
+                        )
+                    } else {
+                        format!(
+                            "no linked tree-sitter grammar for {lang}; {counted} recovered by \
+                             pattern, {} — the symbol list is a prefix, not a set",
+                            caveats.join(" and ")
+                        )
+                    }
+                },
+            },
+            (false, true) => ParseOutcome::Failed {
+                reason: format!("no linked tree-sitter grammar for {lang}"),
+            },
+            (false, false) => ParseOutcome::Failed {
+                reason: format!(
+                    "{lang} is a prose/data format with no declarations to parse; \
+                     indexed as a File node"
+                ),
+            },
+        },
+        symbols,
+        imports: Vec::new(),
+        calls: Vec::new(),
+        exports: Vec::new(),
+        references: Vec::new(),
+        diagnostics,
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
@@ -768,10 +1505,26 @@ fn walk_tree(
     exports: &mut Vec<ExtractedExport>,
     references: &mut Vec<ExtractedReference>,
     wiring: &mut Vec<WiringAnnotation>,
-) {
-    reset_scope_locals();
+    deadline: std::time::Instant,
+) -> bool {
     let mut worklist = vec![root];
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        // A `Cell` read, cheap enough for every node, unlike a clock read.
+        if walk_overran() {
+            return false;
+        }
+        // The clock is read every `DEADLINE_CHECK_STRIDE` nodes rather than
+        // every node: an ordinary file walks millions of nodes and each read is
+        // a real cost, while the pathological case that needs bounding takes
+        // orders of magnitude longer than the stride can hide.
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
         extract_node(
             node,
             source,
@@ -784,12 +1537,55 @@ fn walk_tree(
             references,
             wiring,
         );
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
+        // Beside `extract_node` rather than inside it: heritage is one decision
+        // that fifteen languages spell differently, and putting it in the
+        // per-language match would scatter it across every arm.
+        crate::heritage::push_heritage_references(node, source, lang, file_symbol_name, references);
+        push_children_reversed(node, &mut worklist);
+    }
+    true
+}
+
+/// Nodes walked between deadline checks. See `walk_tree`.
+const DEADLINE_CHECK_STRIDE: u32 = 256;
+
+/// The `{ a, b as c }` clause of a JavaScript/TypeScript import or export
+/// statement, or `None` when the statement has no binding clause at all.
+///
+/// Located structurally because the text scan it replaces was wrong in both
+/// directions on ordinary source. `text.find('{')` and `text.find('}')` were
+/// taken independently with no ordering check, so
+/// `export const isClose = (c) => c === '}' || c === '{';` — valid, idiomatic
+/// JavaScript — produced an inverted slice range and panicked, aborting the
+/// whole build (`extract_all` runs under rayon and release sets
+/// `panic = "abort"`). With the two literals the other way round the same scan
+/// did not panic; it fabricated an import *and* an export of a name spelled
+/// `'`, which is the quieter half of the same defect. `export default function
+/// f() { … }` was read the same way, with the function body parsed as a binding
+/// list.
+///
+/// The grammar already answers the question exactly: a binding clause is an
+/// `export_clause` (`export { … }`) or a `named_imports` (`import { … }`,
+/// reached through the statement's `import_clause`), and a statement that has
+/// neither binds no names. Both are direct or once-nested children, so this
+/// looks no deeper and cannot mistake a nested object literal for a clause.
+fn js_binding_clause(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut inner_cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "export_clause" | "named_imports" => return Some(child),
+            "import_clause" => {
+                for inner in child.named_children(&mut inner_cursor) {
+                    if inner.kind() == "named_imports" {
+                        return Some(inner);
+                    }
+                }
             }
+            _ => {}
         }
     }
+    None
 }
 
 fn find_string_child(node: Node, source: &str) -> Option<String> {
@@ -801,16 +1597,15 @@ fn find_string_child(node: Node, source: &str) -> Option<String> {
                 .to_string(),
         );
     }
-    for i in 0..node.child_count() {
-        if let Some(c) = node.child(i) {
-            if c.kind() == "string" {
-                return Some(
-                    get_node_text(c, source)
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
-                );
-            }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.kind() == "string" {
+            return Some(
+                get_node_text(c, source)
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            );
         }
     }
     None
@@ -827,7 +1622,7 @@ pub(crate) fn enclosing_callable_qualified(
     source: &str,
     file_symbol_name: &str,
 ) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         // The C family derives its name and its owner together: no C-family
         // declaration has a `name` field for `callable_binding_name` to read,
@@ -873,7 +1668,7 @@ pub(crate) fn enclosing_callable_qualified(
                 None => scoped_qualified_name(parent, source, file_symbol_name, &name),
             });
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
 }
@@ -927,7 +1722,7 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     // symbol emitter for `const f = function inner() { … }`, where the emitted
     // symbol is `f`. Falling through to `None` lets the walk continue to an
     // enclosing symbol that does exist, exactly as unnamed arrows already do.
-    let parent = node.parent()?;
+    let parent = bounded_parent(node)?;
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
@@ -948,7 +1743,7 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
 /// the distinction that refusal swallowed every property read and every
 /// callback passed by attribute along with it.
 fn member_access_receiver(node: Node, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    let parent = bounded_parent(node)?;
     // The grammars spell the same shape three ways: `attribute` in Python,
     // `member_expression` in JS/TS, `selector_expression` in Go.
     let object_field = match parent.kind() {
@@ -967,7 +1762,10 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         return None;
     }
     let object = parent.child_by_field_name(object_field)?;
-    let text = get_node_text(object, source);
+    // X44. The object's *identity*, not its source text: `runner.invoke(app,
+    // ["init"]).output` names the call it reads from, and a receiver that is a
+    // block copied into a column groups with nothing.
+    let text = receiver_identity(object, source, 0);
     (!text.is_empty()).then_some(text)
 }
 
@@ -992,7 +1790,7 @@ fn extracted_reference(
 }
 
 fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "class_definition"
@@ -1035,7 +1833,7 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             | "function_expression"
             | "arrow_function"
             | "method_definition" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -1074,7 +1872,7 @@ fn rust_attribute_paths(node: Node, source: &str) -> Vec<String> {
 /// Treating that constant as evidence of deadness is the single highest-volume
 /// Rust false positive.
 fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "impl_item" => {
@@ -1096,7 +1894,7 @@ fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
             // A nested `fn` is not a method merely because an impl block is
             // farther up the ancestor chain.
             "function_item" | "closure_expression" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -1105,7 +1903,7 @@ fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
 /// Root of the syntax tree containing `node`.
 fn ast_root(node: Node) -> Node {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = bounded_parent(current) {
         current = parent;
     }
     current
@@ -1123,12 +1921,12 @@ fn ast_root(node: Node) -> Node {
 /// that reads as "this enum is private and unused" rather than as a bug.
 ///
 /// Two forms are not their own owner:
-/// - `method_definition.parent()` is always `class_body`, so a direct parent
+/// - `bounded_parent(method_definition)` is always `class_body`, so a direct parent
 ///   check can never be true — a method is exported exactly when its class is.
-/// - `variable_declarator.parent()` is the `lexical_declaration`; the export
+/// - `bounded_parent(variable_declarator)` is the `lexical_declaration`; the export
 ///   statement wraps that, not the declarator.
 fn js_symbol_is_exported(node: Node, source: &str) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "export_statement" | "export_declaration" => return true,
@@ -1144,7 +1942,7 @@ fn js_symbol_is_exported(node: Node, source: &str) -> bool {
                 {
                     return true;
                 }
-                ancestor = parent.parent();
+                ancestor = bounded_parent(parent);
             }
             // A value bound inside a callable does not escape by being written.
             // Proving that a returned object reaches a caller needs escape
@@ -1155,7 +1953,7 @@ fn js_symbol_is_exported(node: Node, source: &str) -> bool {
             | "function_expression"
             | "arrow_function"
             | "method_definition" => return false,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     false
@@ -1185,10 +1983,8 @@ fn js_target_is_global(left: Node, source: &str) -> bool {
 fn go_param_count(parameters: Node) -> usize {
     let mut cursor = parameters.walk();
     let mut total = 0;
-    for index in 0..parameters.named_child_count() {
-        let Some(declaration) = parameters.named_child(index) else {
-            continue;
-        };
+    let mut param_cursor = parameters.walk();
+    for declaration in parameters.named_children(&mut param_cursor) {
         if !matches!(
             declaration.kind(),
             "parameter_declaration" | "variadic_parameter_declaration"
@@ -1218,7 +2014,20 @@ fn go_method_sets(
     let mut interface_methods = Vec::new();
     let mut method_params = Vec::new();
     let mut worklist = vec![root];
+    // Same stride idiom as `walk_tree`. This pass runs *after* the walk has
+    // returned, over the whole tree again, and until now had no deadline at
+    // all: a tree that the walk finished just inside its budget could spend
+    // unbounded time here and still be published. The caller re-reads the latch
+    // this sets and refuses the file.
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                break;
+            }
+        }
         match node.kind() {
             "type_spec" => {
                 if let (Some(name), Some(declared)) = (
@@ -1227,10 +2036,8 @@ fn go_method_sets(
                 ) {
                     if declared.kind() == "interface_type" {
                         let interface_name = get_node_text(name, source);
-                        for index in 0..declared.named_child_count() {
-                            let Some(member) = declared.named_child(index) else {
-                                continue;
-                            };
+                        let mut member_cursor = declared.walk();
+                        for member in declared.named_children(&mut member_cursor) {
                             if !matches!(member.kind(), "method_elem" | "method_spec") {
                                 continue;
                             }
@@ -1265,11 +2072,7 @@ fn go_method_sets(
             }
             _ => {}
         }
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children(node, &mut worklist);
     }
     interface_methods.sort_by(|a, b| {
         (&a.method, a.param_count, &a.interface_name).cmp(&(
@@ -1315,7 +2118,7 @@ fn go_interface_method_exemptions(
 /// Module-level bindings are public API surface; a constant declared inside a
 /// function is a local and belongs in nobody's graph.
 fn is_module_level(node: Node) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {
             return false;
@@ -1333,7 +2136,7 @@ fn is_module_level(node: Node) -> bool {
         ) {
             return false;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     true
 }
@@ -1370,6 +2173,8 @@ fn push_module_binding(
         docstring: None,
         signature: None,
         parent_symbol: Some(file_symbol_name.to_string()),
+        body_signature: None,
+        declaration_hash: None,
     });
 }
 
@@ -1447,9 +2252,7 @@ pub(crate) fn generic_declaration(node: Node, source: &str) -> Option<(SymbolKin
     // `function_definition` carries no name field; taking both would emit the
     // same function twice.
     if node.kind() == "function_declarator"
-        && node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "function_definition")
+        && bounded_parent(node).is_some_and(|parent| parent.kind() == "function_definition")
     {
         return None;
     }
@@ -1465,10 +2268,8 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
     // `object_reference` child, which itself has a required `name` field —
     // taking that rather than the reference's whole text keeps a
     // schema-qualified `analytics.events` from becoming part of the identity.
-    for index in 0..node.named_child_count() {
-        let Some(child) = node.named_child(index) else {
-            continue;
-        };
+    let mut ref_cursor = node.walk();
+    for child in node.named_children(&mut ref_cursor) {
         if child.kind() == "object_reference" {
             if let Some(name) = get_child_text(child, "name", source).filter(|n| !n.is_empty()) {
                 return Some(name);
@@ -1482,8 +2283,8 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
     {
         return Some(name);
     }
-    for index in 0..declarator.named_child_count() {
-        let child = declarator.named_child(index)?;
+    let mut declarator_cursor = declarator.walk();
+    for child in declarator.named_children(&mut declarator_cursor) {
         if matches!(
             child.kind(),
             "identifier" | "field_identifier" | "type_identifier"
@@ -1526,7 +2327,7 @@ fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str
 
 /// Nearest enclosing type-like declaration, so a method is owned by its type.
 pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if let Some(kind) = generic_symbol_kind(parent.kind()) {
             if !matches!(kind, SymbolKind::Function) {
@@ -1535,9 +2336,40 @@ pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String>
             // A function inside a function is not owned by a type.
             return None;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
+}
+
+/// The declaration's own header: everything before its body.
+///
+/// A visibility modifier precedes the name in every language that has one, so
+/// this is the region a modifier can legally occupy. Returns the whole node
+/// when no body can be identified, which is the previous behaviour and is safe
+/// for declarations that have no body to confuse it with.
+fn declaration_header<'a>(node: Node, source: &'a str) -> &'a str {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .or_else(|| {
+            let mut cursor = node.walk();
+            let found = node
+                .children(&mut cursor)
+                .find(|child| {
+                    let kind = child.kind();
+                    kind.ends_with("_body")
+                        || kind == "block"
+                        || kind == "declaration_list"
+                        || kind == "field_declaration_list"
+                        || kind == "template_body"
+                })
+                .map(|body| body.start_byte());
+            found
+        })
+        .unwrap_or_else(|| node.end_byte());
+    source
+        .get(node.start_byte()..body_start.max(node.start_byte()))
+        .unwrap_or("")
 }
 
 /// Visibility for grammars without a single export keyword.
@@ -1546,8 +2378,18 @@ pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String>
 /// actually uses one; otherwise a declaration is treated as visible, which is
 /// the safe direction — treating a public symbol as private would make it a
 /// dead-code candidate on no evidence.
+///
+/// The scan is bounded to [`declaration_header`] because it previously read
+/// `get_node_text(node, source)` — the whole subtree, bodies included — and so
+/// answered a question about the declaration from text belonging to its
+/// members. One `private val` inside a public Scala class returned `false`, and
+/// `devmap dead` then reported that class at the 0.90 tier with no exemption
+/// reason. Java escaped it only because `"public "` is tested first and Java
+/// spells the modifier; that is an accident of one keyword set, not a rule.
+/// The doc contract above — every `false` rests on evidence the language
+/// actually provides — is only true once the evidence is the declaration's own.
 pub(crate) fn generic_is_exported(node: Node, source: &str, name: &str) -> bool {
-    let text = get_node_text(node, source);
+    let text = declaration_header(node, source);
     if text.starts_with("pub ") || text.contains("public ") || text.contains("export ") {
         return true;
     }
@@ -1596,6 +2438,8 @@ fn extract_node(
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(file_symbol_name.to_string()),
+                                body_signature: None,
+                                declaration_hash: None,
                             });
                         }
                     }
@@ -1633,6 +2477,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1647,6 +2493,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1762,6 +2610,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1798,6 +2648,8 @@ fn extract_node(
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(file_symbol_name.to_string()),
+                                body_signature: None,
+                                declaration_hash: None,
                             });
                         }
                     }
@@ -1815,6 +2667,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1830,6 +2684,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1845,6 +2701,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1860,6 +2718,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1889,22 +2749,20 @@ fn extract_node(
                         module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
                         span: span.clone(),
                     });
-                } else if let Some(idx1) = text.find('{') {
-                    if let Some(idx2) = text.find('}') {
-                        let inner = &text[idx1 + 1..idx2];
-                        let (names, locals) = crate::model::parse_import_bindings(inner);
-                        imported_names = names;
-                        local_names = locals;
-                        if text.trim_start().starts_with("export") {
-                            for (local, exported) in imported_names.iter().zip(local_names.iter()) {
-                                exports.push(ExtractedExport {
-                                    exported_name: exported.clone(),
-                                    local_name: Some(local.clone()),
-                                    module_specifier: (!mod_spec.is_empty())
-                                        .then(|| mod_spec.clone()),
-                                    span: span.clone(),
-                                });
-                            }
+                } else if let Some(clause) = js_binding_clause(node) {
+                    // `parse_import_bindings` strips the braces itself.
+                    let inner = get_node_text(clause, source);
+                    let (names, locals) = crate::model::parse_import_bindings(&inner);
+                    imported_names = names;
+                    local_names = locals;
+                    if text.trim_start().starts_with("export") {
+                        for (local, exported) in imported_names.iter().zip(local_names.iter()) {
+                            exports.push(ExtractedExport {
+                                exported_name: exported.clone(),
+                                local_name: Some(local.clone()),
+                                module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
+                                span: span.clone(),
+                            });
                         }
                     }
                 } else if text.trim_start().starts_with("import ") {
@@ -1921,7 +2779,12 @@ fn extract_node(
                     }
                 }
 
-                if !mod_spec.is_empty() || !imported_names.is_empty() {
+                // A module edge needs a module. Gating on `imported_names`
+                // instead let `export { a as b };` — a purely local re-export
+                // with no `from` — push an import whose `module_specifier` was
+                // `""`, an endpoint no resolver can ever bind, and it did the
+                // same for every function body the old text scan mis-sliced.
+                if !mod_spec.is_empty() {
                     imports.push(ExtractedImport {
                         raw_import: text,
                         module_specifier: mod_spec,
@@ -2144,6 +3007,8 @@ fn extract_node(
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => file_symbol_name.to_string(),
                         }),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2213,6 +3078,8 @@ fn extract_node(
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => file_symbol_name.to_string(),
                         }),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2232,6 +3099,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2257,21 +3126,7 @@ fn extract_node(
             // Emitting them here as well produced the same method twice.
             "impl_item" => {}
             "use_declaration" => {
-                let text = get_node_text(node, source);
-                let spec = text
-                    .trim_start_matches("pub ")
-                    .trim_start_matches("use ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                imports.push(ExtractedImport {
-                    raw_import: text,
-                    module_specifier: spec,
-                    imported_names: vec![],
-                    local_names: vec![],
-                    alias: None,
-                    span,
-                });
+                rust_use_imports(node, source, span, imports);
             }
             "call_expression" => {
                 if let Some(f) = node.child_by_field_name("function") {
@@ -2427,6 +3282,8 @@ fn extract_node(
                             }
                         }),
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2446,6 +3303,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2563,6 +3422,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2648,10 +3509,26 @@ fn extract_node(
                     docstring: None,
                     signature: None,
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
+                    body_signature: None,
+                    declaration_hash: None,
                 });
             }
         }
     }
+    // Import extraction for the languages whose specifier names a file
+    // (W0.3 move 2), after the `match` rather than inside its generic arm.
+    //
+    // Two of the languages served here reach `extract_node` through a
+    // *specialised* arm — `hcl` has one of its own, and the C family takes the
+    // `c_family` branch — so a call wired beside `langcalls::extract_calls`
+    // would have missed both, including the one family that had no import
+    // handler anywhere. This position is also the one that cannot rot: a
+    // language gaining a specialised arm later keeps its imports, where the
+    // inner position would have taken them away silently.
+    //
+    // Languages whose arm already pushes imports — Python, JS/TS, Rust, Go —
+    // are absent from the dispatcher's match, so nothing is counted twice.
+    crate::langimports::extract_imports(lang, node, source, imports);
     maybe_push_name_reference(node, source, lang, file_symbol_name, references);
 }
 
@@ -2703,6 +3580,13 @@ fn c_declaration_head<'a>(node: Node, source: &'a str) -> &'a str {
         .map_or_else(|| node.end_byte(), |declarator| declarator.start_byte())
         .min(start + HEAD_WINDOW)
         .max(start);
+    // The window edge is an arbitrary byte offset, so it lands mid-character
+    // whenever the head contains any multi-byte text — a comment, an identifier
+    // in a non-ASCII script. `.get()` then yielded `None` and the whole head
+    // became `""`, so `head_has_word("__global__")` answered `false` for a file
+    // whose first ten bytes are `__global__`, and the kernel lost the
+    // entry-point exemption that keeps it out of the dead-code report.
+    let end = crate::langcalls::scope::floor_char_boundary(source, end).max(start);
     source.get(start..end).unwrap_or_default()
 }
 
@@ -2732,12 +3616,12 @@ fn c_declaration_is_explicitly_external(node: Node, source: &str) -> bool {
     // `extern "C" { … }` and `extern "C" int f()` both wrap the declaration in a
     // linkage specification. Stop at the first enclosing body so a declaration
     // merely nested somewhere inside one cannot inherit it.
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "linkage_specification" => return true,
             "function_definition" | "compound_statement" | "translation_unit" => return false,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     false
@@ -2942,7 +3826,7 @@ fn objc_interface_is_implemented_here(node: Node, source: &str) -> bool {
         return false;
     };
     let mut root = node;
-    while let Some(parent) = root.parent() {
+    while let Some(parent) = bounded_parent(root) {
         root = parent;
     }
     let mut cursor = root.walk();
@@ -2959,7 +3843,7 @@ fn objc_interface_is_implemented_here(node: Node, source: &str) -> bool {
 /// C spells `struct chunk *prev` and `struct chunk { … }` with the same node
 /// kind and the same `name` field; only the definition carries a body.
 fn is_bodyless_type_specifier_name(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     matches!(
@@ -2986,7 +3870,7 @@ fn is_objc_declaring_identifier(node: Node) -> bool {
     if node.kind() != "identifier" {
         return false;
     }
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     match parent.kind() {
@@ -3108,14 +3992,14 @@ fn is_c_macro_invocation(node: Node) -> bool {
     // An in-class constructor is a bare `identifier` with no return type too, so
     // anything inside a type body is left alone.
     !matches!(
-        node.parent().map(|parent| parent.kind()),
+        bounded_parent(node).map(|parent| parent.kind()),
         Some("field_declaration_list")
     )
 }
 
 /// Nearest enclosing Objective-C class container.
 fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if matches!(
             parent.kind(),
@@ -3126,7 +4010,7 @@ fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
         ) {
             return objc_container_name(parent, source);
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
 }
@@ -3137,7 +4021,7 @@ fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
 /// a definition that merely follows it, and stops at a `function_definition` so
 /// a nested lambda is not made a member.
 fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "struct_specifier" | "class_specifier" | "union_specifier" => {
@@ -3148,7 +4032,7 @@ fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
             | "category_implementation"
             | "category_interface" => return objc_container_name(parent, source),
             "function_definition" | "compound_statement" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -3161,7 +4045,7 @@ fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
 /// call to `visibility` — a callee that can never resolve and that names
 /// nothing in the program.
 fn is_inside_c_attribute(node: Node) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     for _ in 0..16 {
         let Some(parent) = ancestor else {
             return false;
@@ -3176,7 +4060,7 @@ fn is_inside_c_attribute(node: Node) -> bool {
         ) {
             return true;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     false
 }
@@ -3330,10 +4214,7 @@ fn extract_c_header_export(
         "function_declarator" => {
             // A definition's own declarator is not a declaration of an
             // interface; the definition is already the symbol.
-            if node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "function_definition")
-            {
+            if bounded_parent(node).is_some_and(|parent| parent.kind() == "function_definition") {
                 return;
             }
             let Some(name_node) = c_declarator_name_node(node) else {
@@ -3514,6 +4395,142 @@ pub(crate) fn is_anonymous_callable(kind: &str) -> bool {
     )
 }
 
+/// The longest a receiver expression may be recorded as.
+///
+/// X44. `receiver_expr` is documented as existing "so the classification can be
+/// audited rather than trusted", which means being grouped and read. A receiver
+/// that is a unique 38,644-character string — the measured maximum on this
+/// repository, the whole body of one function, stored as the "receiver" of a
+/// method called on the end of it — groups with nothing and answers no
+/// question, while costing the store a megabyte of duplicated source.
+///
+/// 64 characters holds every receiver that is genuinely a path of names, which
+/// is what this field is for. Past it the value is cut and **marked** cut, so a
+/// truncated string can never be read as a whole expression.
+const MAX_RECEIVER_CHARS: usize = 64;
+
+/// A receiver expression reduced to something a reader can group by.
+///
+/// One line, bounded, and marked when it was cut. Collapsing whitespace is part
+/// of the identity and not cosmetic: 4,973 receivers on this repository contain
+/// a newline, and every one of them is a block that was copied into a column
+/// whose job is to name a value.
+fn bound_receiver_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_RECEIVER_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Grammar keys for a call, across the languages this crate splits receivers
+/// for. A call's identity is the callee it names, never its argument list.
+fn is_call_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "call"
+            | "call_expression"
+            | "function_call_expression"
+            | "invocation_expression"
+            | "macro_invocation"
+            | "member_call_expression"
+            | "method_call"
+            | "method_invocation"
+            | "new_expression"
+            | "object_creation_expression"
+            | "scoped_call_expression"
+    )
+}
+
+/// Grammar keys for member access — the same three spellings
+/// `member_access_receiver` already reconciles, plus Rust's and C's.
+fn member_access_fields(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "attribute" => Some(("object", "attribute")),
+        "member_expression" => Some(("object", "property")),
+        "selector_expression" => Some(("operand", "field")),
+        "field_expression" => Some(("value", "field")),
+        _ => None,
+    }
+}
+
+/// What a receiver expression *is*, rather than what it says.
+///
+/// X44. The receiver used to be `get_node_text` of the receiver node, whole, so
+/// `runner.invoke(app, ["init"]).output.strip()` recorded its entire left-hand
+/// side. The classifier reads only the receiver's leftmost segment, and a
+/// reader auditing the ledger needs rows that group — neither is served by a
+/// copy of the source.
+///
+/// The reduction is structural, not textual: a receiver that is a **call** is
+/// named by that call's callee, and a member access is `<object identity>.
+/// <property>`. Anything this walk does not recognise keeps its text, bounded.
+pub(crate) fn receiver_identity(node: Node, source: &str, depth: usize) -> String {
+    if depth > 16 {
+        return bound_receiver_text(&get_node_text(node, source));
+    }
+    let fallback = || bound_receiver_text(&get_node_text(node, source));
+    let kind = node.kind();
+    if matches!(
+        kind,
+        "await_expression" | "parenthesized_expression" | "non_null_expression"
+    ) {
+        return match node.named_child(0) {
+            Some(inner) => receiver_identity(inner, source, depth + 1),
+            None => fallback(),
+        };
+    }
+    if is_call_node(kind) {
+        return node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .map(|target| {
+                // The inner call's callee **with its own receiver**, not the
+                // callee alone. Measured: reducing `runner.invoke(app, [...])`
+                // to `invoke` cost 1,235 `External` classifications on this
+                // repository, because the classifier roots its answer at the
+                // receiver's leftmost segment and `runner` is where the
+                // declared type `CliRunner` — and the import that proves it
+                // external — is recorded. `runner.invoke` keeps that root and
+                // still drops the argument list, which is the part that made
+                // the string unique.
+                let (name, receiver) = split_call_target_inner(target, source, depth + 1);
+                match receiver.filter(|receiver| !receiver.is_empty()) {
+                    Some(receiver) if !name.is_empty() => format!("{receiver}.{name}"),
+                    _ => name,
+                }
+            })
+            .map(|identity| bound_receiver_text(&identity))
+            .filter(|identity| !identity.is_empty())
+            .unwrap_or_else(fallback);
+    }
+    if let Some((object_field, member_field)) = member_access_fields(kind) {
+        let member = node
+            .child_by_field_name(member_field)
+            .map(|child| get_node_text(child, source))
+            .filter(|text| !text.is_empty());
+        let object = node
+            .child_by_field_name(object_field)
+            .or_else(|| node.child_by_field_name("argument"))
+            .map(|child| receiver_identity(child, source, depth + 1))
+            .filter(|text| !text.is_empty());
+        return match (object, member) {
+            (Some(object), Some(member)) => bound_receiver_text(&format!("{object}.{member}")),
+            _ => fallback(),
+        };
+    }
+    fallback()
+}
+
+/// The receiver named by `field` on `node`, as an identity.
+fn receiver_from_field(node: Node, field: &str, source: &str, depth: usize) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|child| receiver_identity(child, source, depth + 1))
+        .filter(|text| !text.is_empty())
+}
+
 fn split_call_target_inner(
     function_node: Node,
     source: &str,
@@ -3562,11 +4579,11 @@ fn split_call_target_inner(
         }
         "attribute" => (
             get_child_text(function_node, "attribute", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         "member_expression" => (
             get_child_text(function_node, "property", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         // C++ scope resolution: `ns::fn()`, `S::sm()`, `a::b::c()`.
         //
@@ -3609,8 +4626,8 @@ fn split_call_target_inner(
         // field here, so the fallback cannot change a Rust split.
         "field_expression" => {
             let field = get_child_text(function_node, "field", source);
-            let value = get_child_text(function_node, "value", source)
-                .or_else(|| get_child_text(function_node, "argument", source));
+            let value = receiver_from_field(function_node, "value", source, depth)
+                .or_else(|| receiver_from_field(function_node, "argument", source, depth));
             match (field, value) {
                 (Some(field), value) if !field.is_empty() => (field, value),
                 _ => (get_node_text(function_node, source), None),
@@ -3619,7 +4636,7 @@ fn split_call_target_inner(
         "selector_expression" => {
             let field = get_child_text(function_node, "field", source)
                 .or_else(|| get_child_text(function_node, "selector", source));
-            let operand = get_child_text(function_node, "operand", source);
+            let operand = receiver_from_field(function_node, "operand", source, depth);
             match (field, operand) {
                 (Some(field), Some(operand)) if !field.is_empty() => (field, Some(operand)),
                 _ => (get_node_text(function_node, source), None),
@@ -3644,14 +4661,14 @@ fn split_call_target_inner(
 
 fn go_receiver(node: Node, source: &str) -> Option<(String, String)> {
     let receiver = node.child_by_field_name("receiver")?;
-    for index in 0..receiver.named_child_count() {
-        let param = receiver.named_child(index)?;
+    let mut receiver_cursor = receiver.walk();
+    for param in receiver.named_children(&mut receiver_cursor) {
         if param.kind() != "parameter_declaration" {
             continue;
         }
         let recv_name = get_child_text(param, "name", source).unwrap_or_default();
         let type_node = param.child_by_field_name("type")?;
-        let type_name = go_type_name(type_node, source)?;
+        let type_name = go_type_name(type_node, source, 0)?;
         return Some((recv_name, type_name));
     }
     None
@@ -3685,8 +4702,9 @@ fn rust_macro_calls(
     file_symbol_name: &str,
 ) -> Vec<(String, Option<String>)> {
     let _ = file_symbol_name;
-    let Some(tokens) = (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
+    let mut token_cursor = node.walk();
+    let Some(tokens) = node
+        .named_children(&mut token_cursor)
         .find(|child| child.kind() == "token_tree")
     else {
         return Vec::new();
@@ -3781,10 +4799,13 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
                 }
             }
             "macro_invocation" => {
-                if let Some(tokens) = (0..current.named_child_count())
-                    .filter_map(|index| current.named_child(index))
-                    .find(|child| child.kind() == "token_tree")
-                {
+                let mut nested_cursor = current.walk();
+                // Bound in its own statement so the borrowing iterator is
+                // dropped here rather than living to the end of the `if let`.
+                let tokens = current
+                    .named_children(&mut nested_cursor)
+                    .find(|child| child.kind() == "token_tree");
+                if let Some(tokens) = tokens {
                     if let Some(body) = macro_token_body(&get_node_text(tokens, &probe_source)) {
                         nested.push(body);
                     }
@@ -3792,11 +4813,7 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
             }
             _ => {}
         }
-        for index in 0..current.named_child_count() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children(current, &mut stack);
     }
     (calls, nested)
 }
@@ -3821,14 +4838,23 @@ fn scoped_qualified_name(node: Node, source: &str, file_symbol_name: &str, name:
 }
 
 /// Strip references, pointers and generics down to a Rust type's bare name.
-fn rust_type_name(node: Node, source: &str) -> Option<String> {
+///
+/// Bounded depth for the same reason as `rust_type_qualifier` below: the
+/// unwrapping arms recurse once per layer, and `&&&…&T` written deeply enough
+/// exhausts the stack. A stack overflow aborts the process, so one hostile or
+/// generated file would take the whole build with it. Past the bound the type
+/// is simply not recovered, which costs a receiver binding and guesses nothing.
+fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
     match node.kind() {
         "reference_type" | "pointer_type" => node
             .child_by_field_name("type")
-            .and_then(|inner| rust_type_name(inner, source)),
+            .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "generic_type" => node
             .child_by_field_name("type")
-            .and_then(|inner| rust_type_name(inner, source)),
+            .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);
@@ -3836,6 +4862,279 @@ fn rust_type_name(node: Node, source: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// One leaf of a `use` tree: the module it comes from and the name it binds.
+struct RustUseLeaf {
+    /// The path segments before the imported name — `["std", "collections"]`
+    /// for `std::collections::BTreeMap`.
+    module: Vec<String>,
+    /// The name imported from that module, or `None` for a glob.
+    name: Option<String>,
+    /// The local binding, when `as` renamed it.
+    alias: Option<String>,
+}
+
+/// How deeply a `use` tree may nest before recovery stops.
+///
+/// A `use` group is a tree and this walk recurses per level, so an adversarially
+/// nested statement is a stack-overflow shape — the same reason
+/// [`rust_type_name`] is bounded. There is deliberately **no cap on the number
+/// of leaves**: leaves cost source bytes, which `MAX_SOURCE_BYTES` already
+/// bounds, and a leaf cap would silently truncate an import list — presenting a
+/// capped sample as the file's complete set of imports, which is exactly the
+/// shape that makes "nothing imports this" mean two different things.
+const RUST_USE_MAX_DEPTH: usize = 32;
+
+/// The path segments of a `use` path node, appended to `out`.
+///
+/// Returns `false` for a node shape this does not recognise, and the caller
+/// abandons the leaf rather than recording a partial path — half a module path
+/// resolves to a *different* module, which is worse than not resolving.
+fn rust_path_segments(node: Node, source: &str, depth: usize, out: &mut Vec<String>) -> bool {
+    if depth > RUST_USE_MAX_DEPTH {
+        return false;
+    }
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, depth + 1, out) {
+                    return false;
+                }
+            }
+            match node.child_by_field_name("name") {
+                Some(name) => rust_path_segments(name, source, depth + 1, out),
+                None => false,
+            }
+        }
+        "identifier" | "type_identifier" | "primitive_type" | "super" | "crate" | "self"
+        | "metavariable" => {
+            let text = get_node_text(node, source);
+            if text.is_empty() {
+                return false;
+            }
+            out.push(text);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Flatten a `use` tree into one leaf per name it binds.
+fn collect_rust_use_leaves(
+    node: Node,
+    source: &str,
+    prefix: &[String],
+    depth: usize,
+    out: &mut Vec<RustUseLeaf>,
+) {
+    if depth > RUST_USE_MAX_DEPTH {
+        return;
+    }
+    match node.kind() {
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_use_leaves(child, source, prefix, depth + 1, out);
+            }
+        }
+        "scoped_use_list" => {
+            let mut nested = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, 0, &mut nested) {
+                    return;
+                }
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_use_leaves(list, source, &nested, depth + 1, out);
+            }
+        }
+        "use_as_clause" => {
+            let mut segments = prefix.to_vec();
+            let Some(path) = node.child_by_field_name("path") else {
+                return;
+            };
+            if !rust_path_segments(path, source, 0, &mut segments) {
+                return;
+            }
+            let alias = node
+                .child_by_field_name("alias")
+                .map(|child| get_node_text(child, source))
+                .filter(|alias| !alias.is_empty());
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let mut segments = prefix.to_vec();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !rust_path_segments(child, source, 0, &mut segments) {
+                    return;
+                }
+            }
+            out.push(RustUseLeaf {
+                module: segments,
+                name: None,
+                alias: None,
+            });
+        }
+        _ => {
+            let mut segments = prefix.to_vec();
+            if !rust_path_segments(node, source, 0, &mut segments) {
+                return;
+            }
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias: None,
+                });
+            }
+        }
+    }
+}
+
+/// How many **inline** `mod { … }` blocks enclose this node.
+///
+/// Rust's `super` is relative to the module, not to the file, and an inline
+/// module is one module deeper without being one file deeper. `mod tests { use
+/// super::*; }` therefore names the *file it is written in*; the same statement
+/// at file level names the parent directory's module. This repository contains
+/// 87 of the first spelling and none of the resolver's rungs could tell them
+/// apart.
+fn rust_inline_module_depth(node: Node) -> usize {
+    let mut depth = 0usize;
+    let mut current = bounded_parent(node);
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" && parent.child_by_field_name("body").is_some() {
+            depth += 1;
+        }
+        current = bounded_parent(parent);
+    }
+    depth
+}
+
+/// The module specifier a leaf's path denotes, with `super` resolved against
+/// the inline-module nesting it was written inside.
+///
+/// `super` spent against an inline module does not leave the file, so once the
+/// nesting is used up the target is this file — spelled `self`, which the
+/// resolver reads as "the file this import is written in".
+///
+/// Known limit, stated rather than papered over: where the nesting absorbs every
+/// `super` and segments remain (`mod tests { use super::helpers::thing; }`),
+/// the remainder is emitted as `self::helpers`, which resolves to a sibling
+/// *file* module. That is right when `helpers` is `mod helpers;` and wrong when
+/// it is `mod helpers { … }` in this same file — and telling those apart needs
+/// the file's own inline-module table, which this function does not have. The
+/// wrong case resolves to nothing, which is where it already sat.
+fn rust_use_specifier(module: &[String], inline_depth: usize) -> String {
+    let leading_super = module
+        .iter()
+        .take_while(|segment| *segment == "super")
+        .count();
+    let spent = leading_super.min(inline_depth);
+    let remaining = leading_super - spent;
+    let mut segments: Vec<&str> = Vec::with_capacity(module.len());
+    if leading_super > 0 && remaining == 0 {
+        segments.push("self");
+    } else {
+        segments.extend(std::iter::repeat_n("super", remaining));
+    }
+    segments.extend(module[leading_super..].iter().map(String::as_str));
+    segments.join("::")
+}
+
+/// Read a `use_declaration` into one [`ExtractedImport`] per module it names.
+///
+/// The arm this replaces stored the statement's own text as the module
+/// specifier: `use tree_sitter::{Language, Node, Parser};` became one import
+/// whose module was the literal string `"tree_sitter::{Language, Node,
+/// Parser}"`, with an empty `imported_names`. Both fields are what every
+/// consumer of an import reads, so nothing downstream worked at all — measured
+/// on this repository, no `.rs` file produced a single `Imports` edge and
+/// `UnresolvedClass::External` never fired once for Rust, while the same ladder
+/// produced 8,734 External rows for Python from the same evidence shape.
+///
+/// A glob is emitted as the `.` alias rather than as a name. That spelling
+/// already exists for Go's dot-import and means exactly this — bind everything
+/// this module exports — so the resolver needs no second rung for it.
+fn rust_use_imports(
+    node: Node,
+    source: &str,
+    span: Span,
+    imports: &mut Vec<ExtractedImport>,
+) -> Option<()> {
+    let raw = get_node_text(node, source);
+    let argument = node.child_by_field_name("argument")?;
+    let inline_depth = rust_inline_module_depth(node);
+    let mut leaves: Vec<RustUseLeaf> = Vec::new();
+    collect_rust_use_leaves(argument, source, &[], 0, &mut leaves);
+
+    // Grouped by module so `use std::{fmt, io}` is one import of `std` naming
+    // two symbols, the shape every other language's extractor produces. Ordered
+    // by module for determinism (R4); names keep source order within a module.
+    let mut named: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut whole_module: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for leaf in leaves {
+        // `use serde;` and `use super::{self, thing};` import the module
+        // itself, not a name out of it.
+        let names_the_module = leaf.module.is_empty() || leaf.name.as_deref() == Some("self");
+        if names_the_module {
+            let mut module = leaf.module.clone();
+            if leaf.name.as_deref() != Some("self") {
+                if let Some(name) = leaf.name.clone() {
+                    module.push(name);
+                }
+            }
+            if module.is_empty() {
+                continue;
+            }
+            whole_module.insert(rust_use_specifier(&module, inline_depth), leaf.alias);
+            continue;
+        }
+        let specifier = rust_use_specifier(&leaf.module, inline_depth);
+        match leaf.name {
+            // A glob binds the module's whole surface, which is what the
+            // resolver's `.` alias means.
+            None => {
+                whole_module.insert(specifier, Some(".".to_string()));
+            }
+            Some(name) => {
+                let local = leaf.alias.unwrap_or_else(|| name.clone());
+                let entry = named.entry(specifier).or_default();
+                entry.0.push(name);
+                entry.1.push(local);
+            }
+        }
+    }
+
+    for (specifier, (imported_names, local_names)) in named {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names,
+            local_names,
+            alias: None,
+            span: span.clone(),
+        });
+    }
+    for (specifier, alias) in whole_module {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names: vec![],
+            local_names: vec![],
+            alias,
+            span: span.clone(),
+        });
+    }
+    Some(())
 }
 
 /// Parameter name → declared type, for languages whose parameters carry one.
@@ -3870,14 +5169,14 @@ fn param_type_bindings(
                     .child_by_field_name("pattern")
                     .map(|pattern| get_node_text(pattern, source));
                 let ty_node = child.child_by_field_name("type");
-                let ty = ty_node.and_then(|ty| rust_type_name(ty, source));
+                let ty = ty_node.and_then(|ty| rust_type_name(ty, source, 0));
                 let qualifier = ty_node.and_then(|ty| rust_type_qualifier(ty, source, 0));
                 name.zip(ty).map(|(name, ty)| (name, ty, qualifier))
             }
             ("go", "parameter_declaration") => {
                 let name = get_child_text(child, "name", source);
                 let ty_node = child.child_by_field_name("type");
-                let ty = ty_node.and_then(|ty| go_type_name(ty, source));
+                let ty = ty_node.and_then(|ty| go_type_name(ty, source, 0));
                 let qualifier = ty_node.and_then(|ty| go_type_qualifier(ty, source, 0));
                 name.zip(ty).map(|(name, ty)| (name, ty, qualifier))
             }
@@ -3944,14 +5243,26 @@ fn rust_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String>
     }
 }
 
-fn go_type_name(node: Node, source: &str) -> Option<String> {
+/// The bare name of a Go type, unwrapping the pointers around it.
+///
+/// Bounded depth for the same reason as `go_type_qualifier` above, and measured
+/// rather than assumed: `func (r **…*T) M() {}` at 10,000 levels — a ~10 KB
+/// file, four orders of magnitude under `MAX_SOURCE_BYTES` — overflowed the
+/// stack and aborted `devmap build` with exit 134. The tree walk itself is an
+/// explicit worklist and never recurses, so this function and `rust_type_name`
+/// were the whole of that overflow. Past the bound the receiver is not
+/// recovered and the method is named `file::M` rather than `file::T.M` — a lost
+/// qualification, never a guessed one.
+fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
     match node.kind() {
         "pointer_type" => {
-            for index in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(index) {
-                    if let Some(name) = go_type_name(child, source) {
-                        return Some(name);
-                    }
+            let mut pointer_cursor = node.walk();
+            for child in node.named_children(&mut pointer_cursor) {
+                if let Some(name) = go_type_name(child, source, depth + 1) {
+                    return Some(name);
                 }
             }
             None
@@ -3969,14 +5280,15 @@ fn go_type_name(node: Node, source: &str) -> Option<String> {
 }
 
 fn go_package_name(root: Node, source: &str) -> Option<String> {
-    for index in 0..root.named_child_count() {
-        let child = root.named_child(index)?;
+    let mut package_cursor = root.walk();
+    let mut identifier_cursor = root.walk();
+    for child in root.named_children(&mut package_cursor) {
         if child.kind() != "package_clause" {
             continue;
         }
         let name = get_child_text(child, "name", source).or_else(|| {
-            (0..child.named_child_count())
-                .filter_map(|inner| child.named_child(inner))
+            child
+                .named_children(&mut identifier_cursor)
                 .find(|node| node.kind() == "package_identifier")
                 .map(|node| get_node_text(node, source))
         })?;
@@ -4145,6 +5457,20 @@ fn maybe_push_name_reference(
     if !is_user_ident(&name) {
         return;
     }
+    // X40. `_` in **type position** is the inferred-type placeholder — Rust's
+    // `row.get::<_, f64>(1)`, Go's blank identifier — and it references
+    // nothing, so there is no attribution to attempt and no honest tier to file
+    // the failure under. Measured on this repository: 275 of the 9,790 rows in
+    // the tier documented as "the only tier that indicates a defect" were this
+    // placeholder, every one of them a turbofish.
+    //
+    // Restricted to type position on purpose. `_` is a perfectly ordinary
+    // value-position identifier in JavaScript (lodash) and Python (gettext), so
+    // refusing it everywhere would drop real references; no language names a
+    // *type* `_`.
+    if ref_kind == ReferenceKind::Type && name.chars().all(|character| character == '_') {
+        return;
+    }
     if ref_kind == ReferenceKind::Name && name_is_shadowed_by_local(node, source, &name) {
         return;
     }
@@ -4208,7 +5534,7 @@ fn enclosing_emitted_symbol_for(
 /// bind the other way. Every other `binary_operator` — arithmetic, comparison,
 /// a pipe — has operands that are uses, and this must not suppress them.
 fn is_r_binding_target(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     if parent.kind() != "binary_operator" {
@@ -4286,7 +5612,7 @@ fn node_contains(haystack: Node, needle: Node) -> bool {
 fn c_declarator_declaration(node: Node) -> Option<Node> {
     let mut current = node;
     let mut climbed = false;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = bounded_parent(current) {
         if parent
             .child_by_field_name("declarator")
             .is_none_or(|declarator| declarator.id() != current.id())
@@ -4321,10 +5647,7 @@ fn is_defining_name(node: Node) -> bool {
     // symbol it declares — `Main.kt::Mode.FAST` referencing `Main.kt::Mode.FAST`
     // — which is the self-reference shape
     // `c_family_declarations_do_not_reference_themselves` already pins for C.
-    if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "enum_entry")
-    {
+    if bounded_parent(node).is_some_and(|parent| parent.kind() == "enum_entry") {
         return true;
     }
     // R spells every function declaration as an assignment — `helper <-
@@ -4344,15 +5667,12 @@ fn is_defining_name(node: Node) -> bool {
     // self-reference shape `c_family_declarations_do_not_reference_themselves`
     // pins for C. A parameter's identifiers hang off `formal_parameter_list`
     // rather than off the signature, so this reaches only the name.
-    if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "constructor_signature")
-    {
+    if bounded_parent(node).is_some_and(|parent| parent.kind() == "constructor_signature") {
         return true;
     }
     let mut current = node;
     loop {
-        let Some(parent) = current.parent() else {
+        let Some(parent) = bounded_parent(current) else {
             return false;
         };
         if field_contains(parent, "name", node)
@@ -4440,6 +5760,145 @@ fn is_binding_wrapper(kind: &str) -> bool {
 thread_local! {
     static SCOPE_LOCALS: RefCell<HashMap<usize, HashSet<String>>> =
         RefCell::new(HashMap::new());
+    /// The deadline for the current file's extraction, readable by helpers that
+    /// the walk calls but does not pass arguments to.
+    static WALK_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// Set once a helper has stopped early because that deadline passed.
+    static WALK_OVERRAN: Cell<bool> = const { Cell::new(false) };
+    /// Ancestor steps taken since the clock was last read. See `bounded_parent`.
+    static PARENT_STEPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Arms the extraction deadline for exactly as long as one file is being
+/// extracted, and disarms it on the way out of *every* path — including the
+/// early returns that refuse a file.
+///
+/// The deadline used to be armed inside `walk_tree` and never cleared, so it
+/// outlived the walk it belonged to: every phase that runs afterwards
+/// (`go_method_sets`, the Python passes, `clonesig`) saw a live deadline
+/// belonging to the *previous* file, and the next file's pre-walk phases saw
+/// one that had already expired. Nothing consulted it there yet, which is the
+/// only reason it was invisible; extending the bound past the walk — the point
+/// of this type — makes that stale value load-bearing. Tying arm and disarm to
+/// a scope means the invariant cannot be broken by adding a `return`.
+struct BudgetGuard;
+
+impl BudgetGuard {
+    fn arm(deadline: std::time::Instant) -> Self {
+        reset_scope_locals();
+        WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
+        WALK_OVERRAN.with(|slot| slot.set(false));
+        PARENT_STEPS.with(|slot| slot.set(0));
+        BudgetGuard
+    }
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        WALK_DEADLINE.with(|slot| slot.set(None));
+        // `WALK_OVERRAN` is deliberately *not* cleared here. It is read by
+        // `extract_treesitter_with_budget` after the guard's scope ends to
+        // decide whether the file must be refused, and clearing it here would
+        // erase the one signal that says the answer is incomplete.
+    }
+}
+
+/// `bounded_parent(node)`, bounded by the extraction deadline.
+///
+/// **Every ancestor walk in this crate must go through this**, because
+/// `Node::parent()` is not O(1): tree-sitter reconstructs the parent by
+/// descending from the tree root, so one call costs O(depth) and climbing to
+/// the root costs **O(depth^2)**. Measured 2026-09-05 (release, macOS) on
+/// `func (r *…*T) M() {}`: one `parent()` from the deepest node takes 27.8 us
+/// at depth 1,000 and 434 us at depth 16,000, and a full ancestor walk takes
+/// 13.1 ms / 52.7 ms / 204.7 ms / 821.7 ms / 3.46 s at depth 1k / 2k / 4k / 8k
+/// / 16k — four times the cost for twice the depth, which is the signature.
+///
+/// That quadratic is why the stride in `walk_tree` was not a bound. The whole
+/// 13.15 s debug extraction of a 10 KB file was **two ancestor walks on a
+/// single node** — `is_inside_import_or_export` at 1.166 s and
+/// `enclosing_callable_qualified` at 1.145 s in release — so the walk's
+/// per-node clock check had no opportunity to fire between them, and the file
+/// was published `Clean` after running 2.6x past its 5 s budget. A stride is
+/// not a bound if one step is unbounded; this is where that step is bounded.
+///
+/// Returning `None` early reports "no further ancestors", which is a *wrong*
+/// answer, and that is safe only because it is never published: the same check
+/// latches `WALK_OVERRAN`, and `extract_treesitter_with_budget` turns that latch
+/// into a refusal for the whole file. This is the contract
+/// `collect_non_symbol_locals` already relies on.
+///
+/// The clock is read every `PARENT_CHECK_STRIDE` steps rather than every step
+/// because `Instant::now()` costs more than an ordinary ancestor hop on the
+/// happy path, where files nest tens of levels deep, not thousands.
+pub(crate) fn bounded_parent(node: Node<'_>) -> Option<Node<'_>> {
+    let steps = PARENT_STEPS.with(|slot| {
+        let next = slot.get() + 1;
+        slot.set(next);
+        next
+    });
+    if steps >= PARENT_CHECK_STRIDE {
+        PARENT_STEPS.with(|slot| slot.set(0));
+        if walk_deadline_passed() {
+            return None;
+        }
+    }
+    // A walk that has already overrun must not start another climb: the latch
+    // is set for the rest of the file, so every remaining ancestor walk stops
+    // at its first step instead of paying O(depth) apiece to reach the same
+    // refusal.
+    if walk_overran() {
+        return None;
+    }
+    node.parent()
+}
+
+/// Ancestor steps taken between clock reads. See `bounded_parent`.
+///
+/// Smaller than `DEADLINE_CHECK_STRIDE` because the steps are not comparable: a
+/// node visit is O(1) while an ancestor hop is O(depth). At the 1 MiB
+/// `MAX_SOURCE_BYTES` ceiling the deepest reachable nesting is around a million
+/// levels, where one hop measures ~27 ms, so 64 steps bounds the overshoot at
+/// roughly 1.7 s — inside the 5 s `DEFAULT_PARSE_BUDGET` and far inside the 10x
+/// tolerance `tests/budget_is_a_real_bound.rs` allows. A stride of 256 would put
+/// it at 6.9 s, which is past the budget it exists to enforce.
+const PARENT_CHECK_STRIDE: u32 = 64;
+
+/// True once a bounded helper gave up because the walk's deadline passed.
+///
+/// `walk_tree` checks the clock every `DEADLINE_CHECK_STRIDE` nodes, which
+/// bounds the *number* of nodes between checks but not the *work* inside any
+/// one of them. `collect_non_symbol_locals` walks a whole scope subtree per
+/// call, so a single `extract_node` could run for a minute while the stride
+/// counter sat at 1 — a stride is not a bound if one step is unbounded. This
+/// flag is how a helper that stopped early tells the walk to stop too, and it
+/// is a plain `Cell` read so the loop can consult it on every node.
+fn walk_overran() -> bool {
+    WALK_OVERRAN.with(|slot| slot.get())
+}
+
+/// Whether this file's extraction may still publish what it has.
+///
+/// Two ways to fail, and they are not the same question: a helper may have
+/// stopped early and latched `WALK_OVERRAN` — in which case the answers it
+/// returned are incomplete even though the clock may since have been reset —
+/// or the phase just finished may simply have run past the deadline while
+/// checking nothing. Either one means the result is not a complete read of the
+/// file, and a check that could not run must never report what a check that ran
+/// and passed reports.
+fn extraction_overran(deadline: std::time::Instant) -> bool {
+    walk_overran() || std::time::Instant::now() >= deadline
+}
+
+/// Deadline check for a helper running inside the walk. Latches the flag.
+fn walk_deadline_passed() -> bool {
+    match WALK_DEADLINE.with(|slot| slot.get()) {
+        Some(deadline) if std::time::Instant::now() >= deadline => {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Drop the per-scope local-name cache between files.
@@ -4481,13 +5940,13 @@ fn is_callable_node(node: Node) -> bool {
 
 fn enclosing_scope_node(node: Node) -> Node {
     let mut current = node;
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {
             return parent;
         }
         current = parent;
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     current
 }
@@ -4507,7 +5966,7 @@ fn is_symbol_binding(node: Node) -> bool {
     if is_objc_declaring_identifier(node) {
         return true;
     }
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     if matches!(
@@ -4546,12 +6005,19 @@ fn is_symbol_binding(node: Node) -> bool {
 fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
     let mut locals = HashSet::new();
     let mut worklist = Vec::new();
-    for index in 0..scope.child_count() {
-        if let Some(child) = scope.child(index) {
-            worklist.push(child);
-        }
-    }
+    push_children(scope, &mut worklist);
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        // Same stride idiom as `walk_tree`: this loop is per-scope and a
+        // pathological tree makes it the dominant cost of the whole
+        // extraction, so it has to be interruptible on its own.
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                break;
+            }
+        }
         if is_callable_node(node) {
             continue;
         }
@@ -4568,23 +6034,27 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
                 locals.insert(name);
             }
         }
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children_reversed(node, &mut worklist);
     }
     locals
 }
 
 /// Run `visit` over one scope's local-name set, computing it once per scope.
 fn with_scope_locals<R>(scope: Node, source: &str, visit: impl FnOnce(&HashSet<String>) -> R) -> R {
-    SCOPE_LOCALS.with(|cache| {
-        let id = scope.id();
-        if !cache.borrow().contains_key(&id) {
-            let locals = collect_non_symbol_locals(scope, source);
-            cache.borrow_mut().insert(id, locals);
+    let id = scope.id();
+    let known = SCOPE_LOCALS.with(|cache| cache.borrow().contains_key(&id));
+    if !known {
+        let locals = collect_non_symbol_locals(scope, source);
+        if walk_overran() {
+            // A set the deadline cut short is not this scope's local-name set.
+            // The file is refused either way, but caching it would serve the
+            // wrong answer to every later lookup of the same scope in the
+            // meantime, so it is used once and not kept.
+            return visit(&locals);
         }
+        SCOPE_LOCALS.with(|cache| cache.borrow_mut().insert(id, locals));
+    }
+    SCOPE_LOCALS.with(|cache| {
         let borrowed = cache.borrow();
         match borrowed.get(&id) {
             Some(locals) => visit(locals),
@@ -4647,8 +6117,9 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
 /// `type` and `value` fields are not descended into: `def f(x: Widget)` binds
 /// `x` and refers to `Widget`.
 fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
-    let Some(params) = (0..callable.child_count())
-        .filter_map(|index| callable.child(index))
+    let mut params_cursor = callable.walk();
+    let Some(params) = callable
+        .children(&mut params_cursor)
         .find(|child| PARAMETER_LIST_KINDS.contains(&child.kind()))
     else {
         return;
@@ -4673,6 +6144,63 @@ fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<Stri
         }
     }
 }
+/// The **type parameters** the callable declares on itself: `T` and `E` in
+/// `fn read<T, E>(…)`, `T` in `func Map[T any](…)`, `K` in
+/// `function pick<K extends string>(…)`.
+///
+/// X40. A type parameter is a name the enclosing item binds in its own
+/// signature, which is precisely what `UnresolvedClass::LocalBinding` is
+/// defined as — "a bare call to a name the enclosing symbol itself declares".
+/// Before this, a use of `T` in the body or the parameter list matched no
+/// indexed symbol and landed in the tier documented as the one that indicates a
+/// defect, which is not what a generic parameter is.
+///
+/// Read through the grammar's `type_parameters` node rather than from a naming
+/// convention: `T`-shaped single letters are the *style*, not the rule, and a
+/// parameter called `Item` is no less bound by the signature that declares it.
+/// Every grammar this crate links spells the list `type_parameters`; a language
+/// whose grammar does not simply contributes nothing here, which leaves its
+/// generics exactly where they are today rather than guessing.
+fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
+    let mut cursor = callable.walk();
+    let Some(params) = callable
+        .children(&mut cursor)
+        .find(|child| child.kind() == "type_parameters")
+    else {
+        return;
+    };
+    let mut worklist = vec![params];
+    while let Some(node) = worklist.pop() {
+        // The declared name is the *first* identifier of each entry; a bound
+        // (`T: Display`, `T any`) is a use of another type and must not be
+        // recorded as though this signature declared it.
+        if matches!(node.kind(), "type_parameter" | "constrained_type_parameter") {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0))
+                .map(|child| get_node_text(child, source))
+                .filter(|name| is_user_ident(name))
+            {
+                out.insert(name);
+            }
+            continue;
+        }
+        if matches!(node.kind(), "type_identifier" | "identifier")
+            && bounded_parent(node).is_some_and(|parent| parent.kind() == "type_parameters")
+        {
+            let name = get_node_text(node, source);
+            if is_user_ident(&name) {
+                out.insert(name);
+            }
+            continue;
+        }
+        let mut children = node.walk();
+        for child in node.named_children(&mut children) {
+            worklist.push(child);
+        }
+    }
+}
+
 fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
@@ -4694,13 +6222,13 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                 // which is why `next_gap_id: Callable[…]` and `cls` were the two
                 // largest remaining unattributed callees on this repository.
                 collect_parameter_names(node, source, entry);
+                // X40. A type parameter is bound by this signature exactly as a
+                // value parameter is, and the resolver reads both from the same
+                // per-scope set.
+                collect_type_parameter_names(node, source, entry);
             }
         }
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children(node, &mut worklist);
     }
     by_scope
         .into_iter()
@@ -4709,7 +6237,7 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
 }
 
 fn is_inside_import_or_export(node: Node) -> bool {
-    let mut current = node.parent();
+    let mut current = bounded_parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -4753,13 +6281,13 @@ fn is_inside_import_or_export(node: Node) -> bool {
         ) {
             return true;
         }
-        current = parent.parent();
+        current = bounded_parent(parent);
     }
     false
 }
 
 fn is_call_callee(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     // An Objective-C keyword message has one `method` field per selector part,
@@ -4789,7 +6317,7 @@ fn is_call_callee(node: Node) -> bool {
         if let Some(callee) = callee {
             // A walk up from `node` used to sit here, looking for the callee
             // among its ancestors. It was dead by construction: this branch is
-            // only entered when `node.parent()` *is* the call, so the first
+            // only entered when `bounded_parent(node)` *is* the call, so the first
             // ancestor examined is always that same parent and the walk broke
             // immediately. Instrumented over 4,421 files in five languages it
             // never once reached the callee or iterated twice.
@@ -4818,7 +6346,7 @@ fn is_call_callee(node: Node) -> bool {
             .or_else(|| parent.child_by_field_name("field"))
             .is_some_and(|member| member.id() == node.id());
         if is_member_half {
-            if let Some(grand) = parent.parent() {
+            if let Some(grand) = bounded_parent(parent) {
                 // The `function` check is redundant in every linked grammar —
                 // arguments are wrapped in `arguments`/`argument_list`, so a
                 // member expression that is a direct child of a call is always
@@ -4841,7 +6369,7 @@ fn is_call_callee(node: Node) -> bool {
 
 fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
     for _ in 0..4 {
-        node = node.parent()?;
+        node = bounded_parent(node)?;
         let binding = match node.kind() {
             "assignment"
             | "assignment_expression"
@@ -4930,6 +6458,100 @@ pub(crate) fn node_span(node: Node) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every discovered file is addressable, whether or not it parsed. (K1)
+    ///
+    /// The `File` node used to be pushed only inside the tree-sitter branch, so
+    /// a language with no linked grammar produced an `Extraction` with an empty
+    /// `symbols` vector: the file was recorded in `generation_files` and was
+    /// absent from the graph entirely — not returnable by a file-level query
+    /// and not usable as the target of any edge.
+    ///
+    /// All three cases below reached that same nodeless state, and they are
+    /// kept apart because they fail for different reasons: a grammarless
+    /// language whose declarations *are* recoverable, one whose declarations
+    /// are not, and a prose format that is deliberately never scanned. Only
+    /// the first would be fixed by improving the fallback scanner, which is
+    /// why "tier-2 recovers declarations" does not subsume this test.
+    #[test]
+    fn a_grammarless_file_still_gets_a_file_node() {
+        for (path, source, why) in [
+            (
+                "api/user.proto",
+                "message User {\n  string id = 1;\n}\n",
+                "grammarless source with recoverable declarations",
+            ),
+            (
+                "scripts/manifest.psd1",
+                "@{ ModuleVersion = '1.0' }\n",
+                "grammarless source with nothing to recover",
+            ),
+            (
+                "docs/design.md",
+                "# Design\n\nProse, never declaration-scanned.\n",
+                "prose format excluded from tier-2 by NON_DECLARATIVE_LANGUAGES",
+            ),
+        ] {
+            let extraction = crate::extract_file(path, source);
+            let files: Vec<&ExtractedSymbol> = extraction
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::File)
+                .collect();
+            assert_eq!(
+                files.len(),
+                1,
+                "{path} ({why}) must contribute exactly one File node, got {:?}",
+                extraction.symbols
+            );
+            let file = files[0];
+            assert_eq!(
+                file.qualified_name, path,
+                "the File node is addressed by full path, like every parsed file"
+            );
+            assert_eq!(
+                file.span.end_byte,
+                source.len(),
+                "the File node spans the whole file"
+            );
+        }
+    }
+
+    /// The `File` node is not a declaration, so it must not be read as one.
+    ///
+    /// Emitting it unconditionally would be an easy way to make a nodeless file
+    /// *look* recovered. It must not move `parse_outcome`: a file whose
+    /// declarations could not be recovered still reports `Failed`, and only a
+    /// real declaration recovery reports `Fallback`.
+    #[test]
+    fn the_file_node_alone_is_never_reported_as_a_recovery() {
+        let bare = crate::extract_file("scripts/manifest.psd1", "@{ ModuleVersion = '1.0' }\n");
+        assert!(
+            matches!(bare.parse_outcome, ParseOutcome::Failed { .. }),
+            "a File node is not a recovered declaration, got {:?}",
+            bare.parse_outcome
+        );
+        assert!(
+            matches!(bare.engine, ExtractionEngine::Unavailable { .. }),
+            "engine must stay Unavailable, got {:?}",
+            bare.engine
+        );
+
+        let recovered =
+            crate::extract_file("api/user.proto", "message User {\n  string id = 1;\n}\n");
+        assert!(
+            matches!(recovered.parse_outcome, ParseOutcome::Fallback { .. }),
+            "a real declaration recovery still reports Fallback, got {:?}",
+            recovered.parse_outcome
+        );
+        assert!(
+            recovered
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "User" && symbol.kind != SymbolKind::File),
+            "the recovered declaration must survive alongside the File node"
+        );
+    }
 
     /// A real syntax error must never be reported as a clean parse.
     ///
@@ -5725,7 +7347,13 @@ mod tests {
                     // A namespace import records the `*` sentinel, which is how
                     // `ns.anything` stays resolvable without enumerating names.
                     ("pkg", vec!["*"], vec!["ns"], Some("ns")),
-                    ("", vec!["x"], vec!["x"], None),
+                    // `export { x };` is deliberately absent. It used to appear
+                    // here as `("", ["x"], ["x"], None)` — an import with an
+                    // empty module specifier — and this expectation pinned the
+                    // defect rather than the intent: a local re-export with no
+                    // `from` is an export and nothing else, and `""` is an
+                    // endpoint no resolver can ever bind. It still appears in
+                    // the export set below, which is where it belongs.
                 ],
                 vec!["d", "f.ts", "val", "x"],
             ),
@@ -5747,11 +7375,17 @@ mod tests {
                 "rust",
                 "use std::collections::BTreeMap;\nuse crate::thing::{One, Two as Three};\n                 pub use inner::Exported;\n",
                 vec![
-                    ("std::collections::BTreeMap", vec![], vec![], None),
-                    // Grouped `use` is recorded as its raw specifier rather than
-                    // split into names; pinned as current behavior, not intent.
-                    ("crate::thing::{One, Two as Three}", vec![], vec![], None),
-                    ("inner::Exported", vec![], vec![], None),
+                    // X41. Each `use` names a module and the names it takes out
+                    // of it, the shape every other grammar here produces. This
+                    // expectation used to read
+                    // `("crate::thing::{One, Two as Three}", [], [], None)` and
+                    // said so in a comment — "pinned as current behavior, not
+                    // intent". The intent is this: a module specifier that is
+                    // the statement's own source text matches no file and binds
+                    // no name, so nothing downstream could use it.
+                    ("std::collections", vec!["BTreeMap"], vec!["BTreeMap"], None),
+                    ("crate::thing", vec!["One", "Two"], vec!["One", "Three"], None),
+                    ("inner", vec!["Exported"], vec!["Exported"], None),
                 ],
                 vec!["f.rs"],
             ),
@@ -5786,6 +7420,20 @@ mod tests {
                 .collect();
             exports.sort_unstable();
             assert_eq!(exports, expected_exports, "{grammar}: export set drifted");
+
+            // No import names an empty module.
+            //
+            // The loop below already refused an empty binding *name*, and this
+            // test still passed while every `export { x };` in the corpus
+            // pushed an import whose module was `""` — the check was one field
+            // short of the class it was written for.
+            for import in &extraction.imports {
+                assert!(
+                    !import.module_specifier.is_empty(),
+                    "{grammar}: an import must name a module, got {:?}",
+                    import.raw_import
+                );
+            }
 
             // Every import's binding pairs are well formed, so the resolver
             // cannot be handed a binding keyed on an empty name.
@@ -7739,5 +9387,47 @@ mod tests {
                 "predeclared type {predeclared:?} must not be a callee; got {callees:?}"
             );
         }
+    }
+
+    /// Every `grammar_for` arm is counted, and every counted key has an arm.
+    ///
+    /// `linked_grammar_count` is what hosts compare against a vendored
+    /// expectation. If a new language grows an arm without joining
+    /// `GRAMMAR_LANGUAGE_KEYS`, the count stays stale and the host cannot
+    /// detect the mismatch; if a key is listed without an arm, the count
+    /// under-reports silently the other way.
+    #[test]
+    fn linked_grammar_keys_cover_every_grammar_for_arm() {
+        for lang in GRAMMAR_LANGUAGE_KEYS {
+            assert!(
+                grammar_for(lang).is_some()
+                    || UNSAFE_GRAMMARS
+                        .iter()
+                        .any(|(unsafe_lang, _)| unsafe_lang == lang),
+                "{lang} is listed in GRAMMAR_LANGUAGE_KEYS but has no grammar_for arm \
+                 and is not in UNSAFE_GRAMMARS"
+            );
+        }
+        // Spot-check: a language that is not listed must not suddenly grow an
+        // arm without updating the list. Probe a few ids that are deliberately
+        // absent from the table.
+        for absent in ["vb", "cobol", "fortran", "haskell"] {
+            if GRAMMAR_LANGUAGE_KEYS.contains(&absent) {
+                continue;
+            }
+            assert!(
+                grammar_for(absent).is_none()
+                    || UNSAFE_GRAMMARS
+                        .iter()
+                        .any(|(unsafe_lang, _)| *unsafe_lang == absent),
+                "{absent} has a grammar_for arm but is missing from GRAMMAR_LANGUAGE_KEYS"
+            );
+        }
+        let count = linked_grammar_count();
+        assert!(
+            count >= 30,
+            "linked_grammar_count()={count} is too low for this workspace's grammar set"
+        );
+        assert_eq!(count, linked_grammar_keys().len());
     }
 }

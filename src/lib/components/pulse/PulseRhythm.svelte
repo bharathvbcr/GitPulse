@@ -1,7 +1,7 @@
 <script lang="ts">
   import { computeRhythm } from "../../pulse/metrics";
   import type { PulseCommitSummary } from "../../pulse/types";
-  import { Calendar, Flame, Hourglass, Zap } from "lucide-svelte";
+  import { Calendar, Flame, Hourglass, Zap } from "@lucide/svelte";
 
   let {
     commits = [],
@@ -23,7 +23,7 @@
 
 <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
   <!-- Current Streak -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Current Streak</span>
       <Zap size={14} class="text-accent shrink-0" />
@@ -38,7 +38,7 @@
   </div>
 
   <!-- Longest Streak -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Longest Run</span>
       <Flame size={14} class="text-accent shrink-0" />
@@ -53,7 +53,7 @@
   </div>
 
   <!-- Active in 90 Days -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Active in 90d</span>
       <Calendar size={14} class="text-accent shrink-0" />
@@ -71,7 +71,7 @@
   </div>
 
   <!-- Longest Inactive Gap -->
-  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col justify-between">
+  <div class="gp-card p-3.5 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col justify-between">
     <div class="flex items-center justify-between text-textMuted text-[11px] mb-1">
       <span class="font-medium uppercase tracking-wider">Longest Gap</span>
       <Hourglass size={14} class="text-textMuted shrink-0" />

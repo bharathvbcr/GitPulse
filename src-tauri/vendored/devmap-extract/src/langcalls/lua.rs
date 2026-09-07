@@ -139,14 +139,14 @@ fn lua_indexed_target(
 /// the same behaviour `callable_binding_name` already has for unnamed arrows,
 /// and it agrees with the emitter, which emits no symbol for a literal.
 fn lua_enclosing_symbol(node: Node, source: &str, file_symbol_name: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
         if parent.kind() == "function_declaration" {
             if let Some(name) = get_child_text(parent, "name", source).filter(|n| !n.is_empty()) {
                 return Some(format!("{file_symbol_name}::{name}"));
             }
         }
-        ancestor = parent.parent();
+        ancestor = crate::treesitter::bounded_parent(parent);
     }
     None
 }

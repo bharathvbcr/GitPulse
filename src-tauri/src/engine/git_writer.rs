@@ -117,6 +117,31 @@ impl GitWriter {
         Ok(())
     }
 
+    /// Moves a tracked file with `git mv` and stages the rename.
+    ///
+    /// Used by the doc-vault rename path so link rewrites land beside a
+    /// reviewable rename in the index rather than an opaque filesystem move.
+    /// Paths are sandbox-checked first; `git mv` takes path arguments (not
+    /// pathspecs), so `:(literal)` cannot be used here the way `git add` can.
+    pub fn mv_file(repo_path: &str, from: &str, to: &str) -> Result<(), String> {
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _from_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, from)?;
+        let to_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, to)?;
+        if to_abs.exists() {
+            return Err(format!("destination already exists: {to}"));
+        }
+        if let Some(parent) = to_abs.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create destination parent: {e}"))?;
+        }
+        git_text(&repo, &["mv", "--", from, to])?;
+        Ok(())
+    }
+
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() {

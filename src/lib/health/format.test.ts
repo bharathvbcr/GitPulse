@@ -214,6 +214,16 @@ describe("dependabotBadgeClass — severity casing (regression)", () => {
     expect(dependabotBadgeClass([])).toBe("");
   });
 
+  it("maps CodeQL rule.severity onto the npm/GitHub tiers the rest of Health uses", () => {
+    expect(normalizeSeverity("error")).toBe("high");
+    expect(normalizeSeverity("ERROR")).toBe("high");
+    expect(normalizeSeverity("warning")).toBe("moderate");
+    expect(normalizeSeverity("NOTE")).toBe("info");
+    expect(normalizeSeverity("none")).toBe("info");
+    expect(dependabotBadgeClass([{ severity: "error" }])).toBe("text-rose-300");
+    expect(dependabotBadgeClass([{ severity: "warning" }])).toBe("text-amber-300");
+  });
+
   it("takes the worst severity in the list, not the first", () => {
     expect(
       dependabotBadgeClass([{ severity: "low" }, { severity: "CRITICAL" }]),

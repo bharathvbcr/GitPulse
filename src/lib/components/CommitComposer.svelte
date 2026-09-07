@@ -7,9 +7,19 @@
     type AiGeneration,
     type PolicyVerdict,
   } from "../stores/harnessStore";
-  import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "lucide-svelte";
+  import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "@lucide/svelte";
+  import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { previewStore, previewSummary } from "../codeintel/previewStore";
+  import { getImpactLayeredMany } from "../codeintel/client";
+  import {
+    composeLayeredImpacts,
+    emptyComposedBlast,
+    type ComposedBlastRadius,
+  } from "../codeintel/blastCompose";
+  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
+  import BlastRadiusPanel from "./BlastRadiusPanel.svelte";
 
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
@@ -31,6 +41,49 @@
       conflictedCount > 0 ||
       (quickCommit ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending),
   );
+
+  // A1: one preview batch for staged paths — DiffFileRail reads the same store.
+  let previewPaths = $derived(stagedFiles.map((s) => s.path));
+  let previewPathsKey = $derived(previewPaths.slice().sort().join("\0"));
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const key = previewPathsKey;
+    void key;
+    void previewStore.refresh(repo, previewPaths);
+  });
+
+  // A3: blast radius over the staged set (layered — no min_rung).
+  let blast = $state<ComposedBlastRadius | null>(null);
+  let blastLoading = $state(false);
+  let blastGuard: AsyncGuard | null = null;
+
+  $effect(() => {
+    const repo = $repoStore.currentPath;
+    const paths = previewPaths;
+    blastGuard?.cancel();
+    if (!repo || paths.length === 0) {
+      blast = null;
+      blastLoading = false;
+      return;
+    }
+    const guard = createAsyncGuard();
+    blastGuard = guard;
+    blastLoading = true;
+    void getImpactLayeredMany(repo, paths, 800)
+      .then((results) => {
+        if (!guard.isLive()) return;
+        blast = composeLayeredImpacts(results, paths);
+        blastLoading = false;
+      })
+      .catch(() => {
+        if (!guard.isLive()) return;
+        blast = emptyComposedBlast("layered impact request failed");
+        blastLoading = false;
+      });
+  });
+
+  $effect(() => () => blastGuard?.cancel());
 
   async function generateMessage() {
     const path = $repoStore.currentPath;
@@ -118,13 +171,77 @@
     </button>
   </div>
 
+  {#if stagedFiles.length > 0}
+    <!-- A1: what this commit breaks — every PreviewReport honesty field. -->
+    <div
+      class="flex flex-col gap-1 rounded-lg border border-border/60 bg-background/60 p-2"
+      data-testid="commit-preview-breaks"
+    >
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted"
+          >What this commit breaks</span
+        >
+        {#if $previewStore.loading}
+          <Loader size={11} class="animate-spin text-textMuted" />
+        {/if}
+      </div>
+      {#if $previewSummary}
+        <p
+          class="text-[11px] leading-snug {$previewSummary.unreliableFiles > 0 ||
+          $previewSummary.unavailableFiles > 0 ||
+          $previewSummary.brokenCallerTotal > 0
+            ? 'text-amber-500'
+            : 'text-textSecondary'}"
+        >
+          {$previewSummary.headline}
+        </p>
+        {#if $previewSummary.outcomeReason}
+          <p class="text-[10px] text-textMuted">{$previewSummary.outcomeReason}</p>
+        {/if}
+        <ul class="flex max-h-28 flex-col gap-1 overflow-y-auto gp-scroll">
+          {#each $previewSummary.files as file (file.file_path)}
+            <li class="rounded border border-border/40 px-1.5 py-1 font-mono text-[9px] leading-relaxed text-textMuted">
+              <div class="truncate text-textSecondary" title={file.file_path}>{file.file_path}</div>
+              <div>
+                parse={file.parse_status}
+                · against={file.compared_against}
+                · indexed={file.file_is_indexed ? "yes" : "no"}
+                · delta={file.delta_available ? "yes" : "no"}
+              </div>
+              {#if file.degraded_reason}
+                <div class="text-amber-500">degraded: {file.degraded_reason}</div>
+              {/if}
+              <div>
+                bodies_not_compared={file.bodies_not_compared}
+                · ambiguous_callers={file.ambiguous_callers}
+                · broken={file.broken_shown}/{file.broken_total}{file.broken_truncated
+                  ? " (truncated)"
+                  : ""}
+              </div>
+              {#if file.walk_incomplete}
+                <div class="text-amber-500">walk_incomplete: {file.walk_incomplete}</div>
+              {/if}
+              {#if !file.available}
+                <div class="text-amber-500">unavailable: {file.reason}</div>
+              {:else if file.unreliable}
+                <div class="text-amber-500">unreliable preview — not "nothing breaks"</div>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+
+    <BlastRadiusPanel {blast} loading={blastLoading} title="Staged blast radius" />
+  {/if}
+
   <textarea
     value={commitMessage}
     oninput={(e) => repoStore.setCommitDraft((e.currentTarget as HTMLTextAreaElement).value)}
     onkeydown={onMessageKeydown}
     placeholder="Commit message (e.g. feat: add auth)..."
     rows="3"
-    class="w-full bg-background border border-border/80 rounded-xl p-2.5 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none focus:border-accent/60 resize-none font-mono transition-colors"
+    class="w-full bg-background border border-border/80 rounded-xl p-2.5 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden focus:border-accent/60 resize-none font-mono transition-colors"
   ></textarea>
 
   {#if generation}
@@ -160,17 +277,22 @@
     <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError}</div>
   {:else if lastVerdict}
     <div
-      class="text-[10px] flex items-start gap-1 {lastVerdict.status === 'unchecked'
+      class="text-[10px] flex flex-col gap-0.5 {lastVerdict.status === 'unchecked'
         ? 'text-amber-400'
         : 'text-textMuted'}"
-      title={verdictDetail(lastVerdict)}
     >
-      {#if lastVerdict.checked}
-        <ShieldCheck size={11} class="mt-px shrink-0" />
-      {:else}
-        <ShieldAlert size={11} class="mt-px shrink-0" />
-      {/if}
-      <span>{verdictLabel(lastVerdict)}</span>
+      <div class="flex items-start gap-1">
+        {#if lastVerdict.checked}
+          <ShieldCheck size={11} class="mt-px shrink-0" />
+        {:else}
+          <ShieldAlert size={11} class="mt-px shrink-0" />
+        {/if}
+        <span>{verdictLabel(lastVerdict)}</span>
+      </div>
+      <MarkdownBody
+        source={verdictDetail(lastVerdict)}
+        class="text-[10px] text-textMuted pl-4"
+      />
     </div>
   {/if}
 

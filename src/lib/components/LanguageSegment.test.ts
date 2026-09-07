@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import LanguageSegment from "./LanguageSegment.svelte";
+import { stripMarkupComments } from "../dom/markupText";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "LanguageSegment.svelte"), "utf8");
@@ -15,9 +16,7 @@ describe("LanguageSegment", () => {
     // Svelte's SSR hydration markers are not content, so they are stripped
     // rather than asserted away with a substring check that would also pass
     // on a rendered element.
-    const visible = render(LanguageSegment)
-      .body.replace(/<!--[\s\S]*?-->/g, "")
-      .trim();
+    const visible = stripMarkupComments(render(LanguageSegment).body).trim();
     expect(visible).toBe("");
   });
 

@@ -79,7 +79,7 @@
 
       <form class="p-4 space-y-3" onsubmit={submit}>
         {#if options.message}
-          <p class="text-textMuted leading-relaxed whitespace-pre-wrap break-words">{options.message}</p>
+          <p class="text-textMuted leading-relaxed whitespace-pre-wrap wrap-break-word">{options.message}</p>
         {/if}
 
         {#if !isConfirm}

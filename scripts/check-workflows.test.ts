@@ -1,6 +1,12 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { INSTALL_HINT, interpret, workflowFiles } from "./check-workflows.mjs";
+import {
+  INSTALL_HINT,
+  hasWorkflowLevelPermissions,
+  interpret,
+  workflowFiles,
+  workflowsMissingPermissions,
+} from "./check-workflows.mjs";
 
 describe("check:workflows", () => {
   it("finds the repository's workflow files", () => {
@@ -30,5 +36,24 @@ describe("check:workflows", () => {
     // verdict about the workflows.
     expect(interpret({ status: 2 }).code).toBe(2);
     expect(interpret({ status: 3 }).code).toBe(2);
+  });
+
+  it("requires a workflow-level permissions block so GITHUB_TOKEN is fail-closed", () => {
+    expect(hasWorkflowLevelPermissions("on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n")).toBe(
+      false,
+    );
+    expect(
+      hasWorkflowLevelPermissions(
+        "on: push\npermissions:\n  contents: read\njobs:\n  a:\n    runs-on: ubuntu-latest\n",
+      ),
+    ).toBe(true);
+    // A job-only map is not enough: GitHub's default token still applies to
+    // every other job, which is the finding this check exists to keep closed.
+    expect(
+      hasWorkflowLevelPermissions("on: push\njobs:\n  a:\n    permissions:\n      contents: read\n"),
+    ).toBe(false);
+
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    expect(workflowsMissingPermissions(dir)).toEqual([]);
   });
 });

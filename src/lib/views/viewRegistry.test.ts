@@ -18,6 +18,23 @@ describe("viewRegistry", () => {
     }
   });
 
+  it("gives every view and section a summary that is not just its label", () => {
+    // The header and section bars render these as glanceable tooltips. A
+    // missing summary would compile (until the field was required) and then
+    // show a card that only repeats the tab name — the defect this field
+    // exists to stop.
+    for (const view of REGISTERED_VIEWS) {
+      expect(view.summary.length, view.id).toBeGreaterThan(view.label.length);
+      expect(view.summary).not.toBe(view.label);
+      for (const section of view.sections ?? []) {
+        expect(section.summary.length, `${view.id}:${section.id}`).toBeGreaterThan(
+          section.label.length,
+        );
+        expect(section.summary).not.toBe(section.label);
+      }
+    }
+  });
+
   it("keeps MANVI reachable (regression: it once existed but was missing from consumers)", () => {
     // MANVI was its own tab, and the original regression was that it existed
     // without any consumer listing it. It is a section of Work now, so the

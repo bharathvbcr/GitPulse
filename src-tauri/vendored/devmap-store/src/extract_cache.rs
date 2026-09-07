@@ -28,12 +28,30 @@ pub fn extract_tree_cached_with_report(
     store: &Store,
     root: &Path,
 ) -> anyhow::Result<(Vec<Extraction>, devmap_extract::model::DiscoveryReport)> {
-    let (sources, report) = devmap_extract::collect_sources_with_report(root)?;
-    let extractions: Vec<Extraction> = sources
+    let scanned = devmap_extract::scan_tree(root)?;
+    let extractions = extract_scanned_cached(store, &scanned)?;
+    Ok((extractions, scanned.report))
+}
+
+/// Extract a tree that has already been scanned, consulting `store` for hits.
+///
+/// The split exists so a caller can decide *whether* to extract. Every lookup
+/// here goes through the store's single guarded connection, so this loop is
+/// serial on the SQLite mutex however many rayon threads enter it, and it
+/// deserializes one full extraction payload per file: measured on this
+/// repository, 213–254 ms for 1,311 unchanged files. A build that only needs to
+/// know whether the tree moved gets that from
+/// [`devmap_extract::ScannedTree::matches_file_hashes`] instead and never calls
+/// this at all.
+pub fn extract_scanned_cached(
+    store: &Store,
+    scanned: &devmap_extract::ScannedTree,
+) -> anyhow::Result<Vec<Extraction>> {
+    scanned
+        .sources
         .par_iter()
         .map(|(path, src)| extract_one_cached(store, path, src))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((extractions, report))
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 fn extract_one_cached(store: &Store, path: &str, src: &str) -> anyhow::Result<Extraction> {
@@ -137,6 +155,78 @@ mod tests {
             assert_eq!(extractions.len(), 64);
             assert_eq!(paths.len(), 64, "cache must preserve every file identity");
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The unchanged verdict a scan reaches is the one extraction would reach.
+    ///
+    /// This is the equivalence the no-op fast path rests on: the build now
+    /// compares `ScannedTree`'s `(path, content_hash)` pairs against the stored
+    /// generation instead of extracting every file and comparing the
+    /// extractions' own `file_path`/`content_hash`. The two must agree over
+    /// every case the corpus can produce — a clean parse, a parse that FAILED
+    /// (never cache-admitted, so it takes the re-parse arm every time), a file
+    /// whose content is shared with another path (a cache key collision the
+    /// path guard rejects), and an empty file.
+    #[test]
+    fn scan_hashes_agree_with_extraction_hashes_over_every_outcome() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-scan-agree-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("clean.py"), "def clean():\n    return 1\n").unwrap();
+        fs::write(root.join("broken.py"), "def ((( invalid\n").unwrap();
+        // Byte-identical to clean.py: one content hash, two file identities.
+        fs::write(root.join("twin.py"), "def clean():\n    return 1\n").unwrap();
+        fs::write(root.join("empty.py"), "").unwrap();
+        fs::write(root.join("notes.md"), "# not a source file\n").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        // Twice: once cold (every file re-parsed) and once warm (cache hits),
+        // because the two arms of `extract_one_cached` build `content_hash`
+        // differently — one from the parser, one from a stored payload.
+        for pass in 0..2 {
+            let scanned = devmap_extract::scan_tree(&root).unwrap();
+            let extractions = extract_scanned_cached(&store, &scanned).unwrap();
+
+            let from_scan: std::collections::BTreeMap<&str, u64> =
+                scanned.file_hashes().into_iter().collect();
+            let from_extraction: std::collections::BTreeMap<&str, u64> = extractions
+                .iter()
+                .map(|e| (e.file_path.as_str(), e.content_hash))
+                .collect();
+            assert_eq!(
+                from_scan, from_extraction,
+                "pass {pass}: scan and extraction must agree on every (path, hash)"
+            );
+
+            // And the verdict built on them agrees too, in both directions.
+            let previous: std::collections::BTreeMap<String, u64> = from_extraction
+                .iter()
+                .map(|(path, hash)| ((*path).to_string(), *hash))
+                .collect();
+            assert!(
+                scanned.matches_file_hashes(&previous),
+                "pass {pass}: an identical tree must match"
+            );
+            let mut moved = previous.clone();
+            moved.insert("clean.py".to_string(), 0);
+            assert!(
+                !scanned.matches_file_hashes(&moved),
+                "pass {pass}: one differing hash must not match"
+            );
+            let mut renamed = previous.clone();
+            let hash = renamed.remove("twin.py").unwrap();
+            renamed.insert("renamed.py".to_string(), hash);
+            assert!(
+                !scanned.matches_file_hashes(&renamed),
+                "pass {pass}: a rename with identical content must not match"
+            );
+        }
+
         let _ = fs::remove_dir_all(&root);
     }
 

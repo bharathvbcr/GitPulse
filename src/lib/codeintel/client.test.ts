@@ -4,7 +4,33 @@ import {
   getCodeintelStatus,
   searchSymbols,
   getImpact,
+  getImpactAtRung,
+  getImpactLayered,
+  getImpactLayeredMany,
   getDeadSymbols,
+  getDependencies,
+  traceBetween,
+  getNeighbors,
+  exploreSymbol,
+  getAffectedTests,
+  getClones,
+  cancelCodeintelQuery,
+  newCodeintelCancelToken,
+  buildDevmap,
+  refreshDevmap,
+  maybeRefreshDevmap,
+  getDevmapCliStatus,
+  getDevmapRepoMap,
+  previewDevmapEdit,
+  previewDevmapEdits,
+  getCodeGraphViz,
+  getMapPreviewViz,
+  syncWorkspaceTabs,
+  searchWorkspaceSymbols,
+  listWorkspaceRepos,
+  registerWorkspaceRepo,
+  unregisterWorkspaceRepo,
+  getWorkspaceLinkCandidates,
 } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -110,5 +136,212 @@ describe("codeintel client", () => {
       tokenBudget: 1000,
     });
     expect(res.items[0].symbol_name).toBe("unused_helper");
+  });
+
+  it("queries impact at rung and layered impact for many targets", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: true,
+      reason: null,
+      items: [],
+      total: 2,
+      shown: 0,
+      truncated: false,
+      rungs: { deterministic: 1, high: 1, speculative: 0, filtered_out: 3 },
+    });
+    const atRung = await getImpactAtRung("/repo", "src/a.ts", 20, "high");
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_impact_at_rung", {
+      repoPath: "/repo",
+      target: "src/a.ts",
+      tokenBudget: 20,
+      minRung: "high",
+    });
+    expect(atRung.rungs?.filtered_out).toBe(3);
+
+    vi.mocked(invoke).mockResolvedValueOnce([]);
+    await getImpactLayeredMany("/repo", ["a.ts", "b.ts"], 800);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_impact_layered_many", {
+      repoPath: "/repo",
+      targets: ["a.ts", "b.ts"],
+      tokenBudget: 800,
+    });
+  });
+
+  it("batches preview edits", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: true,
+      files: [],
+      cancelled: false,
+    });
+    await previewDevmapEdits("/repo", [["src/a.ts", "console.log(1)"]]);
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_preview_many", {
+      repoPath: "/repo",
+      files: [["src/a.ts", "console.log(1)"]],
+    });
+  });
+
+  it("loads ranked code-graph and map-preview canvas payloads", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: true,
+      kind: "code_graph",
+      payload: {
+        nodes: [],
+        links: [],
+        counts: { nodes_shown: 0, nodes_total: 0, nodes_truncated: false },
+      },
+    });
+    await getCodeGraphViz("/repo", true, 500);
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_viz", {
+      repoPath: "/repo",
+      symbols: true,
+      maxNodes: 500,
+    });
+
+    vi.mocked(invoke).mockResolvedValueOnce({
+      available: true,
+      kind: "map_preview",
+      payload: { nodes: [], links: [] },
+    });
+    await getMapPreviewViz("/repo");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_map_preview", { repoPath: "/repo" });
+  });
+
+  it("syncs and searches the multi-repo workspace registry", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      version: 1,
+      registry_root: "/a",
+      registry_path: "/a/.devmap/workspace.json",
+      repos: [{ name: "a", root: "/a", db: ".devmap/codeintel/devmap.sqlite", db_path: "/a/.devmap/codeintel/devmap.sqlite" }],
+    });
+    await syncWorkspaceTabs("/a", ["/a", "/b"]);
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_sync", {
+      registryRoot: "/a",
+      repoPaths: ["/a", "/b"],
+    });
+
+    vi.mocked(invoke).mockResolvedValueOnce({
+      items: [],
+      repos_queried: 0,
+      unavailable: [],
+      total: 0,
+      shown: 0,
+      hidden: 0,
+      truncated: false,
+      semantic: true,
+    });
+    await searchWorkspaceSymbols("/a", "Widget", 400, true);
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_search", {
+      registryRoot: "/a",
+      query: "Widget",
+      tokenBudget: 400,
+      semantic: true,
+    });
+
+    vi.mocked(invoke).mockResolvedValueOnce({ version: 1, registry_root: "/a", registry_path: "/a/.devmap/workspace.json", repos: [] });
+    await listWorkspaceRepos("/a");
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_list", { registryRoot: "/a" });
+
+    vi.mocked(invoke).mockResolvedValueOnce({ name: "b", root: "/b", replaced: false, registry_path: "/a/.devmap/workspace.json" });
+    await registerWorkspaceRepo("/a", "/b", "b");
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_register", {
+      registryRoot: "/a",
+      repoPath: "/b",
+      name: "b",
+    });
+
+    vi.mocked(invoke).mockResolvedValueOnce({ name: "b", removed: true, registry_path: "/a/.devmap/workspace.json" });
+    await unregisterWorkspaceRepo("/a", "b");
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_unregister", {
+      registryRoot: "/a",
+      name: "b",
+    });
+
+    vi.mocked(invoke).mockResolvedValueOnce({ links: [], count: 0, repos_considered: 1 });
+    await getWorkspaceLinkCandidates("/a");
+    expect(invoke).toHaveBeenCalledWith("cmd_workspace_link_candidates", {
+      registryRoot: "/a",
+    });
+  });
+
+  it("covers the remaining codeintel and digmap IPC wrappers", async () => {
+    vi.mocked(invoke).mockResolvedValue({});
+
+    await getDependencies("/repo", "src/a.ts", 10);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_dependencies", {
+      repoPath: "/repo",
+      filePath: "src/a.ts",
+      tokenBudget: 10,
+      minRung: undefined,
+    });
+
+    await traceBetween("/repo", "a", "b", 20);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_trace", {
+      repoPath: "/repo",
+      from: "a",
+      to: "b",
+      tokenBudget: 20,
+      minRung: undefined,
+    });
+
+    await getNeighbors("/repo", ["src/a.ts"], 30);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_neighbors", {
+      repoPath: "/repo",
+      targets: ["src/a.ts"],
+      tokenBudget: 30,
+      minRung: undefined,
+    });
+
+    await exploreSymbol("/repo", "Foo", 40);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_explore", {
+      repoPath: "/repo",
+      query: "Foo",
+      tokenBudget: 40,
+      limit: undefined,
+    });
+
+    await getAffectedTests("/repo", ["src/a.ts"], 50);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_affected_tests", {
+      repoPath: "/repo",
+      targets: ["src/a.ts"],
+      tokenBudget: 50,
+      maxDepth: undefined,
+    });
+
+    await getClones("/repo", 60);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_clones", {
+      repoPath: "/repo",
+      tokenBudget: 60,
+    });
+
+    await getImpactLayered("/repo", "src/a.ts", 70);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_impact_layered", {
+      repoPath: "/repo",
+      target: "src/a.ts",
+      tokenBudget: 70,
+    });
+
+    const token = newCodeintelCancelToken();
+    expect(token.length).toBeGreaterThan(4);
+    await cancelCodeintelQuery(token);
+    expect(invoke).toHaveBeenCalledWith("cmd_codeintel_cancel", { cancelToken: token });
+
+    await buildDevmap("/repo");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_build", { repoPath: "/repo" });
+    await refreshDevmap("/repo");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_refresh", { repoPath: "/repo" });
+    await maybeRefreshDevmap("/repo", true);
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_maybe_refresh", {
+      repoPath: "/repo",
+      repoChanged: true,
+    });
+    await getDevmapCliStatus("/repo");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_status", { repoPath: "/repo" });
+    await getDevmapRepoMap("/repo");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_repo_map", { repoPath: "/repo" });
+    await previewDevmapEdit("/repo", "src/a.ts", "x");
+    expect(invoke).toHaveBeenCalledWith("cmd_devmap_preview", {
+      repoPath: "/repo",
+      filePath: "src/a.ts",
+      content: "x",
+    });
   });
 });

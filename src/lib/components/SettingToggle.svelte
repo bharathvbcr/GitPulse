@@ -40,7 +40,7 @@
       : 'bg-border'}"
   >
     <span
-      class="absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform {checked
+      class="absolute top-[2px] left-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-xs transition-transform {checked
         ? 'translate-x-[14px]'
         : 'translate-x-0'}"
     ></span>

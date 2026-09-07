@@ -23,7 +23,7 @@
     FoldVertical,
     SlidersHorizontal,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
   import { formatError } from "../../ui/formatError";
@@ -798,7 +798,7 @@
         onclick={() => createNewFile("")}
         title="New file in repository root"
         aria-label="New file in repository root"
-        class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
       >
         <FilePlus size={13} />
       </button>
@@ -807,7 +807,7 @@
         onclick={() => createNewFolder("")}
         title="New folder in repository root"
         aria-label="New folder in repository root"
-        class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
       >
         <FolderPlus size={13} />
       </button>
@@ -816,7 +816,7 @@
         onclick={allCollapsed ? expandAll : collapseAll}
         title={allCollapsed ? "Expand all folders" : "Collapse all folders"}
         aria-label={allCollapsed ? "Expand all folders" : "Collapse all folders"}
-        class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+        class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
       >
         <FoldVertical size={13} />
       </button>
@@ -827,7 +827,7 @@
         aria-controls="file-tree-filters"
         title="Sort and file-type filters"
         aria-label="Sort and file-type filters"
-        class="gp-icon-btn !p-1 {filtersOpen ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn p-1! {filtersOpen ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
       >
         <SlidersHorizontal size={13} />
       </button>
@@ -847,7 +847,7 @@
         placeholder="Filter files"
         title={QUERY_SYNTAX}
         spellcheck="false"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none"
+        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
       />
       {#if query}
         <button
@@ -855,7 +855,7 @@
           onclick={() => { query = ""; applyQuery.cancel(); debouncedQuery = ""; }}
           aria-label="Clear filter"
           title="Clear filter"
-          class="gp-icon-btn !p-0.5 text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn p-0.5! text-textMuted hover:text-textPrimary"
         >
           <X size={11} />
         </button>

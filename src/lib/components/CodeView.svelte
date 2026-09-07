@@ -12,25 +12,21 @@
   /**
    * Code: the working tree, under whichever lens the question needs.
    *
-   * Files and Blame were two header entries reading one file. Both keyed off
-   * `selectedFilePath`, and the split showed in the code: Blame carried its
-   * own explorer rail and its own path box so a user would not have to walk
-   * back to Files for the file they already had open — the same tell the Diff
-   * view gave before History absorbed it. As sections the selection survives
-   * the switch, so the editor's Blame button changes lens instead of
-   * teleporting, and Blame's second picker could go.
+   * Explorer and Blame share `selectedFilePath`. Map is the structural
+   * navigator over the consumer repo map — subsystems, entry points, area
+   * tests — and does not need a file selected.
    *
-   * Explorer is `FileViewer` unchanged and eager: it is the section Code
-   * opens on, so deferring it would only add a round trip. Blame stays lazy —
-   * it was already its own chunk and nothing about the merge makes it cheaper
-   * to parse at startup.
+   * Explorer is eager (the default section). Blame and Map stay lazy.
    */
 
   let {
     /** Blame's loader, declared at module scope by App so it stays stable. */
     loadBlame,
+    /** Map navigator loader — same stability rule as Blame. */
+    loadMap,
   }: {
     loadBlame: ViewLoader;
+    loadMap: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("code", $repoStore.viewSections));
@@ -39,14 +35,8 @@
 
 <div class="flex-1 flex flex-col min-h-0">
   <ViewSectionBar view="code">
-    <!-- The subject both sections share, named once. Blame used to print the
-         path into its own input; there is one file here, and it is the file
-         the Explorer section has open.
-
-         Explorer draws its own breadcrumb, where each folder is a control that
-         reveals it in the tree. Repeating the path here put the same string on
-         screen twice, three lines apart, one copy inert — so this now speaks
-         only for Blame, which has no breadcrumb of its own. -->
+    <!-- The subject Blame shares with Explorer. Map has its own subject
+         (subsystems), so the path chip stays Blame-only. -->
     {#if selected && section === "blame"}
       <span
         class="ml-auto shrink-0 max-w-[40ch] truncate font-mono text-[11px] text-textMuted"
@@ -63,6 +53,8 @@
          and unsaved drafts on every switch. -->
     {#if section === "blame"}
       <LazyView load={loadBlame} name="blame" />
+    {:else if section === "map"}
+      <LazyView load={loadMap} name="Map" />
     {:else}
       <FileViewer />
     {/if}

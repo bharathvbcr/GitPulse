@@ -16,6 +16,12 @@ export interface ViewSection {
   /** Display name in the view's own segmented control. */
   readonly label: string;
   /**
+   * Glanceable sentence for the section tab's tooltip. Required: a new
+   * section that ships without one is a labelled button that still does not
+   * say what the pane is.
+   */
+  readonly summary: string;
+  /**
    * Command-palette label. Every section a retired view became needs one, or
    * the retirement takes away the only door that view had.
    */
@@ -26,6 +32,12 @@ export interface ViewRegistration {
   readonly id: ViewTab;
   /** Display name in the header tabs/menus and the default palette phrasing. */
   readonly label: string;
+  /**
+   * What this view is for, in the header tab's tooltip. Required for the
+   * same reason section summaries are: a new view cannot ship as a name
+   * that only repeats itself.
+   */
+  readonly summary: string;
   /**
    * Command-palette label for views that are reachable as commands. Omitted
    * means the view gets no palette command (matching historical behavior for
@@ -54,6 +66,8 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
   work: {
     id: "work",
     label: "Work",
+    summary:
+      "Everything in flight: worktrees, pull requests, CI runs and MANVI verdicts. Blocked items sort first.",
     paletteCommand: "Open Work — tasks, worktrees, PRs, runs and verdicts",
     // Everything in flight, and the surfaces that act on it. GitHub and MANVI
     // were separate views rendering halves of the same answer Work already
@@ -61,31 +75,79 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // to draw overlapping lists. Resolve was never a destination: it is what
     // a blocked row opens into, and Work already sorts blocked rows first.
     sections: [
-      { id: "overview", label: "Overview" },
-      { id: "resolve", label: "Resolve", paletteCommand: "Open Resolve — finish a parked merge or rebase" },
-      { id: "remote", label: "Remote", paletteCommand: "Open GitHub — pull requests, issues, runs and releases" },
-      { id: "stack", label: "Stack", paletteCommand: "Open Stack — branch chains and restacking" },
-      { id: "policy", label: "Policy", paletteCommand: "Open MANVI — gates, verdicts and branch cleanup" },
+      {
+        id: "overview",
+        label: "Overview",
+        summary:
+          "The joined list of this repository's worktrees, pull requests and runs. A blocked row is the one to open.",
+      },
+      {
+        id: "resolve",
+        label: "Resolve",
+        summary:
+          "Finish a parked merge or rebase. Conflicted files, chunk by chunk, without leaving Work.",
+        paletteCommand: "Open Resolve — finish a parked merge or rebase",
+      },
+      {
+        id: "remote",
+        label: "Remote",
+        summary:
+          "Pull requests, issues, Actions runs and releases from GitHub for this repository.",
+        paletteCommand: "Open GitHub — pull requests, issues, runs and releases",
+      },
+      {
+        id: "stack",
+        label: "Stack",
+        summary:
+          "Branch chains: which branch sits on which, and restack after the base moved.",
+        paletteCommand: "Open Stack — branch chains and restacking",
+      },
+      {
+        id: "policy",
+        label: "Policy",
+        summary:
+          "MANVI gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
+        paletteCommand: "Open MANVI — gates, verdicts and branch cleanup",
+      },
     ],
   },
   code: {
     id: "code",
     label: "Code",
-    paletteCommand: "Open Code — the file explorer, editor and blame",
-    // Two readings of one file. Both sections key off `selectedFilePath`, so
-    // switching lens keeps the file: the Blame button in the editor header
-    // stopped being a jump to another destination and became what it always
-    // meant. Blame had grown a duplicate explorer rail and a path box purely
-    // because it was reachable with nothing selected; Explorer is one click
-    // away now, so the second picker is gone.
+    summary:
+      "The working tree. Open a file in Explorer, inspect Blame, or navigate the code map.",
+    paletteCommand: "Open Code — the file explorer, editor, blame and map",
+    // Three readings of one repository. Explorer and Blame still share
+    // `selectedFilePath`; Map is the structural navigator over
+    // `.devcouncil/repo_map.json` plus docs search, doc graph, and workspace links.
     sections: [
-      { id: "explorer", label: "Explorer" },
-      { id: "blame", label: "Blame", paletteCommand: "Open Blame — line authorship and code age" },
+      {
+        id: "explorer",
+        label: "Explorer",
+        summary:
+          "Browse and edit files. The tree, editor tabs and the live pulse dashboard live here.",
+      },
+      {
+        id: "blame",
+        label: "Blame",
+        summary:
+          "Who last touched each line, and how old that code is. Keeps the file Explorer had open.",
+        paletteCommand: "Open Blame — line authorship and code age",
+      },
+      {
+        id: "map",
+        label: "Map",
+        summary:
+          "Subsystems, entry points, doc search, the code/doc graph canvas, and cross-repo link candidates. Caps and truncation are named, not dressed as complete.",
+        paletteCommand: "Open Map — subsystems, docs, graphs and link candidates",
+      },
     ],
   },
   history: {
     id: "history",
     label: "History",
+    summary:
+      "What happened in this repository. The graph, the selected commit's diff and the reflog share one selection.",
     paletteCommand: "Open History — the commit graph, diffs and the reflog",
     // Three renderings of one subject: what happened to this repository.
     // They were three tabs, and the split cost more than it saved — the Diff
@@ -93,14 +155,32 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // user would not have to go back to Graph for the commit they had just
     // been looking at. Sharing `selectedCommitId`, the sections keep it.
     sections: [
-      { id: "graph", label: "Graph" },
-      { id: "diff", label: "Diff", paletteCommand: "Open Diff — changes in the selected commit" },
-      { id: "reflog", label: "Reflog", paletteCommand: "Open Reflog — HEAD movements and recovery points" },
+      {
+        id: "graph",
+        label: "Graph",
+        summary: "The commit graph: branches, merges, and the commit you have selected.",
+      },
+      {
+        id: "diff",
+        label: "Diff",
+        summary:
+          "The changes in the selected commit — or the working tree, if none is selected.",
+        paletteCommand: "Open Diff — changes in the selected commit",
+      },
+      {
+        id: "reflog",
+        label: "Reflog",
+        summary:
+          "Every movement of HEAD. Recovery points after a reset, checkout or amend.",
+        paletteCommand: "Open Reflog — HEAD movements and recovery points",
+      },
     ],
   },
   insights: {
     id: "insights",
     label: "Insights",
+    summary:
+      "On-demand measurements of this repository: activity, coverage, dependency health and disk. A scan that could not run is never shown as clean.",
     paletteCommand: "Open Insights — activity, dependencies, coverage and disk",
     // Four scans of one subject: this repository. They were four header
     // entries, each empty until someone ran it — over half the Inspect menu
@@ -108,10 +188,33 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
     // they share one scan-card shell and one honesty contract about
     // truncation, which is the thing all four actually had in common.
     sections: [
-      { id: "pulse", label: "Pulse", paletteCommand: "Open Pulse — repository rhythm, churn and metrics" },
-      { id: "coverage", label: "Coverage", paletteCommand: "Open Coverage" },
-      { id: "health", label: "Health", paletteCommand: "Scan npm vulnerabilities and updates" },
-      { id: "storage", label: "Storage", paletteCommand: "Scan repository disk usage" },
+      {
+        id: "pulse",
+        label: "Pulse",
+        summary:
+          "Rhythm and churn: heatmap, hotspots, who knows which files, and DORA-style movement.",
+        paletteCommand: "Open Pulse — repository rhythm, churn and metrics",
+      },
+      {
+        id: "coverage",
+        label: "Coverage",
+        summary:
+          "Line and file coverage from this project's own test commands. Truncation and failures are named, not dressed as 100%.",
+        paletteCommand: "Open Coverage",
+      },
+      {
+        id: "health",
+        label: "Health",
+        summary:
+          "Local audits across ecosystems, Dependabot and code scanning alerts, and dead code from the code graph. A scanner that did not run is listed, not implied clean.",
+        paletteCommand: "Scan npm vulnerabilities and updates",
+      },
+      {
+        id: "storage",
+        label: "Storage",
+        summary: "Where disk went: git objects, worktrees, and ignored build artifacts.",
+        paletteCommand: "Scan repository disk usage",
+      },
     ],
   },
 };

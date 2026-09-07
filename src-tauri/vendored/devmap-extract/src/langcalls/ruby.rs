@@ -136,7 +136,7 @@ fn ruby_callee_name(method: Node, source: &str) -> Option<String> {
 
 /// Whether this node is the target being written to, rather than a value.
 fn is_assignment_target(node: Node) -> bool {
-    node.parent().is_some_and(|parent| {
+    crate::treesitter::bounded_parent(node).is_some_and(|parent| {
         matches!(parent.kind(), "assignment" | "operator_assignment")
             && parent
                 .child_by_field_name("left")
@@ -167,7 +167,7 @@ fn ruby_receiver_expr(receiver: Node, source: &str) -> Option<String> {
 /// about which target receives which value, and a guess would bind a real name
 /// to the wrong type — the SC9 class of confidently-wrong edge.
 fn ruby_assigned_binding(node: Node, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    let parent = crate::treesitter::bounded_parent(node)?;
     if parent.kind() != "assignment" {
         return None;
     }

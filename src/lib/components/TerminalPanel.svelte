@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -16,7 +15,7 @@
     SquareTerminal,
     ListChecks,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -43,6 +42,15 @@
 
   /** The shared wire shape; aliased for this panel's existing call sites. */
   type TerminalRunResponse = TerminalRunResult;
+
+  let {
+    repoPath = null,
+    visible = true,
+  }: {
+    repoPath?: string | null;
+    /** False while another repository's panel (or a closed dock) is showing. */
+    visible?: boolean;
+  } = $props();
 
   interface ExecutionEntry {
     id: string;
@@ -86,17 +94,15 @@
   //
   // Session ownership lives in TerminalSession, one instance per tab. This
   // component owns only the strip: which tabs exist, which is focused, and
-  // what each is called. The repository boundary is App's `{#key currentPath}`
-  // — a repo switch remounts this panel, and every session dies with its own
-  // component rather than through a lifecycle effect here that had to be
-  // memoised against repoStore's ~6s republish.
+  // what each is called. The repository this panel talks to is a prop from
+  // the dock — one panel per open repo tab, hidden rather than remounted —
+  // so a tab switch cannot kill the shells, and a hidden panel cannot follow
+  // `currentPath` into a different worktree.
   // ---------------------------------------------------------------------
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
   let tabState = $state<TabState>(initialState());
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
-
-  const repoPath = $derived($repoStore.currentPath);
 
   function newTab(launcher: LauncherKind) {
     if (!canOpenTab(tabState)) return;
@@ -137,8 +143,9 @@
    * layout, and the grid it would paint until then is the stale one.
    */
   $effect(() => {
+    if (!visible || mode !== "shell") return;
     const id = tabState.activeId;
-    if (mode !== "shell" || !id) return;
+    if (!id) return;
     sessions[id]?.reveal();
   });
 
@@ -161,7 +168,6 @@
     const textToRun = (rawCommand ?? commandInput).trim();
     if (!textToRun || running) return;
 
-    const repoPath = $repoStore.currentPath;
     if (!repoPath) {
       validationError = "No repository open.";
       return;
@@ -299,7 +305,7 @@
       <Terminal size={16} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
       <span class="text-textMuted font-mono truncate max-w-md">
-        {$repoStore.currentPath ?? "No repository"}
+        {repoPath ?? "No repository"}
       </span>
     </div>
     <div class="flex items-center gap-2">
@@ -308,7 +314,7 @@
           type="button"
           aria-pressed={mode === "shell"}
           data-active={mode === "shell" ? "true" : "false"}
-          class="gp-seg-btn !text-[11px] !py-0.5"
+          class="gp-seg-btn text-[11px]! py-0.5!"
           onclick={() => (mode = "shell")}
           title="A real interactive shell in this repository"
         >
@@ -318,7 +324,7 @@
           type="button"
           aria-pressed={mode === "console"}
           data-active={mode === "console" ? "true" : "false"}
-          class="gp-seg-btn !text-[11px] !py-0.5"
+          class="gp-seg-btn text-[11px]! py-0.5!"
           onclick={() => (mode = "console")}
           title="Run single commands with capped output and per-run policy verdicts"
         >
@@ -340,7 +346,7 @@
         <button
           type="button"
           onclick={clearOutput}
-          class="gp-btn !py-1"
+          class="gp-btn py-1!"
           title="Clear terminal output"
         >
           <Trash2 size={12} />
@@ -378,7 +384,7 @@
             type="button"
             role="tab"
             aria-selected={tab.id === tabState.activeId}
-            class="max-w-[14rem] truncate"
+            class="max-w-56 truncate"
             onclick={() => selectTab(tab.id)}
             title={`${launcherLabel(tab.launcher)} — ${tabLabel(tab)}`}
           >
@@ -427,7 +433,7 @@
       {:else if tabState.tabs.length === 0}
         <div class="h-full flex flex-col items-center justify-center gap-3 text-textMuted text-xs">
           <span>No sessions open.</span>
-          <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={() => newTab("shell")}>
+          <button type="button" class="gp-btn py-1! text-[11px]!" onclick={() => newTab("shell")}>
             <SquareTerminal size={12} /> New shell
           </button>
         </div>
@@ -463,7 +469,7 @@
   >
     {#if executions.length === 0}
       <div class="flex flex-col items-center justify-center h-full max-w-lg mx-auto text-center space-y-4 text-textMuted font-sans">
-        <div class="p-3 rounded-2xl bg-surface border border-border shadow-sm text-accent">
+        <div class="p-3 rounded-2xl bg-surface border border-border shadow-xs text-accent">
           <Terminal size={28} />
         </div>
           <div>
@@ -492,7 +498,7 @@
       </div>
     {:else}
       {#each executions as entry (entry.id)}
-        <div class="rounded-xl border border-border/70 bg-surface/80 shadow-sm overflow-hidden font-mono">
+        <div class="rounded-xl border border-border/70 bg-surface/80 shadow-xs overflow-hidden font-mono">
           <!-- Command line header -->
           <div class="px-3 py-1.5 bg-surface border-b border-border/50 gp-section-edge flex items-center justify-between gap-2 text-xs">
             <div class="flex items-center gap-2 min-w-0">
@@ -620,14 +626,14 @@
           type="text"
           placeholder="Enter command (e.g. git status, npm test, cargo update)..."
           disabled={running}
-          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none disabled:opacity-50"
+          class="flex-1 bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden disabled:opacity-50"
         />
       </div>
       <button
         type="button"
         onclick={() => void execute()}
         disabled={running || !commandInput.trim()}
-        class="gp-btn-primary !px-4 !py-2 shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+        class="gp-btn-primary px-4! py-2! shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
       >
         {#if running}
           <LoaderCircle size={14} class="animate-spin" />

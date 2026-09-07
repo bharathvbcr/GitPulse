@@ -70,6 +70,21 @@ export interface CiLocalReport {
    * failed".
    */
   not_recorded_reason: string;
+  /**
+   * How test steps were scoped. A fail-closed full suite must never read as
+   * "affected tests passed".
+   */
+  test_scope?: CiTestScope;
+}
+
+/** How CI:local scoped its test steps for one run. */
+export interface CiTestScope {
+  /** `affected` when path-filtered; `full_suite` otherwise. */
+  mode: string;
+  reason: string;
+  seeds: string[];
+  test_files: string[];
+  fail_closed: boolean;
 }
 
 /**

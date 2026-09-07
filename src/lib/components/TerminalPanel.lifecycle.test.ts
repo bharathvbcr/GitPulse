@@ -37,15 +37,38 @@ describe("TerminalPanel lifecycle hygiene", () => {
 });
 
 describe("terminal repository boundary", () => {
-  it("is App's key on the current repository path", () => {
-    // The panel no longer carries a repo-keyed teardown effect, so this is
-    // the single thing that ends every session on a repo switch. If the key
-    // moves inside the dock, shells would survive into the wrong repository
-    // and keep running commands against a path the user has left.
-    const keyIdx = app.indexOf("{#key $repoStore.currentPath}");
-    expect(keyIdx).toBeGreaterThan(-1);
+  it("hosts the dock outside every currentPath key so a repo tab switch cannot kill the shell", () => {
+    // Git UI still remounts per repository; the PTY must not. Nested keys
+    // would make "the next {/key}" the wrong closer — these keys are
+    // sequential on purpose.
+    const key = "{#key $repoStore.currentPath}";
+    const close = "{/key}";
     const dockIdx = app.indexOf("<TerminalDock");
-    expect(dockIdx).toBeGreaterThan(keyIdx);
-    expect(app.indexOf("{/key}")).toBeGreaterThan(dockIdx);
+    expect(dockIdx).toBeGreaterThan(-1);
+    expect(app.split(key).length - 1).toBeGreaterThanOrEqual(2);
+
+    let from = 0;
+    let keys = 0;
+    while (from < app.length) {
+      const start = app.indexOf(key, from);
+      if (start === -1) break;
+      const end = app.indexOf(close, start + key.length);
+      expect(end).toBeGreaterThan(start);
+      expect(
+        dockIdx < start || dockIdx > end,
+        "TerminalDock sits inside {#key $repoStore.currentPath}, which remounts and kills the PTY on a tab switch",
+      ).toBe(true);
+      keys += 1;
+      from = end + close.length;
+    }
+    expect(keys).toBeGreaterThanOrEqual(2);
+  });
+
+  it("still remounts the git UI when the repository tab changes", () => {
+    // The dock moved out of the key; Sidebar and the view column must stay
+    // inside one, or a switch would leak the previous repo's graph/diff into
+    // the next worktree.
+    expect(app).toMatch(/\{#key \$repoStore\.currentPath\}[\s\S]*<Sidebar/);
+    expect(app).toMatch(/\{#key \$repoStore\.currentPath\}[\s\S]*gp-view/);
   });
 });

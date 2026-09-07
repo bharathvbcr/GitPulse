@@ -44,4 +44,19 @@ describe("CommitComposer", () => {
   it("disables commit when conflicts are present", () => {
     expect(source).toContain("conflictedCount > 0");
   });
+
+  it("previews staged edits via the shared codeintel preview store", () => {
+    expect(source).toContain("previewStore.refresh");
+    expect(source).toContain("What this commit breaks");
+    expect(source).toContain("parse=");
+    expect(source).toContain("bodies_not_compared=");
+    expect(source).toContain("walk_incomplete");
+    expect(source).toContain('data-testid="commit-preview-breaks"');
+  });
+
+  it("composes staged blast radius with layered impact (no min_rung)", () => {
+    expect(source).toContain("getImpactLayeredMany");
+    expect(source).toContain("BlastRadiusPanel");
+    expect(source).not.toContain("minRung");
+  });
 });

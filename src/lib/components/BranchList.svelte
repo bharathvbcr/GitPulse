@@ -62,7 +62,7 @@
     Trash2,
     Upload,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
 
   const FILTER_DEBOUNCE_MS = 80;
   // First-paint estimates for the context menu before the portaled node
@@ -799,7 +799,7 @@
         <span class="text-[10px] font-mono text-textMuted" title="{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}">+{branch.commits_ahead_of_base}</span>
       {/if}
       {#if branch.is_current}
-        <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-sm shrink-0"></span>
+        <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs shrink-0"></span>
       {/if}
       <button
         type="button"
@@ -906,7 +906,7 @@
      View). The rule models `tree` as non-interactive, which is wrong here;
      removing the tabindex would make the branch list keyboard-unreachable. -->
 <div
-  class="flex flex-col h-full focus:outline-none"
+  class="flex flex-col h-full focus:outline-hidden"
   role="tree"
   aria-label="Branches"
   tabindex="0"
@@ -979,14 +979,14 @@
 
   <!-- Search Box -->
   <div class="px-1 {gapBand}">
-    <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-2 py-1.5 focus-within:border-accent/60 focus-within:shadow-[var(--ring-focus)] transition-all duration-150">
+    <div class="flex items-center gap-1 bg-background border border-border/80 rounded-full px-2 py-1.5 focus-within:border-accent/60 focus-within:shadow-(--ring-focus) transition-all duration-150">
       <Search size={11} class="text-textMuted shrink-0" />
       <input
         type="text"
         bind:value={query}
         oninput={(e) => applyFilter(e.currentTarget.value)}
         placeholder="Filter branches…"
-        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none"
+        class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
       />
       {#if query}
         <button
@@ -1066,7 +1066,7 @@
       <input
         bind:value={createName}
         placeholder="feat/name"
-        class="flex-1 min-w-0 bg-background border border-border/80 rounded-full px-2.5 py-1 text-[11px] text-textPrimary focus:outline-none focus:border-accent/60 font-mono transition-colors"
+        class="flex-1 min-w-0 bg-background border border-border/80 rounded-full px-2.5 py-1 text-[11px] text-textPrimary focus:outline-hidden focus:border-accent/60 font-mono transition-colors"
       />
       <button
         type="button"
@@ -1078,7 +1078,7 @@
       >
         <Sparkles size={12} class={suggesting ? "animate-pulse text-accent" : ""} />
       </button>
-      <button type="submit" class="gp-btn-primary !px-2 !py-0.5 !text-[10px]">Create</button>
+      <button type="submit" class="gp-btn-primary px-2! py-0.5! text-[10px]!">Create</button>
     </form>
   {/if}
 
@@ -1130,7 +1130,7 @@
   <div
     bind:this={menuEl}
     use:portal={"body"}
-    class="fixed z-50 min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-none"
+    class="fixed z-50 min-w-44 gp-menu gp-pop text-xs text-textPrimary focus:outline-hidden"
     style="left: {menuPos.left}px; top: {menuPos.top}px"
     role="menu"
     aria-orientation="vertical"

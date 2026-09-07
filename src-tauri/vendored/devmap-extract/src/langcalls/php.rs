@@ -147,9 +147,10 @@ fn php_callee_name_node<'tree>(
     match target.kind() {
         "name" => Some((target, None)),
         "qualified_name" => {
-            let name_node = (0..target.named_child_count())
-                .filter_map(|index| target.named_child(index))
-                .next_back()
+            let mut name_cursor = target.walk();
+            let name_node = target
+                .named_children(&mut name_cursor)
+                .last()
                 .filter(|last| last.kind() == "name")?;
             // The grammar labels every leading token `prefix`, separators
             // included, so `child_by_field_name` hands back the `\` rather
@@ -157,8 +158,9 @@ fn php_callee_name_node<'tree>(
             // `namespace_name`, and a call qualified only by a leading `\`
             // (`\strlen()`) has none, which is the right answer: the root
             // namespace qualifies nothing.
-            let namespace = (0..target.named_child_count())
-                .filter_map(|index| target.named_child(index))
+            let mut namespace_cursor = target.walk();
+            let namespace = target
+                .named_children(&mut namespace_cursor)
                 .find(|child| child.kind() == "namespace_name")
                 .map(|prefix| get_node_text(prefix, source))
                 .filter(|text| !text.is_empty());
@@ -178,9 +180,9 @@ fn php_callee_name_node<'tree>(
 /// dispatch key every symbol and type-method lookup is stored under.
 fn php_scope_expr(scope: Node, source: &str) -> Option<String> {
     let text = match scope.kind() {
-        "qualified_name" => (0..scope.named_child_count())
-            .filter_map(|index| scope.named_child(index))
-            .next_back()
+        "qualified_name" => scope
+            .named_children(&mut scope.walk())
+            .last()
             .filter(|last| last.kind() == "name")
             .map(|last| get_node_text(last, source))?,
         _ => get_node_text(scope, source),
@@ -190,7 +192,7 @@ fn php_scope_expr(scope: Node, source: &str) -> Option<String> {
 
 /// The variable receiving this call's value, when the grammar proves one.
 fn php_assigned_binding(node: Node, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    let parent = crate::treesitter::bounded_parent(node)?;
     if parent.kind() != "assignment_expression" {
         return None;
     }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { KnowledgeReport } from "../../pulse/types";
-  import { Users, AlertTriangle, ShieldCheck, FileWarning, RefreshCw } from "lucide-svelte";
+  import { Users, AlertTriangle, ShieldCheck, FileWarning, RefreshCw } from "@lucide/svelte";
 
   let {
     knowledge = null,
@@ -27,7 +27,7 @@
   }
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col gap-4">
+<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
   <!-- Header -->
   <div class="flex items-center justify-between border-b border-border/40 pb-3">
     <div>
@@ -61,7 +61,7 @@
   {:else if error && !knowledge}
     <div class="py-8 px-4 text-center text-xs flex flex-col items-center gap-2">
       <span class="text-rose-400 font-medium">Blame scan failed — this is not a bus factor of zero.</span>
-      <span class="font-mono text-[11px] text-textMuted break-words max-w-lg">{error}</span>
+      <span class="font-mono text-[11px] text-textMuted wrap-break-word max-w-lg">{error}</span>
     </div>
   {:else if !knowledge || knowledge.scanned_files === 0}
     <div class="py-8 text-center text-textMuted text-xs">

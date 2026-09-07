@@ -216,6 +216,10 @@
           available: true, cli_present: true, is_github_remote: true,
           slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
         }),
+        cmd_github_code_scanning_alerts: () => ({
+          available: true, cli_present: true, is_github_remote: true,
+          slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
+        }),
         cmd_list_branches: () => [], cmd_get_status: () => [],
         // Complete TagList, per src/lib/branches/types.ts. A bare array here is
         // the retired Vec<TagInfo> shape, which parseTagList treats as a FAILED
@@ -315,6 +319,7 @@
       const { mount, unmount } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
       const { locMetric, coverageMetric, storageMetric } = await import("../src/lib/metrics/repoMetrics.ts");
+      const { pickNamedFunction } = await import("../src/lib/stress/pickNamedFunction.ts");
 
       const LOADERS = {
         PulseView: () => import("../src/lib/components/pulse/PulseView.svelte"),
@@ -326,7 +331,7 @@
         ManviOpsPanel: () => import("../src/lib/components/ManviOpsPanel.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
       };
-      const Component = (await LOADERS[COMPONENT]()).default;
+      const Component = (await pickNamedFunction(LOADERS, COMPONENT, Object.keys(LOADERS))()).default;
 
       const repos = ALL_REPOS.slice(0, Math.max(1, TABS));
       for (const r of repos) await repoStore.openRepo(r, { activate: true });

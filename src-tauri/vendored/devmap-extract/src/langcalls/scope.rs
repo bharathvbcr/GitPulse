@@ -56,14 +56,14 @@ pub(crate) fn enclosing_emitted_symbol(
     lang: &str,
     file_symbol_name: &str,
 ) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
         // A declaration the emitter cannot name emits no symbol, so keep
         // walking rather than inventing one.
         if let Some(declaration) = crate::langdecl::declaration_of(lang, parent, source) {
             return Some(declaration.qualified(file_symbol_name));
         }
-        ancestor = parent.parent();
+        ancestor = crate::treesitter::bounded_parent(parent);
     }
     None
 }
@@ -88,6 +88,26 @@ const MAX_RECEIVER_BYTES: usize = 96;
 /// resolves no better truncated than whole; both miss every lookup and land in
 /// the `uninferred_receiver` tier, which is where an unnameable receiver
 /// belongs.
+/// The largest index `<= index` that is a character boundary in `text`.
+///
+/// Slicing a byte window out of source text splits a multi-byte character
+/// whenever the window edge lands mid-character, and the two ways to write that
+/// slice fail differently: `&text[..end]` panics, while `text.get(..end)`
+/// returns `None`. The `.get()` form is the dangerous one, because the usual
+/// `.unwrap_or_default()` beside it turns "I could not read this" into an empty
+/// string that every subsequent question answers `false` for — a check that
+/// could not run, reporting what a check that ran and found nothing reports.
+///
+/// One owner because there were two copies of this loop and only one of them
+/// was reached by the code that needed it.
+pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 pub(crate) fn clamp_receiver(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -98,10 +118,7 @@ pub(crate) fn clamp_receiver(text: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     let head = trimmed.lines().next().unwrap_or(trimmed).trim_end();
-    let mut end = head.len().min(MAX_RECEIVER_BYTES);
-    while end > 0 && !head.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = floor_char_boundary(head, MAX_RECEIVER_BYTES);
     let clipped = &head[..end];
     if clipped.is_empty() {
         return None;

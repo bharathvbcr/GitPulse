@@ -23,7 +23,7 @@ import {
   observedTotal,
   skippedAudits,
 } from "./report";
-import type { DependabotReport, DepsHealthReport } from "./types";
+import type { CodeScanningReport, DependabotReport, DepsHealthReport } from "./types";
 
 function bareReport(over: Partial<DepsHealthReport> = {}): DepsHealthReport {
   return {
@@ -117,11 +117,38 @@ describe("health renderers survive hostile scanner output", () => {
           },
         ],
       };
-      expect(() => formatHealthReport(report, s, dependabot)).not.toThrow();
+      const codeScanning: CodeScanningReport = {
+        available: true,
+        cli_present: true,
+        is_github_remote: true,
+        slug: s,
+        truncated: true,
+        error: s,
+        alerts: [
+          {
+            number: 1,
+            rule_id: s,
+            rule_name: s,
+            severity: s,
+            state: s,
+            tool: s,
+            tool_version: s,
+            title: s,
+            path: s,
+            start_line: 0,
+            url: s,
+            dismissed_reason: s,
+            created_at: s,
+            updated_at: s,
+          },
+        ],
+      };
+      expect(() => formatHealthReport(report, s, dependabot, codeScanning)).not.toThrow();
       expect(() => skippedAudits(report)).not.toThrow();
       expect(() => normalizeSeverity(s)).not.toThrow();
       expect(() => severityClass(s)).not.toThrow();
       expect(() => dependabotBadgeClass(dependabot.alerts)).not.toThrow();
+      expect(() => dependabotBadgeClass(codeScanning.alerts)).not.toThrow();
       expect(() => updateKind(s, s)).not.toThrow();
     }
   });
@@ -133,7 +160,7 @@ describe("health renderers survive hostile scanner output", () => {
       expect(tiers.has(normalizeSeverity(s))).toBe(true);
     }
     // Casing must never change the rendered tier — the bug this suite guards.
-    for (const s of ["critical", "high", "medium", "moderate", "low", "info", "bogus"]) {
+    for (const s of ["critical", "high", "medium", "moderate", "low", "info", "error", "warning", "note", "none", "bogus"]) {
       expect(severityClass(s.toUpperCase())).toBe(severityClass(s));
       expect(dependabotBadgeClass([{ severity: s.toUpperCase() }])).toBe(
         dependabotBadgeClass([{ severity: s }]),

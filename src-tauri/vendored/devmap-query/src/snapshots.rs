@@ -26,6 +26,27 @@ pub struct SemanticSnapshot {
     pub truncated: bool,
 }
 
+/// Token cost of one symbol row in a snapshot.
+///
+/// Shared by the per-file packer and the multi-file one so a symbol costs the
+/// same wherever it is counted; two copies of this rate are how a response
+/// comes to report a token count it did not spend.
+const SNAPSHOT_SYMBOL_TOKENS: u32 = 12;
+
+/// Token cost of a snapshot's own header: its path, language and counts.
+const SNAPSHOT_HEADER_TOKENS: u32 = 12;
+
+/// Token cost of one file's snapshot: its header plus the symbol rows it
+/// actually carries.
+///
+/// A flat per-file rate — which this was — charges a snapshot holding 160
+/// symbols the same as one holding none, so `tokens_used` stops describing the
+/// payload it is supposed to bound.
+fn snapshot_tokens(snapshot: &SemanticSnapshot) -> u32 {
+    let rows = u32::try_from(snapshot.symbols.len()).unwrap_or(u32::MAX);
+    SNAPSHOT_HEADER_TOKENS.saturating_add(rows.saturating_mul(SNAPSHOT_SYMBOL_TOKENS))
+}
+
 fn is_public_symbol(sym: &ExtractedSymbol, ext: &Extraction) -> bool {
     match ext.language.as_str() {
         "python" => !sym.name.starts_with('_'),
@@ -61,7 +82,8 @@ pub fn semantic_snapshot_for_file(
         });
     }
     symbols.sort_by(|a, b| a.name.cmp(&b.name));
-    let resp: Response<SemanticSnapshotSymbol> = budget_take(symbols, token_budget, |_| 12);
+    let resp: Response<SemanticSnapshotSymbol> =
+        budget_take(symbols, token_budget, |_| SNAPSHOT_SYMBOL_TOKENS);
     SemanticSnapshot {
         file_path: ext.file_path.clone(),
         language: ext.language.clone(),
@@ -86,15 +108,31 @@ pub fn semantic_snapshots(
     }
     out.sort_by(|a, b| a.file_path.cmp(&b.file_path));
     let total = out.len() as u32;
-    let resp = budget_take(out, req.token_budget.saturating_mul(10), |_| 50);
+    // The requested budget, not a multiple of it. This took
+    // `token_budget * 10` and then reported the tokens it spent verbatim, so a
+    // 2,000-token request could answer `tokens_used: 20000` — and
+    // `DevMapClient._budgeted` raises on any response over its budget, which
+    // turned a large answer into a client-side error rather than a truncated
+    // one.
+    let resp = budget_take(out, req.token_budget, snapshot_tokens);
+    let hidden = total.saturating_sub(resp.shown);
     Response {
         total,
         shown: resp.shown,
-        hidden: total.saturating_sub(resp.shown),
-        truncated: resp.truncated || resp.shown < total,
+        hidden,
+        // `truncated` means exactly "something was withheld". Deriving it from
+        // `hidden` keeps the flag and the count from ever disagreeing.
+        truncated: hidden > 0,
         tokens_used: resp.tokens_used,
         items: resp.items,
         resolution: resp.resolution,
+        walk_incomplete: None,
+        rungs: None,
+        // A snapshot re-frames one answer's counters; it does not produce a
+        // dead-code answer, so it carries neither cluster field.
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 
@@ -116,6 +154,8 @@ mod tests {
             docstring: None,
             signature: None,
             parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
         }
     }
 

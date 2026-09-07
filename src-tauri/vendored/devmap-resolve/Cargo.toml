@@ -2,9 +2,14 @@
 name = "devmap-resolve"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "Call and import resolution into a defended edge graph"
 
 [dependencies]
+# Already a workspace dependency built for devmap-extract and devmap-store, so
+# no new crate enters the tree; resolution is the last serial CPU phase.
+rayon = { version = "1.10" }
 devmap-extract = { path = "../devmap-extract", default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
 
@@ -13,3 +18,87 @@ default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's tests
+# did not compile in it: every fixture here is built by `devmap_extract::
+# extract_file`, which is `#[cfg(feature = "parse")]`. One unresolved import
+# fails a whole target, so the command returned a build error rather than
+# results — which reads as "not meant to be tested", and is how it survived.
+#
+# `required-features` skips these when `parse` is off instead of failing the
+# build. The inline tests are gated the same way, per fn rather than per module,
+# so the 20 that need no grammar still run in the feature-off configuration.
+
+[[test]]
+name = "adversarial_resolve"
+required-features = ["parse"]
+
+[[test]]
+name = "audit_regressions"
+required-features = ["parse"]
+
+[[test]]
+name = "embedded_script_families"
+required-features = ["parse"]
+
+[[test]]
+name = "parallel_determinism"
+required-features = ["parse"]
+
+[[test]]
+name = "primary_languages"
+required-features = ["parse"]
+
+[[test]]
+name = "test_phase3_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_honesty"
+required-features = ["parse"]
+
+[[test]]
+name = "import_paths_resolve_to_real_files"
+required-features = ["parse"]
+
+[[test]]
+name = "reexport_chains"
+required-features = ["parse"]
+
+[[test]]
+name = "type_position_classification"
+required-features = ["parse"]
+
+[[test]]
+name = "rust_module_paths"
+required-features = ["parse"]
+
+[[test]]
+name = "implicit_receiver_dispatch"
+required-features = ["parse"]
+
+[[test]]
+name = "qualified_module_paths"
+required-features = ["parse"]
+
+[[test]]
+name = "every_site_is_counted_once"
+required-features = ["parse"]
+
+[[test]]
+name = "go_package_scope"
+required-features = ["parse"]
+
+[[test]]
+name = "rust_self_type"
+required-features = ["parse"]
+
+[[test]]
+name = "implicit_receiver_reference"
+required-features = ["parse"]
+
+[[test]]
+name = "host_global_objects"
+required-features = ["parse"]

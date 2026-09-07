@@ -8,7 +8,7 @@
    * gutter's layout math) wins over DOM measurement; everyone else is
    * observed.
    */
-  import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from "lucide-svelte";
+  import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from "@lucide/svelte";
   import {
     EMPTY_OVERFLOW_HINT,
     observeOverflow,

@@ -34,7 +34,7 @@
   id={section ? panelId(view, section) : undefined}
   aria-labelledby={section ? tabId(view, section) : undefined}
   tabindex="0"
-  class="flex-1 flex flex-col min-h-0 focus:outline-none {className}"
+  class="flex-1 flex flex-col min-h-0 focus:outline-hidden {className}"
 >
   {@render children()}
 </div>

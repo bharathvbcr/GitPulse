@@ -64,8 +64,10 @@ describe("light-theme contrast contract", () => {
   });
 
   it("removes opacity from light-theme semantic text utilities", () => {
-    expect(css).toContain('html.light :where([class~="text-textMuted/40"]');
-    expect(css).toContain('[class~="text-accent/80"]');
-    expect(css).toContain('[class~="text-amber-400/80"]');
+    // Quote style and wrapping are formatter output; the class tokens are
+    // the contract. Tailwind 4's upgrade pretty-prints these :where() lists.
+    expect(css).toMatch(/html\.light\s*:where\([\s\S]*?\[class~=["']text-textMuted\/40["']\]/);
+    expect(css).toMatch(/\[class~=["']text-accent\/80["']\]/);
+    expect(css).toMatch(/\[class~=["']text-amber-400\/80["']\]/);
   });
 });

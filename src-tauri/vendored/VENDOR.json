@@ -7,7 +7,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-glob",
-        "commit": "1778214be41d8b14ae46752382bb69fddc8d326f"
+        "commit": "6dbac091cf23c5ca5a2451f03e8ac85cdcd209d2"
       },
       "omitted": [
         "tests/",
@@ -30,7 +30,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-store",
-        "commit": "1778214be41d8b14ae46752382bb69fddc8d326f"
+        "commit": "6dbac091cf23c5ca5a2451f03e8ac85cdcd209d2"
       },
       "omitted": [
         "tests/",
@@ -44,7 +44,7 @@
       ],
       "files": {
         "Cargo.toml": "c13a3bf8df510f2ef3a84ccf577059210c50e63cad425fcf324db96459a8aebb",
-        "src/bin/dcstore.rs": "fe1e46f6e1e04abf5ea3576cb1e5ccb42e56143b9ff5b6ff2bc0189bc1b095bf",
+        "src/bin/dcstore.rs": "de410a3deed09c7587d1e8d7cc3cb74fb246cd0726bd10d6f165db69443821a7",
         "src/json.rs": "00fad17a5c902c59eafce74ca45c8bd68859ee898bbeb898854cded0a5d6f2ea",
         "src/lib.rs": "a619c0a08a2594b6f91583f363e0f38e5a37c72a5e7928505d07a65ed1dcd69a",
         "src/schema.rs": "bca17c5cf94e26392f6d6ed9e7090c092a8fb27d579da29d579ef62f7d5cb8d7"
@@ -56,7 +56,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-verify",
-        "commit": "1778214be41d8b14ae46752382bb69fddc8d326f"
+        "commit": "6dbac091cf23c5ca5a2451f03e8ac85cdcd209d2"
       },
       "omitted": [
         "tests/",
@@ -73,7 +73,7 @@
         "src/bin/dcverify.rs": "2a1eaf08d2d654250cea9792efa9336b20bf0e827ab906b5df068ebb59b89ae2",
         "src/coverage.rs": "b6c99639a33041662db25956193f62ca3dee94480a55762e3012e94bfc1d611a",
         "src/lib.rs": "73bd856ad1db1147ca023bcd1cd4b6496c80347257ba3f40bd43cc335523a17b",
-        "src/rigor.rs": "e04050da723c42044517af8e025e8e0906bd933c037cac9995d6b6eedd8f7523"
+        "src/rigor.rs": "5630c68089b70f2e10b5e8b4ea19c80ab5b760bd584a2044481cfd3adc729e33"
       }
     },
     {
@@ -82,7 +82,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-analyze",
-        "commit": "c8064f9c990c3d090c4ddcae8a07be7c046f022f"
+        "commit": "1a76a577d7ba838b21329f36b6c8e1a05af956de"
       },
       "omitted": [
         "tests/",
@@ -91,19 +91,28 @@
       "rewrites": [
         "package.version = \"0.1.0\"",
         "package.edition = \"2021\"",
-        "package.license = \"MIT\"",
+        "package.license = \"Apache-2.0\"",
+        "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
         "dependencies.serde from the workspace",
         "dependencies.serde_json from the workspace",
-        "dependencies.anyhow from the workspace"
+        "dependencies.anyhow from the workspace",
+        "dependencies.tree-sitter from the workspace",
+        "dependencies.tree-sitter-python from the workspace"
       ],
       "files": {
-        "Cargo.toml": "fda301bfefdc46e63133a27ed8db829f5b9457cc86509e3ef30223d17fa3fdd4",
-        "src/clustering.rs": "5d7d010920a620e3a45632827f65c40fee73f2be17927b5601eb9c568d284ec9",
-        "src/lib.rs": "eeaf60a87393d728bc36d8003fc1bdb8550ac934107cb1803e284e64e76d6d94",
-        "src/liveness.rs": "d1d76f8450cf7f3002407f60f28a536a3abd2e2722d41b3380cdb5ff26e015b0",
-        "src/model.rs": "85959a0e8919d0037a9677e8d20dd4e3afbc10c1c2bbee52c61d2a64cb68bd46",
-        "src/pdg.rs": "10a9b0b7d6a7bedbdde2302237d6b6ac4f54f484c7ff93f0381dc1ed61556c09",
-        "src/traversal.rs": "cd9da8de1b36eed4798c1a5330ae429df35272ef2f6a52b4aceae4de5a47061d"
+        "Cargo.toml": "df538d84a011aa636298bf863d688b4de80a65dadf2b6aab6848299a72dac6a8",
+        "src/.devcouncil/logs/devcouncil.log": "38649082a96e96e5fcb020ac37d5a3197cd711dc03eb97c0eb8a9a6083b863ca",
+        "src/clones.rs": "80fcfe9b880b13b1016f434cb14e6a16ed949751987945119051f3fb6128dff4",
+        "src/clustering.rs": "a154f73f80f7b95838207aeaf4f3a903a473bb90cf2330ce0013e53a79b13b6c",
+        "src/dead_clusters.rs": "02f9fb7ccca406602ca082e7dce6d6f08b36cbe1965e6d00d336b6594ff75bfd",
+        "src/graph_intel.rs": "5771edd83891421a06916e04f352d6bc0e74312dc8817ef46f8fce5f31a6cad9",
+        "src/lib.rs": "032fff9d6d58012f0823a472f2227ec41d1a76f0efa30bdb65d2390a83dfb39b",
+        "src/liveness.rs": "506e80e8515a069da9ec3fb9544dcb9a19c7831de14e8962b36f4ec7ce04ec98",
+        "src/model.rs": "1f5c1a19c4341ff540e56054cad9ddfe4ed1cec4ec83015d05cc1c76e51fb7b8",
+        "src/pdg.rs": "412e148c3837acdded9f6e467347b877afed88fc19f2978ac28936b9a49cc786",
+        "src/pdgsrc.rs": "ca5d3dea9cb36a8d4a0e162b15a3b28ec0d419f96e0779e62df878e95fa8902e",
+        "src/resolution_rate.rs": "26acf697f690a8d10a9326ac819eef6f56eb6d4ff0413681013d5656406c747a",
+        "src/traversal.rs": "36fc0548b7a2e992a34a4734e0b105b25f71fd78948a154146e4835be4a4198d"
       }
     },
     {
@@ -112,7 +121,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "c8064f9c990c3d090c4ddcae8a07be7c046f022f"
+        "commit": "1a76a577d7ba838b21329f36b6c8e1a05af956de"
       },
       "omitted": [
         "tests/",
@@ -121,11 +130,13 @@
       "rewrites": [
         "package.version = \"0.1.0\"",
         "package.edition = \"2021\"",
-        "package.license = \"MIT\"",
+        "package.license = \"Apache-2.0\"",
+        "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
         "dependencies.serde from the workspace",
         "dependencies.serde_json from the workspace",
         "dependencies.rayon from the workspace",
         "dependencies.regex from the workspace",
+        "dependencies.toml from the workspace",
         "dependencies.anyhow from the workspace",
         "dependencies.tree-sitter from the workspace",
         "dependencies.tree-sitter-language from the workspace",
@@ -159,37 +170,73 @@
         "dependencies.tree-sitter-kotlin-ng from the workspace",
         "dependencies.tree-sitter-svelte-ng from the workspace",
         "dependencies.tree-sitter-astro-next from the workspace",
-        "dependencies.ignore from the workspace"
+        "dependencies.ignore from the workspace",
+        "target.'cfg(unix)'.dependencies.libc from the workspace"
       ],
       "files": {
-        "Cargo.toml": "36ca62f5de4a2a886a1364a4cb18f267358e3591c93a78aa7ffe7f77a33296fe",
+        "Cargo.toml": "32cfab53c343b143ce39b456eeca2c959ad665c285ba8c082bc355bcc0434e3d",
         "build.rs": "2dc890341f53d5a38fae8a64d35f37edda19e3d61d23e27fac5ff266b3587a92",
-        "src/cache.rs": "ddb7710652f55d72e4ebb349cbef6022fb6afd9fb5bd22b7c07fee517a09f8fe",
-        "src/frameworks.rs": "e1e146c3b42228127fba6e39e1887c1967dc3ca9c21fdf460a981ebe4b13bbc0",
-        "src/gomod.rs": "534714a8b51014e0b436c7ed4bfeff62c8581f256d80d0c4f12790a410fcf41c",
+        "src/.devcouncil/logs/devcouncil.log": "929f7601bf99917657e04e84aee0b81568ad9b35c4fff3c377cb76c9d163c3c8",
+        "src/cache.rs": "12616974d9baed316102a6dc6fbeb60f57e2a8880e5a51afd3e9f532f726316a",
+        "src/clonesig.rs": "11afa842f06228636d7cc0271e83925347108ed44a8c70502dfb480e47a0ea43",
+        "src/embedded.rs": "9a37abb2a6bd8a3cf5f22ce8eb6174d53c2e38bc6b19b0a7821a287f92bb2edb",
+        "src/fallback.rs": "35c7bb1dde061964e8ecfb92fae823ea191abcba7a20c0a5f38dd24a14635e62",
+        "src/frameworks.rs": "1899508a57f6b4a06c01fc9b9852ce5a667573460619e9ac18582f97a3b4d4e0",
+        "src/gomod.rs": "21b120ec0bfd4bdc4c5bb8cf34d0058537bb03cfcc7b1df65741b6b311771a56",
+        "src/heritage.rs": "6f4682ef7cb0d5e5e57aa6543df57a23ab4d7133288968fb474993496b7b4ff0",
         "src/langcalls/csharp.rs": "cccad4267800c472c1a43bd06b460a5c42e3143d1ee97f0ec8329ebbc531a05c",
-        "src/langcalls/dart.rs": "756f3b64afd32d7de50b2e6f7cea3bd466f1d68d52e4ae22969c7b428ee14fd6",
+        "src/langcalls/dart.rs": "bbd82289bd96b106d4ccb361453f61deed1861ab69084a8cc7083cd1df4025b0",
+        "src/langcalls/erlang.rs": "da58e9561d228129a2680361138ee2246b108fc2d98d719e57dc9a80c9b96ede",
         "src/langcalls/java.rs": "383a8f8475c6cb6836b805a4627fb1aa32e2326b624555370d28b13d0d2748ec",
-        "src/langcalls/jvm_dotnet.rs": "c5db1bb23d3d54970ff0ced646c23428f1daefd8138a3967d5dca304e0d56eb9",
+        "src/langcalls/jvm_dotnet.rs": "5fca9319964a1b2f8ba0a1fee10d51582d14f9db9ebdb39e6c2bb09749fe5e40",
         "src/langcalls/kotlin.rs": "8943edf81b622284edc7a9b9685f9efbcc74c7c77380bb993477ed61ab071b92",
-        "src/langcalls/lua.rs": "fc16543a41c4e6e7acc0cecb658fbe1beb7d2cd03ca083ed0be4ccd7d7a683f0",
-        "src/langcalls/mod.rs": "82195dc81439b2c22a7caac6adb8556bd962a12fbe2a075b143f310b3a37a0e2",
-        "src/langcalls/php.rs": "c8ddcf8626f7cffcca34172a1beab8e8963816adf378a5fdbe2a46d306b90f4e",
+        "src/langcalls/lua.rs": "93c890e29a28a8184eb51cda87de695fb67784f86c5bfa5821ac87fc98f6ca63",
+        "src/langcalls/mod.rs": "5d2094cbe64e34fc7240c83eee598909dde0eacc2d178c02edb681d9b1a1c571",
+        "src/langcalls/nix.rs": "6441077a6a655ea3fa79583795403a54f0b5f3898aa3c0b7cd13ac123ee9e18a",
+        "src/langcalls/pascal.rs": "ec36f25e4c2d735e70adfa3e16b1b1afe18812bb4163ef54eaade222ea30c664",
+        "src/langcalls/php.rs": "b5ea93c7488a035855a6bb755c9d493209dac9807bf037be38ebd177d7b9a09f",
         "src/langcalls/r.rs": "b7bc20a8d0913d050974dbd083c2c4c69d196c52407152427507926157b26c25",
-        "src/langcalls/ruby.rs": "200f51da12878f56259af3c118557c8d9f57088fe4aad0b5f78a90f608e07ad2",
-        "src/langcalls/scala.rs": "ec634749e288f97dde102d6eb56c12b76af4dbcff17bac5cc4d9692121a69084",
-        "src/langcalls/scope.rs": "0f6dd7c75b8e7f262ab94bd132cfc1b81964ad72f48f744547150f608b2320d6",
-        "src/langcalls/swift.rs": "5e4a2eeee520490ab2a8837754f6e8d4917320e8e953f3b860e84d70e287cf4a",
-        "src/langdecl/dart.rs": "4e3ed865253ef3be2c11646844501b1d3ff8dae69d6673e17eaeb797bb0d1bb2",
+        "src/langcalls/ruby.rs": "4f4517abed956efd85a387682ceaf1c5f0736e8ffd516cfe0d1c4e3c78117d2c",
+        "src/langcalls/scala.rs": "9ae4ecef4d5afbac2cfd45cb71f565fb0a554fc9e8496c99c2a1d5896b043332",
+        "src/langcalls/scope.rs": "0381759ba816a9166a3c541bf22a828c0ecc27ed93e73859979a090706845bb1",
+        "src/langcalls/shell.rs": "02d745e342e6fb38297fde16e1ec406f5305e6fca9cce0dfb9ae8db422a5f561",
+        "src/langcalls/solidity.rs": "cb31515fbd5be4a9235225a6479a000e494600b7f1f249716f7e52269c725c90",
+        "src/langcalls/sql.rs": "e4cd7539e4f30dfa540d7e9eb8439874cc1b2759d812db9dbf35af57138e68b2",
+        "src/langcalls/swift.rs": "3c4cff66cd51ce7d7a575d1644b928bdb0fac21764cbd0161ec263656a516d50",
+        "src/langdecl/dart.rs": "1fea3675cf743b5b34b82d61ae4e7e4048b7beb81a4b1d7267322e1e7b2d0b24",
+        "src/langdecl/erlang.rs": "1bc157e9c61ca49861f6918c0000c184fdde557474c78528779b0573d2a15d5b",
         "src/langdecl/kotlin.rs": "f29dcacbbc58394477841c75db42d5838853eb1f0af62574a186661190f7cb5f",
-        "src/langdecl/mod.rs": "4b9b46f85b0e263f12fed6b470b1464b35d80136ee5019fa8ddefb21a9cd6f1b",
-        "src/langdecl/r.rs": "a700e3d22b6710e9fecf99974a816d3acea5b4bc9228777b2d4f08a68b82185c",
-        "src/langdecl/swift.rs": "46a860fd879ef870dde3618ace363f869df71185930f03058ce3046a50ebbff3",
-        "src/languages.rs": "de20e42d7fa22204382efdba5f49a205044a6a888e86a68df93a9dd6e31de590",
-        "src/lib.rs": "568368826df7f872d229eb8fd393e021a9e19562f799c7cb7c2a07a24f3ae6cc",
-        "src/model.rs": "cd96a3330c7f37d2328d3a3d2de5f94036ad7239638083394da82c6797b87efc",
-        "src/treesitter.rs": "742ce3ee23459cc01e3089603d975980116d89613f547d6178fe247209620729",
-        "src/wiring.rs": "c69c8ce206dcc3dffe3a97c597e4bd3f3e44b82e01204a356a2b53be9f9b4434"
+        "src/langdecl/mod.rs": "dc496d0f3f4b735227be019418fe9918e25c28c50555e889c2a906760a238ab7",
+        "src/langdecl/nix.rs": "231cbbe0ed2ca5f5f1d0d72226e020376b1fc2f53a94454a8c2e3b01ce7f1e00",
+        "src/langdecl/pascal.rs": "61d44d89a6a13b17ddb53f03da3201865bd971b828c5b17ea4e0737013fc1c99",
+        "src/langdecl/r.rs": "3d6dff0b2432bae475c040665e790720890cd06f46568395612b9ee23340e5c4",
+        "src/langdecl/solidity.rs": "696df03a24f1856fdb1dbfbcbc8cb697b5ff999b19caa72e3b270eacf91ab98d",
+        "src/langdecl/swift.rs": "e52190522076b2d7d8c29f564c9a5fb782e9c79f79a3ae53a8eeb12fad7a4806",
+        "src/langimports/cfamily.rs": "6fa9ca24a0b800f1d6dd39b44fcb5b2ef410fdd5bde28e9677934f0f00c87a87",
+        "src/langimports/cfml.rs": "5a041aec5abb944a17d4f2d4830061f752e74ec01109c4f40dd355567042accd",
+        "src/langimports/dart.rs": "33e16116ffdab5597dc63990814826adafd1781b5d0228cca37137a3380c2a1b",
+        "src/langimports/erlang.rs": "a001f113f26308e898cc0d5f534d07d3ff116a29c2bf5884bac9ed904f37eb16",
+        "src/langimports/hcl.rs": "e20c0b2e34a929c5b919c22b5c646837289395530db364900165ec40e8eae82d",
+        "src/langimports/java.rs": "0d2db5bb5f21637c2e80f8253509aa874945ae84e93fc89d8f2d2dca7ea5857c",
+        "src/langimports/kotlin.rs": "61fcd06a28490eadbfdc3afaf179d3515c1796241e5b7c034608fa5a44f6563f",
+        "src/langimports/lua.rs": "3752222979ce4ed9f02c69c97f42b1311101efc8f8a06d26b42a11e2b222cb1b",
+        "src/langimports/mod.rs": "2302b92535c08d55264bb957e0e73d7fceb4d8e01e91c5b0e262f57a1bce12e8",
+        "src/langimports/nix.rs": "030efe5e8ed7891764d483cebfddafb6f294975fc66737a276bb470a2e5322c6",
+        "src/langimports/pascal.rs": "deb372d8766c19c8d8c73b98f9150f1ec741bdd23394066806bc92830da8fccb",
+        "src/langimports/php.rs": "b2dd2a45debff31a8dcac23e629b1fd8fb36688e0988c0e1df2c92db7ec6291c",
+        "src/langimports/r.rs": "dbbf366b0df0e5cf31487fdbcdea201a4e858bbed8c938f1479b5fe4130b2f08",
+        "src/langimports/ruby.rs": "d8a20501f0e9dcca12508bb56e1276c3c0388249d4de35442c01c14b11c4cbc0",
+        "src/langimports/rust.rs": "ef852e93e78b6ed5a9d292674782222049515b8f9b2be320d0a569f7e0d727fa",
+        "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
+        "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
+        "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
+        "src/lib.rs": "92d83f0157ba055ca704a0afef7c5bf0dd1a08bb8ea218c7d5a3990a787898d5",
+        "src/model.rs": "3dd367156906b2c5521999f312427e6bb169a59b262b7af346adbc0702fbd9e9",
+        "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
+        "src/paths.rs": "06688ac3493f464e8a3d594ab3c120cd92c7bdbac67ee2ad50fae1a724cecaeb",
+        "src/subprocess.rs": "0a6575cc0f667bf2f75be636e391397685a1e29c842df7b6e81954fb49092c60",
+        "src/treesitter.rs": "c1b5fc8b5e9b1326ca193db46229e29ecde966fae6b1e6c32ae8f6962f712c18",
+        "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
       }
     },
     {
@@ -198,7 +245,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "c8064f9c990c3d090c4ddcae8a07be7c046f022f"
+        "commit": "1a76a577d7ba838b21329f36b6c8e1a05af956de"
       },
       "omitted": [
         "tests/",
@@ -207,22 +254,42 @@
       "rewrites": [
         "package.version = \"0.1.0\"",
         "package.edition = \"2021\"",
-        "package.license = \"MIT\"",
+        "package.license = \"Apache-2.0\"",
+        "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
         "dependencies.serde from the workspace",
         "dependencies.serde_json from the workspace",
-        "dependencies.anyhow from the workspace"
+        "dependencies.anyhow from the workspace",
+        "dependencies.regex from the workspace",
+        "src/map_preview.rs: force-graph include_str retargeted to ../assets/force-graph.min.js.bundle (crate-local, rustfmt-stable)"
       ],
       "files": {
-        "Cargo.toml": "e19361bfc91a4f1a1d105e638bf22e9f8794601e728893a0ff13b6af66b8a3f7",
-        "src/artifacts.rs": "660d6f0b115244da9058e98ef4c2dfe91cc120aa8158ff175ae0455a6841e31b",
-        "src/code_graph.rs": "d42fe7db0fb6a1c52599ac2c7fdfa1b76654517ab32f0af3f3ca41ec9496140f",
-        "src/engine.rs": "725f567a717ef42bc1174854c57b0f6dff2bbe920b839826e05243b9ae91c04e",
+        "Cargo.toml": "2992848a14fa7fd3da096ea49eff99041f8579237c4cc6f90f6995c97ea2c4f0",
+        "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
+        "src/api_routes.rs": "3758344d1bd33fc3506df19d9d29f682ff5468b6af9abba68d723b5ba7926743",
+        "src/artifacts.rs": "070658cd837afbe63be0673d48153c9c44816abe0774018c7656a5ddff65aed2",
+        "src/ast.rs": "6ec0da5812f4036a78976a45b183ff8fb000f7b817403e352487034101d7a6f0",
+        "src/cancel.rs": "529599c39eb77c586f4cbea523676d39de0d4d0496b971f2f8814a6dcddac4cc",
+        "src/code_graph.rs": "0c6650916e7a1af7bb49ffd8dfc9dc3680e1db0ed5e9cd932ebe2ba24374e24c",
+        "src/cypher.rs": "b76a45dee1205833d2cb042c8d1e1ecc161675cf19a8fe0e1b62d2b62c9678d5",
+        "src/digest.rs": "400ce85d492added4723f5f0b01ffd858a2837bb77b3f4adf214ce0a9cb44fb1",
+        "src/engine.rs": "0ca26a510fa1cceeab6630af61201f1c28f0461909a61d77d98848882ee6dd49",
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
-        "src/lib.rs": "d6132f033025a630b8c3ce704d2e2f1f7444e640bd3c291295787841baa83dbe",
-        "src/manifest.rs": "5b8d2fa7a8d7f37378f81b94cb7f28db7e5f8d24f64a592faa9f7eb5e2158668",
-        "src/model.rs": "befcefb63cfdaa8a5286eed9f29e75d500c5cb9767b369e4f4e2c007557c7a95",
-        "src/query_match.rs": "45131a00b7a171c07251b266e16dd9f8b631c082c7b58f4acfc081b24c286afd",
-        "src/snapshots.rs": "ce19f05cef6c5157b2117e7aa83c42f8b9461db8b577b4ca7d62b32ef1468e3b"
+        "src/export.rs": "3bfb15986ff49dba6ebbf4af82d9050c34931e6397a04e2c8031aa2fcb4b529d",
+        "src/freshness.rs": "5492ea2bf9aaeb0c5a408c7a33f12f3c0c972beb3cda9ed08a53f4031de702c7",
+        "src/guides.rs": "8e3c74798a62f4079b3af2dbdce80c464ae1de783abd7808fe3b8a5b4ce11169",
+        "src/inventory.rs": "3d55ffbbfe2995367b08b9645427691563b119288f8f87fc71a6ed17adf3ae90",
+        "src/lib.rs": "e97ae4c0b6329fa96107c05259c85ef2244caf7d4f8a93c4cc674f946c94e9ca",
+        "src/linguist.rs": "08832b5a4215e7c3242f31af0672391ad9c33b25e1d050e7c365b11b3a418908",
+        "src/manifest.rs": "279fdb350bcaee24bddb29123192661d413802afd630eb5dafc06d9a73121437",
+        "src/map_preview.html": "fa44bf38aab2977ea6bb17392198ea2e6cf63478c0d58a2122b571269b618158",
+        "src/map_preview.rs": "47415fc5fc4330a0961a7342c29f736f1e1ddcf950d71ca4a78bfb16eadffed8",
+        "src/model.rs": "b6110fb77bdb2bbb1520533793c5479f6a75b5ac49249c5d4865a10f84fbe1d5",
+        "src/query_match.rs": "d3895702cdfac77fe87cfffb7f729555f7da5f20a762c58c7437fa92c51ca51d",
+        "src/rung.rs": "e962ef23a3dc51e7595bb0708bb6a132cf5bf3172f8c2b9b1050ffeaf0c7f243",
+        "src/semantic.rs": "bf045dad9afd1e87a50872983081db999575d9aae54ece304c2cd9c563fc38e4",
+        "src/snapshots.rs": "e16bf276eefe759e362d53fe39a97cc7e96b022756f7f7374b03a9d0591abc73",
+        "src/viz.rs": "59956c340b40c249bac8704897e1cd64821a54f301aee58390224873d0d0310d",
+        "src/workspace.rs": "a143523a44881f0f4589a38d8edf2d0ca676747b41f530a1cd9c5ca56ddb32ee"
       }
     },
     {
@@ -231,7 +298,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-resolve",
-        "commit": "c8064f9c990c3d090c4ddcae8a07be7c046f022f"
+        "commit": "1a76a577d7ba838b21329f36b6c8e1a05af956de"
       },
       "omitted": [
         "tests/",
@@ -240,15 +307,19 @@
       "rewrites": [
         "package.version = \"0.1.0\"",
         "package.edition = \"2021\"",
-        "package.license = \"MIT\"",
+        "package.license = \"Apache-2.0\"",
+        "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
+        "dependencies.rayon from the workspace",
         "dependencies.serde from the workspace"
       ],
       "files": {
-        "Cargo.toml": "29d052abbc83cd58eb41f6cd36e3fc6d1024ec591bc19b8dcf52802c42daaa8f",
-        "src/builtins.rs": "597ce740d9828d9383a8190e0cf34cb62121c51d7e1084d0d814801681179391",
-        "src/lib.rs": "8c2ad1a6834a8ecd758b06f7126cb7acc1674d247c2e3b7decdd545c1ab95675",
-        "src/model.rs": "11b1bded2c2ad7df4ed2aa2267fe16196cc8d8c6213d140408a4878bebe47531",
-        "src/resolver.rs": "d61a2a0b0dbe82e89abba95b023b5a03e363f7b451a04c45e629ed4a7e822de3"
+        "Cargo.toml": "6dea8b9dcd72d2ea7c23942a3ad1f8f8d5c027c6e8c40f9dbf2aa4b1a02f1eae",
+        "src/.devcouncil/logs/devcouncil.log": "003816edc9d5dc0bbed39cc71649ebfcf8943de9c563cc56f394f21a5accf712",
+        "src/builtins.rs": "de63c281b6949e5f45d73672ed7aa68c8f3b24ab531ffdf30253d8c21af25b90",
+        "src/importpath.rs": "27d476e5a9c2b0a2dc75b26ff875e0ed9087038b798997abc009a0ae8e604b16",
+        "src/lib.rs": "ad28406823b9fef01b30e881780561ae5557c9dc4a6315a71e97d9a7aaccd183",
+        "src/model.rs": "2fd415056ef71ba75f73f8d39cbc086bde081b5fc6925b3d0ee138bff9382b30",
+        "src/resolver.rs": "415b8af9a3c86060281b85e52f176a9a08c50bedbab98c778d0b2e0d57ba2f88"
       }
     },
     {
@@ -257,7 +328,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "c8064f9c990c3d090c4ddcae8a07be7c046f022f"
+        "commit": "1a76a577d7ba838b21329f36b6c8e1a05af956de"
       },
       "omitted": [
         "tests/",
@@ -266,7 +337,8 @@
       "rewrites": [
         "package.version = \"0.1.0\"",
         "package.edition = \"2021\"",
-        "package.license = \"MIT\"",
+        "package.license = \"Apache-2.0\"",
+        "package.repository = \"https://github.com/bharathvbcr/DevCouncil\"",
         "dependencies.rusqlite from the workspace",
         "dependencies.serde_json from the workspace",
         "dependencies.anyhow from the workspace",
@@ -274,11 +346,47 @@
         "dropped [dev-dependencies]"
       ],
       "files": {
-        "Cargo.toml": "7b64c0a4aa3df9eb1583553cdf72476da5749cb197d80a7b892c90f77feb8f33",
-        "src/db.rs": "11523ebde18979b9b83ab02aa15835289a26d6fb0887f3c18a44efe62293d120",
-        "src/extract_cache.rs": "9059ed4a3630f918eacfde896dba181c5f3c91b891edac161bd7d259a411e94e",
-        "src/lib.rs": "205e55efe8794105b40be723fecac382a8df65dbf141ac5bc3443a6ef4fdf8ba",
-        "src/schema.rs": "35f558ea4047cb67c2921935f88eb0c12e807d7d922356fd562cc7b0a7fa4229"
+        "Cargo.toml": "e89b2320eef92134fecee25bc366a7ae57bb6da49ae0843a877f7042ea20000a",
+        "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
+        "src/db.rs": "d33d4bb672bd3ce091e4d565230992b25d6fb9376d93f584aa26eb0eca8fa03f",
+        "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
+        "src/extract_cache.rs": "7cc1bc56e5c1abe5272d62245f2572070a5d33b4b7b982a621d848fcb74f95fa",
+        "src/lib.rs": "4192b8b3443865d7a65bda5980227cadd9772a058a71e6106e877845cef0fe48",
+        "src/schema.rs": "70730b88b19ee5de68e54bc7d337a8b822532a07cb2cc7c4eed4197e7474ddce"
+      }
+    },
+    {
+      "name": "markdev",
+      "origin": {
+        "repo": "markdev",
+        "root_env": "GITPULSE_MARKDEV_ROOT",
+        "path": "core",
+        "commit": "df281a507c2f5c9c6f1d6faed165c0ac2d6f5c41"
+      },
+      "omitted": [
+        "tests/",
+        "[dev-dependencies]"
+      ],
+      "rewrites": [
+        "dropped [dev-dependencies]"
+      ],
+      "files": {
+        "Cargo.toml": "7e674e5d0cd630cc47a0591f62beadd9023f9256eadb1454c28fada880efaf9e",
+        "build.rs": "b3da659a31dc522e93c00215c26e88d66476e3fc881d6fbc02298e6c97206a69",
+        "src/ffi.rs": "666fb3a20c7dfa65f2ec1bbebd5f0fce839dbab2e4903779c4e8965990303629",
+        "src/highlight/mod.rs": "280229e609fd6d6001c7fa5b268fc1beee0f3d28479188cda827027daedb1e4e",
+        "src/html.rs": "d92dcd8f5c4f82c8b9d7a8bed05c05e5ec16388094fb0eb65acfa804e1e0ba42",
+        "src/lib.rs": "cb2f3c18efa8f188a8d95ed9b625e852b282a1a213be24550f2983058848b681",
+        "src/md/incremental.rs": "251b970ea10a3fdc48e8d0441f63ec520fb89e926ab4ca10e03ded557b62e844",
+        "src/md/mod.rs": "f3887f3b044279affa7074fef6e563f603fdd6c9effb8f8c366c8bc6e354772d",
+        "src/md/model.rs": "e84a01e57cf30626ecb41e0e72eec56d02c27fa13aa39814a1ef25a29a56c423",
+        "src/md/parse.rs": "c19936995a85e77b841e379e04cf0de392e2b6bfbb2b86fcc118e5f80704b09e",
+        "src/vault/graph.rs": "ff122670715e44db032297881ca0719a5c000d2586ffb9bd0dd24d59b3043d50",
+        "src/vault/index.rs": "9143b1e95d3dbbb8e4505cb9e2bf5db0c0875c3290e0f9630f4b71cc1287910f",
+        "src/vault/mod.rs": "d30dfa9f66336986fbc3a6e51d650107a8b4b9a6dc793109b4482a09574aa19b",
+        "src/vault/note.rs": "bf4c7888a939c5416fdb6f7bca89de2534decd870a7b4809485cfc73eb431b40",
+        "src/vault/rename.rs": "efaac578ed2f921f88952cb9091efa0a01b3fae546e88377566609cdf74bf1bc",
+        "src/vault/search.rs": "d98ad7b98f7176d7116993b51a8f54f38d53153ea8bff41ccc51693872529c5c"
       }
     }
   ]

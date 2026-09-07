@@ -1,7 +1,7 @@
 <script lang="ts">
   import { computeLineChanges, computeLocTrend } from "../../pulse/metrics";
   import type { PulseCommitSummary, WeeklyLineBucket } from "../../pulse/types";
-  import { ArrowDown, ArrowUp, TrendingUp } from "lucide-svelte";
+  import { ArrowDown, ArrowUp, TrendingUp } from "@lucide/svelte";
 
   let {
     commits = [],
@@ -34,7 +34,7 @@
   const totalNet = $derived(totalAdditions - totalDeletions);
 </script>
 
-<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col gap-4">
+<div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
   <div class="flex items-center justify-between border-b border-border/50 pb-2.5">
     <div class="flex items-center gap-2">
       <TrendingUp size={15} class="text-accent shrink-0" />

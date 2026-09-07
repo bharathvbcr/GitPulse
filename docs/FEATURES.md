@@ -8,7 +8,7 @@ On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MA
 flowchart TD
     subgraph ViewGroup["The four views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Resolve · Remote · Stack · Policy"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame — two lenses on one file selection"]
+        Code["<b>Code</b> (<code>code</code>)<br/>Explorer · Blame · Map — file selection plus the code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph · Diff · Reflog — three lenses on one commit selection"]
         Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository"]
     end
@@ -59,12 +59,16 @@ how the branches stack, and what policy allows.
 - **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list, each carrying when it was last updated, and searchable by number, title, author or label.
 - **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
 - **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
-- **CI:Local Runner**: Runs full repository CI pipeline locally before pushing commits:
+- **CI:Local Runner**: Runs the repository CI pipeline locally before pushing commits. When a fresh
+  DevMap index can answer, test steps may be scoped to **affected test files** for the change set;
+  a stale map, incomplete walk, or unmatched seed **fails closed** to the full suite and says why —
+  the run badge never reads "affected tests passed" for a fail-closed full suite:
   ```mermaid
   flowchart LR
-      Manifests["Detect Manifests<br/>(package.json, Cargo.toml)"] --> Plan["Plan Step Matrix"]
+      Manifests["Detect Manifests<br/>(package.json, Cargo.toml)"] --> Scope["Affected tests or full suite"]
+      Scope --> Plan["Plan Step Matrix"]
       Plan --> Exec["Sequential Execution<br/>(Svelte Check → Tests → Clippy → Cargo Test)"]
-      Exec --> Report["Honest Accounting<br/>(Passed / Failed / Skipped)"]
+      Exec --> Report["Honest Accounting<br/>(Passed / Failed / Skipped · scope named)"]
   ```
 
 ### 1.4 Stack
@@ -86,28 +90,26 @@ how the branches stack, and what policy allows.
 
 ## 2. Code (`code`)
 
-Two lenses on one subject — a file — switched by the segmented control in the
-view's own header, which also names the file both sections are reading.
-Explorer and Blame were two top-level views keyed off the same
-`selectedFilePath`, and the split showed: Blame carried its own explorer rail
-*and* its own path box so a reader would not have to walk back to Files for
-the file they already had open. As sections the selection survives the switch,
-so the editor's **Blame** button changes lens instead of teleporting.
+Three sections under one view. Explorer and Blame are two lenses on one **file**
+(`selectedFilePath` survives the switch). Map is the structural navigator over
+the DevMap repo map, the code/doc graph, and repository markdown — not a third
+reading of the same open file. Sections switch from the segmented control
+(`⌥1` / `⌥2` / `⌥3` while Code is active) or by name in the command palette.
 
 ### 2.1 Explorer
 
 - **IDE File Explorer**: Recursive directory tree navigation with real-time Git status markers (staged, unstaged, untracked, ignored).
-- **Virtualized Code Viewer**: High-performance line-virtualized code viewer supporting tokenized syntax highlighting across 60+ programming languages.
+- **Virtualized Code Viewer**: High-performance line-virtualized code viewer. Syntax highlighting has one owner and two backends: MarkDev tree-sitter for rust / JavaScript / TypeScript / Python / JSON / shell, and the existing regex tokenizer for the rest of the supported set.
 - **In-File Search & Filter**: Search with case-sensitivity toggle (`Aa`), regular expression support (`.*`), match count badges, and keyboard navigation (`Enter` / `Shift+Enter`).
 - **Go To Line**: Fast modal overlay to jump directly to any line number (1–N).
 - **Line Selection & Range Inspection**: Single-click line selection, shift-click line range highlighting, indentation style detection, and file status bar.
 - **Inline Editor**: Instant toggle between read-only syntax viewing and direct in-memory text editing with save feedback.
 - **Copy & Formatting Tools**: One-click whole-file or line-range copying with persistent feedback, whitespace character rendering toggle (`·` / `→`), and zoom font scaling (`⌘+` / `⌘-` / `⌘0`).
 - **Specialized Media & Binary Previews**:
-  - **Markdown / MarkDev**: Rendered document preview with syntax-highlighted code blocks and task lists.
+  - **Markdown / MarkDev**: Rendered from MarkDev's Rust flat parse model (UTF-16 offsets). Outline, task lists, callouts, tables, validated math / highlight adjacency, and backlinks from the repo docs vault. Commit message bodies and MANVI verdict detail use the same renderer.
   - **Images & Media**: Visual viewer with dimensions, aspect ratios, and format inspection.
   - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters for compiled and binary artifacts.
-- **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators.
+- **Live Pulse Dashboard**: Uncommitted churn overview, active branch status, and instant staging accelerators. The commit composer shows a **what this commit breaks** summary from `devmap preview` over staged paths (shared with the Diff file rail).
 - **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
 - **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
 - **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
@@ -119,6 +121,15 @@ so the editor's **Blame** button changes lens instead of teleporting.
 - **Coverage Gutter**: Per-line hit counts beside the authorship gutter, and an explicit *Coverage unavailable* marker when the lookup fails — a file with no coverage data and a coverage read that failed must not look the same.
 - **Commit Navigation**: One-click navigation from any blamed line directly to its full commit diff and history details.
 - **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
+
+### 2.3 Map
+
+- **Repo map navigator**: Reads `.devcouncil/repo_map.json` — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
+- **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.
+- **Repo docs vault**: Built from `git ls-files` of markdown (git is the authority — no ignored / vendor walk). Full-text search, broken-link report, and backlinks in the markdown viewer. Caps and skips are reported on the status strip.
+- **Freshness & build**: Status strip from `devmap status --json` (generation, freshness, `schema_outdated`, coverage gaps). Build / Refresh shell out to the installed `devmap` CLI. Watcher-driven incremental refresh runs when the index is stale, one build per repo at a time.
+- **Cross-repo link candidates**: Import-graph candidates across repos registered in DevMap's workspace from open tabs.
+- **Honesty**: `walk_incomplete`, schema mismatch, and missing CLI are named. An empty panel with `available: false` is not an all-clear.
 
 ---
 
@@ -148,7 +159,9 @@ the commit you had just selected.
 - **True Side-By-Side Split**: Replacement blocks align `del[k]` against `add[k]`, so a three-line rewrite reads across, not down; the longer side spills into rows whose other column is empty, and file/hunk chrome spans both columns instead of leaving one blank. Unified and Split derive from one row model and one intra-line pairing, so the two views cannot disagree about what a change replaced or which words changed.
 - **One Horizontal Scroll, Pinned Gutter**: The surface scrolls sideways as a whole with the line-number gutter stuck to the left over an opaque background. Rows used to scroll independently — a scrollbar per line, and the numbers rode away with the code.
 - **Both Line Numbers**: Old and new columns, sized to the file's widest number, instead of one column that meant `oldNo` on deletions and `newNo` on additions.
-- **Syntax Colouring**: The same zero-dependency tokenizer the code viewer uses, composed under the intra-line word diff and the search highlight so all three read at once. Bounded by line length and by diff size, and toggleable.
+- **Syntax Colouring**: The same dual-backend highlighter the code viewer uses (tree-sitter where MarkDev has a grammar; regex otherwise), composed under the intra-line word diff and the search highlight so all three read at once. Bounded by line length and by diff size, and toggleable.
+- **Blast radius & rung filter**: Change-set layered impact by hop (sample size *and* omitted counts). Flat per-file impact offers a min-rung filter and a rung histogram; layered impact and min-rung are never offered together. `walk_incomplete` is shown when the walk stopped early.
+- **Pre-commit preview markers**: The file rail shares the commit composer's `devmap preview` batch — per-file markers for broken callers / unreliable preview, not a second query path.
 - **Find In Diff**: ⌘F, case and regex toggles, match count, F3 / ⇧F3 stepping, and highlighting that follows the rendered text rather than the raw `+`/`-` column. A pattern whose nesting can backtrack exponentially (`(a+)+`) is refused with a message rather than run — a JavaScript regex cannot be interrupted once it starts.
 - **Change Stepping & Sticky Context**: Alt+PgUp/PgDn walk block to block, and a strip above the rows names the file and hunk you are inside once its header has scrolled away.
 - **Embedded File Rail & Commit Picker**: Browse changed files and move between recent commits without leaving the section. Rows carry the shortest path suffix that tells them apart (`analyzer/mod.rs` beside `codeintel/mod.rs`), filter as you type, group into a directory tree on request, virtualize past sixty entries, and the rail resizes. Uncommitted changes stay a first-class entry, and history truncation is surfaced rather than passed off as a whole list.
@@ -198,7 +211,7 @@ rather than presenting a floor as a total.
   - **JaCoCo XML** (`jacoco.xml`)
   - **Clover XML** (`clover.xml`)
 - **Per-File Line Coverage**: Displays hit counts, uncovered branches, and line gutter markers.
-- **Toolchain Installation & Detection**: Automatically detects missing coverage generators (`cargo-llvm-cov`, `pytest-cov`, `vitest`, `nyc`, etc.) and provides 1-click install suggestions.
+- **Toolchain Installation & Detection**: Automatically detects missing coverage generators (`cargo-llvm-cov`, `pytest-cov`, `vitest`, `nyc`, etc.) and provides 1-click install suggestions. Separately, Settings → Agents (and Code → Map / MANVI when missing) can install or update the `devmap` and `manvi` CLIs from a sibling checkout.
 - **Failure Recovery Hints**: Surfaces actionable diagnostic explanations when test coverage generation fails.
 - **Report & Diagnostics Copying**: Persistent copy action to export sanitized coverage metrics directly to your clipboard.
 - **MANVI AI Test Generator**: Analyzes coverage gaps and suggests runnable test scripts for Rust, TypeScript/JavaScript, Python, Go, Swift, Dart, Java, etc.
@@ -213,6 +226,8 @@ rather than presenting a floor as a total.
   - `composer audit` (PHP)
   - `bundler-audit` (Ruby)
   - GitHub Dependabot alerts (via local `gh` CLI)
+  - GitHub Code Scanning alerts (CodeQL / GHAS, via the same `gh` CLI)
+- **Code map status & dead symbols**: When a DevMap store is present (schema 19), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 
 ### 4.4 Storage
@@ -397,9 +412,9 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 | **Fleet** | `⇧ F10` | `Shift+F10` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
-Sections within a view — Code's Explorer / Blame, History's Graph / Diff /
+Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
 Reflog, Insights' Pulse / Coverage / Health / Storage — are switched by that
-view's segmented control,
+view's segmented control (`⌥` + section digit while the view is active),
 or by name from the command palette.
 
 ### 6.3 Inside Fleet
@@ -450,4 +465,6 @@ alone. Each is an accelerator for something that also has a visible control.
 | `>` | **Commands** (default) | Run any application action, open views, switch themes, or run audits. |
 | `#` | **Jump to Commit** | Instantly search and jump to a commit by SHA prefix or commit message. |
 | `@` | **Jump to Branch** | Search local and remote branches and checkout with a single keystroke. |
-| `?` | **Help & Shortcuts** | View available keyboard shortcuts and documentation. |
+| `:` | **Symbols (this repo)** | Search the DevMap symbol index for the active repository. |
+| `::` | **Symbols (workspace)** | Cross-repo symbol search over tabs registered in DevMap's workspace. Append `~` for TF-IDF name ranking. Unavailable repos and truncation are named on the result strip. |
+| `?` | **Help & Shortcuts** | View available keyboard shortcuts and documentation (including Map / docs tips). |

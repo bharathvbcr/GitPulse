@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { RefreshCw } from "lucide-svelte";
+  import { RefreshCw } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";

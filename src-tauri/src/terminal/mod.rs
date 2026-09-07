@@ -377,7 +377,7 @@ where
         Err(e) => {
             log::warn!(
                 target: "terminal",
-                "terminal session '{session_id}': could not reap shell process: {e}"
+                "could not reap shell process: {e}"
             );
             (None, String::new())
         }
@@ -489,7 +489,7 @@ pub fn spawn_session(
                         ) {
                             log::warn!(
                                 target: "terminal",
-                                "failed to emit terminal-output for '{sid_for_thread}': {e}"
+                                "failed to emit terminal-output: {e}"
                             );
                         }
                     }
@@ -658,7 +658,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
         if let Err(e) = session.killer.kill() {
             log::warn!(
                 target: "terminal",
-                "kill: could not signal shell of terminal session '{session_id}': {e}"
+                "kill: could not signal shell: {e}"
             );
         }
     }
@@ -3200,8 +3200,93 @@ mod tests {
         let state = TerminalSessions::default();
         let input = "x".repeat(MAX_PTY_INPUT_BYTES + 1);
         let err = write_to_session(&state, "term-missing", &input).unwrap_err();
-        assert!(err.contains("input"), "{err}");
-        assert!(err.contains("limit"), "{err}");
+        assert!(
+            err.contains("input"),
+            "oversized input must name the input bound"
+        );
+        assert!(
+            err.contains("limit"),
+            "oversized input must name the per-write limit"
+        );
+    }
+
+    #[test]
+    fn log_sites_do_not_interpolate_session_identifiers() {
+        let src = include_str!("mod.rs");
+        let payloads = log_macro_payloads(src);
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload.contains("could not reap"))
+                && payloads
+                    .iter()
+                    .any(|payload| payload.contains("terminal-output"))
+                && payloads
+                    .iter()
+                    .any(|payload| payload.contains("could not signal")),
+            "expected the PTY warn sites: {payloads:?}"
+        );
+        for payload in &payloads {
+            for ident in ["session_id", "sid_for_thread", "sid_for_exit"] {
+                assert!(
+                    !payload.contains(ident),
+                    "log payload interpolates {ident}: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_input_assertion_does_not_dump_the_error_string() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn oversized_pty_input_is_refused_before_session_lookup")
+            .expect("test exists");
+        let rest = &src[start..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        let test = &rest[..end];
+        assert!(
+            !test.contains("{err}"),
+            "dumping the error interpolates a session-id-tainted string into the panic log"
+        );
+    }
+
+    fn log_macro_payloads(src: &str) -> Vec<&str> {
+        const KINDS: [&str; 4] = ["log::error!", "log::warn!", "log::info!", "log::debug!"];
+        let mut out = Vec::new();
+        let mut from = 0;
+        while from < src.len() {
+            let next = KINDS
+                .iter()
+                .filter_map(|kind| src[from..].find(kind).map(|rel| (rel, kind.len())))
+                .min_by_key(|(rel, _)| *rel);
+            let Some((rel, kind_len)) = next else {
+                break;
+            };
+            let open_search = from + rel + kind_len;
+            let Some(open_rel) = src[open_search..].find('(') else {
+                break;
+            };
+            let open = open_search + open_rel;
+            let mut depth = 0i32;
+            let mut end = open;
+            for (offset, ch) in src[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(&src[open..=end]);
+            from = end.saturating_add(1);
+        }
+        out
     }
 
     #[test]

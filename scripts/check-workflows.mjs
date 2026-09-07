@@ -17,7 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,6 +40,33 @@ export function workflowFiles(dir) {
   return readdirSync(dir)
     .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
     .sort();
+}
+
+/**
+ * True when `yaml` declares a workflow-level `permissions:` map (before `jobs:`).
+ * Job-only permissions leave the rest of the file on GitHub's default token,
+ * which is the hole `actions/missing-workflow-permissions` reports.
+ *
+ * @param {string} yaml
+ * @returns {boolean}
+ */
+export function hasWorkflowLevelPermissions(yaml) {
+  const jobsAt = yaml.search(/^jobs\s*:/m);
+  const head = jobsAt === -1 ? yaml : yaml.slice(0, jobsAt);
+  return /^permissions\s*:/m.test(head);
+}
+
+/**
+ * Workflow filenames in `dir` that lack a top-level permissions block.
+ *
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function workflowsMissingPermissions(dir) {
+  return workflowFiles(dir).filter((name) => {
+    const text = readFileSync(path.join(dir, name), "utf8");
+    return !hasWorkflowLevelPermissions(text);
+  });
 }
 
 /**

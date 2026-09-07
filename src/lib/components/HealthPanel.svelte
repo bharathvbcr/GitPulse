@@ -3,6 +3,7 @@
   import type {
     DepsHealthReport,
     DependabotReport,
+    CodeScanningReport,
   } from "../health/types";
 
   export interface DependabotFreshness {
@@ -26,6 +27,9 @@
     dependabot: DependabotReport | null;
     dependabotCheckedAt: number | null;
     dependabotRequestFailed: boolean;
+    codeScanning: CodeScanningReport | null;
+    codeScanningCheckedAt: number | null;
+    codeScanningRequestFailed: boolean;
   }>();
 </script>
 
@@ -46,7 +50,7 @@
     Play,
     Check,
     Terminal,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     harnessStore,
@@ -82,6 +86,9 @@
   let dependabot = $state<DependabotReport | null>(null);
   let dependabotCheckedAt = $state<number | null>(null);
   let dependabotRequestFailed = $state(false);
+  let codeScanning = $state<CodeScanningReport | null>(null);
+  let codeScanningCheckedAt = $state<number | null>(null);
+  let codeScanningRequestFailed = $state(false);
   let deadSymbols = $state<CodeintelDeadSymbol[]>([]);
   let deadSymbolsAvailable = $state(false);
   let deadSymbolsReason = $state<string | null>(null);
@@ -182,6 +189,19 @@
   );
   let displayedDependabotFreshness = $derived(
     dependabotCheckedAt === null ? null : dependabotFreshness(dependabotCheckedAt),
+  );
+  /** Open code scanning alerts, for the header badge. */
+  let openCodeScanningCount = $derived(
+    codeScanning?.available ? codeScanning.alerts.length : 0,
+  );
+  let codeScanningBadgeClass = $derived(
+    codeScanning?.available ? badgeClassFor(codeScanning.alerts) : "",
+  );
+  let displayedCodeScanningFreshness = $derived(
+    codeScanningCheckedAt === null ? null : dependabotFreshness(codeScanningCheckedAt),
+  );
+  let displayedGithubFreshness = $derived(
+    displayedDependabotFreshness ?? displayedCodeScanningFreshness,
   );
   // Observed totals, not surviving-row counts: a capped table that prints only
   // what it kept reads as complete coverage. Shared with the copied report so
@@ -308,6 +328,9 @@
         dependabot,
         dependabotCheckedAt,
         dependabotRequestFailed,
+        codeScanning,
+        codeScanningCheckedAt,
+        codeScanningRequestFailed,
       });
     }
     if (guard.isLive()) loading = false;
@@ -323,6 +346,8 @@
     result: DependabotReport,
     checkedAt: number,
     requestFailed: boolean,
+    codeScanningResult: CodeScanningReport,
+    codeScanningFailed: boolean,
   ) {
     const currentReport = scanned.path === repoPath ? report : null;
     const deps = currentReport ?? healthCache.get(repoPath)?.deps;
@@ -332,6 +357,9 @@
       dependabot: result,
       dependabotCheckedAt: checkedAt,
       dependabotRequestFailed: requestFailed,
+      codeScanning: codeScanningResult,
+      codeScanningCheckedAt: checkedAt,
+      codeScanningRequestFailed: codeScanningFailed,
     });
   }
 
@@ -344,31 +372,55 @@
     checkingGithub = true;
     actionError = null;
     try {
-      const next = await invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath });
+      const [depSettled, csSettled] = await Promise.allSettled([
+        invoke<DependabotReport>("cmd_github_dependabot_alerts", { repoPath }),
+        invoke<CodeScanningReport>("cmd_github_code_scanning_alerts", { repoPath }),
+      ]);
       if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
       const checkedAt = Date.now();
+      const next: DependabotReport =
+        depSettled.status === "fulfilled"
+          ? depSettled.value
+          : {
+              available: false,
+              // Neutral sentinels only satisfy the wire shape. The separate
+              // failure bit prevents either from being interpreted as backend
+              // evidence.
+              cli_present: true,
+              is_github_remote: false,
+              slug: "",
+              alerts: [],
+              truncated: false,
+              error: formatError(depSettled.reason),
+            };
+      const depFailed = depSettled.status === "rejected";
+      const nextCodeScanning: CodeScanningReport =
+        csSettled.status === "fulfilled"
+          ? csSettled.value
+          : {
+              available: false,
+              cli_present: true,
+              is_github_remote: false,
+              slug: "",
+              alerts: [],
+              truncated: false,
+              error: formatError(csSettled.reason),
+            };
+      const csFailed = csSettled.status === "rejected";
       dependabot = next;
       dependabotCheckedAt = checkedAt;
-      dependabotRequestFailed = false;
-      cacheDependabotResult(repoPath, next, checkedAt, false);
-    } catch (err) {
-      if (!guard.isLive() || $repoStore.currentPath !== repoPath) return;
-      const checkedAt = Date.now();
-      const failed: DependabotReport = {
-        available: false,
-        // Neutral sentinels only satisfy the wire shape. The separate failure
-        // bit prevents either from being interpreted as backend evidence.
-        cli_present: true,
-        is_github_remote: false,
-        slug: "",
-        alerts: [],
-        truncated: false,
-        error: formatError(err),
-      };
-      dependabot = failed;
-      dependabotCheckedAt = checkedAt;
-      dependabotRequestFailed = true;
-      cacheDependabotResult(repoPath, failed, checkedAt, true);
+      dependabotRequestFailed = depFailed;
+      codeScanning = nextCodeScanning;
+      codeScanningCheckedAt = checkedAt;
+      codeScanningRequestFailed = csFailed;
+      cacheDependabotResult(
+        repoPath,
+        next,
+        checkedAt,
+        depFailed,
+        nextCodeScanning,
+        csFailed,
+      );
     } finally {
       if (guard.isLive()) checkingGithub = false;
     }
@@ -379,9 +431,20 @@
     const current = report;
     const repoPath = $repoStore.currentPath;
     if (!current || !repoPath) return null;
-    const text = formatHealthReport(current, repoPath, dependabot);
-    if (!dependabot || dependabotCheckedAt === null) return text;
-    return `${text}\nDependabot checked at: ${dependabotFreshness(dependabotCheckedAt).iso} (result may be cached)`;
+    const text = formatHealthReport(current, repoPath, dependabot, codeScanning);
+    const stamps: string[] = [];
+    if (dependabot && dependabotCheckedAt !== null) {
+      stamps.push(
+        `Dependabot checked at: ${dependabotFreshness(dependabotCheckedAt).iso} (result may be cached)`,
+      );
+    }
+    if (codeScanning && codeScanningCheckedAt !== null) {
+      stamps.push(
+        `Code scanning checked at: ${dependabotFreshness(codeScanningCheckedAt).iso} (result may be cached)`,
+      );
+    }
+    if (stamps.length === 0) return text;
+    return `${text}\n${stamps.join("\n")}`;
   }
 
   let copyTimer: number | null = null;
@@ -535,6 +598,9 @@
       dependabot = null;
       dependabotCheckedAt = null;
       dependabotRequestFailed = false;
+      codeScanning = null;
+      codeScanningCheckedAt = null;
+      codeScanningRequestFailed = false;
       errorMsg = null;
       actionError = null;
       loading = false;
@@ -555,11 +621,17 @@
       dependabot = cached.dependabot;
       dependabotCheckedAt = cached.dependabotCheckedAt;
       dependabotRequestFailed = cached.dependabotRequestFailed;
+      codeScanning = cached.codeScanning;
+      codeScanningCheckedAt = cached.codeScanningCheckedAt;
+      codeScanningRequestFailed = cached.codeScanningRequestFailed;
     } else {
       report = null;
       dependabot = null;
       dependabotCheckedAt = null;
       dependabotRequestFailed = false;
+      codeScanning = null;
+      codeScanningCheckedAt = null;
+      codeScanningRequestFailed = false;
       deadSymbols = [];
       deadSymbolsAvailable = false;
       deadSymbolsReason = null;
@@ -667,6 +739,89 @@
     {/if}
   {/snippet}
 
+  {#snippet codeScanningSection()}
+    {#if codeScanning && (codeScanning.available || codeScanning.error)}
+      <section class="space-y-2">
+        <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+          GitHub Code Scanning{codeScanning.available
+            ? ` (${codeScanning.alerts.length}${codeScanning.truncated ? "+" : ""})`
+            : ""}
+        </h3>
+        {#if codeScanning.error}
+          <div class="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 max-w-2xl">
+            Could not fetch code scanning alerts: {codeScanning.error}
+          </div>
+          {#if !codeScanningRequestFailed && !codeScanning.cli_present && codeScanning.is_github_remote}
+            <p class="text-textMuted max-w-2xl">
+              Install the <span class="font-mono">gh</span> CLI and run
+              <span class="font-mono">gh auth login</span> before checking again.
+            </p>
+          {/if}
+        {:else if !codeScanning.cli_present}
+          <p class="text-textMuted max-w-2xl">
+            Install the <span class="font-mono">gh</span> CLI and run
+            <span class="font-mono">gh auth login</span> to fetch code scanning alerts for
+            {codeScanning.slug || "this repository"}.
+          </p>
+        {:else if codeScanning.alerts.length === 0}
+          <p class="text-textMuted">No open code scanning alerts on {codeScanning.slug}.</p>
+        {:else}
+          {#if codeScanning.truncated}
+            <p class="text-amber-300">Showing the first {codeScanning.alerts.length} alerts.</p>
+          {/if}
+          <div class="border border-border/70 rounded-2xl overflow-hidden max-w-5xl shadow-card">
+            <table class="w-full text-left">
+              <thead class="bg-surface text-[10px] uppercase text-textMuted">
+                <tr>
+                  <th class="px-3 py-2 font-medium">Severity</th>
+                  <th class="px-3 py-2 font-medium">Rule</th>
+                  <th class="px-3 py-2 font-medium">Location</th>
+                  <th class="px-3 py-2 font-medium">Tool</th>
+                  <th class="px-3 py-2 font-medium w-8"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each codeScanning.alerts as alert}
+                  <tr class="border-t border-border/40 align-top">
+                    <td class="px-3 py-1.5">
+                      <span class="px-1.5 py-0.5 rounded-full text-[10px] uppercase font-semibold {severityClass(alert.severity)}">{alert.severity || "unranked"}</span>
+                    </td>
+                    <td class="px-3 py-1.5">
+                      <div class="font-mono text-textPrimary">{alert.rule_id || alert.rule_name || "rule"}</div>
+                      <div class="text-[10px] text-textMuted">{alert.title}</div>
+                    </td>
+                    <td class="px-3 py-1.5 font-mono text-textMuted">
+                      {#if alert.path}
+                        {alert.path}{#if alert.start_line > 0}:{alert.start_line}{/if}
+                      {:else}
+                        —
+                      {/if}
+                    </td>
+                    <td class="px-3 py-1.5 text-textMuted">
+                      {alert.tool || "—"}{#if alert.tool_version} {alert.tool_version}{/if}
+                    </td>
+                    <td class="px-2 py-1.5">
+                      {#if alert.url}
+                        <button
+                          type="button"
+                          class="p-1 rounded-full hover:bg-surfaceHover text-textMuted hover:text-accent transition-colors"
+                          title="Open alert on GitHub"
+                          onclick={() => openExternal(alert.url)}
+                        >
+                          <ExternalLink size={13} />
+                        </button>
+                      {/if}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
+    {/if}
+  {/snippet}
+
   <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
     <div class="flex items-center gap-2 min-w-0">
       <ShieldAlert size={16} class="text-accent shrink-0" />
@@ -696,6 +851,17 @@
              nothing to have checked, and the chip would be noise. -->
         <span class="truncate text-textMuted">· Dependabot not checked</span>
       {/if}
+      {#if openCodeScanningCount > 0}
+        <span class={`truncate ${codeScanningBadgeClass}`}>
+          · Code scanning {openCodeScanningCount}{codeScanning?.truncated ? "+" : ""}
+        </span>
+      {:else if codeScanning && !codeScanning.available}
+        <span class="truncate text-amber-300">· Code scanning unavailable</span>
+      {:else if codeScanning?.available}
+        <span class="truncate text-textMuted">· Code scanning 0 open</span>
+      {:else if report}
+        <span class="truncate text-textMuted">· Code scanning not checked</span>
+      {/if}
     </div>
     <div class="flex items-center gap-2">
       <button
@@ -704,7 +870,7 @@
         onclick={() => scanDependabot()}
         disabled={checkingGithub}
         class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed"
-        title="Use the GitHub CLI, its credentials, and the network to check Dependabot alerts"
+        title="Use the GitHub CLI, its credentials, and the network to check Dependabot and code scanning alerts"
       >
         <ShieldAlert size={13} class={checkingGithub ? "animate-pulse" : ""} />
         {checkingGithub ? "Checking GitHub…" : "Check GitHub alerts"}
@@ -759,12 +925,12 @@
     <div class="rounded-xl border border-border/70 bg-surface px-3 py-2 text-[11px] text-textMuted max-w-3xl space-y-1">
       <p id="dependabot-permission-note">
         GitHub alerts are not checked automatically. The explicit check uses the GitHub CLI,
-        its credentials, and the network.
+        its credentials, and the network to fetch Dependabot and code scanning alerts.
       </p>
-      {#if dependabot && displayedDependabotFreshness}
+      {#if displayedGithubFreshness}
         <p role="status">
           This result may be cached. Last checked
-          <time datetime={displayedDependabotFreshness.iso}>{displayedDependabotFreshness.label}</time>.
+          <time datetime={displayedGithubFreshness.iso}>{displayedGithubFreshness.label}</time>.
         </p>
       {:else}
         <p>No GitHub alert result has been loaded for this repository.</p>
@@ -792,6 +958,7 @@
         {errorMsg}
       </div>
       {@render dependabotSection()}
+      {@render codeScanningSection()}
     {:else if report}
       {#if planError}
         <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 max-w-3xl">
@@ -813,7 +980,7 @@
                     type="button"
                     onclick={runAllSteps}
                     disabled={runningAll || Object.values(stepResults).some((r) => r.running)}
-                    class="gp-btn-primary !py-1 !text-[11px]"
+                    class="gp-btn-primary py-1! text-[11px]!"
                     title="Execute all executable plan steps sequentially"
                   >
                     {#if runningAll}
@@ -828,13 +995,13 @@
                 <button
                   type="button"
                   onclick={() => interfaceStore.setTerminalDockOpen(true)}
-                  class="gp-btn !py-1 !text-[11px]"
+                  class="gp-btn py-1! text-[11px]!"
                   title="Open the terminal below this panel, so the plan stays on screen while you run it"
                 >
                   <Terminal size={12} />
                   <span>Terminal</span>
                 </button>
-                <button type="button" onclick={copyPlan} class="gp-btn !py-1 !text-[11px]" title="Copy the remediation plan">
+                <button type="button" onclick={copyPlan} class="gp-btn py-1! text-[11px]!" title="Copy the remediation plan">
                   <Clipboard size={12} />
                   {planCopied ? "Copied" : "Copy plan"}
                 </button>
@@ -876,7 +1043,7 @@
                           type="button"
                           onclick={() => void runStep(step, beginSteps())}
                           disabled={res?.running || runningAll}
-                          class="gp-btn !py-1 !px-2.5 text-xs shrink-0 disabled:opacity-50"
+                          class="gp-btn py-1! px-2.5! text-xs shrink-0 disabled:opacity-50"
                           title="Execute this command step directly"
                         >
                           {#if res?.running}
@@ -931,7 +1098,7 @@
                 type="button"
                 onclick={() => void scan()}
                 disabled={loading}
-                class="gp-btn !py-1 text-xs shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                class="gp-btn py-1! text-xs shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="Rescan repository health"
               >
                 <RefreshCw size={11} class={loading ? "animate-spin" : ""} />
@@ -1046,14 +1213,14 @@
               type="button"
               aria-pressed={filter === "all"}
               data-active={filter === "all" ? "true" : "false"}
-              class="gp-seg-btn !text-[11px] !py-0.5"
+              class="gp-seg-btn text-[11px]! py-0.5!"
               onclick={() => (filter = "all")}
             >All</button>
             <button
               type="button"
               aria-pressed={filter === "direct"}
               data-active={filter === "direct" ? "true" : "false"}
-              class="gp-seg-btn !text-[11px] !py-0.5"
+              class="gp-seg-btn text-[11px]! py-0.5!"
               onclick={() => (filter = "direct")}
             >Direct</button>
           </div>
@@ -1118,6 +1285,7 @@
       </section>
 
       {@render dependabotSection()}
+      {@render codeScanningSection()}
 
       <section class="space-y-2 pb-4">
         <h3 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">

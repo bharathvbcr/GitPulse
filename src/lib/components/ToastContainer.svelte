@@ -1,6 +1,6 @@
 <script lang="ts">
   import { toastStore, type ToastItem, type ToastKind } from "../stores/toastStore";
-  import { CheckCircle2, Info, AlertTriangle, AlertCircle, X } from "lucide-svelte";
+  import { CheckCircle2, Info, AlertTriangle, AlertCircle, X } from "@lucide/svelte";
   import { fly, fade } from "svelte/transition";
   import { LAYERS } from "../ui/layers";
 
@@ -98,7 +98,7 @@
       </div>
 
       <div class="flex-1 min-w-0">
-        <p class="text-xs font-medium leading-snug {config.text} break-words">
+        <p class="text-xs font-medium leading-snug {config.text} wrap-break-word">
           {toast.message}
         </p>
 
@@ -107,7 +107,7 @@
             <button
               type="button"
               onclick={() => handleAction(toast)}
-              class="gp-btn !py-0.5 !px-2.5 text-[11px] font-semibold hover:border-accent/60"
+              class="gp-btn py-0.5! px-2.5! text-[11px] font-semibold hover:border-accent/60"
             >
               {toast.action.label}
             </button>

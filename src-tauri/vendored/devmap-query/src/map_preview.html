@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>DevCouncil Repo Map</title>
+<style>
+:root {
+  --bg:#0d1117; --panel:#141b24; --panel-2:#1a2332; --line:#243044; --line-2:#2f3d52;
+  --fg:#e7ecf3; --muted:#8b9bb4; --accent:#3d8bfd; --dead:#e35d6a; --entry:#34d399; --warn:#f59e0b;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; font:13px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  background:var(--bg); color:var(--fg); display:flex; height:100vh; overflow:hidden;
+}
+#sidebar { width:400px; flex:0 0 400px; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+#stage { flex:1; position:relative; min-width:0; }
+/* force-graph clears the element it mounts into, so #graph holds nothing
+   but the canvas and every overlay is a sibling inside #stage. */
+#graph { position:absolute; inset:0; }
+header.top { padding:14px; border-bottom:1px solid var(--line); }
+header.top h1 { font-size:15px; margin:0; letter-spacing:.2px; }
+header.top .sub { color:var(--muted); font-size:11px; margin-top:3px; font-variant-numeric:tabular-nums; }
+.scroll { flex:1; overflow:auto; }
+.block { padding:12px 14px; border-bottom:1px solid var(--line); }
+.block-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; font-size:11px; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); font-weight:600; margin-bottom:8px; }
+.block-head .aside { text-transform:none; letter-spacing:0; font-weight:400; }
+.muted { color:var(--muted); }
+.stats { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line); }
+.stat { background:var(--panel); padding:9px 4px; text-align:center; }
+.stat .n { font-size:16px; font-weight:650; font-variant-numeric:tabular-nums; }
+.stat .k { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+
+.langbar { display:flex; height:9px; border-radius:5px; overflow:hidden; background:var(--line); gap:2px; }
+.langbar span { display:block; height:100%; min-width:2px; }
+.langlegend { display:flex; flex-wrap:wrap; gap:3px 14px; margin-top:10px; }
+.langlegend .li { display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; border:0; background:none; color:inherit; padding:1px 0; font-family:inherit; }
+.langlegend .li:hover .nm { color:var(--accent); }
+.langlegend .li .pct { color:var(--muted); font-variant-numeric:tabular-nums; }
+.langlegend .li.off { opacity:.4; }
+.dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+.dot.unofficial { box-shadow:inset 0 0 0 1px var(--line-2); }
+.note { margin-top:10px; font-size:11px; color:var(--muted); line-height:1.5; }
+.note strong { color:var(--fg); font-weight:600; font-variant-numeric:tabular-nums; }
+
+input, select { width:100%; padding:6px 8px; background:#0d1117; color:var(--fg); border:1px solid var(--line-2); border-radius:5px; font:inherit; }
+input:focus, select:focus { outline:none; border-color:var(--accent); }
+.row2 { display:grid; grid-template-columns:1fr 132px; gap:8px; }
+
+.badges { display:flex; flex-wrap:wrap; gap:5px; }
+.badge { display:inline-flex; align-items:center; gap:5px; padding:2px 7px; border-radius:11px; font-size:11px; background:#0d1117; border:1px solid var(--line-2); color:var(--muted); font-variant-numeric:tabular-nums; }
+.badge b { color:var(--fg); font-weight:600; }
+.badge.entry { border-color:#1f6f52; } .badge.entry b { color:var(--entry); }
+.badge.dead { border-color:#7a3038; } .badge.dead b { color:var(--dead); }
+.badge.warn { border-color:#7a5410; color:var(--warn); }
+
+.list { list-style:none; padding:0; margin:0; }
+.list li { padding:7px 8px; border-radius:5px; cursor:pointer; display:grid; grid-template-columns:9px 1fr auto; gap:8px; align-items:center; }
+.list li:hover { background:var(--panel-2); }
+.list li.sel { background:var(--panel-2); box-shadow:inset 2px 0 0 var(--accent); }
+.list li .nm { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.list li .nm .dim { color:var(--muted); }
+.list li .ct { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; }
+.list li .strip { grid-column:2/4; display:flex; height:3px; border-radius:2px; overflow:hidden; gap:1px; margin-top:2px; }
+.list li .strip span { display:block; height:100%; min-width:1px; }
+.list .empty { color:var(--muted); padding:8px; cursor:default; display:block; }
+
+.detail h3 { margin:0 0 3px; font-size:13px; word-break:break-all; }
+.detail .sum { color:var(--muted); font-size:12px; margin-bottom:10px; }
+.detail .grp { margin-top:11px; }
+.detail .grp > .t { font-size:10px; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); font-weight:600; margin-bottom:4px; }
+.detail ul { list-style:none; margin:0; padding:0; font-size:12px; }
+.detail ul li { padding:2px 0; word-break:break-all; }
+.detail ul li::before { content:"\00b7"; color:var(--muted); margin-right:6px; }
+.detail .chip { display:inline-block; padding:2px 7px; margin:2px 4px 2px 0; border-radius:4px; font-size:11px; background:#0d1117; border:1px solid var(--line-2); cursor:pointer; color:inherit; font-family:inherit; }
+.detail .chip:hover { border-color:var(--accent); color:var(--accent); }
+.detail .chip.off { cursor:default; color:var(--muted); border-style:dashed; }
+.detail .chip.off:hover { border-color:var(--line-2); color:var(--muted); }
+.detail .none { color:var(--muted); font-size:12px; font-style:italic; }
+.detail .mini { display:flex; height:6px; border-radius:3px; overflow:hidden; gap:1px; margin:6px 0 4px; }
+.detail .mini span { display:block; height:100%; min-width:2px; }
+
+footer.bot { padding:10px 14px; border-top:1px solid var(--line); font-size:11px; color:var(--muted); display:flex; justify-content:space-between; gap:8px; }
+a.link { color:var(--accent); text-decoration:none; }
+a.link:hover { text-decoration:underline; }
+
+#controls { position:absolute; top:12px; right:12px; z-index:5; display:flex; flex-direction:column; gap:8px; align-items:flex-end; pointer-events:none; font:12px/1.35 ui-sans-serif,system-ui,sans-serif; }
+#controls > * { pointer-events:auto; }
+#controls .ctrl-row { display:flex; gap:4px; }
+#controls button { padding:6px 10px; background:#0d1117; color:var(--fg); border:1px solid var(--line-2); border-radius:5px; cursor:pointer; font-weight:600; font-family:inherit; }
+#controls button:hover { border-color:var(--accent); color:#fff; }
+#controls .zoom-pct { min-width:54px; text-align:center; padding:6px 8px; background:#0d1117; border:1px solid var(--line-2); border-radius:5px; color:var(--muted); font-variant-numeric:tabular-nums; }
+#controls .hint { color:var(--muted); font-size:11px; text-align:right; max-width:230px; }
+#controls details { background:var(--panel); border:1px solid var(--line-2); border-radius:6px; padding:8px 10px; min-width:206px; }
+#controls details summary { cursor:pointer; color:var(--fg); font-weight:600; margin-bottom:6px; }
+#controls details label { display:block; margin:6px 0 2px; color:var(--muted); font-size:11px; }
+#controls details label.inline { display:flex; align-items:center; gap:6px; }
+#controls details input[type=range] { width:100%; }
+#controls details input[type=checkbox] { width:auto; }
+#legend { position:absolute; left:12px; bottom:12px; z-index:5; background:rgba(20,27,36,.94); border:1px solid var(--line-2); border-radius:6px; padding:8px 10px; font:11px/1.4 ui-sans-serif,system-ui,sans-serif; color:var(--muted); max-width:240px; }
+#legend .leg-row { display:flex; align-items:center; gap:8px; margin:3px 0; }
+#legend .swatch { width:12px; height:12px; border-radius:2px; flex-shrink:0; }
+#legend .swatch.entry { background:var(--entry); }
+#legend .swatch.edge-handoff { background:#a78bfa; }
+#legend .swatch.edge-neighbor { background:#3d8bfd; }
+#legend .leg-sec { margin-top:7px; padding-top:7px; border-top:1px solid var(--line); }
+#vendorWarn { display:none; position:absolute; inset:0; z-index:10; padding:40px; color:var(--dead); font-size:14px; background:var(--bg); }
+</style>
+</head>
+<body>
+<!-- fingerprint:__FINGERPRINT__ -->
+<aside id="sidebar">
+  <header class="top">
+    <h1>DevCouncil Repo Map</h1>
+    <div class="sub" id="headLine"></div>
+  </header>
+  <div class="stats" id="stats"></div>
+  <div class="scroll">
+    <section class="block">
+      <div class="block-head">Languages <span class="aside" id="langMeta"></span></div>
+      <div class="langbar" id="langBar"></div>
+      <div class="langlegend" id="langLegend"></div>
+      <div class="note" id="coverage"></div>
+    </section>
+    <section class="block">
+      <div class="row2">
+        <input id="search" placeholder="Filter area or summary" autocomplete="off" aria-label="Filter subsystems"/>
+        <select id="langFilter" aria-label="Filter by language"></select>
+      </div>
+      <div class="badges" id="livenessBadges" style="margin-top:10px"></div>
+    </section>
+    <section class="block">
+      <div class="block-head">Subsystems <span class="aside" id="counts"></span></div>
+      <ul class="list" id="subList"></ul>
+    </section>
+    <section class="block" style="border-bottom:none">
+      <div class="block-head">Detail</div>
+      <div class="detail" id="detail"><span class="none">Select a subsystem to inspect.</span></div>
+    </section>
+  </div>
+  <footer class="bot">
+    <span>Click a node or row for detail</span>
+    <a class="link" href="graph/graph.html">code graph &rarr;</a>
+  </footer>
+</aside>
+<main id="stage">
+  <div id="graph"></div>
+  <div id="vendorWarn">
+    The force-graph bundle did not load &mdash; the canvas cannot render.<br/>
+    This page is built with it inlined, so a failure here means the artifact was truncated.
+  </div>
+  <div id="controls">
+    <div class="ctrl-row">
+      <button type="button" id="zoomOut" title="Zoom out (-)">&minus;</button>
+      <span class="zoom-pct" id="zoomPct">100%</span>
+      <button type="button" id="zoomIn" title="Zoom in (+)">+</button>
+      <button type="button" id="zoomFit" title="Fit (0)">Fit</button>
+    </div>
+    <div class="hint">Scroll to zoom &middot; drag background to pan &middot; Esc clears focus</div>
+    <details>
+      <summary>Layout</summary>
+      <label class="inline"><input type="checkbox" id="layoutPause"/> Pause simulation</label>
+      <label>Charge</label><input type="range" id="layoutCharge" min="-500" max="-40" value="-260"/>
+      <label>Link distance</label><input type="range" id="layoutDistance" min="30" max="240" value="110"/>
+      <label>Labels</label>
+      <select id="labelMode"><option value="always">always</option><option value="hover">hover</option><option value="selected">selected</option></select>
+      <label>Node size</label>
+      <select id="sizeMode"><option value="files">files</option><option value="degree">degree</option><option value="constant">constant</option></select>
+    </details>
+  </div>
+  <div id="legend"></div>
+</main>
+<script>__VENDOR_JS__</script>
+<script>
+const DATA = __DATA_JSON__;
+const META = DATA.meta || {};
+const PALETTE = META.palette || {};
+const NEUTRAL = META.neutral_color || '#6e7681';
+let selected = [];
+let langFilter = '';
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function colorFor(lang) { const e = PALETTE[lang]; return (e && e.color) || NEUTRAL; }
+function labelFor(lang) { const e = PALETTE[lang]; return (e && e.label) || lang || 'unknown'; }
+function isOfficial(lang) { const e = PALETTE[lang]; return !!(e && e.official); }
+function fmt(n) { return Number(n || 0).toLocaleString('en-US'); }
+function pct(n, total) { return total > 0 ? (n * 100 / total) : 0; }
+function pctText(n, total) {
+  const p = pct(n, total);
+  if (p === 0) return '0%';
+  return (p < 1 ? p.toFixed(1) : p.toFixed(p < 10 ? 1 : 0)) + '%';
+}
+function lid(l, key) { const v = l[key]; return typeof v === 'object' && v ? v.id : v; }
+function subsystemById(id) { return (DATA.subsystems || []).find(s => s.id === id); }
+
+/* ---- language bars ------------------------------------------------------ */
+
+function barHtml(pairs, total, withTitle) {
+  if (!total) return '';
+  return (pairs || []).map(p => {
+    const lang = p[0], n = p[1];
+    const style = 'width:' + pct(n, total).toFixed(3) + '%;background:' + colorFor(lang);
+    const title = withTitle ? ' title="' + escapeHtml(labelFor(lang) + ' — ' + fmt(n) + ' files (' + pctText(n, total) + ')') + '"' : '';
+    return '<span style="' + style + '"' + title + '></span>';
+  }).join('');
+}
+
+function renderLanguages() {
+  const totals = META.language_totals || [];
+  const total = totals.reduce((a, p) => a + p[1], 0);
+  document.getElementById('langBar').innerHTML = barHtml(totals, total, true)
+    || '<span style="width:100%;background:' + NEUTRAL + '"></span>';
+  const anyUnofficial = totals.some(p => !isOfficial(p[0]));
+  document.getElementById('langMeta').textContent = total
+    ? fmt(total) + ' files · GitHub Linguist ' + (META.linguist_version || '')
+    : 'no indexed files';
+  const legend = document.getElementById('langLegend');
+  legend.innerHTML = totals.slice(0, 14).map(p => {
+    const lang = p[0], n = p[1];
+    const off = isOfficial(lang) ? '' : ' unofficial';
+    const t = isOfficial(lang) ? labelFor(lang) : labelFor(lang) + ' — no Linguist colour, shown neutral';
+    return '<button type="button" class="li" data-lang="' + escapeHtml(lang) + '" title="' + escapeHtml(t) + '">'
+      + '<span class="dot' + off + '" style="background:' + colorFor(lang) + '"></span>'
+      + '<span class="nm">' + escapeHtml(labelFor(lang)) + '</span>'
+      + '<span class="pct">' + pctText(n, total) + '</span></button>';
+  }).join('') || '<span class="muted">none</span>';
+  legend.querySelectorAll('button[data-lang]').forEach(b => {
+    b.addEventListener('click', () => {
+      const l = b.getAttribute('data-lang');
+      langFilter = (langFilter === l) ? '' : l;
+      document.getElementById('langFilter').value = langFilter;
+      redraw();
+    });
+  });
+
+  const cov = META.coverage || {};
+  const indexed = cov.indexed_total || 0;
+  const inSubs = cov.in_subsystems || 0;
+  const el = document.getElementById('coverage');
+  if (!indexed) {
+    el.textContent = 'This map carries no file inventory, so language shares are unknown.';
+  } else {
+    el.innerHTML = 'Subsystems account for <strong>' + fmt(inSubs) + '</strong> of <strong>' + fmt(indexed)
+      + '</strong> indexed files (' + pctText(inSubs, indexed) + '). The bar above covers every indexed file; '
+      + 'per-subsystem strips cover only the ' + pctText(inSubs, indexed) + ' inside a subsystem.'
+      + (anyUnofficial ? ' Ringed swatches have no Linguist colour.' : '');
+  }
+
+  const sel = document.getElementById('langFilter');
+  sel.innerHTML = '<option value="">All languages</option>' + totals.map(p =>
+    '<option value="' + escapeHtml(p[0]) + '">' + escapeHtml(labelFor(p[0])) + ' (' + fmt(p[1]) + ')</option>'
+  ).join('');
+  sel.value = langFilter;
+}
+
+function renderStats() {
+  const cov = META.coverage || {};
+  const tiles = [
+    [(DATA.nodes || []).length, 'subsystems'],
+    [(DATA.links || []).length, 'edges'],
+    [cov.indexed_total || 0, 'files'],
+    [(META.language_totals || []).length, 'languages']
+  ];
+  document.getElementById('stats').innerHTML = tiles.map(t =>
+    '<div class="stat"><div class="n">' + fmt(t[0]) + '</div><div class="k">' + t[1] + '</div></div>'
+  ).join('');
+  const head = String(META.generated_head || '');
+  document.getElementById('headLine').textContent = head
+    ? 'HEAD ' + head.slice(0, 10)
+    : 'working tree (no HEAD recorded)';
+}
+
+/* ---- filtering ---------------------------------------------------------- */
+
+function subsystemHasLang(s, lang) { return (s.languages || []).some(p => p[0] === lang); }
+
+function filtered() {
+  const q = (document.getElementById('search').value || '').toLowerCase();
+  const nodes = (DATA.nodes || []).filter(n => {
+    const sub = subsystemById(n.id) || {};
+    if (langFilter && !subsystemHasLang(sub, langFilter)) return false;
+    if (!q) return true;
+    return n.id.toLowerCase().includes(q)
+      || (n.name || '').toLowerCase().includes(q)
+      || (sub.summary || '').toLowerCase().includes(q);
+  });
+  // Drawn in this order, and the label collision pass below is first-come —
+  // so ranking by size here is what decides whose label survives a clash.
+  nodes.sort((a, b) => (b.file_count || 0) - (a.file_count || 0));
+  const ids = new Set(nodes.map(n => n.id));
+  const links = (DATA.links || []).filter(l => ids.has(lid(l, 'source')) && ids.has(lid(l, 'target')));
+  return {nodes, links};
+}
+
+/* ---- detail pane -------------------------------------------------------- */
+
+function group(title, body) {
+  return '<div class="grp"><div class="t">' + escapeHtml(title) + '</div>' + body + '</div>';
+}
+function bullets(items, cap) {
+  const list = (items || []).slice(0, cap);
+  if (!list.length) return '';
+  const more = (items || []).length - list.length;
+  return '<ul>' + list.map(p => '<li>' + escapeHtml(p) + '</li>').join('')
+    + (more > 0 ? '<li class="muted">… ' + more + ' more</li>' : '') + '</ul>';
+}
+// A subsystem's neighbours are areas, and most areas are not subsystems: this
+// map draws a selected few. Only the ones it draws are clickable, so a chip
+// never promises a destination the page cannot go to.
+function chips(ids) {
+  if (!(ids || []).length) return '';
+  let offMap = 0;
+  const html = ids.map(n => {
+    if (subsystemById(n)) {
+      return '<button type="button" class="chip" data-goto="' + escapeHtml(n) + '">' + escapeHtml(n) + '</button>';
+    }
+    offMap++;
+    return '<span class="chip off" title="Not one of this map’s subsystems">' + escapeHtml(n) + '</span>';
+  }).join('');
+  return html + (offMap
+    ? '<div class="note" style="margin-top:6px">' + offMap + ' of ' + ids.length
+      + ' neighbour areas are outside this map’s subsystems and are not clickable.</div>'
+    : '');
+}
+
+function showDetail(id) {
+  const s = subsystemById(id);
+  const d = document.getElementById('detail');
+  if (!s) { d.innerHTML = '<span class="none">No detail.</span>'; return; }
+  const langs = s.languages || [];
+  const fileCount = s.file_count || 0;
+  let html = '<h3>' + escapeHtml(s.area) + '</h3>';
+  if (s.summary) html += '<div class="sum">' + escapeHtml(s.summary) + '</div>';
+
+  if (fileCount) {
+    html += '<div class="mini">' + barHtml(langs, fileCount, true) + '</div>';
+    html += '<div class="muted" style="font-size:11px">' + langs.slice(0, 6).map(p =>
+      escapeHtml(labelFor(p[0])) + ' ' + pctText(p[1], fileCount)).join(' · ')
+      + ' — ' + fmt(fileCount) + ' file' + (fileCount === 1 ? '' : 's') + '</div>';
+  } else {
+    html += '<div class="none">No indexed files attributed to this subsystem.</div>';
+  }
+
+  html += group('Entry points', bullets(s.entry_points, 10) || '<div class="none">none</div>');
+  html += group('Critical files', bullets(s.critical_files, 10) || '<div class="none">none</div>');
+  html += group('Neighbors', chips(s.neighbors) || '<div class="none">none</div>');
+
+  const handoffFallback = META.handoff_paths_computed
+    ? '<div class="none">none</div>'
+    : '<div class="none">not computed for this map</div>';
+  html += group('Handoffs', bullets(s.handoff_paths, 8) || handoffFallback);
+
+  const roles = s.role_files || {};
+  const roleKeys = Object.keys(roles);
+  if (roleKeys.length) {
+    html += group('Roles', '<ul>' + roleKeys.map(r =>
+      '<li><span class="muted">' + escapeHtml(r) + ':</span> ' + escapeHtml((roles[r] || []).slice(0, 6).join(', ')) + '</li>'
+    ).join('') + '</ul>');
+  } else if (!META.role_files_computed) {
+    html += group('Roles', '<div class="none">not computed for this map</div>');
+  }
+
+  const unresolved = (DATA.unresolved_handoffs || []).filter(u => u.from === id);
+  if (unresolved.length) {
+    html += group('Unresolved handoffs (text only)', bullets(unresolved.map(u => u.text), 8));
+  }
+  d.innerHTML = html;
+  d.querySelectorAll('button[data-goto]').forEach(b => b.addEventListener('click', () => select(b.getAttribute('data-goto'))));
+}
+
+function select(id, fromList) {
+  selected = [id];
+  showDetail(id);
+  redraw();
+  if (fromList) return;
+  const li = document.querySelector('#subList li[data-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+  if (li && li.scrollIntoView) li.scrollIntoView({block: 'nearest'});
+}
+
+/* ---- liveness + list ---------------------------------------------------- */
+
+function renderLiveness() {
+  const live = DATA.liveness || {};
+  const parts = [
+    '<span class="badge entry">entry roots <b>' + fmt((live.entry_roots || []).length) + '</b></span>',
+    '<span class="badge dead">unwired <b>' + fmt((live.unwired_candidates || []).length) + '</b></span>',
+    '<span class="badge dead">dead symbols <b>' + fmt((live.dead_symbol_candidates || []).length) + '</b></span>'
+  ];
+  if (live.liveness_unreachable_unreliable) {
+    parts.push('<span class="badge warn">unreachable unreliable</span>');
+  } else {
+    parts.push('<span class="badge">unreachable <b>' + fmt((live.unreachable_files || []).length) + '</b></span>');
+  }
+  document.getElementById('livenessBadges').innerHTML = parts.join('');
+}
+
+function renderSubList(fd) {
+  const ul = document.getElementById('subList');
+  const rows = (fd.nodes || []).map(n => {
+    const s = subsystemById(n.id) || {};
+    const langs = s.languages || [];
+    const count = s.file_count || 0;
+    const head = String(s.area || n.id);
+    const cut = head.lastIndexOf('/');
+    const nm = cut >= 0
+      ? '<span class="dim">' + escapeHtml(head.slice(0, cut + 1)) + '</span>' + escapeHtml(head.slice(cut + 1))
+      : escapeHtml(head);
+    const sel = selected.indexOf(n.id) >= 0 ? ' class="sel"' : '';
+    return '<li data-id="' + escapeHtml(n.id) + '"' + sel + '>'
+      + '<span class="dot" style="background:' + colorFor(n.lang) + '" title="' + escapeHtml(labelFor(n.lang)) + '"></span>'
+      + '<span class="nm" title="' + escapeHtml(head) + '">' + nm + (n.entry ? ' <span style="color:var(--entry)">&#9733;</span>' : '') + '</span>'
+      + '<span class="ct">' + (count ? fmt(count) : '&mdash;') + '</span>'
+      + (count ? '<span class="strip">' + barHtml(langs, count, false) + '</span>' : '')
+      + '</li>';
+  });
+  ul.innerHTML = rows.join('') || '<li class="empty">No subsystem matches this filter.</li>';
+  ul.querySelectorAll('li[data-id]').forEach(li => li.addEventListener('click', () => select(li.getAttribute('data-id'), true)));
+}
+
+/* ---- graph -------------------------------------------------------------- */
+
+const elem = document.getElementById('graph');
+const stage = document.getElementById('stage');
+const Graph = window.ForceGraph;
+if (typeof Graph !== 'function') {
+  document.getElementById('vendorWarn').style.display = 'block';
+}
+const g = typeof Graph === 'function' ? Graph()(elem) : null;
+
+// Node size is a *screen* measurement, in CSS pixels at 100% zoom.
+//
+// It was a graph-space one, and graph space is multiplied by the zoom: a
+// subsystem of 85 files drew an 18.7-unit disc, which zoom-to-fit's 175% turned
+// into 65px of solid colour with a 12px label under it. Every disc read as a
+// blob and the edges between them disappeared. The cap hid the worst of it and
+// hid the cause with it — the radius was never in the units the reader sees.
+//
+// The band is taken from the renderers this preview is measured against, not
+// from taste: cosmos.gl ships `pointDefaultSize: 4` and sigma.js hides a label
+// once a node renders below 6px. Both draw a *marker* — a small dot whose job
+// is to anchor a label and a colour — and let edges and text carry the picture.
+// Earlier passes here drew 65px and then 35px discs, which turn a 14-node graph
+// into a bubble chart and hide the edges behind the bubbles.
+//
+// Size still encodes one number, but over a deliberately narrow span: the exact
+// file count is printed in the sidebar, so the dot only has to rank at a glance.
+const R_MIN = 3, R_MAX = 8;
+function nodeScreenRadius(n, sizeMode) {
+  if (sizeMode === 'constant') return 4;
+  const raw = sizeMode === 'files'
+    ? 2.5 + Math.sqrt(Math.max(1, n.file_count || 1)) * 0.6
+    : 2.5 + Math.sqrt(Math.max(1, n.val || 1)) * 0.9;
+  return Math.max(R_MIN, Math.min(R_MAX, raw));
+}
+
+// cosmos.gl's `scalePointsOnZoom: false`, which is its default. Dividing the
+// canvas transform out entirely holds the dot at an exact pixel size at every
+// zoom, so zooming spreads the layout and leaves the markers alone. sigma.js
+// grows them by `sqrt(ratio)` instead; that was the previous pass here, and at
+// a 256% opening fit it still opened at 35px.
+function drawnRadius(n, sizeMode, globalScale) {
+  return nodeScreenRadius(n, sizeMode) / Math.max(0.05, globalScale);
+}
+
+function ctrlValue(id, fallback) {
+  const el = document.getElementById(id);
+  return el ? el.value : fallback;
+}
+
+// Labels are a fixed pixel size, so at a low zoom they collide long before the
+// dots do — five subsystems stacked their names into one smudge at the opening
+// fit. sigma.js answers this by simply not drawing a label that would overlap
+// one already placed, and so does this: boxes are collected per frame, in draw
+// order, and a clash means the later (smaller) node goes unlabelled until you
+// zoom in and the collision clears itself.
+let labelBoxes = [];
+function labelFits(x, y, w, h) {
+  for (const b of labelBoxes) {
+    if (x < b[0] + b[2] && x + w > b[0] && y < b[1] + b[3] && y + h > b[1]) return false;
+  }
+  return true;
+}
+
+function applyNodeStyle() {
+  if (!g) return;
+  const sizeMode = ctrlValue('sizeMode', 'files');
+  const labelMode = ctrlValue('labelMode', 'always');
+  // force-graph derives the pointer area *and* `zoomToFit`'s bbox padding from
+  // `sqrt(nodeVal) * nodeRelSize`. Left at the raw file count with the default
+  // relSize of 4, an 85-file subsystem claimed a 37-unit hit radius around an
+  // 18.7-unit disc, and padded the fit by the same wrong amount. At relSize 1,
+  // `nodeVal = r²` makes both agree with what is actually drawn.
+  g.nodeRelSize(1).nodeVal(n => Math.pow(nodeScreenRadius(n, sizeMode), 2));
+  g.nodeCanvasObject((node, ctx, globalScale) => {
+    const isSel = selected.indexOf(node.id) >= 0;
+    const show = labelMode === 'always' || (labelMode === 'selected' && isSel) || isSel;
+    const r = drawnRadius(node, sizeMode, globalScale);
+    // Strokes and text divide by the scale outright: a 1px hairline and a 12px
+    // label should stay a 1px hairline and a 12px label at every zoom.
+    const px = 1 / globalScale;
+    if (node.entry) {
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r + 2 * px, 0, 2 * Math.PI, false);
+      ctx.strokeStyle = '#34d399';
+      ctx.lineWidth = 1.25 * px;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, r, 0, 2 * Math.PI, false);
+    ctx.fillStyle = colorFor(node.lang);
+    ctx.fill();
+    if (isSel) {
+      ctx.strokeStyle = '#e7ecf3';
+      ctx.lineWidth = 1.75 * px;
+      ctx.stroke();
+    }
+    if (show) {
+      const label = node.name || node.id;
+      ctx.font = (11 * px) + 'px ui-sans-serif, system-ui, sans-serif';
+      const w = ctx.measureText(label).width;
+      const h = 12 * px;
+      const x = node.x - w / 2;
+      const y = node.y + r + 3 * px;
+      // The selection is what the reader just asked for, so it is drawn even
+      // when it clashes — and it still claims its box, so nothing lands on it.
+      if (isSel || labelFits(x, y, w, h)) {
+        labelBoxes.push([x, y, w, h]);
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = isSel ? '#e7ecf3' : '#8b9bb4';
+        ctx.fillText(label, node.x, y);
+      }
+    }
+  });
+}
+
+function renderLegend(fd) {
+  const seen = [];
+  (fd.nodes || []).forEach(n => { if (n.lang && seen.indexOf(n.lang) < 0) seen.push(n.lang); });
+  const langRows = seen.slice(0, 6).map(l =>
+    '<div class="leg-row"><span class="dot' + (isOfficial(l) ? '' : ' unofficial') + '" style="background:' + colorFor(l) + '"></span> ' + escapeHtml(labelFor(l)) + '</div>'
+  ).join('');
+  document.getElementById('legend').innerHTML =
+    '<div class="leg-row"><span class="swatch edge-neighbor"></span> neighbor edge</div>'
+    + '<div class="leg-row"><span class="swatch edge-handoff"></span> handoff edge</div>'
+    + '<div class="leg-row"><span class="swatch entry"></span> ring = has entry points</div>'
+    + (langRows ? '<div class="leg-sec">' + langRows + (seen.length > 6 ? '<div class="leg-row muted">+' + (seen.length - 6) + ' more</div>' : '') + '</div>' : '');
+}
+
+function updateCounts(fd) {
+  const shown = (fd.nodes || []).length, all = (DATA.nodes || []).length;
+  document.getElementById('counts').textContent =
+    shown === all ? fmt(all) + ' shown' : fmt(shown) + ' of ' + fmt(all) + ' shown';
+}
+
+function redraw() {
+  const fd = filtered();
+  if (g) {
+    g.graphData(fd);
+    g.width(stage.clientWidth).height(stage.clientHeight);
+    applyNodeStyle();
+  }
+  updateCounts(fd);
+  renderSubList(fd);
+  renderLegend(fd);
+  document.getElementById('langLegend').querySelectorAll('button[data-lang]').forEach(b => {
+    b.classList.toggle('off', !!langFilter && b.getAttribute('data-lang') !== langFilter);
+  });
+}
+
+/* ---- canvas chrome ------------------------------------------------------ */
+
+let zoomK = 1;
+// The startup sequence reheats the simulation *after* the first run begins, so
+// the first `onEngineStop` reports a half-placed layout. Fitting once on that
+// stop left 3 of 14 nodes outside the stage. Fit on every stop instead, until
+// the reader takes over the viewport — after that the view is theirs.
+let userAdjusted = false;
+let forcesInstalled = false;
+function updateZoomPct(k) {
+  if (typeof k === 'number' && k > 0) zoomK = k;
+  document.getElementById('zoomPct').textContent = Math.round(zoomK * 100) + '%';
+}
+function fitView() {
+  if (!g) return;
+  // Padding proportional to the stage. A fixed 80px is a comfortable margin on
+  // a wide canvas and most of the canvas on a narrow one — at a 300px stage it
+  // fit the graph to 12% and stacked every label on top of its neighbour.
+  const pad = Math.max(16, Math.min(80, Math.min(stage.clientWidth, stage.clientHeight) * 0.08));
+  requestAnimationFrame(() => g.zoomToFit(400, pad));
+}
+function bumpZoom(factor) {
+  if (!g) return;
+  const cur = typeof g.zoom() === 'number' ? g.zoom() : zoomK;
+  g.zoom(Math.max(0.05, Math.min(8, cur * factor)), 200);
+}
+// A d3-style positioning force pulling every node toward the origin.
+//
+// Without it, a subsystem with no edges feels only charge repulsion and drifts
+// outward for as long as the simulation runs: on this repository `cpp`,
+// `tree_sitter` and `web` ended hundreds of units past the connected cluster,
+// and the only *correct* fit that included them shrank the interesting part to
+// 30%. d3's own `forceCenter` does not help — it translates the mean position,
+// it does not bound the spread. Written inline because the bundle exposes
+// `d3Force(name, force)` but not the d3 factories.
+function towardOrigin(strength) {
+  let nodes = [];
+  function force(alpha) {
+    const k = strength * alpha;
+    for (const n of nodes) { n.vx -= n.x * k; n.vy -= n.y * k; }
+  }
+  force.initialize = (n) => { nodes = n; };
+  return force;
+}
+
+function applyLayoutForces() {
+  if (!g) return;
+  const charge = Number(ctrlValue('layoutCharge', -260));
+  const dist = Number(ctrlValue('layoutDistance', 110));
+  const chargeForce = g.d3Force('charge');
+  if (chargeForce && chargeForce.strength) chargeForce.strength(charge);
+  const linkForce = g.d3Force('link');
+  if (linkForce && linkForce.distance) linkForce.distance(dist);
+  // Scaled to the repulsion it balances, so the Charge slider keeps working.
+  g.d3Force('containment', towardOrigin(Math.min(0.2, Math.abs(charge) / 3250)));
+  g.d3ReheatSimulation();
+}
+
+if (g) {
+  g.nodeId('id')
+    .nodeLabel(n => (n.entry ? '★ ' : '') + (n.area || n.id) + ' — ' + labelFor(n.lang) + ' · ' + fmt(n.file_count) + ' files')
+    .nodeColor(n => colorFor(n.lang))
+    .linkColor(l => l.kind === 'handoff' ? '#a78bfa' : '#3d8bfd')
+    .linkDirectionalParticles(l => l.kind === 'handoff' ? 2 : 1)
+    .linkDirectionalParticleWidth(1.5)
+    .cooldownTicks(120)
+    .onRenderFramePre(() => { labelBoxes = []; })
+    .onNodeClick(n => select(n.id))
+    .onZoom(z => updateZoomPct(z && typeof z.k === 'number' ? z.k : z))
+    .onEngineStop(() => { if (!userAdjusted) fitView(); })
+    // force-graph builds its simulation lazily on the first frame, so forces
+    // installed synchronously after `graphData` are written into a simulation
+    // that is then replaced — the containment force silently never applied.
+    // The first tick is the earliest point at which the simulation exists.
+    .onEngineTick(() => { if (!forcesInstalled) { forcesInstalled = true; applyLayoutForces(); } });
+
+  // Any deliberate viewport change hands control over. Captured on the stage so
+  // it sees the wheel and drag force-graph handles internally.
+  ['wheel', 'pointerdown'].forEach(evt =>
+    stage.addEventListener(evt, () => { userAdjusted = true; }, {passive: true, capture: true}));
+
+  document.getElementById('zoomIn').addEventListener('click', () => { userAdjusted = true; bumpZoom(1.25); });
+  document.getElementById('zoomOut').addEventListener('click', () => { userAdjusted = true; bumpZoom(0.8); });
+  // Fit is a request to re-fit, so it clears the override rather than setting it.
+  document.getElementById('zoomFit').addEventListener('click', () => { userAdjusted = false; fitView(); });
+  document.getElementById('layoutPause').addEventListener('change', ev => {
+    if (ev.target.checked) g.pauseAnimation(); else g.resumeAnimation();
+  });
+  ['layoutCharge', 'layoutDistance'].forEach(id =>
+    document.getElementById(id).addEventListener('input', applyLayoutForces));
+  ['labelMode', 'sizeMode'].forEach(id =>
+    document.getElementById(id).addEventListener('change', () => { applyNodeStyle(); }));
+}
+
+document.getElementById('search').addEventListener('input', redraw);
+document.getElementById('langFilter').addEventListener('change', ev => { langFilter = ev.target.value; redraw(); });
+// A resize changes how much canvas the same layout has to sit in, so the zoom
+// that fitted the old stage does not fit the new one. Refit unless the reader
+// has taken over the viewport. Debounced: a drag-resize fires continuously.
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!g) return;
+  g.width(stage.clientWidth).height(stage.clientHeight);
+  if (userAdjusted) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(fitView, 120);
+});
+document.addEventListener('keydown', ev => {
+  const t = ev.target && ev.target.tagName ? ev.target.tagName.toLowerCase() : '';
+  if (t === 'input' || t === 'select' || t === 'textarea') return;
+  if (ev.key === '+' || ev.key === '=') { ev.preventDefault(); userAdjusted = true; bumpZoom(1.25); }
+  else if (ev.key === '-' || ev.key === '_') { ev.preventDefault(); userAdjusted = true; bumpZoom(0.8); }
+  else if (ev.key === '0') { ev.preventDefault(); userAdjusted = false; fitView(); }
+  else if (ev.key === 'Escape') {
+    selected = [];
+    langFilter = '';
+    document.getElementById('langFilter').value = '';
+    document.getElementById('detail').innerHTML = '<span class="none">Select a subsystem to inspect.</span>';
+    redraw();
+  }
+});
+
+renderStats();
+renderLanguages();
+renderLiveness();
+redraw();
+fitView();
+</script>
+</body>
+</html>

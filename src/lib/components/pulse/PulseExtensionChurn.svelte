@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PulseExtensionChurn } from "../../pulse/types";
-  import { Layers } from "lucide-svelte";
+  import { Layers } from "@lucide/svelte";
 
   let {
     extensions = [],
@@ -15,7 +15,7 @@
 </script>
 
 {#if shown.length > 0}
-  <div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-sm flex flex-col gap-3">
+  <div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-3">
     <div class="flex items-center gap-2 border-b border-border/50 pb-2.5">
       <Layers size={15} class="text-accent shrink-0" />
       <span class="text-xs font-semibold text-textPrimary uppercase tracking-wider">Churn by extension</span>

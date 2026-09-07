@@ -1,0 +1,134 @@
+{
+  "map_engine": "devmap-rust",
+  "generated_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "indexed_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "content_fingerprint": "c2:cccccccccccccccccccccccccccccccccccccccc",
+  "graph_degraded": false,
+  "graph_degraded_reason": "",
+  "liveness_unreachable_unreliable": true,
+  "languages": ["rust", "typescript"],
+  "frameworks": [],
+  "package_managers": ["cargo", "npm"],
+  "test_commands": ["cargo test", "npm test"],
+  "important_files": ["src-tauri/Cargo.toml", "package.json"],
+  "candidate_files": [],
+  "files": [
+    {
+      "path": "src/lib/map.rs",
+      "area": "src/lib",
+      "kind": "code",
+      "language": "rust"
+    },
+    {
+      "path": "src/lib/map_test.rs",
+      "area": "src/lib",
+      "kind": "code",
+      "language": "rust"
+    }
+  ],
+  "subsystems": [
+    {
+      "area": "src/lib",
+      "summary": "src/lib: 2 files, mostly rust (1 tests)",
+      "entry_points": ["src/lib/map.rs"],
+      "critical_files": ["src/lib/map.rs"],
+      "neighbors": ["src-tauri/src"],
+      "handoff_paths": ["src/lib/map.rs -> src-tauri/src/devmap/mod.rs"],
+      "role_files": {
+        "entry": ["src/lib/map.rs"],
+        "tests": ["src/lib/map_test.rs"],
+        "other": []
+      },
+      "role_file_counts": {
+        "entry": 1,
+        "tests": 5,
+        "other": 0
+      }
+    }
+  ],
+  "dependents": {},
+  "dependents_total": 0,
+  "entry_roots": ["package.json", "src-tauri/Cargo.toml"],
+  "unwired_candidates": ["src/orphan.rs", "tools/scratch.ts"],
+  "unreachable_files": ["vendor/legacy/dead.rs"],
+  "dead_symbol_candidates": [
+    "src/lib/map.rs::unused_helper",
+    "src/orphan.rs::gone"
+  ],
+  "resolution_rate": {
+    "resolved_sites": 10,
+    "unresolved_sites": 20,
+    "explained_sites": 5,
+    "gross_permille": 333,
+    "net_permille": 400,
+    "by_language": {}
+  },
+  "dead_clusters": null,
+  "dead_clusters_truncated": 0,
+  "dead_clusters_incomplete": "component pass refused an oversized graph",
+  "lsp": {},
+  "dependency_risks": [],
+  "processes": [],
+  "freshness": {
+    "generated_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "indexed_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "content_fingerprint": "c2:cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "liveness_meta": {
+    "engine": "devmap-rust",
+    "dead_symbol": {
+      "shown": 2,
+      "total": 7,
+      "truncated": true,
+      "count": 7,
+      "by_confidence": {
+        "shown": { "extracted": 2, "inferred": 0, "ambiguous": 0 },
+        "total": { "extracted": 4, "inferred": 3, "ambiguous": 0 }
+      }
+    },
+    "entry_roots": { "shown": 2, "total": 4, "truncated": true },
+    "subsystems": {
+      "shown": 1,
+      "total": 3,
+      "truncated": true,
+      "dropped_no_area": 1,
+      "neighbors_shown": 1,
+      "neighbors_total": 4,
+      "neighbors_truncated": true,
+      "handoff_paths_shown": 1,
+      "handoff_paths_total": 9,
+      "handoff_paths_truncated": true,
+      "role_files_shown": 2,
+      "role_files_total": 6,
+      "role_files_truncated": true,
+      "neighbors_endpoints_unresolved": 0
+    },
+    "important_files": { "shown": 2, "total": 2, "truncated": false },
+    "unwired": {
+      "shown": 2,
+      "total": 2,
+      "truncated": false,
+      "excluded_coverage_loss": 1,
+      "excluded_import_blind": 0
+    },
+    "unavailable": {
+      "unreachable_files": "the component pass could not answer reachability for this generation"
+    }
+  },
+  "meta": {
+    "devmap_rust": {
+      "neighbors_computed": true,
+      "handoff_paths_computed": true,
+      "role_files_computed": true,
+      "file_kinds_computed": true,
+      "subsystem_summaries_computed": true,
+      "frameworks_computed": true,
+      "package_managers_computed": true,
+      "test_commands_computed": true,
+      "candidate_files_computed": false,
+      "dependency_risks_computed": false,
+      "lsp_computed": false,
+      "processes_computed": false
+    }
+  }
+}

@@ -470,7 +470,7 @@ pub fn redact_secrets(text: &str) -> String {
     }
     // Longest first, so a short prefix cannot partially rewrite a longer token
     // that contains it and leave the tail in place.
-    tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    tokens.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
     let mut out = text.to_string();
     for (token, keep) in tokens {

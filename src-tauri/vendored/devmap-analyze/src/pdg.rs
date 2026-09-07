@@ -4,9 +4,42 @@
 //! control flow from line numbers: branch, loop, exception, termination,
 //! definitions, uses, and exact sink variables must be explicit at the
 //! extraction boundary.
+//!
+//! # Bounds
+//!
+//! [`FunctionPdgInput`] derives `Deserialize`, so the statement tree is
+//! untrusted input by construction and every walk over it is bounded:
+//! [`MAX_PDG_NESTING_DEPTH`] on the recursion, [`MAX_PDG_STATEMENTS`] on the
+//! breadth, and a pass ceiling on each of the two dataflow fixpoints. All four
+//! are *refusals* — an `Err` naming the ceiling — never a truncated graph.
+//! Returning a PDG built from part of a function would be a check that could
+//! not run reporting as one that ran and passed, and the whole point of a data
+//! dependency graph is that a caller trusts what it does not contain.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Deepest statement nesting the builder will walk.
+///
+/// Both walks over the tree — [`validate_statements`] and
+/// `PdgBuilder::build_sequence` — recurse once per nesting level, and with no
+/// cap the failure mode is `fatal runtime error: stack overflow` and a `SIGABRT`
+/// that no caller can catch: a 100,000-level tree is a ~2 MB payload, far under
+/// anything a transport would reject. Sixty-four levels is far past anything a
+/// real function reaches (CPython's own compiler caps nesting at 20) and leaves
+/// the deepest legal input using ~65 frames of the several thousand available.
+pub const MAX_PDG_NESTING_DEPTH: usize = 64;
+
+/// Most statements one function's PDG may hold, counting every nesting level.
+///
+/// Breadth is a ceiling for a different reason than depth: every statement
+/// becomes a CFG node, and both fixpoints below sweep every node on every pass,
+/// so the build is quadratic in this number. Measured on the debug profile with
+/// a def-use chain — the worst shape — 800 statements took 1.3 s and the cost
+/// grows with the square, which is why this sits at 2,000 and not higher. A
+/// single function with more statements than this is not a function this
+/// analysis has anything useful to say about.
+pub const MAX_PDG_STATEMENTS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CfgNodeKind {
@@ -200,11 +233,26 @@ impl<'a> PdgBuilder<'a> {
         id
     }
 
+    /// Thread the CFG for one statement list.
+    ///
+    /// `depth` is the same nesting level [`validate_statements`] counted, and
+    /// the cap is re-checked here rather than assumed: validation is the gate
+    /// that makes exceeding it impossible, but a builder whose only protection
+    /// lives in a function a future caller might skip is one refactor away from
+    /// aborting the process again. Exceeding it is an error, never a shorter
+    /// graph — a CFG missing the body of a loop is not a smaller answer, it is
+    /// a wrong one.
     fn build_sequence(
         &mut self,
         statements: &[PdgStatement],
         mut incoming: Vec<Incoming>,
-    ) -> Vec<Incoming> {
+        depth: usize,
+    ) -> anyhow::Result<Vec<Incoming>> {
+        if depth > MAX_PDG_NESTING_DEPTH {
+            anyhow::bail!(
+                "PDG statement nesting exceeds the {MAX_PDG_NESTING_DEPTH}-level depth cap"
+            );
+        }
         for statement in statements {
             if incoming.is_empty() {
                 break;
@@ -213,6 +261,7 @@ impl<'a> PdgBuilder<'a> {
             for source in &incoming {
                 self.add_control(&source.node, &node, source.edge_kind);
             }
+            let inner = depth + 1;
             incoming = match &statement.kind {
                 PdgStatementKind::Basic => vec![Incoming {
                     node,
@@ -238,7 +287,8 @@ impl<'a> PdgBuilder<'a> {
                                 node: node.clone(),
                                 edge_kind: "control:true",
                             }],
-                        )
+                            inner,
+                        )?
                     };
                     let else_exits = if else_body.is_empty() {
                         vec![Incoming {
@@ -252,7 +302,8 @@ impl<'a> PdgBuilder<'a> {
                                 node,
                                 edge_kind: "control:false",
                             }],
-                        )
+                            inner,
+                        )?
                     };
                     then_exits.into_iter().chain(else_exits).collect()
                 }
@@ -263,7 +314,8 @@ impl<'a> PdgBuilder<'a> {
                             node: node.clone(),
                             edge_kind: "control:true",
                         }],
-                    );
+                        inner,
+                    )?;
                     for tail in body_exits {
                         self.add_control(&tail.node, &node, "control:loop");
                     }
@@ -283,7 +335,8 @@ impl<'a> PdgBuilder<'a> {
                             node: node.clone(),
                             edge_kind: "control:try",
                         }],
-                    );
+                        inner,
+                    )?;
                     for handler in handlers {
                         exits.extend(self.build_sequence(
                             handler,
@@ -291,7 +344,8 @@ impl<'a> PdgBuilder<'a> {
                                 node: node.clone(),
                                 edge_kind: "control:exception",
                             }],
-                        ));
+                            inner,
+                        )?);
                     }
                     if finally_body.is_empty() {
                         exits
@@ -299,26 +353,27 @@ impl<'a> PdgBuilder<'a> {
                         for incoming in &mut exits {
                             incoming.edge_kind = "control:finally";
                         }
-                        self.build_sequence(finally_body, exits)
+                        self.build_sequence(finally_body, exits, inner)?
                     }
                 }
             };
         }
-        incoming
+        Ok(incoming)
     }
 
-    fn finish(mut self) -> FunctionPdg {
+    fn finish(mut self) -> anyhow::Result<FunctionPdg> {
         let tails = self.build_sequence(
             &self.input.body,
             vec![Incoming {
                 node: self.entry.clone(),
                 edge_kind: "control:entry",
             }],
-        );
+            0,
+        )?;
         for tail in tails {
             self.add_control(&tail.node, &self.exit.clone(), tail.edge_kind);
         }
-        self.add_data_edges();
+        self.add_data_edges()?;
         self.edges.sort_by(|left, right| {
             (
                 &left.source_node,
@@ -334,16 +389,33 @@ impl<'a> PdgBuilder<'a> {
                 ))
         });
         self.edges.dedup();
-        FunctionPdg {
+        Ok(FunctionPdg {
             function_name: self.input.function_name.clone(),
             generation_id: self.input.generation_id,
             content_hash: self.input.content_hash,
             nodes: self.nodes,
             edges: self.edges,
-        }
+        })
     }
 
-    fn add_data_edges(&mut self) {
+    /// Pass ceiling shared by both dataflow fixpoints below.
+    ///
+    /// Sound for each, not a guess. Reaching definitions: a definition reaches
+    /// a node along some shortest path, a shortest path is simple and so has at
+    /// most `|N|` edges, and every pass sweeps every node — so after `|N|`
+    /// passes every definition has arrived and pass `|N| + 1` reports no change.
+    /// Taint: a node's whole definition set is tainted in the single pass its
+    /// `consumes_taint` first holds, and a node can make that transition once,
+    /// so at most `|N|` passes are productive.
+    ///
+    /// Hitting it therefore means the iteration is not the monotone one this
+    /// argument describes, which is a bug in this module rather than a large
+    /// input — so it is reported, not absorbed.
+    fn fixpoint_pass_ceiling(&self) -> usize {
+        self.nodes.len().saturating_add(2)
+    }
+
+    fn add_data_edges(&mut self) -> anyhow::Result<()> {
         type Definitions = BTreeMap<String, BTreeSet<(String, u32)>>;
         let mut predecessors: BTreeMap<String, BTreeSet<String>> = self
             .nodes
@@ -366,12 +438,28 @@ impl<'a> PdgBuilder<'a> {
             .map(|node| (node.clone(), Definitions::new()))
             .collect();
         let mut outbound = inbound.clone();
+        let ceiling = self.fixpoint_pass_ceiling();
+        // Every lookup below goes through `get`, never `BTreeMap`'s `Index`.
+        // Both maps are keyed by every node id and every id used here comes
+        // from `self.nodes`, so a miss is impossible today — and `Index` turns
+        // the day that stops being true into a panic in a library, which is the
+        // one failure mode a caller cannot do anything about.
+        let empty = Definitions::new();
+        let mut passes = 0usize;
         loop {
+            passes += 1;
+            if passes > ceiling {
+                anyhow::bail!(
+                    "PDG reaching definitions did not settle in {ceiling} pass(es) over \
+                     {} node(s)",
+                    self.nodes.len()
+                );
+            }
             let mut changed = false;
             for (node, cfg_node) in &self.nodes {
                 let mut new_in = Definitions::new();
                 for predecessor in predecessors.get(node).into_iter().flatten() {
-                    merge_definitions(&mut new_in, &outbound[predecessor]);
+                    merge_definitions(&mut new_in, outbound.get(predecessor).unwrap_or(&empty));
                 }
                 let mut new_out = new_in.clone();
                 if let Some(facts) = self.facts.get(node) {
@@ -382,7 +470,7 @@ impl<'a> PdgBuilder<'a> {
                         );
                     }
                 }
-                if inbound[node] != new_in || outbound[node] != new_out {
+                if inbound.get(node) != Some(&new_in) || outbound.get(node) != Some(&new_out) {
                     inbound.insert(node.clone(), new_in);
                     outbound.insert(node.clone(), new_out);
                     changed = true;
@@ -399,11 +487,20 @@ impl<'a> PdgBuilder<'a> {
             .iter()
             .map(|param| (self.entry.clone(), param.clone()))
             .collect();
+        let mut passes = 0usize;
         loop {
+            passes += 1;
+            if passes > ceiling {
+                anyhow::bail!(
+                    "PDG taint propagation did not settle in {ceiling} pass(es) over {} node(s)",
+                    self.nodes.len()
+                );
+            }
             let mut changed = false;
             for (node, facts) in &self.facts {
+                let reaching = inbound.get(node).unwrap_or(&empty);
                 let consumes_taint = facts.uses.iter().any(|used| {
-                    inbound[node].get(used).is_some_and(|definitions| {
+                    reaching.get(used).is_some_and(|definitions| {
                         definitions
                             .iter()
                             .any(|(source, _)| tainted.contains(&(source.clone(), used.clone())))
@@ -422,8 +519,9 @@ impl<'a> PdgBuilder<'a> {
 
         let mut data_edges = Vec::new();
         for (node, facts) in &self.facts {
+            let reaching = inbound.get(node).unwrap_or(&empty);
             for used in &facts.uses {
-                for (source, _) in inbound[node].get(used).into_iter().flatten() {
+                for (source, _) in reaching.get(used).into_iter().flatten() {
                     data_edges.push(PdgEdge {
                         source_node: source.clone(),
                         target_node: node.clone(),
@@ -437,7 +535,7 @@ impl<'a> PdgBuilder<'a> {
                 }
             }
             for sink in &facts.sinks {
-                for (source, _) in inbound[node].get(sink).into_iter().flatten() {
+                for (source, _) in reaching.get(sink).into_iter().flatten() {
                     if tainted.contains(&(source.clone(), sink.clone())) {
                         data_edges.push(PdgEdge {
                             source_node: source.clone(),
@@ -450,6 +548,7 @@ impl<'a> PdgBuilder<'a> {
             }
         }
         self.edges.extend(data_edges);
+        Ok(())
     }
 }
 
@@ -478,16 +577,50 @@ pub fn build_function_pdg(input: &FunctionPdgInput) -> anyhow::Result<FunctionPd
             anyhow::bail!("PDG parameter names must be unique and non-empty");
         }
     }
-    validate_statements(&input.body, input.start_line, input.end_line)?;
-    Ok(PdgBuilder::new(input).finish())
+    let mut budget = Budget {
+        statements: MAX_PDG_STATEMENTS,
+    };
+    validate_statements(
+        &input.body,
+        input.start_line,
+        input.end_line,
+        0,
+        &mut budget,
+    )?;
+    PdgBuilder::new(input).finish()
 }
 
+/// What is left of the size ceilings while one input is being validated.
+struct Budget {
+    statements: usize,
+}
+
+/// Check the statement tree, and bound the walk that checks it.
+///
+/// `depth` and `budget` are the two ceilings the module documents. They are
+/// enforced here, before a node is allocated, because this is the walk that
+/// runs first: refusing an oversized tree at the gate is what keeps
+/// `build_sequence` from descending it and what keeps the fixpoints from
+/// sweeping it.
 fn validate_statements(
     statements: &[PdgStatement],
     start_line: u32,
     end_line: u32,
+    depth: usize,
+    budget: &mut Budget,
 ) -> anyhow::Result<()> {
+    if depth > MAX_PDG_NESTING_DEPTH {
+        anyhow::bail!("PDG statement nesting exceeds the {MAX_PDG_NESTING_DEPTH}-level depth cap");
+    }
+    let inner = depth + 1;
     for statement in statements {
+        let Some(remaining) = budget.statements.checked_sub(1) else {
+            anyhow::bail!(
+                "PDG function exceeds the {MAX_PDG_STATEMENTS}-statement cap; \
+                 the graph is refused rather than built from part of the function"
+            );
+        };
+        budget.statements = remaining;
         if !(start_line..=end_line).contains(&statement.line) {
             anyhow::bail!(
                 "PDG statement line {} is outside the function",
@@ -516,22 +649,22 @@ fn validate_statements(
                 then_body,
                 else_body,
             } => {
-                validate_statements(then_body, start_line, end_line)?;
-                validate_statements(else_body, start_line, end_line)?;
+                validate_statements(then_body, start_line, end_line, inner, budget)?;
+                validate_statements(else_body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Loop { body } => {
-                validate_statements(body, start_line, end_line)?;
+                validate_statements(body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Try {
                 body,
                 handlers,
                 finally_body,
             } => {
-                validate_statements(body, start_line, end_line)?;
+                validate_statements(body, start_line, end_line, inner, budget)?;
                 for handler in handlers {
-                    validate_statements(handler, start_line, end_line)?;
+                    validate_statements(handler, start_line, end_line, inner, budget)?;
                 }
-                validate_statements(finally_body, start_line, end_line)?;
+                validate_statements(finally_body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Basic | PdgStatementKind::Return | PdgStatementKind::Raise => {}
         }

@@ -43,15 +43,20 @@
     LayoutGrid,
     Settings,
     Plug,
-  } from "lucide-svelte";
+    Wrench,
+  } from "@lucide/svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { highlightMatches } from "../branches/groupBranches";
-  import { searchSymbols } from "../codeintel/client";
-  import type { CodeintelSymbolHit } from "../codeintel/types";
+  import { searchSymbols, searchWorkspaceSymbols } from "../codeintel/client";
+  import type { CodeintelSymbolHit, WorkspaceFederatedHit } from "../codeintel/types";
+  import { openSetupWizard } from "../tools/onboardingStore";
 
   let isOpen = $state(false);
   let query = $state("");
   let symbolHits = $state<CodeintelSymbolHit[]>([]);
+  let symbolSearchNote = $state<string | null>(null);
+  let workspaceHits = $state<WorkspaceFederatedHit[]>([]);
+  let workspaceSearchNote = $state<string | null>(null);
   let highlighted = $state(0);
   let inputEl: HTMLInputElement | undefined = $state();
   let listEl: HTMLDivElement | undefined = $state();
@@ -77,6 +82,33 @@
     } catch {
       /* ignore quota errors */
     }
+  }
+
+  function tabForWorkspaceRepo(repoName: string) {
+    const needle = repoName.toLowerCase();
+    return $repoStore.openTabs.find((tab) => {
+      if (tab.label.toLowerCase() === needle) return true;
+      if (tab.name.toLowerCase() === needle) return true;
+      const parts = tab.path.replace(/\\/g, "/").split("/").filter(Boolean);
+      const suffix = needle.split("/");
+      if (parts.length >= suffix.length) {
+        const tail = parts
+          .slice(-suffix.length)
+          .map((p) => p.toLowerCase())
+          .join("/");
+        if (tail === needle) return true;
+      }
+      return false;
+    });
+  }
+
+  async function openWorkspaceHit(hit: WorkspaceFederatedHit) {
+    const match = tabForWorkspaceRepo(hit.repo);
+    if (match && !match.isActive) {
+      await repoStore.activateTab(match.id);
+    }
+    repoStore.selectFilePath(hit.file_path);
+    repoStore.setActiveTab("code", "explorer");
   }
 
   // Keyboard navigation keeps the highlighted row visible.
@@ -252,6 +284,13 @@
       shortcut: undefined,
       action: () => window.dispatchEvent(new CustomEvent("gitpulse:settings")),
     },
+    {
+      id: "optional_tools_setup",
+      label: "Set up optional tools (devmap / manvi)",
+      icon: Wrench,
+      shortcut: undefined,
+      action: () => openSetupWizard("devmap", "explain"),
+    },
   ];
 
   let repoCommands = $derived([
@@ -260,6 +299,14 @@
     { id: "next_tab", label: "Next Repository Tab", icon: FolderGit2, shortcut: "Ctrl+Tab", action: () => void repoStore.nextTab() },
     { id: "prev_tab", label: "Previous Repository Tab", icon: FolderGit2, shortcut: "Ctrl+⇧+Tab", action: () => void repoStore.prevTab() },
     { id: "reopen_tab", label: "Reopen Closed Repository", icon: FolderGit2, shortcut: undefined, action: () => void repoStore.reopenLastClosed() },
+    { id: "move_tab_left", label: "Move Repository Tab Left", icon: FolderGit2, shortcut: "Ctrl+⇧+←", action: () => {
+      const active = $repoStore.openTabs.find((tab) => tab.isActive);
+      if (active) repoStore.moveTabBy(active.id, -1);
+    } },
+    { id: "move_tab_right", label: "Move Repository Tab Right", icon: FolderGit2, shortcut: "Ctrl+⇧+→", action: () => {
+      const active = $repoStore.openTabs.find((tab) => tab.isActive);
+      if (active) repoStore.moveTabBy(active.id, 1);
+    } },
     ...$repoStore.openTabs.map((tab) => ({
       id: `switch:${tab.id}`,
       label: `Switch to ${tab.label}`,
@@ -288,10 +335,12 @@
     action: () => void;
   }
 
-  let mode = $derived.by<"commands" | "commits" | "branches" | "symbols" | "help">(() => {
+  let mode = $derived.by<"commands" | "commits" | "branches" | "symbols" | "workspace" | "help">(() => {
     const trimmed = query.trim();
     if (trimmed.startsWith("#")) return "commits";
     if (trimmed.startsWith("@")) return "branches";
+    // `::` is cross-repo (TF-IDF when trailing `~`); bare `:` stays single-repo.
+    if (trimmed.startsWith("::")) return "workspace";
     if (trimmed.startsWith(":")) return "symbols";
     if (trimmed.startsWith("?")) return "help";
     return "commands";
@@ -299,10 +348,20 @@
 
   let effectiveSearchText = $derived.by(() => {
     const trimmed = query.trim();
+    if (trimmed.startsWith("::")) return trimmed.slice(2).trim();
     if (trimmed.startsWith(">") || trimmed.startsWith("#") || trimmed.startsWith("@") || trimmed.startsWith(":") || trimmed.startsWith("?")) {
       return trimmed.slice(1).trim();
     }
     return trimmed;
+  });
+
+  /** Trailing `~` requests TF-IDF name ranking for workspace search. */
+  let workspaceQuery = $derived.by(() => {
+    const text = effectiveSearchText;
+    if (text.endsWith("~")) {
+      return { query: text.slice(0, -1).trim(), semantic: true };
+    }
+    return { query: text, semantic: false };
   });
 
   $effect(() => {
@@ -311,22 +370,72 @@
     const repoPath = $repoStore.currentPath;
     if (currentMode !== "symbols" || !repoPath || !text) {
       symbolHits = [];
+      symbolSearchNote = null;
       return;
     }
     void searchSymbols(repoPath, text, 30).then((res) => {
       if (res.available) {
         symbolHits = res.items;
+        symbolSearchNote = null;
       } else {
         symbolHits = [];
+        // Cannot-search must not render like zero hits.
+        symbolSearchNote =
+          res.reason ??
+          "Symbol search unavailable — not the same as zero matches. Install or build the code map.";
       }
     }).catch(() => {
       symbolHits = [];
+      symbolSearchNote = "Symbol search failed — not the same as zero matches.";
     });
+  });
+
+  $effect(() => {
+    const currentMode = mode;
+    const { query: text, semantic } = workspaceQuery;
+    const registryRoot = $repoStore.currentPath;
+    if (currentMode !== "workspace" || !registryRoot || !text) {
+      workspaceHits = [];
+      workspaceSearchNote = null;
+      return;
+    }
+    void searchWorkspaceSymbols(registryRoot, text, 40, semantic)
+      .then((res) => {
+        workspaceHits = res.items;
+        const parts: string[] = [];
+        if (semantic) parts.push("TF-IDF name search");
+        if (res.unavailable.length > 0) {
+          parts.push(
+            `${res.unavailable.length} repo${res.unavailable.length === 1 ? "" : "s"} unavailable`,
+          );
+        }
+        if (res.truncated) parts.push(`${res.shown} of ${res.total} shown`);
+        workspaceSearchNote = parts.length > 0 ? parts.join(" · ") : null;
+      })
+      .catch(() => {
+        workspaceHits = [];
+        workspaceSearchNote = "Workspace search failed";
+      });
   });
 
   let allAvailableItems = $derived.by<PaletteItem[]>(() => {
     const currentMode = mode;
     const search = effectiveSearchText.toLowerCase();
+
+    if (currentMode === "workspace") {
+      return workspaceHits.map((hit) => ({
+        id: `ws:${hit.repo}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`,
+        label: `[${hit.repo}] ${hit.symbol_name} (${hit.kind}) — ${hit.file_path}:${hit.span_start_line}`,
+        icon: FileCode,
+        filePath: hit.file_path,
+        category: workspaceSearchNote
+          ? `Cross-repo · ${workspaceSearchNote}`
+          : "Cross-repo symbols",
+        action: () => {
+          void openWorkspaceHit(hit);
+        },
+      }));
+    }
 
     if (currentMode === "symbols") {
       // Symbol & Code Search Mode (devmap)
@@ -398,9 +507,21 @@
         },
         {
           id: "help_symbols",
-          label: "Type : to search symbols and code graph",
+          label: "Type : to search symbols in the active repository",
           icon: FileCode,
           action: () => { query = ":"; },
+        },
+        {
+          id: "help_workspace",
+          label: "Type :: for cross-repo symbols (append ~ for TF-IDF name search)",
+          icon: FileCode,
+          action: () => { query = "::"; },
+        },
+        {
+          id: "help_map_docs",
+          label: "Open Map for docs search, doc graph, and cross-repo link candidates",
+          icon: FileCode,
+          action: () => repoStore.setActiveTab("code", "map"),
         },
       ];
     }
@@ -535,8 +656,8 @@
           bind:this={inputEl}
           type="text"
           bind:value={query}
-          placeholder="Type a command or #commit, @branch, ?help..."
-          class="w-full bg-transparent text-textPrimary placeholder:text-textMuted text-sm focus:outline-none"
+          placeholder="Type a command or #commit, @branch, :symbol, ::cross-repo, ?help..."
+          class="w-full bg-transparent text-textPrimary placeholder:text-textMuted text-sm focus:outline-hidden"
           role="combobox"
           aria-expanded="true"
           aria-autocomplete="list"
@@ -596,7 +717,21 @@
         {/each}
         {#if filteredCommands.length === 0}
           <div class="px-3 py-4 text-xs text-textMuted text-center" role="status">
-            No matching {mode === "commands" ? "commands" : mode}
+            {#if mode === "symbols" && symbolSearchNote}
+              <p class="text-amber-600 dark:text-amber-400">{symbolSearchNote}</p>
+              <button
+                type="button"
+                class="gp-btn text-[11px] mt-2"
+                onclick={() => {
+                  isOpen = false;
+                  openSetupWizard("devmap", "explain");
+                }}
+              >
+                Set up devmap
+              </button>
+            {:else}
+              No matching {mode === "commands" ? "commands" : mode}
+            {/if}
           </div>
         {/if}
       </div>

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { coverageGap, failedAudits, formatHealthReport, skippedAudits } from "./report";
-import type { DependabotAlertInfo, DependabotReport, DepsHealthReport } from "./types";
+import type {
+  CodeScanningAlertInfo,
+  CodeScanningReport,
+  DependabotAlertInfo,
+  DependabotReport,
+  DepsHealthReport,
+} from "./types";
 
 function emptyReport(): DepsHealthReport {
   return {
@@ -44,6 +50,44 @@ function dependabotReport(
   overrides: Partial<DependabotReport> = {},
   alerts: DependabotAlertInfo[] = [dependabotAlert()],
 ): DependabotReport {
+  return {
+    available: true,
+    cli_present: true,
+    is_github_remote: true,
+    slug: "acme/repo",
+    alerts,
+    truncated: false,
+    error: null,
+    ...overrides,
+  };
+}
+
+function codeScanningAlert(
+  overrides: Partial<CodeScanningAlertInfo> = {},
+): CodeScanningAlertInfo {
+  return {
+    number: 1,
+    rule_id: "js/clear-text-logging",
+    rule_name: "Clear-text logging of sensitive information",
+    severity: "high",
+    state: "open",
+    tool: "CodeQL",
+    tool_version: "2.20.0",
+    title: "Clear-text logging of sensitive information",
+    path: "src/auth.rs",
+    start_line: 42,
+    url: "https://github.com/acme/repo/security/code-scanning/1",
+    dismissed_reason: "",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function codeScanningReport(
+  overrides: Partial<CodeScanningReport> = {},
+  alerts: CodeScanningAlertInfo[] = [codeScanningAlert()],
+): CodeScanningReport {
   return {
     available: true,
     cli_present: true,
@@ -351,6 +395,82 @@ describe("formatHealthReport", () => {
     const text = formatHealthReport(emptyReport(), "/repo", dependabot);
     expect(text).toContain("GitHub Dependabot: 0 open alert(s).");
     expect(text).toContain("No issues, vulnerabilities or outdated packages were reported.");
+  });
+
+  it("omits code scanning entirely when no GitHub data exists", () => {
+    const text = formatHealthReport(emptyReport(), "/repo", null, null);
+    expect(text).not.toContain("Code Scanning");
+    expect(text).not.toContain("github-code-scanning");
+  });
+
+  it("carries code scanning alerts with rule, tool, location and alert link", () => {
+    const codeScanning = codeScanningReport({}, [
+      codeScanningAlert(),
+      codeScanningAlert({
+        number: 2,
+        rule_id: "js/redos",
+        severity: "error",
+        title: "Inefficient regular expression",
+        path: "src/parse.ts",
+        start_line: 0,
+        tool_version: "",
+        url: "https://github.com/acme/repo/security/code-scanning/2",
+      }),
+    ]);
+    const text = formatHealthReport(emptyReport(), "/repo", null, codeScanning);
+    expect(text).toContain("scanners: npm audit, github-code-scanning");
+    expect(text).toContain("GitHub Code Scanning: 2 open alert(s).");
+    expect(text).toContain("## GitHub Code Scanning alerts (2)");
+    expect(text).toContain("- [high] js/clear-text-logging — Clear-text logging of sensitive information");
+    expect(text).toContain("tool: CodeQL 2.20.0");
+    expect(text).toContain("at: src/auth.rs:42");
+    expect(text).toContain("alert: https://github.com/acme/repo/security/code-scanning/1");
+    expect(text).toContain("- [error] js/redos — Inefficient regular expression");
+    expect(text).toContain("at: src/parse.ts");
+    expect(text).not.toContain("were reported.");
+  });
+
+  it("reports a failed code scanning fetch instead of laundering it into all-clear silence", () => {
+    const codeScanning = codeScanningReport({
+      available: false,
+      alerts: [],
+      error: "Advanced Security must be enabled (HTTP 403)",
+    });
+    const text = formatHealthReport(emptyReport(), "/repo", null, codeScanning);
+    expect(text).toContain(
+      "code scanning unavailable (Advanced Security must be enabled (HTTP 403))",
+    );
+    expect(text).not.toContain("GitHub Code Scanning alerts (");
+    expect(text).not.toContain("github-code-scanning");
+  });
+
+  it("flags a capped code scanning list as incomplete coverage too", () => {
+    const codeScanning = codeScanningReport({ truncated: true });
+    const text = formatHealthReport(emptyReport(), "/repo", null, codeScanning);
+    expect(text).toContain(
+      "NOTE: the scan was capped; findings below are not complete coverage.",
+    );
+    expect(text).toContain("GitHub Code Scanning: at least 1 open alert(s).");
+    expect(text).toContain("## GitHub Code Scanning alerts (at least 1)");
+  });
+
+  it("keeps the explicit all-clear when code scanning ran clean alongside an empty local scan", () => {
+    const codeScanning = codeScanningReport({}, []);
+    const text = formatHealthReport(emptyReport(), "/repo", null, codeScanning);
+    expect(text).toContain("GitHub Code Scanning: 0 open alert(s).");
+    expect(text).toContain("No issues, vulnerabilities or outdated packages were reported.");
+  });
+
+  it("lists both GitHub scanners when Dependabot and code scanning both ran", () => {
+    const text = formatHealthReport(
+      emptyReport(),
+      "/repo",
+      dependabotReport({}, []),
+      codeScanningReport({}, []),
+    );
+    expect(text).toContain("scanners: npm audit, github-dependabot, github-code-scanning");
+    expect(text).toContain("GitHub Dependabot: 0 open alert(s).");
+    expect(text).toContain("GitHub Code Scanning: 0 open alert(s).");
   });
 });
 

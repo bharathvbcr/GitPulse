@@ -5,13 +5,24 @@
 //! tracing, and dead code detection.
 
 use crate::engine::git_cli::validate_repo;
-use devmap_query::{Request, ResolutionAvailability, Response, StoreQueryEngine};
-use devmap_store::Store;
+use devmap_query::{
+    Cancel, Request, ResolutionAvailability, Response, Rung, RungHistogram, StoreQueryEngine,
+};
+use devmap_resolve::model::ResolvedEdge;
+use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default token budget for in-process query operations.
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
+
+/// Schema version this GitPulse build can read. Pinned to the linked
+/// `devmap_store` constant so a re-vendor that drifts fails a test rather than
+/// shipping a dead panel.
+pub const SUPPORTED_STORE_SCHEMA: i32 = CURRENT_SCHEMA_VERSION;
+
+/// Upstream `MAX_NEIGHBOR_TARGETS` — chunk affected-tests / neighbors seeds here.
+pub const MAX_NEIGHBOR_TARGETS: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeintelSymbolHit {
@@ -52,6 +63,25 @@ pub struct CodeintelDeadSymbol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelRungHistogram {
+    pub deterministic: usize,
+    pub high: usize,
+    pub speculative: usize,
+    pub filtered_out: usize,
+}
+
+impl From<RungHistogram> for CodeintelRungHistogram {
+    fn from(h: RungHistogram) -> Self {
+        Self {
+            deterministic: h.deterministic,
+            high: h.high,
+            speculative: h.speculative,
+            filtered_out: h.filtered_out,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeintelResponse<T> {
     pub available: bool,
     pub reason: Option<String>,
@@ -59,6 +89,12 @@ pub struct CodeintelResponse<T> {
     pub total: u32,
     pub shown: u32,
     pub truncated: bool,
+    /// Set when the producer stopped early — distinct from budget truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_incomplete: Option<String>,
+    /// Population across the resolution ladder before any `min_rung` filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<CodeintelRungHistogram>,
 }
 
 impl<T> CodeintelResponse<T> {
@@ -70,6 +106,8 @@ impl<T> CodeintelResponse<T> {
             total: 0,
             shown: 0,
             truncated: false,
+            walk_incomplete: None,
+            rungs: None,
         }
     }
 
@@ -81,6 +119,8 @@ impl<T> CodeintelResponse<T> {
             total,
             shown,
             truncated,
+            walk_incomplete: None,
+            rungs: None,
         }
     }
 }
@@ -127,6 +167,21 @@ fn resolve_repo(repo_path: &str) -> Result<PathBuf, String> {
     validate_repo(repo_path)
 }
 
+fn rewrite_schema_mismatch(raw: &str) -> Option<String> {
+    // Vendored store refuses future schemas with this wording. Surface the
+    // handshake the UI can act on rather than the rusqlite parameter name.
+    const PREFIX: &str = "unsupported future schema version ";
+    let idx = raw.find(PREFIX)?;
+    let rest = &raw[idx + PREFIX.len()..];
+    let version: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if version.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "map built by devmap schema {version}, this build reads {SUPPORTED_STORE_SCHEMA}"
+    ))
+}
+
 fn open_store(repo: &Path) -> Result<Store, String> {
     let db_path = map_path(repo);
     if !db_path.exists() {
@@ -135,7 +190,13 @@ fn open_store(repo: &Path) -> Result<Store, String> {
             db_path.to_string_lossy()
         ));
     }
-    Store::open(&db_path).map_err(|e| format!("Failed to open devmap database: {e}"))
+    Store::open(&db_path).map_err(|e| {
+        let raw = e.to_string();
+        if let Some(friendly) = rewrite_schema_mismatch(&raw) {
+            return friendly;
+        }
+        format!("Failed to open devmap database: {raw}")
+    })
 }
 
 /// Opens the store AND requires that it actually hold an indexed generation.
@@ -203,16 +264,105 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
         shown,
         truncated,
         resolution,
+        walk_incomplete,
+        rungs,
         ..
     } = response;
     match resolution {
         ResolutionAvailability::Unavailable { reason } => CodeintelResponse::unavailable(reason),
-        ResolutionAvailability::Available => CodeintelResponse::ok(
-            items.into_iter().map(map).collect(),
-            total,
-            shown,
-            truncated,
-        ),
+        ResolutionAvailability::Available => {
+            let mut out = CodeintelResponse::ok(
+                items.into_iter().map(map).collect(),
+                total,
+                shown,
+                truncated,
+            );
+            out.walk_incomplete = walk_incomplete;
+            out.rungs = rungs.map(CodeintelRungHistogram::from);
+            out
+        }
+    }
+}
+
+fn parse_min_rung(min_rung: Option<&str>) -> Result<Option<Rung>, String> {
+    match min_rung.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some("deterministic") => Ok(Some(Rung::Deterministic)),
+        Some("high") => Ok(Some(Rung::High)),
+        Some("speculative") => Ok(Some(Rung::Speculative)),
+        Some(other) => Err(format!(
+            "min_rung must be deterministic|high|speculative, got {other}"
+        )),
+    }
+}
+
+fn map_edge(edge: ResolvedEdge) -> CodeintelEdge {
+    CodeintelEdge {
+        source_file: edge.source_file,
+        target_file: edge.target_file,
+        source_symbol: edge.source_symbol,
+        target_symbol: edge.target_symbol,
+        confidence: edge.confidence.0,
+    }
+}
+
+/// Cooperative cancel token for long walks — thin alias over the kernel's.
+pub type QueryCancel = Cancel;
+
+/// Wall-clock backstop for long UI walks. Freeing the await without tripping
+/// this flag leaves the blocking traversal running on the pool.
+pub const QUERY_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn cancel_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Cancel>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Cancel>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register a cancel flag for `token`, also tripped after [`QUERY_CANCEL_DEADLINE`].
+///
+/// UI dismiss (file switch, unmount) calls [`cancel_query`] with the same token
+/// so the walk stops rather than only having its answer ignored.
+pub fn begin_cancellable_query(token: Option<&str>) -> Cancel {
+    let cancel = Cancel::new();
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        let mut map = cancel_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(token.to_string(), cancel.clone());
+    }
+    let timed = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(QUERY_CANCEL_DEADLINE);
+        timed.cancel();
+    });
+    cancel
+}
+
+/// Trip a previously registered query cancel token (user dismiss / navigation).
+pub fn cancel_query(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let mut map = cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cancel) = map.remove(token) {
+        cancel.cancel();
+        true
+    } else {
+        false
+    }
+}
+
+/// Drop a finished token so the registry cannot grow with every request.
+pub fn finish_cancellable_query(token: Option<&str>) {
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        let mut map = cancel_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(token);
     }
 }
 
@@ -343,14 +493,32 @@ pub fn impact(
     target: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
+    impact_at_rung(repo_path, target, token_budget, None, None)
+}
+
+/// Impact narrowed to a named resolution rung.
+pub fn impact_at_rung(
+    repo_path: &str,
+    target: &str,
+    token_budget: Option<u32>,
+    min_rung: Option<&str>,
+    cancel: Option<Cancel>,
+) -> CodeintelResponse<CodeintelEdge> {
     if let Err(e) = require_argument("target", target) {
         return CodeintelResponse::unavailable(e);
     }
+    let rung = match parse_min_rung(min_rung) {
+        Ok(r) => r,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store);
+    if let Some(cancel) = cancel {
+        engine = engine.with_cancel(cancel);
+    }
     let req = Request {
         query: target.to_string(),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
@@ -358,14 +526,8 @@ pub fn impact(
         max_depth: 10,
     };
 
-    match engine.impact(req) {
-        Ok(res) => from_engine(res, |edge| CodeintelEdge {
-            source_file: edge.source_file,
-            target_file: edge.target_file,
-            source_symbol: edge.source_symbol,
-            target_symbol: edge.target_symbol,
-            confidence: edge.confidence.0,
-        }),
+    match engine.impact_at_rung(req, rung) {
+        Ok(res) => from_engine(res, map_edge),
         Err(e) => CodeintelResponse::unavailable(format!("Impact computation failed: {e}")),
     }
 }
@@ -376,14 +538,32 @@ pub fn dependencies(
     file_path: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
+    dependencies_at_rung(repo_path, file_path, token_budget, None, None)
+}
+
+/// Dependencies narrowed to a named resolution rung.
+pub fn dependencies_at_rung(
+    repo_path: &str,
+    file_path: &str,
+    token_budget: Option<u32>,
+    min_rung: Option<&str>,
+    cancel: Option<Cancel>,
+) -> CodeintelResponse<CodeintelEdge> {
     if let Err(e) = require_argument("file_path", file_path) {
         return CodeintelResponse::unavailable(e);
     }
+    let rung = match parse_min_rung(min_rung) {
+        Ok(r) => r,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store);
+    if let Some(cancel) = cancel {
+        engine = engine.with_cancel(cancel);
+    }
     let req = Request {
         query: file_path.to_string(),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
@@ -391,14 +571,8 @@ pub fn dependencies(
         max_depth: 10,
     };
 
-    match engine.dependencies(req) {
-        Ok(res) => from_engine(res, |edge| CodeintelEdge {
-            source_file: edge.source_file,
-            target_file: edge.target_file,
-            source_symbol: edge.source_symbol,
-            target_symbol: edge.target_symbol,
-            confidence: edge.confidence.0,
-        }),
+    match engine.dependencies_at_rung(req, rung) {
+        Ok(res) => from_engine(res, map_edge),
         Err(e) => CodeintelResponse::unavailable(format!("Dependencies lookup failed: {e}")),
     }
 }
@@ -434,14 +608,33 @@ pub fn trace_between(
     to: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
+    trace_between_at_rung(repo_path, from, to, token_budget, None, None)
+}
+
+/// Trace narrowed to a named resolution rung.
+pub fn trace_between_at_rung(
+    repo_path: &str,
+    from: &str,
+    to: &str,
+    token_budget: Option<u32>,
+    min_rung: Option<&str>,
+    cancel: Option<Cancel>,
+) -> CodeintelResponse<CodeintelEdge> {
     if let Err(e) = require_argument("from", from).and_then(|()| require_argument("to", to)) {
         return CodeintelResponse::unavailable(e);
     }
+    let rung = match parse_min_rung(min_rung) {
+        Ok(r) => r,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let mut engine = StoreQueryEngine::new(&store);
+    if let Some(cancel) = cancel {
+        engine = engine.with_cancel(cancel);
+    }
     let req = Request {
         query: (from.to_string(), to.to_string()),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
@@ -450,20 +643,619 @@ pub fn trace_between(
     };
 
     match engine.trace_between(req) {
-        Ok(res) => from_engine(res, |edge| CodeintelEdge {
-            source_file: edge.source_file,
-            target_file: edge.target_file,
-            source_symbol: edge.source_symbol,
-            target_symbol: edge.target_symbol,
-            confidence: edge.confidence.0,
-        }),
+        Ok(mut res) => {
+            if rung.is_some() {
+                let (kept, histogram) =
+                    devmap_query::rung::narrow(std::mem::take(&mut res.items), rung);
+                res.items = kept;
+                res.rungs = Some(histogram);
+            }
+            from_engine(res, map_edge)
+        }
         Err(e) => CodeintelResponse::unavailable(format!("Trace between failed: {e}")),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelNeighbors {
+    pub target: String,
+    pub callers: CodeintelResponse<CodeintelEdge>,
+    pub callees: CodeintelResponse<CodeintelEdge>,
+}
+
+/// Callers and callees for one or more targets (chunked at [`MAX_NEIGHBOR_TARGETS`]).
+pub fn neighbors(
+    repo_path: &str,
+    targets: &[String],
+    token_budget: Option<u32>,
+    min_rung: Option<&str>,
+) -> Result<Vec<CodeintelNeighbors>, String> {
+    if targets.is_empty() {
+        return Err("neighbors requires at least one target".into());
+    }
+    let rung = parse_min_rung(min_rung)?;
+    let store = open_repo_map(repo_path)?;
+    let engine = StoreQueryEngine::new(&store);
+    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
+    let mut out = Vec::new();
+    for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
+        let report = engine
+            .neighbors_at_rung(chunk, budget, 0.0, 10, rung)
+            .map_err(|e| format!("neighbors failed: {e}"))?;
+        for entry in report {
+            out.push(CodeintelNeighbors {
+                target: entry.target,
+                callers: from_engine(entry.callers, map_edge),
+                callees: from_engine(entry.callees, map_edge),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelBlastLayer {
+    pub depth: usize,
+    pub nodes: Vec<String>,
+    pub node_count: u32,
+    pub nodes_omitted: u32,
+    pub lowest_confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelBlastRadius {
+    pub seeds: Vec<String>,
+    pub unmatched_targets: Vec<String>,
+    pub layers: CodeintelResponse<CodeintelBlastLayer>,
+    pub total_impacted: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelLayeredImpact {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub edges: CodeintelResponse<CodeintelEdge>,
+    pub blast_radius: CodeintelBlastRadius,
+}
+
+fn map_blast_radius(radius: devmap_query::BlastRadius) -> CodeintelBlastRadius {
+    CodeintelBlastRadius {
+        seeds: radius.seeds,
+        unmatched_targets: radius.unmatched_targets,
+        layers: from_engine(radius.layers, |layer| CodeintelBlastLayer {
+            depth: layer.depth,
+            nodes: layer.nodes,
+            node_count: layer.node_count,
+            nodes_omitted: layer.nodes_omitted,
+            lowest_confidence: layer.lowest_confidence,
+        }),
+        total_impacted: radius.total_impacted,
+    }
+}
+
+/// Layered impact for one target. Do not combine with `min_rung` — the kernel
+/// refuses that pairing; the UI must not offer both.
+pub fn impact_layered(
+    repo_path: &str,
+    target: &str,
+    token_budget: Option<u32>,
+) -> CodeintelLayeredImpact {
+    impact_layered_with_cancel(repo_path, target, token_budget, None)
+}
+
+/// Layered impact with an optional cooperative cancel token.
+pub fn impact_layered_with_cancel(
+    repo_path: &str,
+    target: &str,
+    token_budget: Option<u32>,
+    cancel: Option<Cancel>,
+) -> CodeintelLayeredImpact {
+    if let Err(e) = require_argument("target", target) {
+        return CodeintelLayeredImpact {
+            available: false,
+            reason: Some(e),
+            edges: CodeintelResponse::unavailable("target must not be blank"),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: Vec::new(),
+                layers: CodeintelResponse::unavailable("no target"),
+                total_impacted: 0,
+            },
+        };
+    }
+    let store = match open_repo_map(repo_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return CodeintelLayeredImpact {
+                available: false,
+                reason: Some(e.clone()),
+                edges: CodeintelResponse::unavailable(e.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: vec![target.to_string()],
+                    layers: CodeintelResponse::unavailable(e),
+                    total_impacted: 0,
+                },
+            }
+        }
+    };
+    let mut engine = StoreQueryEngine::new(&store);
+    if let Some(cancel) = cancel {
+        engine = engine.with_cancel(cancel);
+    }
+    let req = Request {
+        query: target.to_string(),
+        token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
+        min_confidence: 0.0,
+        max_depth: 10,
+    };
+    match engine.impact_layered(req) {
+        Ok(layered) => {
+            let edges = from_engine(layered.edges, map_edge);
+            let available = edges.available;
+            let reason = edges.reason.clone();
+            CodeintelLayeredImpact {
+                available,
+                reason,
+                blast_radius: map_blast_radius(layered.blast_radius),
+                edges,
+            }
+        }
+        Err(e) => CodeintelLayeredImpact {
+            available: false,
+            reason: Some(format!("layered impact failed: {e}")),
+            edges: CodeintelResponse::unavailable(format!("layered impact failed: {e}")),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: vec![target.to_string()],
+                layers: CodeintelResponse::unavailable(format!("layered impact failed: {e}")),
+                total_impacted: 0,
+            },
+        },
+    }
+}
+
+/// Compose layered impact over a changed-file set, chunked at 16 targets.
+pub fn impact_layered_many(
+    repo_path: &str,
+    targets: &[String],
+    token_budget: Option<u32>,
+) -> Vec<CodeintelLayeredImpact> {
+    impact_layered_many_with_cancel(repo_path, targets, token_budget, None)
+}
+
+/// Layered-many with a shared cancel token (checked between targets).
+pub fn impact_layered_many_with_cancel(
+    repo_path: &str,
+    targets: &[String],
+    token_budget: Option<u32>,
+    cancel: Option<Cancel>,
+) -> Vec<CodeintelLayeredImpact> {
+    targets
+        .iter()
+        .map(|t| {
+            if let Some(cancel) = cancel.as_ref() {
+                if cancel.is_cancelled() {
+                    return CodeintelLayeredImpact {
+                        available: false,
+                        reason: Some("query cancelled".into()),
+                        edges: CodeintelResponse::unavailable("query cancelled"),
+                        blast_radius: CodeintelBlastRadius {
+                            seeds: Vec::new(),
+                            unmatched_targets: vec![t.clone()],
+                            layers: CodeintelResponse::unavailable("query cancelled"),
+                            total_impacted: 0,
+                        },
+                    };
+                }
+            }
+            impact_layered_with_cancel(repo_path, t, token_budget, cancel.clone())
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelAffectedTest {
+    pub path: String,
+    pub depth: usize,
+    pub symbols: Vec<String>,
+    pub reached_symbols: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelAffectedTests {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub targets: Vec<String>,
+    pub tests: CodeintelResponse<CodeintelAffectedTest>,
+    pub blast_radius: CodeintelBlastRadius,
+    /// True when the map was stale, a walk incomplete, or a seed unmatched —
+    /// callers must fall back to the full suite and say why.
+    pub fail_closed: bool,
+    pub fail_closed_reason: Option<String>,
+}
+
+/// Affected test **files** for a set of seeds. Chunks at [`MAX_NEIGHBOR_TARGETS`].
+pub fn affected_tests(
+    repo_path: &str,
+    targets: &[String],
+    token_budget: Option<u32>,
+    max_depth: Option<usize>,
+) -> CodeintelAffectedTests {
+    if targets.is_empty() {
+        return CodeintelAffectedTests {
+            available: false,
+            reason: Some("affected_tests requires at least one target".into()),
+            targets: Vec::new(),
+            tests: CodeintelResponse::unavailable("no targets"),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: Vec::new(),
+                layers: CodeintelResponse::unavailable("no targets"),
+                total_impacted: 0,
+            },
+            fail_closed: true,
+            fail_closed_reason: Some("no seeds provided".into()),
+        };
+    }
+    let repo = match resolve_repo(repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return CodeintelAffectedTests {
+                available: false,
+                reason: Some(e.clone()),
+                targets: targets.to_vec(),
+                tests: CodeintelResponse::unavailable(e.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: targets.to_vec(),
+                    layers: CodeintelResponse::unavailable(e.clone()),
+                    total_impacted: 0,
+                },
+                fail_closed: true,
+                fail_closed_reason: Some(e),
+            }
+        }
+    };
+    let store = match open_indexed_store(&repo) {
+        Ok(s) => s,
+        Err(e) => {
+            return CodeintelAffectedTests {
+                available: false,
+                reason: Some(e.clone()),
+                targets: targets.to_vec(),
+                tests: CodeintelResponse::unavailable(e.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: targets.to_vec(),
+                    layers: CodeintelResponse::unavailable(e.clone()),
+                    total_impacted: 0,
+                },
+                fail_closed: true,
+                fail_closed_reason: Some(e),
+            }
+        }
+    };
+    // A map with pending paths is not a complete picture of this checkout.
+    // Querying it and treating the answer as "these are the tests to run"
+    // is exactly the failure mode fail_closed exists to prevent.
+    let db_str = map_path(&repo).to_string_lossy().into_owned();
+    if let Ok(summary) = store.status(&db_str) {
+        if summary.pending_count > 0 {
+            let reason = format!(
+                "code map is stale: {} pending path(s) not yet indexed",
+                summary.pending_count
+            );
+            return CodeintelAffectedTests {
+                available: true,
+                reason: Some(reason.clone()),
+                targets: targets.to_vec(),
+                tests: CodeintelResponse::unavailable(reason.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: targets.to_vec(),
+                    layers: CodeintelResponse::unavailable(reason.clone()),
+                    total_impacted: 0,
+                },
+                fail_closed: true,
+                fail_closed_reason: Some(reason),
+            };
+        }
+        if let Some(degraded) = summary.degraded_reason.filter(|r| !r.is_empty()) {
+            let reason = format!("code map is degraded: {degraded}");
+            return CodeintelAffectedTests {
+                available: true,
+                reason: Some(reason.clone()),
+                targets: targets.to_vec(),
+                tests: CodeintelResponse::unavailable(reason.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: targets.to_vec(),
+                    layers: CodeintelResponse::unavailable(reason.clone()),
+                    total_impacted: 0,
+                },
+                fail_closed: true,
+                fail_closed_reason: Some(reason),
+            };
+        }
+    }
+    let engine = StoreQueryEngine::new(&store);
+    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
+    let depth = max_depth.unwrap_or(10);
+    let mut all_tests = Vec::new();
+    let mut walk_incomplete: Option<String> = None;
+    let mut unmatched = Vec::new();
+    let mut seeds = Vec::new();
+    let mut total_impacted = 0u32;
+    let mut layers_items = Vec::new();
+    let mut any_unavailable = false;
+    let mut unavailable_reason = None;
+
+    for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
+        match engine.affected_tests(chunk, budget, 0.0, depth) {
+            Ok(report) => {
+                unmatched.extend(report.blast_radius.unmatched_targets);
+                seeds.extend(report.blast_radius.seeds);
+                total_impacted = total_impacted.saturating_add(report.blast_radius.total_impacted);
+                let tests = from_engine(report.tests, |t| CodeintelAffectedTest {
+                    path: t.path,
+                    depth: t.depth,
+                    symbols: t.symbols,
+                    reached_symbols: t.reached_symbols,
+                });
+                if !tests.available {
+                    any_unavailable = true;
+                    unavailable_reason = tests.reason.clone();
+                }
+                if let Some(reason) = tests.walk_incomplete {
+                    walk_incomplete = Some(match walk_incomplete {
+                        Some(existing) => format!("{existing}; {reason}"),
+                        None => reason,
+                    });
+                }
+                all_tests.extend(tests.items);
+                let mapped_layers =
+                    from_engine(report.blast_radius.layers, |layer| CodeintelBlastLayer {
+                        depth: layer.depth,
+                        nodes: layer.nodes,
+                        node_count: layer.node_count,
+                        nodes_omitted: layer.nodes_omitted,
+                        lowest_confidence: layer.lowest_confidence,
+                    });
+                layers_items.extend(mapped_layers.items);
+            }
+            Err(e) => {
+                return CodeintelAffectedTests {
+                    available: false,
+                    reason: Some(format!("affected_tests failed: {e}")),
+                    targets: targets.to_vec(),
+                    tests: CodeintelResponse::unavailable(format!("affected_tests failed: {e}")),
+                    blast_radius: CodeintelBlastRadius {
+                        seeds: Vec::new(),
+                        unmatched_targets: targets.to_vec(),
+                        layers: CodeintelResponse::unavailable(format!(
+                            "affected_tests failed: {e}"
+                        )),
+                        total_impacted: 0,
+                    },
+                    fail_closed: true,
+                    fail_closed_reason: Some(format!("affected_tests failed: {e}")),
+                };
+            }
+        }
+    }
+
+    let shown = u32::try_from(all_tests.len()).unwrap_or(u32::MAX);
+    let mut tests = CodeintelResponse::ok(all_tests, shown, shown, false);
+    tests.walk_incomplete = walk_incomplete.clone();
+
+    let fail_closed = any_unavailable || !unmatched.is_empty() || walk_incomplete.is_some();
+    let fail_closed_reason = if any_unavailable {
+        unavailable_reason
+            .clone()
+            .or_else(|| Some("query unavailable".into()))
+    } else if !unmatched.is_empty() {
+        Some(format!(
+            "{} seed(s) matched nothing in the map",
+            unmatched.len()
+        ))
+    } else {
+        walk_incomplete.clone()
+    };
+
+    let layer_shown = u32::try_from(layers_items.len()).unwrap_or(u32::MAX);
+    CodeintelAffectedTests {
+        available: !any_unavailable,
+        reason: unavailable_reason,
+        targets: targets.to_vec(),
+        tests,
+        blast_radius: CodeintelBlastRadius {
+            seeds,
+            unmatched_targets: unmatched,
+            layers: CodeintelResponse::ok(layers_items, layer_shown, layer_shown, false),
+            total_impacted,
+        },
+        fail_closed,
+        fail_closed_reason,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelExploreDefinition {
+    pub symbol_name: String,
+    pub file_path: String,
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelExplore {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub definitions: CodeintelResponse<CodeintelExploreDefinition>,
+    pub blast_radius: CodeintelBlastRadius,
+    pub limit: u32,
+}
+
+/// Explore a symbol: definitions plus blast radius.
+pub fn explore(
+    repo_path: &str,
+    query: &str,
+    token_budget: Option<u32>,
+    limit: Option<u32>,
+) -> CodeintelExplore {
+    if let Err(e) = require_argument("query", query) {
+        return CodeintelExplore {
+            available: false,
+            reason: Some(e),
+            definitions: CodeintelResponse::unavailable("query must not be blank"),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: Vec::new(),
+                layers: CodeintelResponse::unavailable("no query"),
+                total_impacted: 0,
+            },
+            limit: 0,
+        };
+    }
+    let store = match open_repo_map(repo_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return CodeintelExplore {
+                available: false,
+                reason: Some(e.clone()),
+                definitions: CodeintelResponse::unavailable(e.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: vec![query.to_string()],
+                    layers: CodeintelResponse::unavailable(e),
+                    total_impacted: 0,
+                },
+                limit: 0,
+            }
+        }
+    };
+    let engine = StoreQueryEngine::new(&store);
+    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
+    let limit = limit.unwrap_or(20) as usize;
+    match engine.explore(query, limit, budget, 0.0, 10) {
+        Ok(report) => {
+            let definitions = from_engine(report.definitions, |d| CodeintelExploreDefinition {
+                symbol_name: d.symbol_name,
+                file_path: d.file_path,
+                kind: d.kind,
+                id: d.id,
+            });
+            CodeintelExplore {
+                available: definitions.available,
+                reason: definitions.reason.clone(),
+                blast_radius: map_blast_radius(report.blast_radius),
+                definitions,
+                limit: report.limit,
+            }
+        }
+        Err(e) => CodeintelExplore {
+            available: false,
+            reason: Some(format!("explore failed: {e}")),
+            definitions: CodeintelResponse::unavailable(format!("explore failed: {e}")),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: vec![query.to_string()],
+                layers: CodeintelResponse::unavailable(format!("explore failed: {e}")),
+                total_impacted: 0,
+            },
+            limit: u32::try_from(limit).unwrap_or(u32::MAX),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelCloneGroup {
+    pub size: usize,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelClones {
+    pub available: bool,
+    pub reason: Option<String>,
+    pub groups: CodeintelResponse<CodeintelCloneGroup>,
+    pub signed_symbols: usize,
+    pub unsigned_symbols: usize,
+}
+
+/// Duplicate-code groups with coverage honesty.
+pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
+    let store = match open_repo_map(repo_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return CodeintelClones {
+                available: false,
+                reason: Some(e.clone()),
+                groups: CodeintelResponse::unavailable(e),
+                signed_symbols: 0,
+                unsigned_symbols: 0,
+            }
+        }
+    };
+    let engine = StoreQueryEngine::new(&store);
+    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
+    match engine.clones(budget, None, 0) {
+        Ok(report) => {
+            let groups = from_engine(report.groups, |g| CodeintelCloneGroup {
+                size: g.members.len(),
+                members: g
+                    .members
+                    .into_iter()
+                    .map(|m| format!("{}::{}", m.file_path, m.symbol_name))
+                    .collect(),
+            });
+            CodeintelClones {
+                available: groups.available,
+                reason: groups.reason.clone(),
+                groups,
+                signed_symbols: report.signed_symbols,
+                unsigned_symbols: report.unsigned_symbols,
+            }
+        }
+        Err(e) => CodeintelClones {
+            available: false,
+            reason: Some(format!("clones failed: {e}")),
+            groups: CodeintelResponse::unavailable(format!("clones failed: {e}")),
+            signed_symbols: 0,
+            unsigned_symbols: 0,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_schema_matches_linked_store_constant() {
+        assert_eq!(
+            SUPPORTED_STORE_SCHEMA, CURRENT_SCHEMA_VERSION,
+            "SUPPORTED_STORE_SCHEMA must track the linked devmap_store constant"
+        );
+        const {
+            assert!(
+                SUPPORTED_STORE_SCHEMA >= 19,
+                "GitPulse must read schema 19+ maps"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_mismatch_reason_names_both_versions() {
+        let friendly =
+            rewrite_schema_mismatch("unsupported future schema version 19").expect("parse");
+        assert!(friendly.contains("schema 19"), "{friendly}");
+        assert!(
+            friendly.contains(&format!("reads {SUPPORTED_STORE_SCHEMA}")),
+            "{friendly}"
+        );
+    }
 
     #[test]
     fn devmap_db_path_construction() {
@@ -711,15 +1503,23 @@ mod tests {
         .expect("insert generation");
 
         for id in 1i64..=3 {
+            // Since schema v17 `generation_files` is a view over
+            // `file_payloads` + `generation_file_rows` — insert the base tables.
             conn.execute(
-                "INSERT INTO generation_files
-                   (generation_id, file_id, language, content_hash,
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
                     parse_outcome_json, engine_json, extraction_json,
                     grammar_version, analyzer_version)
-                 VALUES (1, ?1, 'rust', ?1, '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
+                 VALUES (?1, ?1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
                 [id],
             )
-            .expect("insert generation file");
+            .expect("insert file payload");
+            conn.execute(
+                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                 VALUES (1, ?1, ?1)",
+                [id],
+            )
+            .expect("insert generation file row");
         }
 
         // `search` reads nodes through the FTS index, whose rowid encodes the
@@ -756,11 +1556,14 @@ mod tests {
             .expect("insert fts map row");
         }
 
+        // Since schema v18 `generation_edges` is a view over `edge_rows`
+        // joined to generations by validity range.
         conn.execute(
-            "INSERT INTO generation_edges
-               (generation_id, ordinal, source_file_id, target_file_id,
-                source_symbol, target_symbol, edge_kind, confidence)
-             VALUES (1, 0, 1, 2, 'probe_caller', 'probe_callee', 'Calls', 0.9)",
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (0, 1, 2, 'probe_caller', 'probe_callee', 'Calls', 0.9, 1, NULL)",
             [],
         )
         .expect("insert edge");
@@ -1128,6 +1931,53 @@ mod tests {
             status(&root).total_files,
             expected,
             "a history row for another generation was reported as this one's file count"
+        );
+    }
+
+    /// Pending paths make the map stale: affected_tests must fail closed
+    /// rather than hand CI a partial test list wearing a complete badge.
+    ///
+    /// Uses a minimal generation row only — the richer `repo_with_one_generation`
+    /// fixture inserts into `generation_files`, which is a view on current
+    /// schemas and is out of scope to rewrite here.
+    #[test]
+    fn affected_tests_fail_closed_when_the_map_has_pending_paths() {
+        let dir = git_repo();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = open_fixture_store(dir.path());
+        let db = map_path(dir.path());
+        drop(store);
+
+        let conn = rusqlite::Connection::open(&db).expect("open fixture db");
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, 'fixture', '{}', ?1)",
+            [&root],
+        )
+        .expect("insert generation");
+        conn.close().expect("close");
+
+        let store = Store::open(&db).expect("reopen store");
+        store
+            .enqueue_pending_paths(&["src/new_file.rs".into()])
+            .expect("enqueue pending");
+        drop(store);
+
+        let report = affected_tests(&root, &["src/caller.rs".into()], None, None);
+        assert!(
+            report.fail_closed,
+            "a stale map must not produce a trusted affected-tests list"
+        );
+        let reason = report
+            .fail_closed_reason
+            .expect("stale map states why it failed closed");
+        assert!(
+            reason.contains("stale") && reason.contains("pending"),
+            "reason must name staleness, got {reason}"
+        );
+        assert!(
+            report.tests.items.is_empty(),
+            "must not return test paths from a stale map"
         );
     }
 }

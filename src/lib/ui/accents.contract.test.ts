@@ -39,11 +39,22 @@ const WORST_SURFACE: Record<Theme, [number, number, number]> = {
   light: [236, 238, 248],
 };
 
+/**
+ * Theme tokens live on the `html.dark` / `html.light` declaration blocks.
+ * `indexOf(selector)` is not enough: utilities also write combinators such as
+ * `html.light &[data-active]`, which are not the palette.
+ */
+function themeBlock(selector: string): string {
+  const re = new RegExp(`(?:^|[\\n,])\\s*${selector.replaceAll(".", "\\.")}\\s*\\{`);
+  const match = re.exec(css);
+  expect(match, `${selector} theme block missing`).toBeTruthy();
+  const start = match!.index;
+  return css.slice(start, css.indexOf("\n}", start));
+}
+
 /** Reads a `--c-*` triplet out of one selector block in app.css. */
 function cssTriplet(selector: string, name: string): [number, number, number] {
-  const start = css.indexOf(selector);
-  expect(start, `${selector} missing`).toBeGreaterThan(-1);
-  const block = css.slice(start, css.indexOf("\n}", start));
+  const block = themeBlock(selector);
   const match = block.match(new RegExp(`--${name}:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)`));
   if (!match) throw new Error(`missing --${name} in ${selector}`);
   return [Number(match[1]), Number(match[2]), Number(match[3])];
@@ -107,8 +118,7 @@ describe("the default accent is the stylesheet's own", () => {
     // Hard-coded channels here would leave a teal window with a blue focus
     // ring — the tell that the setting is only half wired.
     for (const selector of ["html.dark", "html.light"]) {
-      const start = css.indexOf(selector);
-      const block = css.slice(start, css.indexOf("\n}", start));
+      const block = themeBlock(selector);
       expect(block, `${selector} --shadow-glow`).toMatch(
         /--shadow-glow:[^;]*rgb\(var\(--c-accent\)/,
       );

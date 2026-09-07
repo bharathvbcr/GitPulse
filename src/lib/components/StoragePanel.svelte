@@ -12,7 +12,7 @@
     Clock,
     Sparkles,
     FolderTree,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import type { StorageReport } from "../storage/types";
   import { storageMetric } from "../metrics/repoMetrics";
   import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
@@ -699,7 +699,7 @@
             <span><span class="font-semibold text-amber-300">{report.branches.merged_stale_count}</span> <span class="text-textMuted">merged-stale</span></span>
             <span><span class="font-semibold text-rose-300">{report.branches.gone_upstream_count}</span> <span class="text-textMuted">upstream gone</span></span>
             {#if report.branches.merged_stale_count > 0}
-              <button type="button" onclick={openManviCleanup} class="gp-btn !py-0.5 ml-auto" title="Review the conservative cleanup plan in the MANVI view">
+              <button type="button" onclick={openManviCleanup} class="gp-btn py-0.5! ml-auto" title="Review the conservative cleanup plan in the MANVI view">
                 <Sparkles size={11} />
                 Clean up in MANVI
               </button>
@@ -724,7 +724,7 @@
             {/if}
           </h3>
           {#if series.length > 0}
-            <button type="button" onclick={clearHistory} class="gp-btn !py-0.5" title="Forget this repository's stored snapshots">
+            <button type="button" onclick={clearHistory} class="gp-btn py-0.5!" title="Forget this repository's stored snapshots">
               <Trash2 size={11} />
               Clear
             </button>

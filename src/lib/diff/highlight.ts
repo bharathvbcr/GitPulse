@@ -8,15 +8,23 @@
  * they are flattened here into a single sequence of spans, each carrying all
  * three answers.
  *
- * The diff view had none of these: it printed the raw line in one colour with
- * the word-diff segments as the only structure, while the file viewer beside
- * it has had syntax highlighting the whole time, from a tokenizer that ships
- * in this repository. Two readings of the same file should not disagree about
- * what a keyword looks like.
+ * Syntax colouring has one owner and two backends. MarkDev's tree-sitter
+ * grammars cover six languages; the regex tokenizer in `syntaxHighlight.ts`
+ * covers the rest. Callers highlight a whole file once (Rust) and pass the
+ * per-line tokens in, or let {@link resolveLineTokens} pick the sync
+ * tokenizer when no document-level result is available.
  */
 
-import { tokenizeLine, type SupportedLanguage, type SyntaxToken } from "../files/syntaxHighlight";
+import {
+  tokenizeLine,
+  type SupportedLanguage,
+  type SyntaxToken,
+  type TokenType,
+} from "../files/syntaxHighlight";
+import { syntaxHighlight, type TreeSitterSpan } from "../syntax/client";
 import type { DiffChunkKind, DiffSegment } from "./wordDiff";
+
+export type { TreeSitterSpan };
 
 export interface Range {
   start: number;
@@ -40,6 +48,54 @@ export interface DiffSpan {
  * highlight is worth. Minified bundles and base64 blobs live here.
  */
 export const MAX_HIGHLIGHT_CHARS = 2_000;
+
+/**
+ * Languages MarkDev's tree-sitter layer can highlight.
+ *
+ * Mirrors the keys in markdev's `configurations()` — keep in sync when a
+ * grammar is added upstream. Everything else stays on the regex tokenizer.
+ */
+export const TREE_SITTER_LANGUAGES: ReadonlySet<SupportedLanguage> = new Set([
+  "rust",
+  "javascript",
+  "typescript",
+  "python",
+  "json",
+  "shell",
+]);
+
+/** Whether `language` should be highlighted in Rust when a whole file is available. */
+export function usesTreeSitter(language: SupportedLanguage): boolean {
+  return TREE_SITTER_LANGUAGES.has(language);
+}
+
+/** Maps a MarkDev highlight kind name onto the shared TokenType palette. */
+export function tokenTypeFromKind(kind: string): TokenType {
+  switch (kind) {
+    case "keyword":
+      return "keyword";
+    case "string":
+      return "string";
+    case "number":
+      return "number";
+    case "comment":
+      return "comment";
+    case "function":
+      return "function";
+    case "type":
+      return "type";
+    case "variable":
+      return "variable";
+    case "operator":
+      return "operator";
+    case "punctuation":
+      return "punctuation";
+    case "attribute":
+      return "attribute";
+    default:
+      return "text";
+  }
+}
 
 /**
  * Character ranges the word diff marks as changed on this side of a pair.
@@ -90,27 +146,129 @@ function coveredBy(ranges: readonly Range[], start: number, cursor: { index: num
 }
 
 /**
+ * Turns UTF-16 highlight spans covering `code` into a contiguous token list
+ * that reproduces `code` exactly — gaps between spans become `text` tokens.
+ */
+export function tokensFromSpans(code: string, spans: readonly TreeSitterSpan[]): SyntaxToken[] {
+  if (code.length === 0) return [];
+  if (spans.length === 0) return [{ text: code, type: "text" }];
+
+  const ordered = [...spans]
+    .filter((span) => span.end > span.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const tokens: SyntaxToken[] = [];
+  let cursor = 0;
+  for (const span of ordered) {
+    const start = Math.max(0, Math.min(code.length, span.start));
+    const end = Math.max(start, Math.min(code.length, span.end));
+    if (start < cursor) continue;
+    if (start > cursor) {
+      tokens.push({ text: code.slice(cursor, start), type: "text" });
+    }
+    if (end > start) {
+      tokens.push({ text: code.slice(start, end), type: tokenTypeFromKind(span.kind) });
+    }
+    cursor = end;
+  }
+  if (cursor < code.length) {
+    tokens.push({ text: code.slice(cursor), type: "text" });
+  }
+  return tokens;
+}
+
+/**
+ * Slices document-level highlight spans into one token list per line.
+ *
+ * Line breaks are `\n` only (matching `String.split("\n")` in the viewers).
+ * Spans that cross a newline are split so each line's tokens stay local.
+ */
+export function lineTokensFromSpans(code: string, spans: readonly TreeSitterSpan[]): SyntaxToken[][] {
+  const lines = code.split("\n");
+  if (lines.length === 0) return [];
+
+  /** Exclusive UTF-16 end offset of each line's content (before its `\n`). */
+  const lineEnds: number[] = [];
+  let offset = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    offset += lines[i].length;
+    lineEnds.push(offset);
+    if (i < lines.length - 1) offset += 1; // the `\n`
+  }
+
+  const perLine: TreeSitterSpan[][] = lines.map(() => []);
+  for (const span of spans) {
+    if (span.end <= span.start) continue;
+    let lineIndex = 0;
+    let lineStart = 0;
+    for (; lineIndex < lines.length; lineIndex += 1) {
+      const lineEnd = lineEnds[lineIndex];
+      if (span.start < lineEnd || (span.start === lineEnd && span.start === span.end)) {
+        // Span starts on this line (or at EOF on the last empty segment).
+        break;
+      }
+      lineStart = lineEnd + (lineIndex < lines.length - 1 ? 1 : 0);
+    }
+    if (lineIndex >= lines.length) continue;
+
+    let start = span.start;
+    let kind = span.kind;
+    while (lineIndex < lines.length && start < span.end) {
+      const lineEnd = lineEnds[lineIndex];
+      const localStart = Math.max(0, start - lineStart);
+      const localEnd = Math.min(lines[lineIndex].length, span.end - lineStart);
+      if (localEnd > localStart) {
+        perLine[lineIndex].push({ start: localStart, end: localEnd, kind });
+      }
+      if (span.end <= lineEnd) break;
+      lineIndex += 1;
+      lineStart = lineEnd + 1;
+      start = lineStart;
+      kind = span.kind;
+    }
+  }
+
+  return lines.map((line, i) => tokensFromSpans(line, perLine[i]));
+}
+
+/**
+ * Sync token resolution for one line.
+ *
+ * When `documentTokens` is provided (from a whole-file tree-sitter pass),
+ * those win. Otherwise the regex tokenizer is used — including for the six
+ * tree-sitter languages, because a single line is not a document and a
+ * wrong multi-line parse is worse than a weaker per-line colouring.
+ */
+export function resolveLineTokens(
+  text: string,
+  language: SupportedLanguage,
+  options: { syntax?: boolean; documentTokens?: readonly SyntaxToken[] } = {},
+): SyntaxToken[] {
+  if (text.length === 0) return [];
+  const wantSyntax =
+    options.syntax !== false && language !== "plaintext" && text.length <= MAX_HIGHLIGHT_CHARS;
+  if (!wantSyntax) return [{ text, type: "text" }];
+  if (options.documentTokens) {
+    const joined = options.documentTokens.map((t) => t.text).join("");
+    return joined === text ? [...options.documentTokens] : tokenizeLine(text, language);
+  }
+  return tokenizeLine(text, language);
+}
+
+/**
  * Splits `text` at every boundary the three layers introduce.
  *
- * Adjacent slices carrying identical answers are merged, so a plain line of
- * unchanged code renders as one span rather than as one span per token when
- * the language is not highlighted.
+ * `tokens` must already reproduce `text` exactly; if they do not, the line
+ * falls back to a single plain token so offsets never desynchronise.
  */
 export function composeSpans(
   text: string,
-  language: SupportedLanguage,
+  tokens: readonly SyntaxToken[],
   segments: readonly DiffSegment[] | undefined,
   changedKind: DiffChunkKind,
   matches: readonly Range[] = [],
-  options: { syntax?: boolean } = {},
 ): DiffSpan[] {
   if (text.length === 0) return [];
-
-  const wantSyntax =
-    options.syntax !== false && language !== "plaintext" && text.length <= MAX_HIGHLIGHT_CHARS;
-  const tokens: SyntaxToken[] = wantSyntax
-    ? tokenizeLine(text, language)
-    : [{ text, type: "text" }];
 
   const changedRanges = normalizeRanges(segmentRanges(text, segments, changedKind));
   const matchRanges = normalizeRanges(matches);
@@ -167,6 +325,50 @@ export function composeSpans(
     }
   }
   return spans;
+}
+
+/**
+ * Resolves tokens for a line, then composes them with change/match layers.
+ *
+ * Prefer this at call sites that do not already hold document-level tokens;
+ * pass `options.documentTokens` (or call {@link composeSpans} directly) when
+ * a whole-file tree-sitter pass has already sliced the line.
+ */
+export function composeLineSpans(
+  text: string,
+  language: SupportedLanguage,
+  segments: readonly DiffSegment[] | undefined,
+  changedKind: DiffChunkKind,
+  matches: readonly Range[] = [],
+  options: { syntax?: boolean; documentTokens?: readonly SyntaxToken[] } = {},
+): DiffSpan[] {
+  return composeSpans(
+    text,
+    resolveLineTokens(text, language, options),
+    segments,
+    changedKind,
+    matches,
+  );
+}
+
+/**
+ * Highlights a whole document in Rust when a grammar exists.
+ *
+ * Returns one token list per line, or `null` when the language has no
+ * tree-sitter grammar / the IPC call fails — callers then keep the regex
+ * tokenizer. Never invents an empty success: failure is `null`.
+ */
+export async function highlightDocument(
+  language: SupportedLanguage,
+  code: string,
+): Promise<SyntaxToken[][] | null> {
+  if (!usesTreeSitter(language) || code.length === 0) return null;
+  try {
+    const spans = await syntaxHighlight(language, code);
+    return lineTokensFromSpans(code, spans);
+  } catch {
+    return null;
+  }
 }
 
 /**

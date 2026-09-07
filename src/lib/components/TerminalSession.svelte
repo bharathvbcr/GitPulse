@@ -67,7 +67,7 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, LoaderCircle, RotateCw } from "lucide-svelte";
+  import { AlertCircle, LoaderCircle, RotateCw } from "@lucide/svelte";
   import { harnessStore } from "../stores/harnessStore";
   import { themeStore } from "../stores/themeStore";
   import { formatError } from "../ui/formatError";
@@ -344,12 +344,12 @@
       {:else if error}
         <AlertCircle size={13} class="text-rose-400 shrink-0" />
         <span class="text-rose-300 flex-1 truncate text-[11px]">{error}</span>
-        <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={restart}>
+        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
           <RotateCw size={12} /> Retry
         </button>
       {:else if exited}
         <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
-        <button type="button" class="gp-btn !py-1 !text-[11px]" onclick={restart}>
+        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
           <RotateCw size={12} /> Restart
         </button>
       {:else}

@@ -41,9 +41,15 @@
      * an empty pane is indistinguishable from a view with nothing to show.
      */
     name: string;
+    /**
+     * Spread onto the resolved view. The same seam LazyMount uses: a concrete
+     * prop type here would be the union of every deferred pane, which no
+     * single loader satisfies. Empty for every caller that has no extra inputs.
+     */
+    props?: Record<string, unknown>;
   }
 
-  let { load, name }: Props = $props();
+  let { load, name, props = {} }: Props = $props();
 
   let view = $derived(resolved.get(load));
   let failure = $state<string | null>(null);
@@ -77,7 +83,7 @@
 
 {#if view}
   {@const View = view}
-  <View />
+  <View {...props} />
 {:else if failure}
   <div
     class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center font-sans"

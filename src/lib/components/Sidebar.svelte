@@ -37,7 +37,7 @@
     PanelLeftOpen,
     Plus,
     Search,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import ScrollCue from "./ScrollCue.svelte";
 
   // An agent can touch thousands of files in one pass; lists mount a window
@@ -205,7 +205,7 @@
           onclick={() => layoutStore.toggleCollapsed()}
           title="Collapse sidebar"
           aria-label="Collapse sidebar"
-          class="gp-icon-btn !p-1 hover:text-accent"
+          class="gp-icon-btn p-1! hover:text-accent"
         >
           <PanelLeftClose size={14} />
         </button>
@@ -214,7 +214,7 @@
           onclick={() => repoStore.pickAndOpenRepo()}
           title="Open Repository"
           aria-label="Open Repository"
-          class="gp-icon-btn !p-1 hover:text-accent"
+          class="gp-icon-btn p-1! hover:text-accent"
         >
           <FolderOpen size={14} />
         </button>
@@ -295,7 +295,7 @@
         <div class="flex gap-1 pt-1.5 mt-2">
           <button
             type="button"
-            class="gp-icon-btn !p-1 hover:text-accent disabled:cursor-not-allowed"
+            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.fetch()}
             disabled={$repoStore.isLoading}
             title="Fetch from remote"
@@ -305,7 +305,7 @@
           </button>
           <button
             type="button"
-            class="gp-icon-btn !p-1 hover:text-accent disabled:cursor-not-allowed"
+            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.pull()}
             disabled={$repoStore.isLoading}
             title="Pull from upstream"
@@ -315,7 +315,7 @@
           </button>
           <button
             type="button"
-            class="gp-icon-btn !p-1 hover:text-accent disabled:cursor-not-allowed"
+            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.push()}
             disabled={$repoStore.isLoading}
             title="Push to upstream"
@@ -325,7 +325,7 @@
           </button>
           <button
             type="button"
-            class="gp-icon-btn !p-1 hover:text-accent disabled:cursor-not-allowed"
+            class="gp-icon-btn p-1! hover:text-accent disabled:cursor-not-allowed"
             onclick={() => void repoStore.stashSave()}
             disabled={$repoStore.isLoading}
             title="Stash changes"
@@ -572,7 +572,7 @@
       aria-valuemin={SIDEBAR_MIN_WIDTH}
       aria-valuemax={SIDEBAR_MAX_WIDTH}
       aria-valuenow={$layoutStore.width}
-      class="absolute top-0 -right-[3px] z-10 h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
+      class="absolute top-0 right-[-3px] z-10 h-full w-[6px] cursor-col-resize hover:bg-accent/40 transition-colors"
       title="Drag to resize · double-click to reset · ←/→ to nudge"
       onpointerdown={startResize}
       onpointermove={moveResize}

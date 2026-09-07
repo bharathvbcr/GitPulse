@@ -2,7 +2,9 @@
 name = "devmap-store"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "SQLite store and schema migrations for the DevCouncil code-intelligence kernel"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }

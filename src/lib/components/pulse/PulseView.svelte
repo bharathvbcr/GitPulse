@@ -30,7 +30,7 @@
     RefreshCw,
     Rocket,
     Users,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
 
   type LocState =
     | { status: "idle" | "loading" }
@@ -241,7 +241,7 @@
 <div class="flex-1 flex flex-col min-h-0 bg-background overflow-y-auto">
   <div class="px-6 py-4 border-b border-border/80 gp-section-edge bg-surface/40 shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
     <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-xl bg-accent/10 border border-accent/25 flex items-center justify-center text-accent shadow-sm">
+      <div class="w-9 h-9 rounded-xl bg-accent/10 border border-accent/25 flex items-center justify-center text-accent shadow-xs">
         <Activity size={18} />
       </div>
       <div>
@@ -314,7 +314,7 @@
         type="button"
         onclick={() => (exportModalOpen = true)}
         disabled={!report}
-        class="gp-btn !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5"
+        class="gp-btn py-1.5! px-3! text-xs inline-flex items-center gap-1.5"
         title="Export Pulse Summary Card for README"
       >
         <Download size={12} />
@@ -325,7 +325,7 @@
         type="button"
         onclick={() => pulseStore.reload()}
         disabled={loading}
-        class="gp-btn !py-1.5 !px-3 text-xs inline-flex items-center gap-1.5"
+        class="gp-btn py-1.5! px-3! text-xs inline-flex items-center gap-1.5"
       >
         <RefreshCw size={12} class={loading ? 'animate-spin text-accent' : ''} />
         <span>{loading ? 'Refreshing…' : 'Refresh'}</span>
@@ -354,7 +354,7 @@
           type="button"
           onclick={handleDeepenScan}
           disabled={loading}
-          class="gp-btn !py-1 !px-2.5 !text-[11px] shrink-0 font-medium"
+          class="gp-btn py-1! px-2.5! text-[11px]! shrink-0 font-medium"
         >
           Scan Deeper (25k)
         </button>
@@ -367,7 +367,7 @@
       <AlertCircle size={16} class="shrink-0 mt-0.5" />
       <div class="flex-1">
         <p class="font-semibold">Unable to generate repository pulse metrics</p>
-        <p class="mt-1 font-mono text-[11px] opacity-90 break-words">{error}</p>
+        <p class="mt-1 font-mono text-[11px] opacity-90 wrap-break-word">{error}</p>
         <p class="mt-2 text-[11px] text-textMuted">
           Recorded under <span class="font-mono">pulse</span> in Diagnostics, which carries the
           backend log tail — where a backend crash writes its location and backtrace.
@@ -376,14 +376,14 @@
           <button
             type="button"
             onclick={() => pulseStore.reload()}
-            class="gp-btn !py-1 !px-2.5 text-xs"
+            class="gp-btn py-1! px-2.5! text-xs"
           >
             Try Again
           </button>
           <button
             type="button"
             onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
-            class="gp-btn !py-1 !px-2.5 text-xs"
+            class="gp-btn py-1! px-2.5! text-xs"
           >
             Open Diagnostics
           </button>

@@ -2979,10 +2979,7 @@ mod tests {
         }
         let raw = String::from_utf8_lossy(&bytes);
         for secret in [auth, cookie, password, cli_password, private_key] {
-            assert!(
-                !raw.contains(secret),
-                "contextual secret reached disk: {secret}"
-            );
+            assert!(!raw.contains(secret), "contextual secret reached disk");
         }
 
         let event = tail(repo, 0, 10).expect("tail").pop().expect("event");
@@ -2997,6 +2994,16 @@ mod tests {
                 "redaction marker missing: {json}"
             );
         }
+    }
+
+    #[test]
+    fn redaction_failure_messages_do_not_echo_the_secret() {
+        let src = include_str!("mod.rs");
+        let forbidden = String::from("reached disk: {") + "secret}";
+        assert!(
+            !src.contains(&forbidden),
+            "a failing assert must not write the secret into the log"
+        );
     }
 
     #[cfg(unix)]

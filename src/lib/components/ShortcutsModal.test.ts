@@ -62,4 +62,9 @@ describe("ShortcutsModal", () => {
     expect(body).toContain("Previous / next file in this change");
     expect(body).toContain("F3");
   });
+
+  it("documents how to reorder repository tabs from the keyboard", () => {
+    const { body } = render(ShortcutsModal, { props: { isOpen: true } });
+    expect(body).toContain("Move the focused repository tab left or right");
+  });
 });

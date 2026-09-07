@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import WorkView from "./WorkView.svelte";
+import { stripMarkupComments } from "../dom/markupText";
 import { ALL_STATUSES } from "../work/projection";
 
 const source = readFileSync(
@@ -70,7 +71,7 @@ describe("WorkView", () => {
     // Comments are stripped first: the property is about text a reader sees,
     // and this file's comments legitimately discuss DevCouncil when explaining
     // why a column is hidden from people who do not run one.
-    const rendered = source.replace(/<!--[\s\S]*?-->/g, "");
+    const rendered = stripMarkupComments(source);
     const emptyState = rendered.slice(rendered.indexOf("Nothing in flight"));
     expect(emptyState).not.toContain("DevCouncil");
   });

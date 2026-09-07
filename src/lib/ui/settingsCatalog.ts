@@ -175,6 +175,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "mcp codex plugin tools read-only agents claude protocol",
   },
   {
+    id: "external-tools",
+    section: "agents",
+    label: "devmap and manvi",
+    keywords: "devmap manvi install update cargo go harness code map cli binary toolchain",
+  },
+  {
     id: "update-check",
     section: "updates",
     label: "Check for new releases",

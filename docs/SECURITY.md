@@ -35,7 +35,7 @@ flowchart TD
 
 ### Local `gh` Credential Safety
 - GitPulse never requests, reads, stores, or transmits your GitHub personal access tokens or passwords.
-- All GitHub operations (PR inspection, workflow dispatch, Dependabot queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
+- All GitHub operations (PR inspection, workflow dispatch, Dependabot and code scanning queries) delegate exclusively to your locally installed and authenticated `gh` CLI.
 
 ### Loopback-Only Local AI Transport
 - All AI completions and model probing requests are restricted to local loopback addresses (`127.0.0.1`, `localhost`, `[::1]`).

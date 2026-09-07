@@ -1,12 +1,27 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  composeLineSpans,
   composeSpans,
+  highlightDocument,
+  lineTokensFromSpans,
   MAX_HIGHLIGHT_CHARS,
   normalizeRanges,
+  resolveLineTokens,
   segmentRanges,
   shiftMatches,
+  tokenTypeFromKind,
+  tokensFromSpans,
+  TREE_SITTER_LANGUAGES,
+  usesTreeSitter,
+  type TreeSitterSpan,
 } from "./highlight";
 import { computeWordDiff, type DiffSegment } from "./wordDiff";
+
+vi.mock("../syntax/client", () => ({
+  syntaxHighlight: vi.fn(),
+}));
+
+import { syntaxHighlight } from "../syntax/client";
 
 const text = (spans: ReturnType<typeof composeSpans>) => spans.map((span) => span.text).join("");
 
@@ -65,18 +80,18 @@ describe("normalizeRanges", () => {
   });
 });
 
-describe("composeSpans", () => {
+describe("composeSpans / composeLineSpans", () => {
   it("reproduces the line exactly, whatever the layers say", () => {
     const line = 'const greeting = "hello, world"; // note';
     const diff = computeWordDiff('const greeting = "hi"; // note', line);
-    const spans = composeSpans(line, "typescript", diff.modified_segments, "Added", [
+    const spans = composeLineSpans(line, "typescript", diff.modified_segments, "Added", [
       { start: 6, end: 14 },
     ]);
     expect(text(spans)).toBe(line);
   });
 
   it("keeps syntax, change and match answers on the same span", () => {
-    const spans = composeSpans("let x = 1;", "typescript", undefined, "Added", [
+    const spans = composeLineSpans("let x = 1;", "typescript", undefined, "Added", [
       { start: 0, end: 3 },
     ]);
     const keyword = spans.find((span) => span.text.startsWith("let"));
@@ -88,48 +103,64 @@ describe("composeSpans", () => {
     const before = "const a = 1;";
     const after = "const b = 1;";
     const diff = computeWordDiff(before, after);
-    const spans = composeSpans(after, "typescript", diff.modified_segments, "Added");
+    const spans = composeLineSpans(after, "typescript", diff.modified_segments, "Added");
     const changed = spans.filter((span) => span.changed).map((span) => span.text);
     expect(changed).toEqual(["b"]);
   });
 
   it("splits one token where a change starts inside it", () => {
     const diff = computeWordDiff("callOldName()", "callNewName()");
-    const spans = composeSpans("callNewName()", "typescript", diff.modified_segments, "Added");
+    const spans = composeLineSpans("callNewName()", "typescript", diff.modified_segments, "Added");
     expect(text(spans)).toBe("callNewName()");
     expect(spans.some((span) => span.changed)).toBe(true);
     expect(spans.some((span) => !span.changed)).toBe(true);
   });
 
   it("merges neighbours that agree on all three answers", () => {
-    const spans = composeSpans("aaaa", "plaintext", undefined, "Added");
+    const spans = composeLineSpans("aaaa", "plaintext", undefined, "Added");
     expect(spans).toHaveLength(1);
   });
 
   it("skips tokenizing a line too long to read", () => {
     const long = `const x = "${"a".repeat(MAX_HIGHLIGHT_CHARS)}";`;
-    const spans = composeSpans(long, "typescript", undefined, "Added");
+    const spans = composeLineSpans(long, "typescript", undefined, "Added");
     expect(text(spans)).toBe(long);
     expect(spans.every((span) => span.token === "text")).toBe(true);
   });
 
   it("still marks changes and matches on a line too long to tokenize", () => {
     const long = "b".repeat(MAX_HIGHLIGHT_CHARS + 10);
-    const spans = composeSpans(long, "typescript", undefined, "Added", [{ start: 0, end: 5 }]);
+    const spans = composeLineSpans(long, "typescript", undefined, "Added", [{ start: 0, end: 5 }]);
     expect(spans[0].match).toBe(true);
     expect(spans[0].text).toHaveLength(5);
     expect(text(spans)).toBe(long);
   });
 
   it("honours an explicit request for no syntax highlighting", () => {
-    const spans = composeSpans("let x = 1;", "typescript", undefined, "Added", [], {
+    const spans = composeLineSpans("let x = 1;", "typescript", undefined, "Added", [], {
       syntax: false,
     });
     expect(spans.every((span) => span.token === "text")).toBe(true);
   });
 
   it("returns nothing for an empty line", () => {
-    expect(composeSpans("", "typescript", undefined, "Added")).toEqual([]);
+    expect(composeLineSpans("", "typescript", undefined, "Added")).toEqual([]);
+  });
+
+  it("accepts pre-resolved tokens instead of tokenizing", () => {
+    const tokens = resolveLineTokens("let x = 1;", "typescript");
+    const spans = composeSpans("let x = 1;", tokens, undefined, "Added");
+    expect(text(spans)).toBe("let x = 1;");
+    expect(spans.some((s) => s.token === "keyword")).toBe(true);
+  });
+
+  it("prefers documentTokens over the sync tokenizer", () => {
+    const documentTokens = [
+      { text: "let", type: "keyword" as const },
+      { text: " x", type: "text" as const },
+    ];
+    const tokens = resolveLineTokens("let x", "go", { documentTokens });
+    expect(tokens).toEqual(documentTokens);
   });
 
   it("reproduces the line for every language it claims to support", () => {
@@ -155,7 +186,7 @@ describe("composeSpans", () => {
       ["plaintext", "just words"],
     ];
     for (const [language, line] of samples) {
-      const spans = composeSpans(line, language as never, undefined, "Added");
+      const spans = composeLineSpans(line, language as never, undefined, "Added");
       expect(text(spans), language).toBe(line);
     }
   });
@@ -171,8 +202,8 @@ describe("composeSpans", () => {
       "   ",
     ];
     for (const line of hostile) {
-      expect(text(composeSpans(line, "typescript", undefined, "Added")), line).toBe(line);
-      expect(text(composeSpans(line, "rust", undefined, "Removed")), line).toBe(line);
+      expect(text(composeLineSpans(line, "typescript", undefined, "Added")), line).toBe(line);
+      expect(text(composeLineSpans(line, "rust", undefined, "Removed")), line).toBe(line);
     }
   });
 
@@ -180,13 +211,87 @@ describe("composeSpans", () => {
     const before = "  const total = countOf(items);";
     const after = "  const total = countOf(rows) + 1;";
     const diff = computeWordDiff(before, after);
-    const spans = composeSpans(after, "typescript", diff.modified_segments, "Added", [
+    const spans = composeLineSpans(after, "typescript", diff.modified_segments, "Added", [
       { start: 8, end: 13 },
     ]);
     expect(text(spans)).toBe(after);
     expect(spans.some((span) => span.changed && span.match)).toBe(false);
     expect(spans.some((span) => span.match)).toBe(true);
     expect(spans.some((span) => span.changed)).toBe(true);
+  });
+});
+
+describe("tree-sitter owner", () => {
+  it("names exactly the six languages MarkDev highlights", () => {
+    expect([...TREE_SITTER_LANGUAGES].sort()).toEqual([
+      "javascript",
+      "json",
+      "python",
+      "rust",
+      "shell",
+      "typescript",
+    ]);
+    expect(usesTreeSitter("rust")).toBe(true);
+    expect(usesTreeSitter("go")).toBe(false);
+    expect(usesTreeSitter("svelte")).toBe(false);
+  });
+
+  it("maps highlight kinds onto the shared palette", () => {
+    expect(tokenTypeFromKind("keyword")).toBe("keyword");
+    expect(tokenTypeFromKind("attribute")).toBe("attribute");
+    expect(tokenTypeFromKind("mystery")).toBe("text");
+  });
+
+  it("fills gaps between spans so tokens reproduce the source", () => {
+    const code = "fn main()";
+    const spans: TreeSitterSpan[] = [
+      { start: 0, end: 2, kind: "keyword" },
+      { start: 3, end: 7, kind: "function" },
+    ];
+    const tokens = tokensFromSpans(code, spans);
+    expect(tokens.map((t) => t.text).join("")).toBe(code);
+    expect(tokens.map((t) => t.type)).toEqual(["keyword", "text", "function", "text"]);
+  });
+
+  it("slices document spans onto lines without losing characters", () => {
+    const code = "fn a() {\n  let x = 1;\n}";
+    const spans: TreeSitterSpan[] = [
+      { start: 0, end: 2, kind: "keyword" },
+      { start: 11, end: 14, kind: "keyword" },
+      { start: 19, end: 20, kind: "number" },
+    ];
+    const lines = lineTokensFromSpans(code, spans);
+    expect(lines).toHaveLength(3);
+    expect(lines.map((line) => line.map((t) => t.text).join(""))).toEqual([
+      "fn a() {",
+      "  let x = 1;",
+      "}",
+    ]);
+    expect(lines[0].some((t) => t.type === "keyword")).toBe(true);
+    expect(lines[1].some((t) => t.type === "keyword")).toBe(true);
+    expect(lines[1].some((t) => t.type === "number")).toBe(true);
+  });
+
+  it("highlightDocument returns null for languages without a grammar", async () => {
+    await expect(highlightDocument("go", "package main")).resolves.toBeNull();
+    expect(syntaxHighlight).not.toHaveBeenCalled();
+  });
+
+  it("highlightDocument slices a successful IPC answer", async () => {
+    vi.mocked(syntaxHighlight).mockResolvedValueOnce([
+      { start: 0, end: 2, kind: "keyword" },
+      { start: 3, end: 7, kind: "function" },
+    ] satisfies TreeSitterSpan[]);
+    const lines = await highlightDocument("rust", "fn main");
+    expect(syntaxHighlight).toHaveBeenCalledWith("rust", "fn main");
+    expect(lines).not.toBeNull();
+    expect(lines![0].map((t) => t.text).join("")).toBe("fn main");
+    expect(lines![0].some((t) => t.type === "keyword")).toBe(true);
+  });
+
+  it("highlightDocument returns null when IPC fails rather than inventing tokens", async () => {
+    vi.mocked(syntaxHighlight).mockRejectedValueOnce(new Error("backend down"));
+    await expect(highlightDocument("rust", "fn main() {}")).resolves.toBeNull();
   });
 });
 

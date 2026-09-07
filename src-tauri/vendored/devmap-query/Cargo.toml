@@ -2,7 +2,9 @@
 name = "devmap-query"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "Query engine and code-graph artifact writers for the DevCouncil kernel"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }
@@ -12,9 +14,185 @@ devmap-store = { path = "../devmap-store", default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
+regex = { version = "1.10" }
 
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse", "devmap-store/parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's test
+# suite did not compile in it: these targets import items that are
+# `#[cfg(feature = "parse")]`, and one unresolved import fails a whole target,
+# so `cargo test -p devmap-query --no-default-features` returned a build
+# error instead of results. A build error reads as "not meant to be tested",
+# which is how it survived — no test had ever run in that configuration.
+#
+# `required-features` skips these when `parse` is off rather than failing the
+# build. Nothing changes with default features on, where `parse` is enabled.
+#
+# `workspace_registry_concurrency` and `freshness_parity` are deliberately
+# absent — they exercise the workspace registry and the freshness stamp, neither
+# of which needs a parser, and they must keep being compiled and run in the
+# no-parse configuration. See the note below the list for the examples.
+
+[[test]]
+name = "a_cold_query_pays_for_its_answer_not_the_generation"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_loss_artifacts"
+required-features = ["parse"]
+
+[[test]]
+name = "edge_index_under_writes"
+required-features = ["parse"]
+
+[[example]]
+name = "answer_snapshot"
+required-features = ["parse"]
+
+[[test]]
+name = "explore_and_affected"
+required-features = ["parse"]
+
+[[test]]
+name = "incomplete_answers_say_so"
+required-features = ["parse"]
+
+[[test]]
+name = "manifest_truncation_counts"
+required-features = ["parse"]
+
+[[test]]
+name = "neighbors_adversarial"
+required-features = ["parse"]
+
+[[test]]
+name = "neighbors_composition"
+required-features = ["parse"]
+
+[[test]]
+name = "preview_containment"
+required-features = ["parse"]
+
+[[test]]
+name = "preview_unreadable_file"
+required-features = ["parse"]
+
+[[test]]
+name = "query_cancellation"
+required-features = ["parse"]
+
+[[test]]
+name = "search_counts_under_concurrent_writes"
+required-features = ["parse"]
+
+[[test]]
+name = "search_ranks_before_paging"
+required-features = ["parse"]
+
+[[test]]
+name = "snapshot_budget"
+required-features = ["parse"]
+
+[[test]]
+name = "workspace_search_totals"
+required-features = ["parse"]
+
+[[test]]
+name = "paired_reads_are_one_generation"
+required-features = ["parse"]
+
+[[test]]
+name = "query_work_is_bounded_by_the_answer"
+required-features = ["parse"]
+
+# Examples are targets too, and `--all-targets` builds them. `query_bench`
+# builds a store to measure against, so it needs the frontend for the same
+# reason the tests above do. The other three examples compile without `parse`
+# and are deliberately left ungated: `required-features` means "skip", and
+# skipping a target that would have built is coverage quietly deleted.
+
+[[example]]
+name = "query_bench"
+required-features = ["parse"]
+
+[[test]]
+name = "a_fan_out_pays_for_its_index_once_per_direction"
+required-features = ["parse"]
+
+[[test]]
+name = "a_delete_this_list_reads_for_its_answer"
+required-features = ["parse"]
+
+[[test]]
+name = "a_traversal_over_a_hole_says_so"
+required-features = ["parse"]
+
+[[test]]
+name = "answers_agree_with_each_other"
+required-features = ["parse"]
+
+[[test]]
+name = "subsystem_neighbours_are_computed"
+required-features = ["parse"]
+
+[[test]]
+name = "stored_edges_keep_the_confidence_their_evidence_earned"
+required-features = ["parse"]
+
+[[test]]
+name = "dynamic_references_clear_unwired"
+required-features = ["parse"]
+
+[[test]]
+name = "rung_filter"
+required-features = ["parse"]
+
+[[test]]
+name = "rung_filter_under_stress"
+required-features = ["parse"]
+
+[[test]]
+name = "stored_edge_resolution_is_read_not_guessed"
+required-features = ["parse"]
+
+[[test]]
+name = "unwired_excludes_prose_on_its_own_grounds"
+required-features = ["parse"]
+
+[[test]]
+name = "unwired_is_not_import_blind"
+required-features = ["parse"]
+
+[[test]]
+name = "routes_under_hostile_input"
+required-features = ["parse"]
+
+[[test]]
+name = "coupling_spans_inheritance"
+required-features = ["parse"]
+
+[[test]]
+name = "every_emitted_field_says_whether_it_ran"
+required-features = ["parse"]
+
+[[test]]
+name = "graph_intel_is_emitted"
+required-features = ["parse"]
+
+[[test]]
+name = "the_core_graph_is_the_artifacts_nodes_and_edges"
+required-features = ["parse"]
+
+[[test]]
+name = "dead_clusters_reach_a_query"
+required-features = ["parse"]
+
+[[test]]
+name = "impact_layers_come_from_the_kernel"
+required-features = ["parse"]

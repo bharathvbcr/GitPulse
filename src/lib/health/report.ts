@@ -1,6 +1,6 @@
 import { formatAuditCounts } from "./format";
 import { cappedSuffix, observedTotal as observedScanTotal } from "../scan/limits";
-import type { DependabotReport, DepsHealthReport } from "./types";
+import type { CodeScanningReport, DependabotReport, DepsHealthReport } from "./types";
 
 function line(items: (string | undefined | null)[]): string {
   return items.filter((item) => item !== undefined && item !== null && item !== "").join(" · ");
@@ -128,6 +128,7 @@ export function formatHealthReport(
   report: DepsHealthReport,
   repoPath?: string | null,
   dependabot?: DependabotReport | null,
+  codeScanning?: CodeScanningReport | null,
 ): string {
   const out: string[] = [];
   out.push("# Dependency health report");
@@ -147,6 +148,7 @@ export function formatHealthReport(
   const scanners = [
     ...localScanners,
     dependabot?.available ? "github-dependabot" : null,
+    codeScanning?.available ? "github-code-scanning" : null,
   ].filter(Boolean);
   out.push(
     line([
@@ -155,6 +157,9 @@ export function formatHealthReport(
       scanners.length ? `scanners: ${scanners.join(", ")}` : "no audit scanner available",
       dependabot && !dependabot.available && dependabot.error
         ? `dependabot unavailable (${dependabot.error})`
+        : undefined,
+      codeScanning && !codeScanning.available && codeScanning.error
+        ? `code scanning unavailable (${codeScanning.error})`
         : undefined,
     ]),
   );
@@ -186,7 +191,12 @@ export function formatHealthReport(
       `GitHub Dependabot: ${dependabot.truncated ? "at least " : ""}${dependabot.alerts.length} open alert(s).`,
     );
   }
-  if (report.truncated || dependabot?.truncated) {
+  if (codeScanning?.available) {
+    out.push(
+      `GitHub Code Scanning: ${codeScanning.truncated ? "at least " : ""}${codeScanning.alerts.length} open alert(s).`,
+    );
+  }
+  if (report.truncated || dependabot?.truncated || codeScanning?.truncated) {
     out.push("NOTE: the scan was capped; findings below are not complete coverage.");
   }
   for (const notice of report.limit_notices ?? []) {
@@ -235,6 +245,31 @@ export function formatHealthReport(
     }
   }
 
+  if (codeScanning?.available && codeScanning.alerts.length > 0) {
+    out.push(
+      "",
+      `## GitHub Code Scanning alerts (${codeScanning.truncated ? "at least " : ""}${codeScanning.alerts.length})`,
+    );
+    for (const alert of codeScanning.alerts) {
+      const rule = alert.rule_id || alert.rule_name || "rule";
+      const location =
+        alert.path && alert.start_line > 0
+          ? `${alert.path}:${alert.start_line}`
+          : alert.path;
+      const tool = alert.tool
+        ? `${alert.tool}${alert.tool_version ? ` ${alert.tool_version}` : ""}`
+        : undefined;
+      out.push(`- [${alert.severity}] ${rule} — ${alert.title}`);
+      out.push(
+        line([
+          tool ? `tool: ${tool}` : undefined,
+          location ? `at: ${location}` : undefined,
+          alert.url ? `alert: ${alert.url}` : undefined,
+        ]),
+      );
+    }
+  }
+
   if (report.outdated.length > 0) {
     out.push("", `## Outdated npm packages (${outdatedTotal}${cappedSuffix(outdatedTotal, report.outdated.length)})`);
     for (const pkg of report.outdated) {
@@ -250,7 +285,8 @@ export function formatHealthReport(
     report.issues.length === 0 &&
     report.vulnerabilities.length === 0 &&
     report.outdated.length === 0 &&
-    (!dependabot?.available || dependabot.alerts.length === 0);
+    (!dependabot?.available || dependabot.alerts.length === 0) &&
+    (!codeScanning?.available || codeScanning.alerts.length === 0);
   if (nothingReported && skipped.length === 0 && auditComplete) {
     out.push("", "No issues, vulnerabilities or outdated packages were reported.");
   } else if (nothingReported && !auditComplete) {

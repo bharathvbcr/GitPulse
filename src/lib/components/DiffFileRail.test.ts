@@ -48,6 +48,25 @@ describe("DiffFileRail", () => {
     expect(body).toContain("+10 −2");
   });
 
+  it("renders shared preview markers without a second query path", () => {
+    const markers = new Map([
+      [
+        "src/a.ts",
+        {
+          kind: "breaks" as const,
+          label: "3",
+          title: "3 broken callers",
+          brokenTotal: 3,
+        },
+      ],
+    ]);
+    const { body } = render(DiffFileRail, {
+      props: props({ previewMarkers: markers }),
+    });
+    expect(body).toContain('data-preview-marker="breaks"');
+    expect(body).toContain(">3<");
+  });
+
   it("marks the file currently on screen", () => {
     const { body } = render(DiffFileRail, { props: props() });
     expect(body).toContain('aria-current="true"');

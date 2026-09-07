@@ -6,7 +6,12 @@ export interface TipHost {
   readonly textContent: string | null;
 }
 
-const TITLED_SELECTOR = "[title], [data-tip-text]";
+/**
+ * Every attribute the global tooltip treats as an anchor. Exported so the
+ * renderer and the resolver cannot drift onto different selectors — a guide
+ * card that the hover never finds is a labelled tab that still looks empty.
+ */
+export const TOOLTIP_ANCHOR_SELECTOR = "[title], [data-tip-text], [data-tip-guide]";
 
 /** Pointer/focus target that can resolve a global-tooltip anchor. */
 export interface TooltipPointerTarget extends TipHost {
@@ -20,6 +25,19 @@ function declaresAccessibleName(el: TipHost): boolean {
   if (label !== null && label.trim().length > 0) return true;
   if (el.getAttribute("aria-labelledby") !== null) return true;
   return el.textContent !== null && el.textContent.trim().length > 0;
+}
+
+/**
+ * Destination-guide key on an element, or null when it is a plain-text tip.
+ *
+ * Empty or whitespace-only values are treated as absent: a button that
+ * declared `data-tip-guide=""` must not steal hover from a titled parent.
+ */
+export function tipGuideOf(el: TipHost): string | null {
+  const key = el.getAttribute("data-tip-guide");
+  if (key === null) return null;
+  const trimmed = key.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /**
@@ -67,9 +85,17 @@ function isCanvasPointerTarget(el: TooltipPointerTarget): boolean {
 
 function isSelfTitled(el: TooltipPointerTarget): boolean {
   if (typeof el.hasAttribute === "function") {
-    return el.hasAttribute("title") || el.hasAttribute("data-tip-text");
+    return (
+      el.hasAttribute("title") ||
+      el.hasAttribute("data-tip-text") ||
+      el.hasAttribute("data-tip-guide")
+    );
   }
-  return el.getAttribute("title") !== null || el.getAttribute("data-tip-text") !== null;
+  return (
+    el.getAttribute("title") !== null ||
+    el.getAttribute("data-tip-text") !== null ||
+    el.getAttribute("data-tip-guide") !== null
+  );
 }
 
 function asTipHost(value: unknown): TipHost | null {
@@ -84,6 +110,10 @@ function asTipHost(value: unknown): TipHost | null {
   return null;
 }
 
+function suppressNativeTitle(el: TipHost): void {
+  if (el.getAttribute("title") !== null) el.removeAttribute("title");
+}
+
 /**
  * Resolves the global-tooltip anchor for a pointer or focus target.
  *
@@ -91,6 +121,10 @@ function asTipHost(value: unknown): TipHost | null {
  * from a canvas would bind a titled ancestor (the horizontally-scrollable
  * gutter) and replace commit details with a layout hint. Canvases only
  * participate when they carry their own title.
+ *
+ * Destination-guide anchors (`data-tip-guide`) win over a leftover `title`
+ * so the OS bubble cannot flash beside the card, and so a labelled view tab
+ * is never reduced to repeating its own name.
  */
 export function tooltipAnchorFromTarget(target: unknown): TipHost | null {
   if (!isTooltipPointerTarget(target)) return null;
@@ -98,7 +132,11 @@ export function tooltipAnchorFromTarget(target: unknown): TipHost | null {
     ? isSelfTitled(target)
       ? target
       : null
-    : asTipHost(target.closest(TITLED_SELECTOR));
+    : asTipHost(target.closest(TOOLTIP_ANCHOR_SELECTOR));
   if (!el) return null;
+  if (tipGuideOf(el)) {
+    suppressNativeTitle(el);
+    return el;
+  }
   return tipTextOf(el).trim().length > 0 ? el : null;
 }

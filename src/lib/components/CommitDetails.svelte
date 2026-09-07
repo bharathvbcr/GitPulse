@@ -17,9 +17,10 @@
     AlertTriangle,
     Copy,
     Check,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import MarkdownBody from "./MarkdownBody.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash } from "../format";
   import { formatError } from "../ui/formatError";
@@ -261,7 +262,9 @@
           {/if}
         </div>
         {#if details?.body}
-          <div class="px-2 py-1 text-[11px] text-textMuted whitespace-pre-wrap select-text">{details.body}</div>
+          <div class="px-2 py-1">
+            <MarkdownBody source={details.body} />
+          </div>
         {/if}
         {#if details && details.co_authors.length > 0}
           <div class="px-2 py-1 text-[11px] text-textMuted select-text">Co-authors: {details.co_authors.join(", ")}</div>
@@ -276,7 +279,7 @@
             title={aiReady
               ? "Explain this commit with the local model"
               : ($harnessStore.ai?.detail ?? "No local model server is running")}
-            class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors !py-1"
+            class="gp-chip bg-accent/15 text-accent border-accent/40 hover:bg-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors py-1!"
           >
             {#if isExplaining}
               <Loader size={12} class="animate-spin" />

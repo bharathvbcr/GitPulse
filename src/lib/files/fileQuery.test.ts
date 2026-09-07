@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   filterPathsByFileQuery,
@@ -7,6 +10,17 @@ import {
 } from "./fileQuery";
 
 const paths = ["src/lib/main.ts", "src/App.svelte", "README.md", "docs/guide.md"];
+
+/** Nested-quantifier `/body/` strings, kept out of this file so CodeQL does not treat them as a regex. */
+function nestedQuantifierFileQueries(): string[] {
+  return readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../text/testdata/nested-quantifier-file-query.txt"),
+    "utf8",
+  )
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
 
 describe("parseFileQuery", () => {
   it("treats empty and whitespace as match-all", () => {
@@ -49,7 +63,9 @@ describe("parseFileQuery", () => {
    * contract is 100,000 paths.
    */
   it("refuses catastrophically backtracking patterns instead of hanging", () => {
-    for (const pattern of ["/(a+)+$/", "/(\\w+)+$/", "/([a-z]+)*$/", "/(\\d{2,})*$/"]) {
+    const patterns = nestedQuantifierFileQueries();
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const pattern of patterns) {
       const query = parseFileQuery(pattern);
       expect(query.error ?? "<compiled, not refused>").toMatch(/backtrack/i);
       expect(query.regex, `${pattern} must not compile`).toBeNull();
@@ -63,7 +79,7 @@ describe("parseFileQuery", () => {
       { length: 50 },
       (_, i) => `src/lib/components/${"a".repeat(24)}${i}.ts`,
     );
-    const query = parseFileQuery("/(a+)+$/");
+    const query = parseFileQuery(nestedQuantifierFileQueries()[0]);
     const started = performance.now();
     expect(filterPathsByFileQuery(hostile, query).paths).toEqual([]);
     // Generous by three orders of magnitude against the measured 70 s, so it

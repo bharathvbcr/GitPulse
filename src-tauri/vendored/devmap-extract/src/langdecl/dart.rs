@@ -139,7 +139,10 @@ pub(crate) fn exemption(
 /// member and off the declaration itself at top level, so both are read.
 fn annotation_names(node: Node, source: &str) -> Vec<String> {
     let mut names = Vec::new();
-    for scope in [node.parent(), Some(node)].into_iter().flatten() {
+    for scope in [crate::treesitter::bounded_parent(node), Some(node)]
+        .into_iter()
+        .flatten()
+    {
         let mut cursor = scope.walk();
         for child in scope.named_children(&mut cursor) {
             if child.kind() != "annotation" && child.kind() != "marker_annotation" {

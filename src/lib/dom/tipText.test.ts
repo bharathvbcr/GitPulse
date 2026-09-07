@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
+import { tipGuideOf, tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
 
 class FakeTipHost implements TipHost {
   attributes = new Map<string, string>();
@@ -13,7 +13,13 @@ class FakeTipHost implements TipHost {
       this.attributes.set(name, value);
     }
     this.nodeName = options.nodeName ?? "DIV";
-    this._closest = options.closest ?? (() => (this.hasAttribute("title") || this.hasAttribute("data-tip-text") ? this : null));
+    this._closest = options.closest ?? (() =>
+      this.hasAttribute("title") ||
+      this.hasAttribute("data-tip-text") ||
+      this.hasAttribute("data-tip-guide")
+        ? this
+        : null
+    );
   }
   private _closest: () => unknown;
   closest(_selectors: string): unknown {
@@ -124,5 +130,29 @@ describe("tooltipAnchorFromTarget", () => {
     });
     expect(tooltipAnchorFromTarget(canvas)).toBe(canvas);
     expect(canvas.getAttribute("data-tip-text")).toBe("Commit graph");
+  });
+
+  it("resolves a destination-guide tab without migrating a title", () => {
+    const tab = new FakeTipHost({ "data-tip-guide": "work" }, "Work");
+    expect(tipGuideOf(tab)).toBe("work");
+    expect(tooltipAnchorFromTarget(tab)).toBe(tab);
+    expect(tab.getAttribute("data-tip-text")).toBeNull();
+  });
+
+  it("strips a leftover title so the OS bubble cannot flash beside the card", () => {
+    const tab = new FakeTipHost(
+      { "data-tip-guide": "history:diff", title: "Diff (⌥2)" },
+      "Diff",
+    );
+    expect(tooltipAnchorFromTarget(tab)).toBe(tab);
+    expect(tab.getAttribute("title")).toBeNull();
+    expect(tab.getAttribute("data-tip-text")).toBeNull();
+  });
+
+  it("ignores a whitespace-only guide and falls through to title text", () => {
+    const el = new FakeTipHost({ "data-tip-guide": "  ", title: "Save" }, "Save");
+    expect(tipGuideOf(el)).toBeNull();
+    expect(tooltipAnchorFromTarget(el)).toBe(el);
+    expect(el.getAttribute("data-tip-text")).toBe("Save");
   });
 });

@@ -996,7 +996,7 @@
       bind:clientWidth={tooltipBoxWidth}
       bind:clientHeight={tooltipBoxHeight}
       aria-hidden={tooltipSource === "focus" ? undefined : true}
-      class="pointer-events-none fixed left-0 top-0 w-80 max-w-[calc(100vw_-_1rem)]"
+      class="pointer-events-none fixed left-0 top-0 w-80 max-w-[calc(100vw-1rem)]"
       style="transform: translate3d({tooltipLeft}px, {tooltipTop}px, 0); z-index: {LAYERS.TOOLTIP};"
     >
       <GraphNodeTooltip

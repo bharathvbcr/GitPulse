@@ -133,8 +133,9 @@ fn type_target<'tree>(
 /// bare identifier, since a receiver that is an expression tells the resolver
 /// nothing it can key on here.
 fn cascade_receiver(node: Node, source: &str) -> Option<String> {
-    let section = node.parent().filter(|p| p.kind() == "cascade_section")?;
-    let target = section.parent()?.named_child(0)?;
+    let section =
+        crate::treesitter::bounded_parent(node).filter(|p| p.kind() == "cascade_section")?;
+    let target = crate::treesitter::bounded_parent(section)?.named_child(0)?;
     if target.kind() != "identifier" {
         return None;
     }

@@ -3,6 +3,7 @@
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
+  import { dropReorderIndex } from "../repos/tabModel";
   import { portal } from "../dom/portal";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -21,7 +22,7 @@
     FolderGit2,
     FolderOpen,
     LayoutGrid,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
 
@@ -40,11 +41,12 @@
   let recentsOpen = $state(false);
   let recentsTriggerEl: HTMLButtonElement | undefined = $state();
   let recentsEl: HTMLDivElement | undefined = $state();
-  let dragFrom = $state<number | null>(null);
+  let dragFromId = $state<string | null>(null);
   // Where a dragged tab would land. `before` picks the left/right half of the
   // hovered tab; null means "no useful insertion point" and hides the bar.
   let dropTarget = $state<{ index: number; before: boolean } | null>(null);
   let scroller: HTMLDivElement | undefined = $state();
+  let moveAnnouncement = $state("");
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
 
   let unusedRecents = $derived(
@@ -247,16 +249,67 @@
   });
 
   function endDrag() {
-    dragFrom = null;
+    dragFromId = null;
     dropTarget = null;
+  }
+
+  function focusTabById(id: string) {
+    const tabs = scroller?.querySelectorAll<HTMLElement>('[role="tab"][data-tab-id]') ?? [];
+    const match = Array.from(tabs).find((el) => el.dataset.tabId === id);
+    match?.focus();
+  }
+
+  function announceMove(id: string) {
+    const tabs = $repoStore.openTabs;
+    const index = tabs.findIndex((tab) => tab.id === id);
+    const tab = index >= 0 ? tabs[index] : undefined;
+    if (!tab) return;
+    moveAnnouncement = `Moved ${tab.label} to position ${index + 1} of ${tabs.length}`;
+  }
+
+  function moveFocusedTabTo(id: string, toIndex: number) {
+    const before = $repoStore.openTabs.map((tab) => tab.id).join("\0");
+    repoStore.moveTab(id, toIndex);
+    if (before === $repoStore.openTabs.map((tab) => tab.id).join("\0")) return;
+    announceMove(id);
+    window.setTimeout(() => focusTabById(id), 0);
+  }
+
+  function moveFocusedTabBy(id: string, delta: number) {
+    const before = $repoStore.openTabs.map((tab) => tab.id).join("\0");
+    repoStore.moveTabBy(id, delta);
+    if (before === $repoStore.openTabs.map((tab) => tab.id).join("\0")) return;
+    announceMove(id);
+    window.setTimeout(() => focusTabById(id), 0);
+  }
+
+  function tabIdUnderFocus(): string | null {
+    const focused = document.activeElement;
+    const shell = focused instanceof Element ? focused.closest("[data-tab-id]") : null;
+    if (shell instanceof HTMLElement && shell.dataset.tabId) return shell.dataset.tabId;
+    return $repoStore.openTabs.find((tab) => tab.isActive)?.id ?? null;
   }
 
   /**
    * Arrow-key roving focus across the tablist (ARIA tabs pattern): focus
    * moves and wraps without changing the active repo; Home/End jump to the
-   * edges. Focus on the container itself enters the list in travel direction.
+   * edges. Ctrl+Shift+←/→ reorders the focused (or active) tab instead.
    */
   function onTablistKeydown(e: KeyboardEvent) {
+    if (
+      (e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+      e.ctrlKey &&
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.altKey
+    ) {
+      const id = tabIdUnderFocus();
+      if (!id) return;
+      e.preventDefault();
+      moveFocusedTabBy(id, e.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
     const key = e.key as RovingKey;
     if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
     const tabs = scroller?.querySelectorAll<HTMLElement>("[data-tab-index]") ?? [];
@@ -282,23 +335,37 @@
    * stale between child elements. Adjacent-to-self positions are no-op moves
    * and show nothing.
    */
+  function onTabDragStart(e: DragEvent, id: string) {
+    if (e.target instanceof Element && e.target.closest("[data-tab-close]")) {
+      e.preventDefault();
+      return;
+    }
+    dragFromId = id;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", id);
+      e.dataTransfer.setData("application/x-gitpulse-repo-tab", id);
+    }
+  }
+
   function onScrollerDragOver(e: DragEvent) {
     e.preventDefault();
-    if (dragFrom === null) return;
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    if (dragFromId === null) return;
+    const fromIndex = $repoStore.openTabs.findIndex((tab) => tab.id === dragFromId);
     const tabEl = e.target instanceof Element ? e.target.closest("[data-tab-shell-index]") : null;
     if (!(tabEl instanceof HTMLElement) || tabEl.dataset.tabShellIndex === undefined) {
       dropTarget = null;
       return;
     }
     const index = Number(tabEl.dataset.tabShellIndex);
-    if (!Number.isInteger(index)) {
+    if (!Number.isInteger(index) || fromIndex < 0) {
       dropTarget = null;
       return;
     }
     const rect = tabEl.getBoundingClientRect();
     const before = e.clientX < rect.left + rect.width / 2;
-    const insertAt = before ? index : index + 1;
-    if (insertAt === dragFrom || insertAt === dragFrom + 1) {
+    if (dropReorderIndex(fromIndex, index, before) === null) {
       dropTarget = null;
       return;
     }
@@ -307,11 +374,15 @@
 
   function onScrollerDrop(e: DragEvent) {
     e.preventDefault();
-    if (dragFrom !== null && dropTarget) {
+    if (dragFromId !== null && dropTarget) {
+      const fromIndex = $repoStore.openTabs.findIndex((tab) => tab.id === dragFromId);
       const { index, before } = dropTarget;
-      const insertAt = before ? index : index + 1;
-      const adjusted = insertAt > dragFrom ? insertAt - 1 : insertAt;
-      if (adjusted !== dragFrom) repoStore.reorderTabs(dragFrom, adjusted);
+      const adjusted = dropReorderIndex(fromIndex, index, before);
+      if (adjusted !== null) {
+        const id = dragFromId;
+        repoStore.moveTab(id, adjusted);
+        announceMove(id);
+      }
     }
     endDrag();
   }
@@ -361,8 +432,9 @@
       {#each $repoStore.openTabs as tab, index (tab.id)}
         <div
           role="presentation"
+          data-tab-id={tab.id}
           data-tab-shell-index={index}
-          title={`${tab.path}\n←/→ move tabs · P to ${tab.pinned ? "unpin" : "pin"}`}
+          title={`${tab.path}\nDrag to reorder · Ctrl+Shift+←/→ to move · P to ${tab.pinned ? "unpin" : "pin"}`}
           draggable="true"
           onauxclick={(e) => {
             if (e.button === 1) {
@@ -371,18 +443,20 @@
             }
           }}
           oncontextmenu={(e) => onContext(e, tab.id)}
-          ondragstart={() => (dragFrom = index)}
+          ondragstart={(e) => onTabDragStart(e, tab.id)}
           ondragend={endDrag}
-          class="group relative max-w-[14rem] min-w-[7rem] pr-1 flex items-center gap-1 rounded-full border shrink-0 transition-[color,background-color,border-color,box-shadow] duration-150 {dropTarget?.index === index ? 'border-accent/50' : ''} {tab.isActive
-            ? 'bg-surfaceHover border-border/80 text-textPrimary shadow-sm'
+          class="group relative min-w-28 pr-1 flex items-center gap-1 rounded-full border shrink-0 cursor-grab active:cursor-grabbing transition-[color,background-color,border-color,box-shadow,opacity] duration-150 {dragFromId === tab.id
+            ? 'opacity-60'
+            : ''} {dropTarget?.index === index ? 'border-accent/50' : ''} {tab.isActive
+            ? 'bg-surfaceHover border-border/80 text-textPrimary shadow-xs'
             : 'border-transparent text-textMuted hover:text-textPrimary hover:bg-surfaceHover/60'}"
         >
           {#if dropTarget?.index === index}
             <span
               aria-hidden="true"
               class="absolute top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent shadow-glow transition-opacity {dropTarget.before
-                ? '-left-[3px]'
-                : '-right-[3px]'}"
+                ? 'left-[-3px]'
+                : 'right-[-3px]'}"
             ></span>
           {/if}
           <button
@@ -390,9 +464,10 @@
             role="tab"
             tabindex={tab.isActive ? 0 : -1}
             aria-selected={tab.isActive}
-            aria-keyshortcuts="Enter p Delete"
+            aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"
             data-active-repo={tab.isActive ? "true" : "false"}
             data-tab-index={index}
+            data-tab-id={tab.id}
             onclick={() => repoStore.activateTab(tab.id)}
             onkeydown={(e) => {
               if (e.key === "p" || e.key === "P") {
@@ -404,16 +479,16 @@
               }
             }}
             ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
-            class="min-w-0 flex-1 h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/70"
+            class="h-full pl-2.5 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
           >
             {#if tab.pinned}
               <Pin size={10} class="text-accent shrink-0" />
             {:else}
               <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
             {/if}
-            <span class="truncate font-medium">{tab.label}</span>
+            <span class="whitespace-nowrap font-medium">{tab.label}</span>
             {#if tab.currentBranch}
-              <span class="truncate text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
+              <span class="whitespace-nowrap text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
             {/if}
             {#if tab.isDirty}
               <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 shadow-[0_0_6px_rgb(251_191_36/0.8)]" title="Uncommitted changes"></span>
@@ -425,6 +500,7 @@
           <button
             type="button"
             tabindex="-1"
+            data-tab-close
             title="Close"
             aria-label={`Close ${tab.label}`}
             onclick={(e) => {
@@ -445,7 +521,7 @@
       type="button"
       title="Open repository"
       onclick={() => onOpen?.()}
-      class="gp-icon-btn !p-1 shrink-0 hover:text-accent"
+      class="gp-icon-btn p-1! shrink-0 hover:text-accent"
     >
       <Plus size={13} />
     </button>
@@ -462,7 +538,7 @@
           menu = null;
           recentsOpen = !recentsOpen;
         }}
-        class="gp-icon-btn !p-1 h-full"
+        class="gp-icon-btn p-1! h-full"
       >
         <ChevronDown size={13} />
       </button>
@@ -523,12 +599,17 @@
          every open repository, so they belong to the tab strip that owns
          them. Hidden with a single tab open, where they say nothing new. -->
     <WorkspaceActions />
+    <div class="sr-only" role="status" aria-live="polite">{moveAnnouncement}</div>
   </div>
 {/if}
 
 {#if menu}
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}
   {#if tab}
+    {@const tabIndex = $repoStore.openTabs.findIndex((item) => item.id === tab.id)}
+    {@const lastIndex = $repoStore.openTabs.length - 1}
+    {@const canMoveLeft = tabIndex > 0}
+    {@const canMoveRight = tabIndex >= 0 && tabIndex < lastIndex}
     <div
       bind:this={menuEl}
       use:portal={"body"}
@@ -543,6 +624,55 @@
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.pinTab(tab.id, !tab.pinned); closeMenu(); }}>
         {tab.pinned ? "Unpin" : "Pin"} tab
       </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item {canMoveLeft ? '' : 'opacity-40 pointer-events-none'}"
+        aria-disabled={!canMoveLeft}
+        onclick={() => {
+          if (!canMoveLeft) return;
+          moveFocusedTabBy(tab.id, -1);
+          closeMenu();
+        }}
+      >
+        Move left
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item {canMoveRight ? '' : 'opacity-40 pointer-events-none'}"
+        aria-disabled={!canMoveRight}
+        onclick={() => {
+          if (!canMoveRight) return;
+          moveFocusedTabBy(tab.id, 1);
+          closeMenu();
+        }}
+      >
+        Move right
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item {canMoveLeft ? '' : 'opacity-40 pointer-events-none'}"
+        aria-disabled={!canMoveLeft}
+        onclick={() => {
+          if (!canMoveLeft) return;
+          moveFocusedTabTo(tab.id, 0);
+          closeMenu();
+        }}
+      >
+        Move to start
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item {canMoveRight ? '' : 'opacity-40 pointer-events-none'}"
+        aria-disabled={!canMoveRight}
+        onclick={() => {
+          if (!canMoveRight) return;
+          moveFocusedTabTo(tab.id, lastIndex);
+          closeMenu();
+        }}
+      >
+        Move to end
+      </button>
+      <span class="gp-menu-sep" aria-hidden="true"></span>
       <button role="menuitem" class="gp-menu-item" onclick={() => void copyPath(tab.path)}>
         Copy path
       </button>

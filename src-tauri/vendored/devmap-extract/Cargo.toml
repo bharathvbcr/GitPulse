@@ -2,13 +2,16 @@
 name = "devmap-extract"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
+description = "Tree-sitter extraction frontend for the DevCouncil code-intelligence kernel"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 rayon = { version = "1.10" }
 regex = { version = "1.10" }
+toml = { version = "1.1", default-features = false, features = ["parse", "preserve_order", "serde", "std"] }
 anyhow = { version = "1.0" }
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-language = { version = "0.1", optional = true }
@@ -43,6 +46,13 @@ tree-sitter-kotlin-ng = { version = "1.1", optional = true }
 tree-sitter-svelte-ng = { version = "1.0", optional = true }
 tree-sitter-astro-next = { version = "0.1", optional = true }
 ignore = { version = "0.4" }
+
+# `kill(2)` against a process *group*, which `std` has no way to express: the
+# deadline in `subprocess.rs` has to reach everything the child started, not
+# just the child. Unix-only, because a process group is; the other targets keep
+# `Child::kill` and say so in that module's doc.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2" }
 
 [build-dependencies]
 cc = "1"
@@ -96,3 +106,157 @@ parse = [
     "dep:tree-sitter-svelte-ng",
     "dep:tree-sitter-astro-next",
 ]
+
+# Which integration tests need a grammar.
+#
+# `--no-default-features` is the shape GitPulse actually links, and its test
+# suite did not compile: every one of these imports `extract_file`, `treesitter`,
+# `langcalls` or `cache`, all of which are `#[cfg(feature = "parse")]`. One
+# unresolved import fails the whole target, so `cargo test -p devmap-extract
+# --no-default-features` reported a build error rather than results — meaning the
+# configuration an embedder ships had never had a single test run against it.
+#
+# `required-features` skips these targets when `parse` is off instead of failing
+# the build, so the feature-off configuration is testable. The two tests absent
+# from this list — `ignore_rule_tolerance` — touches only the model and the
+# walker, and runs in both configurations. The `budget_probe` example is
+# gated for the same reason: it drives the parser directly.
+#
+# Nothing changes with default features on: `parse` is in `default`, so all
+# fifteen targets build and run exactly as before.
+
+[[test]]
+name = "adversarial_corpus"
+required-features = ["parse"]
+
+[[test]]
+name = "mutation_fuzz"
+required-features = ["parse"]
+
+[[test]]
+name = "budget_is_a_real_bound"
+required-features = ["parse"]
+
+[[test]]
+name = "c_family"
+required-features = ["parse"]
+
+[[test]]
+name = "capped_reads_say_so"
+required-features = ["parse"]
+
+[[test]]
+name = "cprobe"
+required-features = ["parse"]
+
+[[test]]
+name = "declarations"
+required-features = ["parse"]
+
+[[test]]
+name = "grammar_matrix"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_jvm_dotnet"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_lua_r"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_ruby_php"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_swift_scala"
+required-features = ["parse"]
+
+[[test]]
+name = "stress_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "test_phase2_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "metal_coverage"
+required-features = ["parse"]
+
+[[example]]
+name = "budget_probe"
+required-features = ["parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's test
+# suite did not compile in it: these targets import items that are
+# `#[cfg(feature = "parse")]`, and one unresolved import fails a whole target,
+# so `cargo test -p devmap-extract --no-default-features` returned a build
+# error instead of results. A build error reads as "not meant to be tested",
+# which is how it survived — no test had ever run in that configuration.
+#
+# `required-features` skips these when `parse` is off rather than failing the
+# build. Nothing changes with default features on, where `parse` is enabled.
+
+[[test]]
+name = "embedded_scripts"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_erlang_pascal"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_nix"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_shell_sql_solidity"
+required-features = ["parse"]
+
+[[test]]
+name = "ts_import_export_fabrication"
+required-features = ["parse"]
+
+[[test]]
+name = "allow_unwired_and_dynamic_imports"
+required-features = ["parse"]
+
+[[test]]
+name = "wiring_port_under_stress"
+required-features = ["parse"]
+
+[[test]]
+name = "langimports_specifier_names_a_file"
+required-features = ["parse"]
+
+[[test]]
+name = "cargo_target_roots_are_wired"
+required-features = ["parse"]
+
+[[test]]
+name = "a_minified_bundle_is_not_parsed"
+required-features = ["parse"]
+
+[[test]]
+name = "heritage"
+required-features = ["parse"]
+
+[[test]]
+name = "language_capabilities"
+required-features = ["parse"]
+
+[[test]]
+name = "liquid_script_scanner_limits"
+required-features = ["parse"]
+
+[[test]]
+name = "rust_use_declarations"
+required-features = ["parse"]
+
+[[test]]
+name = "receiver_is_an_identity"
+required-features = ["parse"]

@@ -459,6 +459,89 @@ const HOST_GLOBALS: &[(&str, &str)] = &[
     ("structuredClone", "web+node"),
 ];
 
+/// X48. The JavaScript-family global **objects**, as opposed to the global
+/// *functions* in [`HOST_GLOBALS`].
+///
+/// A separate table because it answers a different question, and answering it
+/// from the other one would break that one's first admission rule. `HOST_GLOBALS`
+/// is "callable only" on purpose: a call whose *callee* is `console` cannot be a
+/// real call, so it must stay in the tier that means "possible defect". What
+/// this table is for is the *receiver*: `console.log(...)`, `JSON.stringify(x)`,
+/// `process.env`, `Math.floor(n)`. There the name is not being called — it is
+/// the object the runtime injected, and the member is platform API.
+///
+/// Those rows reached `UninferredReceiver`, the tier documented as "the receiver
+/// is a value whose type we could not infer". `console` is not a receiver whose
+/// type could not be inferred; it is one whose type the runtime states. That is
+/// the same argument X43 made for `std::fs`, in the language whose globals are
+/// objects rather than modules. Measured before this table existed: **126 of the
+/// 316** JS `uninferred_receiver` rows on this repository were rooted at one of
+/// these, and 7,408 of 58,904 across scholarlm's JS/TS.
+///
+/// Two admission rules:
+///
+/// 1. **Named by a specification as a property of the global object** — ECMA-262
+///    §19-28 for the standard objects, WHATWG HTML "Web application APIs" for
+///    the browser ones, and the Node.js "Global objects" page for `process`.
+/// 2. **Never sufficient on its own.** Every use of this table is guarded by the
+///    corpus: the enclosing scope must not bind the name, the file's imports
+///    must not, and no indexed file of the family may declare it. A repository
+///    with its own `class Date` keeps its `Date.parse` in the defect tier, which
+///    is the same veto `is_prelude_type` opens with and for the same reason.
+///
+/// Sorted by name: `host_global_object` uses `binary_search_by_key`.
+const HOST_GLOBAL_OBJECTS: &[(&str, &str)] = &[
+    ("Array", "ecma"),
+    ("Atomics", "ecma"),
+    ("BigInt", "ecma"),
+    ("Boolean", "ecma"),
+    ("Date", "ecma"),
+    ("Intl", "ecma"),
+    ("JSON", "ecma"),
+    ("Map", "ecma"),
+    ("Math", "ecma"),
+    ("Number", "ecma"),
+    ("Object", "ecma"),
+    ("Promise", "ecma"),
+    ("Proxy", "ecma"),
+    ("Reflect", "ecma"),
+    ("RegExp", "ecma"),
+    ("Set", "ecma"),
+    ("String", "ecma"),
+    ("Symbol", "ecma"),
+    ("WeakMap", "ecma"),
+    ("WeakSet", "ecma"),
+    ("console", "web+node"),
+    ("crypto", "web+node"),
+    ("document", "web"),
+    ("globalThis", "web+node"),
+    ("history", "web"),
+    ("localStorage", "web"),
+    ("location", "web"),
+    ("navigator", "web+node"),
+    ("performance", "web+node"),
+    ("process", "node"),
+    ("sessionStorage", "web"),
+    ("window", "web"),
+];
+
+/// The environment that injects `name` as a global **object**, or `None`.
+///
+/// Only ever consulted for the *root of a receiver* in a JavaScript-family
+/// file, and only behind the three corpus guards [`HOST_GLOBAL_OBJECTS`]
+/// documents. A bare callee is not asked here: `console()` is not a call the
+/// runtime can answer, and letting this table say otherwise would hide the
+/// extraction defect that produced it.
+pub fn host_global_object(family: LangFamily, name: &str) -> Option<&'static str> {
+    if family != LangFamily::JsTs {
+        return None;
+    }
+    HOST_GLOBAL_OBJECTS
+        .binary_search_by_key(&name, |(global, _)| *global)
+        .ok()
+        .map(|index| HOST_GLOBAL_OBJECTS[index].1)
+}
+
 /// Whether `name` is declared by the language itself for this family.
 ///
 /// Only ever consulted for a *bare* callee. A call with a receiver is library
@@ -472,18 +555,225 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::JsTs => JS_BUILTINS,
         LangFamily::Swift => SWIFT_BUILTINS,
         LangFamily::Kotlin => KOTLIN_BUILTINS,
-        // C/C++/C#/Java have no free-function builtins that reach the resolver
-        // this way, and `Generic` spans languages with no curated set at all.
         LangFamily::Ruby => RUBY_BUILTINS,
         LangFamily::Php => PHP_BUILTINS,
+        LangFamily::Shell => SHELL_BUILTINS,
+        // C/C++/C#/Java have no free-function builtins that reach the resolver
+        // this way, and `Generic` spans languages with no curated set at all.
+        //
+        // The six added when embedded-script extraction landed
+        // (`Erlang`..`Sql`) are here for the honest reason rather than the
+        // convenient one: no curated builtin table has been written for them.
+        // Listing them explicitly rather than adding a `_` arm keeps this match
+        // exhaustive, so the next language forces the same decision instead of
+        // silently inheriting "no builtins" — which would classify every
+        // `length/1` or `echo` as a possible defect and bury the real ones,
+        // the exact signal loss SC18 closed.
         LangFamily::CStyle
         | LangFamily::Scala
         | LangFamily::Lua
         | LangFamily::R
         | LangFamily::Dart
+        | LangFamily::Erlang
+        | LangFamily::Nix
+        | LangFamily::Pascal
+        | LangFamily::Solidity
+        | LangFamily::Sql
         | LangFamily::Generic => return false,
     };
     table.binary_search(&name).is_ok()
+}
+
+/// Rust's standard prelude, restricted to the names that appear in **type
+/// position**: the types and traits `std::prelude::rust_2021` brings into scope
+/// with no `use` at all, plus the derive macros usable unqualified.
+///
+/// Kept apart from [`RUST_BUILTINS`] rather than folded into it, because the
+/// two are consulted with different evidence. `RUST_BUILTINS` answers a *bare
+/// callee* — `println!`, `Some(x)` — and a Rust source file cannot write
+/// `String(x)` as a call at all, so nothing in this table belongs there. These
+/// names reach the resolver as `ReferenceKind::Type`, and the rung that reads
+/// them (`Resolver::classify_unresolved`) additionally requires that **no
+/// indexed file of the same family declares the name**. That second condition
+/// is what makes the table safe where the module comment says a name list is
+/// not: `Default`, `Debug`, `Clone`, `Iterator` and `Error`-adjacent names are
+/// all plausible things a Rust repository declares itself, and where one does,
+/// the reference either resolved to it or the resolver *abstained on
+/// ambiguity*. Labelling an abstention "the language declares this" is exactly
+/// the over-classification the module comment forbids, so the corpus gets the
+/// last word.
+///
+/// Audited against the Rust reference's "Standard library prelude" section for
+/// the 2021 edition: `std::prelude::v1` (which re-exports `core::prelude::v1`)
+/// plus the 2021 additions `TryFrom`, `TryInto` and `FromIterator`. The
+/// prelude's enum *variants* — `Some`, `None`, `Ok`, `Err` — are deliberately
+/// absent here and present in [`RUST_BUILTINS`] instead: they are written in
+/// value position, where that table is the one consulted.
+///
+/// Sorted, not grouped by category: [`is_prelude_type`] uses `binary_search`.
+pub const RUST_PRELUDE_TYPES: &[&str] = &[
+    "AsMut",
+    "AsRef",
+    "Box",
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "DoubleEndedIterator",
+    "Drop",
+    "Eq",
+    "ExactSizeIterator",
+    "Extend",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+    "From",
+    "FromIterator",
+    "Hash",
+    "Into",
+    "IntoIterator",
+    "Iterator",
+    "Option",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
+    "Result",
+    "Send",
+    "Sized",
+    "String",
+    "Sync",
+    "ToOwned",
+    "ToString",
+    "TryFrom",
+    "TryInto",
+    "Unpin",
+    "Vec",
+];
+
+/// The shell's own builtins: POSIX.1-2017 XCU §2.14 ("Special Built-In
+/// Utilities") and §1.6 ("Built-In Utilities"), plus the builtins `bash` adds,
+/// which is the interpreter every `#!` line in this repository names.
+///
+/// X43. `LangFamily::Shell` fell to `is_builtin`'s "no curated table" arm,
+/// which the arm's own comment predicted the cost of: "which would classify
+/// every `length/1` or `echo` as a possible defect and bury the real ones".
+/// Measured on this repository: **398 of the 521 shell rows** were `echo`,
+/// `exit`, `printf`, `return`, `set`, `cd`, `command`, `pwd`, `break`, `trap`
+/// and friends, sitting in the tier documented as the only one that indicates a
+/// defect, and shell reported a net resolution of 38 permille against python's
+/// 492.
+///
+/// External *programs* are deliberately absent — `grep`, `awk`, `cargo`, `git`,
+/// `python3`. The shell does not declare them, no import names them, and what
+/// is on `PATH` is a property of a machine rather than of the language. Under
+/// this module's rule that leaves them in `Unresolved`, which costs 123 rows of
+/// noise on this repository and hides nothing.
+///
+/// `[` and `[[` are included as written: they are utilities whose *name* is the
+/// bracket, and a script cannot declare a function called `[`.
+/// Sorted, not grouped by category: `is_builtin` uses `binary_search`.
+pub const SHELL_BUILTINS: &[&str] = &[
+    ".",
+    ":",
+    "[",
+    "[[",
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "cd",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "test",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
+];
+
+/// Module-path roots the language reserves for its own standard library.
+///
+/// X43. `std::fs::write(...)` reached the classifier as a *receiver* — `std::fs`
+/// — and fell to `UninferredReceiver`, the tier that means "the receiver is a
+/// value whose type we could not infer". `std::fs` is not a value. Rust injects
+/// `std`, `core` and `alloc` into every crate's extern prelude, so a path rooted
+/// at one of them is addressable with no `use` at all and can never name
+/// anything an indexed file declares. 2,128 rows on this repository.
+///
+/// Only Rust has an entry, and the arm is exhaustive so the next language has
+/// to decide rather than inherit a silence. Python's `os.path.join` needs no
+/// entry: `import os` is a statement in the file, and the import rungs already
+/// read it — a table would be a second, weaker answer to a question already
+/// answered by evidence.
+pub fn is_reserved_module_root(family: LangFamily, root: &str) -> bool {
+    match family {
+        // `proc_macro` and `test` are compiler-provided too, but only under a
+        // crate type / feature that the source does not state, so they are left
+        // out on this module's "when in doubt, leave it out" rule.
+        LangFamily::Rust => matches!(root, "std" | "core" | "alloc"),
+        _ => false,
+    }
+}
+
+/// Whether `name`, written in **type position**, is one the language itself
+/// puts in scope with no import.
+///
+/// Rust only. Every other family either has its type names in [`is_builtin`]
+/// already (Go's predeclared types, JavaScript's constructors, Python's
+/// `str`/`int`/`list`) or has no prelude to speak of, and inventing a table for
+/// one that does not exist would classify a real defect as expected — the one
+/// direction this module refuses to fail in.
+pub fn is_prelude_type(family: LangFamily, name: &str) -> bool {
+    match family {
+        LangFamily::Rust => RUST_PRELUDE_TYPES.binary_search(&name).is_ok(),
+        _ => false,
+    }
 }
 
 /// Swift standard-library **free functions**, from the Swift Standard Library
@@ -712,6 +1002,8 @@ mod tests {
             ("kotlin", KOTLIN_BUILTINS),
             ("ruby", RUBY_BUILTINS),
             ("php", PHP_BUILTINS),
+            ("rust prelude types", RUST_PRELUDE_TYPES),
+            ("shell", SHELL_BUILTINS),
         ] {
             let mut sorted = table.to_vec();
             sorted.sort_unstable();
@@ -745,6 +1037,39 @@ mod tests {
                 matches!(*environment, "web" | "node" | "web+node"),
                 "{name:?} names an environment {environment:?} that is not one \
                  of the three this crate can cite"
+            );
+        }
+    }
+
+    /// X48. The object table, held to the same two properties, plus the one
+    /// that keeps the two tables from answering each other's question: a
+    /// *function* the runtime injects and an *object* it injects are asked
+    /// about in different positions — callee and receiver root — and a name in
+    /// both would make the answer depend on which position it was written in.
+    #[test]
+    fn the_host_global_object_table_is_sorted_unique_and_disjoint() {
+        let names: Vec<&str> = HOST_GLOBAL_OBJECTS.iter().map(|(name, _)| *name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted, names,
+            "the host-global-object table must be sorted and duplicate-free for \
+             binary_search_by_key to find its entries"
+        );
+        for (name, environment) in HOST_GLOBAL_OBJECTS {
+            assert!(
+                matches!(*environment, "web" | "node" | "web+node" | "ecma"),
+                "{name:?} names an environment {environment:?} that is not one \
+                 of the four this crate can cite"
+            );
+            assert!(
+                HOST_GLOBALS
+                    .binary_search_by_key(name, |(global, _)| *global)
+                    .is_err(),
+                "{name:?} is claimed as both a host global function and a host \
+                 global object; the tier would then depend on the position the \
+                 name was written in rather than on evidence"
             );
         }
     }

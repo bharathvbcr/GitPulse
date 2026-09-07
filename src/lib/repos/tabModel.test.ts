@@ -16,6 +16,9 @@ import {
   removeRecent,
   reopenLastClosed,
   reorderTab,
+  dropReorderIndex,
+  moveTabBy,
+  moveTabTo,
   type WorkspaceTabs,
 } from "./tabModel";
 
@@ -108,6 +111,34 @@ describe("activate and reorder", () => {
     expect(ws.tabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/c", "/r/a"]);
     expect(reorderTab(ws, -1, 1)).toBe(ws);
     expect(reorderTab(ws, 0, 0)).toBe(ws);
+  });
+
+  it("moves a tab by id to an index or by a delta", () => {
+    let ws = emptyWorkspace();
+    const a = mustOpen(ws, "/r/a");
+    const b = mustOpen(a.workspace, "/r/b");
+    const c = mustOpen(b.workspace, "/r/c");
+    ws = c.workspace;
+    ws = moveTabTo(ws, a.id, 2);
+    expect(ws.tabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/c", "/r/a"]);
+    expect(ws.activeId).toBe(c.id);
+    ws = moveTabBy(ws, a.id, -1);
+    expect(ws.tabs.map((tab) => tab.path)).toEqual(["/r/b", "/r/a", "/r/c"]);
+    expect(moveTabTo(ws, "missing", 0)).toBe(ws);
+    expect(moveTabBy(ws, a.id, 0)).toBe(ws);
+    expect(moveTabBy(ws, a.id, 8)).toBe(ws);
+  });
+
+  it("maps a drop onto a tab half to a reorder index, or null for a no-op", () => {
+    // Three tabs [0, 1, 2]; dragging 0 onto 2's right half lands at the end.
+    expect(dropReorderIndex(0, 2, false)).toBe(2);
+    // Dragging 2 onto 0's left half lands at the start.
+    expect(dropReorderIndex(2, 0, true)).toBe(0);
+    // Adjacent gaps are the same order as today.
+    expect(dropReorderIndex(1, 1, true)).toBeNull();
+    expect(dropReorderIndex(1, 1, false)).toBeNull();
+    expect(dropReorderIndex(0, 1, true)).toBeNull();
+    expect(dropReorderIndex(-1, 0, true)).toBeNull();
   });
 });
 

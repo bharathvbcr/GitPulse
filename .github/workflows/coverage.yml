@@ -10,10 +10,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Fail closed. `actions: write` is the upload-artifact job's own need, not a
+# convenience — without it a restricted GITHUB_TOKEN cannot store the LCOV
+# files this workflow exists to publish. Nothing here writes repository contents.
+permissions:
+  contents: read
+
 jobs:
   coverage:
     name: Generate Code Coverage Reports
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     timeout-minutes: 45
     steps:
       - name: Checkout Repository

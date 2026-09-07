@@ -1,6 +1,6 @@
 <script lang="ts">
   import { interfaceStore } from "../stores/interfaceStore";
-  import { Sparkles, X } from "lucide-svelte";
+  import { Sparkles, X } from "@lucide/svelte";
   import { fade, scale } from "svelte/transition";
 
   let {
@@ -64,7 +64,7 @@
           <button
             type="button"
             onclick={dismiss}
-            class="gp-btn-primary !py-0.5 !px-2.5 !text-[10px] !font-semibold"
+            class="gp-btn-primary py-0.5! px-2.5! text-[10px]! font-semibold!"
           >
             Got it
           </button>

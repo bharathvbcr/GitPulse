@@ -2,8 +2,8 @@
   import { repoStore } from "../stores/repoStore";
   import type { ViewTab } from "../repos/persist";
   import { activeSectionFor, sectionsFor, VIEW_REGISTRY } from "../views/viewRegistry";
+  import { destinationGuide, tipGuideDescId, tipGuideKey } from "../views/viewGuide";
   import { focusTabAt, handleTablistKeydown, tabProps } from "../dom/tablist";
-  import { sectionAccelerator } from "../views/viewShortcuts";
 
   /**
    * A view's own lens switcher.
@@ -57,6 +57,14 @@
   <div
     class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 gp-section-edge bg-surface/40 select-none"
   >
+    <div class="sr-only">
+      {#each sections as section (section.id)}
+        {@const guide = destinationGuide(tipGuideKey(view, section.id))}
+        {#if guide}
+          <span id={tipGuideDescId(tipGuideKey(view, section.id))}>{guide.summary}</span>
+        {/if}
+      {/each}
+    </div>
     <div
       bind:this={list}
       class="gp-segmented"
@@ -65,21 +73,24 @@
       tabindex="-1"
       onkeydown={onKeydown}
     >
-      {#each sections as section, index (section.id)}
+      {#each sections as section (section.id)}
         {@const isActive = active === section.id}
         {@const props = tabProps(view, section.id, isActive)}
+        {@const guideKey = tipGuideKey(view, section.id)}
+        {@const guide = destinationGuide(guideKey)}
         <button
           type="button"
           role={props.role}
           id={props.id}
           aria-selected={props["aria-selected"]}
           aria-controls={props["aria-controls"]}
+          aria-describedby={guide ? tipGuideDescId(guideKey) : undefined}
           tabindex={props.tabindex}
           data-active={isActive ? "true" : "false"}
           data-section={section.id}
+          data-tip-guide={guideKey}
           onclick={() => repoStore.setViewSection(view, section.id)}
-          class="gp-seg-btn !text-[11px] !py-1"
-          title="{section.label} ({sectionAccelerator(index)})"
+          class="gp-seg-btn text-[11px]! py-1!"
         >
           {section.label}
         </button>

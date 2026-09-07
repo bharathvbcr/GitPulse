@@ -80,6 +80,16 @@ export function sources(env = process.env) {
       crates: ["devmap-analyze", "devmap-extract", "devmap-query", "devmap-resolve", "devmap-store"],
       crateDir: (/** @type {string} */ name) => path.join("rust-port", "crates", name),
     },
+    {
+      // MarkDev's parse + highlight core. Package name is `markdev`; the
+      // crate lives at `core/` and has no workspace inheritance of its own,
+      // so `workspace` points at that same directory for resolveManifest.
+      id: "markdev",
+      root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev"),
+      workspace: "core",
+      crates: ["markdev"],
+      crateDir: (/** @type {string} */ _name) => "core",
+    },
   ];
 }
 
@@ -110,7 +120,52 @@ function findSibling(name, from = REPO) {
 }
 
 /** Files and directories taken from each crate. */
-const COPIED = ["src", "build.rs"];
+const COPIED = ["src", "build.rs", "assets"];
+
+/**
+ * Rewrites that keep a vendored crate buildable outside its upstream tree.
+ *
+ * `devmap-query`'s map preview inlines force-graph from a path that walks out
+ * of the crate into DevCouncil's Python package. That path does not exist once
+ * the crate lives under `src-tauri/vendored/`, and the same bytes already sit
+ * in the crate's own `assets/` (what `viz.rs` reads). Point the include at the
+ * local bundle so the vendored build stays self-contained.
+ *
+ * @param {string} crateName
+ * @param {string} crateDir absolute path of the vendored crate
+ * @returns {string[]} human-readable rewrite notes for the manifest
+ */
+function applyStandalonePatches(crateName, crateDir) {
+  /** @type {string[]} */
+  const notes = [];
+  if (crateName !== "devmap-query") return notes;
+
+  const target = path.join(crateDir, "src", "map_preview.rs");
+  if (!existsSync(target)) return notes;
+
+  const before = readFileSync(target, "utf8");
+  // Emit the rustfmt-stable single-line form: the shorter crate-local path
+  // fits on one line, and `cargo fmt --check` fails if we only rewrite the
+  // include path while leaving upstream's two-line `const` split.
+  const upstreamConst =
+    'const FORCE_GRAPH_JS: &str =\n    include_str!("../../../../src/devcouncil/assets/vendor/force-graph.min.js");';
+  const localConst =
+    'const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");';
+  if (!before.includes(upstreamConst)) {
+    if (!before.includes(localConst)) {
+      throw new Error(
+        "devmap-query map_preview.rs no longer has the expected out-of-tree force-graph include; update applyStandalonePatches",
+      );
+    }
+    return notes;
+  }
+  const after = before.replace(upstreamConst, localConst);
+  writeFileSync(target, after);
+  notes.push(
+    "src/map_preview.rs: force-graph include_str retargeted to ../assets/force-graph.min.js.bundle (crate-local, rustfmt-stable)",
+  );
+  return notes;
+}
 
 // --- a very small TOML reader -------------------------------------------
 //
@@ -398,6 +453,7 @@ export function vendor(env = process.env) {
       const upstream = readFileSync(path.join(from, "Cargo.toml"), "utf8");
       const { text, rewrites } = resolveManifest(upstream, workspace);
       writeFileSync(path.join(to, "Cargo.toml"), text);
+      const patches = applyStandalonePatches(name, to);
 
       /** @type {Record<string, string>} */
       const files = {};
@@ -407,7 +463,7 @@ export function vendor(env = process.env) {
         name,
         origin: { repo: source.id, root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`, path: source.crateDir(name), commit },
         omitted: ["tests/", "[dev-dependencies]"],
-        rewrites,
+        rewrites: [...rewrites, ...patches],
         files,
       });
     }
@@ -467,7 +523,22 @@ export function check(env = process.env) {
         const src = path.join(from, item);
         if (!existsSync(src)) continue;
         for (const rel of statSync(src).isDirectory() ? walk(src, item) : [item]) {
-          const theirs = readFileSync(path.join(from, rel));
+          let theirs = readFileSync(path.join(from, rel));
+          // Compare against the post-patch bytes for files the vendor step rewrites,
+          // otherwise a deliberate standalone patch reads as permanent upstream drift.
+          if (
+            crate.name === "devmap-query" &&
+            rel === "src/map_preview.rs"
+          ) {
+            const text = theirs.toString("utf8");
+            const upstreamConst =
+              'const FORCE_GRAPH_JS: &str =\n    include_str!("../../../../src/devcouncil/assets/vendor/force-graph.min.js");';
+            const localConst =
+              'const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");';
+            if (text.includes(upstreamConst)) {
+              theirs = Buffer.from(text.replace(upstreamConst, localConst), "utf8");
+            }
+          }
           const ours = path.join(dir, rel);
           if (!existsSync(ours) || sha256(readFileSync(ours)) !== sha256(theirs)) result.drifted.push(rel);
         }

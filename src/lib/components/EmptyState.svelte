@@ -19,7 +19,7 @@
     compact = false,
     action,
   }: {
-    icon: typeof import("lucide-svelte").FolderOpen;
+    icon: typeof import("@lucide/svelte").FolderOpen;
     title: string;
     hint?: string;
     compact?: boolean;
@@ -33,7 +33,7 @@
 <div class="flex items-center justify-center {compact ? 'p-4' : 'p-8'}">
   <div class="gp-pop gp-card rounded-2xl text-center {compact ? 'px-6 py-5' : 'px-8 py-7'} max-w-sm">
     <div
-      class="mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10 text-accent ring-1 ring-accent/25 shadow-sm {compact
+      class="mx-auto mb-3 flex items-center justify-center rounded-full bg-accent/10 text-accent ring-1 ring-accent/25 shadow-xs {compact
         ? 'h-9 w-9'
         : 'h-11 w-11'}"
     >
@@ -49,7 +49,7 @@
         <button
           type="button"
           onclick={action.onClick}
-          class="{action.variant === 'secondary' ? 'gp-btn' : 'gp-btn-primary'} !py-1.5 !px-3.5 !text-xs inline-flex items-center gap-1.5"
+          class="{action.variant === 'secondary' ? 'gp-btn' : 'gp-btn-primary'} py-1.5! px-3.5! text-xs! inline-flex items-center gap-1.5"
         >
           {#if ActionIcon}
             <ActionIcon size={13} />

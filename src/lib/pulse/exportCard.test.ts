@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { stripMarkupTags } from "../dom/markupText";
 import { generatePulseSvgCard, type ExportCardOptions } from "./exportCard";
 
 /** A fully measured card. Individual tests null out one field at a time. */
@@ -23,7 +24,7 @@ function card(overrides: Partial<ExportCardOptions> = {}): string {
 /** Text content of every element carrying `className`, in document order. */
 function textOf(svg: string, className: string): string[] {
   const matches = svg.matchAll(new RegExp(`class="${className}"[^>]*>(.*?)</text>`, "g"));
-  return [...matches].map((m) => m[1].replace(/<[^>]*>/g, ""));
+  return [...matches].map((m) => stripMarkupTags(m[1]));
 }
 
 describe("generatePulseSvgCard structure", () => {

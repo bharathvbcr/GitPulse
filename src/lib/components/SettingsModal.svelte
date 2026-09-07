@@ -27,7 +27,7 @@
     RotateCcw,
     Search,
     X,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { getMcpInfo } from "../insights/client";
   import type { McpInfo } from "../insights/types";
   import { copyText } from "../desktop/clipboard";
@@ -58,6 +58,7 @@
   import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
+  import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
 
   let {
     isOpen = false,
@@ -367,7 +368,7 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-3xl h-[34rem] max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
+      class="w-full max-w-3xl h-136 max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between gap-3 shrink-0">
         <div
@@ -380,7 +381,7 @@
 
         <!-- Search narrows the rail AND the rows inside each panel, so a hit
              is visible without hunting down the category it landed in. -->
-        <div class="relative min-w-0 flex-1 max-w-[15rem]">
+        <div class="relative min-w-0 flex-1 max-w-60">
           <Search
             size={12}
             class="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-textMuted"
@@ -390,7 +391,7 @@
             bind:value={query}
             placeholder="Search settings"
             aria-label="Search settings"
-            class="w-full rounded-lg border border-border/70 bg-surfaceHover/40 py-1 pl-6 pr-6 text-[11px] text-textPrimary placeholder:text-textMuted focus:border-accent/60 focus:outline-none"
+            class="w-full rounded-lg border border-border/70 bg-surfaceHover/40 py-1 pl-6 pr-6 text-[11px] text-textPrimary placeholder:text-textMuted focus:border-accent/60 focus:outline-hidden"
           />
           {#if query}
             <button
@@ -428,7 +429,7 @@
               onclick={() => (activeSection = entry.id)}
               onkeydown={onRailKeydown}
               class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors duration-100 {active
-                ? 'bg-surface text-accent font-semibold shadow-sm'
+                ? 'bg-surface text-accent font-semibold shadow-xs'
                 : 'text-textMuted hover:text-textPrimary hover:bg-surface/60'}"
             >
               <Icon size={13} class="shrink-0" />
@@ -518,7 +519,7 @@
                       <button
                         type="button"
                         onclick={() => interfaceStore.zoomOut()}
-                        class="gp-btn !py-0.5 !px-2 text-xs"
+                        class="gp-btn py-0.5! px-2! text-xs"
                         title="Zoom Out (⌘-)">-</button
                       >
                       <input
@@ -534,13 +535,13 @@
                       <button
                         type="button"
                         onclick={() => interfaceStore.zoomIn()}
-                        class="gp-btn !py-0.5 !px-2 text-xs"
+                        class="gp-btn py-0.5! px-2! text-xs"
                         title="Zoom In (⌘+)">+</button
                       >
                       <button
                         type="button"
                         onclick={() => interfaceStore.resetZoom()}
-                        class="gp-btn !py-0.5 !px-2 text-[10px]"
+                        class="gp-btn py-0.5! px-2! text-[10px]"
                         title="Reset Zoom (⌘0)">Reset</button
                       >
                     </div>
@@ -600,7 +601,7 @@
                     <button
                       type="button"
                       onclick={() => interfaceStore.resetCoachMarks()}
-                      class="gp-btn !py-0.5 !px-2.5 text-[11px] shrink-0"
+                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
                     >
                       Reset Tips
                     </button>
@@ -718,7 +719,7 @@
                       type="button"
                       onclick={() => interfaceStore.showAllViews()}
                       disabled={hiddenViews.length === 0}
-                      class="gp-btn !py-0.5 !px-2.5 text-[11px] shrink-0"
+                      class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
                     >
                       Show all
                     </button>
@@ -855,7 +856,7 @@
                   />
                 </div>
               {:else if entry.id === "agents"}
-                <div data-setting="mcp-plugin">
+                <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
                     Agents connect through the native Codex plugin package
                     (`.codex-plugin/plugin.json` + `.mcp.json`) and speak MCP 2026-07-28. The
@@ -895,7 +896,7 @@
                       <div class="flex flex-wrap gap-1.5 pt-1">
                         <button
                           type="button"
-                          class="gp-btn !py-0.5 !px-2 text-[10px] inline-flex items-center gap-1"
+                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
                           disabled={!mcpInfo.plugin_manifest_json}
                           onclick={() => void copyMcp("plugin", mcpInfo?.plugin_manifest_json ?? "")}
                         >
@@ -904,7 +905,7 @@
                         </button>
                         <button
                           type="button"
-                          class="gp-btn !py-0.5 !px-2 text-[10px] inline-flex items-center gap-1"
+                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
                           disabled={!mcpInfo.plugin_mcp_json}
                           onclick={() => void copyMcp("mcp", mcpInfo?.plugin_mcp_json ?? "")}
                         >
@@ -930,6 +931,25 @@
                     </div>
                   {/if}
                 </div>
+                <div data-setting="external-tools" hidden={!shown("external-tools")} class="mt-3 space-y-1.5">
+                  <h4 class="text-[10px] font-bold uppercase tracking-wider text-textMuted">
+                    External CLIs
+                  </h4>
+                  <p class="text-textMuted text-[10px] leading-snug">
+                    Install or update <span class="font-mono">devmap</span> (Code → Map) and
+                    <span class="font-mono">manvi</span> (policy harness) via the install ladder:
+                    PATH → prebuilt release → cargo/go install → local checkout. Env vars still win
+                    over saved config.
+                  </p>
+                  <button
+                    type="button"
+                    class="gp-btn text-[11px] px-2 py-0.5"
+                    onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"))}
+                  >
+                    Run setup
+                  </button>
+                  <ExternalToolsPanel />
+                </div>
               {:else if entry.id === "updates"}
                 <div class="space-y-3">
                   <div data-setting="update-check" hidden={!shown("update-check")}>
@@ -952,7 +972,7 @@
                       type="button"
                       onclick={runManualUpdateCheck}
                       disabled={checkingUpdate}
-                      class="gp-btn !py-0.5 !px-2.5 text-[11px] flex items-center gap-1.5"
+                      class="gp-btn py-0.5! px-2.5! text-[11px] flex items-center gap-1.5"
                     >
                       <RefreshCw size={11} class={checkingUpdate ? "animate-spin" : ""} />
                       {checkingUpdate ? "Checking…" : "Check"}
@@ -993,7 +1013,7 @@
         <button
           type="button"
           onclick={restoreDefaults}
-          class="gp-btn !py-0.5 !px-2.5 text-[11px] flex items-center gap-1.5"
+          class="gp-btn py-0.5! px-2.5! text-[11px] flex items-center gap-1.5"
           title="Restore every setting on this page to its default"
         >
           <RotateCcw size={11} />

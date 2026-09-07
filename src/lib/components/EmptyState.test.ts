@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import EmptyState from "./EmptyState.svelte";
-import { FolderOpen, Plus } from "lucide-svelte";
+import { FolderOpen, Plus } from "@lucide/svelte";
 
 describe("EmptyState", () => {
   it("renders title and hint", () => {

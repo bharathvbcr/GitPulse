@@ -9,10 +9,16 @@
     createCarryIndex,
     tokenClass,
     type SupportedLanguage,
+    type SyntaxToken,
   } from "../../files/syntaxHighlight";
+  import {
+    highlightDocument,
+    usesTreeSitter,
+  } from "../../diff/highlight";
   import { copyText } from "../../desktop/clipboard";
   import { formatError } from "../../ui/formatError";
   import { askConfirm } from "../../stores/modalStore";
+  import { createAsyncGuard } from "../../async/guard";
   import {
     Search,
     ChevronUp,
@@ -24,7 +30,7 @@
     Save,
     RotateCcw,
     Hash,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import VirtualList from "../VirtualList.svelte";
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
@@ -107,6 +113,36 @@
    */
   let carryAt = $derived.by(() => createCarryIndex(splitFile.lines, language));
   let byteSize = $derived(content.length);
+
+  /**
+   * Whole-file tree-sitter tokens when MarkDev has a grammar for this
+   * language. `null` means "use the regex tokenizer" — either no grammar, or
+   * the IPC call failed / is still in flight. Never treat an empty array as
+   * "highlighted": that would paint a tree-sitter language as plain text
+   * while the request is outstanding.
+   */
+  let treeSitterLines = $state<SyntaxToken[][] | null>(null);
+  let treeSitterGuard: ReturnType<typeof createAsyncGuard> | null = null;
+
+  $effect(() => {
+    const lang = language;
+    const text = isEditing ? editDraft : content;
+    treeSitterGuard?.cancel();
+    treeSitterLines = null;
+    if (!usesTreeSitter(lang) || isEditing) return;
+    const guard = createAsyncGuard();
+    treeSitterGuard = guard;
+    void highlightDocument(lang, text).then((lines) => {
+      if (!guard.isLive()) return;
+      treeSitterLines = lines;
+    });
+  });
+
+  function tokensForLine(line: string, lineIdx: number): SyntaxToken[] {
+    const cached = treeSitterLines?.[lineIdx];
+    if (cached) return cached;
+    return tokenizeLineWithCarry(line ?? "", language, carryAt(lineIdx)).tokens;
+  }
 
   /**
    * Debounced copy of the query. `searchQuery` is bound to the input, so the
@@ -352,21 +388,21 @@
       <button
         type="button"
         onclick={() => (isSearchOpen = !isSearchOpen)}
-        class="gp-btn !py-0.5 !px-2 ml-2 flex items-center gap-1 text-[11px] {isSearchOpen ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
+        class="gp-btn py-0.5! px-2! ml-2 flex items-center gap-1 text-[11px] {isSearchOpen ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
       >
         <Search size={11} />
         <span>Find</span>
-        <span class="gp-keycap !text-[9px]">⌘F</span>
+        <span class="gp-keycap text-[9px]!">⌘F</span>
       </button>
 
       <button
         type="button"
         onclick={() => (goToLineOpen = true)}
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px]"
+        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px]"
       >
         <Hash size={11} />
         <span>Go to Line</span>
-        <span class="gp-keycap !text-[9px]">⌘G</span>
+        <span class="gp-keycap text-[9px]!">⌘G</span>
       </button>
     </div>
 
@@ -375,7 +411,7 @@
       <button
         type="button"
         onclick={() => (wordWrap = !wordWrap)}
-        class="gp-icon-btn !p-1.5 {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn p-1.5! {wordWrap ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
         title="Word wrap (edit mode)"
       >
         <WrapText size={13} />
@@ -384,7 +420,7 @@
       <button
         type="button"
         onclick={() => (showWhitespace = !showWhitespace)}
-        class="gp-icon-btn !p-1.5 {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        class="gp-icon-btn p-1.5! {showWhitespace ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
         title="Toggle Whitespace Indicators"
       >
         <span class="font-mono text-[11px] font-bold">·_</span>
@@ -414,7 +450,7 @@
         <button
           type="button"
           onclick={startEdit}
-          class="gp-btn !py-1 !px-2.5 flex items-center gap-1 text-[11px]"
+          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px]"
         >
           <Edit3 size={12} class="text-accent" />
           <span>Edit</span>
@@ -423,7 +459,7 @@
         <button
           type="button"
           onclick={cancelEdit}
-          class="gp-btn !py-1 !px-2.5 flex items-center gap-1 text-[11px] text-textMuted"
+          class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px] text-textMuted"
         >
           <RotateCcw size={12} />
           <span>Cancel</span>
@@ -432,7 +468,7 @@
           type="button"
           onclick={saveChanges}
           disabled={isSaving || !hasUnsavedChanges}
-          class="gp-btn-primary !py-1 !px-3 flex items-center gap-1 text-[11px]"
+          class="gp-btn-primary py-1! px-3! flex items-center gap-1 text-[11px]"
         >
           {#if isSaving}
             <span class="animate-spin text-xs">⏳</span>
@@ -446,7 +482,7 @@
       <button
         type="button"
         onclick={handleCopy}
-        class="gp-btn !py-1 !px-2.5 flex items-center gap-1 text-[11px]"
+        class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px]"
         title="Copy whole file content"
       >
         {#if copied}
@@ -477,7 +513,7 @@
               }
             }}
             placeholder="Find in file..."
-            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-none"
+            class="w-full bg-transparent text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden"
           />
           {#if searchQuery}
             <span class="text-[10px] font-mono text-textMuted shrink-0">
@@ -511,7 +547,7 @@
           type="button"
           onclick={prevMatch}
           disabled={matchCount === 0}
-          class="gp-btn !py-1 !px-2 flex items-center gap-1"
+          class="gp-btn py-1! px-2! flex items-center gap-1"
           title="Previous match (Shift+Enter)"
         >
           <ChevronUp size={12} />
@@ -520,7 +556,7 @@
           type="button"
           onclick={nextMatch}
           disabled={matchCount === 0}
-          class="gp-btn !py-1 !px-2 flex items-center gap-1"
+          class="gp-btn py-1! px-2! flex items-center gap-1"
           title="Next match (Enter)"
         >
           <ChevronDown size={12} />
@@ -528,7 +564,7 @@
         <button
           type="button"
           onclick={() => { isSearchOpen = false; searchQuery = ""; }}
-          class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
         >✕</button>
       </div>
     </div>
@@ -548,10 +584,10 @@
           if (e.key === "Escape") goToLineOpen = false;
         }}
         placeholder="Line number"
-        class="gp-field !w-24"
+        class="gp-field w-24!"
       />
-      <button type="button" class="gp-btn-primary !py-1 !px-3" onclick={handleGoToLine}>Go</button>
-      <button type="button" class="gp-btn !py-1 !px-2" onclick={() => (goToLineOpen = false)}>Cancel</button>
+      <button type="button" class="gp-btn-primary py-1! px-3!" onclick={handleGoToLine}>Go</button>
+      <button type="button" class="gp-btn py-1! px-2!" onclick={() => (goToLineOpen = false)}>Cancel</button>
     </div>
   {/if}
 
@@ -569,7 +605,7 @@
         oninput={onEditInput}
         disabled={isSaving}
         spellcheck="false"
-        class="flex-1 w-full h-full p-4 bg-background font-mono text-xs text-textPrimary leading-relaxed focus:outline-none resize-none border-none {wordWrap ? 'whitespace-pre-wrap' : 'whitespace-pre overflow-x-auto'}"
+        class="flex-1 w-full h-full p-4 bg-background font-mono text-xs text-textPrimary leading-relaxed focus:outline-hidden resize-none border-none {wordWrap ? 'whitespace-pre-wrap' : 'whitespace-pre overflow-x-auto'}"
         style="font-size: {0.75 * (zoomPercent / 100)}rem;"
       ></textarea>
     {:else}
@@ -592,7 +628,7 @@
                 (selectedLineEnd === null
                   ? selectedLine === lineNum
                   : lineNum >= Math.min(selectedLine, selectedLineEnd) && lineNum <= Math.max(selectedLine, selectedLineEnd))}
-              {@const tokens = tokenizeLineWithCarry(line ?? "", language, carryAt(lineIdx)).tokens}
+              {@const tokens = tokensForLine(line ?? "", lineIdx)}
               <div
                 class="flex items-center w-full leading-5 transition-colors {isHighlighted
                   ? 'bg-accent/15 border-l-2 border-accent'

@@ -100,6 +100,7 @@ describe("HealthPanel rendering", () => {
     // With no repository open there is nothing to have checked, so the
     // Dependabot state chip stays out of the header entirely.
     expect(body).not.toContain("Dependabot not checked");
+    expect(body).not.toContain("Code scanning not checked");
     expect(body).toContain("Open a repository to scan dependency health");
   });
 
@@ -109,9 +110,11 @@ describe("HealthPanel rendering", () => {
   });
 
   it("includes Dependabot in the copied report and shows every alert severity in the header", () => {
-    expect(source).toContain("formatHealthReport(current, repoPath, dependabot)");
+    expect(source).toContain("formatHealthReport(current, repoPath, dependabot, codeScanning)");
     expect(source).toContain("Dependabot checked at:");
+    expect(source).toContain("Code scanning checked at:");
     expect(source).toContain("{#if openDependabotCount > 0}");
+    expect(source).toContain("{#if openCodeScanningCount > 0}");
   });
 
   it("keeps credentialed GitHub checks behind an explicit user action", () => {
@@ -120,6 +123,7 @@ describe("HealthPanel rendering", () => {
       source.indexOf("async function scanDependabot"),
     );
     expect(localScan).not.toContain("cmd_github_dependabot_alerts");
+    expect(localScan).not.toContain("cmd_github_code_scanning_alerts");
     expect(source).toContain("async function scanDependabot");
     expect(source).toContain("GitHub alerts are not checked automatically");
     expect(source).toMatch(/uses the GitHub CLI,\s+its credentials, and the network/);
@@ -127,6 +131,8 @@ describe("HealthPanel rendering", () => {
     expect(source).not.toContain('class="hidden xl:inline text-[10px] text-textMuted"');
     expect(source).toContain("Check GitHub alerts");
     expect(source).toContain("onclick={() => scanDependabot()}");
+    expect(source).toContain("cmd_github_code_scanning_alerts");
+    expect(source).toContain("Promise.allSettled");
   });
 
   it("shows an IPC failure instead of misdiagnosing it as a missing GitHub CLI", () => {
@@ -143,8 +149,23 @@ describe("HealthPanel rendering", () => {
     );
     const renderedError = section.slice(errorBranch, missingCliBranch);
     expect(renderedError).toContain("!dependabotRequestFailed");
-    expect(source).toContain("dependabotRequestFailed = true;");
+    expect(source).toContain("dependabotRequestFailed = depFailed;");
     expect(source).toContain("dependabotRequestFailed = false;");
+    expect(source).toContain("codeScanningRequestFailed = csFailed;");
+  });
+
+  it("shows an IPC failure for code scanning instead of misdiagnosing it as a missing GitHub CLI", () => {
+    const section = source.slice(
+      source.indexOf("{#snippet codeScanningSection()}"),
+      source.indexOf("{/snippet}", source.indexOf("{#snippet codeScanningSection()}")),
+    );
+    const errorBranch = section.indexOf("{#if codeScanning.error}");
+    const missingCliBranch = section.indexOf("{:else if !codeScanning.cli_present}");
+    expect(errorBranch).toBeGreaterThan(-1);
+    expect(missingCliBranch).toBeGreaterThan(-1);
+    expect(errorBranch).toBeLessThan(missingCliBranch);
+    const renderedError = section.slice(errorBranch, missingCliBranch);
+    expect(renderedError).toContain("!codeScanningRequestFailed");
   });
 
   it("labels outdated results as npm-only and renders exact cap notices", () => {
@@ -158,6 +179,7 @@ describe("HealthPanel flicker contracts", () => {
   it("hydrates the cached report before rescanning so revisits render instantly", () => {
     expect(source).toContain("createRepoPanelCache<{");
     expect(source).toContain("dependabotCheckedAt: number | null");
+    expect(source).toContain("codeScanningCheckedAt: number | null");
     expect(source).toContain(
       "dependabotRequestFailed,",
     );
@@ -173,8 +195,11 @@ describe("HealthPanel flicker contracts", () => {
     );
     expect(body).toContain("const checkedAt = Date.now();");
     expect(body).toContain("dependabotCheckedAt = checkedAt;");
-    expect(body).toContain("cacheDependabotResult(repoPath, next, checkedAt, false)");
-    expect(body).toContain("cacheDependabotResult(repoPath, failed, checkedAt, true)");
+    expect(body).toContain("codeScanningCheckedAt = checkedAt;");
+    expect(body).toContain("Promise.allSettled");
+    expect(body).toContain("cmd_github_code_scanning_alerts");
+    expect(body).toContain("cacheDependabotResult(");
+    expect(body).toContain("nextCodeScanning");
   });
 
   it("does not resurrect an older GitHub result after the local rescan fails", () => {
@@ -189,6 +214,8 @@ describe("HealthPanel flicker contracts", () => {
     expect(helper).toContain(
       "dependabotRequestFailed: requestFailed,",
     );
+    expect(helper).toContain("codeScanning: codeScanningResult");
+    expect(helper).toContain("codeScanningRequestFailed: codeScanningFailed");
   });
 
   it("renders an explicit age for cached Dependabot results", () => {
@@ -205,6 +232,8 @@ describe("HealthPanel flicker contracts", () => {
     expect(effectBody).toContain("report = null;");
     expect(effectBody).toContain("dependabot = null;");
     expect(effectBody).toContain("dependabotCheckedAt = null;");
+    expect(effectBody).toContain("codeScanning = null;");
+    expect(effectBody).toContain("codeScanningCheckedAt = null;");
     expect(effectBody).toContain("deadSymbols = [];");
     expect(effectBody).toContain("codegraph = null;");
     expect(effectBody).toContain("dependabotInflight?.cancel();");
@@ -303,6 +332,12 @@ describe("HealthPanel error-state separation (regression)", () => {
     expect(source).toContain("Dependabot not checked");
     expect(source).toContain("Dependabot 0 open");
     expect(source).toContain("Dependabot unavailable");
+  });
+
+  it("distinguishes an unchecked code scanning result from a checked-and-clear one", () => {
+    expect(source).toContain("Code scanning not checked");
+    expect(source).toContain("Code scanning 0 open");
+    expect(source).toContain("Code scanning unavailable");
   });
 
   /**

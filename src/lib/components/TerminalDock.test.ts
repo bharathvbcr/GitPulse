@@ -31,11 +31,19 @@ describe("TerminalDock", () => {
 
   it("hides rather than unmounts, because closing must not kill the shell", () => {
     // The whole reason the terminal could never really be a view: unmounting
-    // the pane ends the process. `mounted` latches true and only the
-    // repository switch above it tears the session down.
+    // the pane ends the process. `mounted` latches true; hiding, a view
+    // switch, and a repository tab switch all keep the component alive.
     expect(source).toContain("let mounted = $state(open)");
     expect(source).toContain("if (open) mounted = true;");
     expect(source).toContain("class:hidden={!open}");
+  });
+
+  it("keeps one panel per visited repository tab, keyed so a close cannot recycle a shell", () => {
+    expect(source).toContain("nextHostedTerminals");
+    expect(source).toContain("{#each hostedTabs as tab (tab.id)}");
+    expect(source).toContain("data-terminal-host={tab.id}");
+    expect(source).toContain("repoPath: tab.path");
+    expect(source).toContain("visible: open && tab.id === $repoStore.activeTabId");
   });
 
   it("offers the WAI-ARIA splitter, keyboard included", () => {

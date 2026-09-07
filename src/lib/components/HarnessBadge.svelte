@@ -11,7 +11,7 @@
     requestManviFocus,
     type ManviFocusId,
   } from "../ui/manviFocus";
-  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles } from "lucide-svelte";
+  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles } from "@lucide/svelte";
 
   onMount(() => {
     // One probe at startup: the sweep is a handful of loopback connections and
@@ -75,7 +75,7 @@
     onclick={() => openManvi("harness")}
     disabled={!reachable}
     title={harnessTitle}
-    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors shadow-sm disabled:cursor-default
+    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors shadow-xs disabled:cursor-default
       {permissionMode === 'connected'
         ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400 enabled:hover:bg-emerald-500/20'
         : permissionMode === 'blocked'
@@ -99,7 +99,7 @@
     onclick={() => openManvi("model")}
     disabled={!reachable}
     title={modelTitle}
-    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors max-w-[180px] shadow-sm disabled:cursor-default
+    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors max-w-[180px] shadow-xs disabled:cursor-default
       {ai?.ready
         ? 'border-accent/30 bg-accent/10 text-accent enabled:hover:bg-accent/20'
         : 'border-border/80 bg-surfaceHover text-textMuted enabled:hover:text-textPrimary'}"
@@ -113,7 +113,7 @@
       onclick={() => openManvi("activity")}
       disabled={!reachable}
       title={verdictTitle}
-      class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 shadow-sm disabled:cursor-default
+      class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 shadow-xs disabled:cursor-default
         {verdict.status === 'blocked'
           ? 'border-rose-500/30 bg-rose-500/10 text-rose-400'
           : verdict.status === 'unchecked'

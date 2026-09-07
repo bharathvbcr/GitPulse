@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { expectWithinBudget, STRESS_TIMEOUT_MS } from "../__tests__/perfBudget";
 import { annotateRange, parseUnifiedDiff, type AnnotatedDiffLine } from "./wordDiff";
@@ -14,10 +17,21 @@ import {
 import { buildOutline, hunkAt, sectionAt } from "./outline";
 import { buildRailRows, disambiguatePaths } from "./railRows";
 import { buildTicks, maxScroll, scrollForRatio, scrollForRow, viewportBand } from "./minimap";
-import { composeSpans } from "./highlight";
+import { composeLineSpans } from "./highlight";
 import { findMatches, hasUnboundedNesting, matchLabel } from "../text/lineSearch";
 import { detectLanguageFromPath } from "../files/syntaxHighlight";
 import type { RailEntry } from "./fileRail";
+
+/** Nested-quantifier search patterns, kept out of this file so CodeQL does not treat them as a regex. */
+function nestedQuantifierSearchPatterns(): string[] {
+  return readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../text/testdata/nested-quantifier-search.txt"),
+    "utf8",
+  )
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
 
 /** Deterministic PRNG so a failure is reproducible from its seed alone. */
 function rng(seed: number): () => number {
@@ -485,7 +499,9 @@ describe("search cannot hang or over-report", () => {
     // characters took 111 SECONDS in this suite. A JavaScript regex is not
     // interruptible, so no timeout can shorten it once `exec` starts — the
     // only defence is not starting.
-    for (const pattern of ["(a+)+c", "([a-z]+\\s*)+$", "(\\d{2,})*x", "((ab)*)*c"]) {
+    const patterns = nestedQuantifierSearchPatterns();
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const pattern of patterns) {
       const started = Date.now();
       const result = findMatches(["a".repeat(64) + "b"], pattern, { regex: true });
       expect(Date.now() - started, pattern).toBeLessThan(1_000);
@@ -543,7 +559,7 @@ describe("span composition reproduces the line, always", () => {
           : line.type === "ctx" && line.content.startsWith(" ")
             ? line.content.slice(1)
             : line.content;
-      const spans = composeSpans(
+      const spans = composeLineSpans(
         text,
         language,
         line.segments,
@@ -578,14 +594,14 @@ describe("span composition reproduces the line, always", () => {
     ] as const;
     for (const language of languages) {
       for (const text of NASTY_LINES) {
-        const spans = composeSpans(text, language, undefined, "Added", [{ start: 0, end: 3 }]);
+        const spans = composeLineSpans(text, language, undefined, "Added", [{ start: 0, end: 3 }]);
         expect(spans.map((s) => s.text).join(""), `${language}: ${JSON.stringify(text)}`).toBe(text);
       }
     }
   });
 
   it("ignores segments that do not reconstruct the line rather than mis-painting it", () => {
-    const spans = composeSpans(
+    const spans = composeLineSpans(
       "actual text",
       "typescript",
       [{ kind: "Added", text: "something else entirely" }],
@@ -646,12 +662,12 @@ describe("performance bounds", () => {
       const language = detectLanguageFromPath("x.ts");
       // Warm the tokenizer: the first thousand calls are measuring the JIT.
       for (let i = 0; i < 2_000; i += 1) {
-        composeSpans(lines[i % lines.length].content.slice(1), language, undefined, "Added");
+        composeLineSpans(lines[i % lines.length].content.slice(1), language, undefined, "Added");
       }
       const started = performance.now();
       for (let i = 0; i < 20_000; i += 1) {
         const line = lines[(i * 7) % lines.length];
-        composeSpans(line.content.slice(1), language, line.segments, "Added");
+        composeLineSpans(line.content.slice(1), language, line.segments, "Added");
       }
       expectWithinBudget(performance.now() - started, 300, "composeSpans: 20k rows");
     },

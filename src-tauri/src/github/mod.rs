@@ -163,6 +163,46 @@ pub struct DependabotReport {
     pub error: Option<String>,
 }
 
+/// One open GitHub code scanning alert (CodeQL / GHAS), shaped for Health.
+///
+/// Severities prefer `rule.security_severity_level` (`low`/`medium`/`high`/
+/// `critical`) and fall back to CodeQL's `rule.severity` (`note`/`warning`/
+/// `error`). Empty strings mean GitHub published nothing for that field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeScanningAlertInfo {
+    pub number: u64,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub severity: String,
+    pub state: String,
+    pub tool: String,
+    pub tool_version: String,
+    pub title: String,
+    pub path: String,
+    /// 0 when GitHub omitted `most_recent_instance.location.start_line`.
+    pub start_line: u64,
+    pub url: String,
+    pub dismissed_reason: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Result of fetching code scanning alerts for the opened repository.
+///
+/// Same fail-closed contract as [`DependabotReport`]: `available: false` with
+/// an `error` is "could not check" (no token, 403 GHAS, 404, rate limit),
+/// never an empty success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeScanningReport {
+    pub available: bool,
+    pub cli_present: bool,
+    pub is_github_remote: bool,
+    pub slug: String,
+    pub alerts: Vec<CodeScanningAlertInfo>,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
 /// Drops a trailing `.git` the way git itself does: case-insensitively
 /// (`Repo.GIT` and `repo.git` both clone into `repo`).
 fn trim_git_suffix(path: &str) -> &str {
@@ -1015,6 +1055,165 @@ fn alert_from_json(row: &Value) -> DependabotAlertInfo {
         ),
         url: path_str(row, &["html_url"]),
         created_at: path_str(row, &["created_at"]),
+    }
+}
+
+/// Loads open GitHub code scanning alerts via `gh api`.
+///
+/// Same contract as [`load_dependabot_alerts`]: every condition that prevents
+/// the fetch comes back as [`CodeScanningReport`] with `available: false` and
+/// an explicit reason. A 403 ("Advanced Security is not enabled") or missing
+/// `security_events` scope must never look like "no open alerts".
+pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
+    let cli_present = gh_cli_present();
+    let remote = match discover_github_remote(repo_path) {
+        Ok(Some(r)) => r,
+        Ok(None) => return unavailable_code_scanning(cli_present, false, String::new(), None),
+        Err(e) => return unavailable_code_scanning(cli_present, false, String::new(), Some(e)),
+    };
+    if !cli_present {
+        return unavailable_code_scanning(
+            false,
+            true,
+            remote.slug(),
+            Some("GitHub CLI (`gh`) is not installed or not on PATH".into()),
+        );
+    }
+    match list_code_scanning_alerts(&remote) {
+        Ok((alerts, truncated)) => CodeScanningReport {
+            available: true,
+            cli_present: true,
+            is_github_remote: true,
+            slug: remote.slug(),
+            alerts,
+            truncated,
+            error: None,
+        },
+        Err(e) => unavailable_code_scanning(true, true, remote.slug(), Some(e)),
+    }
+}
+
+fn unavailable_code_scanning(
+    cli_present: bool,
+    is_github_remote: bool,
+    slug: String,
+    error: Option<String>,
+) -> CodeScanningReport {
+    CodeScanningReport {
+        available: false,
+        cli_present,
+        is_github_remote,
+        slug,
+        alerts: Vec::new(),
+        truncated: false,
+        error,
+    }
+}
+
+fn list_code_scanning_alerts(
+    remote: &GitHubRepoRef,
+) -> Result<(Vec<CodeScanningAlertInfo>, bool), String> {
+    let fetch_limit = (ALERT_DISPLAY_LIMIT + 1).to_string();
+    // Official REST: GET /repos/{owner}/{repo}/code-scanning/alerts
+    // Query params confirmed: state, per_page (max 100), ref, tool_name,
+    // severity, page. We request open alerts and one extra row so a cap is
+    // reported rather than silently looking complete. Auth is the same `gh
+    // api` session Dependabot uses — no second token path.
+    let endpoint = format!(
+        "repos/{}/{}/code-scanning/alerts?state=open&per_page={fetch_limit}",
+        remote.owner, remote.name
+    );
+    let out = capture_gh_api(remote, &endpoint)?;
+    if !out.success {
+        return Err(gh_api_error_message(&out));
+    }
+    parse_code_scanning_alerts(&out.stdout_text(), ALERT_DISPLAY_LIMIT)
+}
+
+fn parse_code_scanning_alerts(
+    text: &str,
+    display_limit: usize,
+) -> Result<(Vec<CodeScanningAlertInfo>, bool), String> {
+    let value: Value = serde_json::from_str(text.trim())
+        .map_err(|error| format!("could not parse gh code-scanning output: {error}"))?;
+    let rows = value
+        .as_array()
+        .ok_or("code-scanning payload must be an array")?;
+    let truncated = rows.len() > display_limit;
+    let mut alerts: Vec<CodeScanningAlertInfo> = rows.iter().map(code_scanning_from_json).collect();
+    alerts.sort_by(|a, b| {
+        code_scanning_severity_rank(&a.severity)
+            .cmp(&code_scanning_severity_rank(&b.severity))
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    alerts.truncate(display_limit);
+    Ok((alerts, truncated))
+}
+
+/// Maps GitHub code-scanning severity vocab onto [`severity_rank`].
+///
+/// `security_severity_level` uses Dependabot's ladder. CodeQL `rule.severity`
+/// uses `error`/`warning`/`note`/`none` — those must not land in the unknown
+/// bucket that capping drops first.
+fn code_scanning_severity_rank(severity: &str) -> u8 {
+    let key = severity.to_ascii_lowercase();
+    match key.as_str() {
+        "error" => severity_rank("high"),
+        "warning" => severity_rank("medium"),
+        "note" => severity_rank("low"),
+        other => severity_rank(other),
+    }
+}
+
+fn path_u64(value: &Value, path: &[&str]) -> u64 {
+    json_path(value, path).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn code_scanning_severity(row: &Value) -> String {
+    let security = path_str(row, &["rule", "security_severity_level"]);
+    if !security.is_empty() {
+        security
+    } else {
+        path_str(row, &["rule", "severity"])
+    }
+}
+
+fn code_scanning_title(row: &Value) -> String {
+    let description = path_str(row, &["rule", "description"]);
+    if !description.is_empty() {
+        return description;
+    }
+    let message = path_str(row, &["most_recent_instance", "message", "text"]);
+    if !message.is_empty() {
+        return message;
+    }
+    let name = path_str(row, &["rule", "name"]);
+    if !name.is_empty() {
+        return name;
+    }
+    let rule_id = path_str(row, &["rule", "id"]);
+    if !rule_id.is_empty() {
+        return rule_id;
+    }
+    "Code scanning alert".to_string()
+}
+
+fn code_scanning_from_json(row: &Value) -> CodeScanningAlertInfo {
+    CodeScanningAlertInfo {
+        number: row.get("number").and_then(Value::as_u64).unwrap_or(0),
+        rule_id: path_str(row, &["rule", "id"]),
+        rule_name: path_str(row, &["rule", "name"]),
+        severity: code_scanning_severity(row),
+        state: path_str(row, &["state"]),
+        tool: path_str(row, &["tool", "name"]),
+        tool_version: path_str(row, &["tool", "version"]),
+        title: code_scanning_title(row),
+        path: path_str(row, &["most_recent_instance", "location", "path"]),
+        start_line: path_u64(row, &["most_recent_instance", "location", "start_line"]),
+        url: path_str(row, &["html_url"]),
+        dismissed_reason: path_str(row, &["dismissed_reason"]),
+        created_at: path_str(row, &["created_at"]),
+        updated_at: path_str(row, &["updated_at"]),
     }
 }
 
@@ -2076,6 +2275,169 @@ mod tests {
         );
     }
 
+    fn code_scanning_row(
+        number: u64,
+        rule_id: &str,
+        security_severity: Option<&str>,
+        rule_severity: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "html_url": format!("https://github.com/acme/repo/security/code-scanning/{number}"),
+            "state": "open",
+            "dismissed_reason": null,
+            "rule": {
+                "id": rule_id,
+                "name": rule_id,
+                "severity": rule_severity,
+                "security_severity_level": security_severity,
+                "description": format!("{rule_id} finding")
+            },
+            "tool": { "name": "CodeQL", "version": "2.20.0", "guid": null },
+            "most_recent_instance": {
+                "ref": "refs/heads/main",
+                "state": "open",
+                "message": { "text": format!("{rule_id} on main") },
+                "location": {
+                    "path": "src/lib.rs",
+                    "start_line": 10 + number,
+                    "end_line": 10 + number,
+                    "start_column": 1,
+                    "end_column": 8
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn code_scanning_alerts_sort_worst_first() {
+        let rows = vec![
+            code_scanning_row(2, "js/redos", Some("medium"), "warning"),
+            code_scanning_row(1, "js/clear-text-logging", Some("high"), "error"),
+        ];
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, truncated) = parse_code_scanning_alerts(&text, 50).unwrap();
+        assert!(!truncated);
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].number, 1);
+        assert_eq!(alerts[0].severity, "high");
+        assert_eq!(alerts[0].rule_id, "js/clear-text-logging");
+        assert_eq!(alerts[0].tool, "CodeQL");
+        assert_eq!(alerts[0].path, "src/lib.rs");
+        assert_eq!(alerts[0].start_line, 11);
+        assert_eq!(alerts[1].severity, "medium");
+    }
+
+    #[test]
+    fn code_scanning_prefers_security_severity_level() {
+        let row = code_scanning_row(4, "js/sql-injection", Some("critical"), "warning");
+        let text = serde_json::to_string(&vec![row]).unwrap();
+        let (alerts, _) = parse_code_scanning_alerts(&text, 50).unwrap();
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[0].title, "js/sql-injection finding");
+    }
+
+    #[test]
+    fn code_scanning_falls_back_to_rule_severity() {
+        let row = code_scanning_row(5, "js/inefficient-regex", None, "warning");
+        let text = serde_json::to_string(&vec![row]).unwrap();
+        let (alerts, _) = parse_code_scanning_alerts(&text, 50).unwrap();
+        assert_eq!(alerts[0].severity, "warning");
+    }
+
+    #[test]
+    fn code_scanning_empty_array_is_available_success() {
+        let (alerts, truncated) = parse_code_scanning_alerts("[]", 50).unwrap();
+        assert!(alerts.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn code_scanning_alerts_tolerate_missing_optional_fields() {
+        let payload = r#"[{"number":7,"rule":{"id":"js/x"}}]"#;
+        let (alerts, truncated) = parse_code_scanning_alerts(payload, 50).unwrap();
+        let alert = alerts.first().expect("one alert");
+        assert!(!truncated);
+        assert_eq!(alert.severity, "");
+        assert_eq!(alert.path, "");
+        assert_eq!(alert.start_line, 0);
+        assert_eq!(alert.tool, "");
+        assert_eq!(alert.dismissed_reason, "");
+        assert_eq!(alert.title, "js/x");
+        assert_eq!(alert.url, "");
+    }
+
+    #[test]
+    fn garbage_code_scanning_output_is_a_parse_error_not_an_empty_success() {
+        for garbage in ["", "{\"unexpected\":true}", "\"array?\""] {
+            assert!(
+                parse_code_scanning_alerts(garbage, ALERT_DISPLAY_LIMIT).is_err(),
+                "code-scanning parse must fail loudly on {garbage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_scanning_fetch_capping_is_reported_not_hidden() {
+        let rows: Vec<serde_json::Value> = (1..=3)
+            .map(|n| code_scanning_row(n as u64, "js/note", None, "note"))
+            .collect();
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, truncated) = parse_code_scanning_alerts(&text, 2).unwrap();
+        assert_eq!(alerts.len(), 2);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn code_scanning_cap_drops_least_severe_not_arbitrary_rows() {
+        let rows = vec![
+            code_scanning_row(1, "js/low-a", None, "note"),
+            code_scanning_row(2, "js/low-b", None, "note"),
+            code_scanning_row(3, "js/critical-c", Some("critical"), "error"),
+        ];
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, truncated) = parse_code_scanning_alerts(&text, 2).unwrap();
+        assert!(truncated);
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].number, 3);
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[1].number, 1);
+    }
+
+    #[test]
+    fn code_scanning_severity_ranking_is_case_insensitive() {
+        let rows = vec![
+            code_scanning_row(1, "a", Some("HIGH"), "error"),
+            code_scanning_row(2, "b", Some("Critical"), "error"),
+            code_scanning_row(3, "c", None, "WARNING"),
+        ];
+        let text = serde_json::to_string(&rows).unwrap();
+        let (alerts, _) = parse_code_scanning_alerts(&text, 50).unwrap();
+        assert_eq!(
+            alerts.iter().map(|alert| alert.number).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+    }
+
+    #[test]
+    fn code_scanning_ghas_403_is_extracted_not_silent() {
+        let output = CapturedOutput {
+            stdout: br#"{"message":"Advanced Security must be enabled for this repository to use code scanning.","documentation_url":"https://docs.github.com/rest"}"#
+                .to_vec(),
+            stderr: b"gh: HTTP 403".to_vec(),
+            success: false,
+            status_code: 403,
+        };
+        let message = gh_api_error_message(&output);
+        assert!(
+            message.contains("Advanced Security must be enabled"),
+            "got {message}"
+        );
+        assert!(message.contains("HTTP 403"), "got {message}");
+    }
+
     /// Error text surfaced from gh is tail-capped: a chatty failure cannot
     /// ship megabytes of stderr into reports and warnings.
     #[test]
@@ -2312,13 +2674,26 @@ mod tests {
         }]))
         .unwrap();
         let seed_alert = serde_json::to_string(&vec![dependabot_row(1, "p", "high")]).unwrap();
+        let seed_code_scanning = serde_json::to_string(&vec![code_scanning_row(
+            1,
+            "js/redos",
+            Some("high"),
+            "error",
+        )])
+        .unwrap();
 
-        // Intact inputs parse cleanly on all three parsers.
+        // Intact inputs parse cleanly on all parsers.
         assert!(parse_pr_list(&seed_prs, 50).is_ok());
         assert!(parse_workflow_runs(&seed_runs, 20).is_ok());
         assert!(parse_dependabot_alerts(&seed_alert, 50).is_ok());
+        assert!(parse_code_scanning_alerts(&seed_code_scanning, 50).is_ok());
 
-        let seeds: Vec<Vec<u8>> = vec![seed_prs, seed_runs, seed_alert.into_bytes()];
+        let seeds: Vec<Vec<u8>> = vec![
+            seed_prs,
+            seed_runs,
+            seed_alert.into_bytes(),
+            seed_code_scanning.into_bytes(),
+        ];
         let mut rng = Lcg(0x0061_7564_6974_6f72);
         for iteration in 0..4000usize {
             let mut payload = seeds[iteration % seeds.len()].clone();
@@ -2337,7 +2712,9 @@ mod tests {
                 assert!(truncated || prs.len() <= 50);
             }
             let _ = parse_workflow_runs(&payload, 20);
-            let _ = parse_dependabot_alerts(&String::from_utf8_lossy(&payload), 50);
+            let lossy = String::from_utf8_lossy(&payload);
+            let _ = parse_dependabot_alerts(&lossy, 50);
+            let _ = parse_code_scanning_alerts(&lossy, 50);
         }
     }
 
@@ -2372,6 +2749,22 @@ mod tests {
         assert_eq!(alerts.len(), ALERT_DISPLAY_LIMIT);
         assert!(truncated);
         // Worst-first ordering survives the scale.
+        assert_eq!(alerts[0].severity, "critical");
+
+        let code_scanning_json: Vec<serde_json::Value> = (1..=20_000usize)
+            .map(|n| {
+                let (security, rule) = match n % 3 {
+                    0 => (Some("critical"), "error"),
+                    1 => (Some("high"), "error"),
+                    _ => (None, "note"),
+                };
+                code_scanning_row(n as u64, "js/rule", security, rule)
+            })
+            .collect();
+        let text = serde_json::to_string(&code_scanning_json).unwrap();
+        let (alerts, truncated) = parse_code_scanning_alerts(&text, ALERT_DISPLAY_LIMIT).unwrap();
+        assert_eq!(alerts.len(), ALERT_DISPLAY_LIMIT);
+        assert!(truncated);
         assert_eq!(alerts[0].severity, "critical");
 
         let releases_json: Vec<serde_json::Value> = (1..=5_000usize)

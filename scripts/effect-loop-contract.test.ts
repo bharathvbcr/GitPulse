@@ -1,6 +1,8 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { scriptBlocks } from "../src/lib/dom/markupText.ts";
+import { escapeRegExp } from "../src/lib/text/lineSearch.ts";
 
 /**
  * A pane that crashes with `effect_update_depth_exceeded` takes its whole
@@ -110,7 +112,7 @@ export function balanced(src: string, open: number, o = "(", c = ")"): string {
   return src.slice(open, i);
 }
 
-const word = (name: string) => name.replace(/\$/g, "\\$");
+const word = (name: string) => escapeRegExp(name);
 
 export function countWrites(region: string, name: string): { plain: number; compound: number } {
   const n = word(name);
@@ -152,13 +154,10 @@ const SYNC_CALLBACK_APIS = /\.(subscribe|forEach|map|watch|listen|on)\s*\(/g;
  *  taking only the first would hide the instance script behind `<script module>`. */
 function scriptRegions(file: string, raw: string): { code: string; offset: number }[] {
   if (!file.endsWith(".svelte")) return [{ code: blankNonCode(raw), offset: 0 }];
-  const out: { code: string; offset: number }[] = [];
-  for (const m of raw.matchAll(/<script[^>]*>/g)) {
-    const start = (m.index ?? 0) + m[0].length;
-    const end = raw.indexOf("</script>", start);
-    if (end > start) out.push({ code: blankNonCode(raw.slice(start, end)), offset: start });
-  }
-  return out;
+  return scriptBlocks(raw).map((block) => ({
+    code: blankNonCode(block.inner),
+    offset: block.innerStart,
+  }));
 }
 
 /** Component-local helper bodies, so a callback that delegates to a helper
@@ -314,6 +313,13 @@ describe("no $effect reads the state it writes through a synchronous callback", 
       report = snap.value;`);
     expect(countReads(sample, "loading")).toBe(0);
     expect(countReads(sample, "report")).toBe(0);
+  });
+
+  it("escapes backslash so a name cannot become a character-class in the identifier regex", () => {
+    // Pre-fix `word` only escaped `$`. `x\d` compiled as "x, then a digit" and
+    // counted `x0 = 1` as a write of the identifier `x\d`.
+    expect(countWrites("x0 = 1", "x\\d").plain).toBe(0);
+    expect(countWrites("x\\d = 1", "x\\d").plain).toBe(1);
   });
 
   it("does not flag a read that is explicitly untracked", () => {

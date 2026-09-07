@@ -46,7 +46,7 @@
     Activity,
     Columns2,
     XCircle,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
@@ -559,7 +559,7 @@
       aria-label="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer"
       aria-pressed={paneLayout.explorerVisible}
       title="{paneLayout.explorerVisible ? 'Hide' : 'Show'} Explorer (⌘B)"
-      class="gp-icon-btn !p-1.5 shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+      class="gp-icon-btn p-1.5! shrink-0 {paneLayout.explorerVisible ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
     >
       {#if paneLayout.explorerVisible}
         <PanelLeftClose size={14} />
@@ -650,7 +650,7 @@
           onclick={closeOtherTabs}
           aria-label="Close other tabs"
           title="Close Other Tabs"
-          class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
         >
           <Columns2 size={13} />
         </button>
@@ -659,7 +659,7 @@
           onclick={closeAllTabs}
           aria-label="Close all tabs"
           title="Close All Tabs"
-          class="gp-icon-btn !p-1 text-textMuted hover:text-rose-400"
+          class="gp-icon-btn p-1! text-textMuted hover:text-rose-400"
         >
           <XCircle size={13} />
         </button>
@@ -672,7 +672,7 @@
         aria-pressed={paneLayout.dashboardVisible}
         aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse dashboard"
         title="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live Pulse Dashboard (⌘⇧D)"
-        class="gp-btn !py-0.5 !px-2 flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
+        class="gp-btn py-0.5! px-2! flex items-center gap-1 text-[11px] {paneLayout.dashboardVisible
           ? 'border-accent/60 bg-accent/15 text-accent font-semibold'
           : ''}"
       >
@@ -726,7 +726,7 @@
         <button
           type="button"
           onclick={copyActivePath}
-          class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
           aria-label="Copy relative path"
           title="Copy Relative Path"
         >
@@ -736,7 +736,7 @@
         <button
           type="button"
           onclick={openActiveInDefaultApp}
-          class="gp-icon-btn !p-1 text-textMuted hover:text-textPrimary"
+          class="gp-icon-btn p-1! text-textMuted hover:text-textPrimary"
           aria-label="Open in default application"
           title="Open in Default Application"
         >
@@ -748,7 +748,7 @@
         <button
           type="button"
           onclick={() => inspectIn("diff")}
-          class="gp-btn !py-0.5 !px-1.5 text-[10px] flex items-center gap-1 text-cyan-400"
+          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 text-cyan-400"
           title="View in Diff Tab"
         >
           <Layers size={11} />
@@ -758,7 +758,7 @@
         <button
           type="button"
           onclick={() => inspectIn("blame")}
-          class="gp-btn !py-0.5 !px-1.5 text-[10px] flex items-center gap-1 text-purple-400"
+          class="gp-btn py-0.5! px-1.5! text-[10px] flex items-center gap-1 text-purple-400"
           title="View Git Blame"
         >
           <GitCommit size={11} />

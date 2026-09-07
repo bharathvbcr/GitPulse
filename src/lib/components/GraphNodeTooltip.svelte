@@ -7,7 +7,7 @@
     GitCommit,
     GitMerge,
     Tag,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import type { GraphHitKind, VisualCommitRow } from "../canvas/GraphRenderer";
   import type { TooltipPlacement } from "../canvas/graphInteraction";
   import type { RefItem } from "./CommitRow.svelte";
@@ -100,7 +100,7 @@
   ></div>
 
   <div class="flex items-start gap-2.5 border-b border-border/50 px-3 py-2.5">
-    <div class="mt-0.5 rounded-full bg-accent/15 p-1.5 text-accent shadow-sm">
+    <div class="mt-0.5 rounded-full bg-accent/15 p-1.5 text-accent shadow-xs">
       {#if row.is_merge}
         <GitMerge size={14} />
       {:else}

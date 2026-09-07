@@ -49,10 +49,21 @@ impl Graph {
     }
 }
 
+/// Communities, plus whether the partition is the one the search settled on.
+///
+/// Separate from `Vec<CommunityReport>` so a degraded run cannot be mistaken
+/// for a clean one. `degraded` carries the reason rather than a bare flag,
+/// because it is rendered into `AnalysisStatus::Partial` and a status a reader
+/// cannot act on is barely better than no status.
+pub struct CommunityDetection {
+    pub communities: Vec<CommunityReport>,
+    pub degraded: Option<String>,
+}
+
 pub fn detect_communities(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
-) -> Vec<CommunityReport> {
+) -> CommunityDetection {
     // Sorted node index; ordering is the determinism anchor for everything below.
     let mut names: BTreeSet<String> = BTreeSet::new();
     for ext in extractions {
@@ -64,7 +75,11 @@ pub fn detect_communities(
     }
     let names: Vec<String> = names.into_iter().collect();
     if names.is_empty() {
-        return Vec::new();
+        // Nothing to partition is a complete answer, not a degraded one.
+        return CommunityDetection {
+            communities: Vec::new(),
+            degraded: None,
+        };
     }
     let index: BTreeMap<&str, usize> = names
         .iter()
@@ -96,19 +111,43 @@ pub fn detect_communities(
     }
     let base = Graph { adj };
 
-    let partition = louvain(&base);
+    let (partition, converged) = louvain(&base, MAX_PASSES, MAX_LOCAL_ROUNDS);
     let partition = split_disconnected(&base, &partition);
-    emit(&names, &base, &partition)
+    CommunityDetection {
+        communities: emit(&names, &base, &partition),
+        degraded: (!converged).then(|| {
+            format!(
+                "community detection stopped at its iteration ceiling \
+                 ({MAX_PASSES} passes / {MAX_LOCAL_ROUNDS} local rounds) before the \
+                 partition settled; communities are best-effort"
+            )
+        }),
+    }
 }
 
-/// Multi-level Louvain. Returns a community label per node of `graph`.
-fn louvain(graph: &Graph) -> Vec<usize> {
+/// Multi-level Louvain. Returns a community label per node of `graph`, and
+/// whether the search converged rather than being stopped by a ceiling.
+///
+/// Both `MAX_PASSES` and `MAX_LOCAL_ROUNDS` guard pathological graphs, and the
+/// comment on them has always said so. That is a claim about how often the
+/// ceiling is reached, not a reason to make reaching it invisible: an exhausted
+/// search returns a `Vec<usize>` identical in type and shape to a converged
+/// one, so every consumer reads a best-effort partition as the answer. This is
+/// the Class A shape from `PLAN.md` §3.1 — ran-and-settled and stopped-early
+/// must not be indistinguishable in the return value.
+///
+/// The ceilings are parameters rather than reads of the constants so the
+/// exhaustion path is reachable from a test. A property that cannot be
+/// exercised is a property nobody has checked — which is how this one came to
+/// be unreported in the first place.
+fn louvain(graph: &Graph, max_passes: usize, max_local_rounds: usize) -> (Vec<usize>, bool) {
     let n = graph.adj.len();
     // Every node in its own community is already optimal when there are no
-    // edges to trade off, and the modularity denominator would be zero.
+    // edges to trade off, and the modularity denominator would be zero. That
+    // is a converged answer, not a degraded one.
     let total = graph.total_degree();
     if total <= 0.0 {
-        return (0..n).collect();
+        return ((0..n).collect(), true);
     }
 
     // Maps original nodes to communities of the current (possibly aggregated)
@@ -118,11 +157,18 @@ fn louvain(graph: &Graph) -> Vec<usize> {
         adj: graph.adj.clone(),
     };
 
-    for _ in 0..MAX_PASSES {
-        let local = local_moving(&level, total);
+    // Converged unless a ceiling says otherwise. A level whose local sweep hit
+    // `MAX_LOCAL_ROUNDS` degrades the whole result, even if the outer loop then
+    // stops cleanly — the partition it aggregated from was already best-effort.
+    let mut converged = false;
+    let mut local_converged = true;
+    for _ in 0..max_passes {
+        let (local, settled) = local_moving(&level, total, max_local_rounds);
+        local_converged &= settled;
         let (compact, count) = compact_labels(&local);
         // No node changed community: further aggregation cannot help.
         if count == level.adj.len() {
+            converged = true;
             break;
         }
         for label in labels.iter_mut() {
@@ -132,18 +178,19 @@ fn louvain(graph: &Graph) -> Vec<usize> {
     }
 
     let (labels, _) = compact_labels(&labels);
-    labels
+    (labels, converged && local_converged)
 }
 
 /// Phase 1: move nodes to the neighbouring community with the best modularity
 /// gain until nothing moves.
-fn local_moving(graph: &Graph, total_degree: f64) -> Vec<usize> {
+/// Returns the partition and whether the sweep settled before the ceiling.
+fn local_moving(graph: &Graph, total_degree: f64, max_rounds: usize) -> (Vec<usize>, bool) {
     let n = graph.adj.len();
     let mut community: Vec<usize> = (0..n).collect();
     let degree: Vec<f64> = (0..n).map(|i| graph.degree(i)).collect();
     let mut sigma_tot: Vec<f64> = degree.clone();
 
-    for _ in 0..MAX_LOCAL_ROUNDS {
+    for _ in 0..max_rounds {
         let mut moved = false;
         // Ascending node order — the tie-break anchor (R4).
         for node in 0..n {
@@ -183,11 +230,15 @@ fn local_moving(graph: &Graph, total_degree: f64) -> Vec<usize> {
             }
         }
         if !moved {
-            break;
+            // Settled: no node improved modularity by moving.
+            return (community, true);
         }
     }
 
-    community
+    // The ceiling stopped the sweep while nodes were still moving. The
+    // partition is the best so far, not the one the algorithm converged to,
+    // and the caller has to be able to tell those apart.
+    (community, false)
 }
 
 /// Renumber sparse labels to `0..count` in ascending order of first appearance.
@@ -328,4 +379,67 @@ fn emit(names: &[String], graph: &Graph, community: &[usize]) -> Vec<CommunityRe
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    /// A ring: every node has two equal-weight neighbours, so no single move
+    /// ever produces a strictly better modularity than any other and the sweep
+    /// keeps finding work. Large enough that one pass cannot settle it.
+    fn ring(n: usize) -> Graph {
+        let mut adj: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); n];
+        for i in 0..n {
+            let j = (i + 1) % n;
+            adj[i].insert(j, 1.0);
+            adj[j].insert(i, 1.0);
+        }
+        Graph { adj }
+    }
+
+    /// An exhausted search reports itself as unconverged. (Class A)
+    ///
+    /// Before the ceilings became parameters this path was unreachable from a
+    /// test, which is precisely why it went unreported in production: `louvain`
+    /// returned a `Vec<usize>` identical in type and shape whether it settled
+    /// or ran out of passes.
+    #[test]
+    fn a_ceiling_stopped_search_does_not_claim_convergence() {
+        let graph = ring(64);
+        // One pass and one local round cannot settle a 64-node ring.
+        let (labels, converged) = louvain(&graph, 1, 1);
+        assert_eq!(labels.len(), 64, "a partition is still returned");
+        assert!(
+            !converged,
+            "the search was stopped by the ceiling and must not report convergence"
+        );
+    }
+
+    /// The flag is not simply always false — that would be equally useless.
+    #[test]
+    fn a_settled_search_reports_convergence() {
+        // Two disconnected pairs settle immediately.
+        let mut adj: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); 4];
+        adj[0].insert(1, 1.0);
+        adj[1].insert(0, 1.0);
+        adj[2].insert(3, 1.0);
+        adj[3].insert(2, 1.0);
+        let (_, converged) = louvain(&Graph { adj }, MAX_PASSES, MAX_LOCAL_ROUNDS);
+        assert!(
+            converged,
+            "a trivially separable graph settles well inside the ceilings"
+        );
+    }
+
+    /// A graph with no edges is converged, not degraded.
+    #[test]
+    fn an_edgeless_graph_is_converged() {
+        let graph = Graph {
+            adj: vec![BTreeMap::new(); 3],
+        };
+        let (labels, converged) = louvain(&graph, MAX_PASSES, MAX_LOCAL_ROUNDS);
+        assert_eq!(labels.len(), 3);
+        assert!(converged, "nothing to optimise is a complete answer");
+    }
 }

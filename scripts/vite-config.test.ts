@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   gitpulseManualChunk,
@@ -5,6 +8,10 @@ import {
   tauriHotUpdateDecision,
 } from "../vite.config.ts";
 import vitestConfig from "../vitest.config.ts";
+
+const tsconfig = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "tsconfig.json"), "utf8"),
+) as { compilerOptions?: { types?: string[] } };
 
 describe("gitpulseManualChunk", () => {
   it("isolates the large runtimes from the application entry", () => {
@@ -15,7 +22,7 @@ describe("gitpulseManualChunk", () => {
     // startup chunk, including the 120 that only lazily-loaded views import.
     // Rollup places each icon with its importers instead.
     expect(
-      gitpulseManualChunk("/repo/node_modules/lucide-svelte/dist/icons/bug.svelte"),
+      gitpulseManualChunk("/repo/node_modules/@lucide/svelte/dist/icons/bug.js"),
     ).toBeUndefined();
     expect(gitpulseManualChunk("/repo/node_modules/svelte/src/internal/client/index.js")).toBe(
       "vendor-svelte",
@@ -65,6 +72,15 @@ describe("gitpulseTauriFullReload", () => {
     expect(plugin.name).toBe("gitpulse-tauri-full-reload");
     expect(plugin.hotUpdate).toMatchObject({ order: "pre" });
     expect(plugin.handleHotUpdate).toBeUndefined();
+  });
+});
+
+describe("TypeScript 6 ambient types", () => {
+  it("names node and vite/client so svelte-check can see process, node:*, and CSS", () => {
+    // TS 6 defaults `types` to [] and stops auto-including @types/*. Without
+    // this list, `npm run check` reports 250 missing-name errors that tests
+    // never see, because Vitest loads Node types through its own pipeline.
+    expect(tsconfig.compilerOptions?.types).toEqual(["node", "vite/client"]);
   });
 });
 

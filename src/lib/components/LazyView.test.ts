@@ -50,4 +50,11 @@ describe("LazyView pending and failed states", () => {
     const effect = source.slice(source.indexOf("$effect(() => {"));
     expect(effect.slice(0, effect.indexOf("loader().then"))).toContain("void attempt;");
   });
+
+  it("spreads optional props onto the resolved view, the same seam LazyMount uses", () => {
+    // TerminalDock binds each host to a repository path this way. Callers
+    // that have no extra inputs pass nothing; an empty spread is <View />.
+    expect(source).toContain("<View {...props} />");
+    expect(source).toContain("props?: Record<string, unknown>");
+  });
 });

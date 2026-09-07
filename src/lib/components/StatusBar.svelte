@@ -15,10 +15,10 @@
     GitMerge,
     HelpCircle,
     SquareTerminal,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { tabMarker, tabTooltip } from "../repos/operation";
   import { describeWatch, watchMarker } from "../repos/watchState";
-  import { RadioTower } from "lucide-svelte";
+  import { RadioTower } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { resolveStatusBarMode } from "../ui/statusBarMode";
 

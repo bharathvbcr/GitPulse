@@ -41,7 +41,7 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
 /// anonymous function — `lapply(xs, function(x) x + 1)` — is bound to nothing
 /// and yields no symbol, which is correct: there is no name a call could use.
 fn bound_name(node: Node, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    let parent = crate::treesitter::bounded_parent(node)?;
     if parent.kind() != "binary_operator" {
         return None;
     }

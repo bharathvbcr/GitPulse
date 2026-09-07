@@ -11,7 +11,7 @@
   import type { ReflogEntry } from "../branches/types";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "@tauri-apps/api/core";
-  import { History } from "lucide-svelte";
+  import { History } from "@lucide/svelte";
   import EmptyState from "./EmptyState.svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { formatDate, shortHash } from "../format";
@@ -134,7 +134,7 @@
                     aria-label={`Inspect ${entry.selector}, commit ${shortHash(entry.commit_id, 8)}, ${entry.action}: ${entry.message}, ${formatDate(entry.timestamp)}`}
                     title="Inspect this commit in History"
                     onclick={() => inspectEntry(entry)}
-                    class="rounded px-1 -mx-1 text-accent hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                    class="rounded px-1 -mx-1 text-accent hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
                   >
                     {entry.selector}
                   </button>

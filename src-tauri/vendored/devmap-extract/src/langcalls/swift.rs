@@ -276,7 +276,7 @@ fn starts_capitalised(name: &str) -> bool {
 fn swift_assignment_binding(node: Node, source: &str) -> Option<String> {
     let mut current = node;
     for _ in 0..4 {
-        let parent = current.parent()?;
+        let parent = crate::treesitter::bounded_parent(current)?;
         match parent.kind() {
             // `let service = Service()`
             "property_declaration" => {

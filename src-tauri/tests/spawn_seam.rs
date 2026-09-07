@@ -39,6 +39,23 @@ const ALLOWED: &[(&str, &str)] = &[
          handed one the caller built inside the seam, so the rule this test \
          exists for is untouched",
     ),
+    (
+        "src/tool_install/mod.rs",
+        "optional-tools install ladder (cargo/go/curl and binary probes). These \
+         are not git; every `Command` is handed to `git_cli::run_bounded_capped` \
+         so the timeout and stdout/stderr caps still apply. Holding a gate \
+         permit for a multi-minute `cargo install` would starve every git call",
+    ),
+    (
+        "src/tool_install/release.rs",
+        "release-asset discovery for the same ladder; `Command`s are probes \
+         handed to `run_bounded_capped`, not ungated spawns",
+    ),
+    (
+        "src/devmap/cli.rs",
+        "devmap binary invocation for map builds/queries; builds a `Command` \
+         then hands it to `git_cli::run_bounded_capped`",
+    ),
 ];
 
 #[test]

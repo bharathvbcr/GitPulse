@@ -33,7 +33,7 @@ describe("RepoTabBar", () => {
 
   it("gives both popup menus complete keyboard and assistive semantics", () => {
     expect(source).toContain('role="menu"');
-    expect((source.match(/role="menuitem"/g) ?? []).length).toBeGreaterThanOrEqual(8);
+    expect((source.match(/role="menuitem"/g) ?? []).length).toBeGreaterThanOrEqual(12);
     expect(source).toContain('aria-haspopup="menu"');
     expect(source).toContain("aria-expanded={recentsOpen}");
     expect(source).toContain("function handlePopupKeydown");
@@ -72,7 +72,7 @@ describe("RepoTabBar", () => {
     const tablist = source.slice(source.indexOf('role="tablist"'), source.indexOf("{#each $repoStore.openTabs"));
     expect(tablist).not.toContain('tabindex="0"');
     expect(source).toContain("[data-tab-shell-index]");
-    expect(source).toContain('aria-keyshortcuts="Enter p Delete"');
+    expect(source).toContain('aria-keyshortcuts="Enter p Delete Control+Shift+ArrowLeft Control+Shift+ArrowRight"');
     expect(source).toContain('if (e.key === "Delete")');
 
     const closeButton = source.slice(
@@ -90,6 +90,42 @@ describe("RepoTabBar", () => {
 
   it("elevates the tab bar stacking context so dropdowns are not clipped beneath workspace panes", () => {
     expect(source).toMatch(/class="[^"]*gp-repo-tabs[^"]*relative[^"]*z-20/);
+  });
+
+  it("lets the repo label and current branch render in full instead of clipping both inside 14rem", () => {
+    const each = source.slice(
+      source.indexOf("{#each $repoStore.openTabs"),
+      source.indexOf("{#if tab.pinned}"),
+    );
+    expect(each).not.toContain("max-w-56");
+    expect(each).not.toContain("min-w-0 flex-1");
+
+    const label = source.split("\n").find((line) => line.includes("{tab.label}") && line.includes("<span"));
+    expect(label).toBeDefined();
+    expect(label).not.toContain("truncate");
+    expect(label).toContain("whitespace-nowrap");
+
+    const branch = source
+      .split("\n")
+      .find((line) => line.includes("{tab.currentBranch}") && line.includes("<span"));
+    expect(branch).toBeDefined();
+    expect(branch).not.toContain("truncate");
+    expect(branch).toContain("whitespace-nowrap");
+  });
+
+  it("reorders tabs by drag, keyboard, and the context menu", () => {
+    expect(source).toContain("dropReorderIndex");
+    expect(source).toContain('e.dataTransfer.setData("text/plain", id)');
+    expect(source).toContain("application/x-gitpulse-repo-tab");
+    expect(source).toContain("Control+Shift+ArrowLeft");
+    expect(source).toContain("Move left");
+    expect(source).toContain("Move right");
+    expect(source).toContain("Move to start");
+    expect(source).toContain("Move to end");
+    expect(source).toContain("repoStore.moveTab");
+    expect(source).toContain("repoStore.moveTabBy");
+    expect(source).toContain('aria-live="polite"');
+    expect(source).toContain("Drag to reorder");
   });
 
   it("bounds recent repositories dropdown height and enables scrolling to prevent viewport clipping", () => {

@@ -5,7 +5,7 @@
   import { backdropFade, backdropFadeOut, cardScale, cardScaleOut } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "lucide-svelte";
+  import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "@lucide/svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
 
   let {
@@ -41,6 +41,7 @@
         { keys: ["Ctrl", "Tab"], description: "Cycle to next repository tab" },
         { keys: ["Ctrl", "⇧", "Tab"], description: "Cycle to previous repository tab" },
         { keys: ["Ctrl", "Alt", "1–9"], description: "Jump to specific repository tab" },
+        { keys: ["Ctrl", "⇧", "← / →"], description: "Move the focused repository tab left or right" },
       ],
     },
     {
@@ -184,7 +185,7 @@
               type="text"
               bind:value={filterQuery}
               placeholder="Search shortcuts…"
-              class="gp-field !pl-7 !py-1 !text-xs !w-44"
+              class="gp-field pl-7! py-1! text-xs! w-44!"
             />
           </div>
           <button
@@ -234,7 +235,7 @@
       <!-- Footer -->
       <div class="p-3 border-t border-border/70 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-[11px] text-textMuted px-5">
         <span>Tip: Press <kbd class="gp-keycap">?</kbd> anywhere to reopen</span>
-        <button type="button" class="gp-btn !py-1 !px-3" onclick={close}>Done</button>
+        <button type="button" class="gp-btn py-1! px-3!" onclick={close}>Done</button>
       </div>
     </div>
   </div>

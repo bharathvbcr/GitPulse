@@ -4,7 +4,7 @@
     Binary,
     Maximize2,
     ExternalLink,
-  } from "lucide-svelte";
+  } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
   import { formatError } from "../../ui/formatError";
@@ -102,7 +102,7 @@
         <button
           type="button"
           onclick={() => { imageFit = true; imageZoom = 100; }}
-          class="gp-btn !py-0.5 !px-2 text-[11px] {imageFit ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
+          class="gp-btn py-0.5! px-2! text-[11px] {imageFit ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
         >
           <Maximize2 size={11} />
           <span>Fit Screen</span>
@@ -111,7 +111,7 @@
         <button
           type="button"
           onclick={() => { imageFit = false; imageZoom = 100; }}
-          class="gp-btn !py-0.5 !px-2 text-[11px] {!imageFit && imageZoom === 100 ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
+          class="gp-btn py-0.5! px-2! text-[11px] {!imageFit && imageZoom === 100 ? 'border-accent/60 bg-accent/15 text-accent' : ''}"
         >
           <span>1:1 Actual</span>
         </button>
@@ -135,7 +135,7 @@
     <!-- Image Canvas Area with Transparency Grid -->
     <div class="flex-1 min-h-0 flex items-center justify-center p-8 overflow-auto bg-background/80 relative">
       <div
-        class="rounded-xl border border-border/80 shadow-card p-2 bg-[radial-gradient(#334155_1px,transparent_1px)] [background-size:16px_16px] dark:bg-[radial-gradient(#1e293b_1px,transparent_1px)] max-w-full max-h-full flex items-center justify-center overflow-hidden"
+        class="rounded-xl border border-border/80 shadow-card p-2 bg-[radial-gradient(#334155_1px,transparent_1px)] bg-size-[16px_16px] dark:bg-[radial-gradient(#1e293b_1px,transparent_1px)] max-w-full max-h-full flex items-center justify-center overflow-hidden"
       >
         {#if imageSrc}
           <img
@@ -172,7 +172,7 @@
         <button
           type="button"
           onclick={openMediaInDefaultApp}
-          class="gp-btn !py-0.5 !px-2.5 flex items-center gap-1 text-[11px]"
+          class="gp-btn py-0.5! px-2.5! flex items-center gap-1 text-[11px]"
         >
           <ExternalLink size={12} />
           <span>Open in External App</span>

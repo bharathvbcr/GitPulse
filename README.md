@@ -56,7 +56,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(139 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(185 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -140,12 +140,12 @@ command-palette entry, so no door was closed by the consolidation.
 ### 🛡️ Code Intelligence & Auditing
 | Feature | Description |
 | --- | --- |
-| **In-Process Code Intelligence** | Impact analysis, symbol search, and dead-code detection answered in-process from DevCouncil's persisted code map without background daemons or runtime parsers. |
+| **DevMap + MarkDev integration** | Schema-19 code map in-process (impact, layered blast radius, neighbors, explore, affected tests, clones, dead symbols) plus CLI-driven build/refresh/preview. Code → Map navigates `repo_map.json`, draws code/doc graphs, and searches tracked markdown. Pre-commit preview and fail-closed affected-test CI live on the change set. MarkDev parses/renders markdown; tree-sitter highlights six languages beside the regex tokenizer. Palette `:` / `::` for single- and cross-repo symbols. Caps, `walk_incomplete`, and schema mismatch are always named. |
 | **Git-Native Provenance** | `CI:local` runs recorded as verification notes under `refs/notes/gitpulse/`, with branch and PR decay freshness badges based on distance from the default branch. |
 | **Universal Test Coverage** | Discovers and renders line coverage across all major formats: **LCOV**, **Cobertura**, **Go cover**, **Istanbul/NYC JSON**, **JaCoCo**, and **Clover**. Includes virtualized file navigation, missing toolchain detection & installation guidance, actionable generation failure recovery, and copyable diagnostics. |
 | **Multi-Language Analysis** | Fast, comment-aware line-of-code breakdown for **60+ programming languages** with official GitHub Linguist color palettes. The status-bar mix is ordered by share of code lines; the label is the true majority among the languages drawn. |
 | **Storage & Hygiene Audit** | Full disk-usage breakdown (packfiles, loose objects, reflogs, LFS, submodules, build artifacts, ignored files) with historical trend sparklines. |
-| **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, and GitHub Dependabot. |
+| **Multi-Ecosystem Health** | Automated security and staleness scans via `npm audit/outdated`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, and GitHub Code Scanning. |
 | **Durable Crash Logging** | Synchronous append-only per-binary crash logging with bounded backtraces surviving process restarts across GUI and CLI binaries (`gitpulsed`, `gitpulse-mcp`). |
 | **MCP 2.0 + agent plugins** | `gitpulse-mcp` speaks MCP `2026-07-28` (`server/discover`, per-request `_meta`, cacheable `tools/list`) and still answers the legacy `initialize` handshake. The canonical package is `plugins/gitpulse/`, with native Codex, Claude Code, and [Agent Plugins 1.0](https://agent-plugins.org/specification) manifests plus shared skills. Tools are read-only insights: worktrees, collisions, change context, ledger, code graph. |
 
@@ -267,8 +267,9 @@ npm run tauri dev
 | --- | --- |
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
-| `npm run check` | Run `svelte-check` and `tsc` TypeScript type validation |
-| `npm run check:ipc` | Verify 139 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check` | Run `svelte-check` (classic TypeScript 6) and `tsgo` on `tsconfig.node.json` |
+| `npm run check:ipc` | Verify 185 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
 | `npm run mcp:install` | Install/refresh `gitpulse-mcp` on PATH, which is what agent clients spawn |

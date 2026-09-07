@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { ChevronDown, SquareTerminal } from "lucide-svelte";
+  import { ChevronDown, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { repoStore } from "../stores/repoStore";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
   import {
     TERMINAL_DOCK_MAX_HEIGHT,
@@ -9,6 +10,7 @@
     TERMINAL_DOCK_RESIZE_STEP,
     fitTerminalDockHeight,
   } from "../terminal/dockMetrics";
+  import { nextHostedTerminals } from "../terminal/repoHosts";
 
   /**
    * The terminal, docked beneath the active view.
@@ -20,8 +22,10 @@
    * are about to commit. A full-screen terminal hid all of it.
    *
    * Mounted on first open and kept mounted after, because unmounting kills
-   * the shell. Closing hides it; only a repository switch (App's `{#key}`)
-   * tears the session down.
+   * the shell. Closing hides it. Switching repository tabs also hides rather
+   * than unmounts: one panel per visited tab, bound to that tab's path, so
+   * the scrollback is still there when you come back. Closing the repository
+   * tab is what drops the panel.
    */
 
   let {
@@ -44,6 +48,29 @@
   $effect(() => {
     if (open) mounted = true;
   });
+
+  /**
+   * Repository tabs whose terminal panel has been created. The derived below
+   * also includes the active tab while the dock is open so the first paint
+   * has a host without waiting for this latch; the latch is what keeps a
+   * panel alive after the user leaves it.
+   */
+  let hostedIds = $state(new Set<string>());
+  $effect(() => {
+    const next = nextHostedTerminals(
+      hostedIds,
+      $repoStore.openTabs.map((tab) => tab.id),
+      $repoStore.activeTabId,
+      open,
+    );
+    if (next !== hostedIds) hostedIds = next;
+  });
+
+  const hostedTabs = $derived(
+    $repoStore.openTabs.filter(
+      (tab) => hostedIds.has(tab.id) || (open && tab.id === $repoStore.activeTabId),
+    ),
+  );
 
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
@@ -137,7 +164,7 @@
       tabindex="0"
       onpointerdown={startDrag}
       onkeydown={handleSeparatorKey}
-      class="h-1.5 shrink-0 cursor-row-resize hover:bg-accent/40 focus-visible:bg-accent/50 focus-visible:outline-none transition-colors {dragging
+      class="h-1.5 shrink-0 cursor-row-resize hover:bg-accent/40 focus-visible:bg-accent/50 focus-visible:outline-hidden transition-colors {dragging
         ? 'bg-accent/50'
         : ''}"
     ></div>
@@ -149,7 +176,7 @@
       <button
         type="button"
         onclick={onClose}
-        class="gp-icon-btn !p-0.5"
+        class="gp-icon-btn p-0.5!"
         title="Hide the terminal (⌃`) — the session keeps running"
         aria-label="Hide the terminal dock"
       >
@@ -157,8 +184,25 @@
       </button>
     </div>
 
-    <div class="flex-1 min-h-0 flex flex-col">
-      <LazyView {load} name="the terminal" />
+    <div class="flex-1 min-h-0 relative">
+      {#each hostedTabs as tab (tab.id)}
+        <!-- Absolute so a hidden sibling keeps its box: a panel laid out at
+             zero height would reflow its xterm to a 1-row grid. -->
+        <div
+          class="absolute inset-0 flex flex-col"
+          class:hidden={tab.id !== $repoStore.activeTabId}
+          data-terminal-host={tab.id}
+        >
+          <LazyView
+            {load}
+            name="the terminal"
+            props={{
+              repoPath: tab.path,
+              visible: open && tab.id === $repoStore.activeTabId,
+            }}
+          />
+        </div>
+      {/each}
     </div>
   </div>
 {/if}

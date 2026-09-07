@@ -1,5 +1,6 @@
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import tailwindcss from "@tailwindcss/vite";
 import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
 import { appVersion } from "./scripts/app-version.mjs";
 
@@ -37,7 +38,7 @@ const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
  * Vite normalizes module ids, but replacing separators keeps this deterministic
  * when the same configuration is exercised directly on Windows.
  *
- * `lucide-svelte` is deliberately NOT listed. Naming a chunk here forces every
+ * `@lucide/svelte` is deliberately NOT listed. Naming a chunk here forces every
  * module of that package into it regardless of who imports it, and because the
  * header imports five glyphs the whole chunk then loads at startup. Measured on
  * this tree: 402 distinct icons across 60 files, 120 of them reachable only
@@ -54,7 +55,7 @@ export function gitpulseManualChunk(id: string): string | undefined {
   const normalized = id.replaceAll("\\", "/");
   if (!normalized.includes("/node_modules/")) return undefined;
   if (normalized.includes("/node_modules/@xterm/")) return "vendor-xterm";
-  if (normalized.includes("/node_modules/lucide-svelte/")) return undefined;
+  if (normalized.includes("/node_modules/@lucide/svelte/")) return undefined;
   if (normalized.includes("/node_modules/svelte/")) return "vendor-svelte";
   if (normalized.includes("/node_modules/@tauri-apps/")) return "vendor-tauri";
   return "vendor";
@@ -126,6 +127,7 @@ export function gitpulseTauriFullReload(
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
+    tailwindcss(),
     gitpulseTauriFullReload(),
     svelte({
       compilerOptions: {
