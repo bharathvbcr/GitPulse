@@ -6,6 +6,7 @@
  */
 
 import type { RepoMapDocument, RepoMapSubsystem } from "./types";
+import { dedupePreserveOrder } from "../ui/eachKeys";
 
 export function formatCap(shown: number, total: number, truncated: boolean): string {
   if (truncated || shown < total) {
@@ -34,10 +35,15 @@ export function preferredDeadLists(map: RepoMapDocument): {
   unreachableSuppressed: boolean;
 } {
   const unreachableSuppressed = map.liveness_unreachable_unreliable === true;
+  // Producer samples can repeat an id (measured on DevCouncil/Manvi maps).
+  // RepoMapPanel keys `{#each}` on these strings; a duplicate throws
+  // `each_key_duplicate` and takes the Code → Map pane down.
   return {
-    unwired: map.unwired_candidates ?? [],
-    deadSymbols: map.dead_symbol_candidates ?? [],
-    unreachable: unreachableSuppressed ? [] : (map.unreachable_files ?? []),
+    unwired: dedupePreserveOrder(map.unwired_candidates ?? []),
+    deadSymbols: dedupePreserveOrder(map.dead_symbol_candidates ?? []),
+    unreachable: unreachableSuppressed
+      ? []
+      : dedupePreserveOrder(map.unreachable_files ?? []),
     unreachableSuppressed,
   };
 }

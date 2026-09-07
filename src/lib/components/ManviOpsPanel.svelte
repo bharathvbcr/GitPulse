@@ -576,7 +576,7 @@
             <div class="mb-2 flex items-center gap-2 text-rose-400"><AlertTriangle size={14} /> Cleanup coverage is inconsistent; deletion is disabled.</div>
           {/if}
           <div class="max-h-52 space-y-1 overflow-auto">
-            {#each cleanup.candidates as branch (branch.name)}
+            {#each cleanup.candidates as branch, i (`${branch.name}#${i}`)}
               <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
                 <input type="checkbox" checked={isSelected(branch.name)} onchange={() => toggleSelected(branch.name)} />
                 <span class="min-w-0 flex-1"><span class="font-mono">{branch.name}</span><span class="ml-2 truncate text-textMuted">{branch.last_summary}</span></span>
@@ -621,7 +621,7 @@
             {#if tagPlan.retained_count > 0}
               <p class="mb-1 text-textSecondary">Holding work {tagPlan.compared_to ?? "the base"} does not have — kept, not deletable.</p>
               <div class="max-h-40 space-y-1 overflow-auto">
-                {#each tagPlan.retained as tag (tag.name)}
+                {#each tagPlan.retained as tag, i (`${tag.name}#${i}`)}
                   <div class="flex items-center gap-2 rounded-lg px-2 py-1.5">
                     <Tag size={13} class="shrink-0 text-amber-400" />
                     <span class="min-w-0 flex-1 truncate font-mono">{tag.name}</span>
@@ -635,7 +635,7 @@
             {/if}
             <p class="mt-3 mb-1 text-textSecondary">Every commit already in {tagPlan.compared_to ?? "the base"} — safe to delete.</p>
             <div class="max-h-40 space-y-1 overflow-auto">
-              {#each tagPlan.candidates as tag (tag.name)}
+              {#each tagPlan.candidates as tag, i (`${tag.name}#${i}`)}
                 <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
                   <input type="checkbox" checked={selectedTags.includes(tag.name)} onchange={() => toggleTag(tag.name)} />
                   <span class="min-w-0 flex-1 truncate"><span class="font-mono">{tag.name}</span><span class="ml-2 text-textMuted">{tag.summary}</span></span>
@@ -679,7 +679,7 @@
         {:else if review}
           <p class="mb-2 text-textSecondary">{summarizeCommitReview(review)} <span class="font-mono text-textMuted">{review.range}</span></p>
           <div class="max-h-56 space-y-1 overflow-auto">
-            {#each review.findings as finding (`${finding.commit_id}:${finding.code}`)}
+            {#each review.findings as finding, i (`${finding.commit_id}:${finding.code}#${i}`)}
               <div class="rounded-lg border border-border px-2.5 py-2">
                 <div class="flex items-center gap-2"><span class="font-mono text-accent">{finding.short_id}</span><span class={finding.severity === "error" ? "text-rose-400" : finding.severity === "warning" ? "text-amber-400" : "text-textMuted"}>{finding.code}</span></div>
                 <div class="mt-0.5 truncate">{finding.subject}</div><div class="text-textMuted">{finding.detail}</div>
@@ -742,7 +742,7 @@
           </div>
         {:else if (github?.releases?.length ?? 0) > 0}
           <div class="mb-3 max-h-44 space-y-1 overflow-auto">
-            {#each github?.releases ?? [] as release (release.tag_name || release.name)}
+            {#each github?.releases ?? [] as release, i (`${release.tag_name || release.name || "release"}#${i}`)}
               <button
                 class="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left hover:bg-surfaceHover"
                 onclick={() => release.url && openExternal(release.url)}

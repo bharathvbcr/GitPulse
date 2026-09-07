@@ -79,7 +79,17 @@ describe("RepoMapPanel", () => {
     expect(source).toContain('mapFailureMessage("no_cli")');
     expect(source).toContain("mapFailureMode");
   });
+
+  it("keys dead-symbol and path lists with an index so map duplicates cannot crash the pane", () => {
+    // preferredDeadLists dedupes, and the template still suffixes `#${i}` —
+    // either layer alone is enough; both stay so a regression in one cannot
+    // bring back each_key_duplicate (svelte.dev/e/each_key_duplicate).
+    expect(source).toContain("deadLists.deadSymbols as id, i");
+    expect(source).toContain("deadLists.unwired as path, i");
+    expect(source).toContain("selected.entry_points as path, i");
+  });
 });
+
 describe("CodeView map section", () => {
   it("lazy-loads the Map panel beside Explorer and Blame", () => {
     expect(codeView).toContain('section === "map"');

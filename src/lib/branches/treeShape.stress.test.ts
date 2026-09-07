@@ -92,17 +92,17 @@ describe("groupBranches + flattenRows stress: duplicate ref names", () => {
     expect(new Set(keys).size).toBe(keys.length); // b:pinned:main vs b:local:main
   });
 
-  it("characterizes duplicate branch names as emitting duplicate keys by design", () => {
-    // flattenRows deliberately does NOT re-enforce key uniqueness (its
-    // docstring documents the contract): git ref naming guarantees unique
-    // full names within a section upstream, and synthetic duplicates are a
-    // caller error. groupBranches tolerates them; keys collide harmlessly in
-    // this characterization because production inputs cannot produce them.
+  it("suffixes keys when duplicate branch names reach flattenRows", () => {
+    // Git full names are unique within a section; synthetic duplicates are a
+    // caller error. Keys must still be unique — Svelte 5 throws
+    // each_key_duplicate and takes BranchList down otherwise.
     const storm = Array.from({ length: 100 }, () => branch({ name: "feat/x" }));
     const rows = expand(groupBranches(storm));
     expect(branchRows(rows)).toHaveLength(100);
     const keys = branchRows(rows).map((r) => r.key);
-    expect(new Set(keys).size).toBe(1);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys[0]).toBe("b:local:feat/x");
+    expect(keys[1]).toBe("b:local:feat/x#1");
   });
 });
 
@@ -197,7 +197,7 @@ describe("groupBranches + flattenRows stress: tags and section identity", () => 
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("characterizes hand-built same-id sections as producing duplicate header keys", () => {
+  it("suffixes section header keys when hand-built sections reuse an id", () => {
     const make = (): BranchSection => ({
       id: "dup",
       label: "Dup",
@@ -210,7 +210,7 @@ describe("groupBranches + flattenRows stress: tags and section identity", () => 
     });
     const rows = expand([make(), make()]);
     const headerKeys = rows.filter((r) => r.kind === "section-header").map((r) => r.key);
-    expect(headerKeys).toEqual(["s:dup", "s:dup"]); // documented manual-input caveat
+    expect(headerKeys).toEqual(["s:dup", "s:dup#1"]);
   });
 
   it("propagates a throwing collapse lookup instead of swallowing it", () => {

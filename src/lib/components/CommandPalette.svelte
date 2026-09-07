@@ -680,7 +680,7 @@
         role="listbox"
         aria-label="Commands"
       >
-        {#each filteredCommands as cmd, i (cmd.id)}
+        {#each filteredCommands as cmd, i (`${cmd.id}#${i}`)}
           {@const parts = highlightMatches(cmd.label, effectiveSearchText)}
           <button
             id={`palette-option-${i}`}

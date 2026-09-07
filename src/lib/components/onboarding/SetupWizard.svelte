@@ -163,7 +163,7 @@
           {#if $preflight}
             <p class="text-textMuted text-[11px]">{$preflight.estimate}</p>
             <ul class="space-y-1">
-              {#each $preflight.requirements as req (req.name)}
+              {#each $preflight.requirements as req, i (`${req.name}#${i}`)}
                 <li class="flex items-start gap-2 font-mono text-[11px]">
                   <span class={req.satisfies ? "text-emerald-500" : "text-amber-500"}>
                     {req.satisfies ? "✓" : "✗"}
@@ -185,7 +185,7 @@
         {:else if $wizard.step === "install"}
           {#if $ladder}
             <ul class="space-y-1.5">
-              {#each $ladder.rungs as rung (rung.rung)}
+              {#each $ladder.rungs as rung, i (`${rung.rung}#${i}`)}
                 <li
                   class="rounded-lg border px-2 py-1.5 text-[11px] {rung.available
                     ? 'border-border/60'

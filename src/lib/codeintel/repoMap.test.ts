@@ -105,4 +105,18 @@ describe("repoMap honesty helpers", () => {
     expect(lists.unreachable).toEqual(["vendor/dead.rs"]);
     expect(lists.unreachableSuppressed).toBe(false);
   });
+
+  it("dedupes repeated dead-symbol and unwired ids so Map each-keys stay unique", () => {
+    const lists = preferredDeadLists(
+      baseMap({
+        unwired_candidates: ["a.rs", "b.rs", "a.rs"],
+        dead_symbol_candidates: ["a.rs::f", "b.rs::g", "a.rs::f", "a.rs::f"],
+        unreachable_files: ["x.rs", "x.rs"],
+        liveness_unreachable_unreliable: false,
+      }),
+    );
+    expect(lists.unwired).toEqual(["a.rs", "b.rs"]);
+    expect(lists.deadSymbols).toEqual(["a.rs::f", "b.rs::g"]);
+    expect(lists.unreachable).toEqual(["x.rs"]);
+  });
 });

@@ -100,7 +100,7 @@
   {:else if !status}
     <p class="text-textMuted text-[10px]">Checking installed tools…</p>
   {:else}
-    {#each rows as row (row.tool)}
+    {#each rows as row, i (`${row.tool}#${i}`)}
       <div
         class="rounded-xl border border-border/70 bg-background/60 {compact
           ? 'p-2'

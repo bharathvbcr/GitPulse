@@ -721,7 +721,7 @@
         </div>
       {:else if scan && scan.servers.length > 0}
         <div class="space-y-1.5">
-          {#each scan.servers as server (server.base_url)}
+          {#each scan.servers as server, i (`${server.base_url}#${i}`)}
             <div class="rounded-xl border border-border/70 bg-background p-2.5 space-y-1">
               <div class="flex items-center gap-2 text-[11px]">
                 <Server size={12} class="text-accent shrink-0" />
@@ -733,7 +733,7 @@
                   <span class="shrink-0 text-[9px] text-textMuted">v{server.version}</span>
                 {/if}
               </div>
-              {#each server.models as model (model.id)}
+              {#each server.models as model, i (`${model.id || "model"}#${i}`)}
                 <button
                   onclick={() => pick({ base_url: server.base_url, model: model.id })}
                   class="w-full px-2 py-1 rounded-lg flex items-center gap-2 text-left text-[10px] transition-colors
@@ -919,7 +919,7 @@
           </div>
         {:else if grants && grants.grants.length > 0}
           <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-40 overflow-y-auto">
-            {#each orderedGrants as grant (grant.id)}
+            {#each orderedGrants as grant, i (`${grant.id}#${i}`)}
               <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]">
                 <div class="flex items-center gap-1.5 min-w-0">
                   <span class="font-mono text-[10px] text-accent truncate">
@@ -983,7 +983,7 @@
       </div>
     </div>
     <div class="grid gap-2 md:grid-cols-2" aria-label="Activity history status">
-      {#each activityHistory as status (status.label)}
+      {#each activityHistory as status, i (`${status.label}#${i}`)}
         <div class="rounded-xl border p-3 {status.cardClass}" role="status">
           <div class="text-[10px] font-semibold uppercase tracking-wider {status.badgeClass}">
             {status.label}
@@ -1001,7 +1001,7 @@
       </div>
     {:else}
       <div class="rounded-xl border border-border/70 bg-background divide-y divide-border/40 max-h-56 overflow-y-auto">
-          {#each recentActions as action (action.identity)}
+          {#each recentActions as action, i (`${action.identity}#${i}`)}
           <div class="px-3 py-1.5 flex flex-col gap-0.5 text-[11px]" title={action.verdict?.detail ?? action.label}>
             <div class="flex items-center gap-2">
               <span class="font-mono text-[10px] text-textMuted shrink-0">{actionTime(action.ts)}</span>

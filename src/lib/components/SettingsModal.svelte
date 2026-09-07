@@ -919,7 +919,7 @@
                             {mcpInfo.tools.length} tools (start with gitpulse_insights)
                           </summary>
                           <ul class="mt-1 space-y-0.5 max-h-32 overflow-y-auto">
-                            {#each mcpInfo.tools as tool (tool.name)}
+                            {#each mcpInfo.tools as tool, i (`${tool.name}#${i}`)}
                               <li class="font-mono text-[10px] text-textPrimary">
                                 {tool.name}
                                 <span class="text-textMuted font-sans"> — {tool.title}</span>

@@ -1,4 +1,5 @@
 import type { BranchFolder, BranchInfo, BranchSection, TagInfo } from "./types";
+import { uniqueKeyAllocator } from "../ui/eachKeys";
 
 export interface SectionHeaderRow {
   kind: "section-header";
@@ -41,10 +42,13 @@ export type CollapsedLookup = (id: string, kind: BranchSection["kind"]) => boole
  * Flattens grouped sections into render-order rows for the sidebar's single
  * shared scroller. Collapsed sections/folders contribute only their header
  * row. Keys are deterministic section/folder/name prefixes; uniqueness within
- * a section is guaranteed upstream by git ref naming, not re-enforced here.
+ * a section is usually unique from git; collisions are suffix-disambiguated.
  */
 export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLookup): FlatRow[] {
   const rows: FlatRow[] = [];
+  // Git names are unique within a section in healthy data; synthetic or buggy
+  // listings still used to emit duplicate keys and crash BranchList's each.
+  const key = uniqueKeyAllocator();
 
   const pushFolders = (folders: BranchFolder[], depth: number, sectionId: string): void => {
     for (const folder of folders) {
@@ -54,7 +58,7 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
         sectionId,
         folderId: folder.id,
         folder,
-        key: `f:${folder.id}`,
+        key: key(`f:${folder.id}`),
       });
       if (isCollapsed(folder.id, "local")) continue;
       pushFolders(folder.folders, depth + 1, sectionId);
@@ -63,7 +67,7 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
           kind: "branch",
           depth: depth + 1,
           branch,
-          key: `b:${sectionId}:${branch.name}`,
+          key: key(`b:${sectionId}:${branch.name}`),
         });
       }
     }
@@ -75,18 +79,18 @@ export function flattenRows(sections: BranchSection[], isCollapsed: CollapsedLoo
       depth: 0,
       section,
       sectionId: section.id,
-      key: `s:${section.id}`,
+      key: key(`s:${section.id}`),
     });
     if (isCollapsed(section.id, section.kind)) continue;
     if (section.kind === "tags") {
       for (const tag of section.tags) {
-        rows.push({ kind: "tag", depth: 0, tag, key: `t:${tag.name}` });
+        rows.push({ kind: "tag", depth: 0, tag, key: key(`t:${tag.name}`) });
       }
       continue;
     }
     pushFolders(section.folders, 0, section.id);
     for (const branch of section.branches) {
-      rows.push({ kind: "branch", depth: 0, branch, key: `b:${section.id}:${branch.name}` });
+      rows.push({ kind: "branch", depth: 0, branch, key: key(`b:${section.id}:${branch.name}`) });
     }
   }
   return rows;

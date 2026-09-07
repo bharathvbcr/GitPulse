@@ -84,7 +84,7 @@
     </div>
     {#if expanded}
       <ul class="mt-1 space-y-0.5 pl-[26px]">
-        {#each notices as notice (notice)}
+        {#each notices as notice, i (`${i}:${notice}`)}
           <li class="wrap-break-word">{notice}</li>
         {/each}
       </ul>

@@ -503,7 +503,7 @@
       </div>
       {#if collisions.items.length > 0}
         <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
-          {#each collisions.items.slice(0, 8) as item (item.path)}
+          {#each collisions.items.slice(0, 8) as item, i (`${item.path}#${i}`)}
             <li>
               {item.path}
               <span class="text-textMuted">
@@ -566,7 +566,7 @@
     </div>
   {:else if projection}
     <div class="mx-auto w-full max-w-6xl space-y-2">
-      {#each visibleRows as row (row.key || "__unbound")}
+      {#each visibleRows as row, i (row.key || `__unbound:${i}`)}
         {@const chips = noteworthyStatuses(row.verdicts)}
         <div
           class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card"
@@ -725,7 +725,7 @@
             <div class="mt-2.5 grid gap-2 border-t border-border/50 pt-2.5 md:grid-cols-2">
               {#if row.kind !== "worktree" && row.worktrees.length > 0}
                 <ul class="space-y-1">
-                  {#each row.worktrees as binding (binding.worktree.path)}
+                  {#each row.worktrees as binding, i (`${binding.worktree.path}#${i}`)}
                     <li>
                       <button
                         type="button"

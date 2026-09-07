@@ -1085,7 +1085,7 @@
             <EmptyState icon={Tag} title="No releases found" compact />
           {:else}
             <div class="space-y-2">
-              {#each ctx.releases as release (release.tag_name || release.name)}
+              {#each ctx.releases as release, i (`${release.tag_name || release.name || "release"}#${i}`)}
                 <div class="p-3 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
                   <div class="min-w-0 flex-1">
                     <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">

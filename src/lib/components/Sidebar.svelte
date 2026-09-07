@@ -399,7 +399,7 @@
             </div>
           {:else}
             <div class="space-y-0.5">
-              {#each visibleStaged as f (f.path)}
+              {#each visibleStaged as f, i (`${f.path}#${i}`)}
                 {@const parts = formatPathParts(f.path)}
                 <div class="px-2 py-1.5 rounded-full flex items-center gap-1.5 hover:bg-surfaceHover group transition-colors">
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />

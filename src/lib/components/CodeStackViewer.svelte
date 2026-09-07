@@ -291,7 +291,7 @@
       </h2>
       {#if stackBreadcrumb && stackBreadcrumb.breadcrumb_chain.length > 1}
         <div class="mt-1.5 flex items-center gap-1.5 flex-wrap font-mono text-[11px] text-textMuted">
-          {#each stackBreadcrumb.breadcrumb_chain as segment, i (segment)}
+          {#each stackBreadcrumb.breadcrumb_chain as segment, i (`${i}:${segment}`)}
             {#if i > 0}
               <span aria-hidden="true">›</span>
             {/if}
@@ -344,7 +344,7 @@
   {#if rows.length > 0}
     <div class="max-w-3xl">
       <ul class="space-y-1.5">
-        {#each rows as row (row.node.branch_name)}
+        {#each rows as row, i (`${i}:${row.node.branch_name}`)}
           {@const node = row.node}
           {@const facts = stackBranchFacts(node.branch_name, $repoStore.branches)}
           {@const isCurrent = node.branch_name === $repoStore.currentBranch}
@@ -504,7 +504,7 @@
         {stackDefaultBranch ?? "the default branch"} directly, or below the history this scan loaded.
       </p>
       <div class="flex flex-wrap gap-1.5">
-        {#each unplaced as name (name)}
+        {#each unplaced as name, i (`${i}:${name}`)}
           <button
             type="button"
             class="gp-pill text-[10px]! font-mono hover:text-accent"

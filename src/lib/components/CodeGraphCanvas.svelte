@@ -316,7 +316,7 @@
       class="shrink-0 flex flex-wrap gap-x-3 gap-y-1 px-2.5 py-1.5 text-[10px] text-textMuted border-b border-border/40 max-h-16 overflow-y-auto"
       aria-label="Communities"
     >
-      {#each model.communities.slice(0, 12) as community (community.name)}
+      {#each model.communities.slice(0, 12) as community, i (`${community.name}#${i}`)}
         <span class="inline-flex items-center gap-1">
           <span
             class="inline-block w-2 h-2 rounded-full"

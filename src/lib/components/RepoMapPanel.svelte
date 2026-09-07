@@ -722,7 +722,7 @@
           </span>
         </div>
         <ul class="px-1 pb-2">
-          {#each doc.subsystems as sub (sub.area)}
+          {#each doc.subsystems as sub, i (`${sub.area}#${i}`)}
             <li>
               <button
                 type="button"
@@ -763,7 +763,7 @@
               <p class="text-[11px] text-textMuted">None listed.</p>
             {:else}
               <ul class="space-y-0.5">
-                {#each selected.entry_points as path (path)}
+                {#each selected.entry_points as path, i (`${path}#${i}`)}
                   <li>
                     <button
                       type="button"
@@ -786,7 +786,7 @@
               <p class="text-[11px] text-textMuted">None listed.</p>
             {:else}
               <ul class="space-y-0.5">
-                {#each selected.critical_files as path (path)}
+                {#each selected.critical_files as path, i (`${path}#${i}`)}
                   <li>
                     <button
                       type="button"
@@ -818,7 +818,7 @@
               </p>
             {:else}
               <ul class="space-y-0.5">
-                {#each tests.paths as path (path)}
+                {#each tests.paths as path, i (`${path}#${i}`)}
                   <li>
                     <button
                       type="button"
@@ -868,7 +868,7 @@
                 <p class="text-[11px] text-textMuted">None in this sample.</p>
               {:else}
                 <ul class="space-y-0.5 max-h-32 overflow-y-auto">
-                  {#each deadLists.unwired as path (path)}
+                  {#each deadLists.unwired as path, i (`${path}#${i}`)}
                     <li>
                       <button
                         type="button"
@@ -903,7 +903,7 @@
                 <p class="text-[11px] text-textMuted">None in this sample.</p>
               {:else}
                 <ul class="space-y-0.5 max-h-40 overflow-y-auto">
-                  {#each deadLists.deadSymbols as id (id)}
+                  {#each deadLists.deadSymbols as id, i (`${id}#${i}`)}
                     <li class="font-mono text-[11px] text-textMuted truncate" title={id}>{id}</li>
                   {/each}
                 </ul>
@@ -920,7 +920,7 @@
                   Unreachable files (secondary)
                 </h3>
                 <ul class="space-y-0.5 max-h-24 overflow-y-auto">
-                  {#each deadLists.unreachable as path (path)}
+                  {#each deadLists.unreachable as path, i (`${path}#${i}`)}
                     <li class="font-mono text-[11px] text-textMuted truncate">{path}</li>
                   {/each}
                 </ul>
