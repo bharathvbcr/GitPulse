@@ -11,7 +11,51 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-09-06
+
+### Added
+
+- **Tags now say where their work stands, so work parked on a tag is no longer invisible.** A tag is a
+  ref, so the graph walks it and draws its commit a lane — one shaped exactly like an unmerged branch.
+  But `list_branches` and the cleanup plan read only `refs/heads` and `refs/remotes`, so nothing in the
+  app could answer "is this merged?" for a commit held by a tag alone, which is exactly what a
+  `retired/…` tag does. `TagInfo` now carries `commits_ahead_of_base`, `commits_behind_base` and
+  `compared_to`, measured against the same default base branches are measured against and read in the
+  same single `git tag -l` process via `%(ahead-behind:)`. The sidebar shows a `+N` chip on a tag that
+  holds commits the base does not, and the tooltip says either how far ahead it is or that every commit
+  is already in the base. `compared_to: null` means the comparison could not be made — an old git, or a
+  tag that does not peel to a commit — and is never rendered as "merged".
+
+- **Ops now reports what the repository retains on tags, which branch cleanup counts nowhere.** A new
+  Tag retention card splits every tag into "holding commits the base does not have" and "every commit
+  already in the base — safe to delete", with per-tag counts and the existing tag-delete path behind a
+  confirmation. A tag the comparison could not be made for is reported as its own number and is never
+  proposed for deletion, and all three caps (the tag listing, the retained rows, the deletable rows)
+  say so rather than letting a sample read as the whole repository. No tag is pre-selected: unlike a
+  merged branch, a tag is usually kept on purpose. Deletion is disabled unless the three buckets add
+  up to the tag total, mirroring the branch plan's own coverage guard.
+- **Graph tag chips carry the count too.** A tag lane is shaped exactly like an unmerged branch lane,
+  so the chip on the commit row and in the graph tooltip now reads `+N` for a tag holding commits the
+  base does not have, and its hover says either that or that every commit has already landed. It reuses
+  the tag listing the sidebar has already loaded, so the graph pays no extra command on a path that
+  reruns on every repo switch, and a tag past the listing cap simply says nothing rather than implying
+  its work has landed. `ManviOpsPanel` joins the runtime harness (`harness/stress.html?c=ManviOpsPanel`),
+  whose `cmd_list_tags` fixture was still the retired bare-array shape that `parseTagList` rejects.
+
 ### Fixed
+
+- **A branch whose ahead/behind git never filled in would have read as merged.** `list_branches` parsed
+  the `%(ahead-behind:)` field leniently, turning an empty or malformed value into `(0, 0)` beside a
+  named base — the wire shape for "every commit is already in the base". Unreachable for branch refs,
+  which are always commit-ish, but the safety of that lenient path was an argument rather than a check.
+  Both listings now share one strict parser: an unparsable field leaves the row *uncompared* instead,
+  and `branch_refs_always_yield_two_counts` pins the assumption. The lenient parser and its private
+  tokeniser are gone.
+
+- **An annotated tag reported its own object id where a commit id was expected.** `list_tags` read
+  `%(objectname)`, which for an annotated tag is the tag object, not the commit it points at, so the id
+  shown in the tag tooltip matched nothing on the graph. It now peels through `%(*objectname)`, as the
+  graph's own decoration listing already did.
 
 - **The storage trend sparkline ignored the chosen accent and always drew the same purple.** It
   read `var(--accent, #8b5cf6)`, and `--accent` is defined nowhere — the token is `--accent-color`.
@@ -26,6 +70,13 @@ before that tag is pushed.
   file name, which is the only part that distinguishes them. The name now comes first with the
   directory dimmed after it, so truncation eats the half that repeats, and the full path is on the
   row's tooltip — the same shape `DiffFileRail` already used.
+- **The work-in-progress indicator beside Fetch all rendered as bare transparent text with no pill container.**
+  Sitting on the translucent repository tab bar, the button carried no border, no background fill, and
+  only a 10% amber hover state, making it read as ghosted or see-through over the glass chrome. It now
+  wears the shared `.gp-btn` pill geometry in both states — an outlined surface pill with subtle emerald
+  indicator when all clear, and a defined, tinted amber pill (`!bg-amber-500/20` light, `dark:!bg-amber-500/25`)
+  with WCAG-accessible contrast text (`text-amber-700 dark:text-amber-300`) and active state when work
+  is in progress.
 
 ### Internal
 
@@ -607,7 +658,8 @@ before that tag is pushed.
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...v0.0.4
