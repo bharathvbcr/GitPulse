@@ -982,6 +982,7 @@
           rowHeight={ROW_HEIGHT}
           overscan={OVERSCAN}
           bind:scrollTop
+          scrollCue
           class="h-full"
         >
           {#snippet row(r, index)}

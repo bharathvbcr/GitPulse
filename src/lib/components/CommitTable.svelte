@@ -65,6 +65,7 @@
   import { LAYERS } from "../ui/layers";
   import CommitRow, { type RefItem } from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
 
   let isLoadingMore = $state(false);
 
@@ -924,12 +925,7 @@
         <canvas bind:this={canvas} class="gp-gpu w-full h-full block"></canvas>
       </div>
     </div>
-    {#if graphOverflow.showStartFade}
-      <div class="gp-edge-fade gp-edge-fade-start"></div>
-    {/if}
-    {#if graphOverflow.showEndFade}
-      <div class="gp-edge-fade gp-edge-fade-end"></div>
-    {/if}
+    <ScrollCue target={graphViewport} axis="x" hint={graphOverflow} />
   </div>
 
   <div

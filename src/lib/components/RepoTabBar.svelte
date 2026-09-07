@@ -23,6 +23,7 @@
     LayoutGrid,
   } from "lucide-svelte";
   import WorkspaceActions from "./WorkspaceActions.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
 
   let {
     onOpen,
@@ -346,9 +347,10 @@
       <span>Fleet</span>
     </button>
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
+    <div class="relative min-w-0 flex-1 self-stretch">
     <div
       bind:this={scroller}
-      class="flex-1 flex items-center gap-1 overflow-x-auto min-w-0 py-1"
+      class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
       role="tablist"
       tabindex="-1"
       aria-label="Open repositories"
@@ -435,6 +437,8 @@
           </button>
         </div>
       {/each}
+    </div>
+    <ScrollCue target={scroller} axis="x" />
     </div>
 
     <button

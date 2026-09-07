@@ -38,6 +38,7 @@
     Plus,
     Search,
   } from "lucide-svelte";
+  import ScrollCue from "./ScrollCue.svelte";
 
   // An agent can touch thousands of files in one pass; lists mount a window
   // and grow on demand so the sidebar never becomes the bottleneck.
@@ -65,6 +66,7 @@
   let dragStartWidth = 0;
   /** Set on pointerup after a real drag; dblclick inside the window is ignored. */
   let lastDragEndAt = 0;
+  let bodyScroller: HTMLDivElement | undefined = $state();
 
   /* --- Derived repo pulse --------------------------------------------------- */
 
@@ -336,7 +338,8 @@
     {/if}
 
     <!-- Main Scrollable Section -->
-    <div class="flex-1 overflow-y-auto p-3 space-y-5 mt-2">
+    <div class="relative flex-1 min-h-0 mt-2">
+    <div bind:this={bodyScroller} class="h-full overflow-y-auto p-3 space-y-5">
       <BranchList />
 
       <WorktreesPanel />
@@ -520,6 +523,8 @@
           {/if}
         {/if}
       </div>
+    </div>
+    <ScrollCue target={bodyScroller} axis="y" />
     </div>
 
     <CommitComposer />

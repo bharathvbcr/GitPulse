@@ -108,6 +108,13 @@ describe("CommitTable graph horizontal overflow", () => {
     expect(body).toContain("max-width:");
     expect(body).toContain("flex-basis:");
   });
+
+  it("advertises horizontal overflow with the shared chevron cue, not a title", () => {
+    expect(source).toContain("ScrollCue");
+    expect(source).toContain("hint={graphOverflow}");
+    expect(source).not.toContain("showStartFade");
+    expect(source).not.toContain("gp-edge-fade-start");
+  });
 });
 
 describe("tag standing on graph chips", () => {

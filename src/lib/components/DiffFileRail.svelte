@@ -45,6 +45,7 @@
   import { shortHash } from "../format";
   import { timestampFormat } from "../ui/timestampFormat";
   import VirtualList from "./VirtualList.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
 
   let {
     rail,
@@ -102,6 +103,8 @@
   // event. It answers "which change", asked once per visit; the file list
   // answers "which file", asked constantly.
   let listScroll = $state(0);
+  let commitScroller: HTMLDivElement | undefined = $state();
+  let fileListEl: HTMLUListElement | undefined = $state();
 
   const note = $derived(truncationNote(rail));
   const commitNote = $derived(pickerNote(commits));
@@ -264,7 +267,8 @@
   </div>
 
   {#if commitsOpen}
-    <div class="max-h-56 shrink-0 overflow-y-auto gp-scroll border-b border-border/60 py-1">
+    <div class="relative max-h-56 shrink-0">
+    <div bind:this={commitScroller} class="max-h-56 overflow-y-auto gp-scroll border-b border-border/60 py-1">
       <!-- Uncommitted work is first because it is what a reader is most often
            coming back to, and it is the one entry that is not in the graph. -->
       <button
@@ -312,6 +316,8 @@
       {#if commitNote}
         <p class="px-2.5 py-1 text-[9px] text-textMuted">{commitNote}</p>
       {/if}
+    </div>
+    <ScrollCue target={commitScroller} axis="y" />
     </div>
   {/if}
 
@@ -445,6 +451,7 @@
       rowHeight={ROW_HEIGHT}
       overscan={12}
       bind:scrollTop={listScroll}
+      scrollCue
       class="min-h-0 flex-1 py-1"
     >
       {#snippet row(item, index)}
@@ -452,11 +459,14 @@
       {/snippet}
     </VirtualList>
   {:else}
-    <ul class="min-h-0 flex-1 overflow-y-auto gp-scroll py-1">
+    <div class="relative min-h-0 flex-1">
+    <ul bind:this={fileListEl} class="min-h-0 h-full overflow-y-auto gp-scroll py-1">
       {#each rows as row, index (row.key)}
         <li>{@render railRow(row, index)}</li>
       {/each}
     </ul>
+    <ScrollCue target={fileListEl} axis="y" />
+    </div>
   {/if}
 
   {#if onResize}

@@ -5,6 +5,7 @@
     computeWindow,
     ensureNonEmptyWindow,
   } from "../dom/virtualWindow";
+  import ScrollCue from "./ScrollCue.svelte";
 
   interface Props {
     /** Rows to window over. Omit and pass `itemCount` to render blanks. */
@@ -41,6 +42,13 @@
     /** Receives the row item (undefined past a shorter column) and its index. */
     row: Snippet<[item: T | undefined, index: number]>;
     class?: string;
+    /**
+     * Overlay a chevron on overflowing edges. Off by default: code panes and
+     * diffs already have a real scrollbar, and an arrow there covers source.
+     * File lists (explorer, the diff rail) opt in because their overflow is
+     * otherwise silent.
+     */
+    scrollCue?: boolean;
   }
 
   let {
@@ -53,6 +61,7 @@
     scrollTop = $bindable(0),
     row,
     class: className = "",
+    scrollCue = false,
   }: Props = $props();
 
   let scroller: HTMLDivElement | undefined = $state();
@@ -105,7 +114,7 @@
   });
 </script>
 
-<div bind:this={scroller} onscroll={handleScroll} class="overflow-auto gp-scroll relative {className}">
+{#snippet body()}
   {#if virtualize}
     <div style="height: {total * rowHeight}px; position: relative;">
       <div
@@ -127,4 +136,17 @@
       {/each}
     </div>
   {/if}
-</div>
+{/snippet}
+
+{#if scrollCue}
+  <div class="relative min-h-0 min-w-0 {className}">
+    <div bind:this={scroller} onscroll={handleScroll} class="overflow-auto gp-scroll h-full">
+      {@render body()}
+    </div>
+    <ScrollCue target={scroller} axis="y" />
+  </div>
+{:else}
+  <div bind:this={scroller} onscroll={handleScroll} class="overflow-auto gp-scroll relative {className}">
+    {@render body()}
+  </div>
+{/if}

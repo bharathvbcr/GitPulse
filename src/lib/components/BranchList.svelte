@@ -30,6 +30,7 @@
   import { branchTooltip, tagTooltip } from "../branches/branchTooltip";
   import { interfaceStore } from "../stores/interfaceStore";
   import BranchHealthDot from "./BranchHealthDot.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import { freshnessStore } from "../provenance/store";
   import { clampScrollTop, computeWindow, ensureNonEmptyWindow } from "../dom/virtualWindow";
@@ -103,6 +104,7 @@
   let menuIndex = $state(-1);
 
   let containerEl: HTMLDivElement | undefined = $state();
+  let chipScroller: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let viewportHeight = $state(450);
 
@@ -1001,7 +1003,8 @@
   </div>
 
   <!-- Quick Filter Chips -->
-  <div class="chip-strip flex items-center gap-1 px-1 {gapChips} overflow-x-auto text-[10px]">
+  <div class="relative min-w-0">
+  <div bind:this={chipScroller} class="chip-strip flex items-center gap-1 px-1 {gapChips} overflow-x-auto text-[10px]">
     <button
       type="button"
       onclick={() => (activeTab = "all")}
@@ -1048,6 +1051,8 @@
       Stale ({staleCount})
     </button>
   </div>
+  <ScrollCue target={chipScroller} axis="x" />
+  </div>
 
   <!-- Create branch form -->
   {#if creating}
@@ -1078,11 +1083,12 @@
   {/if}
 
   <!-- Virtual Scroller Container -->
+  <div class="relative flex-1 min-h-0">
   <div
     bind:this={containerEl}
     bind:clientHeight={viewportHeight}
     onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
-    class="flex-1 overflow-y-auto min-h-0 relative select-none will-change-scroll {scrollerAir}"
+    class="h-full overflow-y-auto min-h-0 relative select-none will-change-scroll {scrollerAir}"
   >
     {#if allRows.length === 0}
       <div class="px-3 py-6 text-center text-[11px] text-textMuted/70">
@@ -1111,6 +1117,8 @@
         </div>
       </div>
     {/if}
+  </div>
+  <ScrollCue target={containerEl} axis="y" />
   </div>
 </div>
 
@@ -1201,9 +1209,8 @@
 {/if}
 
 <style>
-  /* app.css never defined the dead class this strip used to reference, so
-     the horizontal scrollbar is hidden here instead of reviving a class
-     nobody owns. */
+  /* Overlay scrollbars (and this hidden track) do not advertise overflow;
+     ScrollCue's end chevron is the cue. */
   .chip-strip {
     scrollbar-width: none;
   }

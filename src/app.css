@@ -375,15 +375,17 @@ html.dark {
     backdrop-filter: blur(4px);
   }
 
-  /* Horizontal-overflow cue at the edges of a scroller. Written inline as
+  /* Overflow cue at the edges of a scroller. Written inline as
      `from-background to-transparent`, which has two faults: Tailwind's
      `to-transparent` is `rgb(0 0 0 / 0)`, so the ramp travels through black
      and fringes on light themes, and `from-background` is a full-alpha stop --
      an opaque band at each edge of a pane that is otherwise translucent. Both
      ends fade one colour to its own zero instead, and macOS swaps the colour
-     for a shade, because the gutter deliberately stopped painting the base. */
+     for a shade, because the gutter deliberately stopped painting the base.
+     The fade is pointer-events-none so the graph (and any other host) still
+     receives clicks through it; the chevron button re-enables pointer events. */
   .gp-edge-fade {
-    @apply pointer-events-none absolute inset-y-0 z-20 w-8;
+    @apply pointer-events-none absolute inset-y-0 z-20 flex w-8 items-center justify-center;
   }
   .gp-edge-fade-start {
     left: 0;
@@ -392,6 +394,23 @@ html.dark {
   .gp-edge-fade-end {
     right: 0;
     background-image: linear-gradient(to left, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
+  }
+  .gp-edge-fade-y {
+    @apply pointer-events-none absolute inset-x-0 z-20 flex h-8 items-center justify-center;
+  }
+  .gp-edge-fade-top {
+    top: 0;
+    background-image: linear-gradient(to bottom, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
+  }
+  .gp-edge-fade-bottom {
+    bottom: 0;
+    background-image: linear-gradient(to top, rgb(var(--c-bg)), rgb(var(--c-bg) / 0));
+  }
+  .gp-scroll-cue-btn {
+    @apply pointer-events-auto inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-surface/90 text-textMuted;
+  }
+  .gp-scroll-cue-btn:hover {
+    @apply bg-surfaceHover text-textPrimary;
   }
 
   /* Floating menu / popover. */
@@ -857,6 +876,14 @@ html.macos .gp-edge-fade-start {
 
 html.macos .gp-edge-fade-end {
   background-image: linear-gradient(to left, var(--mac-edge-shade), rgb(0 0 0 / 0));
+}
+
+html.macos .gp-edge-fade-top {
+  background-image: linear-gradient(to bottom, var(--mac-edge-shade), rgb(0 0 0 / 0));
+}
+
+html.macos .gp-edge-fade-bottom {
+  background-image: linear-gradient(to top, var(--mac-edge-shade), rgb(0 0 0 / 0));
 }
 
 /*

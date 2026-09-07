@@ -359,7 +359,10 @@ describe("macOS material", () => {
     expect(strays).toEqual([]);
     expect(css).toMatch(/\.gp-edge-fade-start \{/);
     expect(css).toMatch(/\.gp-edge-fade-end \{/);
+    expect(css).toMatch(/\.gp-edge-fade-top \{/);
+    expect(css).toMatch(/\.gp-edge-fade-bottom \{/);
     expect(css).toMatch(/html\.macos \.gp-edge-fade-start \{[^}]*var\(--mac-edge-shade\)/);
+    expect(css).toMatch(/html\.macos \.gp-edge-fade-top \{[^}]*var\(--mac-edge-shade\)/);
   });
 
   it("keeps a veil under the content so an unknown desktop cannot set the contrast", () => {

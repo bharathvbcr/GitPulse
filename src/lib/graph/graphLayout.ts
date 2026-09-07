@@ -1,3 +1,8 @@
+import {
+  resolveOverflowHint,
+  type OverflowHint,
+} from "../dom/overflowHint";
+
 export type GraphWidthMode = "balanced" | "wide" | "full";
 
 /** Fallback canvas width when the measured lane width is not a number. */
@@ -38,11 +43,8 @@ export interface GraphLayout {
   isHorizontallyScrollable: boolean;
 }
 
-export interface GraphOverflowHint {
-  canScroll: boolean;
-  showStartFade: boolean;
-  showEndFade: boolean;
-}
+/** Graph gutter overflow; same shape as the shared overflow hint. */
+export type GraphOverflowHint = OverflowHint;
 
 export function isGraphWidthMode(value: unknown): value is GraphWidthMode {
   return value === "balanced" || value === "wide" || value === "full";
@@ -123,18 +125,7 @@ export function resolveGraphOverflow(
   viewportWidth: number,
   contentWidth: number,
 ): GraphOverflowHint {
-  const view = finiteNonNegative(viewportWidth, 0);
-  const content = finiteNonNegative(contentWidth, 0);
-  const max = Math.max(0, content - view);
-  const left = Number.isFinite(scrollLeft)
-    ? Math.min(max, Math.max(0, scrollLeft))
-    : 0;
-  const canScroll = max > 0.5;
-  return {
-    canScroll,
-    showStartFade: canScroll && left > 1,
-    showEndFade: canScroll && left < max - 1,
-  };
+  return resolveOverflowHint(scrollLeft, viewportWidth, contentWidth);
 }
 
 export function clampGraphScrollLeft(

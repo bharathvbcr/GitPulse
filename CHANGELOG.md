@@ -44,6 +44,11 @@ before that tag is pushed.
   rescan button (`locMetric.refresh` with `force: true`) with an active spin indicator, allowing instant
   recalculation of code percentages after checking out branches or generating code without requiring a full
   repository switch.
+- **Scroll cues now surface overflow on clipped panels.** A new overlay component (`ScrollCue`)
+  and DOM observer (`observeOverflow`) add edge chevrons and gradient fade cues to scrollers whose
+  overflow was otherwise silent, including `BranchList`, `FileViewer`, `DiffFileRail`, `TerminalPanel`,
+  `RepoTabBar`, and `VirtualList`. The graph layout's horizontal gutter overflow calculation now shares
+  the same canonical `resolveOverflowHint` logic.
 - **Soft pill dividers and high-contrast section borders unify panel styling.** Replaced harsh full-width hairline
   borders with centered pill dividers (`.gp-separator`, `.gp-menu-sep`) and solid high-contrast borders
   (`.gp-section-edge`) across modals, panels, and dropdowns to improve visual hierarchy and contrast in both

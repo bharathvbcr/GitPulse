@@ -25,6 +25,7 @@
   } from "./lib/desktop/nativeShell";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
   import Logo from "./lib/components/Logo.svelte";
+  import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
   // Graph, Diff and Reflog live inside History now; App no longer mounts any
@@ -155,6 +156,7 @@
     if (isDiagnosticsOpen) diagnosticsMounted = true;
   });
   let dropActive = $state(false);
+  let headerScroller: HTMLDivElement | undefined = $state();
   /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
   let lastModalRepoPath: string | null = null;
   const macos = isMacOS();
@@ -723,7 +725,8 @@
     </div>
     <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
 
-    <div class="gp-header-scroll min-w-0 flex-1 h-full">
+    <div class="relative min-w-0 flex-1 h-full">
+    <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
       <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
         <!-- The icons carry the meaning on their own; the words are the part
              the Layout setting drops. Both keep their accessible name either
@@ -753,6 +756,8 @@
         {/if}
         <div class="flex-1 min-w-4 h-full" data-tauri-drag-region></div>
       </div>
+    </div>
+    <ScrollCue target={headerScroller} axis="x" />
     </div>
 
     <!-- Right Actions -->

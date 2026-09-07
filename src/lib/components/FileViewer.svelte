@@ -57,6 +57,7 @@
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { resolveFilePaneLayout } from "../files/filePaneLayout";
@@ -574,9 +575,10 @@
     {:else}
       <!-- The strip listens for the arrow keys but is not itself a tab stop:
            the roving tabindex on the tabs is what the user lands on. -->
+      <div class="relative min-w-0 flex-1 h-full">
       <div
         bind:this={tabStrip}
-        class="flex items-stretch gap-1 min-w-0 flex-1 h-full overflow-x-auto gp-header-scroll py-1"
+        class="flex items-stretch gap-1 min-w-0 h-full overflow-x-auto gp-header-scroll py-1"
         role="tablist"
         aria-label="Open files"
         tabindex="-1"
@@ -634,6 +636,8 @@
             </button>
           </div>
         {/each}
+      </div>
+      <ScrollCue target={tabStrip} axis="x" />
       </div>
     {/if}
 

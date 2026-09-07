@@ -120,26 +120,26 @@ describe("graph viewport overflow geometry", () => {
     expect(graphContentBoxStyle(Number.POSITIVE_INFINITY)).toContain("width:0px");
   });
 
-  it("fades only the side that still has hidden lanes", () => {
+  it("cues only the side that still has hidden lanes", () => {
     expect(resolveGraphOverflow(0, 440, 1_200)).toEqual({
       canScroll: true,
-      showStartFade: false,
-      showEndFade: true,
+      showStart: false,
+      showEnd: true,
     });
     expect(resolveGraphOverflow(400, 440, 1_200)).toEqual({
       canScroll: true,
-      showStartFade: true,
-      showEndFade: true,
+      showStart: true,
+      showEnd: true,
     });
     expect(resolveGraphOverflow(760, 440, 1_200)).toEqual({
       canScroll: true,
-      showStartFade: true,
-      showEndFade: false,
+      showStart: true,
+      showEnd: false,
     });
     expect(resolveGraphOverflow(0, 440, 440)).toEqual({
       canScroll: false,
-      showStartFade: false,
-      showEndFade: false,
+      showStart: false,
+      showEnd: false,
     });
   });
 

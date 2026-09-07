@@ -23,6 +23,7 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
     MAX_TERMINAL_TABS,
@@ -63,6 +64,7 @@
 
   let inputEl = $state<HTMLInputElement | null>(null);
   let scrollContainer = $state<HTMLDivElement | null>(null);
+  let tabScroller: HTMLDivElement | undefined = $state();
   /** Copy-feedback reset timer; cleared on teardown so it cannot fire post-unmount. */
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -358,8 +360,10 @@
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
            behind an `ml-auto`, so past a handful of tabs the way to open one
            more scrolled off the right edge. -->
+      <div class="relative flex-1 min-w-0 self-stretch">
       <div
-        class="flex-1 min-w-0 flex items-stretch gap-1 overflow-x-auto"
+        bind:this={tabScroller}
+        class="h-full flex items-stretch gap-1 overflow-x-auto"
         role="tablist"
         aria-label="Terminal sessions"
       >
@@ -391,6 +395,8 @@
           </button>
         </div>
       {/each}
+      </div>
+      <ScrollCue target={tabScroller} axis="x" />
       </div>
 
       <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">

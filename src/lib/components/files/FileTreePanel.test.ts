@@ -96,6 +96,7 @@ describe("FileTreePanel", () => {
 
   it("uses VirtualList for tree rendering and supports keyboard navigation", () => {
     expect(source).toContain("VirtualList");
+    expect(source).toContain("scrollCue");
     expect(source).toContain("handleKeydown");
     expect(source).toContain('"ArrowDown"');
     expect(source).toContain('"ArrowUp"');

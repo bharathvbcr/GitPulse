@@ -182,7 +182,7 @@ describe("Sidebar change lists", () => {
   });
 
   it("uses roomier spacing per the density pass", () => {
-    expect(source).toContain('class="flex-1 overflow-y-auto p-3 space-y-5 mt-2"');
+    expect(source).toContain("overflow-y-auto p-3 space-y-5");
     expect(source).toContain("py-1.5 rounded-full flex items-center gap-1");
     expect(source).toContain("py-1.5");
   });
