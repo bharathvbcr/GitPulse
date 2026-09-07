@@ -3353,6 +3353,9 @@ mod tests {
     /// The second defect: the shell started non-login, so zsh never read
     /// `~/.zprofile` — where `brew shellenv` and the user's PATH exports live
     /// — and `~/.zshrc` then died on its first call to an installed tool.
+    // `login_flag` returns None on Windows by design, so this asserts Unix
+    // behaviour — the same gate `login_flag_covers_known_shells_only` carries.
+    #[cfg(unix)]
     #[test]
     fn the_user_shell_starts_as_a_login_shell() {
         let home = tempfile::tempdir().unwrap();

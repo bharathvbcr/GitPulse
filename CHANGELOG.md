@@ -29,6 +29,16 @@ before that tag is pushed.
 
 ### Internal
 
+- **Two Rust tests asserted POSIX behaviour on every platform, and the Windows suite had never run
+  to reach them.** `the_user_shell_starts_as_a_login_shell` expected `-l`, which `login_flag`
+  deliberately never returns on Windows; it is now `#[cfg(unix)]`, the gate its sibling
+  `login_flag_covers_known_shells_only` already carried.
+  `a_slow_call_does_not_delay_the_answer_to_a_fast_one` made its slow call with `repo_path: "/tmp"`,
+  which is not an absolute path on Windows — the call was rejected before doing any work
+  (`duration_ms: 0`) and answered instantly, so it beat the "fast" request and failed the test for
+  the exact opposite of the condition it exists to catch. The slow call now scans a directory that
+  is absolute on every platform, with Unix keeping `/tmp` verbatim because the timing was tuned
+  against it.
 - **Windows clippy failed on unix-only test and bench code, and had been hidden behind an earlier
   failing step.** `-D warnings` promotes `unused_imports` and `dead_code` to errors, and six items
   reachable only from `#[cfg(unix)]` code were declared ungated: two imports in the `analyzer::deps`

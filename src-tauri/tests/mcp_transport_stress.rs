@@ -366,6 +366,23 @@ fn a_request_past_its_budget_is_answered_and_the_server_keeps_serving() {
     );
 }
 
+/// A directory that is absolute on every platform and holds enough for a scan
+/// of it to take meaningfully longer than a trivial `tools/list`.
+///
+/// `/tmp` is not an absolute path on Windows, so `gitpulse_insights` rejected
+/// it before doing any work — `"Repository path must be absolute"` with
+/// `duration_ms: 0` — and the "slow" call answered instantly and beat the fast
+/// one. The test failed for the exact opposite of the condition it exists to
+/// catch. Unix keeps `/tmp` verbatim, because that is the path the timing here
+/// was tuned against.
+fn slow_scan_root() -> String {
+    if cfg!(windows) {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    } else {
+        "/tmp".to_string()
+    }
+}
+
 #[test]
 fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
     // Head-of-line blocking, measured: with a sequential loop a trivial
@@ -379,7 +396,7 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         request(
             json!("slow"),
             "tools/call",
-            json!({ "name": "gitpulse_insights", "arguments": { "repo_path": "/tmp" } }),
+            json!({ "name": "gitpulse_insights", "arguments": { "repo_path": slow_scan_root() } }),
         )
         .as_bytes(),
     );
