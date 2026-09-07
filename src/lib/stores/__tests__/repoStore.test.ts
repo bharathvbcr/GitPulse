@@ -2299,7 +2299,16 @@ describe("repoStore tag list honesty", () => {
     );
     await store.openRepo("/r/many-tags");
     const state = get(store);
-    expect(state.tags).toEqual([{ name: "v400", commit_id: "abc", message: null }]);
+    expect(state.tags).toEqual([
+      {
+        name: "v400",
+        commit_id: "abc",
+        message: null,
+        commits_ahead_of_base: 0,
+        commits_behind_base: 0,
+        compared_to: null,
+      },
+    ]);
     expect(state.tagsTruncated).toBe(true);
     expect(state.tagsFailed).toBe(false);
   });

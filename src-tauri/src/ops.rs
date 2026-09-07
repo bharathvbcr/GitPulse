@@ -16,6 +16,10 @@ use crate::engine::git_writer::validate_ref_name;
 use crate::engine::{BranchInfo, GitReader};
 
 const COMMIT_REVIEW_LIMIT: usize = 500;
+
+/// Cap on tag rows carried in a cleanup plan. The plan is a to-do list, not an
+/// inventory: the counts beside each list stay whole even when the list does not.
+const MAX_TAG_CLEANUP_ROWS: usize = 40;
 const MAX_RELEASE_MESSAGE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +39,102 @@ pub struct BranchCleanupPlan {
     pub protected_branches: usize,
     pub unmerged_branches: usize,
     pub candidates: Vec<BranchCleanupCandidate>,
+}
+
+/// One tag in a [`TagCleanupPlan`], on either side of the split.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagCleanupEntry {
+    pub name: String,
+    pub commit_id: String,
+    pub summary: String,
+    pub commits_ahead_of_base: usize,
+    pub commits_behind_base: usize,
+}
+
+/// What the repository is retaining on tags.
+///
+/// [`BranchCleanupPlan`] reads `refs/heads` only, so a commit held by a tag and
+/// no branch is counted nowhere in it — which is exactly the shape of work
+/// parked under a `retired/…` tag. This plan is that missing half. It proposes
+/// deletion only for tags whose every commit is already in the base; a tag
+/// git could not measure is neither proposed nor counted as retained work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagCleanupPlan {
+    /// Base every tag was measured against. `None` means no comparison was
+    /// possible, and then nothing is proposed for deletion.
+    pub compared_to: Option<String>,
+    pub total_tags: usize,
+    /// Tags git could not measure — an old git, or a tag that does not peel to
+    /// a commit. Never proposed for deletion, never counted as retained work.
+    pub uncompared_tags: usize,
+    /// Tags holding commits the base does not have.
+    pub retained_count: usize,
+    /// Tags whose every commit is already in the base.
+    pub deletable_count: usize,
+    /// Sample of the retained tags, newest first; at most [`MAX_TAG_CLEANUP_ROWS`].
+    pub retained: Vec<TagCleanupEntry>,
+    /// Sample of the deletable tags; at most [`MAX_TAG_CLEANUP_ROWS`].
+    pub candidates: Vec<TagCleanupEntry>,
+    /// The underlying tag listing was itself capped, so every count here
+    /// describes a sample of the repository's tags rather than all of them.
+    pub truncated: bool,
+}
+
+/// Splits the repository's tags into "already in the base" and "holding work".
+///
+/// Deliberately no total commit count: two tags on the same lane share commits,
+/// so summing their ahead counts would report more commits than exist. Each row
+/// carries its own exact count instead.
+pub fn tag_cleanup_plan(repo_path: &str) -> Result<TagCleanupPlan, String> {
+    let listed = GitReader::list_tags(repo_path)?;
+
+    let mut compared_to: Option<String> = None;
+    let mut uncompared_tags = 0usize;
+    let mut retained_count = 0usize;
+    let mut deletable_count = 0usize;
+    let mut retained: Vec<TagCleanupEntry> = Vec::new();
+    let mut candidates: Vec<TagCleanupEntry> = Vec::new();
+
+    for tag in &listed.tags {
+        let Some(base) = tag.compared_to.as_ref() else {
+            // "Not asked" is its own answer. Folding it into either side would
+            // either propose an unexamined tag for deletion or invent work.
+            uncompared_tags += 1;
+            continue;
+        };
+        if compared_to.is_none() {
+            compared_to = Some(base.clone());
+        }
+        let entry = TagCleanupEntry {
+            name: tag.name.clone(),
+            commit_id: tag.commit_id.clone(),
+            summary: tag.message.clone().unwrap_or_default(),
+            commits_ahead_of_base: tag.commits_ahead_of_base,
+            commits_behind_base: tag.commits_behind_base,
+        };
+        if tag.commits_ahead_of_base > 0 {
+            retained_count += 1;
+            if retained.len() < MAX_TAG_CLEANUP_ROWS {
+                retained.push(entry);
+            }
+        } else {
+            deletable_count += 1;
+            if candidates.len() < MAX_TAG_CLEANUP_ROWS {
+                candidates.push(entry);
+            }
+        }
+    }
+
+    Ok(TagCleanupPlan {
+        compared_to,
+        total_tags: listed.tags.len(),
+        uncompared_tags,
+        retained_count,
+        deletable_count,
+        retained,
+        candidates,
+        truncated: listed.truncated,
+    })
 }
 
 pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, String> {
@@ -510,6 +610,90 @@ mod tests {
         assert_eq!(plan.unmerged_branches, 1);
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].name, "merged-work");
+    }
+
+    #[test]
+    fn tag_cleanup_plan_splits_tags_the_branch_plan_counts_nowhere() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        git(dir.path(), &["init", "-b", "main"]);
+        commit_file(dir.path(), "base.txt", "base", "feat: initial");
+        git(dir.path(), &["tag", "already-in-main"]);
+
+        // The shape this exists for: work parked on a tag, on no branch at all.
+        git(dir.path(), &["switch", "-c", "throwaway"]);
+        commit_file(dir.path(), "kept.txt", "kept", "feat: preserved attempt");
+        git(dir.path(), &["tag", "retired/attempt"]);
+        git(dir.path(), &["switch", "main"]);
+        git(dir.path(), &["branch", "-D", "throwaway"]);
+        commit_file(dir.path(), "next.txt", "next", "feat: main moves on");
+
+        let path = dir.path().to_str().expect("utf8 path");
+        let plan = tag_cleanup_plan(path).expect("tag plan");
+
+        assert_eq!(plan.compared_to.as_deref(), Some("main"));
+        assert_eq!(plan.total_tags, 2);
+        assert_eq!(plan.uncompared_tags, 0);
+        assert_eq!(plan.retained_count, 1);
+        assert_eq!(plan.deletable_count, 1);
+        assert_eq!(plan.retained[0].name, "retired/attempt");
+        assert_eq!(plan.retained[0].commits_ahead_of_base, 1);
+        assert_eq!(plan.candidates[0].name, "already-in-main");
+        assert_eq!(plan.candidates[0].commits_ahead_of_base, 0);
+        assert!(!plan.truncated);
+
+        // The branch plan sees none of it: that is the gap this closes.
+        let branches = branch_cleanup_plan(path).expect("branch plan");
+        assert_eq!(branches.unmerged_branches, 0);
+        assert!(branches.candidates.is_empty());
+    }
+
+    #[test]
+    fn tag_cleanup_plan_never_proposes_a_tag_it_could_not_measure() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        git(dir.path(), &["init", "-b", "main"]);
+        commit_file(dir.path(), "payload.txt", "contents", "feat: initial");
+        let blob = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD:payload.txt"])
+                .current_dir(dir.path())
+                .output()
+                .expect("rev-parse");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        // Does not peel to a commit: `git tag -l` errors on this row and still
+        // exits 0, leaving it uncompared.
+        git(
+            dir.path(),
+            &["tag", "-a", "blobbed", "-m", "tag on a blob", &blob],
+        );
+        git(dir.path(), &["tag", "ordinary"]);
+
+        let plan = tag_cleanup_plan(dir.path().to_str().expect("utf8 path")).expect("tag plan");
+
+        assert_eq!(plan.total_tags, 2);
+        assert_eq!(plan.uncompared_tags, 1);
+        // Proposing an unexamined tag for deletion is the failure this pins.
+        assert_eq!(plan.deletable_count, 1);
+        assert!(plan.candidates.iter().all(|c| c.name != "blobbed"));
+        assert!(plan.retained.iter().all(|r| r.name != "blobbed"));
+        assert_eq!(
+            plan.uncompared_tags + plan.retained_count + plan.deletable_count,
+            plan.total_tags,
+            "every tag lands in exactly one bucket"
+        );
+    }
+
+    #[test]
+    fn tag_cleanup_plan_on_a_repository_with_no_tags_names_no_base() {
+        let dir = tempfile::tempdir().expect("temp repo");
+        git(dir.path(), &["init", "-b", "main"]);
+        commit_file(dir.path(), "base.txt", "base", "feat: initial");
+
+        let plan = tag_cleanup_plan(dir.path().to_str().expect("utf8 path")).expect("tag plan");
+        assert_eq!(plan.total_tags, 0);
+        assert_eq!(plan.compared_to, None);
+        assert!(plan.candidates.is_empty());
+        assert!(plan.retained.is_empty());
     }
 
     #[test]

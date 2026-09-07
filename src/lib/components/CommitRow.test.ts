@@ -166,3 +166,39 @@ describe("CommitRow timestamp style", () => {
     expect(at({ timestampStyle: "absolute", density: "compact" })).toContain("w-[4.6rem]");
   });
 });
+
+describe("tag chips carry the tag's standing against the base", () => {
+  it("shows the count of commits the base does not have", () => {
+    const { body } = render(CommitRow, {
+      props: {
+        row,
+        refs: [{ name: "retired/attempt", kind: "tag" as const, aheadOfBase: 16, comparedTo: "main" }],
+      },
+    });
+    expect(body).toContain("+16");
+    expect(body).toContain("16 commits not in main");
+  });
+
+  it("says so when the tag holds nothing the base lacks", () => {
+    const { body } = render(CommitRow, {
+      props: {
+        row,
+        refs: [{ name: "v1.2.3", kind: "tag" as const, aheadOfBase: 0, comparedTo: "main" }],
+      },
+    });
+    // No chip for a release tag sitting on the base, but the hover still says why.
+    expect(body).not.toContain("+0");
+    expect(body).toContain("every commit is already in main");
+  });
+
+  it("claims nothing for a tag that was never measured", () => {
+    // Past the tag-list cap, or one git could not compare. Absence of a
+    // comparison must not render as a comparison that came back clean.
+    const { body } = render(CommitRow, {
+      props: { row, refs: [{ name: "unmeasured", kind: "tag" as const }] },
+    });
+    expect(body).toContain("unmeasured");
+    expect(body).not.toContain("already in");
+    expect(body).not.toMatch(/\+\d/);
+  });
+});

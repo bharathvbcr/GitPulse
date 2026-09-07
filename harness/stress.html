@@ -216,9 +216,68 @@
           available: true, cli_present: true, is_github_remote: true,
           slug: "bharathvbcr/GitPulse", alerts: [], truncated: false, error: null,
         }),
-        cmd_list_branches: () => [], cmd_list_tags: () => [], cmd_get_status: () => [],
+        cmd_list_branches: () => [], cmd_get_status: () => [],
+        // Complete TagList, per src/lib/branches/types.ts. A bare array here is
+        // the retired Vec<TagInfo> shape, which parseTagList treats as a FAILED
+        // read — the fixture would have been testing the error path.
+        cmd_list_tags: () => ({
+          tags: [
+            { name: "v0.0.6", commit_id: "a".repeat(40), message: "release", commits_ahead_of_base: 0, commits_behind_base: 4, compared_to: "main" },
+            { name: "retired/flask-third-attempt", commit_id: "b".repeat(40), message: null, commits_ahead_of_base: 1, commits_behind_base: 117, compared_to: "main" },
+            { name: "retired/laneP-prerebase-backup", commit_id: "c".repeat(40), message: null, commits_ahead_of_base: 5, commits_behind_base: 268, compared_to: "main" },
+            { name: "blobbed", commit_id: "d".repeat(40), message: "tag on a blob", commits_ahead_of_base: 0, commits_behind_base: 0, compared_to: null },
+          ],
+          truncated: false,
+        }),
         cmd_list_remotes: () => [], cmd_list_submodules: () => [], cmd_stash_list: () => [],
         cmd_branch_stats: () => ({}),
+        // --- MANVI Ops ---------------------------------------------------
+        // Numbers mirror a real repository's retired/* tags so the card is
+        // exercised with the shape it actually meets: some tags holding work,
+        // some redundant, one git could not measure.
+        cmd_tag_cleanup_plan: () => ({
+          compared_to: "main",
+          total_tags: 9,
+          uncompared_tags: 1,
+          retained_count: 6,
+          deletable_count: 2,
+          retained: [
+            { name: "retired/laneP-prerebase-backup", commit_id: "c".repeat(40), summary: "", commits_ahead_of_base: 5, commits_behind_base: 268 },
+            { name: "retired/dev-map-hardening-mcp", commit_id: "e".repeat(40), summary: "", commits_ahead_of_base: 4, commits_behind_base: 266 },
+            { name: "retired/dev-map-performance-hardening", commit_id: "f".repeat(40), summary: "", commits_ahead_of_base: 3, commits_behind_base: 265 },
+            { name: "retired/devmap-goal-lanes", commit_id: "1".repeat(40), summary: "", commits_ahead_of_base: 1, commits_behind_base: 258 },
+            { name: "retired/flask-graph-plumbing", commit_id: "2".repeat(40), summary: "", commits_ahead_of_base: 1, commits_behind_base: 117 },
+          ],
+          candidates: [
+            { name: "retired/dev-map-hardening-4a1062", commit_id: "3".repeat(40), summary: "superseded", commits_ahead_of_base: 0, commits_behind_base: 266 },
+            { name: "retired/modest-rosalind-e00564", commit_id: "4".repeat(40), summary: "superseded", commits_ahead_of_base: 0, commits_behind_base: 268 },
+          ],
+          truncated: false,
+        }),
+        cmd_branch_cleanup_plan: () => ({
+          default_branch: "main",
+          current_branch: "main",
+          total_local_branches: 3,
+          protected_branches: 1,
+          unmerged_branches: 1,
+          candidates: [
+            { name: "merged-work", last_summary: "fix: merged work", last_author: "T", last_commit_timestamp: 1788000000, upstream_gone: false },
+          ],
+        }),
+        cmd_review_outgoing_commits: () => ({
+          range: "origin/main..main",
+          total_commits: 2,
+          reviewed_commits: 2,
+          truncated: false,
+          conventional_commits: 2,
+          issue_linked_commits: 0,
+          findings: [],
+        }),
+        cmd_github_context: () => ({
+          available: false, cli_present: false, host: "github.com", owner: "", repo: "",
+          html_url: "", workflow_runs: [], releases: [], pull_requests: [],
+          issues: [], issues_truncated: false, error: null,
+        }),
         // Complete TerminalSpawned, per src/lib/terminal/runResult.ts. A null
         // here would leave every session with `spawned.id === undefined`: the
         // strip would still render, and a harness that exercises no live
@@ -264,6 +323,7 @@
         CoverageViewer: () => import("../src/lib/components/CoverageViewer.svelte"),
         FleetView: () => import("../src/lib/components/FleetView.svelte"),
         TerminalPanel: () => import("../src/lib/components/TerminalPanel.svelte"),
+        ManviOpsPanel: () => import("../src/lib/components/ManviOpsPanel.svelte"),
         LoopCanary: () => import("./LoopCanary.svelte"),
       };
       const Component = (await LOADERS[COMPONENT]()).default;

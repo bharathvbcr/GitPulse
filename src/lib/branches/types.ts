@@ -24,6 +24,15 @@ export interface TagInfo {
   name: string;
   commit_id: string;
   message?: string | null;
+  /** Commits on the tag but not on `compared_to`. Meaningless without it. */
+  commits_ahead_of_base: number;
+  commits_behind_base: number;
+  /**
+   * Base the counts are measured against, or null when the comparison could
+   * not be made. Null is "not asked", zero-ahead is "already merged" — never
+   * render the first as the second.
+   */
+  compared_to?: string | null;
 }
 
 /** Wire shape of `cmd_list_tags`. A bare tag array could not say when the cap cut older tags. */
@@ -56,14 +65,36 @@ export function parseTagList(value: unknown): {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       return { tags: [], truncated: false, failed: true };
     }
-    const t = item as { name?: unknown; commit_id?: unknown; message?: unknown };
+    const t = item as {
+      name?: unknown;
+      commit_id?: unknown;
+      message?: unknown;
+      commits_ahead_of_base?: unknown;
+      commits_behind_base?: unknown;
+      compared_to?: unknown;
+    };
     if (typeof t.name !== "string" || typeof t.commit_id !== "string") {
+      return { tags: [], truncated: false, failed: true };
+    }
+    // Present-but-wrong is a corrupt payload, same as a missing name. Absent
+    // is a payload from a build that did not measure tags: that must land as
+    // "not compared" (compared_to null), never as "zero commits ahead".
+    const ahead = t.commits_ahead_of_base;
+    const behind = t.commits_behind_base;
+    if (
+      (ahead !== undefined && typeof ahead !== "number") ||
+      (behind !== undefined && typeof behind !== "number") ||
+      (t.compared_to !== undefined && t.compared_to !== null && typeof t.compared_to !== "string")
+    ) {
       return { tags: [], truncated: false, failed: true };
     }
     tags.push({
       name: t.name,
       commit_id: t.commit_id,
       message: typeof t.message === "string" ? t.message : null,
+      commits_ahead_of_base: typeof ahead === "number" ? ahead : 0,
+      commits_behind_base: typeof behind === "number" ? behind : 0,
+      compared_to: typeof t.compared_to === "string" ? t.compared_to : null,
     });
   }
   return { tags, truncated: rec.truncated, failed: false };

@@ -10,6 +10,40 @@ const source = readFileSync(
   "utf8",
 );
 
+describe("ManviOpsPanel tag retention", () => {
+  it("checks every tag lands in exactly one bucket before allowing deletion", () => {
+    // Mirrors cleanupInvariant. A split that does not add up is not describing
+    // the repository, and deleting from it would be guesswork.
+    expect(source).toContain(
+      "tagPlan.uncompared_tags + tagPlan.retained_count + tagPlan.deletable_count ===",
+    );
+    expect(source).toContain("disabled={!tagInvariant || selectedTags.length === 0");
+  });
+
+  it("says when a count describes a sample rather than the whole repository", () => {
+    // Three separate caps, three separate admissions: the tag listing itself,
+    // the retained rows, and the deletable rows.
+    expect(source).toContain(
+      "The tag listing was capped, so these counts describe a sample of this repository's tags",
+    );
+    expect(source).toContain("{#if tagPlan.retained.length < tagPlan.retained_count}");
+    expect(source).toContain("{#if tagPlan.candidates.length < tagPlan.deletable_count}");
+  });
+
+  it("reports tags it could not compare instead of hiding them in a bucket", () => {
+    // An unmeasured tag is neither deletable nor evidence of retained work.
+    expect(source).toContain("{tagPlan.uncompared_tags} could not be compared");
+  });
+
+  it("pre-selects no tags, unlike merged branches", () => {
+    // A tag is usually kept deliberately, so deletion is a per-row choice.
+    const start = source.indexOf("async function scanTags()");
+    const scan = source.slice(start, source.indexOf("function toggleTag(", start));
+    expect(scan).toContain("selectedTags = [];");
+    expect(source).toContain("selectedBranches = next.candidates.map((candidate) => candidate.name);");
+  });
+});
+
 describe("ManviOpsPanel deferred issue-load drain", () => {
   it("queues an issue load skipped because an operation holds busy", () => {
     // Switching repos while an op runs must not drop the new repo's issues
@@ -38,6 +72,14 @@ describe("ManviOpsPanel deferred issue-load drain", () => {
 });
 
 describe("ManviOpsPanel rendering", () => {
+  it("renders the tag retention card, not just its source", () => {
+    // A source-text assertion cannot tell a card that mounts from one that
+    // throws mid-render. This is the render path.
+    const { body } = render(ManviOpsPanel);
+    expect(body).toContain("Tag retention");
+    expect(body).toContain("Build tag plan");
+  });
+
   it("renders the MANVI header with both panes", () => {
     const { body } = render(ManviOpsPanel);
     expect(body).toContain("MANVI");

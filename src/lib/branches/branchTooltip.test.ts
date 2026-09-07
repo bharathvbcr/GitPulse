@@ -88,13 +88,58 @@ describe("branchTooltip", () => {
 
 describe("tagTooltip", () => {
   it("includes name, message and a short commit id", () => {
-    const tag: TagInfo = { name: "v1.2.3", commit_id: "abcdef1234567890", message: "Release" };
+    const tag: TagInfo = {
+      name: "v1.2.3",
+      commit_id: "abcdef1234567890",
+      message: "Release",
+      commits_ahead_of_base: 0, commits_behind_base: 0,
+    };
     const text = tagTooltip(tag);
     expect(text.split("\n")).toEqual(["Tag v1.2.3", "Release", "abcdef123456"]);
   });
 
+  it("says how much work a tag holds that the base does not", () => {
+    const text = tagTooltip({
+      name: "retired/third-attempt",
+      commit_id: "dab718e8260d",
+      message: null,
+      commits_ahead_of_base: 16,
+      commits_behind_base: 3,
+      compared_to: "main",
+    });
+    expect(text.split("\n").at(-1)).toBe("16 commits not in main, 3 commits behind");
+  });
+
+  it("says so when every commit is already in the base", () => {
+    const text = tagTooltip({
+      name: "retired/superseded",
+      commit_id: "aaa",
+      message: null,
+      commits_ahead_of_base: 0,
+      commits_behind_base: 4,
+      compared_to: "main",
+    });
+    expect(text.split("\n").at(-1)).toBe("Every commit is already in main.");
+  });
+
+  it("gives no verdict at all when the tag was never compared", () => {
+    // The counts are zero because the question was not asked — an old git, or
+    // a tag that does not peel to a commit. Rendering that as "already in the
+    // base" is the one thing this must never do.
+    const text = tagTooltip({
+      name: "blobbed",
+      commit_id: "aaa",
+      message: null,
+      commits_ahead_of_base: 0,
+      commits_behind_base: 0,
+      compared_to: null,
+    });
+    expect(text).toBe("Tag blobbed\naaa");
+    expect(text).not.toContain("already in");
+  });
+
   it("handles sparse tags without message or id", () => {
-    expect(tagTooltip({ name: "t", commit_id: "" })).toBe("Tag t");
-    expect(tagTooltip({ name: "t", commit_id: "x", message: null })).toBe("Tag t\nx");
+    expect(tagTooltip({ name: "t", commit_id: "", commits_ahead_of_base: 0, commits_behind_base: 0 })).toBe("Tag t");
+    expect(tagTooltip({ name: "t", commit_id: "x", message: null, commits_ahead_of_base: 0, commits_behind_base: 0 })).toBe("Tag t\nx");
   });
 });

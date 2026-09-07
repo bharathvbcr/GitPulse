@@ -200,3 +200,28 @@ describe("GraphNodeTooltip id line layout", () => {
     expect(container).toContain("gap-x-2");
   });
 });
+
+describe("tag chips in the graph tooltip", () => {
+  it("shows how many commits a tag holds that the base does not", () => {
+    // A tag lane is shaped exactly like an unmerged branch lane; without this
+    // the graph draws the lane and refuses to say which it is.
+    const { body } = render(GraphNodeTooltip, {
+      props: {
+        row,
+        refs: [{ name: "retired/attempt", kind: "tag", aheadOfBase: 16, comparedTo: "main" }],
+      },
+    });
+    expect(body).toContain("+16");
+    expect(body).toContain("16 commits not in main");
+  });
+
+  it("claims nothing for a tag that was never measured", () => {
+    // Past the tag-list cap, or one git could not compare. No chip is right;
+    // a "+0" or a silent "merged" would both be assertions nobody checked.
+    const { body } = render(GraphNodeTooltip, {
+      props: { row, refs: [{ name: "unmeasured", kind: "tag" }] },
+    });
+    expect(body).toContain("unmeasured");
+    expect(body).not.toMatch(/\+\d/);
+  });
+});

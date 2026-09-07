@@ -93,7 +93,7 @@ describe("flattenRows", () => {
   it("renders collapsed sections as their header alone", () => {
     const sections = groupBranches(
       [branch({ name: "main" })],
-      [{ name: "v1.0.0", commit_id: "aaa" }]
+      [{ name: "v1.0.0", commit_id: "aaa", commits_ahead_of_base: 0, commits_behind_base: 0 }]
     );
     const rows = flattenRows(sections, collapseMap({}));
     // Remote/tags default collapsed; here only the tags section exists.
@@ -132,7 +132,7 @@ describe("flattenRows", () => {
   it("prefixes pinned and tag keys without a uniqueness scan", () => {
     const sections = groupBranches(
       [branch({ name: "feat/auth" }), branch({ name: "main" })],
-      [{ name: "v1.0.0", commit_id: "aaa" }],
+      [{ name: "v1.0.0", commit_id: "aaa", commits_ahead_of_base: 0, commits_behind_base: 0 }],
       new Set(["feat/auth"])
     );
     const rows = flattenRows(sections, () => false);

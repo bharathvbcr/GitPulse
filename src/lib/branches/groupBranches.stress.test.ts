@@ -188,8 +188,8 @@ describe("filterBranchSections stress: ordering determinism", () => {
         branch({ name: "upstream/alpha-x", is_remote: true, remote_name: "upstream" }),
       ],
       [
-        { name: "v2.0", commit_id: "a" },
-        { name: "v1.0", commit_id: "b" },
+        { name: "v2.0", commit_id: "a", commits_ahead_of_base: 0, commits_behind_base: 0 },
+        { name: "v1.0", commit_id: "b", commits_ahead_of_base: 0, commits_behind_base: 0 },
       ]
     );
     expect(grouped.map((s) => s.id)).toEqual(["local", "remote:origin", "remote:upstream", "tags"]);

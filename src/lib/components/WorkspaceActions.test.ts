@@ -87,4 +87,15 @@ describe("the work-in-progress roll-up panel", () => {
     // Replaced, not accumulated: the old bottom button is gone.
     expect(source).not.toContain('class="gp-btn mt-2 !py-1 !px-2 !text-[11px] w-full"');
   });
+
+  it("styles the trigger as a defined pill button, not a bare transparent element", () => {
+    // The trigger sits beside 'Fetch all' in the header/tab bar. Leaving it
+    // with un-bordered, transparent styling made it read as ghost text or
+    // too transparent over the glass titlebar. It must wear the gp-btn pill
+    // geometry, a border, and non-transparent background in both clear and work states.
+    expect(source).toMatch(/data-workspace-wip-trigger[\s\S]*?class="[^"]*\bgp-btn\b/);
+    expect(source).not.toContain(
+      'class="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors',
+    );
+  });
 });

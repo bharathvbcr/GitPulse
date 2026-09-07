@@ -145,6 +145,7 @@ pub fn run() {
             cmd_scan_deps_health,
             cmd_storage_scan,
             cmd_branch_cleanup_plan,
+            cmd_tag_cleanup_plan,
             cmd_review_outgoing_commits,
             cmd_fetch,
             cmd_pull,

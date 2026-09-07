@@ -17,6 +17,33 @@ export interface BranchCleanupPlan {
   candidates: BranchCleanupCandidate[];
 }
 
+export interface TagCleanupEntry {
+  name: string;
+  commit_id: string;
+  summary: string;
+  commits_ahead_of_base: number;
+  commits_behind_base: number;
+}
+
+/**
+ * What the repository retains on tags — the half `BranchCleanupPlan` cannot
+ * see, since a commit held by a tag alone is on no branch.
+ *
+ * `retained`/`candidates` are capped samples; the `*_count` fields beside them
+ * are whole. `uncompared_tags` is neither deletable nor retained work: it is
+ * the number of tags the comparison could not be made for.
+ */
+export interface TagCleanupPlan {
+  compared_to: string | null;
+  total_tags: number;
+  uncompared_tags: number;
+  retained_count: number;
+  deletable_count: number;
+  retained: TagCleanupEntry[];
+  candidates: TagCleanupEntry[];
+  truncated: boolean;
+}
+
 export type ReviewSeverity = "error" | "warning" | "info";
 
 export interface CommitMessageFinding {

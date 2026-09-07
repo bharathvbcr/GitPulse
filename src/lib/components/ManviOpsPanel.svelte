@@ -30,6 +30,7 @@
     summarizeCommitReview,
     type BranchCleanupPlan,
     type CommitReviewReport,
+    type TagCleanupPlan,
   } from "../ops/model";
   import ManviHarnessPane from "./ManviHarnessPane.svelte";
   import {
@@ -91,6 +92,18 @@
   let releaseMessage = $state("");
   let releaseConfirmed = $state(false);
   let lastRepo: string | null = null;
+
+  let tagPlan = $state<TagCleanupPlan | null>(null);
+  let selectedTags = $state<string[]>([]);
+
+  // Same shape as cleanupInvariant: every tag must land in exactly one bucket,
+  // or the split is not describing the repository and deletion is unsafe.
+  let tagInvariant = $derived(
+    tagPlan
+      ? tagPlan.uncompared_tags + tagPlan.retained_count + tagPlan.deletable_count ===
+          tagPlan.total_tags
+      : true,
+  );
 
   let cleanupInvariant = $derived(
     cleanup
@@ -185,6 +198,63 @@
       selectedBranches = next.candidates.map((candidate) => candidate.name);
     } catch (error) {
       if ($repoStore.currentPath === repo) notice = formatError(error);
+    } finally {
+      settleBusy();
+    }
+  }
+
+  async function scanTags() {
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    busy = "tags";
+    notice = null;
+    try {
+      const next = await invoke<TagCleanupPlan>("cmd_tag_cleanup_plan", { repoPath: repo });
+      if ($repoStore.currentPath !== repo) return;
+      tagPlan = next;
+      // Nothing pre-selected: unlike a merged branch, a tag is often kept on
+      // purpose, so deleting one is a choice the user makes per row.
+      selectedTags = [];
+    } catch (error) {
+      if ($repoStore.currentPath === repo) notice = formatError(error);
+    } finally {
+      settleBusy();
+    }
+  }
+
+  function toggleTag(name: string) {
+    selectedTags = selectedTags.includes(name)
+      ? selectedTags.filter((item) => item !== name)
+      : [...selectedTags, name];
+  }
+
+  async function cleanTags() {
+    if (selectedTags.length === 0) return;
+    const repo = $repoStore.currentPath;
+    if (!repo) return;
+    const names = [...selectedTags];
+    const confirmed = await askConfirm({
+      title: "Delete tags",
+      message: `Delete ${names.length} tag${names.length === 1 ? "" : "s"} whose commits are already in ${tagPlan?.compared_to ?? "the base"}?\n\n${names.join("\n")}`,
+      confirmLabel: "Delete",
+    });
+    if (!confirmed) return;
+    busy = "tag-clean";
+    notice = null;
+    let deleted = 0;
+    const failures: string[] = [];
+    try {
+      for (const name of names) {
+        if ($repoStore.currentPath !== repo) break;
+        const outcome = await repoStore.deleteTag(name);
+        if (outcome.ok) deleted += 1;
+        else failures.push(`${name}: ${outcome.error ?? "failed"}`);
+      }
+      notice = failures.length
+        ? `Deleted ${deleted} of ${names.length}. ${failures.join("; ")}`
+        : `Deleted ${deleted} tag${deleted === 1 ? "" : "s"}.`;
+      selectedTags = [];
+      if ($repoStore.currentPath === repo) await scanTags();
     } finally {
       settleBusy();
     }
@@ -524,6 +594,76 @@
           </div>
         {:else}
           <button class="gp-btn" onclick={scanBranches}><GitBranch size={13} /> Build cleanup plan</button>
+        {/if}
+      </section>
+
+      <section class="gp-card p-4">
+        <div class="mb-3 flex items-center justify-between">
+          <div>
+            <h3 class="font-semibold">Tag retention</h3>
+            <p class="text-textMuted">A commit held by a tag alone is on no branch, so branch cleanup counts it nowhere.</p>
+          </div>
+          {#if tagPlan}<span class="gp-pill">{tagPlan.retained_count} holding work / {tagPlan.total_tags} tags</span>{/if}
+        </div>
+        {#if busy === "tags" || busy === "tag-clean"}
+          <div class="flex items-center gap-2 py-6 text-textMuted"><LoaderCircle size={15} class="animate-spin" /> Measuring tags against the base…</div>
+        {:else if tagPlan}
+          {#if !tagInvariant}
+            <div class="mb-2 flex items-center gap-2 text-rose-400"><AlertTriangle size={14} /> Tag coverage is inconsistent; deletion is disabled.</div>
+          {/if}
+          {#if tagPlan.truncated}
+            <div class="mb-2 text-amber-400">The tag listing was capped, so these counts describe a sample of this repository's tags, not all of them.</div>
+          {/if}
+          {#if tagPlan.total_tags === 0}
+            <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> This repository has no tags.</div>
+          {:else}
+            {#if tagPlan.retained_count > 0}
+              <p class="mb-1 text-textSecondary">Holding work {tagPlan.compared_to ?? "the base"} does not have — kept, not deletable.</p>
+              <div class="max-h-40 space-y-1 overflow-auto">
+                {#each tagPlan.retained as tag (tag.name)}
+                  <div class="flex items-center gap-2 rounded-lg px-2 py-1.5">
+                    <Tag size={13} class="shrink-0 text-amber-400" />
+                    <span class="min-w-0 flex-1 truncate font-mono">{tag.name}</span>
+                    <span class="gp-pill" title="{tag.commits_ahead_of_base} commits not in {tagPlan.compared_to ?? 'the base'}">+{tag.commits_ahead_of_base}</span>
+                  </div>
+                {/each}
+              </div>
+              {#if tagPlan.retained.length < tagPlan.retained_count}
+                <div class="mt-1 text-amber-400">Showing {tagPlan.retained.length} of {tagPlan.retained_count} tags holding work.</div>
+              {/if}
+            {/if}
+            <p class="mt-3 mb-1 text-textSecondary">Every commit already in {tagPlan.compared_to ?? "the base"} — safe to delete.</p>
+            <div class="max-h-40 space-y-1 overflow-auto">
+              {#each tagPlan.candidates as tag (tag.name)}
+                <label class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
+                  <input type="checkbox" checked={selectedTags.includes(tag.name)} onchange={() => toggleTag(tag.name)} />
+                  <span class="min-w-0 flex-1 truncate"><span class="font-mono">{tag.name}</span><span class="ml-2 text-textMuted">{tag.summary}</span></span>
+                </label>
+              {:else}
+                <div class="flex items-center gap-2 py-4 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No tags are redundant with {tagPlan.compared_to ?? "the base"}.</div>
+              {/each}
+            </div>
+            {#if tagPlan.candidates.length < tagPlan.deletable_count}
+              <div class="mt-1 text-amber-400">Showing {tagPlan.candidates.length} of {tagPlan.deletable_count} deletable tags.</div>
+            {/if}
+          {/if}
+          <div class="mt-3 flex items-center justify-between border-t border-border pt-3 text-textMuted">
+            <span>
+              {#if tagPlan.uncompared_tags > 0}
+                <!-- Not folded into either bucket: these were never measured. -->
+                {tagPlan.uncompared_tags} could not be compared
+              {:else if tagPlan.compared_to}
+                measured against {tagPlan.compared_to}
+              {:else}
+                no base to compare against
+              {/if}
+            </span>
+            <button class="gp-btn" onclick={cleanTags} disabled={!tagInvariant || selectedTags.length === 0 || busy !== null}>
+              <Trash2 size={13} /> Delete {selectedTags.length} selected
+            </button>
+          </div>
+        {:else}
+          <button class="gp-btn" onclick={scanTags}><Tag size={13} /> Build tag plan</button>
         {/if}
       </section>
 

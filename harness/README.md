@@ -21,7 +21,7 @@ never reaches the final assignment — that is how the StoragePanel defect
 presented).
 
 - `c` — `PulseView` | `StoragePanel` | `HealthPanel` | `CoverageViewer` | `FleetView` |
-  `TerminalPanel` | `LoopCanary`
+  `TerminalPanel` | `ManviOpsPanel` | `LoopCanary`
 - `scenario` — `mount` | `churn` | `switch` | `storm` | `remount` | `chaos` | `termtabs`
 - `termtabs` drives the terminal strip through the real DOM (open / switch / close),
   because that state is internal to the component. Pair it with `TerminalPanel`:

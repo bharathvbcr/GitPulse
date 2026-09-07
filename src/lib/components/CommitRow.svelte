@@ -35,6 +35,16 @@
   export interface RefItem {
     name: string;
     kind: "head" | "current-branch" | "local-branch" | "remote-branch" | "tag" | "other";
+    /**
+     * For a tag: commits it holds that `comparedTo` does not have.
+     *
+     * A tag lane is shaped exactly like an unmerged branch, so the chip is
+     * where the graph can say which it is. Both fields absent means the tag was
+     * never measured (or is past the tag-list cap) — then the chip says nothing
+     * rather than implying the work has landed.
+     */
+    aheadOfBase?: number | null;
+    comparedTo?: string | null;
   }
 
   let {
@@ -269,9 +279,19 @@
           {r.name}
         </span>
       {:else if r.kind === "tag"}
-        <span class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300">
+        <span
+          class="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300"
+          title={r.comparedTo
+            ? r.aheadOfBase && r.aheadOfBase > 0
+              ? `Tag ${r.name} — ${r.aheadOfBase} commits not in ${r.comparedTo}`
+              : `Tag ${r.name} — every commit is already in ${r.comparedTo}`
+            : `Tag ${r.name}`}
+        >
           <Tag size={10} />
           {r.name}
+          {#if r.comparedTo && r.aheadOfBase && r.aheadOfBase > 0}
+            <span class="opacity-80">+{r.aheadOfBase}</span>
+          {/if}
         </span>
       {:else if r.kind === "other"}
         <!--

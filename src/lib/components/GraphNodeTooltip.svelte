@@ -187,6 +187,12 @@
         <span class="inline-flex max-w-40 items-center gap-1 rounded-full border border-border bg-background px-1.5 py-0.5 font-mono text-[9px] text-textPrimary">
           {#if ref.kind === "tag"}
             <Tag size={9} class="shrink-0 text-amber-400" />
+            {#if ref.comparedTo && ref.aheadOfBase && ref.aheadOfBase > 0}
+              <!-- A tag lane looks exactly like an unmerged branch lane; this
+                   is where the graph says which one it is. Silent when the tag
+                   was never measured, so absence never reads as "merged". -->
+              <span class="shrink-0 text-amber-400" title="{ref.aheadOfBase} commits not in {ref.comparedTo}">+{ref.aheadOfBase}</span>
+            {/if}
           {:else if ref.kind === "remote-branch"}
             <Cloud size={9} class="shrink-0 text-sky-400" />
           {:else if ref.kind === "head"}

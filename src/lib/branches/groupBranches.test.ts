@@ -100,7 +100,7 @@ describe("groupBranches", () => {
   it("puts tags in their own section", () => {
     const sections = groupBranches(
       [branch({ name: "main", is_default: true })],
-      [{ name: "v1.0.0", commit_id: "aaa" }, { name: "v0.9.0", commit_id: "bbb" }]
+      [{ name: "v1.0.0", commit_id: "aaa", commits_ahead_of_base: 0, commits_behind_base: 0 }, { name: "v0.9.0", commit_id: "bbb", commits_ahead_of_base: 0, commits_behind_base: 0 }]
     );
     const tags = sections.find((s) => s.kind === "tags")!;
     expect(tags.tags.map((t) => t.name)).toEqual(["v1.0.0", "v0.9.0"]);
@@ -195,7 +195,7 @@ describe("groupBranches at scale", () => {
       branch({ name: "legacy/old", last_commit_timestamp: 1_500_000_000 }),
       branch({ name: "origin/feat/auth", is_remote: true, remote_name: "origin" }),
     ];
-    const tags = [{ name: "v1.0.0", commit_id: "aaa" }];
+    const tags = [{ name: "v1.0.0", commit_id: "aaa", commits_ahead_of_base: 0, commits_behind_base: 0 }];
     const pinned = new Set(["feat/auth"]);
 
     const sections = groupBranches(branches, tags, pinned);

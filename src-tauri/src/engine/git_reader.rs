@@ -127,8 +127,21 @@ pub struct BranchStatsReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagInfo {
     pub name: String,
+    /// The COMMIT this tag names. An annotated tag's own object id is not a
+    /// commit, so it is peeled here — an unpeeled id matches nothing on the
+    /// graph.
     pub commit_id: String,
     pub message: Option<String>,
+    /// Commits reachable from the tag but not from `compared_to`: the answer
+    /// to "is the work on this tag merged?". Work preserved on a tag is off
+    /// every branch, so `git branch --contains` reports nothing about it.
+    pub commits_ahead_of_base: usize,
+    pub commits_behind_base: usize,
+    /// The base the two counts are measured against, or `None` when the
+    /// comparison could not be made. `None` and "zero ahead" are different
+    /// answers — the first is "not asked", the second is "already merged" —
+    /// and a caller must never render the first as the second.
+    pub compared_to: Option<String>,
 }
 
 /// `cmd_list_tags` payload. A bare `Vec<TagInfo>` could not say when the
@@ -482,11 +495,14 @@ impl GitReader {
             let last_author = parts.get(6).unwrap_or(&"").trim().to_string();
             let last_summary = parts.get(7).unwrap_or(&"").trim().to_string();
 
-            let (commits_ahead_of_base, commits_behind_base) = if has_ahead_behind {
-                parse_ahead_behind_field(parts.get(8).copied().unwrap_or(""))
-            } else {
-                (0, 0)
-            };
+            // Decided per row, like the tag listing: a field git did not fill
+            // leaves this branch uncompared rather than zero-ahead. Unreachable
+            // for branch refs (see `branch_refs_always_yield_two_counts`), and
+            // that is exactly why it must not be the one case read as "merged".
+            let measured = has_ahead_behind
+                .then(|| parse_ahead_behind_pair(parts.get(8).copied().unwrap_or("")))
+                .flatten();
+            let (commits_ahead_of_base, commits_behind_base) = measured.unwrap_or((0, 0));
 
             branches.push(BranchInfo {
                 name,
@@ -507,7 +523,7 @@ impl GitReader {
                 additions: 0,
                 deletions: 0,
                 files_changed: 0,
-                compared_to: has_ahead_behind.then(|| default_short.clone()).flatten(),
+                compared_to: measured.and(default_short.clone()),
             });
         }
 
@@ -1253,26 +1269,76 @@ impl GitReader {
 
     pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
         let repo = validate_repo(repo_path)?;
-        let stdout = git_text(
+        // A tag row could name a commit but never say where that commit stood.
+        // Work parked on a tag (`retired/...`) sits on no branch, so the branch
+        // list and the cleanup plan — both of which read only refs/heads and
+        // refs/remotes — are blind to it, while the graph still draws it a lane
+        // shaped exactly like an unmerged branch. Resolving the base the way
+        // `list_branches` resolves it means a tag and a branch are measured
+        // against the same thing, and it rides this one listing process.
+        let remote = resolve_default_remote(&repo);
+        let head_ref = remote_head_ref(&remote);
+        let origin_head = git_text(&repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
+        let default_base = resolve_default_base_on(&repo, &remote, origin_head.as_deref());
+
+        let mut format = String::from(TAG_LIST_FORMAT);
+        if let Some((_, base_oid)) = default_base.as_ref() {
+            format.push_str("%00%(ahead-behind:");
+            format.push_str(base_oid);
+            format.push(')');
+        }
+        let format_arg = format!("--format={format}");
+        let listed = git_text(
             &repo,
-            &[
-                "tag",
-                "-l",
-                "--sort=-creatordate",
-                "--format=%(refname:short)%00%(objectname)%00%(contents:subject)",
-            ],
-        )?;
+            &["tag", "-l", "--sort=-creatordate", format_arg.as_str()],
+        );
+        // Older git (<2.42) rejects the ahead-behind atom outright: retry once
+        // without it so the listing still works. Every tag is then UNCOMPARED
+        // rather than zero-ahead — see `TagInfo::compared_to`.
+        let (stdout, has_ahead_behind) = match listed {
+            Ok(stdout) => (stdout, default_base.is_some()),
+            Err(err) if default_base.is_some() => {
+                let base_format_arg = format!("--format={TAG_LIST_FORMAT}");
+                let retried = git_text(
+                    &repo,
+                    &["tag", "-l", "--sort=-creatordate", base_format_arg.as_str()],
+                )
+                .map_err(|retry_err| {
+                    format!("{err}; retry without ahead-behind also failed: {retry_err}")
+                })?;
+                (retried, false)
+            }
+            Err(err) => return Err(err),
+        };
+        let base_name = has_ahead_behind
+            .then(|| default_base.map(|(name, _)| name))
+            .flatten();
+
         let mut tags = Vec::new();
         for line in stdout.lines() {
             let parts: Vec<&str> = line.split('\x00').collect();
             if parts.len() >= 2 {
+                // Lightweight tags have no peeled id; theirs is already a commit.
+                let peeled = parts.get(3).map(|s| s.trim()).unwrap_or("");
+                let commit_id = if peeled.is_empty() { parts[1] } else { peeled };
+                // Per ROW, not per listing: one tag git could not compare must
+                // not blind the rest, nor borrow their base.
+                let measured = base_name.as_ref().and_then(|name| {
+                    parse_ahead_behind_pair(parts.get(4).copied().unwrap_or(""))
+                        .map(|counts| (counts, name.clone()))
+                });
+                let (commits_ahead_of_base, commits_behind_base) =
+                    measured.as_ref().map(|(c, _)| *c).unwrap_or((0, 0));
                 tags.push(TagInfo {
                     name: parts[0].to_string(),
-                    commit_id: parts[1].to_string(),
+                    commit_id: commit_id.to_string(),
                     message: parts
                         .get(2)
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
+                    commits_ahead_of_base,
+                    commits_behind_base,
+                    compared_to: measured.map(|(_, name)| name),
                 });
             }
         }
@@ -2220,6 +2286,12 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 /// escapes, unlike log's `%xNN`): author names and commit subjects may legally
 /// contain any byte except NUL, so \x01 separators could be split by hostile
 /// content while %00 cannot.
+/// Tag listing fields. `%(*objectname)` is the commit an annotated tag peels
+/// to and is empty for a lightweight tag, whose `%(objectname)` is already the
+/// commit.
+const TAG_LIST_FORMAT: &str =
+    "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
+
 const BRANCH_LIST_FORMAT: &str = "%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:track)%00%(upstream:short)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)";
 
 /// Resolves the default branch to (short name, commit oid) without needing
@@ -2322,40 +2394,28 @@ fn strip_remote_prefix<'a>(name: &'a str, remote: Option<&str>) -> &'a str {
     }
 }
 
-/// Parses `%(ahead-behind:<base>)` output (`"<ahead> <behind>"`). Malformed
-/// input yields zeros rather than failing the whole listing.
-fn parse_ahead_behind_field(raw: &str) -> (usize, usize) {
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    let ahead = next_decimal_token(bytes, &mut i);
-    let behind = next_decimal_token(bytes, &mut i);
-    (ahead, behind)
-}
-
-fn next_decimal_token(bytes: &[u8], i: &mut usize) -> usize {
-    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
-        *i += 1;
+/// Parses `%(ahead-behind:<base>)` — `Some` only when the field really is
+/// `<digits> <digits>`.
+///
+/// The single parser for this atom, strict on purpose, for both listings.
+/// `git tag -l` prints an `error:` and leaves this field EMPTY for a tag that
+/// does not peel to a commit (an annotated tag on a blob) — while still
+/// exiting 0, so the listing succeeds. Folding that into `(0, 0)` would render
+/// such a tag as "every commit is already in the base, safe to delete", which
+/// is the one thing it must never say. `None` here keeps the row uncompared.
+///
+/// Branch refs are always commit-ish, so `list_branches` never takes that path
+/// — pinned by `branch_refs_always_yield_two_counts` rather than assumed. It
+/// shares this parser anyway: two spellings of one atom is how the lenient
+/// side comes to mean "merged" for a branch nobody measured.
+fn parse_ahead_behind_pair(raw: &str) -> Option<(usize, usize)> {
+    let mut fields = raw.split_ascii_whitespace();
+    let ahead = fields.next()?;
+    let behind = fields.next()?;
+    if fields.next().is_some() {
+        return None;
     }
-    if *i >= bytes.len() {
-        return 0;
-    }
-    let start = *i;
-    let mut n = 0usize;
-    let mut valid = true;
-    while *i < bytes.len() && !bytes[*i].is_ascii_whitespace() {
-        let b = bytes[*i];
-        *i += 1;
-        if valid && b.is_ascii_digit() {
-            n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
-        } else {
-            valid = false;
-        }
-    }
-    if !valid || *i == start {
-        0
-    } else {
-        n
-    }
+    Some((ahead.parse().ok()?, behind.parse().ok()?))
 }
 
 /// One listed ref awaiting churn computation in [`GitReader::branch_stats`].
@@ -3497,6 +3557,24 @@ mod tests {
         );
     }
 
+    fn rev_parse(dir: &Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn tag_named<'a>(listed: &'a TagList, name: &str) -> &'a TagInfo {
+        listed
+            .tags
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tag {name} missing from the listing"))
+    }
+
     fn init_repo_with_remotes(remotes: &[&str], default_branch_name: &str) -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
         git_in(dir.path(), &["init", "-b", default_branch_name]);
@@ -3631,17 +3709,146 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ahead_behind_field() {
-        // Well-formed `%(ahead-behind:<oid>)` output.
-        assert_eq!(parse_ahead_behind_field("3 12"), (3, 12));
-        assert_eq!(parse_ahead_behind_field("0 0"), (0, 0));
-        // Trailing field missing / empty / padded.
-        assert_eq!(parse_ahead_behind_field("7"), (7, 0));
-        assert_eq!(parse_ahead_behind_field(""), (0, 0));
-        assert_eq!(parse_ahead_behind_field(" 4   9 "), (4, 9));
-        // Malformed values degrade to zeros, never poison the listing.
-        assert_eq!(parse_ahead_behind_field("junk data"), (0, 0));
-        assert_eq!(parse_ahead_behind_field("-1 2"), (0, 2));
+    fn list_tags_measures_each_tag_against_the_default_base() {
+        let dir = init_repo_with_remotes(&[], "main");
+        git_in(dir.path(), &["tag", "on-main"]);
+        git_in(dir.path(), &["switch", "-c", "side"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "side one"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "side two"]);
+        git_in(dir.path(), &["tag", "off-main"]);
+        git_in(dir.path(), &["switch", "main"]);
+        git_in(
+            dir.path(),
+            &["commit", "--allow-empty", "-m", "main moves on"],
+        );
+
+        let listed = GitReader::list_tags(&dir.path().to_string_lossy()).expect("tags");
+
+        // Work preserved on a tag and never merged. `git branch --contains`
+        // says nothing about this commit, which is the whole reason the field
+        // exists.
+        let off = tag_named(&listed, "off-main");
+        assert_eq!(off.commits_ahead_of_base, 2);
+        assert_eq!(off.commits_behind_base, 1);
+        assert_eq!(off.compared_to.as_deref(), Some("main"));
+
+        // Contained in the base. Zero ahead WITH a base named is what lets a
+        // caller say "merged"; being behind is not evidence either way.
+        let on = tag_named(&listed, "on-main");
+        assert_eq!(on.commits_ahead_of_base, 0);
+        assert_eq!(on.commits_behind_base, 1);
+        assert_eq!(on.compared_to.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn list_tags_reports_the_commit_an_annotated_tag_peels_to() {
+        let dir = init_repo_with_remotes(&[], "main");
+        git_in(dir.path(), &["tag", "-a", "release", "-m", "annotated"]);
+        git_in(dir.path(), &["tag", "lightweight"]);
+        let head = rev_parse(dir.path(), "HEAD");
+        assert_ne!(
+            rev_parse(dir.path(), "release"),
+            head,
+            "an annotated tag must have its own object for this test to mean anything"
+        );
+
+        let listed = GitReader::list_tags(&dir.path().to_string_lossy()).expect("tags");
+
+        // The tag object's id is not on the graph: matching it against a
+        // commit finds nothing.
+        assert_eq!(tag_named(&listed, "release").commit_id, head);
+        assert_eq!(tag_named(&listed, "lightweight").commit_id, head);
+    }
+
+    #[test]
+    fn list_tags_names_no_base_for_a_tag_git_could_not_compare() {
+        let dir = init_repo_with_remotes(&[], "main");
+        std::fs::write(dir.path().join("payload.txt"), b"contents").expect("write payload");
+        git_in(dir.path(), &["add", "payload.txt"]);
+        git_in(dir.path(), &["commit", "-m", "add payload"]);
+        let blob = rev_parse(dir.path(), "HEAD:payload.txt");
+        git_in(
+            dir.path(),
+            &["tag", "-a", "blobbed", "-m", "tag on a blob", &blob],
+        );
+        git_in(dir.path(), &["tag", "ordinary"]);
+
+        let listed = GitReader::list_tags(&dir.path().to_string_lossy()).expect("tags");
+
+        // `git tag -l` prints an error for this row and still exits 0, leaving
+        // the field empty. Zeros with a base named would render as "already
+        // merged, safe to delete" for a tag that is not even a commit.
+        let blobbed = tag_named(&listed, "blobbed");
+        assert_eq!(blobbed.compared_to, None);
+        assert_eq!(blobbed.commits_ahead_of_base, 0);
+        assert_eq!(blobbed.commits_behind_base, 0);
+
+        // One uncomparable row must not blind the others.
+        assert_eq!(
+            tag_named(&listed, "ordinary").compared_to.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn branch_refs_always_yield_two_counts() {
+        // The assumption that lets the BRANCH listing keep the lenient parser:
+        // every ref it reads is commit-ish, so git always emits "<n> <m>". The
+        // strict tag parser is the oracle — if any branch row stops parsing,
+        // `list_branches` would start reporting unmeasured branches as merged.
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        git_in(dir.path(), &["switch", "-c", "side"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "side work"]);
+        git_in(dir.path(), &["switch", "main"]);
+        git_in(dir.path(), &["commit", "--allow-empty", "-m", "main work"]);
+        let main_oid = rev_parse(dir.path(), "main");
+        let side_oid = rev_parse(dir.path(), "side");
+        // A remote-tracking ref, which `list_branches` reads alongside heads.
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/side", &side_oid],
+        );
+
+        let format = format!("--format=%(refname)%00%(ahead-behind:{main_oid})");
+        let listed = git_text(
+            dir.path(),
+            &[
+                "for-each-ref",
+                format.as_str(),
+                "refs/heads/",
+                "refs/remotes/",
+            ],
+        )
+        .expect("listing");
+
+        let mut rows = 0;
+        for line in listed.lines() {
+            let (refname, field) = line.split_once('\x00').expect("two fields");
+            assert!(
+                parse_ahead_behind_pair(field).is_some(),
+                "{refname} produced {field:?}, which the lenient parser would read as (0, 0)"
+            );
+            rows += 1;
+        }
+        assert_eq!(rows, 3, "two heads and one remote-tracking ref");
+    }
+
+    #[test]
+    fn parse_ahead_behind_pair_rejects_everything_that_is_not_two_counts() {
+        assert_eq!(parse_ahead_behind_pair("2 1"), Some((2, 1)));
+        assert_eq!(parse_ahead_behind_pair("3 12"), Some((3, 12)));
+        assert_eq!(parse_ahead_behind_pair("  0   0  "), Some((0, 0)));
+        assert_eq!(parse_ahead_behind_pair(" 4   9 "), Some((4, 9)));
+        // Inherited from the retired lenient parser's cases: it read these as
+        // (7, 0) and (0, 0), i.e. "measured, and nothing ahead".
+        assert_eq!(parse_ahead_behind_pair("junk data"), None);
+        // The empty field git leaves behind for a tag it refused to compare.
+        assert_eq!(parse_ahead_behind_pair(""), None);
+        assert_eq!(parse_ahead_behind_pair("   "), None);
+        assert_eq!(parse_ahead_behind_pair("2"), None);
+        assert_eq!(parse_ahead_behind_pair("2 1 0"), None);
+        assert_eq!(parse_ahead_behind_pair("a b"), None);
+        assert_eq!(parse_ahead_behind_pair("-1 2"), None);
     }
 
     #[test]

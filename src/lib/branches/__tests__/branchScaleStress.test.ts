@@ -64,6 +64,7 @@ function generateStressBranches(count: number): { branches: BranchInfo[]; tags: 
       name: `v${Math.floor(t / 10)}.${t % 10}.0`,
       commit_id: `tag_oid_${t.toString(16).padStart(40, "0")}`,
       message: t % 2 === 0 ? `Release tag ${t}` : null,
+      commits_ahead_of_base: 0, commits_behind_base: 0,
     });
   }
 

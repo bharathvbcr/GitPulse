@@ -338,6 +338,22 @@
     schedulePaint();
   }
 
+  // The tag listing the sidebar already loaded carries each tag's standing
+  // against the default base. Reusing it costs the graph nothing: no extra
+  // command, no extra git process on a path that runs on every repo switch.
+  // A tag past the listing's cap is simply absent, and an absent tag makes no
+  // claim rather than a false one.
+  let tagStanding = $derived.by(() => {
+    const map = new Map<string, { ahead: number; base: string | null }>();
+    for (const tag of $repoStore.tags) {
+      map.set(tag.name, {
+        ahead: tag.commits_ahead_of_base,
+        base: tag.compared_to ?? null,
+      });
+    }
+    return map;
+  });
+
   let refsByCommit = $derived.by(() => {
     const map = new Map<string, RefItem[]>();
     for (const ref of $graphStore.refs) {
@@ -360,7 +376,13 @@
                   : "local-branch";
       const list = map.get(ref.commit_id) ?? [];
       if (!list.some((r) => r.name === ref.name && r.kind === kind)) {
-        list.push({ name: ref.name, kind });
+        const standing = kind === "tag" ? tagStanding.get(ref.name) : undefined;
+        list.push({
+          name: ref.name,
+          kind,
+          aheadOfBase: standing?.ahead ?? null,
+          comparedTo: standing?.base ?? null,
+        });
       }
       map.set(ref.commit_id, list);
     }

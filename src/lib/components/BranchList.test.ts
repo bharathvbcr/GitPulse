@@ -33,6 +33,21 @@ describe("BranchList", () => {
   });
 });
 
+describe("BranchList tag rows", () => {
+  it("shows how far a tag is ahead of the base, but only when it was compared", () => {
+    // A tag holding unmerged work is on no branch, so this chip is the only
+    // place the sidebar can say so. Both halves of the guard matter: without
+    // `compared_to` the counts are zeros meaning "not asked", and a release
+    // tag sitting on the base has nothing to report.
+    expect(source).toContain(
+      "{#if row.tag.compared_to && row.tag.commits_ahead_of_base > 0}",
+    );
+    expect(source).toContain(
+      'title="{row.tag.commits_ahead_of_base} commits not in {row.tag.compared_to}"',
+    );
+  });
+});
+
 describe("BranchList delete escalation", () => {
   it("attempts the safe non-forced delete first", () => {
     const safeIdx = source.indexOf("repoStore.deleteBranch(branch.name, false)");

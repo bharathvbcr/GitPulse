@@ -9,7 +9,56 @@ describe("parseTagList", () => {
     });
     expect(parsed.failed).toBe(false);
     expect(parsed.truncated).toBe(false);
-    expect(parsed.tags).toEqual([{ name: "v1", commit_id: "abc", message: "release" }]);
+    expect(parsed.tags).toEqual([
+      {
+        name: "v1",
+        commit_id: "abc",
+        message: "release",
+        commits_ahead_of_base: 0,
+        commits_behind_base: 0,
+        compared_to: null,
+      },
+    ]);
+  });
+
+  it("carries the comparison against the default base", () => {
+    const parsed = parseTagList({
+      tags: [
+        {
+          name: "retired/attempt",
+          commit_id: "abc",
+          message: null,
+          commits_ahead_of_base: 16,
+          commits_behind_base: 3,
+          compared_to: "main",
+        },
+      ],
+      truncated: false,
+    });
+    expect(parsed.failed).toBe(false);
+    expect(parsed.tags[0].commits_ahead_of_base).toBe(16);
+    expect(parsed.tags[0].commits_behind_base).toBe(3);
+    expect(parsed.tags[0].compared_to).toBe("main");
+  });
+
+  it("reads an absent comparison as not-compared, never as zero commits ahead", () => {
+    // A payload from a build that did not measure tags. Landing this as
+    // `compared_to: null` is what stops the sidebar calling every tag merged.
+    const parsed = parseTagList({
+      tags: [{ name: "v1", commit_id: "abc" }],
+      truncated: false,
+    });
+    expect(parsed.failed).toBe(false);
+    expect(parsed.tags[0].compared_to).toBeNull();
+    expect(parsed.tags[0].commits_ahead_of_base).toBe(0);
+  });
+
+  it("fails closed when a comparison field is present but the wrong type", () => {
+    const bad = (tag: Record<string, unknown>) =>
+      parseTagList({ tags: [{ name: "v1", commit_id: "abc", ...tag }], truncated: false }).failed;
+    expect(bad({ commits_ahead_of_base: "2" })).toBe(true);
+    expect(bad({ commits_behind_base: null })).toBe(true);
+    expect(bad({ compared_to: 7 })).toBe(true);
   });
 
   it("treats a bare array as a failed read, not an empty tag list", () => {

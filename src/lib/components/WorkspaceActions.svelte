@@ -195,19 +195,19 @@
     <button
       type="button"
       data-workspace-wip-trigger
-      class="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors {wip.allClear
-        ? 'text-textMuted hover:text-textPrimary'
-        : 'text-amber-600 dark:text-amber-400 hover:bg-amber-500/10'}"
+      class="gp-btn !py-1 !px-2 !text-[11px] inline-flex items-center gap-1.5 {wip.allClear
+        ? `text-textMuted hover:text-textPrimary ${detailsOpen ? '!border-accent/50 !bg-surfaceHover !text-textPrimary' : ''}`
+        : `!border-amber-500/50 !bg-amber-500/20 text-amber-700 hover:!bg-amber-500/30 hover:!border-amber-500/70 dark:text-amber-300 dark:!bg-amber-500/25 dark:hover:!bg-amber-500/35 ${detailsOpen ? '!border-amber-500/70 !bg-amber-500/30 dark:!bg-amber-500/40 ring-1 ring-amber-500/40' : ''}`}"
       onclick={() => (detailsOpen = !detailsOpen)}
       title={describeWorkspace(wip)}
       aria-haspopup="dialog"
       aria-expanded={detailsOpen}
     >
       {#if wip.allClear}
-        <CircleCheck size={11} />
+        <CircleCheck size={11} class="text-emerald-600 dark:text-emerald-400" />
         <span>All clean</span>
       {:else}
-        <AlertTriangle size={11} />
+        <AlertTriangle size={11} class="shrink-0 text-amber-600 dark:text-amber-400" />
         <span>{wip.repos.length} with work</span>
       {/if}
     </button>

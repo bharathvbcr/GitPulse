@@ -109,3 +109,20 @@ describe("CommitTable graph horizontal overflow", () => {
     expect(body).toContain("flex-basis:");
   });
 });
+
+describe("tag standing on graph chips", () => {
+  it("reuses the loaded tag listing instead of asking git again", () => {
+    // The graph reloads on every repo switch; a second command here would be a
+    // per-load cost for a chip. repoStore.tags already carries the comparison.
+    expect(source).toContain("for (const tag of $repoStore.tags)");
+    expect(source).not.toContain("cmd_tag_cleanup_plan");
+    expect(source).not.toContain("cmd_list_tags");
+  });
+
+  it("attaches the standing only to tag refs", () => {
+    expect(source).toContain('const standing = kind === "tag" ? tagStanding.get(ref.name) : undefined;');
+    // Absent stays absent: null, not a zero that would read as "merged".
+    expect(source).toContain("aheadOfBase: standing?.ahead ?? null");
+    expect(source).toContain("comparedTo: standing?.base ?? null");
+  });
+});

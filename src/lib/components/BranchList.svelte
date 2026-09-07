@@ -832,6 +832,16 @@
   >
     <Tag size={12} class="text-textMuted shrink-0" />
     {@render highlightedLabel(row.tag.name, debouncedQuery)}
+    {#if row.tag.compared_to && row.tag.commits_ahead_of_base > 0}
+      <!-- Only shown for a tag that was compared AND holds work the base does
+           not: a release tag sitting on main needs no chip, and a tag that
+           could not be compared must not imply it was. -->
+      <span
+        class="ml-auto shrink-0 text-[10px] font-mono text-textMuted"
+        title="{row.tag.commits_ahead_of_base} commits not in {row.tag.compared_to}"
+        >+{row.tag.commits_ahead_of_base}</span
+      >
+    {/if}
   </button>
 {/snippet}
 

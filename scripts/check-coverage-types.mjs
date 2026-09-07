@@ -117,7 +117,7 @@ export const CONTRACTS = Object.freeze([
   { label: "grants", rustPath: rust("grants", "mod.rs"), tsPath: ts("grants", "types.ts"), structs: ["Grant", "Grantor", "GrantScope", "GrantView"] },
   { label: "local-scan", rustPath: rust("harness", "protocol.rs"), tsPath: ts("ai", "scan.ts"), structs: ["ScanModel", "ScanServer", "ScanResult"] },
   { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskView"] },
-  { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport"] },
+  { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupPlan", "CommitReviewReport", "TagCleanupPlan", "TagCleanupEntry"] },
   { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
   // The envelope on every gated command: `policy` travels with `output` so the
   // UI can tell an approved action from one that ran with no gate available.

@@ -1,5 +1,6 @@
 import type { BranchInfo, TagInfo } from "./types";
 import { formatTimestamp, type TimestampStyle } from "../ui/timestampStyle";
+import { plural } from "../format";
 
 /**
  * Rich hover text for the branch tree.
@@ -64,5 +65,20 @@ export function tagTooltip(tag: TagInfo): string {
   const message = tag.message?.trim();
   if (message) lines.push(message);
   if (tag.commit_id) lines.push(tag.commit_id.slice(0, 12));
+
+  // Only a tag that was actually compared gets a verdict. Without a base the
+  // counts are zeros meaning "not asked", and a tag holding unmerged work is
+  // on no branch at all — so this line is the only place the sidebar can say
+  // where it stands. Wording matches branchHealth's "merged" case.
+  const base = tag.compared_to?.trim();
+  if (base) {
+    if (tag.commits_ahead_of_base > 0) {
+      const behind =
+        tag.commits_behind_base > 0 ? `, ${plural(tag.commits_behind_base, "commit")} behind` : "";
+      lines.push(`${plural(tag.commits_ahead_of_base, "commit")} not in ${base}${behind}`);
+    } else {
+      lines.push(`Every commit is already in ${base}.`);
+    }
+  }
   return lines.join("\n");
 }
