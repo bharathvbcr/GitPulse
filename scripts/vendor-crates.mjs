@@ -408,6 +408,11 @@ function walk(dir, prefix = "") {
   if (!existsSync(dir)) return [];
   const out = [];
   for (const entry of readdirSync(dir).sort()) {
+    // DevCouncil / agent local state must never be part of a vendored crate.
+    // It is gitignored (`logs/`, `.devcouncil/*`), so recording it in
+    // VENDOR.json makes CI report the path as missing while a dirty local
+    // tree looks clean.
+    if (entry === ".devcouncil" || entry === ".git" || entry === "target") continue;
     const full = path.join(dir, entry);
     const rel = prefix ? `${prefix}/${entry}` : entry;
     if (statSync(full).isDirectory()) out.push(...walk(full, rel));

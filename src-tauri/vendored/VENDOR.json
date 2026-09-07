@@ -101,7 +101,6 @@
       ],
       "files": {
         "Cargo.toml": "df538d84a011aa636298bf863d688b4de80a65dadf2b6aab6848299a72dac6a8",
-        "src/.devcouncil/logs/devcouncil.log": "38649082a96e96e5fcb020ac37d5a3197cd711dc03eb97c0eb8a9a6083b863ca",
         "src/clones.rs": "80fcfe9b880b13b1016f434cb14e6a16ed949751987945119051f3fb6128dff4",
         "src/clustering.rs": "a154f73f80f7b95838207aeaf4f3a903a473bb90cf2330ce0013e53a79b13b6c",
         "src/dead_clusters.rs": "02f9fb7ccca406602ca082e7dce6d6f08b36cbe1965e6d00d336b6594ff75bfd",
@@ -176,7 +175,6 @@
       "files": {
         "Cargo.toml": "32cfab53c343b143ce39b456eeca2c959ad665c285ba8c082bc355bcc0434e3d",
         "build.rs": "2dc890341f53d5a38fae8a64d35f37edda19e3d61d23e27fac5ff266b3587a92",
-        "src/.devcouncil/logs/devcouncil.log": "929f7601bf99917657e04e84aee0b81568ad9b35c4fff3c377cb76c9d163c3c8",
         "src/cache.rs": "12616974d9baed316102a6dc6fbeb60f57e2a8880e5a51afd3e9f532f726316a",
         "src/clonesig.rs": "11afa842f06228636d7cc0271e83925347108ed44a8c70502dfb480e47a0ea43",
         "src/embedded.rs": "9a37abb2a6bd8a3cf5f22ce8eb6174d53c2e38bc6b19b0a7821a287f92bb2edb",
@@ -314,7 +312,6 @@
       ],
       "files": {
         "Cargo.toml": "6dea8b9dcd72d2ea7c23942a3ad1f8f8d5c027c6e8c40f9dbf2aa4b1a02f1eae",
-        "src/.devcouncil/logs/devcouncil.log": "003816edc9d5dc0bbed39cc71649ebfcf8943de9c563cc56f394f21a5accf712",
         "src/builtins.rs": "de63c281b6949e5f45d73672ed7aa68c8f3b24ab531ffdf30253d8c21af25b90",
         "src/importpath.rs": "27d476e5a9c2b0a2dc75b26ff875e0ed9087038b798997abc009a0ae8e604b16",
         "src/lib.rs": "ad28406823b9fef01b30e881780561ae5557c9dc4a6315a71e97d9a7aaccd183",
