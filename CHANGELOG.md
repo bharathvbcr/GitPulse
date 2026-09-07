@@ -11,16 +11,28 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-09-07
+
 ### Added
 
-- **In-app install / update for `devmap` and `manvi`.** Settings → Agents lists both
-  CLIs with the path that answered (or an honest missing/broken-override reason), and
-  Install / Update runs the documented command against a sibling checkout
-  (`cargo install --path …/devmap-cli --locked --force`, `go -C …/manvi install ./cmd/manvi`).
-  Code → Map offers the same for `devmap` when status is unavailable; the MANVI harness
-  pane offers it when the sidecar is not installed. Progress is cancellable; broken
-  `GITPULSE_*_BIN` / `GITPULSE_*_ROOT` values are refused rather than searched past.
-  Override source roots with `GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_MANVI_ROOT`.
+- **Optional Manvi / DevMap install ladder.** Settings → Agents, Code → Map, the MANVI
+  harness pane, and a resumable **Setup wizard** can install or update `devmap` and
+  `manvi` without treating them as required. Resolution order: configured binary →
+  `PATH` / `~/.cargo/bin` → checksum-verified GitHub release asset → remote
+  install script → local source (`cargo install --path …/devmap-cli --locked --force`,
+  `go -C …/manvi install ./cmd/manvi`). Progress is cancellable. Broken
+  `GITPULSE_*_BIN` / `GITPULSE_*_ROOT` overrides are refused rather than searched past;
+  clone missing checkouts via onboarding. Override roots with
+  `GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_MANVI_ROOT`.
+
+- **`devmap doctor --json` verify on status.** Tool status prefers the doctor JSON
+  contract (`expected_schema_version`, code-graph schema) over scraping `--version`
+  prose, so schema drift is named instead of a silent mismatch with the vendored store.
+
+- **Capability gating when optional tools are absent.** Map / harness UI degrades to
+  explicit “not installed” empty states and CTAs instead of empty panels that look like
+  “nothing found”. Wizard and palette entry: “Set up optional tools (devmap / manvi)”.
+
 
 ### Changed
 
@@ -100,7 +112,6 @@ before that tag is pushed.
 - Schema mismatch and missing/`devmap` binary failures are named; they are not empty "all clear" panels.
 - Affected-tests scoping that cannot prove coverage runs the full suite and says why.
 
-## [0.0.7] - 2026-09-06
 
 ### Added
 
