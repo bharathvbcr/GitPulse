@@ -576,7 +576,6 @@ pub fn preview_many(
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -592,9 +591,13 @@ mod tests {
     fn write_fake_devmap(dir: &Path, script: &str) -> PathBuf {
         let path = dir.join("devmap");
         fs::write(&path, script).expect("write fake");
-        let mut perms = fs::metadata(&path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).expect("chmod");
+        }
         path
     }
 
