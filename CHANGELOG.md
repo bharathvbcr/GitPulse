@@ -11,7 +11,17 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-## [0.0.7] - 2026-09-07
+## [0.0.8] - 2026-09-07
+
+### Fixed
+
+- **Code → Map no longer pane-crashes on duplicate dead-symbol ids.** Real
+  `repo_map.json` files can list the same `dead_symbol_candidates` entry more
+  than once; Svelte 5's keyed `{#each}` then threw `each_key_duplicate` and the
+  Map pane's error boundary reported a pane-crash (six times in diagnostics on
+  open). Dead / unwired / unreachable lists are deduped before render, and
+  keyed lists across Map, Work, stacks, harness, and the setup wizard use
+  index-suffixed keys so a duplicate payload cannot take the pane down again.
 
 ### Added
 
@@ -32,7 +42,6 @@ before that tag is pushed.
 - **Capability gating when optional tools are absent.** Map / harness UI degrades to
   explicit “not installed” empty states and CTAs instead of empty panels that look like
   “nothing found”. Wizard and palette entry: “Set up optional tools (devmap / manvi)”.
-
 
 ### Changed
 
@@ -55,6 +64,12 @@ before that tag is pushed.
   `npm run typecheck` → `tsgo -p tsconfig.node.json --noEmit` via
   `@typescript/native-preview@7.0.0-dev.20260707.2`. App `.svelte` typing
   remains on svelte-check until it accepts TypeScript 7 / tsgo.
+
+### Note
+
+- **v0.0.7 was tagged then withdrawn** after the Map pane-crash above was found in
+  the local build. It was never published as a GitHub Release; this cut is the
+  first ship of that work.
 
 ### Added
 
@@ -228,6 +243,10 @@ before that tag is pushed.
   ask something else. The regression is now asserted where the host cannot reach it (the directory
   is in `gui_launch_fallback_dirs`) plus one uniquely-named probe proving resolution walks that far.
   Neither production path changed; the fallback ordering is deliberate and still stands.
+
+## [0.0.7] - 2026-09-07
+
+Withdrawn before publish (Map pane-crash). See [0.0.8].
 
 ## [0.0.6] - 2026-09-06
 
@@ -774,7 +793,8 @@ before that tag is pushed.
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
 [0.0.7]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...v0.0.5

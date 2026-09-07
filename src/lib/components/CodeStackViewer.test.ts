@@ -102,7 +102,9 @@ describe("CodeStackViewer load correctness", () => {
   });
 
   it("keys each stack row", () => {
-    expect(source).toContain("{#each rows as row (row.node.branch_name)}");
+    // Index-suffixed: branch_name alone is not unique across stacked rows that
+    // share a name after a restack / rename collision.
+    expect(source).toContain("{#each rows as row, i (`${i}:${row.node.branch_name}`)}");
   });
 });
 

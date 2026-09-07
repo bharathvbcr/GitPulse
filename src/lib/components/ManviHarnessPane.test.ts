@@ -135,7 +135,11 @@ describe("ManviHarnessPane capability truth", () => {
   });
 
   it("keys journal rows by their repository-aware durable identity", () => {
-    expect(source).toContain("{#each recentActions as action (action.identity)}");
+    // Index-suffixed: identity can repeat when the same journal entry is
+    // projected twice across reconnects — Svelte 5 rejects duplicate keys.
+    expect(source).toContain(
+      "{#each recentActions as action, i (`${action.identity}#${i}`)}",
+    );
   });
 
   it("rejects a stale A grant response after switching to B", () => {

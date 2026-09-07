@@ -588,17 +588,43 @@ mod tests {
         dir
     }
 
-    fn write_fake_devmap(dir: &Path, script: &str) -> PathBuf {
-        let path = dir.join("devmap");
-        fs::write(&path, script).expect("write fake");
+    /// A host-native fake `devmap`. A `#!/bin/sh` script is not a Win32
+    /// application (os error 193); Windows gets a `.cmd` that answers the same
+    /// preview JSON without reading stdin.
+    fn write_fake_devmap(dir: &Path) -> PathBuf {
         #[cfg(unix)]
         {
+            let path = dir.join("devmap");
+            let script = r#"#!/bin/sh
+if [ "$1" = "preview" ]; then
+  cat >/dev/null
+  printf '%s\n' '{"file_path":"src/lib.rs","parse_status":"Clean","delta_available":true,"file_is_indexed":true,"compared_against":"disk","symbols":[],"bodies_not_compared":0,"ambiguous_callers":0,"broken_callers":{"items":[],"shown":0,"hidden":0,"total":0,"truncated":false,"tokens_used":0,"resolution":{"Available":null}}}'
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 2
+"#;
+            fs::write(&path, script).expect("write fake");
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&path).expect("meta").permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&path, perms).expect("chmod");
+            path
         }
-        path
+        #[cfg(windows)]
+        {
+            let path = dir.join("devmap.cmd");
+            let script = r#"@echo off
+if /I "%~1"=="preview" (
+  echo {"file_path":"src/lib.rs","parse_status":"Clean","delta_available":true,"file_is_indexed":true,"compared_against":"disk","symbols":[],"bodies_not_compared":0,"ambiguous_callers":0,"broken_callers":{"items":[],"shown":0,"hidden":0,"total":0,"truncated":false,"tokens_used":0,"resolution":{"Available":null}}}
+  exit /b 0
+)
+echo unexpected: %* 1>&2
+exit /b 2
+"#;
+            fs::write(&path, script).expect("write fake");
+            path
+        }
     }
 
     #[test]
@@ -618,16 +644,7 @@ mod tests {
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
         let bin_dir = tempfile::TempDir::new().expect("bindir");
-        let script = r#"#!/bin/sh
-if [ "$1" = "preview" ]; then
-  cat >/dev/null
-  printf '%s\n' '{"file_path":"src/lib.rs","parse_status":"Clean","delta_available":true,"file_is_indexed":true,"compared_against":"disk","symbols":[],"bodies_not_compared":0,"ambiguous_callers":0,"broken_callers":{"items":[],"shown":0,"hidden":0,"total":0,"truncated":false,"tokens_used":0,"resolution":{"Available":null}}}'
-  exit 0
-fi
-echo "unexpected: $*" >&2
-exit 2
-"#;
-        let bin = write_fake_devmap(bin_dir.path(), script);
+        let bin = write_fake_devmap(bin_dir.path());
         set_test_binary(Some(bin.to_string_lossy().into_owned()));
         let result = preview(
             &repo.path().to_string_lossy(),

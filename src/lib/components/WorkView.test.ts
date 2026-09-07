@@ -80,7 +80,9 @@ describe("WorkView", () => {
     // Keying on task id collapsed a repository with no task store into a
     // single row labelled "Not bound to a task". Rows are keyed on `key`,
     // which is the worktree path when there is no task model.
-    expect(source).toContain("as row (row.key");
+    // Prefer row.key; fall back to an index-suffixed unbound sentinel so two
+    // unbound rows cannot collide under Svelte 5's each_key_duplicate.
+    expect(source).toContain("as row, i (row.key || `__unbound:${i}`)");
     expect(source).not.toContain("as row (row.taskId");
   });
 
