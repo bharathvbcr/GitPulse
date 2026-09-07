@@ -290,7 +290,7 @@
         {/if}
 
         <!-- Quick actions -->
-        <div class="flex gap-1 pt-1.5 border-t border-border/60">
+        <div class="flex gap-1 pt-1.5 mt-2">
           <button
             type="button"
             class="gp-icon-btn !p-1 hover:text-accent disabled:cursor-not-allowed"

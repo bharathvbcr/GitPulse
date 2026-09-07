@@ -50,7 +50,7 @@
 
 {#if notices.length > 0}
   <div
-    class="shrink-0 border-b border-border bg-surface/60 px-3 py-1 text-[11px] text-textMuted"
+    class="shrink-0 border-b border-border gp-section-edge bg-surface/60 px-3 py-1 text-[11px] text-textMuted"
     data-testid="graph-notices"
   >
     <div class="flex items-center gap-1.5">

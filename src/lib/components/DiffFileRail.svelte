@@ -227,7 +227,7 @@
 >
   <!-- Which change: uncommitted work, or one of the recent commits. Folded by
        default; the file list below is what gets used every few seconds. -->
-  <div class="flex items-center gap-1.5 border-b border-border/60 px-2 py-1.5">
+  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2 py-1.5">
     <button
       type="button"
       class="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-surfaceHover"
@@ -315,7 +315,7 @@
     </div>
   {/if}
 
-  <div class="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1.5">
+  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2.5 py-1.5">
     <FileCode size={12} class="shrink-0 text-accent" />
     <span class="text-[11px] font-semibold text-textPrimary">
       {rail.source === "commit" ? "Commit files" : "Changed files"}
@@ -345,7 +345,7 @@
     </div>
   </div>
 
-  <div class="flex items-center gap-1 border-b border-border/60 px-2 py-1">
+  <div class="flex items-center gap-1 border-b border-border/60 gp-section-edge px-2 py-1">
     <Filter size={11} class="shrink-0 text-textMuted" />
     <input
       bind:value={query}

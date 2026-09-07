@@ -73,7 +73,7 @@
       in:scale={cardScale()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 flex items-center justify-between">
+      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between">
         <span class="text-sm font-semibold text-textPrimary">{options.title}</span>
       </div>
 

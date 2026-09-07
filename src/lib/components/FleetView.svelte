@@ -561,7 +561,7 @@
   onkeydown={onGridKeydown}
 >
   <!-- Header band: the one sentence, then the totals. -->
-  <header class="shrink-0 border-b border-border px-4 py-3 flex flex-col gap-3">
+  <header class="shrink-0 border-b border-border gp-section-edge px-4 py-3 flex flex-col gap-3">
     <div class="flex items-start gap-3">
       <div class="flex items-center gap-2 min-w-0 flex-1">
         <LayoutGrid size={16} class="text-accent shrink-0" />
@@ -628,7 +628,7 @@
   />
 
   <!-- Toolbar: filter, search, and the four scans that cost something. -->
-  <div class="shrink-0 border-b border-border px-4 py-2 flex flex-wrap items-center gap-2">
+  <div class="shrink-0 border-b border-border gp-section-edge px-4 py-2 flex flex-wrap items-center gap-2">
     <div class="flex items-center gap-1" role="group" aria-label="Filter repositories">
       <button
         type="button"
@@ -718,7 +718,7 @@
         <ArrowDownToLine size={11} />
         <span>Pull all</span>
       </button>
-      <span class="w-px h-4 bg-border" aria-hidden="true"></span>
+      <div class="h-3.5 w-1 rounded-full bg-border/50" aria-hidden="true"></div>
     {/if}
 
     <!-- Columns and density. A grid of eleven columns is not the same grid for

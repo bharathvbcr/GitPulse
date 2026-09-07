@@ -56,7 +56,7 @@ describe("FileTreePanel", () => {
   it("maps staged files to unstage and unstaged files to stage", () => {
     const menuStart = source.indexOf("{#if status.is_staged}");
     const menuEnd = source.indexOf(
-      '<div class="my-1 border-t border-border/60"></div>',
+      '<div class="gp-menu-sep" role="separator"></div>',
       menuStart,
     );
     const statusMenu = source.slice(menuStart, menuEnd);

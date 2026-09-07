@@ -551,7 +551,7 @@
     and Left/Right/Home/End move between them, which is what `role="tab"`
     already promised a keyboard user.
   -->
-  <div class="flex items-center px-1.5 bg-surface/90 border-b border-border/70 shrink-0 h-9 gap-1.5">
+  <div class="flex items-center px-1.5 bg-surface/90 border-b border-border/70 gp-section-edge shrink-0 h-9 gap-1.5">
     <button
       type="button"
       onclick={() => toggleSidePane("explorer")}
@@ -567,7 +567,7 @@
       {/if}
     </button>
 
-    <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
+    <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
 
     {#if openTabs.length === 0}
       <span class="text-xs text-textMuted/60 italic pl-1 flex-1">No open files</span>
@@ -659,7 +659,7 @@
         >
           <XCircle size={13} />
         </button>
-        <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
+        <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
       {/if}
 
       <button
@@ -686,7 +686,7 @@
       question a breadcrumb exists to answer — "where is this?" — and the
       answer used to require scrolling the tree by hand.
     -->
-    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 border-b border-border/50 shrink-0 text-xs">
+    <div class="flex items-center justify-between gap-2 px-2.5 py-1 bg-surface/40 border-b border-border/50 gp-section-edge shrink-0 text-xs">
       <nav
         class="flex items-center gap-0.5 text-[11px] min-w-0 flex-1 text-textMuted font-mono"
         aria-label="Path to the open file"
@@ -739,7 +739,7 @@
           <ExternalLink size={12} />
         </button>
 
-        <div class="h-4 w-px bg-border/70 shrink-0" aria-hidden="true"></div>
+        <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
 
         <button
           type="button"

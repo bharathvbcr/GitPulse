@@ -50,4 +50,12 @@ describe("LanguageSegment", () => {
     expect(source).toContain('event.key === "Escape"');
     expect(source).toContain('aria-expanded={open}');
   });
+
+  it("has a rescan button that force-refreshes the LOC metric", () => {
+    // The popover must let the user trigger an explicit language rescan.
+    // Force bypasses the cost floor: an explicit click must always do something.
+    expect(source).toContain("data-language-rescan");
+    expect(source).toContain('locMetric.refresh(repoPath, { force: true })');
+    expect(source).toContain("RefreshCw");
+  });
 });

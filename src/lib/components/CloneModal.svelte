@@ -79,7 +79,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-md gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 flex items-center justify-between">
+      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between">
         <h2 id="clone-modal-title" class="flex items-center gap-2 text-sm font-semibold text-textPrimary">
           <Download size={16} class="text-accent" />
           <span>Clone Git Repository</span>
@@ -125,7 +125,7 @@
         </div>
       </div>
 
-      <div class="p-4 border-t border-border/60 bg-surfaceHover/30 flex justify-end gap-2">
+      <div class="p-4 border-t border-border/60 gp-section-edge bg-surfaceHover/30 flex justify-end gap-2">
         <button onclick={requestClose} disabled={isCloning} class="gp-btn disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
         <button
           onclick={handleClone}

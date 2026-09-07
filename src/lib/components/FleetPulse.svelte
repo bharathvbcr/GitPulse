@@ -83,7 +83,7 @@
 </script>
 
 <section
-  class="shrink-0 border-b border-border px-4 py-2.5"
+  class="shrink-0 border-b border-border gp-section-edge px-4 py-2.5"
   aria-label="Fleet Pulse"
   data-testid="fleet-pulse"
 >

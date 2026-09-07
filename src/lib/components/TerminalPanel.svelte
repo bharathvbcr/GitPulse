@@ -292,7 +292,7 @@
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
   <!-- Header Bar -->
-  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between shrink-0">
+  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
     <div class="flex items-center gap-2 min-w-0">
       <Terminal size={16} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
@@ -352,7 +352,7 @@
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-8 border-b border-border/60 bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-8 border-b border-border/60 gp-section-edge bg-surface/40"
       class:hidden={mode !== "shell"}
     >
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
@@ -488,7 +488,7 @@
       {#each executions as entry (entry.id)}
         <div class="rounded-xl border border-border/70 bg-surface/80 shadow-sm overflow-hidden font-mono">
           <!-- Command line header -->
-          <div class="px-3 py-1.5 bg-surface border-b border-border/50 flex items-center justify-between gap-2 text-xs">
+          <div class="px-3 py-1.5 bg-surface border-b border-border/50 gp-section-edge flex items-center justify-between gap-2 text-xs">
             <div class="flex items-center gap-2 min-w-0">
               <span class="text-accent font-bold">$</span>
               <span class="font-semibold text-textPrimary truncate">{entry.command}</span>
@@ -589,7 +589,7 @@
   </div>
 
   <!-- Input Bar -->
-  <div class="p-3 border-t border-border bg-surface shrink-0 space-y-2">
+  <div class="p-3 border-t border-border gp-section-edge bg-surface shrink-0 space-y-2">
     {#if validationError}
       <div class="px-3 py-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-center gap-1.5">
         <AlertCircle size={13} class="shrink-0" />

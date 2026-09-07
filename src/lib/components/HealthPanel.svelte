@@ -667,7 +667,7 @@
     {/if}
   {/snippet}
 
-  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between shrink-0">
+  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
     <div class="flex items-center gap-2 min-w-0">
       <ShieldAlert size={16} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Health</span>

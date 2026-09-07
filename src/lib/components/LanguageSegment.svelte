@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { RefreshCw } from "lucide-svelte";
   import { repoStore } from "../stores/repoStore";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { portal } from "../dom/portal";
@@ -44,6 +45,7 @@
 
   let open = $state(false);
   let anchor = $state<{ x: number; bottom: number } | null>(null);
+  let refreshing = $state(false);
 
   $effect(() => {
     const path = $repoStore.currentPath;
@@ -72,6 +74,17 @@
       );
     }
     close();
+  }
+
+  async function rescan() {
+    const repoPath = $repoStore.currentPath;
+    if (!repoPath || refreshing) return;
+    refreshing = true;
+    try {
+      await locMetric.refresh(repoPath, { force: true });
+    } finally {
+      refreshing = false;
+    }
   }
 
   function close() {
@@ -188,5 +201,17 @@
         </button>
       {/each}
     </div>
+
+    <button
+      type="button"
+      data-language-rescan
+      onclick={rescan}
+      disabled={refreshing}
+      class="flex items-center justify-center gap-1.5 w-full mt-2 pt-2 border-t border-border/50 text-textMuted hover:text-textPrimary transition-colors disabled:opacity-50"
+      title="Rescan language percentages"
+    >
+      <RefreshCw size={11} class={refreshing ? "animate-spin" : ""} />
+      <span>{refreshing ? "Scanning…" : "Rescan"}</span>
+    </button>
   </div>
 {/if}

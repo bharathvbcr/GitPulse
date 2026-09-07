@@ -88,7 +88,7 @@
   <!-- Image Viewer Surface -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-none">
     <!-- Image Top Bar Controls -->
-    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 bg-surface/70 shrink-0">
+    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0">
       <div class="flex items-center gap-2">
         <ImageIcon size={13} class="text-teal-400" />
         <span class="font-medium text-textPrimary">{blob.mime}</span>
@@ -161,7 +161,7 @@
 {:else if blob.is_binary}
   <!-- Binary Hex View & File Inspector -->
   <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text">
-    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 bg-surface/70 shrink-0">
+    <div class="flex items-center justify-between px-3 py-2 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0">
       <div class="flex items-center gap-2">
         <Binary size={13} class="text-amber-400" />
         <span class="font-semibold text-textPrimary">Binary File</span>

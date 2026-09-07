@@ -216,7 +216,7 @@
       <div
         use:portal
         data-workspace-wip
-        class="fixed right-3 top-20 w-80 gp-card gp-pop rounded-xl p-3 text-[11px]"
+        class="fixed right-3 top-20 w-80 gp-pop shadow-float rounded-xl p-3 text-[11px] bg-surface/95 border border-border/80"
         style="z-index: {LAYERS.MENU}"
         role="dialog"
         aria-label="Workspace status"

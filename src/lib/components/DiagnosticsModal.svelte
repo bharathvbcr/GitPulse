@@ -260,7 +260,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-xl max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 flex items-center justify-between gap-3">
+      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between gap-3">
         <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0">
           <Activity size={16} class="text-accent" />
           <span>Diagnostics</span>
@@ -388,7 +388,7 @@
         {/each}
       </div>
 
-      <div class="p-3 border-t border-border/60 bg-surfaceHover/30 shrink-0 space-y-2">
+      <div class="p-3 border-t border-border/60 gp-section-edge bg-surfaceHover/30 shrink-0 space-y-2">
         <p class="text-[10px] leading-relaxed text-textMuted">
           Review local paths and command output before sharing. Copy only places the report on your
           clipboard; it does not upload or delete any logs.

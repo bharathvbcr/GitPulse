@@ -337,7 +337,7 @@
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
-    <div class="shrink-0 border-t border-border/60 bg-surface/60 flex items-center gap-2 px-4 h-8">
+    <div class="shrink-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
         <span class="text-textMuted text-[11px]">Starting {launcherLabel(launcher)}…</span>

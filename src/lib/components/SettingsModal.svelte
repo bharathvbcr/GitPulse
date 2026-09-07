@@ -369,7 +369,7 @@
       out:scale={cardScaleOut()}
       class="w-full max-w-3xl h-[34rem] max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
-      <div class="p-4 border-b border-border/60 flex items-center justify-between gap-3 shrink-0">
+      <div class="p-4 border-b border-border/60 gp-section-edge flex items-center justify-between gap-3 shrink-0">
         <div
           id="settings-modal-title"
           class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0"
@@ -633,7 +633,8 @@
                     />
                   </div>
 
-                  <div class="space-y-0.5 pt-1 border-t border-border/50">
+                  <div class="gp-separator" aria-hidden="true"></div>
+                  <div class="space-y-0.5 pt-1">
                     <div data-setting="header-labels" hidden={!shown("header-labels")}>
                       <SettingToggle
                         label="Header button labels"
@@ -706,7 +707,8 @@
                     {/each}
                   </div>
 
-                  <div class="flex items-center justify-between gap-3 pt-1 border-t border-border/50">
+                  <div class="gp-separator" aria-hidden="true"></div>
+                  <div class="flex items-center justify-between gap-3 pt-1">
                     <span class="text-textMuted text-[10px]">
                       {hiddenViews.length === 0
                         ? "Every view is listed in the header."
@@ -761,8 +763,9 @@
                   <div
                     data-setting="graph-avatars"
                     hidden={!shown("graph-avatars")}
-                    class="pt-1 border-t border-border/50"
+                    class="pt-1"
                   >
+                    <div class="gp-separator" aria-hidden="true"></div>
                     <SettingToggle
                       label="Author avatars"
                       description="Initial badges beside the branch lanes."
@@ -823,8 +826,9 @@
                   <div
                     data-setting="tab-width"
                     hidden={!shown("tab-width")}
-                    class="pt-1 border-t border-border/50"
+                    class="pt-1"
                   >
+                    <div class="gp-separator" aria-hidden="true"></div>
                     <div class="text-textMuted text-[10px] mb-1.5">Tab width</div>
                     <SettingSegment
                       ariaLabel="Tab width"
@@ -984,7 +988,7 @@
       </div>
 
       <div
-        class="p-4 border-t border-border/60 bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
+        class="p-4 border-t border-border/60 gp-section-edge bg-surfaceHover/30 flex items-center justify-between gap-2 shrink-0"
       >
         <button
           type="button"

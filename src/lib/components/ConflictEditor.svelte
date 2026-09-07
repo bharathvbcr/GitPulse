@@ -390,7 +390,7 @@
     />
   {:else}
     <!-- Top Selector Bar -->
-    <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between">
+    <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between">
       <div class="flex items-center gap-3">
         <ShieldAlert size={16} class="text-amber-400" />
         <select
@@ -535,7 +535,7 @@
     </div>
 
     <!-- Resolved Output Preview -->
-    <div class="h-40 border-t border-border/60 bg-surface p-3 flex flex-col">
+    <div class="h-40 border-t border-border/60 gp-section-edge bg-surface p-3 flex flex-col">
       <span class="text-[10px] font-semibold uppercase text-textMuted mb-1">Resolved Preview</span>
       {#if previewError}
         <div class="mb-1 px-2 py-1 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-[11px] flex items-center gap-1.5">

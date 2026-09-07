@@ -778,7 +778,7 @@
     filter: `filtersOpen` is the toggle OR'd with "a filter is actually
     applied", so a narrowed listing always shows what narrowed it.
   -->
-  <div class="flex items-center justify-between gap-1 px-2.5 h-9 shrink-0 border-b border-border/60 bg-surface/80">
+  <div class="flex items-center justify-between gap-1 px-2.5 h-9 shrink-0 border-b border-border/60 gp-section-edge bg-surface/80">
     <div class="flex items-baseline gap-1.5 min-w-0">
       <span class="text-[11px] font-bold uppercase tracking-wider text-textMuted">Explorer</span>
       <span
@@ -834,7 +834,7 @@
     </div>
   </div>
 
-  <div class="px-2 pt-2 pb-1.5 shrink-0 border-b border-border/60 bg-surface/30 space-y-1.5">
+  <div class="px-2 pt-2 pb-1.5 shrink-0 border-b border-border/60 gp-section-edge bg-surface/30 space-y-1.5">
     <div class="flex items-center gap-1.5 bg-background/90 border border-border/80 rounded-full pl-2.5 pr-1.5 py-1 focus-within:border-accent/70 transition-colors">
       <Search size={12} class="text-textMuted shrink-0" />
       <input
@@ -1165,7 +1165,7 @@
         {/if}
       {/if}
 
-      <div class="my-1 border-t border-border/60"></div>
+      <div class="gp-menu-sep" role="separator"></div>
 
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('history', 'diff'); closeContextMenu(); }}>
         <Layers size={13} class="text-cyan-400" />
@@ -1177,7 +1177,7 @@
       </button>
     {/if}
 
-    <div class="my-1 border-t border-border/60"></div>
+    <div class="gp-menu-sep" role="separator"></div>
 
     <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(row.path)}>
       <Copy size={13} class="text-textMuted" />

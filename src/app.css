@@ -259,8 +259,17 @@ html.dark {
   .gp-btn,
   .gp-btn-primary,
   .gp-btn-success,
-  .gp-field {
+  .gp-field,
+  .gp-separator,
+  .gp-menu-sep {
     border: 1px solid CanvasText;
+  }
+
+  /* Gradient-fade edges vanish when the system owns the palette; a solid
+     CanvasText border is the floor so the panel break still reads. */
+  .gp-section-edge {
+    border-image: none;
+    border-color: CanvasText;
   }
 
   .gp-seg-btn[data-active="true"] {
@@ -395,6 +404,48 @@ html.dark {
   }
   .gp-menu-item:hover {
     @apply bg-surfaceHover;
+  }
+
+  /* Soft centered pill. A bare `border-t` ran the full width of a section
+     and read as a hard rule; forty percent wide, two pixels tall, and faded,
+     it still marks a break without boxing the content. */
+  .gp-separator {
+    display: block;
+    width: 40%;
+    height: 2px;
+    margin-block: 0.5rem;
+    margin-inline: auto;
+    border-radius: 9999px;
+    background: rgb(var(--c-border) / 0.4);
+  }
+
+  /* The same pill, narrowed for a context menu. A full-width hairline in a
+     compact menu looked like a second border on the card; this stays inside
+     the padding. Vertical rhythm matches the old `my-1`. */
+  .gp-menu-sep {
+    display: block;
+    width: 80%;
+    height: 1px;
+    margin-block: 0.25rem;
+    margin-inline: auto;
+    border-radius: 9999px;
+    background: rgb(var(--c-border) / 0.4);
+  }
+
+  /* Panel header and footer edges. `border-t` / `border-b` still draw the
+     1px geometry; `border-image` fades the colour at the sides so the edge
+     does not read as a hard box. Pair this class with those utilities — it
+     is not a substitute for them. `border-image` ignores `border-radius`;
+     call sites inside overflow-clipped cards are rectangular already. */
+  .gp-section-edge {
+    border-image: linear-gradient(
+        to right,
+        transparent,
+        rgb(var(--c-border) / 0.5) 20%,
+        rgb(var(--c-border) / 0.5) 80%,
+        transparent
+      )
+      1;
   }
 
   /* Segmented control: a pill track with a raised active bubble. */

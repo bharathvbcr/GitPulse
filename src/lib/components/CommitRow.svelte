@@ -394,7 +394,7 @@
       <Copy size={12} class="text-textMuted" />
       <span>Copy Message</span>
     </button>
-    <div class="h-px bg-border/60 my-1"></div>
+    <div class="gp-menu-sep" role="separator"></div>
     <button
       role="menuitem"
       class="gp-menu-item"

@@ -529,7 +529,7 @@
       class="w-full max-w-lg gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
     >
       <h2 id="command-palette-title" class="sr-only">Command palette</h2>
-      <div class="p-3.5 border-b border-border/60 flex items-center gap-2.5 bg-surface">
+      <div class="p-3.5 border-b border-border/60 gp-section-edge flex items-center gap-2.5 bg-surface">
         <Search size={16} class="text-accent shrink-0" />
         <input
           bind:this={inputEl}
@@ -602,7 +602,7 @@
       </div>
 
       <!-- Footer Hints -->
-      <div class="px-3 py-1.5 bg-background/60 border-t border-border/60 flex items-center justify-between text-[10px] text-textMuted select-none">
+      <div class="px-3 py-1.5 bg-background/60 border-t border-border/60 gp-section-edge flex items-center justify-between text-[10px] text-textMuted select-none">
         <div class="flex items-center gap-3">
           <span><kbd class="gp-keycap font-mono text-[9px]">↑↓</kbd> Navigate</span>
           <span><kbd class="gp-keycap font-mono text-[9px]">↵</kbd> Select</span>

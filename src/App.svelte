@@ -707,7 +707,7 @@
   <!-- Top App Navigation Bar -->
   <svelte:boundary failed={paneFailed}>
     <header
-    class="gp-glass gp-titlebar bg-surface border-b border-border flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
+    class="gp-glass gp-titlebar bg-surface border-b border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
       ? 'h-12 pr-3'
       : 'h-10 px-3'}"
   >
@@ -721,7 +721,7 @@
       <Logo size={19} variant="badge" />
       <span class="text-textPrimary">GitPulse</span>
     </div>
-    <div class="h-4 w-px bg-border mx-1 shrink-0"></div>
+    <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
 
     <div class="gp-header-scroll min-w-0 flex-1 h-full">
       <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
@@ -748,7 +748,7 @@
         </button>
 
         {#if $repoStore.currentPath}
-          <div class="h-4 w-px bg-border mx-1 shrink-0"></div>
+          <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
           <ViewTabBar {conflictedCount} />
         {/if}
         <div class="flex-1 min-w-4 h-full" data-tauri-drag-region></div>

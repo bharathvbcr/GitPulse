@@ -150,7 +150,7 @@
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-mono select-none overflow-hidden">
   <!-- Toolbar -->
-  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
+  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <button
         type="button"

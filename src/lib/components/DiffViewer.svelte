@@ -970,7 +970,7 @@
 <div class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
   <!-- Identity: what is on screen, taken from the diff itself. -->
   <div
-    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surface/60 px-3 py-1.5 font-sans"
+    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/60 px-3 py-1.5 font-sans"
   >
     {#if languagePath}
       <LanguageLogo filePath={languagePath} size={15} class="shrink-0" />
@@ -1071,7 +1071,7 @@
   <!-- Controls: how the diff is read. Separated from identity so neither row
        has to shed labels at a narrow width. -->
   <div
-    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surface/30 px-3 py-1 font-sans"
+    class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/30 px-3 py-1 font-sans"
   >
     {#if !railOpen && hasRail}
       <button
@@ -1203,7 +1203,7 @@
 
   {#if searchOpen}
     <div
-      class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surface/50 px-3 py-1 font-sans"
+      class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/50 px-3 py-1 font-sans"
     >
       <Search size={13} class="shrink-0 text-textMuted" />
       <input
@@ -1448,7 +1448,7 @@
   <!-- Selection bar: only the action that applies to this side of the index. -->
   {#if isWorkingTreeFile && selectedLines.size > 0}
     <div
-      class="flex shrink-0 items-center justify-between border-t border-border/80 bg-surface p-2.5 font-sans text-xs shadow-lg"
+      class="flex shrink-0 items-center justify-between border-t border-border/80 gp-section-edge bg-surface p-2.5 font-sans text-xs shadow-lg"
     >
       <span class="font-mono text-[11px] text-textMuted">
         {selectedLines.size} line{selectedLines.size === 1 ? "" : "s"} selected

@@ -239,7 +239,7 @@
 </script>
 
 <div class="flex-1 flex flex-col min-h-0 bg-background overflow-y-auto">
-  <div class="px-6 py-4 border-b border-border/80 bg-surface/40 shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+  <div class="px-6 py-4 border-b border-border/80 gp-section-edge bg-surface/40 shrink-0 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
     <div class="flex items-center gap-3">
       <div class="w-9 h-9 rounded-xl bg-accent/10 border border-accent/25 flex items-center justify-center text-accent shadow-sm">
         <Activity size={18} />

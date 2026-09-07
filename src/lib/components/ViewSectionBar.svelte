@@ -55,7 +55,7 @@
 
 {#if sections.length > 1}
   <div
-    class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 bg-surface/40 select-none"
+    class="h-9 shrink-0 px-3 flex items-center gap-3 border-b border-border/60 gp-section-edge bg-surface/40 select-none"
   >
     <div
       bind:this={list}

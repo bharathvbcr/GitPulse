@@ -18,7 +18,7 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans select-none overflow-hidden">
-  <div class="px-3 py-1.5 border-b border-border/60 bg-surface/60 flex items-center justify-between">
+  <div class="px-3 py-1.5 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between">
     <div class="flex items-center gap-2 min-w-0">
       <Image size={15} class="text-accent shrink-0" />
       <span class="font-medium text-textPrimary truncate">{filePath}</span>

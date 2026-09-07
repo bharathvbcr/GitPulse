@@ -329,7 +329,7 @@
 </script>
 
 {#if $repoStore.openTabs.length > 0}
-  <div class="gp-glass gp-repo-tabs relative z-20 h-10 bg-surface/60 border-b border-border/60 flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
+  <div class="gp-glass gp-repo-tabs relative z-20 h-10 bg-surface/60 border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button
@@ -345,7 +345,7 @@
       <LayoutGrid size={12} />
       <span>Fleet</span>
     </button>
-    <div class="h-4 w-px bg-border/70 shrink-0"></div>
+    <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
     <div
       bind:this={scroller}
       class="flex-1 flex items-center gap-1 overflow-x-auto min-w-0 py-1"

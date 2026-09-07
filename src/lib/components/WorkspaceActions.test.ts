@@ -98,4 +98,16 @@ describe("the work-in-progress roll-up panel", () => {
       'class="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] transition-colors',
     );
   });
+
+  it("styles the work-in-progress dropdown as a floating popover with high-contrast, non-transparent surface", () => {
+    // The dropdown floats over content (code viewer, diffs, commit graph)
+    // without a scrim. If it lacks shadow-float, it completely misses the
+    // macOS float tier blur (backdrop-filter: none), rendering as 0px blur
+    // and 50% opacity. It must carry shadow-float to hook into float blur,
+    // and use dense, high-contrast surface styling (bg-surface/95) rather
+    // than thin transparent styling so underlying code doesn't show through.
+    expect(source).toMatch(/data-workspace-wip[\s\S]*?class="[^"]*\bshadow-float\b/);
+    expect(source).toMatch(/data-workspace-wip[\s\S]*?class="[^"]*\bbg-surface\/95\b/);
+    expect(source).not.toMatch(/data-workspace-wip[\s\S]*?class="[^"]*\bgp-card\b[^"]*"/);
+  });
 });

@@ -114,7 +114,7 @@
   <!-- Hidden, never unmounted: display:none pauses rendering, not the shell. -->
   <div
     bind:this={host}
-    class="shrink-0 flex flex-col border-t border-border bg-background"
+    class="shrink-0 flex flex-col border-t border-border gp-section-edge bg-background"
     class:hidden={!open}
     style="height: {height}px"
     data-terminal-dock
@@ -142,7 +142,7 @@
         : ''}"
     ></div>
 
-    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 border-b border-border/60 bg-surface/60 select-none">
+    <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/60 select-none">
       <SquareTerminal size={12} class="text-accent shrink-0" />
       <span class="text-[11px] font-medium text-textPrimary">Terminal</span>
       <div class="flex-1"></div>

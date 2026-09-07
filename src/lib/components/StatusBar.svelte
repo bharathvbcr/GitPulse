@@ -94,7 +94,7 @@
 {#if detail !== "hidden"}
 <footer
   title={forcedTip}
-  class="gp-glass h-6 shrink-0 bg-surface/95 border-t border-border/70 px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none gp-gpu z-20"
+  class="gp-glass h-6 shrink-0 bg-surface/95 border-t border-border/70 gp-section-edge px-3 flex items-center justify-between text-[11px] font-sans text-textMuted select-none gp-gpu z-20"
   role="status"
   aria-label="Repository Status Bar"
 >
@@ -162,7 +162,7 @@
     <!-- Ambient readouts below are what "Compact" drops: they say nothing is
          wrong, which is exactly the noise a decluttered bar should lose. -->
     {#if detail === "full"}
-      <span class="text-border">|</span>
+      <span class="inline-block h-2.5 w-0.5 rounded-full bg-border/50 align-middle" aria-hidden="true"></span>
     {/if}
 
     <!-- Working Tree Changes / Dirty Files -->

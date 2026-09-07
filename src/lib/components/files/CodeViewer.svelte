@@ -337,7 +337,7 @@
   aria-label="Code Viewer"
 >
   <!-- Top Editor Actions Bar -->
-  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 bg-surface/70 shrink-0 select-none">
+  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 gp-section-edge bg-surface/70 shrink-0 select-none">
     <!-- Left: File stats and Search button -->
     <div class="flex items-center gap-2 min-w-0">
       <span class="text-[11px] font-mono text-textMuted">{rawLines.length}{linesTruncated ? "+" : ""} lines</span>
@@ -407,7 +407,7 @@
         >+</button>
       </div>
 
-      <div class="h-3.5 w-px bg-border/80 mx-1"></div>
+      <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1" aria-hidden="true"></div>
 
       <!-- Edit & Save Controls -->
       {#if !isEditing}
@@ -462,7 +462,7 @@
 
   <!-- Search Bar Dropdown -->
   {#if isSearchOpen}
-    <div class="px-3 py-2 bg-surface border-b border-border/80 flex items-center justify-between gap-3 shrink-0 shadow-md select-none animate-in fade-in duration-100">
+    <div class="px-3 py-2 bg-surface border-b border-border/80 gp-section-edge flex items-center justify-between gap-3 shrink-0 shadow-md select-none animate-in fade-in duration-100">
       <div class="flex items-center gap-2 flex-1 max-w-md">
         <div class="flex items-center gap-1.5 bg-background border border-border rounded-full px-2.5 py-1 flex-1 focus-within:border-accent/70">
           <Search size={12} class="text-textMuted shrink-0" />
@@ -632,7 +632,7 @@
   </div>
 
   <!-- Bottom Status Bar -->
-  <div class="flex items-center justify-between px-3 py-1 bg-surface/90 border-t border-border/70 shrink-0 text-[10px] font-mono text-textMuted select-none">
+  <div class="flex items-center justify-between px-3 py-1 bg-surface/90 border-t border-border/70 gp-section-edge shrink-0 text-[10px] font-mono text-textMuted select-none">
     <div class="flex items-center gap-3">
       <span>Ln {selectedLine ?? 1}, Col 1</span>
       <span>•</span>

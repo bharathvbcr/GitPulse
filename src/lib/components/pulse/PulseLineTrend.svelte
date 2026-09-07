@@ -99,7 +99,8 @@
   </div>
 
   <!-- Footer Hover Info -->
-  <div class="text-[11px] text-textMuted pt-1 flex items-center justify-between border-t border-border/40 min-h-5">
+  <div class="gp-separator" aria-hidden="true"></div>
+  <div class="text-[11px] text-textMuted pt-1 flex items-center justify-between min-h-5">
     {#if hoveredBucket}
       <div>
         <span class="font-medium text-textPrimary">Week of {hoveredBucket.weekStart}</span>:

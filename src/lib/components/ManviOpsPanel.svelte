@@ -586,7 +586,8 @@
               <div class="flex items-center gap-2 py-5 text-textMuted"><CheckCircle2 size={15} class="text-green-400" /> No merged local branches need cleanup.</div>
             {/each}
           </div>
-          <div class="mt-3 flex items-center justify-between border-t border-border pt-3 text-textMuted">
+          <div class="gp-separator" aria-hidden="true"></div>
+          <div class="mt-3 flex items-center justify-between pt-3 text-textMuted">
             <span>{cleanup.protected_branches} protected · {cleanup.unmerged_branches} unmerged</span>
             <button class="gp-btn" onclick={cleanBranches} disabled={!cleanupInvariant || selectedBranches.length === 0 || busy !== null}>
               <Trash2 size={13} /> Delete {selectedBranches.length} selected
@@ -647,7 +648,8 @@
               <div class="mt-1 text-amber-400">Showing {tagPlan.candidates.length} of {tagPlan.deletable_count} deletable tags.</div>
             {/if}
           {/if}
-          <div class="mt-3 flex items-center justify-between border-t border-border pt-3 text-textMuted">
+          <div class="gp-separator" aria-hidden="true"></div>
+          <div class="mt-3 flex items-center justify-between pt-3 text-textMuted">
             <span>
               {#if tagPlan.uncompared_tags > 0}
                 <!-- Not folded into either bucket: these were never measured. -->
@@ -713,7 +715,8 @@
           </div>
           {#if github?.issues_truncated}<div class="mt-1 text-amber-400">Showing 50 issues; more open issues exist. This is not complete coverage.</div>{/if}
         {/if}
-        <div class="mt-3 space-y-2 border-t border-border pt-3">
+        <div class="gp-separator" aria-hidden="true"></div>
+        <div class="mt-3 space-y-2 pt-3">
           <input class="gp-input w-full" maxlength="256" placeholder="Issue title" bind:value={issueTitle} />
           <textarea class="gp-input min-h-20 w-full resize-y" maxlength="65536" placeholder="What happened, what you expected, and how to reproduce it" bind:value={issueBody}></textarea>
           <div class="flex gap-2"><input class="gp-input min-w-0 flex-1" placeholder="labels, comma-separated" bind:value={issueLabels} /><button class="gp-btn" onclick={reportIssue} disabled={!issueTitle.trim() || busy !== null}><Bug size={13} /> Report issue</button></div>
@@ -775,7 +778,8 @@
           <div class="mb-3 py-2 text-textMuted">No releases found on GitHub.</div>
         {/if}
 
-        <div class="space-y-2 border-t border-border pt-3">
+        <div class="gp-separator" aria-hidden="true"></div>
+        <div class="space-y-2 pt-3">
           <div class="text-xs font-semibold text-textPrimary">Publish new release tag</div>
           <input class="gp-input w-full font-mono" placeholder="v1.2.3" bind:value={releaseTag} />
           <input class="gp-input w-full" maxlength="4096" placeholder="Release message" bind:value={releaseMessage} />
@@ -785,7 +789,8 @@
           </button>
         </div>
         {#if (github?.workflow_runs?.length ?? 0) > 0}
-          <div class="mt-3 border-t border-border pt-3"><div class="mb-1 text-textMuted">Recent release/workflow activity</div>{#each github?.workflow_runs.slice(0, 3) ?? [] as run (run.id)}<button class="flex w-full items-center justify-between rounded px-1 py-1 text-left hover:bg-surfaceHover" onclick={() => openExternal(run.url)}><span class="truncate">{run.title || run.name}</span><span class="gp-pill">{runState(run)}</span></button>{/each}</div>
+          <div class="gp-separator" aria-hidden="true"></div>
+          <div class="mt-3 pt-3"><div class="mb-1 text-textMuted">Recent release/workflow activity</div>{#each github?.workflow_runs.slice(0, 3) ?? [] as run (run.id)}<button class="flex w-full items-center justify-between rounded px-1 py-1 text-left hover:bg-surfaceHover" onclick={() => openExternal(run.url)}><span class="truncate">{run.title || run.name}</span><span class="gp-pill">{runState(run)}</span></button>{/each}</div>
         {/if}
       </section>
     </div>

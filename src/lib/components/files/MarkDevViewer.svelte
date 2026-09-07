@@ -131,7 +131,7 @@
 
 <div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
   <!-- MarkDev Integrated Header Toolbar -->
-  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 bg-surface/80 shrink-0 select-none gap-2">
+  <div class="flex items-center justify-between px-3 py-1.5 border-b border-border/70 gp-section-edge bg-surface/80 shrink-0 select-none gap-2">
     <!-- Left: MarkDev Brand & Outline Toggle -->
     <div class="flex items-center gap-2 shrink-0">
       <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-border/70 shadow-sm">

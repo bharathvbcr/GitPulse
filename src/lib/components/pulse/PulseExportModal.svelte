@@ -75,7 +75,7 @@
       class="w-full max-w-4xl max-h-[calc(100vh-2rem)] min-h-0 bg-surface border border-border/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
     >
       <!-- Modal Header -->
-      <div class="flex items-center justify-between px-5 py-4 border-b border-border/50 shrink-0">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-border/50 gp-section-edge shrink-0">
         <div>
           <h2 id="export-modal-title" class="text-base font-bold text-textPrimary">Export Pulse Summary Card</h2>
           <p class="text-xs text-textMuted mt-0.5">
@@ -106,7 +106,7 @@
       </div>
 
       <!-- Actions Footer -->
-      <div class="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-t border-border/50 bg-surface shrink-0">
+      <div class="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-t border-border/50 gp-section-edge bg-surface shrink-0">
         <span class="text-xs text-textMuted">Standalone SVG • Zero external dependencies</span>
         <div class="flex items-center gap-2">
           <span class="sr-only" role="status" aria-live="polite">

@@ -40,7 +40,14 @@ before that tag is pushed.
   the tag listing the sidebar has already loaded, so the graph pays no extra command on a path that
   reruns on every repo switch, and a tag past the listing cap simply says nothing rather than implying
   its work has landed. `ManviOpsPanel` joins the runtime harness (`harness/stress.html?c=ManviOpsPanel`),
-  whose `cmd_list_tags` fixture was still the retired bare-array shape that `parseTagList` rejects.
+- **Language breakdown now supports on-demand rescan.** The language segment dropdown now provides a manual
+  rescan button (`locMetric.refresh` with `force: true`) with an active spin indicator, allowing instant
+  recalculation of code percentages after checking out branches or generating code without requiring a full
+  repository switch.
+- **Soft pill dividers and high-contrast section borders unify panel styling.** Replaced harsh full-width hairline
+  borders with centered pill dividers (`.gp-separator`, `.gp-menu-sep`) and solid high-contrast borders
+  (`.gp-section-edge`) across modals, panels, and dropdowns to improve visual hierarchy and contrast in both
+  dark mode and forced-colors accessibility modes.
 
 ### Fixed
 
@@ -70,13 +77,17 @@ before that tag is pushed.
   file name, which is the only part that distinguishes them. The name now comes first with the
   directory dimmed after it, so truncation eats the half that repeats, and the full path is on the
   row's tooltip — the same shape `DiffFileRail` already used.
-- **The work-in-progress indicator beside Fetch all rendered as bare transparent text with no pill container.**
+- **The work-in-progress indicator and its details dropdown rendered too transparently over underlying content.**
   Sitting on the translucent repository tab bar, the button carried no border, no background fill, and
   only a 10% amber hover state, making it read as ghosted or see-through over the glass chrome. It now
   wears the shared `.gp-btn` pill geometry in both states — an outlined surface pill with subtle emerald
   indicator when all clear, and a defined, tinted amber pill (`!bg-amber-500/20` light, `dark:!bg-amber-500/25`)
   with WCAG-accessible contrast text (`text-amber-700 dark:text-amber-300`) and active state when work
-  is in progress.
+  is in progress. Furthermore, its details popover panel previously used `.gp-card` without `shadow-float`,
+  causing it to miss the macOS float blur tier (compositing with 0px blur) and 50% opacity directly over
+  underlying code and diffs. It now correctly carries `shadow-float` for proper float-tier backdrop blur
+  and a dense `bg-surface/95` background with `border border-border/80` so content behind it does not
+  bleed through.
 
 ### Internal
 

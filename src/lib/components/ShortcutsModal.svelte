@@ -166,7 +166,7 @@
       class="w-full max-w-2xl max-h-[85vh] gp-card shadow-float rounded-3xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
     >
       <!-- Header -->
-      <div class="p-4 border-b border-border/70 flex items-center justify-between bg-surfaceHover/30">
+      <div class="p-4 border-b border-border/70 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
         <div class="flex items-center gap-2.5">
           <div class="p-2 rounded-xl bg-accent/10 text-accent ring-1 ring-accent/25">
             <Keyboard size={18} />
@@ -203,10 +203,11 @@
         {#each filteredCategories as category (category.title)}
           {@const CatIcon = category.icon}
           <div>
-            <div class="flex items-center gap-2 text-xs font-semibold text-textPrimary mb-2.5 pb-1 border-b border-border/50">
+            <div class="flex items-center gap-2 text-xs font-semibold text-textPrimary">
               <CatIcon size={14} class="text-accent" />
               <span>{category.title}</span>
             </div>
+            <div class="gp-separator" aria-hidden="true"></div>
 
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {#each category.shortcuts as item}
@@ -231,7 +232,7 @@
       </div>
 
       <!-- Footer -->
-      <div class="p-3 border-t border-border/70 bg-surfaceHover/20 flex items-center justify-between text-[11px] text-textMuted px-5">
+      <div class="p-3 border-t border-border/70 gp-section-edge bg-surfaceHover/20 flex items-center justify-between text-[11px] text-textMuted px-5">
         <span>Tip: Press <kbd class="gp-keycap">?</kbd> anywhere to reopen</span>
         <button type="button" class="gp-btn !py-1 !px-3" onclick={close}>Done</button>
       </div>

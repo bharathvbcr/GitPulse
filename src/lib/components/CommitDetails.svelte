@@ -202,8 +202,8 @@
 
 {#if selectedCommit}
   {@const sig = gpgLabel(details?.gpg_status || "")}
-  <div class="h-64 border-t border-border/60 bg-surface flex flex-col font-sans select-none overflow-hidden">
-    <div class="px-4 py-2.5 border-b border-border/60 flex items-center justify-between bg-surfaceHover/30">
+  <div class="h-64 border-t border-border/60 gp-section-edge bg-surface flex flex-col font-sans select-none overflow-hidden">
+    <div class="px-4 py-2.5 border-b border-border/60 gp-section-edge flex items-center justify-between bg-surfaceHover/30">
       <div class="flex items-center gap-3 min-w-0">
         <GitCommit size={16} class="text-accent shrink-0" />
         <button

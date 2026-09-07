@@ -1329,7 +1329,7 @@
 
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs overflow-hidden">
-  <div class="px-4 py-2 border-b border-border/60 bg-surface/60 flex items-center justify-between font-sans shrink-0">
+  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <Percent size={16} class="text-accent shrink-0" />
       {#if report && report.overall.lines_found > 0}
@@ -1462,7 +1462,7 @@
   {/if}
 
   {#if report && (report.families.length > 0 || report.truncated)}
-    <div class="border-b border-border/40 bg-surface/40 font-sans shrink-0">
+    <div class="border-b border-border/40 gp-section-edge bg-surface/40 font-sans shrink-0">
       <div class="px-4 py-1.5 flex items-center gap-3 overflow-x-auto">
         {#each familyViews as view (view.family)}
           <div class="flex items-center gap-1.5 shrink-0" title="{view.status.expected_formats.join(', ')} · {view.status.expected_paths.join(', ')}">
@@ -1579,7 +1579,7 @@
   {/if}
 
   {#if report && report.languages.length > 0}
-    <div class="px-4 py-2 border-b border-border/40 bg-surface/20 flex items-center gap-4 overflow-x-auto font-sans">
+    <div class="px-4 py-2 border-b border-border/40 gp-section-edge bg-surface/20 flex items-center gap-4 overflow-x-auto font-sans">
       <span class="text-[10px] uppercase tracking-wider text-textMuted/60 shrink-0">by language</span>
       {#each report.languages as lang (lang.language)}
         <div class="shrink-0 min-w-36">

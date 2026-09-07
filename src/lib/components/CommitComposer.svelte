@@ -97,7 +97,7 @@
   }
 </script>
 
-<div class="p-3 border-t border-border/60 bg-surface flex flex-col gap-2 shrink-0">
+<div class="p-3 border-t border-border/60 gp-section-edge bg-surface flex flex-col gap-2 shrink-0">
   <div class="flex items-center justify-between">
     <span class="text-[10px] font-bold uppercase tracking-wider text-textMuted">Commit</span>
     <button
