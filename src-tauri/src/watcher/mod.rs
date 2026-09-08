@@ -283,13 +283,11 @@ where
     // exits and reaps its own session instead of hammering a dead path.
     const DEAD_MISSES: u32 = 3;
     let mut dead_misses: u32 = 0;
-    let mut dead_confirmed = false;
     let mut exit = WatchLoopExit::Stopped;
     'outer: while !stop.load(Ordering::Relaxed) {
         if !git_dir.exists() {
             dead_misses += 1;
             if dead_misses >= DEAD_MISSES {
-                dead_confirmed = true;
                 exit = WatchLoopExit::DeadRepo;
                 break;
             }
@@ -322,7 +320,6 @@ where
                 last_event = Instant::now();
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
                     if !git_dir.exists() {
-                        dead_confirmed = true;
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
                     }
@@ -344,7 +341,6 @@ where
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if should_emit(pending, last_event, first_pending, Instant::now()) {
                     if !git_dir.exists() {
-                        dead_confirmed = true;
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
                     }
@@ -359,8 +355,12 @@ where
             }
         }
     }
-    if dead_confirmed {
-        // Reap the session we belong to, but only while it is still ours —
+    if matches!(
+        exit,
+        WatchLoopExit::DeadRepo | WatchLoopExit::EventStreamClosed
+    ) {
+        // A vanished repo or closed backend relinquishes its session, but only
+        // while it is still ours —
         // the same ptr_eq discipline abandon_watch_slot uses, so an unwatch
         // plus rewatch of the same path is never torn down by this ghost.
         if let Some(sessions) = &sessions {
@@ -953,6 +953,87 @@ mod tests {
             .expect("remove fixture after watches were stopped");
         drop(phase);
         watchdog.join().unwrap();
+    }
+
+    #[test]
+    fn a_disconnected_backend_releases_its_session_for_a_real_restart() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path().canonicalize().unwrap();
+        let git_dir = root.join(".git");
+        let key = root.to_string_lossy().into_owned();
+        let state = WatcherState::default();
+        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
+            .unwrap()
+            .unwrap();
+        let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        watcher.receiver = receiver;
+        let exit = run_watch_loop(
+            watcher,
+            WatchLoopContext {
+                git_dir: git_dir.clone(),
+                internal_roots: vec![git_dir],
+                emit_path: key.clone(),
+            },
+            stop.clone(),
+            Some(state.sessions.clone()),
+            stop,
+            |_| panic!("a closed backend must not invent a change"),
+        );
+        assert_eq!(exit, WatchLoopExit::EventStreamClosed);
+        assert_eq!(
+            state.watch_count().unwrap(),
+            0,
+            "a dead backend must release its slot so rewatch actually starts a backend"
+        );
+        assert_eq!(start_watch_inner(&state, key.clone(), |_| {}).unwrap(), key);
+        assert_eq!(state.watch_count().unwrap(), 1);
+        unwatch_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_disconnected_old_backend_cannot_reap_its_replacement() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path().canonicalize().unwrap();
+        let git_dir = root.join(".git");
+        let key = root.to_string_lossy().into_owned();
+        let state = WatcherState::default();
+        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
+            .unwrap()
+            .unwrap();
+        // Keep the old generation alive while its replacement owns the slot.
+        let old_session = state.lock_sessions().unwrap().remove(&key).unwrap();
+        let replacement = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
+            .unwrap()
+            .unwrap();
+        let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        watcher.receiver = receiver;
+        let exit = run_watch_loop(
+            watcher,
+            WatchLoopContext {
+                git_dir: git_dir.clone(),
+                internal_roots: vec![git_dir],
+                emit_path: key.clone(),
+            },
+            stop.clone(),
+            Some(state.sessions.clone()),
+            stop,
+            |_| panic!("a closed backend must not invent a change"),
+        );
+        assert_eq!(exit, WatchLoopExit::EventStreamClosed);
+        assert_eq!(state.watch_count().unwrap(), 1);
+        assert!(Arc::ptr_eq(
+            &state.lock_sessions().unwrap().get(&key).unwrap().stop,
+            &replacement
+        ));
+        assert!(!replacement.load(Ordering::Relaxed));
+        drop(old_session);
+        unwatch_all(&state).unwrap();
     }
 
     #[test]

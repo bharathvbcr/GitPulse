@@ -42,6 +42,8 @@ before that tag is pushed.
   output readers on readiness so interactive and bulk output avoid polling delays.
 - Avoid redundant JSON parsing during diagnostic breadcrumbs while retaining the
   existing credential redaction and stress-test budgets.
+- Release watcher sessions when their backend event stream closes so watching
+  again starts a live backend. An old backend cannot remove a replacement session.
 - Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.
   Embedded readers preserve distinct symbol identities and withhold source
   snippets when the indexed content hash no longer matches the current file.
