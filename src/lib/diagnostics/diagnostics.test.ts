@@ -1169,3 +1169,17 @@ describe("the key rebuild preserves exotic keys", () => {
     },
   );
 });
+
+it("does not parse ordinary navigation text as JSON or parse a document twice", () => {
+  const parse = vi.spyOn(JSON, "parse");
+  try {
+    for (const text of ["code", "map", "/repo", "file-9999.md"]) {
+      expect(redactDiagnosticText(text)).toBe(text);
+    }
+    expect(parse).not.toHaveBeenCalled();
+    expect(redactDiagnosticText('{"count":1}')).toBe('{"count":1}');
+    expect(parse).toHaveBeenCalledTimes(1);
+  } finally {
+    parse.mockRestore();
+  }
+});

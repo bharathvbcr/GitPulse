@@ -418,14 +418,17 @@ function redactCliJsonValue(value: unknown, depth = 0): RedactedCliJsonValue {
   return { value, changed: false };
 }
 
-function redactSerializedCliValues(value: string, depth = 0): string {
-  if (depth >= MAX_SERIALIZED_NESTING) return value;
+function redactSerializedCliValues(value: string, depth = 0): { text: string; parsed: boolean } {
+  // Only objects, arrays, and quoted strings can carry nested credentials.
+  // Ordinary navigation text must not allocate an exception on every read.
+  // JSON scalar literals cannot contain credentials and use the text path.
+  if (depth >= MAX_SERIALIZED_NESTING || !/^\s*[[{"]/.test(value)) return { text: value, parsed: false };
   try {
     const parsed: unknown = JSON.parse(value);
     const redacted = redactCliJsonValue(parsed, depth);
-    return redacted.changed ? JSON.stringify(redacted.value) : value;
+    return { text: redacted.changed ? JSON.stringify(redacted.value) : value, parsed: true };
   } catch {
-    return value;
+    return { text: value, parsed: false };
   }
 }
 
@@ -476,29 +479,19 @@ function redactEmbeddedCliArrays(value: string, depth = 0): string {
       continue;
     }
     out += value.slice(cursor, start);
-    out += redactSerializedCliValues(value.slice(start, end), depth);
+    out += redactSerializedCliValues(value.slice(start, end), depth).text;
     cursor = end;
   }
   return out + value.slice(cursor);
 }
 
 function redactValueAtDepth(value: string, depth: number): string {
-  let isJson = false;
-  if (depth < MAX_SERIALIZED_NESTING) {
-    try {
-      JSON.parse(value);
-      isJson = true;
-    } catch {
-      // Wrapper prose continues through the embedded-array and contextual
-      // stages below.
-    }
-  }
   const serialized = redactSerializedCliValues(value, depth);
   // Parsed JSON has already been traversed string-by-string. Applying the
   // contextual regexes to its escaped serialization can consume an inner
   // closing quote and silently damage the nested document.
-  if (isJson) return serialized;
-  return redactContextualDiagnosticText(redactEmbeddedCliArrays(serialized, depth));
+  if (serialized.parsed) return serialized.text;
+  return redactContextualDiagnosticText(redactEmbeddedCliArrays(serialized.text, depth));
 }
 
 // Use the same credential vocabulary for JSON, argv, and plain assignments.
