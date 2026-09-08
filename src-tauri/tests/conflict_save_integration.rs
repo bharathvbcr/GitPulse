@@ -157,6 +157,29 @@ fn choose(
         },
     )
 }
+
+#[cfg(windows)]
+#[test]
+fn executable_git_mode_is_staged_without_inventing_a_windows_permission_bit() {
+    let dir = fixture();
+    set_stages(
+        &dir,
+        "file",
+        Some(("100644", b"ours\n")),
+        Some(("100755", b"executable\n")),
+    );
+    assert!(
+        choose(&dir, "file", ConflictFileChoice::Theirs)
+            .unwrap()
+            .staged
+    );
+    assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"executable\n");
+    assert!(
+        String::from_utf8(git(dir.path(), &["ls-files", "--stage", "--", "file"]).unwrap())
+            .unwrap()
+            .starts_with("100755 ")
+    );
+}
 fn object(dir: &TempDir, bytes: &[u8]) -> String {
     String::from_utf8(git_with_stdin(dir.path(), &["hash-object", "-w", "--stdin"], bytes).unwrap())
         .unwrap()
@@ -264,7 +287,12 @@ fn a_missing_working_file_can_be_restored_from_an_index_side() {
 #[test]
 fn literal_pathspecs_do_not_expand_globs_or_break_on_newlines() {
     let dir = fixture();
+    #[cfg(not(windows))]
     let name = "[a]*\n-é.txt";
+    // Windows forbids '*' and newlines; brackets still exercise Git's
+    // pathspec expansion, with spaces and Unicode covering argument transport.
+    #[cfg(windows)]
+    let name = "[a] -é.txt";
     fs::write(dir.path().join(name), b"ours").unwrap();
     set_stages(
         &dir,

@@ -1,7 +1,13 @@
 //! Worktree entries are accessed relative to a pinned, symlink-free directory.
 //! A concurrent ancestor rename cannot redirect resolution I/O through a link.
 use super::conflict_session::Worktree;
+#[cfg(not(windows))]
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(super) use windows::{read, replace, Recovery};
 
 #[cfg(unix)]
 mod unix {
@@ -303,6 +309,9 @@ mod unix {
                 } else {
                     None
                 };
+                // mode_t is u16 on macOS and u32 on Linux. Keep the lossless
+                // conversion required by PermissionsExt without platform forks.
+                #[allow(clippy::useless_conversion)]
                 let mut mode = original
                     .as_ref()
                     .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
@@ -446,12 +455,12 @@ pub(super) fn replace(
     unix::replace(path, source, next)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) struct Recovery {
     pub path: PathBuf,
     pub keep: bool,
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) fn replace(
     _path: &Path,
     source: &Worktree,

@@ -122,12 +122,12 @@ fn conflict_path(repo: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_worktree(dest: &Path) -> Result<Worktree, String> {
     super::conflict_fs::read(dest)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn read_worktree(dest: &Path) -> Result<Worktree, String> {
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
@@ -852,7 +852,6 @@ pub fn save_with_gate(
     };
     authorize_file(&request.file_path, file_op)?;
     let (next, oid, write) = desired(&repo, &current, &source, &request.choice, &mut judge)?;
-    let write = write && source != next;
     let mode = if matches!(
         request.choice,
         ConflictFileChoice::Ours | ConflictFileChoice::Theirs
@@ -863,6 +862,18 @@ pub fn save_with_gate(
         &next.mode
     };
     transaction.prepare(&repo, &request.file_path, mode, oid.as_deref(), &mut judge)?;
+    // Git's selected executable bit belongs in the index. Windows worktree
+    // files do not expose it, so compare physical snapshots in their own mode.
+    #[cfg(windows)]
+    let next = Worktree {
+        mode: if next.mode == "100755" {
+            "100644".into()
+        } else {
+            next.mode
+        },
+        bytes: next.bytes,
+    };
+    let write = write && source != next;
     // Filters may run arbitrary configured tools and take time. Recheck after
     // all preparation and before publishing any working-tree mutation.
     let (fresh, _) = snapshot_inner(&repo, &request.file_path)?;
