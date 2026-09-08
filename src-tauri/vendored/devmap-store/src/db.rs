@@ -652,6 +652,8 @@ pub struct StoredSymbol {
     pub span_start: usize,
     pub span_end: usize,
     pub is_exported: bool,
+    /// Source identity from the same generation as the symbol row.
+    pub content_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5190,7 +5192,84 @@ impl Store {
         Ok(Some(status))
     }
 
+    /// Inspect store health and verify its snapshot against the current tree.
+    /// A quiet queue alone says nothing about edits made without a watcher.
     pub fn status(&self, db_path: &str) -> Result<StoreStatus> {
+        let mut status = self.status_snapshot(db_path)?;
+        if let Some(generation) = status.latest_generation {
+            if status.pending_count == 0 && status.degraded_reason.is_none() {
+                status.degraded_reason = self.source_snapshot_mismatch(generation)?;
+            }
+        }
+        Ok(status)
+    }
+
+    /// Runs without holding the SQLite connection during filesystem I/O. The
+    /// generation is checked again afterwards, so a writer cannot combine a
+    /// newer inventory with the older status snapshot and certify it as fresh.
+    fn source_snapshot_mismatch(&self, generation: u32) -> Result<Option<String>> {
+        match self.latest_generation_payload_is_current() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Some(
+                    "stored extraction payload is obsolete; rebuild with the current analyzer"
+                        .to_string(),
+                ))
+            }
+            Err(error) => return Ok(Some(format!("analyzer freshness unverified: {error}"))),
+        }
+        let Some(root) = self.latest_repo_root()? else {
+            return Ok(Some(
+                "source freshness unverified: this generation has no repository root".to_string(),
+            ));
+        };
+        let hashes = self.latest_file_hashes()?;
+        let refusals = self.latest_discovery_refusals()?;
+        let head = self.latest_generation_head()?;
+        let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
+            Ok(scanned) => scanned,
+            Err(error) => return Ok(Some(format!("source freshness unverified: {error}"))),
+        };
+        if !scanned.matches_file_hashes(&hashes) {
+            return Ok(Some(
+                "source tree differs from the indexed generation; rebuild or drain watcher edits"
+                    .to_string(),
+            ));
+        }
+        if crate::discovery_refusals(&scanned.report) != refusals {
+            return Ok(Some(
+                "source discovery refusals differ from the indexed generation; rebuild required"
+                    .to_string(),
+            ));
+        }
+        if let Some(head) =
+            head.filter(|head| !head.is_empty() && head != "unavailable" && head != "unknown")
+        {
+            match current_git_head(Path::new(&root)) {
+                Ok(current) if current == head => {}
+                Ok(_) => {
+                    return Ok(Some(
+                        "repository HEAD differs from the indexed generation; rebuild required"
+                            .to_string(),
+                    ))
+                }
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "repository HEAD freshness unverified: {error}"
+                    )))
+                }
+            }
+        }
+        let after = self.status_snapshot("")?;
+        if after.latest_generation != Some(generation) || after.pending_count != 0 {
+            return Ok(Some(
+                "index changed during source verification; retry status".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn status_snapshot(&self, db_path: &str) -> Result<StoreStatus> {
         let conn = lock_conn(&self.conn)?;
         // Every number below describes one instant. `status` resolves the
         // latest generation and then counts that generation's nodes and
@@ -5476,8 +5555,9 @@ impl Store {
         };
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
-                    n.span_start, n.span_end, n.is_exported
+                    n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM generation_nodes n
+             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
              JOIN paths p ON p.id = n.file_id
              WHERE n.generation_id = ?1
              ORDER BY n.ordinal",
@@ -5494,6 +5574,7 @@ impl Store {
                 span_start,
                 span_end,
                 is_exported: row.get::<_, i64>(6)? != 0,
+                content_hash: row.get::<_, i64>(7)? as u64,
             })
         })?;
         rows.collect()
@@ -5563,13 +5644,14 @@ impl Store {
         let match_query = fts_match_query(query)?;
         let mut stmt = conn.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
-                    n.span_start, n.span_end, n.is_exported
+                    n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM nodes_fts
              CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
              JOIN generation_nodes n
                ON n.generation_id = m.generation_id
               AND n.ordinal = (nodes_fts.rowid & 4294967295)
              JOIN paths p ON p.id = n.file_id
+             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
              WHERE m.generation_id = ?1 AND nodes_fts MATCH ?2
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
@@ -5586,6 +5668,7 @@ impl Store {
                 span_start,
                 span_end,
                 is_exported: row.get::<_, i64>(6)? != 0,
+                content_hash: row.get::<_, i64>(7)? as u64,
             })
         })?;
         let page = rows.collect::<Result<Vec<_>>>()?;

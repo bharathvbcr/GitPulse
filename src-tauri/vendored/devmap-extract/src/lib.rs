@@ -768,6 +768,57 @@ pub fn collect_sources_with_report(
 /// Splitting the two costs one `PathBuf` per candidate and buys the read
 /// parallelism. Ordering is not at stake: both outputs are sorted by path
 /// before this returns, exactly as they were when the reads were inline.
+/// Read one discovered source. The reader is shared with source verification.
+pub fn read_source(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let refused = |reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // A candidate replaced with a FIFO must not hang before metadata can be
+    // checked. Nonblocking mode has no effect on regular files.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(refused("source is not a regular file"));
+    }
+    if before.len() > MAX_SOURCE_BYTES {
+        return Err(refused("source changed or exceeds the 1 MiB read ceiling"));
+    }
+    let modified = before.modified()?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(refused("source changed or exceeds the 1 MiB read ceiling"));
+    }
+    let after = file.metadata()?;
+    let current = fs::metadata(path)?;
+    if !current.is_file()
+        || before.len() != after.len()
+        || after.len() != bytes.len() as u64
+        || modified != after.modified()?
+        || modified != current.modified()?
+        || before.len() != current.len()
+    {
+        return Err(refused("source changed while being read"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != current.dev() || before.ino() != current.ino() {
+            return Err(refused("source was replaced while being read"));
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 pub fn scan_tree(root: &Path) -> anyhow::Result<ScannedTree> {
     scan_tree_with_progress(root, None)
 }
@@ -784,7 +835,7 @@ pub fn scan_tree_with_progress(
     let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
         .into_par_iter()
         .map(|(relative, absolute)| {
-            let result = match fs::read_to_string(&absolute) {
+            let result = match read_source(&absolute) {
                 Ok(source) => Ok((relative, source)),
                 Err(error) => Err((
                     relative,

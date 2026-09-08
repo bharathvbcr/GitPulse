@@ -602,6 +602,15 @@ pub fn extract_treesitter_with_budget(
                 crate::clonesig::stamp_signatures(&mut symbols, root, source);
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
 
+                let local_bindings = collect_site_bindings(
+                    root,
+                    source,
+                    &file_symbol_name,
+                    &calls,
+                    &references,
+                    &imports,
+                );
+
                 // The last gate before the file is published. Everything above
                 // has either finished or latched `WALK_OVERRAN`; this is what
                 // stops a run that went past its budget from being handed out
@@ -644,6 +653,7 @@ pub fn extract_treesitter_with_budget(
                     // reused rather than every callable's subtree being walked
                     // a second time.
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
+                    local_bindings,
                     source_code: Some(source.to_string()),
                 };
 
@@ -1309,6 +1319,7 @@ fn unparsed_extraction(
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         scope_locals: Vec::new(),
+        local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
     }
 }
@@ -1479,6 +1490,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         scope_locals: Vec::new(),
+        local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
     }
 }
@@ -1616,6 +1628,16 @@ pub(crate) fn enclosing_callable_qualified(
 ) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
+        // Python defaults are evaluated by the enclosing scope, before the
+        // function's parameters exist. Calls in the body keep the callable.
+        if parent.kind() == "function_definition"
+            && node.kind() == "call"
+            && parent.child_by_field_name("name").is_some()
+            && field_contains(parent, "parameters", node)
+        {
+            ancestor = bounded_parent(parent);
+            continue;
+        }
         // The C family derives its name and its owner together: no C-family
         // declaration has a `name` field for `callable_binding_name` to read,
         // and an out-of-line definition names its owner inside its own
@@ -2440,9 +2462,11 @@ fn extract_node(
             "function_definition" | "async_function_definition" => {
                 if let Some(n) = get_child_text(node, "name", source) {
                     let enclosing_type = enclosing_type_name(node, source);
+                    let is_method = enclosing_type.is_some();
                     let parent_symbol = enclosing_type
                         .as_ref()
                         .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                        .or_else(|| enclosing_callable_qualified(node, source, file_symbol_name))
                         .unwrap_or_else(|| file_symbol_name.to_string());
                     let qualified_name = enclosing_type
                         .map(|type_name| format!("{}::{}.{}", file_symbol_name, type_name, n))
@@ -2459,10 +2483,10 @@ fn extract_node(
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name,
-                        kind: if parent_symbol == file_symbol_name {
-                            SymbolKind::Function
-                        } else {
+                        kind: if is_method {
                             SymbolKind::Method
+                        } else {
+                            SymbolKind::Function
                         },
                         span,
                         is_exported: false,
@@ -2574,6 +2598,7 @@ fn extract_node(
                     let parent_symbol = enclosing_type
                         .as_ref()
                         .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                        .or_else(|| enclosing_callable_qualified(node, source, file_symbol_name))
                         .unwrap_or_else(|| file_symbol_name.to_string());
                     let qualified_name = enclosing_type
                         .map(|type_name| format!("{}::{}.{}", file_symbol_name, type_name, n))
@@ -2997,7 +3022,8 @@ fn extract_node(
                         signature: None,
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
-                            None => file_symbol_name.to_string(),
+                            None => enclosing_callable_qualified(node, source, file_symbol_name)
+                                .unwrap_or_else(|| file_symbol_name.to_string()),
                         }),
                         body_signature: None,
                         declaration_hash: None,
@@ -3068,7 +3094,8 @@ fn extract_node(
                         signature: None,
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
-                            None => file_symbol_name.to_string(),
+                            None => enclosing_callable_qualified(node, source, file_symbol_name)
+                                .unwrap_or_else(|| file_symbol_name.to_string()),
                         }),
                         body_signature: None,
                         declaration_hash: None,
@@ -5618,6 +5645,21 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
 }
 
 fn is_defining_name(node: Node) -> bool {
+    // A grammar's `name` field is not necessarily a declaration. Java/Lua
+    // invocation nodes use it for the callee; recording that use as a local
+    // binding suppresses the very call it names (RA1).
+    if bounded_parent(node).is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "method_invocation"
+                | "function_call"
+                | "call"
+                | "call_expression"
+                | "invocation_expression"
+        )
+    }) {
+        return false;
+    }
     if c_declarator_declaration(node).is_some() || is_objc_declaring_identifier(node) {
         return true;
     }
@@ -6056,6 +6098,206 @@ fn with_scope_locals<R>(scope: Node, source: &str, visit: impl FnOnce(&HashSet<S
             None => visit(&HashSet::new()),
         }
     })
+}
+
+/// Module fixtures with an explicit import from pytest. A bare decorator of
+/// the same spelling, without that import, cannot establish framework binding.
+fn python_fixture_names(root: Node, source: &str, imports: &[ExtractedImport]) -> BTreeSet<String> {
+    if root.kind() != "module" {
+        return BTreeSet::new();
+    }
+    let mut decorators = BTreeSet::new();
+    for import in imports
+        .iter()
+        .filter(|import| import.module_specifier == "pytest")
+    {
+        if import.imported_names.is_empty() {
+            decorators.insert(format!(
+                "{}.fixture",
+                import.alias.as_deref().unwrap_or("pytest")
+            ));
+        }
+        for (index, name) in import
+            .imported_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| *name == "fixture")
+        {
+            decorators.insert(
+                import
+                    .local_names
+                    .get(index)
+                    .or(import.alias.as_ref())
+                    .unwrap_or(name)
+                    .clone(),
+            );
+        }
+    }
+    if decorators.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut fixtures = BTreeSet::new();
+    let mut cursor = root.walk();
+    for decorated in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "decorated_definition")
+    {
+        if walk_deadline_passed() {
+            break;
+        }
+        let Some(definition) = decorated
+            .child_by_field_name("definition")
+            .filter(|node| node.kind() == "function_definition")
+        else {
+            continue;
+        };
+        let mut cursor = decorated.walk();
+        let registered = decorated
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "decorator")
+            .any(|node| {
+                let text = get_node_text(node, source);
+                let name = text
+                    .trim()
+                    .trim_start_matches('@')
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                decorators.contains(name)
+            });
+        if registered {
+            if let Some(name) = definition.child_by_field_name("name") {
+                fixtures.insert(get_node_text(name, source));
+            }
+        }
+    }
+    fixtures
+}
+
+/// Establish binding facts while the syntax tree still exists. A named graph
+/// caller may own many anonymous scopes; it cannot stand in for lexical scope.
+fn collect_site_bindings(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+    calls: &[ExtractedCall],
+    references: &[ExtractedReference],
+    imports: &[ExtractedImport],
+) -> Vec<LocalBinding> {
+    let fixtures = python_fixture_names(root, source, imports);
+    let mut sites = BTreeSet::new();
+    let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    let inputs = calls
+        .iter()
+        .map(|call| {
+            (
+                &call.span,
+                call.receiver_expr.as_deref().unwrap_or(&call.callee_name),
+                false,
+            )
+        })
+        .chain(
+            references
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.kind,
+                        ReferenceKind::Name | ReferenceKind::Call | ReferenceKind::Constructor
+                    )
+                })
+                .map(|r| {
+                    (
+                        &r.span,
+                        r.receiver_expr.as_deref().unwrap_or(&r.name),
+                        r.kind == ReferenceKind::Name,
+                    )
+                }),
+        );
+    for (span, name, is_name_reference) in inputs {
+        if walk_deadline_passed() {
+            break;
+        }
+        let Some(node) = root.descendant_for_byte_range(span.start_byte, span.end_byte) else {
+            continue;
+        };
+        let mut ancestor = bounded_parent(node);
+        while let Some(scope) = ancestor {
+            if is_callable_node(scope) {
+                // Python defaults run in the enclosing scope. The parameter's
+                // own declaration is still a binding site, but its value is not.
+                let in_default = scope.kind() == "function_definition"
+                    && field_contains(scope, "parameters", node)
+                    && (node.kind() == "call" || {
+                        let mut cursor = bounded_parent(node);
+                        let mut value = false;
+                        while let Some(parent) = cursor {
+                            if parent.id() == scope.id() {
+                                break;
+                            }
+                            if field_contains(parent, "value", node)
+                                || field_contains(parent, "type", node)
+                            {
+                                value = true;
+                                break;
+                            }
+                            cursor = bounded_parent(parent);
+                        }
+                        value
+                    });
+                if !in_default {
+                    let names = parameters.entry(scope.id()).or_insert_with(|| {
+                        let mut names = BTreeSet::new();
+                        collect_parameter_names(scope, source, &mut names);
+                        // A JavaScript arrow can have a single unparenthesized parameter.
+                        if let Some(parameter) = scope.child_by_field_name("parameter") {
+                            if parameter.kind() == "identifier" {
+                                names.insert(get_node_text(parameter, source));
+                            }
+                        }
+                        names
+                    });
+                    if names.contains(name)
+                        || with_scope_locals(scope, source, |locals| locals.contains(name))
+                    {
+                        // A pytest signature requests a declared fixture. Preserve
+                        // that dependency at the signature only; uses in its body
+                        // refer to the injected value and are still local bindings.
+                        let fixture_request = is_name_reference
+                            && fixtures.contains(name)
+                            && scope.kind() == "function_definition"
+                            && field_contains(scope, "parameters", node)
+                            && scope.child_by_field_name("name").is_some_and(|n| {
+                                let consumer = get_node_text(n, source);
+                                consumer.starts_with("test_") || fixtures.contains(&consumer)
+                            });
+                        if !fixture_request {
+                            let named_scope = callable_binding_name(scope, source).is_some()
+                                || is_c_family_callable(scope);
+                            sites.insert(LocalBinding {
+                                start_byte: span.start_byte,
+                                name: name.to_string(),
+                                scope: named_scope
+                                    .then(|| {
+                                        scope.child(0).and_then(|child| {
+                                            enclosing_callable_qualified(
+                                                child,
+                                                source,
+                                                file_symbol_name,
+                                            )
+                                        })
+                                    })
+                                    .flatten(),
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+            ancestor = bounded_parent(scope);
+        }
+    }
+    sites.into_iter().collect()
 }
 
 fn name_is_shadowed_by_local(node: Node, source: &str, name: &str) -> bool {

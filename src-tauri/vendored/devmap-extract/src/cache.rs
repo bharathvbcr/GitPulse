@@ -281,7 +281,7 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// they change an *exemption*, so a reused row either hides a real finding or
 /// publishes a delete-this verdict about code a framework reaches, and nothing
 /// about the row looks old.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "37";
+pub const EXTRACTION_SCHEMA_VERSION: &str = "38";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

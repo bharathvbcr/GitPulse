@@ -1555,8 +1555,18 @@ mod tests {
                    (payload_id, file_id, content_hash, language,
                     parse_outcome_json, engine_json, extraction_json,
                     grammar_version, analyzer_version)
-                 VALUES (?1, ?1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
-                [id],
+                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
+                // Signed SQLite value emitted by the real devmap writer for
+                // CALLER_SOURCE. The readable-source assertion below pins the
+                // fixture bytes and this identity together.
+                (
+                    id,
+                    if id == 1 {
+                        -477_759_399_776_341_435i64
+                    } else {
+                        id
+                    },
+                ),
             )
             .expect("insert file payload");
             conn.execute(
@@ -1822,6 +1832,25 @@ mod tests {
             reason.contains("src/callee.rs"),
             "the reason does not name the file it is about: {reason}"
         );
+    }
+
+    #[test]
+    fn edited_source_is_withheld_without_losing_the_stored_hit() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_string_lossy().to_string();
+        std::fs::write(repo.path().join("src/caller.rs"), "fn renamed() {}\n").unwrap();
+        let hits = search(&root, "probe_caller", None);
+        assert!(hits.available, "{:?}", hits.reason);
+        let hit = hits
+            .items
+            .first()
+            .expect("the indexed symbol remains visible");
+        assert_eq!(hit.symbol_name, "probe_caller");
+        assert!(hit.source_span.is_empty());
+        assert!(hit
+            .source_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("changed")));
     }
 
     /* ── Finding 2: the repository path is an argument, not a fact ────────── */

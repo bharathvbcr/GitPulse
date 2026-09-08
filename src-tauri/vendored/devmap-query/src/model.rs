@@ -62,6 +62,12 @@ pub enum ResolutionAvailability {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response<T> {
+    /// `None` (JSON null) means current-tree freshness was not checked. Query
+    /// completeness describes the persisted snapshot; `status` performs the
+    /// separate repository verification. Never infer freshness from an empty
+    /// result or from `walk_incomplete` being absent.
+    #[serde(default)]
+    pub source_freshness: Option<bool>,
     pub items: Vec<T>,
     pub shown: u32,
     pub hidden: u32,

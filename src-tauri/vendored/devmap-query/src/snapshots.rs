@@ -117,6 +117,7 @@ pub fn semantic_snapshots(
     let resp = budget_take(out, req.token_budget, snapshot_tokens);
     let hidden = total.saturating_sub(resp.shown);
     Response {
+        source_freshness: None,
         total,
         shown: resp.shown,
         hidden,

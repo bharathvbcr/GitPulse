@@ -1587,10 +1587,14 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<PreviewReport> {
+        if new_source.len() as u64 > devmap_extract::MAX_SOURCE_BYTES {
+            anyhow::bail!("preview source exceeds the 1 MiB source ceiling");
+        }
         let candidate = devmap_extract::extract_file(path, new_source);
         let parse_status = parse_status_name(&candidate.parse_outcome).to_string();
 
         let empty_callers = || Response {
+            source_freshness: None,
             items: Vec::new(),
             shown: 0,
             hidden: 0,
@@ -1663,7 +1667,7 @@ impl<'a> StoreQueryEngine<'a> {
         // `["mod.py:Added", "alpha:Added"]` with `degraded_reason: null` and
         // `delta_available: true`. The caller is handed a clean bill of health
         // by a comparison that never ran.
-        let (on_disk, read_failure) = match std::fs::read_to_string(&resolved) {
+        let (on_disk, read_failure) = match devmap_extract::read_source(&resolved) {
             Ok(source) => (Some(source), None),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
             Err(err) => (None, Some(err)),
@@ -2685,6 +2689,7 @@ impl<'a> QueryEngine<'a> {
     pub fn search(&self, req: Request<String>) -> Response<SymbolHit> {
         if req.query.trim().is_empty() {
             return Response {
+                source_freshness: None,
                 items: Vec::new(),
                 shown: 0,
                 hidden: 0,
@@ -3507,6 +3512,7 @@ fn record_test_hit(
 
 fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
     Response {
+        source_freshness: None,
         items: Vec::new(),
         shown: 0,
         hidden: 0,
@@ -3831,65 +3837,30 @@ thread_local! {
     pub(crate) static SOURCE_SPAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Read only as much of a file as a span ending at `span_end` can need.
-///
-/// K-B1: this was `fs::read_to_string`, so one search hit cost the size of the
-/// file it lives in — a 50 MB generated bundle answered a one-line span with
-/// 50 MB of I/O and 50 MB of resident `String`, per hit, per query, bounded by
-/// nothing. A span at byte 40 needs bytes `0..40`: the prefix, because the line
-/// number is the count of newlines before it, and not one byte more.
-///
-/// Up to three bytes past `span_end` are read and then discarded so a prefix
-/// that lands mid-character still decodes. A file that is shorter than
-/// `span_end` — the working tree moved on since the generation was written —
-/// comes back as whatever is there, exactly as reading the whole file did, and
-/// the caller's span lookup fails the same way it failed before.
-///
-/// The error is preserved rather than collapsed: a file that cannot be read
-/// must not look like a file with nothing in it.
-fn read_source_prefix(path: &std::path::Path, span_end: usize) -> std::io::Result<String> {
-    use std::io::Read;
-
-    // One UTF-8 character is at most four bytes, so three extra can complete
-    // whatever character `span_end` lands inside.
-    let wanted = span_end.saturating_add(3);
-    let mut file = std::fs::File::open(path)?;
-    // Sized from the smaller of what is wanted and what is there, so the common
-    // case — a small file, read whole — costs one allocation, as
-    // `read_to_string` did. Growing from empty instead cost 14% of `search`
-    // (2.37 ms -> 2.70 ms p50 on this repository's store, interleaved), because
-    // a search page is a hundred files and almost all of them are small. A file
-    // whose length cannot be read falls back to growth rather than failing:
-    // the read below is the thing that must succeed, not the hint.
-    let hint = file
-        .metadata()
-        .map(|meta| (meta.len() as usize).min(wanted))
-        .unwrap_or(0);
-    let mut buffer = Vec::with_capacity(hint);
-    // `take` bounds the read at the source, so a hostile or generated file
-    // cannot make this allocate more than the span asked for.
-    file.by_ref().take(wanted as u64).read_to_end(&mut buffer)?;
+/// Verify the complete source identity before applying stored byte coordinates.
+/// A bounded prefix alone can belong to a different file revision. Reads stay
+/// within discovery's source ceiling and only cover files selected for hits.
+fn read_verified_source(
+    path: &std::path::Path,
+    span: std::ops::Range<usize>,
+    expected_hash: u64,
+) -> std::io::Result<String> {
+    let source = devmap_extract::read_source(path)?;
     #[cfg(test)]
-    SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(buffer.len() as u64)));
-    match String::from_utf8(buffer) {
-        Ok(text) => Ok(text),
-        Err(error) => {
-            // Either the file is not UTF-8 — the same failure `read_to_string`
-            // reported — or the cut landed mid-character. Keep the longest
-            // valid prefix when it still covers the span, and report the error
-            // otherwise, so a truncated read is never passed off as the file.
-            let valid = error.utf8_error().valid_up_to();
-            let bytes = error.into_bytes();
-            if valid >= span_end {
-                Ok(String::from_utf8_lossy(&bytes[..valid]).into_owned())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                ))
-            }
-        }
+    SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(source.len() as u64)));
+    if devmap_extract::content_hash(&source) != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source changed since this symbol was indexed",
+        ));
     }
+    if source.get(span).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stored span is invalid for the verified source",
+        ));
+    }
+    Ok(source)
 }
 
 /// Build a hit from a stored symbol row, reading its source span from disk.
@@ -3907,8 +3878,11 @@ fn hit_from_stored(
     let owned_root = repo_root.map(str::to_string);
     #[cfg(test)]
     SOURCE_SPAN_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-    let source_result =
-        read_source_prefix(&resolve_source_path(&owned_root, &row.path), row.span_end);
+    let source_result = read_verified_source(
+        &resolve_source_path(&owned_root, &row.path),
+        row.span_start..row.span_end,
+        row.content_hash,
+    );
     let source_unavailable_reason = source_result.as_ref().err().map(|error| {
         format!(
             "source unavailable at query time for {:?}: {error}",
@@ -4014,6 +3988,7 @@ where
     }
 
     Response {
+        source_freshness: None,
         shown: out.len() as u32,
         hidden: total.saturating_sub(out.len() as u32),
         total,
@@ -4039,6 +4014,7 @@ where
         .fold(0u32, |sum, item| sum.saturating_add(cost_of(item)));
     if required > token_budget {
         return Response {
+            source_freshness: None,
             items: Vec::new(),
             shown: 0,
             hidden: total,
@@ -4054,6 +4030,7 @@ where
         };
     }
     Response {
+        source_freshness: None,
         shown: total,
         hidden: 0,
         total,
@@ -5136,6 +5113,53 @@ mod search_bounds_tests {
         store
     }
 
+    #[test]
+    fn ra3_a_stored_name_cannot_be_combined_with_edited_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-source-coherence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = "def original_name(): return 1\n";
+        std::fs::write(dir.join("a.py"), old).unwrap();
+        let store = store_rooted_at("a.py", old, Some(&dir.to_string_lossy()));
+        let request = || Request {
+            query: "original_name".into(),
+            token_budget: 2000,
+            min_confidence: 0.0,
+            max_depth: 1,
+        };
+        let before = StoreQueryEngine::new(&store).search(request()).unwrap();
+        let wire = serde_json::to_value(&before).unwrap();
+        assert_eq!(
+            wire.get("source_freshness"),
+            Some(&serde_json::Value::Null),
+            "a query must explicitly disclose that whole-tree freshness was not checked"
+        );
+        assert!(before.items[0].source_span.contains("original_name"));
+        std::fs::write(dir.join("a.py"), "def modified_name(): return 2\n").unwrap();
+        let after = StoreQueryEngine::new(&store).search(request()).unwrap();
+        assert_eq!(after.shown, 1);
+        assert!(
+            after.items[0].source_span.is_empty(),
+            "stale name paired with current bytes: {:?}",
+            after.items
+        );
+        assert!(
+            after.items[0]
+                .source_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("changed")),
+            "{:?}",
+            after.items
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A hit near the top of a huge file must not read the whole file.
     ///
     /// K-B1: `hit_from_stored` called `fs::read_to_string`, so the cost of one
@@ -5150,7 +5174,7 @@ mod search_bounds_tests {
     /// `devmap_extract::MAX_SOURCE_BYTES` refuses anything over 1 MiB at
     /// discovery, so a 50 MiB file can carry a stored span *only* from a
     /// generation written while it was smaller — which is exactly the case
-    /// `read_source_prefix` documents, the working tree having moved on.
+    /// `read_verified_source` refuses, the working tree having moved on.
     ///
     /// Handing the filler to the extractor as well, which this fixture used to
     /// do twice over, bought no coverage of the read under test and cost the
@@ -5209,9 +5233,10 @@ mod search_bounds_tests {
             "the fixture must produce exactly one hit"
         );
         assert!(
-            response.items[0].source_span.contains("findable_symbol"),
-            "the span must still be the symbol's own text: {:?}",
-            response.items[0].source_span
+            response.items[0].source_span.is_empty()
+                && response.items[0].source_unavailable_reason.is_some(),
+            "changed oversized source must be refused while preserving the hit: {:?}",
+            response.items[0]
         );
         assert!(
             bytes < (head as u64) * 8 + 4096,

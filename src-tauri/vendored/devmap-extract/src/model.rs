@@ -1162,11 +1162,34 @@ pub struct Extraction {
     /// payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_locals: Vec<(String, String)>,
+    /// Locally bound names at exact call/reference start offsets. Unlike graph
+    /// caller identities, these distinguish unnamed callbacks and captures.
+    /// Sorted and deduplicated; persists after source text is stripped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_bindings: Vec<LocalBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_code: Option<String>,
 }
 
+/// A lexical binding at a specific use site. `scope` is absent for an
+/// anonymous callable, whose variables cannot borrow its graph owner's types.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LocalBinding {
+    pub start_byte: usize,
+    pub name: String,
+    pub scope: Option<String>,
+}
+
 impl Extraction {
+    pub fn local_binding_at(&self, start_byte: usize, name: &str) -> Option<&LocalBinding> {
+        self.local_bindings
+            .binary_search_by(|binding| {
+                (binding.start_byte, binding.name.as_str()).cmp(&(start_byte, name))
+            })
+            .ok()
+            .map(|index| &self.local_bindings[index])
+    }
+
     /// Whether this file is a genuine parse **failure** — one the extractor
     /// tried to read declarations out of and could not.
     ///

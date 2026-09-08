@@ -829,6 +829,12 @@ fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
             .filter(|annotation| annotation.target_symbol != file_path),
     );
     extraction.scope_locals.extend(inner.scope_locals);
+    extraction
+        .local_bindings
+        .extend(inner.local_bindings.into_iter().map(|mut binding| {
+            binding.start_byte = binding.start_byte.saturating_add(offset);
+            binding
+        }));
     extraction.diagnostics.extend(inner.diagnostics);
 }
 
@@ -897,6 +903,8 @@ fn reorder_after_merge(extraction: &mut Extraction) {
     });
     extraction.scope_locals.sort();
     extraction.scope_locals.dedup();
+    extraction.local_bindings.sort();
+    extraction.local_bindings.dedup();
 }
 
 #[cfg(test)]

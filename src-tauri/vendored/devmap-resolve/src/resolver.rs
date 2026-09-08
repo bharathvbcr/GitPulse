@@ -13,6 +13,9 @@ use devmap_extract::GoModule;
 /// the file that declares it, its qualified name, and its kind.
 type PackageDecl = (String, String, SymbolKind);
 
+/// Candidate file, kind, language family, and stable qualified identity.
+type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
+
 /// Where the name a resolution rung failed on was written.
 ///
 /// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
@@ -33,7 +36,7 @@ enum UsePosition<'a> {
 }
 
 pub struct Resolver {
-    symbol_index: BTreeMap<String, Vec<(String, SymbolKind, LangFamily)>>,
+    symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
@@ -120,7 +123,7 @@ pub struct Resolver {
     /// (file, bare symbol name) → qualified name. Edge endpoints are graph
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
-    qualified_names: BTreeMap<(String, String), String>,
+    qualified_names: BTreeMap<(String, String), Option<Arc<str>>>,
     /// `(file, qualified name)` → the symbol that declares it, with the file
     /// path standing for "declared at file level".
     ///
@@ -279,8 +282,9 @@ impl Resolver {
     fn qualified_for(&self, file: &str, name: &str) -> String {
         self.qualified_names
             .get(&(file.to_string(), name.to_string()))
-            .cloned()
-            .unwrap_or_else(|| name.to_string())
+            .and_then(|value| value.as_deref())
+            .unwrap_or(name)
+            .to_string()
     }
 
     /// Whether `name` is a value the symbol `enclosing_symbol` declares itself.
@@ -329,6 +333,80 @@ impl Resolver {
             ))
     }
 
+    /// A binding belongs to its lexical scope. An untyped local must veto the
+    /// file-wide fallback just as a typed one supplies the scoped answer.
+    fn receiver_type_for(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+        binding: Option<&devmap_extract::model::LocalBinding>,
+    ) -> Option<&String> {
+        if let Some(binding) = binding {
+            let declaring_scope = binding.scope.as_deref()?;
+            return self
+                .scoped_receiver_types
+                .get(&format!("{file}:{declaring_scope}:{name}"));
+        }
+        if let Some(scope) = scope {
+            if let Some(typed) = self
+                .scoped_receiver_types
+                .get(&format!("{file}:{scope}:{name}"))
+            {
+                return Some(typed);
+            }
+            if self.scope_declares_local(file, scope, name) {
+                return None;
+            }
+        }
+        self.receiver_types.get(&format!("{file}:{name}"))
+    }
+
+    /// Resolve a spelling in the nearest declaring scope, retaining the full
+    /// identity. A sibling function's nested declaration is never in scope.
+    fn lexical_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        let hits = self.symbol_index.get(name)?;
+        let mut scope = caller.unwrap_or(file);
+        for _ in 0..1024 {
+            let mut candidates = hits
+                .iter()
+                .filter(|(path, kind, _, identity)| {
+                    path == file
+                        && (!Self::family_needs_explicit_receiver(family)
+                            || *kind != SymbolKind::Method)
+                        && self
+                            .symbol_parents
+                            .get(&(file.to_string(), identity.to_string()))
+                            .is_some_and(|parent| parent == scope)
+                })
+                .map(|(_, _, _, identity)| identity.as_ref());
+            if let Some(first) = candidates.next() {
+                return candidates
+                    .all(|other| other == first)
+                    .then(|| first.to_string());
+            }
+            if scope == file {
+                return None;
+            }
+            let next = self
+                .symbol_parents
+                .get(&(file.to_string(), scope.to_string()))
+                .map(String::as_str)
+                .unwrap_or(file);
+            if next == scope {
+                return None;
+            }
+            scope = next;
+        }
+        None
+    }
+
     /// The leftmost segment of a dotted, scoped or slashed path.
     ///
     /// One owner for a split that `classify_unresolved` was doing inline and
@@ -359,7 +437,7 @@ impl Resolver {
     fn family_declares(&self, family: LangFamily, name: &str) -> bool {
         self.symbol_index.get(name).is_some_and(|hits| {
             hits.iter()
-                .any(|(_, _, candidate_family)| family.admits(*candidate_family))
+                .any(|(_, _, candidate_family, _)| family.admits(*candidate_family))
         })
     }
 
@@ -805,10 +883,16 @@ impl Resolver {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
             for sym in &ext.symbols {
+                let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
                     .entry(sym.name.clone())
                     .or_default()
-                    .push((ext.file_path.clone(), sym.kind, family));
+                    .push((
+                        ext.file_path.clone(),
+                        sym.kind,
+                        family,
+                        Arc::clone(&identity),
+                    ));
                 if sym.kind == SymbolKind::Method {
                     if let Some(type_name) = sym
                         .parent_symbol
@@ -824,14 +908,23 @@ impl Resolver {
                 self.symbol_index
                     .entry(sym.qualified_name.clone())
                     .or_default()
-                    .push((ext.file_path.clone(), sym.kind, family));
-                // First declaration wins, so a duplicate name in one file cannot
-                // silently retarget an already-recorded identity.
+                    .push((
+                        ext.file_path.clone(),
+                        sym.kind,
+                        family,
+                        Arc::clone(&identity),
+                    ));
+                // A bare spelling is only an identity when exactly one declaration
+                // owns it. Every global candidate separately retains its full identity.
                 self.qualified_names
                     .entry((ext.file_path.clone(), sym.name.clone()))
-                    .or_insert_with(|| sym.qualified_name.clone());
-                // First declaration wins, matching `qualified_names` above, so
-                // the two indexes always describe the same symbol.
+                    .and_modify(|known| {
+                        if known.as_deref() != Some(identity.as_ref()) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(Arc::clone(&identity)));
+                // Parent links are keyed by full graph identity.
                 self.symbol_parents
                     .entry((ext.file_path.clone(), sym.qualified_name.clone()))
                     .or_insert_with(|| {
@@ -1157,11 +1250,11 @@ impl Resolver {
                 };
                 let types: Vec<_> = candidates
                     .iter()
-                    .filter(|(_, kind, candidate_family)| {
+                    .filter(|(_, kind, candidate_family, _)| {
                         family.admits(*candidate_family)
                             && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
                     })
-                    .map(|(path, kind, _)| (path, kind))
+                    .map(|(path, kind, _, _)| (path, kind))
                     .collect();
                 if types.len() == 1 {
                     if let Some(scope) = reference.enclosing_symbol.as_deref() {
@@ -1473,25 +1566,28 @@ impl Resolver {
                     // agree, with nothing making them.
                     let mut resolution: Option<Arc<Resolution>> = None;
 
+                    // RA1: local binding evidence must be consulted before a
+                    // same-file/import/global rung can invent a target for it.
+                    if call.receiver_expr.is_none()
+                        && ext.local_binding_at(call.span.start_byte, &call.callee_name).is_some() {
+                        resolution = Some(Arc::new(Resolution::Unresolved {
+                            reason: "the callee is a local binding whose value is not known".to_string(),
+                        }));
+                    }
+
                     // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
                     if let Some(recv) = &call.receiver_expr {
                         // Prefer the binding scoped to the calling symbol; fall back
                         // to the file-wide map only when it is unambiguous. Poisoned
                         // keys are absent from both maps, so a collision falls
                         // through the ladder instead of resolving to a guess (SC9).
-                        let recv_key = format!("{}:{}", ext.file_path, recv);
-                        let scoped = call.caller_symbol.as_deref().and_then(|caller| {
-                            self.scoped_receiver_types
-                                .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
-                        });
                         // `admits` gates this rung as well as the global one.
                         // `type_methods` is keyed by `(family, type, method)`,
                         // so two languages sharing `Generic` could dispatch a
                         // method onto each other's type at DETERMINISTIC
                         // confidence — a worse version of the same defect the
                         // global rung had.
-                        if let Some(class_type) = scoped
-                            .or_else(|| self.receiver_types.get(&recv_key))
+                        if let Some(class_type) = self.receiver_type_for(&ext.file_path, call.caller_symbol.as_deref(), recv, ext.local_binding_at(call.span.start_byte, recv))
                             .filter(|_| family.admits(family))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
@@ -1554,7 +1650,7 @@ impl Resolver {
                     // DETERMINISTIC — a confident edge to a function the code
                     // demonstrably does not call, and one that also hands the
                     // real method one fewer caller than it has.
-                    if resolution.is_none() && !implicit_receiver {
+                    if resolution.is_none() && call.receiver_expr.is_none() {
                         if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                             if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
                                 if let Some((resolved_file, resolved_sym)) =
@@ -1564,6 +1660,10 @@ impl Resolver {
                                         target_symbol: resolved_sym,
                                         target_file: resolved_file,
                                         imported_from: call.callee_name.clone(),
+                                    }));
+                                } else {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: "the named import has no unambiguous declaration in its module".to_string(),
                                     }));
                                 }
                             }
@@ -1579,7 +1679,8 @@ impl Resolver {
                         } else {
                             (String::new(), String::new())
                         };
-                        if !recv.is_empty() && !method.is_empty() {
+                        if !recv.is_empty() && !method.is_empty()
+                            && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
                             if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                                 if let Some((target_f, _)) = bindings.get(&recv) {
                                     if let Some((resolved_file, resolved_sym)) =
@@ -1631,44 +1732,17 @@ impl Resolver {
                             .as_deref()
                             .is_none_or(Self::receiver_is_self)
                     {
-                        let bare_call = call.receiver_expr.is_none();
-                        if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
-                            if file_syms
-                                .iter()
-                                .filter(|symbol| *symbol == &call.callee_name)
-                                .count()
-                                == 1
-                                && (!bare_call
-                                    || self.bare_name_is_in_scope(
-                                        &ext.file_path,
-                                        family,
-                                        call.caller_symbol.as_deref(),
-                                        &call.callee_name,
-                                    ))
-                                // X47. The half of the fabricated-caller defect
-                                // X42 left standing. This rung admits a `self.`
-                                // receiver on the grounds that the receiver
-                                // *is* this scope — true, and it says nothing
-                                // about a **module-level function** that
-                                // happens to share the name. Where the
-                                // enclosing type declares the method, rung 1b
-                                // has already answered at `ReceiverType`; where
-                                // it does not, this rung was binding
-                                // `self.on_done()` to `svc.py::on_done` at
-                                // DETERMINISTIC — a free function handed a
-                                // caller it does not have, and thereby shielded
-                                // from the dead-code pass. Same restriction
-                                // X42 put on the global rung, at the rung that
-                                // outranks it.
-                                && (bare_call
-                                    || self.symbol_kind_in(&ext.file_path, &call.callee_name)
-                                        == Some(SymbolKind::Method))
-                            {
+                        if call.receiver_expr.is_none() {
+                            if let Some(target_symbol) = self.lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name) {
                                 resolution = Some(Arc::new(Resolution::SameFile {
-                                    target_symbol: call.callee_name.clone(),
-                                    target_file: ext.file_path.clone(),
+                                    target_symbol, target_file: ext.file_path.clone(),
                                 }));
                             }
+                        } else if self.bare_name_is_in_scope(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Method) {
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
+                            }));
                         }
                     }
 
@@ -1741,6 +1815,15 @@ impl Resolver {
                         }
                     }
 
+                    // A superclass receiver excludes the overriding declaration.
+                    // Without a proven base target, bare-name widening fabricates
+                    // a self-call. Preserve the unresolved site instead.
+                    if resolution.is_none() && call.receiver_expr.as_deref().is_some_and(|r| matches!(r, "super" | "super()" | "base")) {
+                        resolution = Some(Arc::new(Resolution::Unresolved {
+                            reason: "superclass dispatch requires a proven base declaration".to_string(),
+                        }));
+                    }
+
                     // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
                     if resolution.is_none() {
                         if let Some(hits) = self.symbol_index.get(&call.callee_name) {
@@ -1765,7 +1848,7 @@ impl Resolver {
                             let bare_call = call.receiver_expr.is_none();
                             let family_hits: Vec<_> = hits
                                 .iter()
-                                .filter(|(path, kind, candidate_family)| {
+                                .filter(|(path, kind, candidate_family, identity)| {
                                     family.admits(*candidate_family)
                                         // X42. `self.m()` names a *member* of
                                         // the receiver's type. A module-level
@@ -1789,11 +1872,11 @@ impl Resolver {
                                             ))
                                         && (!bare_call
                                             || !Self::family_needs_explicit_receiver(family)
-                                            || self.declared_at_file_level(path, &call.callee_name))
+                                            || self.declared_at_file_level(path, identity))
                                 })
                                 .collect();
                             if family_hits.len() == 1 {
-                                let (target_f, _, _) = family_hits[0];
+                                let (target_f, _, _, target_identity) = family_hits[0];
                                 // G3: Python stdlib-name guard inside UniqueGlobal rung only
                                 let is_python_stdlib_guard = family == LangFamily::Python
                                     && matches!(
@@ -1804,7 +1887,7 @@ impl Resolver {
 
                                 if !is_python_stdlib_guard {
                                     resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                        target_symbol: call.callee_name.clone(),
+                                        target_symbol: target_identity.to_string(),
                                         target_file: target_f.clone(),
                                         family,
                                     }));
@@ -1813,7 +1896,7 @@ impl Resolver {
                                 // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
                                 let mut candidates: Vec<(String, String)> = family_hits
                                     .iter()
-                                    .map(|(f, _, _)| ((*f).clone(), call.callee_name.clone()))
+                                    .map(|(f, _, _, identity)| ((*f).clone(), identity.to_string()))
                                     .collect();
                                 // R4. `symbol_index` values are in input-slice
                                 // order, and that order used to flow straight
@@ -1824,6 +1907,7 @@ impl Resolver {
                                 // here is also what makes the fan-out cap below
                                 // pick the same subset on every run.
                                 candidates.sort();
+                                candidates.dedup();
                                 resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
                                     candidates,
                                     family,
@@ -2037,10 +2121,10 @@ impl Resolver {
                     let route_target = hits.and_then(|hits| {
                         let same_file: Vec<_> = hits
                             .iter()
-                            .filter(|(path, _, _)| path == &ext.file_path)
+                            .filter(|(path, _, _, _)| path == &ext.file_path)
                             .collect();
                         if same_file.len() == 1 {
-                            let (target_f, _, _) = same_file[0];
+                            let (target_f, _, _, _) = same_file[0];
                             return Some((
                                 target_f.clone(),
                                 Resolution::SameFile {
@@ -2065,7 +2149,7 @@ impl Resolver {
                         }
                         let family_hits: Vec<_> = hits
                             .iter()
-                            .filter(|(path, _, candidate_family)| {
+                            .filter(|(path, _, candidate_family, _)| {
                                 family.admits(*candidate_family)
                                     && (*candidate_family != LangFamily::Go
                                         || Self::go_symbol_visible_from(
@@ -2077,7 +2161,7 @@ impl Resolver {
                             .collect();
                         candidate_count = family_hits.len();
                         (family_hits.len() == 1).then(|| {
-                            let (target_f, _, _) = family_hits[0];
+                            let (target_f, _, _, _) = family_hits[0];
                             (
                                 target_f.clone(),
                                 Resolution::UniqueGlobal {
@@ -2478,7 +2562,8 @@ impl Resolver {
     /// merge happened to produce.
     fn type_name_is_identifiable(&self, family: LangFamily, type_name: &str) -> bool {
         let mut files: BTreeSet<&str> = BTreeSet::new();
-        for (path, kind, candidate_family) in self.symbol_index.get(type_name).into_iter().flatten()
+        for (path, kind, candidate_family, _) in
+            self.symbol_index.get(type_name).into_iter().flatten()
         {
             if family.admits(*candidate_family)
                 && matches!(
@@ -2517,6 +2602,20 @@ impl Resolver {
         method: &str,
     ) -> Option<(String, String, String)> {
         let enclosing = self.declaring_type_of(file, caller_symbol)?.to_string();
+        // The caller's declaring type is an exact identity even when another
+        // file declares a namesake. Only inherited lookup needs a global name.
+        if let Some(hits) = self
+            .type_methods
+            .get(&(family, enclosing.clone(), method.to_string()))
+        {
+            let local: Vec<_> = hits.iter().filter(|(path, _)| path == file).collect();
+            if local.len() == 1 {
+                return Some((local[0].0.clone(), local[0].1.clone(), enclosing));
+            }
+            if local.len() > 1 {
+                return None;
+            }
+        }
         let mut frontier = vec![enclosing];
         let mut visited: BTreeSet<String> = BTreeSet::new();
         for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
@@ -2614,31 +2713,34 @@ impl Resolver {
     }
 
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
-        if self
-            .file_symbols
-            .get(file)
-            .is_some_and(|syms| syms.iter().any(|symbol| symbol == name))
-        {
-            return Some((file.to_string(), name.to_string()));
+        let hits = self.symbol_index.get(name)?;
+        let eligible = |path: &str, identity: &str| self.declared_at_file_level(path, identity);
+        let local: Vec<_> = hits
+            .iter()
+            .filter(|(path, _, _, identity)| path == file && eligible(path, identity))
+            .collect();
+        if local.len() == 1 {
+            return Some((file.to_string(), local[0].3.to_string()));
         }
-        if !file.ends_with(".go") {
+        if !local.is_empty() || !file.ends_with(".go") {
             return None;
         }
         let dir = Self::parent_dir(file);
-        let mut hits: Vec<(String, String)> = self
-            .file_symbols
+        let package = self.go_package_by_file.get(file)?;
+        let mut candidates: Vec<_> = hits
             .iter()
-            .filter(|(path, syms)| {
+            .filter(|(path, _, _, identity)| {
                 path.ends_with(".go")
                     && !path.ends_with("_test.go")
                     && Self::parent_dir(path) == dir
-                    && syms.iter().any(|symbol| symbol == name)
+                    && self.go_package_by_file.get(path) == Some(package)
+                    && eligible(path, identity)
             })
-            .map(|(path, _)| (path.clone(), name.to_string()))
+            .map(|(path, _, _, identity)| (path.clone(), identity.to_string()))
             .collect();
-        hits.sort();
-        hits.dedup();
-        (hits.len() == 1).then(|| hits.pop().unwrap())
+        candidates.sort();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.pop().unwrap())
     }
 
     fn go_import_edge_targets(&self, files: &[String]) -> Vec<String> {
@@ -2905,12 +3007,12 @@ impl Resolver {
         receiver: &str,
         name: &str,
     ) -> Option<ResolvedEdge> {
-        let scoped = reference.enclosing_symbol.as_deref().and_then(|scope| {
-            self.scoped_receiver_types
-                .get(&format!("{}:{}:{}", ext.file_path, scope, receiver))
-        });
-        let receiver_key = format!("{}:{}", ext.file_path, receiver);
-        if let Some(class_type) = scoped.or_else(|| self.receiver_types.get(&receiver_key)) {
+        if let Some(class_type) = self.receiver_type_for(
+            &ext.file_path,
+            reference.enclosing_symbol.as_deref(),
+            receiver,
+            ext.local_binding_at(reference.span.start_byte, receiver),
+        ) {
             let key = (family, class_type.clone(), name.to_string());
             if let Some(hits) = self.type_methods.get(&key) {
                 if hits.len() == 1 {
@@ -2959,6 +3061,12 @@ impl Resolver {
             ));
         }
 
+        if ext
+            .local_binding_at(reference.span.start_byte, receiver)
+            .is_some()
+        {
+            return None;
+        }
         let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
         let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
         Some(self.reference_edge(
@@ -3060,6 +3168,16 @@ impl Resolver {
         if name.is_empty() {
             return None;
         }
+        if matches!(
+            reference.kind,
+            ReferenceKind::Name | ReferenceKind::Call | ReferenceKind::Constructor
+        ) && reference.receiver_expr.is_none()
+            && ext
+                .local_binding_at(reference.span.start_byte, name)
+                .is_some()
+        {
+            return None;
+        }
         // X46. `Self` in type position is read as the name of the type the item
         // is written inside, and then answered by the ordinary rungs — so this
         // is a substitution, not a rung. The unresolved ledger keeps `Self`
@@ -3153,26 +3271,25 @@ impl Resolver {
         }
         let implicit_receiver = receiver.is_some_and(Self::receiver_is_self);
 
-        let same_file = receiver
-            .is_none()
-            .then(|| {
-                self.file_symbols.get(&ext.file_path).and_then(|syms| {
-                    let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
-                    (hits.len() == 1).then(|| ext.file_path.clone())
-                })
-            })
-            .flatten();
-        if let Some(target_file) = same_file {
-            if let Some(kind) = self.symbol_kind_in(&target_file, name) {
-                if !prefer_types || is_type(kind) {
+        if receiver.is_none() {
+            if let Some(identity) = self.lexical_target(
+                &ext.file_path,
+                family,
+                reference.enclosing_symbol.as_deref(),
+                name,
+            ) {
+                if self
+                    .symbol_kind_in(&ext.file_path, &identity)
+                    .is_some_and(|kind| !prefer_types || is_type(kind))
+                {
                     return Some(self.reference_edge(
                         ext,
-                        &target_file,
-                        name,
+                        &ext.file_path,
+                        &identity,
                         reference,
                         Resolution::SameFile {
-                            target_symbol: self.qualified_for(&target_file, name),
-                            target_file: target_file.clone(),
+                            target_symbol: identity.clone(),
+                            target_file: ext.file_path.clone(),
                         },
                     ));
                 }
@@ -3251,7 +3368,7 @@ impl Resolver {
         if let Some(hits) = self.symbol_index.get(name) {
             let family_hits: Vec<_> = hits
                 .iter()
-                .filter(|(path, kind, candidate_family)| {
+                .filter(|(path, kind, candidate_family, _)| {
                     family.admits(*candidate_family)
                         && (!prefer_types || is_type(*kind))
                         // X47, the same restriction X42 put on the call
@@ -3264,7 +3381,7 @@ impl Resolver {
                 })
                 .collect();
             if family_hits.len() == 1 {
-                let (target_f, _, _) = family_hits[0];
+                let (target_f, _, _, target_identity) = family_hits[0];
                 let stdlib_guard = family == LangFamily::Python
                     && matches!(
                         name,
@@ -3278,7 +3395,7 @@ impl Resolver {
                         name,
                         reference,
                         Resolution::UniqueGlobal {
-                            target_symbol: self.qualified_for(target_f, name),
+                            target_symbol: target_identity.to_string(),
                             target_file: target_f.clone(),
                             family,
                         },
@@ -3302,8 +3419,8 @@ impl Resolver {
         self.symbol_index.get(name).and_then(|hits| {
             let file_hits: Vec<_> = hits
                 .iter()
-                .filter(|(path, _, _)| path == file)
-                .map(|(_, kind, _)| *kind)
+                .filter(|(path, _, _, _)| path == file)
+                .map(|(_, kind, _, _)| *kind)
                 .collect();
             (file_hits.len() == 1).then(|| file_hits[0])
         })
@@ -4456,7 +4573,7 @@ mod ladder_tests {
         // A sibling file in the same directory resolves.
         assert_eq!(
             resolver.lookup_in_package("pkg/b.go", "Helper"),
-            Some(("pkg/a.go".to_string(), "Helper".to_string())),
+            Some(("pkg/a.go".to_string(), "pkg/a.go::Helper".to_string())),
             "a same-package sibling must resolve"
         );
 
@@ -4507,7 +4624,7 @@ mod ladder_tests {
         ]);
         assert_eq!(
             resolver.lookup_in_package("pkg/a.go", "Same"),
-            Some(("pkg/a.go".to_string(), "Same".to_string())),
+            Some(("pkg/a.go".to_string(), "pkg/a.go::Same".to_string())),
             "the querying file's own symbol must win before any package scan"
         );
     }
