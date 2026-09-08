@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>DevMap preview</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html,body{margin:0;height:100%;background:#10151f}#app{height:100%;display:flex;flex-direction:column}#harness-status{position:fixed;top:0;left:0;z-index:20;font:10px monospace;background:#20394d;color:#bde3fd;padding:3px 8px;border-radius:0 0 5px 0}</style></head>
+<body><div id="harness-status">Graph runtime harness</div><div id="app"></div>
+<script type="module">
+import "../src/app.css";
+import { mount } from "svelte";
+import DevmapHost from "./DevmapHost.svelte";
+mount(DevmapHost, { target: document.getElementById("app") });
+</script></body></html>

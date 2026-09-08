@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>GitPulse responsiveness probe</title>
+  <body>
+    <h1>UI scheduling diagnostics</h1>
+    <p>This harness runs the production responsiveness monitor. The button deliberately blocks this page for 900 ms.</p>
+    <button id="delay">Simulate delay</button>
+    <button id="stop">Stop sampling</button>
+    <p id="status">Sampling</p>
+    <pre id="report" aria-live="polite">No delay recorded</pre>
+    <script type="module">
+      import { installResponsivenessDiagnostics } from "/src/lib/diagnostics/responsiveness.ts";
+      const report = document.querySelector("#report");
+      const status = document.querySelector("#status");
+      const stop = installResponsivenessDiagnostics({
+        warn(source, detail) { report.textContent = `${source}\n${detail}`; },
+      });
+      document.querySelector("#delay").addEventListener("click", () => {
+        const end = performance.now() + 900;
+        while (performance.now() < end) { /* Deliberate bounded test stall. */ }
+        status.textContent = "Delay completed";
+      });
+      document.querySelector("#stop").addEventListener("click", () => {
+        stop();
+        status.textContent = "Sampling stopped";
+      });
+      window.addEventListener("pagehide", stop, { once: true });
+      import.meta.hot?.dispose(stop);
+    </script>
+  </body>
+</html>

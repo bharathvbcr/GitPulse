@@ -58,6 +58,8 @@ export interface WorktreeBinding {
    * marking the worktrees source degraded so the two never read the same.
    */
   operation: RepoOperation | null;
+  /** False when the non-bare worktree could not be probed. */
+  operationChecked?: boolean;
 }
 
 /** Policy outcomes counted over the ledger window this projection saw. */
@@ -212,8 +214,7 @@ function usesTaskRows(input: WorkInputs): boolean {
  * * **grant → task** comes from `scope.task_id`, for the same reason.
  *
  * Rows are ordered by how much is happening on them — a task with a lease and
- * an open PR above one with neither — and the unbound row is always last, so
- * it never displaces real work at the top of the screen.
+ * an open PR above one with neither — with parked operations first. Other unbound records follow named work.
  */
 export function projectWork(input: WorkInputs): WorkProjection {
   const rows = new Map<string, WorkRow>();
@@ -226,7 +227,7 @@ export function projectWork(input: WorkInputs): WorkProjection {
       key,
       kind: key === UNBOUND_ROW_ID ? "unbound" : kind,
       taskId: kind === "task" ? key : "",
-      title: kind === "task" ? (input.titles[key] ?? "") : "",
+      title: kind === "task" ? (Object.hasOwn(input.titles, key) ? input.titles[key] : "") : "",
       status: "",
       lease: null,
       worktrees: [],
@@ -253,15 +254,15 @@ export function projectWork(input: WorkInputs): WorkProjection {
   // worktrees belongs to both, and a PR on it is shown on both rather than
   // arbitrarily assigned to one.
   const keysByBranch = new Map<string, Set<string>>();
-  for (const worktree of input.worktrees ?? []) {
-    const taskId = input.bindings[worktree.path] ?? UNBOUND_ROW_ID;
+  for (const worktree of uniqueBy(input.worktrees ?? [], (w) => w.path)) {
+    const taskId = Object.hasOwn(input.bindings, worktree.path) ? input.bindings[worktree.path] : UNBOUND_ROW_ID;
     // In worktree mode the worktree IS the row, so it never lands in the
     // catch-all: a repository with no task store still shows one row per
     // place work is happening.
     const key = byTask ? taskId : worktree.path;
     const row = rowFor(key, byTask ? "task" : "worktree");
-    const parked = input.operations[worktree.path] ?? null;
-    row.worktrees.push({ worktree, taskId, operation: parked });
+    const parked = Object.hasOwn(input.operations, worktree.path) ? input.operations[worktree.path] : null;
+    row.worktrees.push({ worktree, taskId, operation: parked, operationChecked: worktree.is_bare || Object.hasOwn(input.operations, worktree.path) });
     // A parked operation belongs to the worktree, not to the row kind. Task
     // mode used to skip this assignment, so a DevCouncil repository mid-rebase
     // rendered as idle — the exact screen the banner exists to prevent.
@@ -280,23 +281,31 @@ export function projectWork(input: WorkInputs): WorkProjection {
 
   const rowKind: WorkRowKind = byTask ? "task" : "worktree";
 
-  for (const pr of input.pullRequests ?? []) {
-    const owners = keysByBranch.get(pr.head_ref);
-    if (owners) {
-      for (const key of owners) rowFor(key, rowKind).pullRequests.push(pr);
-    } else {
-      unbound().pullRequests.push(pr);
+  // Bound the cross product as well as each source: many worktrees may share
+  // one branch. Report both counts whenever not every association fits.
+  const MAX_ROW_LINKS = 20_000;
+  let possibleLinks = 0;
+  let shownLinks = 0;
+  function distribute<T>(items: readonly T[], branch: (item: T) => string, bucket: (row: WorkRow) => T[]): void {
+    for (const item of items) {
+      const owners = keysByBranch.get(branch(item));
+      possibleLinks += owners?.size ?? 1;
+      if (shownLinks >= MAX_ROW_LINKS) continue;
+      if (!owners) { bucket(unbound()).push(item); shownLinks += 1; continue; }
+      for (const key of owners) {
+        if (shownLinks >= MAX_ROW_LINKS) break;
+        bucket(rowFor(key, rowKind)).push(item);
+        shownLinks += 1;
+      }
     }
   }
-
-  for (const run of input.runs ?? []) {
-    const owners = keysByBranch.get(run.head_branch);
-    if (owners) {
-      for (const key of owners) rowFor(key, rowKind).runs.push(run);
-    } else {
-      unbound().runs.push(run);
-    }
-  }
+  distribute(uniqueBy(input.pullRequests ?? [], pr => pr.number), pr => pr.head_ref, row => row.pullRequests);
+  distribute(uniqueBy(input.runs ?? [], run => run.id), run => run.head_branch, row => row.runs);
+  const sources = { ...input.sources };
+  if (shownLinks < possibleLinks) sources.github = {
+    ...sources.github, ok: false, present: true,
+    detail: [sources.github.detail, `${shownLinks} of ${possibleLinks} GitHub row associations shown (display limit)`].filter(Boolean).join("; "),
+  };
 
   for (const grant of input.grants ?? []) {
     // A grant is scoped to a task and to nothing else, so in worktree mode it
@@ -327,18 +336,14 @@ export function projectWork(input: WorkInputs): WorkProjection {
   const ordered = [...rows.values()].sort(compareRows);
   return {
     rows: ordered,
-    sources: input.sources,
-    degraded: Object.values(input.sources).some((s: WorkSourceState) => !s.ok),
+    sources,
+    degraded: Object.values(sources).some((s: WorkSourceState) => !s.ok),
   };
 }
 
 /** How much is going on, for ordering. Never a claim about importance. */
 function weight(row: WorkRow): number {
   return (
-    // A parked operation outranks everything: that worktree is blocked on a
-    // person, and burying it under a row with more pull requests would hide
-    // the only thing on this screen that needs doing right now.
-    (row.operation ? 16 : 0) +
     (row.lease ? 8 : 0) +
     row.pullRequests.length * 4 +
     row.worktrees.length * 2 +
@@ -348,15 +353,65 @@ function weight(row: WorkRow): number {
   );
 }
 
-/** Uncommitted files across this row's worktrees; -1 when none were scanned. */
-export function dirtyCount(row: WorkRow): number {
-  let total = -1;
-  for (const binding of row.worktrees) {
-    const dirty = binding.worktree.dirty_files;
-    if (dirty === null || dirty === undefined) continue;
-    total = total < 0 ? dirty : total + dirty;
+/** Preserve identity once when a source repeats records. */
+function uniqueBy<T>(items: readonly T[], key: (item: T) => string | number): T[] {
+  const seen = new Set<string | number>();
+  return items.filter(item => {
+    const id = key(item);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+export function measuredDirty(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Known files and scan coverage travel together, including mixed task rows. */
+export function dirtySummary(row: WorkRow): { files: number; scanned: number; total: number } {
+  let files = 0;
+  let scanned = 0;
+  let total = 0;
+  for (const { worktree } of row.worktrees) {
+    if (worktree.is_bare) continue;
+    total += 1;
+    if (!measuredDirty(worktree.dirty_files)) continue;
+    if (!Number.isSafeInteger(files + worktree.dirty_files)) continue;
+    files += worktree.dirty_files;
+    scanned += 1;
   }
-  return total;
+  return { files, scanned, total };
+}
+
+/** Known uncommitted files; zero only when every worktree was measured clean. */
+export function dirtyCount(row: WorkRow): number {
+  const { files, scanned, total } = dirtySummary(row);
+  return files > 0 || (scanned > 0 && scanned === total) ? files : -1;
+}
+
+/** Latest observed run per workflow and branch; old failures do not imply current failure. */
+export function latestRuns(row: WorkRow): WorkflowRunInfo[] {
+  const latest = new Map<string, WorkflowRunInfo>();
+  for (const run of row.runs) {
+    const key = JSON.stringify([run.head_branch, run.name]);
+    const previous = latest.get(key);
+    const time = Date.parse(run.created_at);
+    const previousTime = previous ? Date.parse(previous.created_at) : NaN;
+    if (!previous || (Number.isFinite(time) && Number.isFinite(previousTime)
+      ? time > previousTime || (time === previousTime && run.id > previous.id)
+      : run.id > previous.id)) latest.set(key, run);
+  }
+  return [...latest.values()];
+}
+
+export function rowNeedsAttention(row: WorkRow): boolean {
+  const dirty = dirtySummary(row);
+  return row.operation !== null || dirty.files > 0 || dirty.scanned < dirty.total ||
+    row.worktrees.some(binding => binding.operationChecked === false) ||
+    row.pullRequests.some(pr => pr.ci_status.toLowerCase() === "failure" || pr.review_decision.toUpperCase() === "CHANGES_REQUESTED") ||
+    latestRuns(row).some(run => run.status.toLowerCase() === "completed" &&
+      ["failure", "timed_out", "action_required", "startup_failure"].includes(run.conclusion.toLowerCase()));
 }
 
 /** The worktree on this row that is blocked, if any. */
@@ -376,8 +431,10 @@ export function openPathFor(row: WorkRow): string {
 }
 
 function compareRows(a: WorkRow, b: WorkRow): number {
-  // The unbound row is last whatever it holds: it is a bucket, not a task, and
-  // in a repository that has just started binding it holds everything.
+  // Parked operations stay first even when the unbound bucket holds one.
+  if (Boolean(a.operation) !== Boolean(b.operation)) return a.operation ? -1 : 1;
+  if (a.key === b.key) return 0;
+  // Other unbound records follow named work.
   if (a.key === UNBOUND_ROW_ID) return 1;
   if (b.key === UNBOUND_ROW_ID) return -1;
   const byWeight = weight(b) - weight(a);
@@ -407,6 +464,7 @@ export interface WorkInsightSummary {
   blocked: number;
   pullRequests: number;
   unscannedDirty: number;
+  unscannedOperations: number;
 }
 
 /**
@@ -420,17 +478,20 @@ export function insightSummary(projection: WorkProjection): WorkInsightSummary {
   let worktrees = 0;
   let dirtyWorktrees = 0;
   let unscannedDirty = 0;
+  let unscannedOperations = 0;
   let blocked = 0;
-  let pullRequests = 0;
+  const pullRequests = new Set<number>();
   const paths: string[] = [];
   for (const row of projection.rows) {
-    pullRequests += row.pullRequests.length;
+    for (const pr of row.pullRequests) pullRequests.add(pr.number);
     if (row.operation) blocked += 1;
     for (const binding of row.worktrees) {
       worktrees += 1;
       paths.push(binding.worktree.path);
+      if (binding.operationChecked === false) unscannedOperations += 1;
+      if (binding.worktree.is_bare) continue;
       const dirty = binding.worktree.dirty_files;
-      if (dirty === null || dirty === undefined) unscannedDirty += 1;
+      if (!measuredDirty(dirty)) unscannedDirty += 1;
       else if (dirty > 0) dirtyWorktrees += 1;
     }
   }
@@ -440,8 +501,9 @@ export function insightSummary(projection: WorkProjection): WorkInsightSummary {
     agentKinds: agentKindsOn(paths),
     dirtyWorktrees,
     blocked,
-    pullRequests,
+    pullRequests: pullRequests.size,
     unscannedDirty,
+    unscannedOperations,
   };
 }
 
@@ -451,5 +513,5 @@ export function degradedSummary(sources: WorkSources): string {
     .filter(([, state]) => !(state as WorkSourceState).ok)
     .map(([name, state]) => `${name} (${(state as WorkSourceState).detail || "no reason given"})`);
   if (failed.length === 0) return "";
-  return `This screen is incomplete — could not read ${failed.join(", ")}.`;
+  return `This screen is incomplete: ${failed.join("; ")}.`;
 }

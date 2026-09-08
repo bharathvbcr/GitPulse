@@ -8,6 +8,7 @@ export default defineConfig({
   // Same definition as the production build, from the same source.
   define: {
     __APP_VERSION__: JSON.stringify(appVersion()),
+    __APP_BUILD_ID__: JSON.stringify("vitest"),
   },
   test: {
     environment: "node",

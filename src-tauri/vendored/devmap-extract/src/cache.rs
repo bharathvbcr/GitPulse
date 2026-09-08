@@ -572,12 +572,9 @@ pub(crate) fn base_grammar_identity(language: &str) -> String {
                 "astro",
                 tree_sitter_astro_next::LANGUAGE.into(),
             ),
-            "cobol" => (
-                "vendored/tree-sitter-cobol",
-                "depth1",
-                "cobol",
-                crate::treesitter::vendored::cobol(),
-            ),
+            // Deliberately unlinked (UNSAFE_GRAMMARS / MSVC VLAs). Fingerprint
+            // must not call into a grammar that is not in the binary.
+            "cobol" => return "unavailable:cobol".to_string(),
             "liquid" => (
                 "vendored/tree-sitter-liquid",
                 "depth1",
@@ -656,7 +653,6 @@ mod tests {
             "svelte",
             "astro",
             "vue",
-            "cobol",
             "liquid",
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -678,12 +674,10 @@ mod tests {
 
         // An unlinked language is explicitly unavailable rather than silently
         // sharing someone else's identity.
-        // VB.NET is the one declared language with no grammar anywhere — not on
-        // crates.io, not in any reachable upstream repository — so it is the
-        // honest example of the unavailable path. This assertion previously
-        // named `cobol`, which quietly stopped testing anything the moment a
-        // cobol grammar was vendored.
+        // VB.NET never had a grammar. COBOL's sources remain under vendor/ but
+        // are deliberately not compiled (non-terminating scanner; MSVC VLAs).
         assert!(grammar_version_for("vb").starts_with("unavailable:"));
+        assert_eq!(grammar_version_for("cobol"), "unavailable:cobol");
     }
 
     #[test]

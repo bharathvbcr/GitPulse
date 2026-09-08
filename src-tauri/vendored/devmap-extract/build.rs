@@ -113,6 +113,14 @@ fn build_vendored_grammars(manifest_dir: &Path) -> Result<(), Box<dyn Error>> {
             .and_then(|n| n.to_str())
             .ok_or("vendored grammar directory has no name")?
             .to_string();
+        // COBOL is in UNSAFE_GRAMMARS and must not be linked: its scanner uses
+        // VLAs that MSVC rejects (C2057), and even on Unix the grammar does not
+        // terminate on malformed input. Keep the sources in vendor/ for the
+        // day a terminating grammar replaces them; do not compile them.
+        if name == "cobol" {
+            println!("cargo:rerun-if-changed={}", dir.display());
+            continue;
+        }
         println!("cargo:rerun-if-changed={}", dir.display());
 
         let mut build = cc::Build::new();

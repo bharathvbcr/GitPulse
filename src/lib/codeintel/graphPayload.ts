@@ -5,8 +5,30 @@
  * vs total when the sample is capped.
  */
 
-import type { GraphVizCounts, GraphVizLink, GraphVizNode, GraphVizPayload } from "./types";
+import type { GraphVizCounts, GraphVizLink, GraphVizNode } from "./types";
 import { DOC_GRAPH_EXTENT } from "../docs/docGraphPayload";
+import { getLanguageDisplayName, resolveLanguageIconKey, type LanguageIconKey } from "../language/languageLogos";
+
+/** Metadata wins; older payloads can still identify a language by source path. */
+export function nodeLanguageKey(node: GraphVizNode): LanguageIconKey {
+  for (const candidate of [node.language, node.lang, node.path, node.id.split("::")[0], node.kind === "file" ? node.name : ""]) {
+    const key = resolveLanguageIconKey(candidate ?? "");
+    if (key !== "file") return key;
+  }
+  return "file";
+}
+
+/** Counts describe the rendered sample, including nodes of unknown language. */
+export function graphLanguageLegend(nodes: GraphVizNode[]): Array<{ key: LanguageIconKey; name: string; count: number }> {
+  const counts = new Map<LanguageIconKey, number>();
+  for (const node of nodes) {
+    const key = nodeLanguageKey(node);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts].map(([key, count]) => ({
+    key, name: key === "file" ? "Other / unknown" : getLanguageDisplayName(key), count,
+  })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
 
 export interface LaidOutNode extends GraphVizNode {
   x: number;
@@ -15,13 +37,27 @@ export interface LaidOutNode extends GraphVizNode {
   colorIndex: number;
 }
 
+export interface GraphCommunity {
+  name: string;
+  label: string;
+  count: number;
+  shown: number;
+  colorIndex: number;
+  bounds: { x: number; y: number; radius: number } | null;
+}
+
+export function nodeCommunity(node: GraphVizNode): string {
+  return (node.community || node.area || "").trim() || "_";
+}
+
 export interface CodeGraphModel {
   nodes: LaidOutNode[];
   links: Array<GraphVizLink & { sourceIndex: number; targetIndex: number }>;
-  communities: Array<{ name: string; count: number; colorIndex: number }>;
+  communities: GraphCommunity[];
   counts: GraphVizCounts | null;
   level: string | null;
   generationId: string | null;
+  warnings: string[];
 }
 
 export interface TruncationLegend {
@@ -40,19 +76,39 @@ function asFinite(n: unknown, fallback = 0): number {
   return typeof n === "number" && Number.isFinite(n) ? n : fallback;
 }
 
-export function normalizeCounts(raw: GraphVizCounts | null | undefined): GraphVizCounts | null {
-  if (!raw || typeof raw !== "object") return null;
-  const nodes_shown = asFinite(raw.nodes_shown);
-  const nodes_total = asFinite(raw.nodes_total, nodes_shown);
-  const nodes_truncated = Boolean(raw.nodes_truncated) || nodes_shown < nodes_total;
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function count(value: unknown): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(asFinite(value))));
+}
+
+function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= 16_384 ? value : undefined;
+}
+
+export function normalizeCounts(raw: unknown): GraphVizCounts | null {
+  const value = asRecord(raw);
+  if (!value) return null;
+  const nodes_shown = count(value.nodes_shown);
+  const nodes_total = Math.max(nodes_shown, count(value.nodes_total));
   return {
-    nodes_shown,
-    nodes_total,
-    nodes_truncated,
-    links_shown: raw.links_shown != null ? asFinite(raw.links_shown) : undefined,
-    links_total: raw.links_total != null ? asFinite(raw.links_total) : undefined,
-    max_nodes: raw.max_nodes != null ? asFinite(raw.max_nodes) : undefined,
+    nodes_shown, nodes_total,
+    nodes_truncated: value.nodes_truncated === true || nodes_shown < nodes_total,
+    links_shown: value.links_shown != null ? count(value.links_shown) : undefined,
+    links_total: value.links_total != null ? Math.max(count(value.links_shown), count(value.links_total)) : undefined,
+    max_nodes: value.max_nodes != null ? count(value.max_nodes) : undefined,
   };
+}
+
+function graphCoverageLabel(raw: unknown): string | null {
+  const value = asRecord(raw);
+  const indexed = value?.indexed_total, inSubs = value?.in_subsystems;
+  if (typeof indexed !== "number" || typeof inSubs !== "number" ||
+      !Number.isSafeInteger(indexed) || !Number.isSafeInteger(inSubs) ||
+      indexed < 0 || inSubs < 0 || inSubs > indexed) return null;
+  return `${inSubs} of ${indexed} indexed files in subsystems`;
 }
 
 /**
@@ -61,15 +117,10 @@ export function normalizeCounts(raw: GraphVizCounts | null | undefined): GraphVi
  */
 export function truncationLegend(
   counts: GraphVizCounts | null,
-  coverage?: { indexed_total?: number; in_subsystems?: number } | null,
+  coverage?: unknown,
 ): TruncationLegend {
+  const coverageLabel = graphCoverageLabel(coverage);
   if (!counts) {
-    const indexed = coverage?.indexed_total;
-    const inSubs = coverage?.in_subsystems;
-    const coverageLabel =
-      indexed != null && inSubs != null
-        ? `${inSubs} of ${indexed} indexed files in subsystems`
-        : null;
     return {
       nodesLabel: "—",
       linksLabel: null,
@@ -96,18 +147,15 @@ export function truncationLegend(
   }
 
   const maxNodes = counts.max_nodes ?? null;
-  const honesty = nodesTruncated
+  let honesty = nodesTruncated
     ? maxNodes != null
-      ? `Showing the ${counts.nodes_shown} most-connected of ${counts.nodes_total} (cap ${maxNodes}). This is not the whole graph.`
+      ? `Showing ${counts.nodes_shown} of ${counts.nodes_total} nodes (cap ${maxNodes}). This is not the whole graph.`
       : `Showing ${counts.nodes_shown} of ${counts.nodes_total}. This is not the whole graph.`
     : null;
 
-  const indexed = coverage?.indexed_total;
-  const inSubs = coverage?.in_subsystems;
-  const coverageLabel =
-    indexed != null && inSubs != null
-      ? `${inSubs} of ${indexed} indexed files in subsystems`
-      : null;
+  if (counts.links_shown != null && counts.links_total != null && counts.links_shown < counts.links_total) {
+    honesty = [honesty, `Showing ${counts.links_shown} of ${counts.links_total} links; some relationships are outside this view.`].filter(Boolean).join(" ");
+  }
 
   return {
     nodesLabel,
@@ -120,154 +168,281 @@ export function truncationLegend(
 }
 
 /**
- * Deterministic 2D layout: community clusters on a ring, nodes on local spirals.
- * Honours payload `x`/`y` when both are finite. Doc-graph coords (`level` doc)
- * arrive in a 1000×1000 extent and are scaled into the canvas box here.
+ * Pack size-aware communities into shelves, then fit the whole arrangement.
+ * A golden-angle disk distributes members through each group's interior;
+ * high-degree nodes start near its center. Dependency-based slot refinement
+ * shortens edges without introducing collisions or a continuously moving map.
+ * Supplied coordinates (including the document graph) remain authoritative.
  */
 export function layoutNodes(
   nodes: GraphVizNode[],
   width: number,
   height: number,
-  options?: { scaleDocExtent?: boolean },
+  options?: { scaleDocExtent?: boolean; links?: readonly GraphVizLink[] },
 ): LaidOutNode[] {
-  const cx = width / 2;
-  const cy = height / 2;
-  const communityIndex = new Map<string, number>();
-  let nextCommunity = 0;
-  const pad = 24;
-  const scaleDoc = Boolean(options?.scaleDocExtent);
-  const docScaleX = (Math.max(160, width) - pad * 2) / DOC_GRAPH_EXTENT;
-  const docScaleY = (Math.max(160, height) - pad * 2) / DOC_GRAPH_EXTENT;
-
-  const withCoords = nodes.map((node) => {
-    const community = (node.community || node.area || "").trim() || "_";
-    if (!communityIndex.has(community)) {
-      communityIndex.set(community, nextCommunity++);
+  width = Math.max(160, asFinite(width, 800));
+  height = Math.max(160, asFinite(height, 560));
+  const names = [...new Set(nodes.map(nodeCommunity))].sort();
+  const colors = new Map(names.map((name, index) => [name, index]));
+  const byCommunity = new Map<string, LaidOutNode[]>();
+  const result = nodes.map((node): LaidOutNode => {
+    const degree = Math.max(1, asFinite(node.degree, asFinite(node.val, 1)));
+    const laidOut = {
+      ...node, x: 0, y: 0,
+      radius: Math.min(9, 4 + Math.sqrt(degree)),
+      colorIndex: colors.get(nodeCommunity(node)) ?? 0,
+    };
+    if (typeof node.x === "number" && Number.isFinite(node.x) &&
+        typeof node.y === "number" && Number.isFinite(node.y)) {
+      laidOut.x = options?.scaleDocExtent ? 24 + node.x * (width - 48) / DOC_GRAPH_EXTENT : node.x;
+      laidOut.y = options?.scaleDocExtent ? 24 + node.y * (height - 48) / DOC_GRAPH_EXTENT : node.y;
+    } else {
+      const name = nodeCommunity(node);
+      const members = byCommunity.get(name) ?? [];
+      members.push(laidOut);
+      byCommunity.set(name, members);
     }
-    const colorIndex = communityIndex.get(community) ?? 0;
-    const degree = asFinite(node.degree, asFinite(node.val, 1));
-    const radius = Math.min(14, 4 + Math.sqrt(Math.max(1, degree)));
-
-    if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
-      let x = node.x as number;
-      let y = node.y as number;
-      if (scaleDoc) {
-        x = pad + x * docScaleX;
-        y = pad + y * docScaleY;
-      }
-      return {
-        ...node,
-        x,
-        y,
-        radius,
-        colorIndex,
-      };
-    }
-    return { ...node, x: 0, y: 0, radius, colorIndex, _community: community };
+    return laidOut;
   });
-
-  const byCommunity = new Map<string, number[]>();
-  withCoords.forEach((node, i) => {
-    if (Number.isFinite(nodes[i]?.x) && Number.isFinite(nodes[i]?.y)) return;
-    const community = (node.community || node.area || "").trim() || "_";
-    const list = byCommunity.get(community) ?? [];
-    list.push(i);
-    byCommunity.set(community, list);
-  });
-
-  const communities = [...byCommunity.keys()];
-  const ringR = Math.min(width, height) * 0.32;
-  communities.forEach((name, ci) => {
-    const angle = (2 * Math.PI * ci) / Math.max(1, communities.length) - Math.PI / 2;
-    const clusterX = cx + Math.cos(angle) * ringR;
-    const clusterY = cy + Math.sin(angle) * ringR;
-    const members = byCommunity.get(name) ?? [];
-    members.forEach((idx, mi) => {
-      const localAngle = (2 * Math.PI * mi) / Math.max(1, members.length);
-      const localR = 18 + Math.min(80, members.length * 4);
-      withCoords[idx].x = clusterX + Math.cos(localAngle) * localR;
-      withCoords[idx].y = clusterY + Math.sin(localAngle) * localR;
+  const groups = [...byCommunity].map(([name, members]) => ({
+    name, members, radius: 24 * Math.sqrt(members.length) + 34, x: 0, y: 0,
+  })).sort((a, b) => b.members.length - a.members.length || a.name.localeCompare(b.name));
+  const area = groups.reduce((sum, group) => sum + (group.radius * 2) ** 2, 0);
+  const shelfWidth = Math.max(groups[0]?.radius * 2 || 0, Math.sqrt(area * width / height));
+  let x = 0, y = 0, rowHeight = 0, usedWidth = 0;
+  for (const group of groups) {
+    const size = group.radius * 2;
+    if (x > 0 && x + size > shelfWidth) { y += rowHeight; x = 0; rowHeight = 0; }
+    group.x = x + group.radius;
+    group.y = y + group.radius;
+    x += size;
+    rowHeight = Math.max(rowHeight, size);
+    usedWidth = Math.max(usedWidth, x);
+  }
+  const usedHeight = y + rowHeight;
+  const fit = Math.min((width - 48) / Math.max(1, usedWidth), (height - 64) / Math.max(1, usedHeight));
+  const offsetX = (width - usedWidth * fit) / 2;
+  const offsetY = (height - usedHeight * fit) / 2;
+  for (const group of groups) {
+    group.members.sort((a, b) => b.radius - a.radius || a.id.localeCompare(b.id));
+    group.members.forEach((node, index) => {
+      const angle = index * Math.PI * (3 - Math.sqrt(5));
+      const distance = 24 * Math.sqrt(index);
+      node.x = offsetX + (group.x + Math.cos(angle) * distance) * fit;
+      node.y = offsetY + (group.y + Math.sin(angle) * distance) * fit;
+      node.radius *= Math.min(1.6, fit);
     });
-  });
+  }
+  refineDependencyLayout(result, groups.map(group => group.members), options?.links ?? []);
+  return result;
+}
 
-  // Strip helper field
-  return withCoords.map(({ ...rest }) => {
-    const cleaned = { ...rest } as LaidOutNode & { _community?: string };
-    delete cleaned._community;
-    return cleaned;
-  });
+/**
+ * Swap occupied slots only when total squared edge length decreases. Spacing
+ * and group separation survive by construction; supplied coordinates never
+ * move. Stable node/neighbor order and an operation budget make refreshes
+ * deterministic, including when a dense graph exhausts the refinement budget.
+ */
+function refineDependencyLayout(nodes: LaidOutNode[], groups: LaidOutNode[][], links: readonly GraphVizLink[]): void {
+  if (!links.length) return;
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const neighbors = new Map<string, LaidOutNode[]>();
+  for (const link of links) {
+    const a = byId.get(link.source), b = byId.get(link.target);
+    if (!a || !b || a === b) continue;
+    const out = neighbors.get(a.id) ?? [], into = neighbors.get(b.id) ?? [];
+    out.push(b); into.push(a);
+    neighbors.set(a.id, out); neighbors.set(b.id, into);
+  }
+  for (const rows of neighbors.values()) rows.sort((a,b) => a.id.localeCompare(b.id));
+  let visits = 0;
+  for (let pass = 0; pass < 8; pass++) {
+    for (const members of groups) {
+      for (let i = 0; i < members.length; i++) {
+        const a = members[i];
+        for (let trial = 0; trial < 3; trial++) {
+          // Three reproducible candidates per pass; no random or wall-clock seed.
+          const b = members[(i + 1 + ((i * 31 + pass * 131 + trial * 47) % members.length)) % members.length];
+          if (a === b) continue;
+          const from = neighbors.get(a.id) ?? [], to = neighbors.get(b.id) ?? [];
+          visits += from.length + to.length;
+          if (visits > 2_000_000) return;
+          let delta = 0;
+          for (const n of from) {
+            if (n === b) continue;
+            delta += (b.x-n.x)**2 + (b.y-n.y)**2 - (a.x-n.x)**2 - (a.y-n.y)**2;
+          }
+          for (const n of to) {
+            if (n === a) continue;
+            delta += (a.x-n.x)**2 + (a.y-n.y)**2 - (b.x-n.x)**2 - (b.y-n.y)**2;
+          }
+          if (delta < -1e-8) {
+            [a.x,b.x] = [b.x,a.x];
+            [a.y,b.y] = [b.y,a.y];
+          }
+        }
+      }
+    }
+  }
+}
+
+/** Naming convention only: used consistently by captions and the test filter. */
+export function isGraphTestPath(path: string): boolean {
+  const parts = path.replace(/\\/g, "/").split("/");
+  const stem = (parts.pop() || "").replace(/\.[^.]+$/, "");
+  return parts.some(part => /^(?:__)?(?:tests?|specs?)(?:__)?$/i.test(part)) ||
+    /(?:^test[_.-]|[._-](?:tests?|specs?)$|(?:Tests?|Specs?)$)/.test(stem);
+}
+
+function communityLabel(name: string, nodes: LaidOutNode[]): string {
+  if (name !== "_" && !/^community[-_]\d+$/.test(name)) return name;
+  // Test suites often outnumber the source files in a community. Prefer its
+  // source area for the caption, without excluding tests from the graph.
+  // Each file gets one vote even in a graph with many symbols per file.
+  const paths = [...new Set(nodes.map(node => (node.path || "").replace(/\\/g, "/")).filter(Boolean))];
+  const sourcePaths = paths.filter(path => !isGraphTestPath(path));
+  const directories = new Map<string, number>();
+  for (const path of sourcePaths.length ? sourcePaths : paths) {
+    const parts = path.split("/");
+    parts.pop();
+    const directory = parts.slice(-2).join("/");
+    if (directory) directories.set(directory, (directories.get(directory) ?? 0) + 1);
+  }
+  return [...directories].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0]
+    ?? (name === "_" ? "Ungrouped" : name.replace(/^community[-_]/, "Group "));
 }
 
 export function buildCodeGraphModel(
-  payload: GraphVizPayload | null | undefined,
+  payload: unknown,
   width = 800,
   height = 560,
 ): CodeGraphModel {
-  const nodesRaw = Array.isArray(payload?.nodes) ? payload!.nodes : [];
-  const linksRaw = Array.isArray(payload?.links) ? payload!.links : [];
-  const counts = normalizeCounts(payload?.counts ?? null);
-
-  // For map-preview (no counts), synthesize shown==total from the node list so
-  // the legend still has a number — but never invent a truncated=false claim
-  // that hides coverage gaps; coverage rides separately.
-  const effectiveCounts =
-    counts ??
-    (nodesRaw.length > 0
-      ? {
-          nodes_shown: nodesRaw.length,
-          nodes_total: nodesRaw.length,
-          nodes_truncated: false,
-          links_shown: linksRaw.length,
-          links_total: linksRaw.length,
-        }
-      : null);
-
-  const nodes = layoutNodes(nodesRaw, width, height, {
-    scaleDocExtent: payload?.level === "doc",
-  });
-  const indexById = new Map(nodes.map((n, i) => [n.id, i]));
-
-  const links = linksRaw
-    .map((link) => {
-      const sourceIndex = indexById.get(link.source);
-      const targetIndex = indexById.get(link.target);
-      if (sourceIndex == null || targetIndex == null) return null;
-      return { ...link, sourceIndex, targetIndex };
-    })
-    .filter((l): l is GraphVizLink & { sourceIndex: number; targetIndex: number } => l != null);
-
-  const communityCounts = payload?.communities ?? {};
-  const communities = Object.entries(communityCounts)
-    .map(([name, count], colorIndex) => ({
-      name,
-      count: asFinite(count),
-      colorIndex,
-    }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-
-  // When communities object is empty, derive from laid-out nodes.
-  if (communities.length === 0) {
-    const derived = new Map<string, { count: number; colorIndex: number }>();
-    for (const node of nodes) {
-      const name = (node.community || node.area || "").trim();
-      if (!name) continue;
-      const prev = derived.get(name);
-      if (prev) prev.count += 1;
-      else derived.set(name, { count: 1, colorIndex: node.colorIndex });
+  const data = asRecord(payload) ?? {};
+  const nodeRows: unknown[] = Array.isArray(data.nodes) ? data.nodes : [];
+  const linkRows: unknown[] = Array.isArray(data.links) ? data.links : [];
+  const counts = normalizeCounts(data.counts);
+  const warnings: string[] = [];
+  const coverage = asRecord(data.meta)?.coverage;
+  if (coverage != null && !graphCoverageLabel(coverage)) warnings.push("Invalid subsystem coverage metadata; indexed-file coverage is unavailable.");
+  if (payload != null && (!Array.isArray(data.nodes) || !Array.isArray(data.links))) {
+    warnings.push("Invalid graph payload: nodes and links must be arrays.");
+  }
+  const nodeIds = new Map<string, GraphVizNode | null>();
+  let invalidNodes = 0;
+  const scanNodes = Math.min(nodeRows.length, 100_000);
+  for (let i = 0; i < scanNodes; i++) {
+    const row = asRecord(nodeRows[i]);
+    const id = textValue(row?.id);
+    if (!row || !id) { invalidNodes++; continue; }
+    if (nodeIds.has(id)) {
+      invalidNodes += nodeIds.get(id) === null ? 1 : 2;
+      nodeIds.set(id, null);
+      continue;
     }
-    for (const [name, { count, colorIndex }] of derived) {
-      communities.push({ name, count, colorIndex });
+    const flags = Array.isArray(row.flags) ? row.flags.slice(0, 50).flatMap((raw: unknown) => {
+      const flag = asRecord(raw);
+      const name = textValue(flag?.flag);
+      return name ? [{ flag: name, confidence: textValue(flag?.confidence) }] : [];
+    }) : [];
+    nodeIds.set(id, {
+      id, name: textValue(row.name) || id, path: textValue(row.path), kind: textValue(row.kind),
+      community: textValue(row.community), area: textValue(row.area), language: textValue(row.language), lang: textValue(row.lang),
+      degree: Math.max(0, asFinite(row.degree, asFinite(row.val, 1))),
+      val: asFinite(row.val), file_count: count(row.file_count), summary: textValue(row.summary),
+      line: count(row.line), entry: row.entry === true, flags,
+      x: typeof row.x === "number" && Number.isFinite(row.x) && Math.abs(row.x) <= 1e7 ? row.x : undefined,
+      y: typeof row.y === "number" && Number.isFinite(row.y) && Math.abs(row.y) <= 1e7 ? row.y : undefined,
+    });
+  }
+  const nodesRaw = [...nodeIds.values()].filter((node): node is GraphVizNode => node !== null);
+  if (nodesRaw.length > 5000) {
+    nodesRaw.sort((a, b) => (b.degree ?? 0) - (a.degree ?? 0) || a.id.localeCompare(b.id));
+    nodesRaw.length = 5000;
+  }
+  if (invalidNodes) warnings.push(`${invalidNodes} invalid or ambiguous node rows omitted.`);
+  if (scanNodes < nodeRows.length) warnings.push(`Examined ${scanNodes} of ${nodeRows.length} node rows; input exceeds the processing limit.`);
+  const projection = asRecord(asRecord(data.meta)?.projection);
+  const omitted = count(projection?.invalid_nodes) + count(projection?.invalid_edges);
+  if (omitted) warnings.push(`${omitted} invalid or unresolved graph records omitted by the index projection.`);
+  const level = textValue(data.level) ?? null;
+  const indexById = new Map(nodesRaw.map((n, i) => [n.id, i]));
+
+  const links: CodeGraphModel["links"] = [];
+  const linkKeys = new Set<string>();
+  let invalidLinks = 0, duplicateLinks = 0;
+  const scanLinks = Math.min(linkRows.length, 500_000);
+  for (let i = 0; i < scanLinks; i++) {
+    const row = asRecord(linkRows[i]);
+    const source = textValue(row?.source), target = textValue(row?.target);
+    if (!row || !source || !target || !nodeIds.get(source) || !nodeIds.get(target)) { invalidLinks++; continue; }
+    const sourceIndex = indexById.get(source), targetIndex = indexById.get(target);
+    if (sourceIndex == null || targetIndex == null) continue;
+    const kind = textValue(row.kind);
+    const key = JSON.stringify([source, target, kind ?? ""]);
+    if (linkKeys.has(key)) { duplicateLinks++; continue; }
+    linkKeys.add(key);
+    if (links.length >= 50_000) continue;
+    const confidence = typeof row.confidence === "number" && Number.isFinite(row.confidence) && row.confidence >= 0 && row.confidence <= 1 ? row.confidence : null;
+    links.push({ source, target, sourceIndex, targetIndex, kind, confidence,
+      resolution: textValue(row.resolution), label: textValue(row.label), evidence_count: Math.max(1, count(row.evidence_count)),
+    });
+  }
+  if (invalidLinks) warnings.push(`${invalidLinks} invalid links or links with ambiguous endpoints omitted.`);
+  if (duplicateLinks) warnings.push(`${duplicateLinks} duplicate links merged.`);
+  if (scanLinks < linkRows.length) warnings.push(`Examined ${scanLinks} of ${linkRows.length} link rows; input exceeds the processing limit.`);
+  const nodes = layoutNodes(nodesRaw, width, height, {scaleDocExtent:level === "doc", links});
+  const nodesTotal = Math.max(nodeRows.length, counts?.nodes_total ?? 0);
+  const linksTotal = Math.max(linkRows.length, counts?.links_total ?? 0);
+  const effectiveCounts: GraphVizCounts | null = payload == null ? null : {
+    nodes_shown: nodes.length, nodes_total: nodesTotal,
+    nodes_truncated: Boolean(counts?.nodes_truncated) || nodes.length < nodesTotal,
+    links_shown: links.length, links_total: linksTotal,
+    max_nodes: nodeRows.length > 5000 ? 5000 : counts?.max_nodes,
+  };
+  const communityCounts = asRecord(data.communities);
+
+  const grouped = new Map<string, LaidOutNode[]>();
+  for (const node of nodes) {
+    const name = nodeCommunity(node);
+    const members = grouped.get(name) ?? [];
+    members.push(node);
+    grouped.set(name, members);
+  }
+  const communities: GraphCommunity[] = [...grouped].map(([name, members]) => {
+    const minX = Math.min(...members.map(n => n.x - n.radius));
+    const maxX = Math.max(...members.map(n => n.x + n.radius));
+    const minY = Math.min(...members.map(n => n.y - n.radius));
+    const maxY = Math.max(...members.map(n => n.y + n.radius));
+    const x = (minX + maxX) / 2, y = (minY + maxY) / 2;
+    const radius = Math.max(...members.map(n => Math.hypot(n.x - x, n.y - y) + n.radius));
+    const hasCoordinates = members.some(n => {
+      const raw = nodesRaw[indexById.get(n.id) ?? -1];
+      return Number.isFinite(raw?.x) && Number.isFinite(raw?.y);
+    });
+    return {
+      name, label: communityLabel(name, members), shown: members.length,
+      count: Math.max(members.length, count(communityCounts?.[name])),
+      colorIndex: members[0].colorIndex,
+      bounds: hasCoordinates ? null : { x, y, radius },
+    };
+  }).sort((a, b) => b.shown - a.shown || a.name.localeCompare(b.name));
+
+  const labelCounts = new Map<string, number>();
+  for (const group of communities) labelCounts.set(group.label, (labelCounts.get(group.label) ?? 0) + 1);
+  for (const group of communities) {
+    if ((labelCounts.get(group.label) ?? 0) > 1 && group.label !== group.name) {
+      group.label += ` · ${group.name.replace(/^community[-_]/, "#")}`;
     }
-    communities.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   }
 
-  const gen = payload?.generation_id;
+  const gen = typeof data.generation_id === "number" && Number.isFinite(data.generation_id) ? data.generation_id : textValue(data.generation_id);
   return {
     nodes,
     links,
     communities,
     counts: effectiveCounts,
-    level: payload?.level ?? null,
+    level,
+    warnings,
     generationId: gen == null ? null : String(gen),
   };
 }

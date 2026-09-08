@@ -1,4 +1,4 @@
-//! Code intelligence module: in-process devmap querying over `.devcouncil/codeintel/devmap.sqlite`.
+//! Code intelligence module: in-process devmap querying over devmap's resolved state directory.
 //!
 //! Links `devmap-query` and `devmap-store` directly without requiring a background
 //! daemon or Unix socket. Provides fast symbol search, impact analysis, dependency
@@ -142,9 +142,7 @@ pub fn devmap_db_path(repo_path: &str) -> PathBuf {
 }
 
 fn map_path(repo: &Path) -> PathBuf {
-    repo.join(".devcouncil")
-        .join("codeintel")
-        .join("devmap.sqlite")
+    devmap_query::paths::store_path(repo)
 }
 
 /// Resolves `repo_path` through the same gate every other repository-scoped
@@ -1258,9 +1256,56 @@ mod tests {
     }
 
     #[test]
-    fn devmap_db_path_construction() {
-        let path = devmap_db_path("/test/repo");
-        assert!(path.ends_with(".devcouncil/codeintel/devmap.sqlite"));
+    fn devmap_db_path_follows_the_canonical_state_directory_precedence() {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let standalone = repo.path().join(".devmap");
+        let legacy = repo.path().join(".devcouncil");
+
+        assert_eq!(
+            devmap_db_path(repo.path().to_str().unwrap()),
+            standalone.join("codeintel/devmap.sqlite"),
+            "a fresh repository uses the standalone layout"
+        );
+
+        std::fs::create_dir_all(&legacy).expect("legacy state");
+        assert_eq!(
+            devmap_db_path(repo.path().to_str().unwrap()),
+            legacy.join("codeintel/devmap.sqlite"),
+            "a legacy-only repository remains readable"
+        );
+
+        std::fs::create_dir_all(&standalone).expect("standalone state");
+        assert_eq!(
+            devmap_db_path(repo.path().to_str().unwrap()),
+            standalone.join("codeintel/devmap.sqlite"),
+            "a migrated repository prefers the standalone layout"
+        );
+    }
+
+    #[test]
+    fn devmap_home_override_is_observed_in_an_isolated_process() {
+        if let Some(expected) = std::env::var_os("GITPULSE_DEVMAP_HOME_CHILD") {
+            assert_eq!(
+                devmap_db_path("/ignored/repository"),
+                PathBuf::from(expected).join("codeintel/devmap.sqlite")
+            );
+            return;
+        }
+
+        let home = tempfile::TempDir::new().expect("override");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "codeintel::tests::devmap_home_override_is_observed_in_an_isolated_process",
+            ])
+            .env("DEVMAP_HOME", home.path())
+            .env("GITPULSE_DEVMAP_HOME_CHILD", home.path())
+            .status()
+            .expect("run isolated test process");
+        assert!(
+            status.success(),
+            "isolated DEVMAP_HOME resolver test failed"
+        );
     }
 
     #[test]

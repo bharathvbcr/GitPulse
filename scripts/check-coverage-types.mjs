@@ -154,6 +154,7 @@ export const CONTRACTS = Object.freeze([
   { label: "deps", rustPath: rust("analyzer", "deps.rs"), tsPath: ts("health", "types.ts"), structs: ["DepsHealthReport"] },
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
+  { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "DoraReport"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },

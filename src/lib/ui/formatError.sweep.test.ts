@@ -29,7 +29,6 @@ const SWEPT_FILES = [
   "../components/ReflogViewer.svelte",
   "../components/BranchList.svelte",
   "../desktop/nativeShell.ts",
-  "../diff/conflictSave.ts",
 ];
 
 // Matches String(err), String(reason), String(error), String(e) — the

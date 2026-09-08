@@ -28,4 +28,13 @@ describe("CodeGraphCanvas", () => {
     expect(source).not.toMatch(/from ["'].*\/GraphRenderer["']/);
     expect(source).not.toContain("VisualCommitRow");
   });
+
+  it("offers accessible search and keyboard navigation without compiler warnings", () => {
+    const { warnings } = compile(source, { filename: "CodeGraphCanvas.svelte", generate: "client" });
+    expect(warnings.filter(w => w.code.startsWith("a11y"))).toEqual([]);
+    expect(source).toContain('aria-label="Find a file or symbol"');
+    expect(source).toContain("onkeydown={onKeyDown}");
+    expect(source).toContain("graphNodeOpenPath(selectedNode)");
+    expect(source).toContain("onOpenNode(path, selectedNode.id)");
+  });
 });

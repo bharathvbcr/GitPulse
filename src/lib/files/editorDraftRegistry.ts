@@ -6,15 +6,18 @@ export interface RepositoryDrafts {
 // FileViewer is remounted on view and repository switches. This module-owned
 // registry is the small, synchronous truth the app-close handler can inspect
 // even while no editor instance is mounted.
-const draftsByRepository = new Map<string, string[]>();
+const draftsByRepository = new Map<string, Map<string, string[]>>();
 
-export function recordEditorDrafts(repo: string, paths: readonly string[]): void {
+export function recordEditorDrafts(repo: string, paths: readonly string[], owner = "files"): void {
   const normalized = [...new Set(paths.filter((path) => path.trim().length > 0))].sort();
+  const owners = draftsByRepository.get(repo) ?? new Map<string, string[]>();
   if (normalized.length === 0) {
-    draftsByRepository.delete(repo);
+    owners.delete(owner);
+    if (owners.size === 0) draftsByRepository.delete(repo);
     return;
   }
-  draftsByRepository.set(repo, normalized);
+  owners.set(owner, normalized);
+  draftsByRepository.set(repo, owners);
 }
 
 export function hasUnsavedEditorDrafts(): boolean {
@@ -22,9 +25,9 @@ export function hasUnsavedEditorDrafts(): boolean {
 }
 
 export function unsavedEditorDrafts(): RepositoryDrafts[] {
-  return [...draftsByRepository.entries()].map(([repo, paths]) => ({
+  return [...draftsByRepository.entries()].map(([repo, owners]) => ({
     repo,
-    paths: [...paths],
+    paths: [...new Set([...owners.values()].flat())].sort(),
   }));
 }
 

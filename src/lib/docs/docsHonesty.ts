@@ -10,7 +10,7 @@ export function docsStatusHonesty(status: DocsStatus | null | undefined): string
   const parts: string[] = [];
   if (status.truncated) {
     parts.push(
-      `Vault capped: indexed ${status.noteCount} notes (file list exceeded the index limit). This is not the whole docs set.`,
+      `Vault capped: indexed ${status.noteCount} notes (a resource limit was reached). This is not the whole docs set.`,
     );
   }
   if (status.skippedOversized > 0) {

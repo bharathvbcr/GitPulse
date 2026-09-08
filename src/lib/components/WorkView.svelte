@@ -4,13 +4,14 @@
 
   // Survives the per-tab remount so revisiting Work renders the last join
   // instantly; the fetch below then refreshes it in place.
-  const workCache = createRepoPanelCache<WorkProjection>();
+  import { createWorkRefresh } from "../work/refresh";
+  const refreshWork = createWorkRefresh();
+  const workCache = createRepoPanelCache<{ projection: WorkProjection; loadedAt: number }>();
 </script>
 
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { openExternal } from "../desktop/openExternal";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
     AlertTriangle,
     ArrowDown,
@@ -34,17 +35,18 @@
   import EmptyState from "./EmptyState.svelte";
   import Skeleton from "./Skeleton.svelte";
   import RepoPanel from "./RepoPanel.svelte";
-  import { loadWork } from "../work/load";
   import {
     degradedSummary,
     dirtyCount,
+    dirtySummary,
+    measuredDirty,
+    latestRuns,
     insightSummary,
     noteworthyStatuses,
     openPathFor,
     type WorkRow,
     type WorktreeBinding,
   } from "../work/projection";
-  import { getCollisionRisk } from "../insights/client";
   import type { CollisionRisk } from "../insights/types";
   import { formatError } from "../ui/formatError";
   import { headline, kindTitle } from "../repos/operation";
@@ -62,7 +64,11 @@
   let collisions = $state<CollisionRisk | null>(null);
   let collisionError = $state<string | null>(null);
   let loading = $state(false);
-  let guard: AsyncGuard | null = null;
+  let loadedAt = $state<number | null>(null);
+  let refreshError = $state<string | null>(null);
+  let navigationError = $state<string | null>(null);
+  let refreshEpoch = 0;
+  let disposed = false;
 
   /**
    * Tone per policy status. Spelled out rather than derived from the name so
@@ -82,29 +88,29 @@
     unchecked: "text-textMuted bg-surfaceHover",
   };
 
-  async function refresh(repo: string) {
-    guard?.cancel();
-    guard = createAsyncGuard();
-    const run = guard;
+  function refresh(repo: string): void {
+    const epoch = ++refreshEpoch;
     loading = true;
-    const result = await loadWork(repo);
-    if (!run.isLive()) return;
-    projection = result;
-    workCache.set(repo, result);
-    loading = false;
-    // Collisions need per-worktree porcelain; they settle independently so a
-    // slow scan cannot blank the rows. Failure is stored, never implied as
-    // "no overlap".
-    try {
-      const risk = await getCollisionRisk(repo);
-      if (!run.isLive()) return;
-      collisions = risk;
-      collisionError = risk.ok ? null : risk.error || "collision check failed";
-    } catch (error) {
-      if (!run.isLive()) return;
-      collisions = null;
-      collisionError = formatError(error);
-    }
+    refreshError = null;
+    const live = () => !disposed && $repoStore.currentPath === repo;
+    refreshWork.request(repo, {
+      projection(result, time) {
+        if (!live()) return;
+        projection = result;
+        loadedAt = time;
+        workCache.set(repo, { projection: result, loadedAt: time });
+      },
+      collisions(result, error) {
+        if (!live()) return;
+        collisions = result;
+        collisionError = error;
+      },
+      finished(error) {
+        if (!live() || epoch !== refreshEpoch) return;
+        refreshError = error;
+        loading = false;
+      },
+    });
   }
 
   let previousRepo: string | null = null;
@@ -120,14 +126,19 @@
     // immediately; a generation bump (status poll, mutation, watcher)
     // refreshes in place so "clean" cannot outlive the working tree.
     if (repoChanged) {
-      projection = repo ? (workCache.get(repo) ?? null) : null;
+      const cached = repo ? workCache.get(repo) : undefined;
+      projection = cached?.projection ?? null;
+      loadedAt = cached?.loadedAt ?? null;
+      navigationError = null;
+      refreshError = null;
       collisions = null;
       collisionError = null;
     }
-    if (repo) void refresh(repo);
+    if (repo) refresh(repo);
+    else { refreshWork.cancel(); loading = false; refreshEpoch += 1; }
   });
 
-  $effect(() => () => guard?.cancel());
+  $effect(() => () => { disposed = true; refreshWork.cancel(); });
 
   function rowTitle(row: WorkRow): string {
     // "Not bound to a task" is only meaningful where tasks exist. In a
@@ -141,6 +152,12 @@
 
   const hasTasks = $derived(projection?.sources.tasks.present === true);
 
+  function reviewChanges(): void {
+    const first = $repoStore.statuses[0];
+    if (first) void repoStore.selectFileDiff(first.path, first.is_staged);
+    else repoStore.setActiveTab("history", "graph");
+  }
+
   /**
    * Opens a row's worktree as a repository tab.
    *
@@ -152,12 +169,25 @@
   async function openWorktree(row: WorkRow): Promise<void> {
     const path = openPathFor(row);
     if (!path) return;
-    await repoStore.openRepo(path);
-    // A parked operation is resolved in the Resolve view; anything else is
-    // most usefully seen as its working-tree diff. openPathFor already picked
-    // the stuck worktree when a task row holds several.
-    if (row.operation) repoStore.setViewSection("work", "resolve");
-    else repoStore.setActiveTab("history", "diff");
+    await openCheckout(path);
+  }
+
+  async function openCheckout(path: string): Promise<void> {
+    navigationError = null;
+    try {
+      const opened = await repoStore.openRepo(path, {
+        onReady: () => {
+          if ($repoStore.operation.operation || $repoStore.statuses.some(status => status.is_conflicted)) repoStore.setActiveTab("work", "resolve");
+          else reviewChanges();
+        },
+      });
+      if (!opened) navigationError = $repoStore.error || `Could not open ${path}`;
+    } catch (error) { navigationError = formatError(error); }
+  }
+
+  async function openGithub(url: string): Promise<void> {
+    try { await openExternal(url); }
+    catch (error) { navigationError = formatError(error); }
   }
 
   function agentsOn(row: WorkRow): string[] {
@@ -174,13 +204,12 @@
   }
 
   async function openBinding(binding: WorktreeBinding): Promise<void> {
-    await repoStore.openRepo(binding.worktree.path);
-    if (binding.operation) repoStore.setViewSection("work", "resolve");
-    else repoStore.setActiveTab("history", "diff");
+    await openCheckout(binding.worktree.path);
   }
 
   const degraded = $derived(projection ? degradedSummary(projection.sources) : "");
   const summary = $derived(projection ? insightSummary(projection) : null);
+  const worktreeListKnown = $derived(projection?.sources.worktrees.ok === true || (summary?.worktrees ?? 0) > 0);
 
   /**
    * Where the reader is standing.
@@ -191,7 +220,7 @@
    * often on this screen and they were answered nowhere on it.
    */
   const here = $derived(
-    hereSummary($repoStore.currentBranch, $repoStore.branches, $repoStore.statuses),
+    hereSummary($repoStore.currentBranch, $repoStore.branches, $repoStore.statuses, Boolean($repoStore.currentPath) && !$repoStore.isBare),
   );
 
   /* --- narrowing ---------------------------------------------------------- */
@@ -205,10 +234,13 @@
    */
   let facet = $state<WorkFacet>("all");
   let query = $state("");
+  let rowLimit = $state(100);
+  $effect(() => { void facet; void query; void $repoStore.currentPath; rowLimit = 100; });
 
   const visibleRows = $derived(
     projection ? filterWorkRows(projection.rows, facet, query) : [],
   );
+  const renderedRows = $derived(visibleRows.slice(0, rowLimit));
   /** True when a filter is on and has hidden every row. */
   const narrowedToNothing = $derived(
     projection !== null && projection.rows.length > 0 && visibleRows.length === 0,
@@ -257,43 +289,82 @@
      so the content centres in a wide pane instead of hugging the left edge and
      leaving a third of the window blank, and the empty states take the leftover
      height rather than sitting under the header with the pane empty beneath. -->
-<div class="flex flex-1 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
-  <div class="flex items-center justify-between gap-3 mb-3 mx-auto w-full max-w-6xl">
-    <h2 class="flex items-center gap-2 text-[13px] font-semibold min-w-0">
-      <LayoutGrid size={15} class="text-accent shrink-0" />
-      Work
-      <span class="text-textMuted font-normal text-[11px] truncate">
+<div class="work-overview flex flex-1 min-w-0 flex-col overflow-y-auto p-4 font-sans text-[12px] text-textPrimary">
+  <div class="flex items-start justify-between gap-3 mb-3 mx-auto w-full max-w-6xl">
+    <div class="min-w-0">
+      <h2 class="text-xl font-semibold tracking-tight">Overview</h2>
+      <p class="mt-1 text-textMuted text-[12px] leading-relaxed">
         {hasTasks
-          ? "tasks, worktrees, pull requests, runs and verdicts, joined"
-          : "every worktree in flight, with its changes, pull requests and runs"}
-      </span>
-    </h2>
+          ? "Your workspace, from tasks to pull requests."
+          : "Your workspace, from local changes to pull requests."}
+      </p>
+    </div>
+    <div class="flex flex-col items-end gap-1 shrink-0">
     <button
       type="button"
-      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border border-border/70 hover:bg-surfaceHover text-[11px] disabled:opacity-50"
+      class="gp-btn shrink-0 mt-1"
       disabled={loading || !$repoStore.currentPath}
       onclick={() => $repoStore.currentPath && void refresh($repoStore.currentPath)}
     >
       <RefreshCw size={12} class={loading ? "animate-spin" : ""} />
-      Refresh
+      {loading ? "Refreshing" : "Refresh"}
     </button>
+    <span class="text-[10px] text-textMuted" aria-live="polite">
+      {#if loadedAt}Loaded {new Date(loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{:else if loading}Loading workspace…{/if}
+    </span>
+    </div>
   </div>
+  {#if refreshError || navigationError || $repoStore.error}
+    <p role="alert" class="mx-auto mb-3 w-full max-w-6xl text-amber-700 dark:text-amber-300">{refreshError || navigationError || $repoStore.error}</p>
+  {/if}
 
   <!-- Where the reader is standing. First, because every other row on this
        screen is somewhere else. -->
-  {#if here && $repoStore.currentPath}
-    <div class="mb-3 mx-auto w-full max-w-6xl rounded-2xl border border-border/70 bg-surface px-3.5 py-2.5 shadow-card">
-      <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+  {#if $repoStore.currentPath}
+    <section aria-label="Current repository" class="overview-repository mb-3 mx-auto w-full max-w-6xl rounded-2xl border border-border/70 bg-surface p-4 shadow-card">
+      <div class="overview-repository-heading">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="rounded-xl bg-accent/10 p-2 text-accent shrink-0"><Layers size={22} /></div>
+          <div class="min-w-0">
+            <p class="text-[10px] font-semibold uppercase tracking-widest text-textMuted">Current repository</p>
+            <h3 class="mt-1 text-[21px] font-semibold tracking-tight truncate" title={$repoStore.currentPath}>
+              {$repoStore.currentPath.split(/[\\/]/).filter(Boolean).pop() || $repoStore.currentPath}
+            </h3>
+            <p class="mt-1 truncate font-mono text-[11px] text-textMuted" title={$repoStore.currentPath}>{$repoStore.currentPath}</p>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          {#if (here && here.conflicted > 0) || $repoStore.operation.operation}
+            <button type="button" class="gp-btn-primary" onclick={() => repoStore.setActiveTab("work", "resolve")}>
+              <GitMerge size={13} /> Open Resolve
+            </button>
+          {:else if here && here.staged + here.unstaged > 0}
+            <button type="button" class="gp-btn-primary" disabled={$repoStore.isLoading || Boolean($repoStore.error)} onclick={reviewChanges}>
+              <FileDiff size={13} /> Review changes <ChevronRight size={12} />
+            </button>
+          {/if}
+          <button type="button" class="gp-btn" onclick={() => repoStore.setActiveTab("code", "explorer")}>
+            Browse files <ChevronRight size={12} />
+          </button>
+          <button type="button" class="gp-btn" onclick={() => repoStore.setActiveTab("history", "graph")}>
+            View history <ChevronRight size={12} />
+          </button>
+        </div>
+      </div>
+      {#if here}
+      <div class="overview-branch flex flex-wrap items-center gap-x-3 gap-y-2 mt-3 rounded-xl bg-background/50 px-3 py-2.5">
         <span class="flex items-center gap-1.5 font-medium text-[13px] min-w-0">
           <GitBranch size={14} class="text-accent shrink-0" />
-          <span class="truncate">{here.branch}</span>
-          <span class="text-[10px] bg-accent/20 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
+          <span class="truncate">{here.branch ?? "Detached HEAD"}</span>
+          <span class="text-[10px] bg-accent/10 text-accent px-1.5 py-0.5 rounded-full font-mono">HEAD</span>
         </span>
 
         <!-- A branch the stats pass has not reached yet says so. Rendering its
              pre-fetch zeroes would claim it is level with a remote nobody has
              asked about. -->
-        {#if here.unmeasured}
+        {#if !here.branch}
+          <span class="text-[11px] text-textMuted">No tracking branch</span>
+        {:else if here.unmeasured}
           <span class="text-[11px] text-textMuted font-mono">sync not measured yet</span>
         {:else if here.upstream === null}
           <span class="text-[11px] text-textMuted font-mono" title="No tracking branch is configured">
@@ -318,7 +389,7 @@
           <span class="text-[11px] font-mono text-textMuted">in sync with {here.upstream.name}</span>
         {/if}
 
-        {#if !here.unmeasured && here.behindBase > 0 && here.comparedTo && here.comparedTo !== here.branch}
+        {#if !$repoStore.statsPending && !here.unmeasured && here.behindBase > 0 && here.comparedTo && here.comparedTo !== here.branch}
           <span class="text-[11px] font-mono text-amber-600 dark:text-amber-400"
             title="{here.behindBase} commit{here.behindBase === 1 ? '' : 's'} on {here.comparedTo} that this branch does not have">
             {here.behindBase} behind {here.comparedTo}
@@ -326,11 +397,14 @@
         {/if}
 
         <span class="ml-auto flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] font-mono">
+          {#if $repoStore.error || $repoStore.isLoading}
+            <span>Status {$repoStore.error ? "unavailable" : "loading"}</span>
+          {:else}
           {#if here.conflicted > 0}
             <button
               type="button"
               class="text-rose-600 dark:text-rose-400 hover:underline"
-              onclick={() => repoStore.setViewSection("work", "resolve")}
+              onclick={() => repoStore.setActiveTab("work", "resolve")}
               title="Open Resolve"
             >
               {here.conflicted} conflicted
@@ -344,25 +418,20 @@
           {/if}
           {#if here.staged + here.unstaged + here.conflicted === 0}
             <span class="text-textMuted">working tree clean</span>
-          {:else}
-            <button
-              type="button"
-              class="text-textMuted hover:text-accent"
-              onclick={() => repoStore.setActiveTab("history", "diff")}
-              title="Open the working-tree diff"
-            >
-              review
-            </button>
+          {/if}
           {/if}
         </span>
       </div>
+      {:else}
+        <p class="mt-4 text-[11px] text-textMuted">{$repoStore.isBare ? "Bare repository" : "No checked-out branch"}</p>
+      {/if}
 
       <!-- The one thing here that cannot make progress on its own. -->
       {#if $repoStore.operation.operation}
         <button
           type="button"
           class="mt-2 flex w-full items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-left text-[11px] text-amber-600 hover:bg-amber-500/20 dark:text-amber-300"
-          onclick={() => repoStore.setViewSection("work", "resolve")}
+          onclick={() => repoStore.setActiveTab("work", "resolve")}
           title="Open Resolve to finish or abort the {kindTitle($repoStore.operation.operation.kind).toLowerCase()}"
         >
           <GitMerge size={12} class="mt-px shrink-0" />
@@ -373,14 +442,14 @@
           Could not check for a parked merge or rebase here — this line is not “nothing is parked”.
         </p>
       {/if}
-    </div>
+    </section>
   {/if}
 
   {#if summary && $repoStore.currentPath}
     <!-- Each tile selects the rows it counted. Tiles the projection can only
          ever count as zero would be four doors to an empty room, so a zero
          tile stays readable but is not offered as a filter. -->
-    <div class="mb-3 mx-auto w-full max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-2">
+    <div aria-label="Workspace summary filters" class="overview-metrics mb-3 mx-auto w-full max-w-6xl grid grid-cols-2 md:grid-cols-4 gap-3">
       <button
         type="button"
         aria-pressed={facet === "all"}
@@ -390,10 +459,12 @@
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <Layers size={11} /> Worktrees
         </div>
-        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.worktrees}</div>
+        <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.worktrees : "—"}</div>
         <div class="text-[10px] text-textMuted">
-          {summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
-            · {summary.unscannedDirty} unscanned{/if}
+          {#if !worktreeListKnown}Worktree list unavailable{:else}
+            {#if !projection?.sources.worktrees.ok}Partial data · {/if}{summary.dirtyWorktrees} dirty{#if summary.unscannedDirty > 0}
+              · {summary.unscannedDirty} unscanned{/if}
+          {/if}
         </div>
       </button>
       <button
@@ -404,11 +475,11 @@
         class="text-left rounded-xl border px-3 py-2 transition-[border-color,background-color] duration-150 disabled:cursor-default {tileClass('agents')}"
       >
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
-          <Bot size={11} /> Agent sessions
+          <Bot size={11} /> Agent worktrees
         </div>
-        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.agentSessions}</div>
+        <div class="overview-metric-value text-textPrimary">{worktreeListKnown ? summary.agentSessions : "—"}</div>
         <div class="text-[10px] text-textMuted truncate">
-          {summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "none from directory layout"}
+          {!worktreeListKnown ? "Worktree list unavailable" : summary.agentKinds.length > 0 ? summary.agentKinds.join(", ") : "No agent worktrees detected"}
         </div>
       </button>
       <button
@@ -421,10 +492,10 @@
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <GitMerge size={11} /> Blocked
         </div>
-        <div class="mt-0.5 text-[13px] font-semibold {summary.blocked > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-textPrimary'}">
-          {summary.blocked}
+        <div class="overview-metric-value {summary.blocked > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-textPrimary'}">
+          {summary.blocked > 0 || (worktreeListKnown && summary.unscannedOperations === 0) ? summary.blocked : "—"}
         </div>
-        <div class="text-[10px] text-textMuted">parked merge / rebase / cherry-pick</div>
+        <div class="text-[10px] text-textMuted">{!worktreeListKnown ? "Operation status unavailable" : summary.unscannedOperations > 0 ? `${summary.unscannedOperations} worktrees not checked` : summary.blocked > 0 ? "Operations waiting for you" : "Parked merges, rebases & picks"}</div>
       </button>
       <button
         type="button"
@@ -436,22 +507,44 @@
         <div class="text-[10px] uppercase tracking-wider text-textMuted flex items-center gap-1">
           <GitPullRequest size={11} /> Pull requests
         </div>
-        <div class="mt-0.5 text-[13px] font-semibold text-textPrimary">{summary.pullRequests}</div>
-        <div class="text-[10px] text-textMuted">joined through a worktree branch</div>
+        <div class="overview-metric-value text-textPrimary">{projection?.sources.github.present && (projection.sources.github.ok || summary.pullRequests > 0) ? summary.pullRequests : "—"}</div>
+        <div class="text-[10px] text-textMuted">{!projection?.sources.github.present ? "GitHub not available" : !projection.sources.github.ok ? "Partial GitHub data" : "Across workspace branches"}</div>
       </button>
     </div>
 
+    <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center justify-between gap-2">
+      <h3 class="flex items-center gap-2 text-[13px] font-semibold">
+        Work in flight
+        <span class="rounded-full bg-surfaceHover px-2 py-0.5 text-[10px] font-mono font-normal text-textMuted">{visibleRows.length}{#if projection && visibleRows.length !== projection.rows.length} / {projection.rows.length}{/if}</span>
+      </h3>
+      <span class="text-[11px] text-textMuted">Blocked work appears first</span>
+    </div>
     <div class="mb-3 mx-auto w-full max-w-6xl flex flex-wrap items-center gap-2">
       <label class="relative flex-1 min-w-52">
         <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
         <input
-          class="gp-field w-full pl-7! py-1!"
+          class="gp-field w-full pl-7! py-2!"
           type="search"
           placeholder="Filter by branch, path, task or pull request"
           aria-label="Filter work rows"
           bind:value={query}
         />
       </label>
+      <button type="button" class="inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-[11px] {tileClass('attention')}"
+        aria-pressed={facet === "attention"} onclick={() => toggleFacet("attention")}
+        title="Parked operations, local changes, unscanned worktrees, failed CI or requested changes">
+        <AlertTriangle size={12} /> Needs attention
+      </button>
+      <button
+        type="button"
+        class="overview-dirty-filter inline-flex items-center gap-1.5 rounded-full border px-3 py-2 text-[11px] transition-colors {tileClass('dirty')}"
+        aria-pressed={facet === "dirty"}
+        onclick={() => toggleFacet("dirty")}
+        title="Show worktrees with measured uncommitted changes"
+      >
+        <FileDiff size={12} class="text-amber-600 dark:text-amber-400" />
+        Uncommitted changes
+      </button>
       {#if projection && (facet !== "all" || query.trim() !== "")}
         <span class="text-[11px] text-textMuted font-mono">
           {visibleRows.length} of {projection.rows.length}
@@ -486,7 +579,8 @@
       <AlertTriangle size={14} class="shrink-0 mt-px" />
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
     </div>
-  {:else if collisions && collisions.ok && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated)}
+  {/if}
+  {#if collisions && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.failed_worktrees > 0 || collisions.truncated)}
     <div
       class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
     >
@@ -497,10 +591,13 @@
             {collisions.overlapping_files} file{collisions.overlapping_files === 1 ? "" : "s"} dirty in more than one worktree
             ({collisions.worktrees_involved} worktrees).
           {:else}
-            Overlap scan did not finish — {collisions.unscanned_worktrees} worktree{collisions.unscanned_worktrees === 1 ? "" : "s"} not porcelain-scanned.
+            Overlap results are incomplete.
           {/if}
         </span>
       </div>
+      {#if collisions.failed_worktrees > 0 || collisions.unscanned_worktrees > 0 || collisions.truncated}
+        <p class="mt-1">{collisions.scanned_worktrees} scanned · {collisions.failed_worktrees} failed · {collisions.unscanned_worktrees} unscanned{collisions.truncated ? " · results truncated" : ""}</p>
+      {/if}
       {#if collisions.items.length > 0}
         <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
           {#each collisions.items.slice(0, 8) as item, i (`${item.path}#${i}`)}
@@ -512,6 +609,7 @@
             </li>
           {/each}
         </ul>
+        {#if collisions.items.length > 8}<p class="mt-1">Showing 8 of {collisions.items.length} reported overlapping paths.</p>{/if}
       {/if}
     </div>
   {/if}
@@ -558,27 +656,31 @@
     <div class="flex flex-1 items-center justify-center">
       <EmptyState
         icon={LayoutGrid}
-        title="Nothing in flight"
-        hint={projection.sources.worktrees.ok
+        title={projection.degraded ? "Workspace data unavailable" : "Nothing in flight"}
+        hint={!projection.degraded
           ? "No worktrees, pull requests or runs were found for this repository."
-          : "The worktree list could not be read, so this screen cannot say what is in flight."}
+          : "Some workspace sources could not be read. Refresh to try again."}
       />
     </div>
   {:else if projection}
-    <div class="mx-auto w-full max-w-6xl space-y-2">
-      {#each visibleRows as row, i (row.key || `__unbound:${i}`)}
+    <div class="mx-auto w-full max-w-6xl space-y-3">
+      {#each renderedRows as row, i (row.key || `__unbound:${i}`)}
         {@const chips = noteworthyStatuses(row.verdicts)}
+        {@const dirty = dirtySummary(row)}
+        {@const activity = rowLastActivity(row, $repoStore.branches)}
         <div
-          class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card"
+          class="overview-work-row rounded-2xl border border-border/70 bg-surface p-4 shadow-card"
           class:opacity-80={row.kind === "unbound"}
+          class:overview-work-row-blocked={row.operation !== null}
+          data-work-row
         >
-          <div class="flex items-start justify-between gap-3">
+          <div class="overview-row-heading flex items-start justify-between gap-3">
             <div class="min-w-0">
               <div class="flex items-center gap-2 flex-wrap font-medium">
                 {#if row.worktrees.length > 0}
                   <button
                     type="button"
-                    class="truncate text-left hover:text-accent"
+                    class="truncate text-left text-[13px] hover:text-accent"
                     title="Open {openPathFor(row)}"
                     onclick={() => void openWorktree(row)}
                   >
@@ -586,6 +688,9 @@
                   </button>
                 {:else}
                   <span class="truncate">{rowTitle(row)}</span>
+                {/if}
+                {#if row.worktrees.some((binding) => binding.worktree.path === $repoStore.currentPath)}
+                  <span class="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent">Current worktree</span>
                 {/if}
                 {#if row.taskId}
                   <span class="font-mono text-[10px] text-textMuted">{row.taskId}</span>
@@ -620,6 +725,11 @@
                   </span>
                 {/if}
               </div>
+              {#if row.kind === "worktree" && row.worktrees.length > 0}
+                <p class="mt-1.5 truncate font-mono text-[10px] text-textMuted" title={row.worktrees[0].worktree.path}>
+                  {row.worktrees[0].worktree.path}
+                </p>
+              {/if}
               <div class="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-textMuted">
                 <!-- A worktree row IS one worktree; printing "1" beside every
                      one of them is noise that crowds out the counts that vary. -->
@@ -631,11 +741,23 @@
                 {/if}
                 <span class="flex items-center gap-1" title="Open pull requests">
                   <GitPullRequest size={12} />
-                  {row.pullRequests.length}
+                  {#if !projection.sources.github.ok && row.pullRequests.length === 0}
+                    PRs unknown
+                  {:else if !projection.sources.github.present}
+                    PRs unavailable
+                  {:else}
+                    {row.pullRequests.length} PR{row.pullRequests.length === 1 ? "" : "s"}
+                  {/if}
                 </span>
                 <span class="flex items-center gap-1" title="Workflow runs">
                   <Play size={12} />
-                  {row.runs.length}
+                  {#if !projection.sources.github.ok && row.runs.length === 0}
+                    Runs unknown
+                  {:else if !projection.sources.github.present}
+                    Runs unavailable
+                  {:else}
+                    {row.runs.length} run{row.runs.length === 1 ? "" : "s"}
+                  {/if}
                 </span>
                 <!-- Grants are a DevCouncil concept. Showing "0" of them to a
                      reader who runs no store is a column that can only ever
@@ -650,19 +772,29 @@
                      cap). Rendering that as 0 would report an unscanned
                      worktree as verified clean. -->
                 {#if dirtyCount(row) > 0}
-                  <span class="flex items-center gap-1 text-amber-500 dark:text-amber-400" title="Uncommitted files">
+                  <span class="flex items-center gap-1 text-amber-700 dark:text-amber-400" title="Uncommitted files">
                     <FileDiff size={12} />
-                    {dirtyCount(row)} uncommitted
+                    {dirty.files} uncommitted
                   </span>
                 {:else if dirtyCount(row) === 0}
                   <span class="flex items-center gap-1" title="No uncommitted changes">
                     <FileDiff size={12} />
                     clean
                   </span>
+                {:else if row.worktrees.length > 0 && dirty.total === 0}
+                  <span class="text-textMuted">Bare repository</span>
+                {:else if row.worktrees.length > 0}
+                  <span class="text-textMuted">Changes not scanned</span>
+                {/if}
+                {#if row.worktrees.some(binding => binding.operationChecked === false)}
+                  <span class="text-amber-700 dark:text-amber-400">Operation not checked</span>
+                {/if}
+                {#if dirty.scanned < dirty.total && dirty.scanned > 0}
+                  <span class="text-amber-700 dark:text-amber-400">{dirty.scanned} of {dirty.total} worktrees scanned</span>
                 {/if}
                 {#if projection.sources.ledger.present}
-                  <span class="font-mono" title="Ledger events attributed to this row">
-                    {row.verdicts.events} events
+                  <span class="font-mono" title="Events attributed to this row within the latest 500 ledger records">
+                    {row.verdicts.events} recent events
                   </span>
                 {/if}
                 <!-- How long this row has been sitting. A worktree nobody has
@@ -670,8 +802,7 @@
                      identically without it, and they want opposite things
                      done. Absent when no branch on the row has been measured,
                      rather than rendered as the epoch. -->
-                {#if rowLastActivity(row, $repoStore.branches)}
-                  {@const activity = rowLastActivity(row, $repoStore.branches)!}
+                {#if activity}
                   <span title="{activity.branch} last moved{activity.author ? ` — ${activity.author}` : ''}">
                     {$timestampFormat.text(activity.timestamp)}
                   </span>
@@ -721,6 +852,16 @@
             </button>
           {/if}
 
+          {#if row.runs.length > 0}
+            <div class="mt-2 flex flex-wrap gap-2" aria-label="Latest observed workflow runs">
+              {#each latestRuns(row) as run (run.id)}
+                <button type="button" class="gp-btn text-[10px]!" onclick={() => void openGithub(run.url)}
+                  title={`Open workflow run ${run.id} on GitHub`}>
+                  <Play size={11} /> {run.name || "Workflow"}: {run.status.toLowerCase() === "completed" ? run.conclusion || "conclusion unknown" : run.status || "status unknown"}
+                </button>
+              {/each}
+            </div>
+          {/if}
           {#if (row.kind !== "worktree" && row.worktrees.length > 0) || row.pullRequests.length > 0}
             <div class="mt-2.5 grid gap-2 border-t border-border/50 pt-2.5 md:grid-cols-2">
               {#if row.kind !== "worktree" && row.worktrees.length > 0}
@@ -735,7 +876,7 @@
                       >
                         <GitBranch size={11} class="shrink-0" />
                         <span class="truncate">{binding.worktree.branch ?? "(detached)"}</span>
-                        {#if binding.worktree.dirty_files}
+                        {#if measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0}
                           <span class="text-amber-500 dark:text-amber-400"
                             >·{binding.worktree.dirty_files} dirty</span
                           >
@@ -753,12 +894,15 @@
                   {#each row.pullRequests as pr (pr.number)}
                     <li class="flex items-center gap-1.5 text-[11px]">
                       <GitPullRequest size={11} class="shrink-0 text-accent" />
-                      <span class="truncate">#{pr.number} {pr.title}</span>
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate" title={pr.title}>#{pr.number} {pr.title}</span>
+                        <span class="text-[10px] text-textMuted">{pr.is_draft ? "Draft · " : ""}CI {pr.ci_status || "unknown"} · {pr.review_decision ? pr.review_decision.toLowerCase().replaceAll("_", " ") : "Review not reported"}</span>
+                      </span>
                       <button
                         type="button"
                         class="shrink-0 text-textMuted hover:text-accent"
                         aria-label={`Open PR #${pr.number} on GitHub`}
-                        onclick={() => void openExternal(pr.url)}
+                        onclick={() => void openGithub(pr.url)}
                       >
                         <ExternalLink size={11} />
                       </button>
@@ -770,6 +914,11 @@
           {/if}
         </div>
       {/each}
+      {#if renderedRows.length < visibleRows.length}
+        <button type="button" class="gp-btn" onclick={() => rowLimit += 100}>
+          Show more · {renderedRows.length} of {visibleRows.length} matching rows shown
+        </button>
+      {/if}
     </div>
   {/if}
 
@@ -795,3 +944,55 @@
     </div>
   {/if}
 </div>
+
+<style>
+  .work-overview {
+    container-type: inline-size;
+    padding: clamp(16px, 1.6vw, 24px);
+  }
+
+  .overview-repository {
+    background-image: radial-gradient(ellipse at top left, rgb(var(--c-accent) / 0.07), transparent 65%);
+  }
+
+  .overview-repository-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 20px;
+  }
+
+  .overview-repository-heading > :first-child {
+    flex: 1 1 240px;
+  }
+
+  .overview-metrics > button {
+    min-width: 0;
+    padding: 10px 14px;
+    border-radius: 14px;
+  }
+
+  .overview-metric-value {
+    margin: 4px 0 3px;
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .overview-work-row-blocked {
+    border-color: rgb(245 158 11 / 0.3);
+  }
+
+  .overview-row-heading > :first-child {
+    flex: 1;
+  }
+
+  @container (max-width: 660px) {
+    .overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .overview-row-heading { flex-wrap: wrap; }
+    .overview-branch > :last-child { margin-left: 0; width: 100%; }
+  }
+</style>

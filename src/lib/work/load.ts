@@ -1,8 +1,10 @@
+import { withinDeadline, workTimeout } from "./request";
+import { validateWorkResponse } from "./contracts";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
 import { mapItems, DEFAULT_FAN_OUT } from "../async/pool";
 import type { GitHubContext } from "../github/types";
-import type { GrantView, Grant } from "../grants/types";
+import type { GrantView } from "../grants/types";
 import type { LedgerEvent } from "../ledger/types";
 import type { TaskScope, TaskView } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
@@ -37,6 +39,8 @@ export const MAX_OPERATION_PROBES = 32;
 
 export interface WorkLoadDeps {
   invoke?: typeof invoke;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 const ABSENT = { ok: true, present: false, detail: "" } as const;
@@ -73,7 +77,14 @@ export async function loadWork(
   repoPath: string,
   deps: WorkLoadDeps = {},
 ): Promise<WorkProjection> {
-  const call = deps.invoke ?? invoke;
+  const nativeCall = deps.invoke ?? invoke;
+  const deadline = Date.now() + workTimeout(deps.timeoutMs);
+  const call: typeof invoke = async <T>(command: string, args?: Parameters<typeof invoke>[1], options?: Parameters<typeof invoke>[2]): Promise<T> => {
+    if (deps.signal?.aborted) throw new Error("Overview refresh superseded");
+    const result = await withinDeadline(() => nativeCall<T>(command, args, options), deadline);
+    validateWorkResponse(command, result);
+    return result;
+  };
 
   const sources: WorkSources = {
     tasks: { ...ABSENT },
@@ -123,13 +134,10 @@ export async function loadWork(
 
   if (!tasks.ok) {
     sources.tasks = failed(tasks.e);
-  } else if (!tasks.v.available) {
-    // No DevCouncil store here. Ordinary, and not a failure — but the leases
-    // list stays null so the projection never reports "no tasks" for a
-    // repository that has no task model at all.
-    sources.tasks = { ...ABSENT };
   } else if (tasks.v.error) {
-    sources.tasks = { ok: false, present: true, detail: tasks.v.error };
+    sources.tasks = failed(tasks.v.error);
+  } else if (!tasks.v.available) {
+    sources.tasks = { ...ABSENT };
   } else {
     sources.tasks = { ...READ };
     input.leases = tasks.v.leases;
@@ -152,7 +160,9 @@ export async function loadWork(
     // source, not an idle worktree — showing nothing because the check
     // itself broke is the failure mode that strands a user mid-rebase with
     // a UI insisting everything is fine.
-    const candidates = worktrees.v.filter((w) => !w.is_bare);
+    const distinct = [...new Map(worktrees.v.map(w => [w.path, w])).values()];
+    input.worktrees = distinct;
+    const candidates = distinct.filter((w) => !w.is_bare);
     const probes = candidates.slice(0, MAX_OPERATION_PROBES);
     if (candidates.length > probes.length) {
       sources.worktrees = noteFailure(
@@ -169,7 +179,7 @@ export async function loadWork(
         (e) => ({ path: w.path, operation: null, ok: false as const, detail: formatError(e) }),
       ),
     );
-    const operations: Record<string, RepoOperation | null> = {};
+    const operations: Record<string, RepoOperation | null> = Object.create(null);
     let probeFailures = 0;
     let probeFailureDetail = "";
     for (const result of parked) {
@@ -178,7 +188,7 @@ export async function loadWork(
         if (!probeFailureDetail) probeFailureDetail = result.detail;
         continue;
       }
-      if (result.operation) operations[result.path] = result.operation;
+      operations[result.path] = result.operation;
     }
     if (probeFailures > 0) {
       const why = probeFailureDetail ? ` (${probeFailureDetail})` : "";
@@ -192,18 +202,18 @@ export async function loadWork(
 
   if (!github.ok) {
     sources.github = failed(github.e);
+  } else if (github.v.error) {
+    sources.github = failed(github.v.error);
   } else if (!github.v.available) {
     sources.github = { ...ABSENT };
-  } else if (github.v.error) {
-    sources.github = { ok: false, present: true, detail: github.v.error };
   } else {
     // A section that failed inside an otherwise usable context degrades this
     // source too: the runs list being empty because `gh` choked is not the
     // same fact as there being no runs.
-    const sectionError = github.v.runs_error ?? "";
-    sources.github = sectionError
-      ? { ok: false, present: true, detail: sectionError }
-      : { ...READ };
+    const details = [github.v.runs_error, ...(github.v.warnings ?? []),
+      github.v.prs_truncated ? "pull request list truncated" : "",
+      github.v.runs_truncated ? "workflow run list truncated" : ""].filter(Boolean);
+    sources.github = details.length ? failed(details.join("; ")) : { ...READ };
     input.pullRequests = github.v.pull_requests;
     input.runs = github.v.workflow_runs;
   }
@@ -217,13 +227,13 @@ export async function loadWork(
 
   if (!grants.ok) {
     sources.grants = failed(grants.e);
+  } else if (grants.v.error) {
+    sources.grants = failed(grants.v.error);
   } else if (!grants.v.available) {
     sources.grants = { ...ABSENT };
-  } else if (grants.v.error) {
-    sources.grants = { ok: false, present: true, detail: grants.v.error };
   } else {
     sources.grants = { ...READ };
-    input.grants = grants.v.grants as Grant[];
+    input.grants = grants.v.grants;
   }
 
   // Worktree → task bindings. One call each, so it is capped; a worktree past
@@ -231,7 +241,7 @@ export async function loadWork(
   // that never silently reads as "bound to nothing".
   if (input.worktrees && input.worktrees.length > 0) {
     const looked = input.worktrees.slice(0, MAX_BINDING_LOOKUPS);
-    const bindings: Record<string, string> = {};
+    const bindings: Record<string, string> = Object.create(null);
     const bindingReads = await mapItems(looked, DEFAULT_FAN_OUT, (worktree) =>
       call<string | null>("cmd_worktree_task", {
         repoPath,
@@ -274,20 +284,20 @@ export async function loadWork(
   }
 
   // Titles for the tasks that ended up on screen.
-  const taskIds = [...new Set((input.leases ?? []).map((l) => l.task_id))].slice(
-    0,
-    MAX_TITLE_LOOKUPS,
-  );
+  const allTaskIds = [...new Set([...(input.leases ?? []).map(l => l.task_id), ...Object.values(input.bindings)])];
+  const taskIds = allTaskIds.slice(0, MAX_TITLE_LOOKUPS);
+  if (taskIds.length < allTaskIds.length) sources.tasks = noteFailure(sources.tasks,
+    `titles loaded for ${taskIds.length} of ${allTaskIds.length} tasks; other rows use task IDs`);
   if (taskIds.length > 0) {
-    const titles: Record<string, string> = {};
-    await mapItems(taskIds, DEFAULT_FAN_OUT, async (taskId) => {
+    const titles: Record<string, string> = Object.create(null);
+    let failures = 0;
+    await mapItems(taskIds, DEFAULT_FAN_OUT, async taskId => {
       try {
         const scope = await call<TaskScope | null>("cmd_task_scope", { repoPath, taskId });
         if (scope?.title) titles[taskId] = scope.title;
-      } catch {
-        // A missing title is cosmetic: the row is identified by its id.
-      }
+      } catch { failures += 1; }
     });
+    if (failures) sources.tasks = noteFailure(sources.tasks, `${failures} task titles could not be read; using task IDs`);
     input.titles = titles;
   }
 

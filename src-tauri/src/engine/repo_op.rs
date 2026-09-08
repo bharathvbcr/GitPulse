@@ -655,6 +655,17 @@ where
     // Judged inside the lock, from the same rendering that runs below. A
     // refusal returns before anything is executed.
     let verdict = judge(&argv)?;
+    if action == OperationAction::Continue {
+        // An external editor can `git add` a file that still contains markers:
+        // stage zero alone does not establish a finished resolution. Ask Git
+        // to check the staged changes, including its configured marker width.
+        // Disable ordinary whitespace checks: resolution integrity must not
+        // introduce a formatting policy into an existing repository.
+        git_text(&repo, &[
+            "-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,-indent-with-non-tab,-tab-in-indent,cr-at-eol",
+            "diff", "--cached", "--check", "--no-ext-diff", "--no-color",
+        ]).map_err(|error| format!("Cannot continue: the staged integrity check failed. Review the staged changes. {error}"))?;
+    }
     // argv[0] is the program name the gate judges; git itself takes the rest.
     let args: Vec<&str> = argv[1..].to_vec();
     // `rebase --continue` and `am --continue` resolve a commit message through

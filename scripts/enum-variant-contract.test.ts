@@ -1,6 +1,11 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  createSourceFile, isIdentifier, isLiteralTypeNode, isParenthesizedTypeNode,
+  isPropertySignature, isStringLiteral, isTypeAliasDeclaration, isTypeLiteralNode,
+  isTypeReferenceNode, isUnionTypeNode, ScriptTarget, type TypeNode,
+} from "typescript";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -126,36 +131,101 @@ function rustEnums(): Map<string, RustEnum> {
   return found;
 }
 
-/**
- * The text of the TS type alias named `name`, scanned to its real end.
- *
- * Stopping at the first `;` is wrong for a union of object types: the
- * separators INSIDE `{ kind: "add"; name: string }` end the match after the
- * first member, so every later variant reads as missing from TypeScript. The
- * declaration ends at the first `;` seen at brace depth zero.
- */
-function typeAliasBody(source: string, name: string): string | null {
-  const header = new RegExp(`(?:export\\s+)?type\\s+${name}\\s*=`).exec(source);
-  if (!header) return null;
-  let depth = 0;
-  const start = header.index + header[0].length;
-  for (let i = start; i < source.length; i += 1) {
-    const char = source[i];
-    if (char === "{" || char === "(" || char === "[") depth += 1;
-    else if (char === "}" || char === ")" || char === "]") depth -= 1;
-    else if (char === ";" && depth === 0) return source.slice(start, i);
-  }
-  return source.slice(start);
+/** Resolve local union aliases without confusing payload strings with variants. */
+function typeAliasLiterals(source: string, name: string, tag?: string): Set<string> | null {
+  const parsed = createSourceFile("enum-contract.ts", source, ScriptTarget.Latest);
+  const aliases = new Map(parsed.statements.filter(isTypeAliasDeclaration)
+    .map((declaration) => [declaration.name.text, declaration.type]));
+  const root = aliases.get(name);
+  if (!root) return null;
+  const literals = new Set<string>();
+  const active = new Set([name]);
+  let visited = 0;
+  const visit = (node: TypeNode, tagField: string | undefined, depth: number): void => {
+    if (++visited > 10_000) throw new Error(`${name}: union expansion exceeds the 10000-node budget`);
+    if (depth > 64) throw new Error(`${name}: union expansion exceeds depth 64`);
+    if (isUnionTypeNode(node)) {
+      node.types.forEach((child) => visit(child, tagField, depth + 1));
+    } else if (isParenthesizedTypeNode(node)) {
+      visit(node.type, tagField, depth + 1);
+    } else if (isLiteralTypeNode(node) && isStringLiteral(node.literal)) {
+      literals.add(node.literal.text);
+    } else if (isTypeReferenceNode(node) && isIdentifier(node.typeName) && !node.typeArguments?.length) {
+      const reference = node.typeName.text;
+      if (active.has(reference)) throw new Error(`${name}: cyclic union alias ${reference}`);
+      const target = aliases.get(reference);
+      if (!target) throw new Error(`${name}: unresolved local union alias ${reference}`);
+      active.add(reference);
+      visit(target, tagField, depth + 1);
+      active.delete(reference);
+    } else if (isTypeLiteralNode(node)) {
+      // Untagged objects are payload variants; neither their keys nor their
+      // field values represent bare enum strings.
+      if (tagField === undefined) return;
+      const member = node.members.find((candidate) => isPropertySignature(candidate)
+        && (isIdentifier(candidate.name) || isStringLiteral(candidate.name))
+        && candidate.name.text === tagField);
+      if (!member || !isPropertySignature(member) || !member.type || member.questionToken) {
+        throw new Error(`${name}: object variant is missing required tag ${tagField}`);
+      }
+      visit(member.type, undefined, depth + 1);
+    } else {
+      throw new Error(`${name}: unsupported enum union member ${node.getText(parsed)}`);
+    }
+  };
+  visit(root, tag, 0);
+  return literals;
 }
 
+describe("TypeScript enum contract extraction", () => {
+  it("follows nested and parenthesized local aliases", () => {
+    const source = `type Base = 'Ours' | "Theirs";
+      type Whole = (Base | "WorkingTree");
+      export type Choice = { Chunks: string[] } | Whole | "StageOnly";`;
+    expect([...typeAliasLiterals(source, "Choice") ?? []].sort())
+      .toEqual(["Ours", "StageOnly", "Theirs", "WorkingTree"]);
+  });
+
+  it("does not mistake quoted payload keys or values for bare enum variants", () => {
+    expect([...typeAliasLiterals(`type Choice = "Unit" | { "Chunks": "payload" };`, "Choice") ?? []])
+      .toEqual(["Unit"]);
+  });
+
+  it("extracts only the declared tag across multiline object variants", () => {
+    const source = `type Kind = "add" | 'remove';
+      type Edit = { "kind": Kind; text: "not;a;tag" } | { kind: "rename"; name: string };`;
+    expect([...typeAliasLiterals(source, "Edit", "kind") ?? []].sort()).toEqual(["add", "remove", "rename"]);
+  });
+
+  it("reports unresolved aliases and cycles rather than treating them as empty coverage", () => {
+    expect(() => typeAliasLiterals(`type Choice = Missing | "Unit";`, "Choice")).toThrow(/Missing/);
+    expect(() => typeAliasLiterals(`type A = B; type B = A;`, "A")).toThrow(/cyclic/i);
+  });
+
+  it("bounds expansion depth and distinguishes a missing declaration", () => {
+    const source = Array.from({ length: 100 }, (_, i) => `type T${i} = T${i + 1};`).join("\n") + `type T100 = "end";`;
+    expect(() => typeAliasLiterals(source, "T0")).toThrow(/depth/i);
+    expect(typeAliasLiterals(`type Other = "Unit";`, "Choice")).toBeNull();
+  });
+
+  it("bounds repeated alias expansion as well as depth", () => {
+    const source = Array.from({ length: 14 }, (_, i) => `type T${i} = T${i + 1} | T${i + 1};`).join("\n") + `type T14 = "end";`;
+    expect(() => typeAliasLiterals(source, "T0")).toThrow(/budget/i);
+  });
+});
+
 /** String literals in the TS union named `name`, if one exists. */
-function tsUnion(name: string): { literals: Set<string>; file: string } | null {
+function tsUnion(name: string, tag?: string): { literals: Set<string>; file: string } | null {
   for (const file of walk(TS_ROOT, [".ts", ".svelte"])) {
     const source = readFileSync(file, "utf8");
-    const body = typeAliasBody(source, name);
-    if (body === null) continue;
+    if (!new RegExp(`\\btype\\s+${name}\\s*=`).test(source)) continue;
+    const script = file.endsWith(".svelte")
+      ? [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]).join("\n")
+      : source;
+    const literals = typeAliasLiterals(script, name, tag);
+    if (literals === null) continue;
     return {
-      literals: new Set([...body.matchAll(/"([^"]+)"/g)].map((m) => m[1])),
+      literals,
       file: path.relative(TS_ROOT, file),
     };
   }
@@ -171,9 +241,9 @@ describe("serde enum variants match their TypeScript unions", () => {
 
   it("spells every unit variant the same on both sides", () => {
     const drift: string[] = [];
-    for (const [name, { unit }] of enums) {
+    for (const [name, { unit, tag }] of enums) {
       if (NO_TS_MIRROR.has(name)) continue;
-      const ts = tsUnion(name);
+      const ts = tsUnion(name, tag);
       if (!ts) {
         drift.push(`${name}: no TypeScript union of this name, and no documented reason`);
         continue;
@@ -191,9 +261,9 @@ describe("serde enum variants match their TypeScript unions", () => {
     // `"Reword"`. A TS union listing it as a plain literal would typecheck and
     // then fail to deserialize backend-side.
     const wrong: string[] = [];
-    for (const [name, { withData }] of enums) {
+    for (const [name, { withData, tag }] of enums) {
       if (NO_TS_MIRROR.has(name)) continue;
-      const ts = tsUnion(name);
+      const ts = tsUnion(name, tag);
       if (!ts) continue;
       for (const variant of withData) {
         if (ts.literals.has(variant)) {

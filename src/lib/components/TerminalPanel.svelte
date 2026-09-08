@@ -1,5 +1,9 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { get } from "svelte/store";
+  import { interfaceStore } from "../stores/interfaceStore";
+  import { terminalSessions } from "../terminal/sessionRegistry";
+  import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
   import {
@@ -15,6 +19,16 @@
     SquareTerminal,
     ListChecks,
     X,
+    Plus,
+    Search,
+    ChevronDown,
+    Maximize2,
+    Minimize2,
+    Keyboard,
+    Columns2,
+    Settings2,
+    ChevronLeft,
+    ChevronRight,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -34,8 +48,11 @@
     launcherLabel,
     openTab,
     setTabTitle,
+    renameTab,
+    moveTab,
     tabLabel,
     terminalTabChord,
+    terminalTabDestination,
     type LauncherKind,
     type TabState,
   } from "../terminal/tabs";
@@ -46,10 +63,16 @@
   let {
     repoPath = null,
     visible = true,
+    onClose,
+    expanded = false,
+    onToggleExpanded,
   }: {
     repoPath?: string | null;
     /** False while another repository's panel (or a closed dock) is showing. */
     visible?: boolean;
+    onClose?: () => void;
+    expanded?: boolean;
+    onToggleExpanded?: () => void;
   } = $props();
 
   interface ExecutionEntry {
@@ -67,6 +90,8 @@
   let savedDraft = $state("");
   let executions = $state<ExecutionEntry[]>([]);
   let running = $state(false);
+  let consoleFollowing = $state(true);
+  let discardedExecutions = $state(0);
   let validationError = $state<string | null>(null);
   let copiedId = $state<string | null>(null);
 
@@ -102,15 +127,33 @@
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
   let tabState = $state<TabState>(initialState());
+  const activeId = $derived(tabState.activeId);
+  const activeTitle = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.title);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
+  let nextLauncher = $state<LauncherKind>(get(interfaceStore).terminalLauncher);
+  let splitIds = $state<[string, string] | null>(null);
+  let tabOptions = $state(false);
+  let sessionListOpen = $state(false);
+  let renameValue = $state("");
+  let tabStatuses = $state<Record<string, string>>({});
+  let unread = $state(new Set<string>());
+  const canCreate = $derived(canOpenTab(tabState) && $terminalSessions.length < MAX_TERMINAL_TABS);
+  const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one in Sessions`);
+  let shortcutsOpen = $state(false);
+  let focusTabStrip = false;
 
   function newTab(launcher: LauncherKind) {
-    if (!canOpenTab(tabState)) return;
+    if (!repoPath || !canCreate) return;
+    focusTabStrip = false;
     tabState = openTab(tabState, launcher);
+    if (splitIds && activeId) splitIds = [splitIds[0], activeId];
   }
 
-  function selectTab(id: string) {
+  function selectTab(id: string, keepStripFocus = false) {
+    focusTabStrip = keepStripFocus;
+    if (splitIds && !splitIds.includes(id)) splitIds = [splitIds[0], id];
     tabState = activateTab(tabState, id);
+
   }
 
   /**
@@ -120,21 +163,56 @@
    * that waits to be asked.
    */
   function dropTab(id: string) {
+    focusTabStrip = false;
+    if (splitIds?.includes(id)) splitIds = null;
     tabState = closeTab(tabState, id);
+    const { [id]: _status, ...statuses } = tabStatuses;
+    tabStatuses = statuses;
+    unread = new Set([...unread].filter((key) => key !== id));
     const { [id]: _gone, ...rest } = sessions;
     sessions = rest;
   }
 
   function handleChord(event: KeyboardEvent): boolean {
     if (mode !== "shell") return false;
+    if (!visible || event.defaultPrevented) return false;
     const chord = terminalTabChord(event);
     if (!chord) return false;
     event.preventDefault();
+    event.stopPropagation();
+    focusTabStrip = false;
     if (chord === "new") newTab("shell");
     else if (chord === "close" && tabState.activeId) dropTab(tabState.activeId);
-    else if (chord === "next") tabState = cycleTab(tabState, 1);
-    else if (chord === "prev") tabState = cycleTab(tabState, -1);
+    else if (chord === "next" || chord === "prev") {
+      const next = cycleTab(tabState, chord === "next" ? 1 : -1).activeId;
+      if (next) selectTab(next);
+    }
     return true;
+  }
+
+  function handlePanelKey(event: KeyboardEvent) {
+    if (!visible || event.defaultPrevented) return;
+    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || shortcutsOpen)) {
+      tabOptions = false; sessionListOpen = false; shortcutsOpen = false;
+      event.preventDefault(); event.stopPropagation();
+      if (activeId) sessions[activeId]?.reveal();
+      return;
+    }
+    if (handleChord(event)) return;
+    if (mode === "shell" && activeId) sessions[activeId]?.handleViewChord(event);
+  }
+
+  async function handleTabKey(event: KeyboardEvent) {
+    if (isImeComposition(event) || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    const id = terminalTabDestination(tabState, event.key);
+    if (!id) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectTab(id, true);
+    await tick();
+    if (visible && mode === "shell" && activeId === id) {
+      tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
+    }
   }
 
   /**
@@ -144,10 +222,65 @@
    */
   $effect(() => {
     if (!visible || mode !== "shell") return;
-    const id = tabState.activeId;
+    const id = activeId;
     if (!id) return;
-    sessions[id]?.reveal();
+    if (unread.has(id)) unread = new Set([...unread].filter((key) => key !== id));
+    const session = sessions[id];
+    void tick().then(() => {
+      if (!visible || mode !== "shell" || activeId !== id) return;
+      session?.reveal();
+      if (focusTabStrip) tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
+    });
   });
+
+  // OSC titles can widen a tab after it is selected. Keep its entire control
+  // (including Close) visible without refocusing the shell on every title.
+  $effect(() => {
+    activeTitle;
+    if (!visible || mode !== "shell") return;
+    const id = activeId;
+    const scroller = tabScroller;
+    void tick().then(() => {
+      if (!visible || mode !== "shell" || activeId !== id) return;
+      scroller?.querySelector(`[data-terminal-tab="${id}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  });
+
+  function toggleSplit() {
+    if (splitIds) { splitIds = null; return; }
+    const first = activeId;
+    if (!first) return;
+    let second = tabState.tabs.find((tab) => tab.id !== first)?.id;
+    if (!second) { newTab(nextLauncher); second = activeId ?? undefined; }
+    if (second && second !== first) splitIds = [first, second];
+  }
+
+  function showTabOptions() {
+    renameValue = tabState.tabs.find((tab) => tab.id === activeId)?.name ?? "";
+    tabOptions = !tabOptions;
+    sessionListOpen = false; shortcutsOpen = false;
+  }
+
+  function saveTabName(event: SubmitEvent) {
+    event.preventDefault();
+    if (activeId) tabState = renameTab(tabState, activeId, renameValue);
+    tabOptions = false;
+  }
+
+  function outputAction(event: Event) {
+    if (!(event.currentTarget instanceof HTMLSelectElement) || !activeId) return;
+    const session = sessions[activeId], action = event.currentTarget.value;
+    event.currentTarget.value = "";
+    if (action === "selection") void session?.copySelection();
+    else if (action === "copy") void session?.copyOutput();
+    else if (action === "export") session?.exportOutput();
+  }
+
+  function trimExecutions() {
+    const retained = retainExecutions(executions);
+    discardedExecutions += executions.length - retained.length;
+    executions = retained;
+  }
 
   const QUICK_COMMANDS = [
     "git status",
@@ -179,12 +312,14 @@
       return;
     }
 
+    if (!boundedCommand(textToRun)) {
+      validationError = "Console commands are limited to 64 KiB.";
+      return;
+    }
     validationError = null;
 
     // Update command history
-    if (history.length === 0 || history[history.length - 1] !== textToRun) {
-      history.push(textToRun);
-    }
+    history = retainCommand(history, textToRun);
     historyIndex = -1;
     savedDraft = "";
     commandInput = "";
@@ -198,6 +333,8 @@
     };
 
     executions = [...executions, entry];
+    trimExecutions();
+    consoleFollowing = true;
     running = true;
     void scrollToBottom();
 
@@ -234,8 +371,8 @@
       });
     } finally {
       running = false;
-      void scrollToBottom();
-      inputEl?.focus();
+      trimExecutions();
+      if (consoleFollowing && visible && mode === "console") void scrollToBottom();
     }
   }
 
@@ -271,6 +408,7 @@
 
   function clearOutput() {
     executions = [];
+    discardedExecutions = 0;
     validationError = null;
   }
 
@@ -298,17 +436,19 @@
   }
 </script>
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<!-- Justified: keyboard events bubble from the region's interactive controls; the region itself is not a focus stop. -->
+<div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Terminal" onkeydown={handlePanelKey}>
   <!-- Header Bar -->
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between shrink-0">
-    <div class="flex items-center gap-2 min-w-0">
-      <Terminal size={16} class="text-accent shrink-0" />
+  <div class="px-3 py-1.5 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-2 items-center shrink-0">
+    <div class="flex flex-1 items-center gap-2 min-w-0">
+      <Terminal size={14} class="text-accent shrink-0" />
       <span class="font-semibold text-textPrimary">Terminal</span>
-      <span class="text-textMuted font-mono truncate max-w-md">
-        {repoPath ?? "No repository"}
+      <span class="text-textMuted font-mono truncate text-[10px]" title={repoPath ?? "No repository"}>
+        {repoPath?.split(/[\\/]/).pop() ?? "No repository"}
       </span>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-1 shrink-0">
       <div class="gp-segmented" role="group" aria-label="Terminal mode">
         <button
           type="button"
@@ -332,15 +472,8 @@
         </button>
       </div>
       {#if mode === "shell"}
-        <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface border border-border/60 text-[10px] text-textMuted">
-          <AlertCircle size={11} class="text-amber-400 shrink-0" />
-          <span>unguarded: a shell runs outside the MANVI gate</span>
-        </div>
-      {:else}
-        <div class="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface border border-border/60 text-[10px] text-textMuted">
-          <Shield size={11} class="text-accent" />
-          <span>Direct & bounded · git commands MANVI-gated</span>
-        </div>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Find in terminal" title="Find in terminal (⌘F / Ctrl+Shift+F)" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
+        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
       {/if}
       {#if mode === "console" && executions.length > 0}
         <button
@@ -353,14 +486,49 @@
           <span>Clear</span>
         </button>
       {/if}
+      <button type="button" class="gp-icon-btn text-[10px]!" aria-label="All terminal sessions" aria-expanded={sessionListOpen} title="Sessions across repositories" onclick={() => { sessionListOpen = !sessionListOpen; tabOptions = false; shortcutsOpen = false; }}>{$terminalSessions.length}/{MAX_TERMINAL_TABS}</button>
+      <button type="button" class="gp-icon-btn" aria-label="Terminal shortcuts" aria-expanded={shortcutsOpen} title="Terminal shortcuts" onclick={() => { shortcutsOpen = !shortcutsOpen; tabOptions = false; sessionListOpen = false; }}><Keyboard size={13} /></button>
+      {#if onToggleExpanded}
+        <button type="button" class="gp-icon-btn" aria-label={expanded ? "Restore terminal size" : "Expand terminal"} title={expanded ? "Restore terminal size" : "Expand terminal"} onclick={onToggleExpanded}>
+          {#if expanded}<Minimize2 size={13} />{:else}<Maximize2 size={13} />{/if}
+        </button>
+      {/if}
+      {#if onClose}
+        <button type="button" class="gp-icon-btn" aria-label="Hide the terminal dock" title="Hide the terminal (⌃`) — sessions keep running" onclick={onClose}><ChevronDown size={14} /></button>
+      {/if}
     </div>
   </div>
+
+  {#if sessionListOpen}
+    <div class="terminal-popover px-3 py-2 overflow-auto border border-border rounded-lg bg-surface shadow-lg text-[11px]" aria-label="Sessions across repositories">
+      {#each $terminalSessions as session (session.key)}
+        <div class="flex gap-2 items-center py-0.5">
+          <span class="flex-1 min-w-0 truncate" title={session.repoPath}>{session.repoPath.split(/[\\/]/).pop()} · {session.label} · {session.status}</span>
+          <button type="button" class="gp-btn py-0!" onclick={() => session.close().catch((error: unknown) => (validationError = formatError(error)))}>Close session</button>
+        </div>
+      {/each}
+      {#if !$terminalSessions.length}<span>No active processes.</span>{/if}
+    </div>
+  {/if}
+  {#if shortcutsOpen}
+    <div class="terminal-popover px-3 py-2 flex flex-wrap gap-x-5 gap-y-1 text-[10px] text-textMuted bg-surface border border-border rounded-lg shadow-lg" aria-label="Terminal keyboard shortcuts">
+      <span><kbd>Ctrl+Shift+T</kbd> New shell</span>
+      <span><kbd>Ctrl+Shift+W</kbd> Close session</span>
+      <span><kbd>Ctrl+Tab / Ctrl+Shift+Tab</kbd> Next / previous tab</span>
+      <span><kbd>⌘F / Ctrl+Shift+F</kbd> Find</span>
+      <span><kbd>Enter / Shift+Enter</kbd> Next / previous match</span>
+      <span><kbd>Esc</kbd> Close find</span>
+      <span><kbd>⌘ + / − / 0</kbd> Text size (Ctrl+Shift on Windows/Linux)</span>
+      <span><kbd>← / → / Home / End</kbd> Navigate focused tabs</span>
+      <span>Shell commands run outside the MANVI gate. Console git commands are MANVI-gated.</span>
+    </div>
+  {/if}
 
   <!-- Tab strip + sessions. Rendered in BOTH modes and merely hidden in
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-8 border-b border-border/60 gp-section-edge bg-surface/40"
+      class="shrink-0 flex items-stretch gap-2 px-2 h-9 border-b border-border/60 gp-section-edge bg-surface/40"
       class:hidden={mode !== "shell"}
     >
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
@@ -375,6 +543,7 @@
       >
       {#each tabState.tabs as tab (tab.id)}
         <div
+          data-terminal-tab={tab.id}
           class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-[11px] shrink-0 transition-colors {tab.id ===
           tabState.activeId
             ? 'bg-surface border-accent/50 text-textPrimary'
@@ -383,16 +552,20 @@
           <button
             type="button"
             role="tab"
+            id={`terminal-tab-${tab.id}`}
+            aria-controls={`terminal-pane-${tab.id}`}
             aria-selected={tab.id === tabState.activeId}
+            tabindex={tab.id === tabState.activeId ? 0 : -1}
             class="max-w-56 truncate"
             onclick={() => selectTab(tab.id)}
-            title={`${launcherLabel(tab.launcher)} — ${tabLabel(tab)}`}
+            onkeydown={handleTabKey}
+            title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
           >
-            {tabLabel(tab)}
+            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-rose-300"> · Error</span>{/if}
           </button>
           <button
             type="button"
-            class="p-0.5 rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
+            class="p-0.5 rounded opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surfaceHover text-textMuted hover:text-rose-300"
             onclick={() => dropTab(tab.id)}
             aria-label={`Close ${tabLabel(tab)}`}
             title="Close this session (⌃⇧W) — the process is terminated"
@@ -406,26 +579,29 @@
       </div>
 
       <div class="flex items-center gap-1 shrink-0 border-l border-border/60 pl-2">
-        <span class="text-[10px] text-textMuted uppercase tracking-wider">New</span>
-        {#each LAUNCHERS as launcher (launcher.kind)}
-          <button
-            type="button"
-            class="px-2 py-0.5 my-1 rounded-full text-[10px] border border-border/60 text-textMuted hover:text-textPrimary hover:border-accent/60 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            disabled={!canOpenTab(tabState)}
-            onclick={() => newTab(launcher.kind)}
-            title={canOpenTab(tabState)
-              ? launcher.kind === "shell"
-                ? "Open another interactive shell (⌃⇧T)"
-                : `Open a new tab running the ${launcher.label} CLI in this worktree`
-              : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one first`}
-          >
-            {launcher.label}
-          </button>
-        {/each}
+        <button type="button" class="gp-icon-btn" aria-label={splitIds ? "Close split view" : "Split terminal"} aria-pressed={Boolean(splitIds)} disabled={!activeId || (tabState.tabs.length < 2 && !canCreate)} onclick={toggleSplit}><Columns2 size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
+        <select bind:value={nextLauncher} onchange={() => interfaceStore.setTerminalLauncher(nextLauncher)} aria-label="New session type" class="max-w-24 bg-surface text-textPrimary text-[11px] rounded px-1 py-0.5 border border-border/60">
+          {#each LAUNCHERS as launcher (launcher.kind)}
+            <option value={launcher.kind}>{launcher.label}</option>
+          {/each}
+        </select>
+        <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => newTab(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
       </div>
     </div>
 
-    <div class="flex-1 min-h-0 relative" class:hidden={mode !== "shell"}>
+    {#if tabOptions && mode === "shell" && activeId}
+      <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 border border-border rounded-lg bg-surface shadow-lg" onsubmit={saveTabName}>
+        <input aria-label="Terminal tab name" bind:value={renameValue} maxlength="64" placeholder="Use automatic title" class="min-w-0 w-36 bg-surface rounded px-2 py-1 border border-border text-xs" />
+        <button type="submit" class="gp-btn py-1!">Rename</button>
+        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={tabState.tabs.at(-1)?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, 1))}><ChevronRight size={13} /></button>
+        <select aria-label="Terminal output actions" onchange={outputAction} class="bg-surface border border-border rounded px-1 py-1 text-xs">
+          <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
+        </select>
+      </form>
+    {/if}
+    <div class="terminal-panes flex-1 min-h-0 relative" class:hidden={mode !== "shell"}>
       {#if !repoPath}
         <div class="h-full flex items-center justify-center text-textMuted text-xs">
           Open a repository to start a shell.
@@ -443,18 +619,25 @@
                at zero height would have its xterm reflow to a 1-row grid and
                tell the shell about it. -->
           <div
-            class="absolute inset-0"
-            class:hidden={tab.id !== tabState.activeId}
+            class="terminal-pane absolute inset-0"
+            data-position={splitIds?.[0] === tab.id ? "left" : splitIds?.[1] === tab.id ? "right" : "full"}
+            class:hidden={splitIds ? !splitIds.includes(tab.id) : tab.id !== tabState.activeId}
+            onfocusin={() => { if (activeId !== tab.id) selectTab(tab.id); }}
             role="tabpanel"
+            id={`terminal-pane-${tab.id}`}
+            aria-labelledby={`terminal-tab-${tab.id}`}
             aria-label={tabLabel(tab)}
           >
             <TerminalSession
               bind:this={sessions[tab.id]}
               repoPath={repoPath}
+              tabId={tab.id}
               launcher={tab.launcher}
-              active={tab.id === tabState.activeId && mode === "shell"}
+              active={visible && tab.id === tabState.activeId && mode === "shell"}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
+              onStatus={(status) => (tabStatuses = { ...tabStatuses, [tab.id]: status })}
+              onActivity={() => { if (visible && mode === "shell" && splitIds?.includes(tab.id)) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
           </div>
         {/each}
@@ -462,11 +645,14 @@
     </div>
 
   {#if mode === "console"}
+  <div class="px-3 h-7 shrink-0 flex items-center gap-1.5 text-[10px] text-textMuted border-b border-border/60"><Shield size={11} />Direct & bounded · git commands MANVI-gated</div>
   <!-- Output Area -->
   <div
     bind:this={scrollContainer}
+    onscroll={() => { if (scrollContainer) consoleFollowing = followsConsoleOutput(scrollContainer.scrollTop, scrollContainer.clientHeight, scrollContainer.scrollHeight); }}
     class="flex-1 overflow-auto p-4 space-y-4 font-mono text-[11px] leading-relaxed"
   >
+    {#if discardedExecutions > 0}<div role="status" class="text-textMuted">{discardedExecutions} older results removed · retains up to 100 results / 8 MiB.</div>{/if}
     {#if executions.length === 0}
       <div class="flex flex-col items-center justify-center h-full max-w-lg mx-auto text-center space-y-4 text-textMuted font-sans">
         <div class="p-3 rounded-2xl bg-surface border border-border shadow-xs text-accent">
@@ -646,3 +832,17 @@
   </div>
   {/if}
 </div>
+
+<style>
+  .terminal-popover { position: absolute; inset: 82px 8px auto; max-height: calc(100% - 90px); overflow: auto; z-index: 20; }
+  .terminal-panes { container-type: inline-size; overflow: auto; }
+  /* Keep a readable grid after Find, warnings, and the footer take their
+     space. Short docks scroll their panes instead of crushing them to zero. */
+  .terminal-pane { min-height: 180px; }
+  .terminal-pane[data-position="left"] { right: 50%; border-right: 1px solid var(--color-border); }
+  .terminal-pane[data-position="right"] { left: 50%; }
+  @container (max-width: 620px) {
+    .terminal-pane[data-position="left"] { right: 0; bottom: auto; height: max(50%, 180px); border-right: 0; border-bottom: 1px solid var(--color-border); }
+    .terminal-pane[data-position="right"] { left: 0; top: max(50%, 180px); bottom: auto; height: max(50%, 180px); }
+  }
+</style>

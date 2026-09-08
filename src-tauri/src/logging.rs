@@ -6,6 +6,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+pub(crate) mod performance;
+
 pub const MAX_LOG_ENTRIES: usize = 1000;
 const TAIL_MAX_LINES: usize = 500;
 const DEFAULT_TAIL_LINES: usize = 200;

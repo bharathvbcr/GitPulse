@@ -1,0 +1,209 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>GitPulse terminal verification</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <button id="stress" disabled style="position:fixed;top:30px;right:4px;z-index:100">Run input stress checks</button>
+    <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
+    <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
+    <script type="module">
+      import { mockIPC } from "@tauri-apps/api/mocks";
+      import { emit } from "@tauri-apps/api/event";
+      import "../src/app.css";
+
+      const sessions = new Map();
+      let written = [];
+      const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [] };
+      const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
+      addEventListener("error", (event) => { report.errors.push(event.message); showReport(); });
+      addEventListener("unhandledrejection", (event) => { report.errors.push(String(event.reason)); showReport(); });
+      const output = async (id, text) => {
+        const bytes = new TextEncoder().encode(text);
+        for (let i = 0; i < bytes.length; i += 4096) {
+          await emit("terminal-output", {id, data_b64:btoa(String.fromCharCode(...bytes.subarray(i, i + 4096)))});
+        }
+      };
+      mockIPC((cmd, args) => {
+        switch (cmd) {
+          case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
+          case "cmd_terminal_spawn": {
+            const id = `fixture-${++report.spawned}`;
+            sessions.set(id, args.repoPath);
+            // The bus subscribes after the acknowledgement; emit on the next task.
+            setTimeout(() => {
+              const lines = Array.from({ length: 80 }, (_, i) => `line ${i + 1}: ${i % 10 === 0 ? "ERROR" : "passed"} · terminal verification`).join("\r\n");
+              void output(id, `\u001b]2;${args.repoPath.split("/").pop()} ${report.spawned}\u0007\u001b[32mSession ready\u001b[0m\r\n${lines}\r\nWrapped: ${"long text ".repeat(20)}needle end\r\nUnicode: 世界 café 🚀\r\n${args.repoPath} $ `);
+            }, 100);
+            showReport();
+            return { id, cwd: args.repoPath, shell: "/bin/zsh" };
+          }
+          case "cmd_terminal_ack": return null;
+          case "cmd_terminal_export": return true;
+          case "cmd_terminal_write":
+            report.writes++;
+            if (new TextEncoder().encode(args.data).length > 65536) throw new Error("PTY input limit");
+            written.push(args.data);
+            showReport(); return output(args.sessionId, args.data === "\r" ? "\r\nsimulated $ " : args.data);
+          case "cmd_terminal_resize":
+            // Real shells repaint the prompt after SIGWINCH. xterm deliberately
+            // does not reflow the cursor line; the fixture must model that too.
+            report.resizes++;
+            if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
+            showReport(); return null;
+          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": case "cmd_stash_list": return [];
+          case "cmd_list_tags": return { tags: [], truncated: false };
+          case "cmd_branch_stats": return {};
+          case "cmd_repo_operation": return null;
+          case "cmd_workspace_sync": return null;
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      }, { shouldMockEvents: true });
+
+      const { mount } = await import("svelte");
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const Host = (await import("./TerminalHost.svelte")).default;
+      await repoStore.openRepo("/fixture/Other");
+      await repoStore.openRepo("/fixture/GitPulse");
+      interfaceStore.setTerminalFontSize(12);
+      interfaceStore.setTerminalDockHeight(400);
+      interfaceStore.setTerminalDockOpen(true);
+      mount(Host, { target: document.querySelector("#app") });
+      showReport();
+
+      document.querySelector("#stress").onclick = async (event) => {
+        event.currentTarget.disabled = true;
+        const input = [...document.querySelectorAll('textarea[aria-label="Terminal input"]')].find((el) => el.getClientRects().length);
+        const paste = (text) => { const clipboardData = new DataTransfer(); clipboardData.setData("text/plain", text); input.dispatchEvent(new ClipboardEvent("paste", {bubbles:true, cancelable:true, clipboardData})); };
+        const payload = "世界🚀é".repeat(25000);
+        written = [];
+        paste(payload);
+        const deadline = performance.now() + 10000;
+        while (written.join("").length < payload.length && performance.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+        const exact = written.join("") === payload;
+        const bounded = written.every((data) => new TextEncoder().encode(data).length <= 16384);
+        const before = report.writes;
+        paste("x".repeat(1024 * 1024 + 1));
+        await new Promise((r) => setTimeout(r, 100));
+        const refused = report.writes === before && document.body.textContent.includes("Paste was not sent");
+        input.dispatchEvent(new KeyboardEvent("keydown", {key:"W",ctrlKey:true,shiftKey:true,repeat:true,bubbles:true,cancelable:true}));
+        await new Promise((r) => setTimeout(r, 100));
+        const repeat = report.writes === before;
+        report.inputStress = {exact,bounded,refused,repeat,bytes:new TextEncoder().encode(payload).length,chunks:written.length};
+        showReport();
+        document.querySelector("#stress").textContent = exact && bounded && refused && repeat ? "4 input stress checks passed" : "Input stress FAILED";
+      };
+
+      document.querySelector("#checks").onclick = async (event) => {
+        event.currentTarget.disabled = true;
+        const results = [];
+        const wait = () => new Promise((resolve) => setTimeout(resolve, 250));
+        const visible = (selector) => [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length);
+        const label = (name) => visible("[aria-label]").find((el) => el.getAttribute("aria-label") === name);
+        const button = (name) => label(name) ?? visible("button").find((el) => el.textContent.trim() === name);
+        const check = (name, pass) => { results.push({ name, pass }); if (!pass) throw new Error(name); };
+        const input = async (text) => {
+          const field = label("Find in terminal output");
+          field.value = text;
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+          await wait();
+        };
+        const press = async (target, key, modifiers = {}) => {
+          target.focus();
+          target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...modifiers }));
+          await wait();
+        };
+        const status = () => visible('[role="status"]')[0]?.textContent;
+        try {
+          const writesBefore = report.writes;
+          button("Find in terminal").click(); await wait();
+          await input("error"); check("case-insensitive search finds eight results", status() === "1 of 8");
+          await press(label("Find in terminal output"), "Enter"); check("Enter selects next match", status() === "2 of 8");
+          await press(label("Find in terminal output"), "Enter", { shiftKey: true }); check("Shift+Enter selects previous match", status() === "1 of 8");
+          button("Match case").click(); await wait(); check("case toggle invalidates highlights and counts", status() === "No matches");
+          await input("世界"); check("Unicode search", status() === "1 of 1");
+          await input("needle end"); check("wrapped output search", status() === "1 of 1");
+          await input("missing-query"); check("no-match state", status() === "No matches");
+          await input(""); check("empty query clears result count", status() === "");
+          await press(label("Find in terminal output"), "Escape"); check("Escape restores terminal focus", document.activeElement?.getAttribute("aria-label") === "Terminal input");
+          await press(button("New Shell session"), "T", { ctrlKey: true, shiftKey: true });
+          check("new-tab chord works from toolbar", visible('[role="tab"]').length === 2);
+          await press(visible('[role="tab"][aria-selected="true"]')[0], "Home");
+          check("Home selects first tab and keeps strip focus", document.activeElement === visible('[role="tab"]')[0]);
+          await press(document.activeElement, "ArrowRight");
+          check("ArrowRight selects next tab and keeps strip focus", document.activeElement === visible('[role="tab"]')[1]);
+          const beforeHide = report.spawned;
+          button("Hide the terminal dock").click(); await wait();
+          button("Show terminal").click(); await wait();
+          check("hide/show preserves both sessions", report.spawned === beforeHide && report.killed === 0);
+          button("Repository Other").click(); await wait();
+          check("another repository gets its own session", report.spawned === beforeHide + 1);
+          button("Repository GitPulse").click(); await wait();
+          check("returning restores both original tabs", visible('[role="tab"]').length === 2 && report.killed === 0);
+          const dock = document.querySelector("[data-terminal-dock]");
+          const height = dock.getBoundingClientRect().height;
+          button("Expand terminal").click(); await wait(); check("expand grows the dock", dock.getBoundingClientRect().height > height);
+          button("Restore terminal size").click(); await wait(); check("restore returns previous height", dock.getBoundingClientRect().height === height);
+          button("Toggle narrow layout").click(); await wait();
+          check("narrow toolbar stays inside its panel", label("Terminal").scrollWidth === label("Terminal").clientWidth);
+          button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", report.spawned === beforeHide + 1);
+          check("terminal palette follows the completed theme transition", getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
+          button("Console").click(); await wait();
+          button("Shell").click(); await wait(); check("Console switch preserves sessions", report.spawned === beforeHide + 1 && report.killed === 0);
+          for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
+          await wait(); check("font size is bounded", button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
+          button("Reset terminal text size").click(); await wait();
+          const beforeClear = report.spawned;
+          button("Clear scrollback").click(); await wait();
+          check("clear keeps the prompt and running session", visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
+          const beforeOptions = report.spawned;
+          button("Terminal tab options").click(); await wait();
+          const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
+          button("Rename").click(); await wait();
+          check("custom tab names survive program titles", visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
+          button("Terminal tab options").click(); await wait();
+          button("Move terminal tab left").click(); await wait();
+          check("tab reorder preserves sessions and selection", visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
+          await press(label("Terminal tab name"), "Escape");
+          button("Split terminal").click(); await wait();
+          check("split view shows two existing sessions", visible('[role="tabpanel"]').length === 2 && report.spawned === beforeOptions);
+          const panes = visible('[role="tabpanel"]').map((el) => el.getBoundingClientRect());
+          check("narrow split stacks panes without overlap", Math.min(panes[0].bottom, panes[1].bottom) <= Math.max(panes[0].top, panes[1].top) + 1);
+          interfaceStore.setTerminalDockHeight(200);
+          button("Find in terminal").click(); await wait();
+          check("minimum dock height keeps both split terminals usable with Find open", visible('[data-terminal-session]').every((el) => el.getBoundingClientRect().height >= 60));
+          const shortPanes = visible('[role="tabpanel"]').map((el) => el.getBoundingClientRect());
+          const paneScroller = visible('.terminal-panes')[0];
+          check("short stacked panes scroll without overlap", Math.min(shortPanes[0].bottom, shortPanes[1].bottom) <= Math.max(shortPanes[0].top, shortPanes[1].top) + 1 && paneScroller.scrollHeight > paneScroller.clientHeight);
+          button("Close find").click(); interfaceStore.setTerminalDockHeight(400); await wait();
+          button("Close split view").click(); await wait();
+          check("closing split preserves both sessions", visible('[role="tabpanel"]').length === 1 && report.killed === 0);
+          button("All terminal sessions").click(); await wait();
+          check("session manager includes both repositories", label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
+          button("All terminal sessions").click(); await wait();
+          for (let i = 0; i < 14; i++) { button("New Shell session").click(); await wait(); }
+          check("global session limit spans both repositories", visible('[role="tab"]').length === 15 && report.spawned === 16 && button("New Shell session").disabled);
+          const activeTab = visible('[role="tab"][aria-selected="true"]')[0].closest("[data-terminal-tab]").getBoundingClientRect();
+          const strip = label("Terminal sessions").getBoundingClientRect();
+          check("new active tab scrolls into view", activeTab.left >= strip.left && activeTab.right <= strip.right + 1);
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          check("close chord kills only its session", visible('[role="tab"]').length === 14 && report.killed === 1);
+          check("controls never write to the shell", report.writes === writesBefore);
+          check("no runtime errors", report.errors.length === 0);
+        } catch (error) {
+          if (!results.some((result) => !result.pass)) results.push({ name: String(error), pass: false });
+        }
+        report.checks = results;
+        showReport();
+        document.querySelector("#result").style.maxWidth = "100%";
+        document.querySelector("#result").style.maxHeight = "70px";
+        document.querySelector("#result").style.overflow = "auto";
+        document.querySelector("#result").style.whiteSpace = "pre-wrap";
+        document.querySelector("#checks").textContent = results.every((result) => result.pass) ? `${results.length} checks passed` : "Checks FAILED";
+        document.querySelector("#stress").disabled = !results.every((result) => result.pass);
+      };
+      document.querySelector("#checks").disabled = false;
+    </script>
+  </body>
+</html>

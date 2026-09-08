@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -305,7 +306,22 @@ fn git_command_with_env(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Command {
-    let mut cmd = Command::new("git");
+    let child_path = (!cfg!(windows))
+        .then(|| extended_child_path(path_var, home))
+        .flatten();
+    // Rust falls back to fork when PATH is changed and the program is a
+    // bare name. Resolve against precisely the child's search path to retain
+    // posix_spawn on macOS, without lossy conversion or a permanent cache
+    // that would ignore a replaced/removed executable. Relative entries need
+    // the OS's child-cwd semantics and deliberately retain the fallback.
+    let program = child_path.as_deref().and_then(|path| {
+        let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+        dirs.iter()
+            .all(|dir| dir.is_absolute())
+            .then(|| find_in_dirs("git", &dirs))
+            .flatten()
+    });
+    let mut cmd = Command::new(program.as_deref().unwrap_or_else(|| Path::new("git")));
     // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
     // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
     // porcelain text output arrives C-quoted ("\\346\\226\\207...") while `-z`
@@ -375,10 +391,8 @@ fn git_command_with_env(
     // one place after it is what stops the next added name from being quietly
     // undone. Inherited entries stay ahead of the appended ones, so no helper
     // that already resolved starts resolving somewhere else.
-    if !cfg!(windows) {
-        if let Some(child_path) = extended_child_path(path_var, home) {
-            cmd.env("PATH", child_path);
-        }
+    if let Some(child_path) = child_path {
+        cmd.env("PATH", child_path);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -470,6 +484,34 @@ pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
 
 pub fn git_with_stdin(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>, String> {
     git_timeout(Some(repo), args, DEFAULT_TIMEOUT, Some(stdin_bytes))
+}
+
+/// A caller-owned index transaction. The override is applied only after the
+/// normal environment scrub; inherited GIT_INDEX_FILE remains untrusted.
+pub(crate) fn git_with_index(
+    repo: &Path,
+    index: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut command = git_command(Some(repo), args);
+    command.env("GIT_INDEX_FILE", index);
+    let output = run_bounded(
+        command,
+        "git index transaction",
+        DEFAULT_TIMEOUT,
+        Some(stdin_bytes),
+    )?;
+    if let Some(reason) = output.incomplete {
+        return Err(format!("Index transaction output {}", reason.describe()));
+    }
+    if !output.success {
+        return Err(format!(
+            "Index transaction failed: {}",
+            String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(2000)])
+        ));
+    }
+    Ok(output.stdout)
 }
 
 /// Runs `git` in `repo` with an explicit deadline instead of
@@ -1230,6 +1272,23 @@ pub(crate) struct BoundedRun {
 const SPAWN_LIMIT_FLOOR: usize = 4;
 const SPAWN_LIMIT_CEILING: usize = 16;
 
+thread_local! {
+    static BACKGROUND_PROCESSES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Applies only inside a synchronous blocking operation. Restore the worker's
+/// previous priority on normal return, errors and unwinding before pool reuse.
+pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BACKGROUND_PROCESSES.set(self.0);
+        }
+    }
+    let _restore = Restore(BACKGROUND_PROCESSES.replace(true));
+    body()
+}
+
 /// A counting semaphore over live child processes.
 ///
 /// Deliberately plain `std` rather than a new dependency: the only operations
@@ -1244,6 +1303,8 @@ struct SpawnGate {
 #[derive(Default)]
 struct GateState {
     in_flight: usize,
+    background: usize,
+    waiting_background: usize,
     /// High-water mark, kept so a test can assert the ceiling actually held
     /// rather than assert on the counter it is trying to prove bounded.
     peak: usize,
@@ -1258,22 +1319,64 @@ impl SpawnGate {
         }
     }
 
-    fn acquire(&self) -> SpawnPermit<'_> {
+    fn acquire(&self, timeout: Duration) -> Option<SpawnPermit<'_>> {
+        let start = Instant::now();
+        let background = BACKGROUND_PROCESSES.get();
         // A poisoned gate must not deadlock the app: a panic inside a permit
         // holder still ran the `Drop` below, so the count is accurate.
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.in_flight >= self.limit {
-            state = self
+        if background {
+            state.waiting_background += 1;
+            self.released.notify_all();
+        }
+        let admitted = loop {
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                break false;
+            };
+            if remaining.is_zero() {
+                break false;
+            }
+            // Optional work gets at most a quarter of the slots (at least
+            // one). Conversely, a waiting background class gets the next
+            // available slot if no background child is running, so sustained
+            // foreground traffic cannot indefinitely postpone all indexing.
+            let eligible = if background {
+                state.background < (self.limit / 4).max(1)
+            } else {
+                state.waiting_background == 0
+                    || state.background > 0
+                    || state.in_flight < self.limit.saturating_sub(1)
+            };
+            if state.in_flight < self.limit && eligible {
+                break true;
+            }
+            let (next, _) = self
                 .released
-                .wait(state)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        };
+        if background {
+            state.waiting_background -= 1;
+        }
+        if !admitted {
+            drop(state);
+            // A timed-out background waiter must release its reservation.
+            self.released.notify_all();
+            return None;
         }
         state.in_flight += 1;
+        if background {
+            state.background += 1;
+        }
         state.peak = state.peak.max(state.in_flight);
-        SpawnPermit { gate: self }
+        Some(SpawnPermit {
+            gate: self,
+            background,
+        })
     }
 
     #[cfg(test)]
@@ -1289,6 +1392,7 @@ impl SpawnGate {
 /// panic all give the descriptor budget back.
 struct SpawnPermit<'a> {
     gate: &'a SpawnGate,
+    background: bool,
 }
 
 impl Drop for SpawnPermit<'_> {
@@ -1299,8 +1403,12 @@ impl Drop for SpawnPermit<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight = state.in_flight.saturating_sub(1);
+        if self.background {
+            state.background = state.background.saturating_sub(1);
+        }
         drop(state);
-        self.gate.released.notify_one();
+        // Waking only an ineligible class can strand an otherwise free slot.
+        self.gate.released.notify_all();
     }
 }
 
@@ -1344,12 +1452,24 @@ pub(crate) fn run_bounded(
 /// whose output lands in the UI pass the budget their surface can actually
 /// render, and tell the user when they hit it.
 pub(crate) fn run_bounded_capped(
-    mut cmd: Command,
+    cmd: Command,
     label: &str,
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
+    run_bounded_with_gate(cmd, label, timeout, stdin_bytes, stdout_cap, spawn_gate())
+}
+
+fn run_bounded_with_gate(
+    mut cmd: Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    gate: &SpawnGate,
+) -> Result<BoundedRun, String> {
+    let start = Instant::now();
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1360,7 +1480,12 @@ pub(crate) fn run_bounded_capped(
     // Held until this function returns, covering the child's descriptors, its
     // two drain threads and their buffers -- see [`SpawnGate`] for why an
     // unbounded fan-out here exhausted the process descriptor table.
-    let _permit = spawn_gate().acquire();
+    let _permit = gate.acquire(timeout).ok_or_else(|| {
+        format!(
+            "{label}{TIMEOUT_MARKER}{}s waiting for a process slot",
+            timeout.as_secs_f64()
+        )
+    })?;
 
     // Spawned into a process group of its own and registered, so a SIGTERM to
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
@@ -1392,20 +1517,24 @@ pub(crate) fn run_bounded_capped(
     // input) makes the write fail with EPIPE, which is not an error of ours —
     // the exit status decides. Dropping `stdin` at closure end is what sends
     // the child EOF.
-    let stdin_handle = stdin_bytes.map(|bytes| {
+    let stdin_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdin_done = stdin_bytes.map(|bytes| {
         // The writer thread may outlive this stack frame. Own the bounded
         // payload rather than leaking a caller borrow into a `'static` task.
         let bytes = bytes.to_vec();
         let stdin = child.stdin.take();
+        let cancel = std::sync::Arc::clone(&stdin_cancel);
+        let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            if let Some(mut stdin) = stdin {
-                use std::io::Write;
-                let _ = stdin.write_all(&bytes);
-            }
-        })
+            let result = match stdin {
+                Some(stdin) => write_stdin_cancellable(stdin, &bytes, &cancel),
+                None => Err("stdin pipe unavailable".to_string()),
+            };
+            let _ = tx.send(result);
+        });
+        rx
     });
 
-    let start = Instant::now();
     let mut backoff = POLL_BACKOFF_START;
     let outcome = loop {
         // Every wait goes through the registration so the registry never
@@ -1425,10 +1554,22 @@ pub(crate) fn run_bounded_capped(
             Err(e) => break Err(format!("Failed to wait on {}: {}", label, e)),
         }
     };
-    if let Some(handle) = stdin_handle {
-        // After a kill the write end fails with EPIPE promptly; on a natural
-        // exit the thread has already finished.
-        let _ = handle.join();
+    if let Some(done) = stdin_done {
+        // A descendant may retain stdin after its parent exits. Never join
+        // that writer indefinitely. Unix writes are nonblocking so cancel
+        // also releases the pipe and input allocation after the next poll.
+        let result = done.recv_timeout(DRAIN_JOIN_GRACE);
+        stdin_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!("writer did not settle: {error}")),
+        };
+        if let Some(error) = error {
+            // Preserve an existing timeout/wait error as the primary cause.
+            outcome.as_ref().map_err(Clone::clone)?;
+            return Err(format!("Failed to deliver {label} stdin: {error}"));
+        }
     }
     match outcome {
         Ok(status) => {
@@ -1491,6 +1632,62 @@ pub(crate) fn run_bounded_capped(
             Err(e)
         }
     }
+}
+
+fn write_stdin_cancellable(
+    mut stdin: std::process::ChildStdin,
+    mut bytes: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = stdin.as_raw_fd();
+        // SAFETY: the owned pipe stays open throughout both fcntl calls;
+        // only this writer uses its write-end file description.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    while !bytes.is_empty() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("writer cancelled after its settle deadline".into());
+        }
+        match stdin.write(bytes) {
+            Ok(0) => return Err("stdin write made no progress".into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    let mut descriptor = libc::pollfd {
+                        fd: stdin.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: one initialized descriptor, owned by stdin.
+                    // Readiness wakes immediately; the 15 ms ceiling bounds
+                    // cancellation latency without throttling large inputs.
+                    let ready = unsafe { libc::poll(&mut descriptor, 1, 15) };
+                    if ready < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error.to_string());
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                thread::sleep(POLL_BACKOFF_START);
+            }
+            // Early exit is decided by the child's status, as before.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// Collects a pipe-drain result, waiting at most [`DRAIN_JOIN_GRACE`] for EOF.
@@ -1783,6 +1980,131 @@ pub fn repo_name_from_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_priority_restores_after_nested_work_errors_and_panic() {
+        assert!(!super::BACKGROUND_PROCESSES.get());
+        let result = std::panic::catch_unwind(|| {
+            super::with_background_processes(|| {
+                assert!(super::BACKGROUND_PROCESSES.get());
+                let error: Result<(), &str> = super::with_background_processes(|| Err("expected"));
+                assert_eq!(error, Err("expected"));
+                assert!(super::BACKGROUND_PROCESSES.get());
+                panic!("expected priority unwind");
+            })
+        });
+        assert!(result.is_err());
+        assert!(!super::BACKGROUND_PROCESSES.get());
+        super::with_background_processes(|| {
+            std::thread::spawn(|| assert!(!super::BACKGROUND_PROCESSES.get()))
+                .join()
+                .unwrap();
+        });
+        assert!(!super::BACKGROUND_PROCESSES.get());
+    }
+
+    #[test]
+    fn background_waiter_gets_capacity_and_timeout_releases_its_reservation() {
+        let gate = std::sync::Arc::new(super::SpawnGate::new(4));
+        let mut foreground: Vec<_> = (0..4)
+            .map(|_| gate.acquire(std::time::Duration::from_secs(1)).unwrap())
+            .collect();
+        let worker_gate = gate.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            super::with_background_processes(|| {
+                let _permit = worker_gate
+                    .acquire(std::time::Duration::from_secs(5))
+                    .expect("background must eventually run");
+                acquired_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            })
+        });
+        let state = gate.state.lock().unwrap();
+        let (state, waited) = gate
+            .released
+            .wait_timeout_while(state, std::time::Duration::from_secs(3), |state| {
+                state.waiting_background == 0
+            })
+            .unwrap();
+        assert!(!waited.timed_out());
+        drop(state);
+        foreground.pop();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(gate.acquire(std::time::Duration::from_millis(20)).is_none());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let last = gate.acquire(std::time::Duration::from_secs(1)).unwrap();
+        assert!(super::with_background_processes(
+            || gate.acquire(std::time::Duration::from_millis(20))
+        )
+        .is_none());
+        assert_eq!(gate.state.lock().unwrap().waiting_background, 0);
+        drop(last);
+        assert!(gate.acquire(std::time::Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn mixed_priority_contention_preserves_counts_and_makes_progress() {
+        let gate = std::sync::Arc::new(super::SpawnGate::new(8));
+        let workers: Vec<_> = (0..24)
+            .map(|worker| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let run = || {
+                        for _ in 0..50 {
+                            let _permit = gate.acquire(std::time::Duration::from_secs(10)).unwrap();
+                            {
+                                let state = gate.state.lock().unwrap();
+                                assert!(state.in_flight <= 8);
+                                assert!(state.background <= 2);
+                            }
+                            std::thread::yield_now();
+                        }
+                    };
+                    if worker % 2 == 0 {
+                        super::with_background_processes(run);
+                    } else {
+                        run();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let state = gate.state.lock().unwrap();
+        assert_eq!(
+            (state.in_flight, state.background, state.waiting_background),
+            (0, 0, 0)
+        );
+        assert!(state.peak <= 8);
+    }
+
+    #[test]
+    fn background_process_admission_reserves_foreground_capacity() {
+        let gate = super::SpawnGate::new(4);
+        let first =
+            super::with_background_processes(|| gate.acquire(std::time::Duration::from_secs(1)))
+                .expect("first background slot");
+        let excess =
+            super::with_background_processes(|| gate.acquire(std::time::Duration::from_millis(20)));
+        assert!(
+            excess.is_none(),
+            "background work must not consume the foreground reserve"
+        );
+        let foreground: Vec<_> = (0..3)
+            .map(|_| gate.acquire(std::time::Duration::from_secs(1)).unwrap())
+            .collect();
+        assert_eq!(gate.peak(), 4);
+        drop(foreground);
+        drop(first);
+    }
+
     use super::*;
 
     #[test]
@@ -1835,82 +2157,6 @@ mod tests {
         assert!(
             slept <= POLL_BACKOFF_MAX * 2,
             "the entire ramp ({slept:?}) should cost about one old tick"
-        );
-    }
-
-    /// End-to-end rather than schedule-only: the constants above are only worth
-    /// anything if `run_bounded` actually uses them.
-    ///
-    /// Measured against this machine's OWN bare spawn-and-reap, not against an
-    /// absolute wall clock. The previous form asserted `< 200 ms` and was wrong
-    /// in both directions. It never protected the property it named — a
-    /// reintroduced flat 15 ms tick costs about 20 ms end to end and sails
-    /// through a 200 ms budget — and it was a claim about a machine the test
-    /// does not own, so a host busy with something else failed it for reasons
-    /// that had nothing to do with the poll schedule. A test that cannot fail
-    /// for its stated reason but can fail for unrelated ones is worse than no
-    /// test: it spends the credibility of the suite on noise.
-    ///
-    /// A ratio survives load because contention inflates both sides together.
-    #[test]
-    fn a_fast_command_is_not_delayed_by_a_fixed_poll_quantum() {
-        fn no_op() -> Command {
-            let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "true" });
-            if cfg!(windows) {
-                cmd.args(["/C", "exit", "0"]);
-            }
-            cmd
-        }
-        /// Spawn, reap, and nothing else: the floor `run_bounded` is allowed
-        /// to approach but not to add a sleep on top of.
-        fn bare() -> Duration {
-            let started = Instant::now();
-            let mut cmd = no_op();
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = cmd.spawn().expect("spawning the no-op should succeed");
-            let status = child.wait().expect("waiting on the no-op should succeed");
-            assert!(status.success());
-            started.elapsed()
-        }
-        fn through_run_bounded() -> Duration {
-            let started = Instant::now();
-            let run = run_bounded(no_op(), "no-op", Duration::from_secs(5), None)
-                .expect("spawning the no-op should succeed");
-            assert!(run.success);
-            started.elapsed()
-        }
-
-        // Best-of-N on both sides, sampled alternately so warm-up and
-        // scheduler drift land on each equally. The minimum is the sample
-        // least contaminated by whatever else the box is doing, and it is the
-        // only statistic here that stays stable under contention: measured
-        // with every core saturated, the two minima are the same to the
-        // nanosecond, while the medians drift apart by ~1.5 ms.
-        const SAMPLES: usize = 12;
-        let mut bare_best = Duration::MAX;
-        let mut bounded_best = Duration::MAX;
-        for i in 0..SAMPLES {
-            if i % 2 == 0 {
-                bare_best = bare_best.min(bare());
-                bounded_best = bounded_best.min(through_run_bounded());
-            } else {
-                bounded_best = bounded_best.min(through_run_bounded());
-                bare_best = bare_best.min(bare());
-            }
-        }
-
-        // Comfortably above the ~1 ms of gate, thread and channel work
-        // `run_bounded` genuinely adds, and comfortably below the flat
-        // POLL_BACKOFF_MAX tick this exists to catch.
-        const SLACK: Duration = Duration::from_millis(8);
-        assert!(
-            bounded_best <= bare_best + SLACK,
-            "run_bounded added {:?} on top of a bare spawn+reap ({bare_best:?} -> \
-             {bounded_best:?}); a flat {POLL_BACKOFF_MAX:?} poll would add about that much, \
-             so the backoff ramp is not being used",
-            bounded_best.saturating_sub(bare_best)
         );
     }
 
@@ -2442,6 +2688,55 @@ mod tests {
                 fallback.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_launch_resolves_the_child_path_without_loss_or_search_order_changes() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        // APFS rejects invalid UTF-8 names; Unix filesystems that support
+        // them exercise byte-preserving executable resolution as well.
+        let name = if cfg!(target_os = "macos") {
+            std::ffi::OsString::from("first-é")
+        } else {
+            std::ffi::OsString::from_vec(b"first-\xff".to_vec())
+        };
+        let first = root.path().join(name);
+        let second = root.path().join("second");
+        for dir in [&first, &second] {
+            std::fs::create_dir(dir).unwrap();
+            let tool = dir.join("git");
+            std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let cmd = git_command_with_env(Some(root.path()), &["status"], Some(&path), None);
+        assert_eq!(cmd.get_program(), first.join("git"));
+        assert!(
+            Path::new(cmd.get_program()).is_absolute(),
+            "a changed PATH plus a bare program forces Rust to fork"
+        );
+        std::fs::set_permissions(first.join("git"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let cmd = git_command_with_env(None, &["status"], Some(&path), None);
+        assert_eq!(cmd.get_program(), second.join("git"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_launch_preserves_relative_path_resolution_and_unset_path_defaults() {
+        // Relative PATH entries have child-cwd semantics; let the OS retain
+        // those semantics rather than silently bypassing a user-selected git.
+        let cmd = git_command_with_env(
+            None,
+            &["status"],
+            Some(std::ffi::OsStr::new("relative:/usr/bin")),
+            None,
+        );
+        assert_eq!(cmd.get_program(), "git");
+        let cmd = git_command_with_env(None, &["status"], None, None);
+        assert!(Path::new(cmd.get_program()).is_absolute());
     }
 
     /// Regression, driven through the failure users actually hit: git resolves
@@ -3453,15 +3748,15 @@ mod tests {
     #[test]
     fn spawn_gate_parks_callers_once_the_limit_is_reached() {
         let gate = std::sync::Arc::new(SpawnGate::new(2));
-        let first = gate.acquire();
-        let second = gate.acquire();
+        let first = gate.acquire(Duration::from_secs(10)).expect("test permit");
+        let second = gate.acquire(Duration::from_secs(10)).expect("test permit");
         assert_eq!(gate.peak(), 2);
 
         let (tx, rx) = mpsc::channel();
         let waiter = {
             let gate = std::sync::Arc::clone(&gate);
             thread::spawn(move || {
-                let permit = gate.acquire();
+                let permit = gate.acquire(Duration::from_secs(10)).expect("test permit");
                 let _ = tx.send(());
                 drop(permit);
             })
@@ -3483,6 +3778,79 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn queued_commands_expire_before_a_subprocess_slot_is_available() {
+        let gate = std::sync::Arc::new(SpawnGate::new(2));
+        let permits: Vec<_> = (0..gate.limit)
+            .map(|_| gate.acquire(Duration::from_secs(10)).expect("test permit"))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let child_gate = std::sync::Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            let result = run_bounded_with_gate(
+                Command::new("/usr/bin/true"),
+                "queue-test",
+                Duration::from_millis(20),
+                None,
+                MAX_OUTPUT_BYTES,
+                &child_gate,
+            );
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(300));
+        drop(permits);
+        worker.join().unwrap();
+        let error = result
+            .expect("queue wait must obey the command deadline")
+            .expect_err("the queued command must not start");
+        assert!(error.contains("waiting for a process slot"), "{error}");
+        assert!(error.contains(TIMEOUT_MARKER), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_stdin_cannot_hold_the_command_runner_after_the_parent_exits() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 4 <&0 >/dev/null 2>&1 & exit 0"]);
+            let result = run_bounded_with_gate(
+                cmd,
+                "stdin-test",
+                Duration::from_secs(10),
+                Some(&vec![b'x'; 1024 * 1024]),
+                1024,
+                &SpawnGate::new(1),
+            );
+            tx.send(result).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        worker.join().unwrap();
+        let error = result
+            .expect("stdin must have a bounded settle window")
+            .expect_err("undelivered stdin cannot report success");
+        assert!(error.contains("stdin"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_stdin_delivers_large_payloads_while_stdout_drains() {
+        let bytes = vec![b'q'; 8 * 1024 * 1024];
+        let result = run_bounded_with_gate(
+            Command::new("/bin/cat"),
+            "stdin-roundtrip",
+            Duration::from_secs(10),
+            Some(&bytes),
+            bytes.len(),
+            &SpawnGate::new(1),
+        )
+        .unwrap();
+        assert!(result.success);
+        assert!(result.incomplete.is_none());
+        assert_eq!(result.stdout, bytes);
+    }
+
     /// A permit released by a panicking holder must not leak its slot, or one
     /// failed git call would shrink the budget for the rest of the session.
     #[test]
@@ -3491,7 +3859,7 @@ mod tests {
         let poisoner = {
             let gate = std::sync::Arc::clone(&gate);
             thread::spawn(move || {
-                let _permit = gate.acquire();
+                let _permit = gate.acquire(Duration::from_secs(10)).expect("test permit");
                 panic!("holder blew up mid-run");
             })
         };
@@ -3500,7 +3868,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let gate2 = std::sync::Arc::clone(&gate);
         thread::spawn(move || {
-            let _permit = gate2.acquire();
+            let _permit = gate2.acquire(Duration::from_secs(10)).expect("test permit");
             let _ = tx.send(());
         });
         rx.recv_timeout(Duration::from_secs(5))

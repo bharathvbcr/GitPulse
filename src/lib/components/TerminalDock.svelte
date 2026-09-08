@@ -74,6 +74,7 @@
 
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
+  let expanded = $state(false);
   /** Height of the column the dock shares with the view, for the ceiling. */
   let containerHeight = $state(0);
 
@@ -81,7 +82,9 @@
   // window actually has, so a dock sized on a large display cannot swallow
   // the view when the same preference is restored on a small one.
   let height = $derived(
-    fitTerminalDockHeight($interfaceStore.terminalDockHeight, containerHeight),
+    expanded
+      ? fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, 0)
+      : fitTerminalDockHeight($interfaceStore.terminalDockHeight, containerHeight),
   );
 
   $effect(() => {
@@ -99,6 +102,10 @@
     event.preventDefault();
     const startY = event.clientY;
     const startHeight = height;
+    if (expanded) {
+      interfaceStore.setTerminalDockHeight(height);
+      expanded = false;
+    }
     dragging = true;
 
     // Pointer capture, not window listeners: a drag that leaves the window
@@ -123,12 +130,14 @@
   }
 
   function handleSeparatorKey(event: KeyboardEvent) {
+    const currentHeight = height;
+    if (expanded && (event.key === "ArrowUp" || event.key === "ArrowDown")) expanded = false;
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      interfaceStore.setTerminalDockHeight(height + TERMINAL_DOCK_RESIZE_STEP);
+      interfaceStore.setTerminalDockHeight(currentHeight + TERMINAL_DOCK_RESIZE_STEP);
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
-      interfaceStore.setTerminalDockHeight(height - TERMINAL_DOCK_RESIZE_STEP);
+      interfaceStore.setTerminalDockHeight(currentHeight - TERMINAL_DOCK_RESIZE_STEP);
     }
   }
 
@@ -169,6 +178,7 @@
         : ''}"
     ></div>
 
+    {#if hostedTabs.length === 0}
     <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 border-b border-border/60 gp-section-edge bg-surface/60 select-none">
       <SquareTerminal size={12} class="text-accent shrink-0" />
       <span class="text-[11px] font-medium text-textPrimary">Terminal</span>
@@ -183,6 +193,7 @@
         <ChevronDown size={13} />
       </button>
     </div>
+    {/if}
 
     <div class="flex-1 min-h-0 relative">
       {#each hostedTabs as tab (tab.id)}
@@ -199,6 +210,9 @@
             props={{
               repoPath: tab.path,
               visible: open && tab.id === $repoStore.activeTabId,
+              onClose,
+              expanded,
+              onToggleExpanded: () => (expanded = !expanded),
             }}
           />
         </div>

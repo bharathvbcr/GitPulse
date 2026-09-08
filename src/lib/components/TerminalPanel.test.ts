@@ -67,7 +67,8 @@ describe("TerminalPanel session ownership", () => {
   it("refits the visible session when its host is shown again", () => {
     const body = source.slice(source.indexOf("$effect(() => {", source.indexOf("function handleChord")));
     expect(body).toContain("if (!visible || mode !== \"shell\") return");
-    expect(body).toContain("sessions[id]?.reveal()");
+    expect(body).toContain("session?.reveal()");
+    expect(body).toContain('if (!visible || mode !== "shell" || activeId !== id) return;');
   });
 
   it("holds no PTY lifecycle of its own", () => {
@@ -114,11 +115,12 @@ describe("TerminalPanel tab strip", () => {
     // start the chosen CLI in its place — switching cost you your session.
     expect(source).not.toContain("selectLauncher");
     expect(source).toContain("{#each LAUNCHERS as launcher (launcher.kind)}");
-    expect(source).toContain("onclick={() => newTab(launcher.kind)}");
+    expect(source).toContain("<option value={launcher.kind}>{launcher.label}</option>");
+    expect(source).toContain("onclick={() => newTab(nextLauncher)}");
   });
 
   it("disables opening past the ceiling and says why", () => {
-    expect(source).toContain("disabled={!canOpenTab(tabState)}");
+    expect(source).toContain("disabled={!repoPath || !canCreate}");
     expect(source).toContain("${MAX_TERMINAL_TABS} terminal sessions are open");
   });
 

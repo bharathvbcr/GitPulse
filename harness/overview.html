@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GitPulse Overview preview</title>
+    <style>
+      body { margin: 0; }
+      #app { display: flex; height: calc(100vh - 38px); }
+      #tools { height: 38px; display: flex; align-items: center; gap: 12px; padding: 0 20px; font: 11px system-ui; }
+    </style>
+  </head>
+  <body>
+    <div id="tools">
+      <span>Overview · fixture preview</span>
+      <button id="theme">Switch theme</button>
+      <button id="checks" disabled>Run interaction checks</button>
+      <output id="result" aria-live="polite">Loading preview…</output>
+    </div>
+    <div id="app"></div>
+    <script type="module">
+      await import("../src/app.css");
+      const scenario = new URLSearchParams(location.search).get("scenario") ?? "populated";
+      const crashes = [], unexpected = [], results = [];
+      const root = scenario === "long" ? `/workspace/${"very-long-repository-name-".repeat(8)}` : "/workspace/GitPulse";
+      const now = Math.floor(Date.now() / 1000);
+      const wt = (path, branch, dirty, main = false) => ({ path, name: path.split("/").pop(), branch,
+        head: "a".repeat(40), is_main: main, is_bare: false, is_detached: false,
+        is_locked: false, is_prunable: false, dirty_files: dirty });
+      let worktrees = scenario === "empty" ? [] : [
+        wt(root, "main", 7, true),
+        wt("/workspace/.codex/worktrees/review-flow", "codex/review-flow", 3),
+        wt("/workspace/.claude/worktrees/search", "feature/repository-search", 0),
+        wt("/workspace/release", "release/0.0.8", null),
+      ];
+      if (scenario === "detached" || scenario === "bare") worktrees[0] = { ...worktrees[0], branch: null, is_detached: true, is_bare: scenario === "bare", dirty_files: scenario === "bare" ? null : 7 };
+      if (scenario === "bare") worktrees = [worktrees[0]];
+      if (scenario === "task") worktrees[0].dirty_files = 0;
+      if (scenario === "stress") worktrees = Array.from({length: 250}, (_, i) => wt(`${root}/wt/${i}`, `feature/${i}`, i % 2));
+      const branches = worktrees.filter(w => w.branch !== null).map((w, i) => ({ name: w.branch, is_current: w.path === root, is_remote: false,
+        is_default: i === 0, tip_commit_id: w.head, upstream: `origin/${w.branch}`, is_gone: false,
+        ahead_count: i === 0 ? 2 : 0, behind_count: 0, last_commit_timestamp: now - 600 * (i + 1),
+        last_author: "Bharath", last_summary: "Improve repository workflows", commits_ahead_of_base: 0,
+        commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0 }));
+      const statuses = scenario === "bare" || scenario === "task" ? [] : Array.from({ length: 7 }, (_, i) => ({ path: `src/change-${i}.ts`, status_code: "M",
+        is_staged: i < 2, is_conflicted: false, additions: 12, deletions: 3 }));
+      const operation = { kind: "Rebase", current_step: 2, total_steps: 4, conflicted_total: 1,
+        conflicted_paths: ["src/review.ts"], conflicted_truncated: false, head_name: "codex/review-flow",
+        onto: "main", original_head: "a".repeat(40), can_continue: true, can_skip: true, can_abort: true };
+      const pr = (number, title, head_ref) => ({ number, title, head_ref, base_ref: "main", state: "OPEN",
+        url: `https://github.com/example/repo/pull/${number}`, is_draft: false, ci_status: "success",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(), review_decision: "", first_review_at: "" });
+      const fixtures = {
+        cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: scenario === "bare" }),
+        cmd_list_branches: () => branches,
+        cmd_get_status: () => statuses,
+        cmd_get_file_diff: () => ({ text: "diff --git a/src/change-0.ts b/src/change-0.ts\n", truncated: false, truncation_reason: null }),
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: a => a.repoPath.includes("review-flow") ? operation : null,
+        cmd_stash_list: () => [], cmd_watch_repo: () => null, cmd_unwatch_repo: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_set_recent_menu: () => null,
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_task_view: () => ({ available: scenario === "task", store_path: "", leases: [], error: "" }),
+        cmd_list_worktrees: () => worktrees,
+        cmd_github_context: () => ({ available: scenario !== "unavailable", cli_present: true,
+          owner: "example", repo: "repo", pull_requests: ["empty", "stress", "bare"].includes(scenario) ? [] : [
+            pr(148, "Make code review easier to navigate", "codex/review-flow"),
+            pr(151, "Search across repository files", "feature/repository-search")],
+          workflow_runs: scenario === "partial" ? [{ id: 10, name: "Build", title: "Build", status: "completed", conclusion: "failure", head_branch: "main", url: "https://github.com/example/repo/actions/runs/10", created_at: new Date().toISOString() }] : [],
+          warnings: scenario === "partial" ? ["Fixture PR listing incomplete"] : [], prs_truncated: scenario === "partial", runs_truncated: scenario === "partial",
+          issues: [], releases: [], error: null }),
+        cmd_ledger_tail: () => [],
+        cmd_grants_view: () => ({ available: false, path: "", grants: [], error: "" }),
+        cmd_worktree_task: a => scenario === "task" ? (a.worktreePath === root || a.worktreePath === "/workspace/release" ? "T1" : a.worktreePath.includes("review-flow") ? "T2" : "T3") : null,
+        cmd_task_scope: a => ({ id: a.taskId, title: a.taskId === "T1" ? "Partly scanned task" : a.taskId, status: "in_progress", planned_files: [], agent_appended_files: [], forbidden_changes: [], allowed_commands: [] }),
+        cmd_collision_risk: () => {
+          if (scenario === "unavailable") throw new Error("Fixture overlap scan unavailable");
+          return { ok: scenario !== "partial", error: scenario === "partial" ? "Fixture one worktree inaccessible" : "", overlapping_files: scenario === "partial" ? 1 : 0, worktrees_involved: scenario === "partial" ? 2 : 0,
+            scanned_worktrees: worktrees.length, unscanned_worktrees: 0, failed_worktrees: scenario === "partial" ? 1 : 0,
+            truncated: false, items: scenario === "partial" ? [{ path: "shared-overlap.ts", worktrees: worktrees.slice(0, 2).map(w => ({ path: w.path, branch: w.branch, agent_kind: "" })) }] : [] };
+        },
+      };
+      if (scenario === "failed") {
+        for (const command of ["cmd_task_view", "cmd_list_worktrees", "cmd_github_context", "cmd_ledger_tail", "cmd_grants_view", "cmd_collision_risk"]) fixtures[command] = () => { throw new Error("Fixture source unavailable"); };
+      }
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          if (cmd.startsWith("plugin:event|")) return 1;
+          if (fixtures[cmd]) return fixtures[cmd](args);
+          unexpected.push(cmd);
+          throw new Error(`Unconfigured Overview command: ${cmd}`);
+        }, transformCallback: cb => cb,
+      };
+      window.addEventListener("error", e => crashes.push(e.message));
+      window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
+      const { mount, unmount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { default: WorkView } = await import("../src/lib/components/WorkView.svelte");
+      if (scenario !== "closed") await repoStore.openRepo(root);
+      let component = mount(WorkView, { target: document.querySelector("#app") });
+      const settle = async () => { await tick(); await new Promise(r => setTimeout(r, 80)); await tick(); };
+      const target = document.querySelector("#app");
+      document.querySelector("#theme").onclick = () => {
+        const dark = document.documentElement.classList.contains("dark");
+        document.documentElement.classList.toggle("dark", !dark);
+        document.documentElement.classList.toggle("light", dark);
+      };
+      const click = async text => {
+        const button = [...target.querySelectorAll("button")].find(b => b.textContent.trim().startsWith(text));
+        if (!button) throw new Error(`Missing button: ${text}`);
+        button.click(); await settle(); return button;
+      };
+      const check = (name, pass) => results.push({ name, pass });
+      document.querySelector("#checks").onclick = async () => {
+        results.length = 0;
+        try {
+          await settle();
+          if (scenario !== "populated" && scenario !== "long") {
+            if (scenario === "detached") {
+              check("detached status stays visible", target.textContent.includes("Detached HEAD") && target.textContent.includes("2 staged"));
+              await click("Review changes");
+              check("detached changes can be reviewed", get(repoStore).selectedFilePath === statuses[0].path);
+            } else if (scenario === "bare") {
+              check("bare checkout identified", target.textContent.includes("Bare repository"));
+              check("bare checkout does not offer working-tree review", ![...target.querySelectorAll("button")].some(b => b.textContent.includes("Review changes")));
+            } else if (scenario === "task") {
+              const row = [...target.querySelectorAll("[data-work-row]")].find(r => r.textContent.includes("Partly scanned task"));
+              check("partial task scan is explicit", row && row.textContent.includes("1 of 2 worktrees scanned") && !row.textContent.includes("clean"));
+            } else if (scenario === "partial") {
+              check("GitHub warning preserved", target.textContent.includes("Fixture PR listing incomplete"));
+              check("both truncations surfaced", target.textContent.includes("pull request list truncated") && target.textContent.includes("workflow run list truncated"));
+              check("failed overlap probes surfaced", target.textContent.includes("1 failed"));
+              check("known overlaps remain visible after another probe fails", target.textContent.includes("shared-overlap.ts"));
+              check("actual workflow outcome shown", target.textContent.includes("Build: failure"));
+            } else if (scenario === "failed") {
+              check("failed sources do not claim nothing is in flight", target.textContent.includes("Workspace data unavailable") && !target.textContent.includes("Nothing in flight"));
+              const blocked = [...target.querySelectorAll("button")].find(b => b.textContent.trim().startsWith("Blocked"));
+              check("failed operation data is not counted as zero blocked", blocked?.textContent.includes("—"));
+            } else if (scenario === "stress") {
+              check("250 rows render progressively", target.querySelectorAll("[data-work-row]").length === 100);
+              await click("Show more");
+              check("next page preserves the full count", target.querySelectorAll("[data-work-row]").length === 200);
+              const input = target.querySelector('input[type="search"]'); input.value = "feature/249"; input.dispatchEvent(new Event("input", {bubbles:true})); await settle();
+              check("search reaches beyond the rendered page", target.querySelectorAll("[data-work-row]").length === 1 && target.textContent.includes("feature/249"));
+            } else if (scenario === "empty") check("empty repository state", target.textContent.includes("Nothing in flight"));
+            else if (scenario === "closed") check("closed repository state", target.textContent.includes("No repository open"));
+            else if (scenario === "unavailable") check("unavailable sources stay explicit", target.textContent.includes("PRs unavailable") && target.textContent.includes("Could not check overlapping files"));
+          } else {
+          check("all worktrees loaded", target.querySelectorAll("[data-work-row]").length === 4);
+          const dirty = await click("Uncommitted changes");
+          check("dirty filter selects two measured worktrees", dirty.getAttribute("aria-pressed") === "true" && target.querySelectorAll("[data-work-row]").length === 2);
+          const input = target.querySelector('input[type="search"]');
+          input.value = "no-such-branch"; input.dispatchEvent(new Event("input", { bubbles: true })); await settle();
+          check("empty search is distinct from empty repository", target.textContent.includes("No row matches this filter"));
+          await click("Clear filter");
+          check("clear restores all rows", target.querySelectorAll("[data-work-row]").length === 4);
+          await click("Agent worktrees");
+          check("agent filter uses actual worktree bindings", target.querySelectorAll("[data-work-row]").length === 2);
+          await click("Worktrees");
+          await click("Needs attention");
+          check("attention includes dirty, blocked and unscanned worktrees", target.querySelectorAll("[data-work-row]").length === 3);
+          await click("Worktrees");
+          await click("Blocked");
+          check("blocked filter preserves the parked operation", target.querySelectorAll("[data-work-row]").length === 1 && target.textContent.includes("Rebase in progress"));
+          await click("Worktrees");
+          await click("Pull requests");
+          check("pull-request filter selects bound branches", target.querySelectorAll("[data-work-row]").length === 2);
+          await click("Worktrees");
+          repoStore.inspectCommitInHistory("b".repeat(40));
+          await click("Review changes");
+          check("review navigates to diff", get(repoStore).activeTab === "history" && get(repoStore).viewSections.history === "diff");
+          check("review opens local changes after inspecting a commit", get(repoStore).selectedCommitId === null && get(repoStore).selectedFilePath === statuses[0].path && get(repoStore).selectedIsStaged === statuses[0].is_staged);
+          await click("Browse files");
+          check("browse navigates to explorer", get(repoStore).activeTab === "code" && get(repoStore).viewSections.code === "explorer");
+          await click("View history");
+          check("history navigates to graph", get(repoStore).activeTab === "history" && get(repoStore).viewSections.history === "graph");
+          await click("Rebase in progress");
+          check("parked operation opens the correct worktree in Resolve", get(repoStore).currentPath.includes("review-flow") && get(repoStore).activeTab === "work" && get(repoStore).viewSections.work === "resolve");
+          await repoStore.openRepo(root); await settle();
+          repoStore.setActiveTab("code", "explorer");
+          const resolve = fixtures.cmd_resolve_repo;
+          fixtures.cmd_resolve_repo = () => { throw new Error("Fixture open denied"); };
+          await click("feature/repository-search");
+          check("failed open does not redirect the active repository", get(repoStore).currentPath === root && get(repoStore).activeTab === "code");
+          fixtures.cmd_resolve_repo = resolve;
+          const collision = fixtures.cmd_collision_risk;
+          let finishCollision;
+          fixtures.cmd_collision_risk = () => new Promise(resolve => { finishCollision = resolve; });
+          const refresh = await click("Refresh");
+          check("refresh stays busy until collision scan settles", refresh.disabled);
+          finishCollision(collision());
+          fixtures.cmd_collision_risk = collision;
+          await settle();
+          const list = fixtures.cmd_list_worktrees;
+          let finishList;
+          fixtures.cmd_list_worktrees = () => new Promise(resolve => { finishList = resolve; });
+          await unmount(component);
+          component = mount(WorkView, {target});
+          await settle();
+          check("remount shows cached rows with a timestamp during refresh", target.querySelectorAll("[data-work-row]").length === 4 && target.textContent.includes("Loaded"));
+          finishList(list()); fixtures.cmd_list_worktrees = list;
+          await settle();
+          await click("Uncommitted changes");
+          await repoStore.openRepo("/workspace/other"); await settle();
+          check("switching repositories resets narrowing", target.querySelectorAll("[data-work-row]").length === 4 && target.querySelector('input[type="search"]').value === "");
+          await repoStore.openRepo(root); await settle();
+          }
+        } catch (e) { results.push({ name: String(e), pass: false }); }
+        check("no browser crashes", crashes.length === 0);
+        check("all IPC calls explicitly configured", unexpected.length === 0);
+        window.__gpResult = { results, crashes, unexpected, pass: results.every(r => r.pass) };
+        document.querySelector("#result").textContent = `${results.filter(r => r.pass).length}/${results.length} passed`;
+        document.querySelector("#result").title = JSON.stringify(window.__gpResult);
+      };
+      await settle();
+      document.querySelector("#checks").disabled = false;
+      document.querySelector("#result").textContent = "Ready";
+      window.__gpOverview = { repoStore, crashes, unexpected };
+    </script>
+  </body>
+</html>

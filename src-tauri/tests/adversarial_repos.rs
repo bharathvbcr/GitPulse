@@ -335,7 +335,15 @@ fn orphan_head_reader_contract() {
         GitReader::get_status(path).is_ok(),
         "status survives unborn HEAD"
     );
-    assert!(GitReader::get_file_blame(path, "seed.txt").is_err());
+    // --orphan stages the seed as a new file on this branch. Its current
+    // content remains readable, but no line can claim an author from main.
+    let blame = GitReader::get_file_blame(path, "seed.txt").expect("uncommitted orphan file");
+    assert_eq!(blame.len(), 1);
+    assert_eq!(blame[0].line_no, 1);
+    assert_eq!(blame[0].content, "seed");
+    assert_eq!(blame[0].commit_id, "0".repeat(40));
+    assert_eq!(blame[0].author_name, "Not Committed Yet");
+    assert!(GitReader::get_file_blame(path, "missing.txt").is_err());
     assert!(GitReader::get_commit_files(path, FAKE_OID).is_err());
 }
 

@@ -73,6 +73,64 @@ pub struct ConflictDocument {
     /// segment's lines (true = that physical line ended with `\r\n`).
     #[serde(default)]
     pub normal_crlf_flags: Vec<Vec<bool>>,
+    /// Malformed marker regions are retained for recovery but cannot be saved.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    #[serde(default = "default_marker_size")]
+    pub marker_size: usize,
+}
+
+fn default_marker_size() -> usize {
+    7
+}
+
+pub const MAX_CONFLICT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CONFLICT_CHUNKS: usize = 2000;
+
+/// Git markers have an entire run followed by whitespace/a label. Operators
+/// such as `<<<<<<<value` and Markdown underline rules are ordinary content.
+fn marker(line: &str, minimum: usize) -> Option<(u8, usize)> {
+    let first = *line.as_bytes().first()?;
+    if !matches!(first, b'<' | b'>' | b'|' | b'=') {
+        return None;
+    }
+    let width = line.bytes().take_while(|byte| *byte == first).count();
+    if width < minimum {
+        return None;
+    }
+    let tail = &line[width..];
+    if first == b'=' {
+        return tail.is_empty().then_some((first, width));
+    }
+    (tail.is_empty() || tail.starts_with(' ') || tail.starts_with('\t')).then_some((first, width))
+}
+
+fn marker_diagnostics(content: &str, minimum: usize) -> Vec<String> {
+    let mut state: Option<(usize, u8, usize)> = None;
+    let mut errors = Vec::new();
+    for (index, raw) in content.split_inclusive('\n').enumerate() {
+        let Some((kind, width)) = marker(split_line_eol(raw).0, minimum) else {
+            continue;
+        };
+        match (state, kind) {
+            (None, b'<') => state = Some((width, b'<', index + 1)),
+            (Some((size, b'<', start)), b'|') if size == width => state = Some((size, b'|', start)),
+            (Some((size, b'<' | b'|', start)), b'=') if size == width => {
+                state = Some((size, b'=', start))
+            }
+            (Some((size, b'=', _)), b'>') if size == width => state = None,
+            (None, b'=') => {} // A heading outside a conflict is legitimate.
+            _ => errors.push(format!("Malformed conflict marker at line {}", index + 1)),
+        }
+        if errors.len() >= 100 {
+            errors.push("Additional marker diagnostics omitted; fix this file externally".into());
+            break;
+        }
+    }
+    if let Some((_, _, start)) = state {
+        errors.push(format!("Unclosed conflict starting at line {start}"));
+    }
+    errors
 }
 
 /// Splits a raw physical line (possibly still carrying its `\r\n` or `\n`
@@ -92,12 +150,43 @@ fn split_line_eol(raw: &str) -> (&str, Option<bool>) {
 pub struct ConflictResolver;
 
 impl ConflictResolver {
+    pub fn parse_checked(file_path: &str, content: &str) -> Result<ConflictDocument, &'static str> {
+        Self::parse_checked_with_marker_size(file_path, content, 7)
+    }
+    pub fn parse_checked_with_marker_size(
+        file_path: &str,
+        content: &str,
+        marker_size: usize,
+    ) -> Result<ConflictDocument, &'static str> {
+        if !(1..=256).contains(&marker_size) {
+            return Err(
+                "Unsupported conflict-marker-size; choose a complete side or resolve externally",
+            );
+        }
+        if content.len() > MAX_CONFLICT_TEXT_BYTES
+            || content.bytes().filter(|b| *b == b'\n').count() > 100_000
+        {
+            return Err("Conflict text exceeds the 4 MiB / 100,000 line editor limit; use whole-file choices or an external editor");
+        }
+        let doc = Self::parse_with_marker_size(file_path, content, marker_size);
+        if doc.total_conflicts > MAX_CONFLICT_CHUNKS {
+            return Err("File exceeds the 2,000 conflict editor limit; use whole-file choices or an external editor");
+        }
+        Ok(doc)
+    }
     /// Parses a file containing standard Git conflict markers into structured editable chunks.
     /// Hardened against malformed, unclosed, or corrupt conflict sections.
     ///
     /// Line endings are recorded per physical line so resolution never has to
     /// guess a document-wide convention.
     pub fn parse(file_path: &str, content: &str) -> ConflictDocument {
+        Self::parse_with_marker_size(file_path, content, 7)
+    }
+    fn parse_with_marker_size(
+        file_path: &str,
+        content: &str,
+        marker_size: usize,
+    ) -> ConflictDocument {
         let mut segments = Vec::new();
         let mut normal_crlf_flags: Vec<Vec<bool>> = Vec::new();
         let mut current_normal: Vec<String> = Vec::new();
@@ -117,7 +206,7 @@ impl ConflictResolver {
 
         while let Some((line_idx, raw)) = lines.next() {
             let (text, _term) = split_line_eol(raw);
-            if text.starts_with("<<<<<<<") {
+            if matches!(marker(text, marker_size), Some((b'<', _))) {
                 // The reference EOL for synthesized lines is the terminator
                 // of the line immediately preceding the conflict.
                 let prev_term = last_term;
@@ -155,13 +244,13 @@ impl ConflictResolver {
                     let (inner_text, inner_term) = split_line_eol(inner_raw);
                     last_term = inner_term;
                     raw_scanned.push((inner_text, inner_term));
-                    if inner_text.starts_with("|||||||") {
+                    if matches!(marker(inner_text, marker_size), Some((b'|', _))) {
                         in_base = true;
                         base_lines = Some((Vec::new(), Vec::new()));
-                    } else if inner_text.starts_with("=======") {
+                    } else if matches!(marker(inner_text, marker_size), Some((b'=', _))) {
                         in_base = false;
                         in_theirs = true;
-                    } else if inner_text.starts_with(">>>>>>>") {
+                    } else if matches!(marker(inner_text, marker_size), Some((b'>', _))) {
                         theirs_label_cell
                             .borrow_mut()
                             .push_str(inner_text.trim_start_matches('>').trim());
@@ -265,6 +354,8 @@ impl ConflictResolver {
             trailing_newline,
             final_crlf,
             normal_crlf_flags,
+            diagnostics: marker_diagnostics(content, marker_size),
+            marker_size,
         }
     }
 
@@ -276,20 +367,110 @@ impl ConflictResolver {
     /// the conflict's `local_crlf` convention. The output ends with a newline
     /// iff the original file did.
     pub fn render_resolved(doc: &ConflictDocument) -> Result<String, &'static str> {
-        Self::render_document(doc, false)
+        if !doc.diagnostics.is_empty() {
+            return Err("Malformed conflict markers must be repaired before saving");
+        }
+        let output = Self::render_document(doc, false)?;
+        Self::validate_marker_free(&output, doc.marker_size)?;
+        Ok(output)
+    }
+
+    /// A bounded caller can validate a complete external resolution without
+    /// allocating the interactive editor's segment/line representation.
+    pub fn validate_marker_free(content: &str, marker_size: usize) -> Result<(), &'static str> {
+        if !(1..=256).contains(&marker_size) {
+            return Err("Invalid conflict marker width");
+        }
+        // Inspect the result, including unchanged regions and pasted custom
+        // text. A forged wire document cannot suppress this check.
+        if content.split_inclusive('\n').any(|line| {
+            matches!(
+                marker(split_line_eol(line).0, marker_size),
+                Some((b'<' | b'>' | b'|', _))
+            )
+        }) {
+            return Err("Resolution still contains conflict markers; repair them before saving");
+        }
+        Ok(())
     }
 
     /// Preview: resolved chunks become their chosen content; unresolved chunks
     /// keep standard conflict markers so the editor can show a live file
     /// without failing the render.
-    pub fn render_preview(doc: &ConflictDocument) -> String {
-        Self::render_document(doc, true).unwrap_or_default()
+    pub fn render_preview(doc: &ConflictDocument) -> Result<String, &'static str> {
+        Self::render_document(doc, true)
     }
 
     fn render_document(
         doc: &ConflictDocument,
         allow_unresolved: bool,
     ) -> Result<String, &'static str> {
+        if !(1..=256).contains(&doc.marker_size) {
+            return Err("Invalid conflict marker width");
+        }
+        let mut count = 0;
+        let mut bytes = doc.file_path.len();
+        let mut line_count = 0usize;
+        let mut flags = doc
+            .normal_crlf_flags
+            .iter()
+            .fold(0usize, |sum, row| sum.saturating_add(row.len()));
+        if doc.normal_crlf_flags.len() > 100_000 || doc.diagnostics.len() > 102 {
+            return Err("Conflict metadata exceeds the editor limit");
+        }
+        for diagnostic in &doc.diagnostics {
+            bytes = bytes.saturating_add(diagnostic.len());
+        }
+        for segment in &doc.segments {
+            match segment {
+                FileSegment::Normal(text) => {
+                    bytes = bytes.saturating_add(text.len());
+                    line_count = line_count
+                        .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count() + 1);
+                }
+                FileSegment::Conflict(chunk) => {
+                    if chunk.chunk_index != count {
+                        return Err("Invalid conflict chunk identity");
+                    }
+                    count += 1;
+                    bytes = bytes
+                        .saturating_add(chunk.ours_content.len())
+                        .saturating_add(chunk.theirs_content.len())
+                        .saturating_add(chunk.base_content.as_ref().map_or(0, String::len));
+                    bytes = bytes
+                        .saturating_add(chunk.ours_label.len())
+                        .saturating_add(chunk.theirs_label.len())
+                        .saturating_add(doc.marker_size * 4 + 32);
+                    flags = flags
+                        .saturating_add(chunk.ours_crlf.len())
+                        .saturating_add(chunk.theirs_crlf.len())
+                        .saturating_add(chunk.base_crlf.as_ref().map_or(0, Vec::len));
+                    for text in [&chunk.ours_content, &chunk.theirs_content]
+                        .into_iter()
+                        .chain(chunk.base_content.iter())
+                    {
+                        line_count = line_count
+                            .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count() + 1);
+                    }
+                    if let ConflictResolutionChoice::Custom(text) = &chunk.resolution {
+                        bytes = bytes.saturating_add(text.len());
+                        line_count = line_count
+                            .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count() + 1);
+                    }
+                }
+            }
+        }
+        if count != doc.total_conflicts {
+            return Err("Invalid conflict count");
+        }
+        if count > MAX_CONFLICT_CHUNKS
+            || bytes > MAX_CONFLICT_TEXT_BYTES * 2
+            || doc.segments.len() > 100_000
+            || flags > 100_000
+            || line_count > 100_000
+        {
+            return Err("Conflict document exceeds the editor limit");
+        }
         // Each emitted line paired with its own EOL convention. Every line
         // gets a terminator except possibly the final one, which is
         // terminated iff the original file ended with a newline.
@@ -312,7 +493,7 @@ impl ConflictResolver {
                         if !allow_unresolved {
                             return Err("Cannot render document with unresolved conflict chunks");
                         }
-                        push_unresolved_markers(&mut lines, chunk);
+                        push_unresolved_markers(&mut lines, chunk, doc.marker_size);
                     }
                     ConflictResolutionChoice::AcceptOurs => {
                         push_lf_block(&mut lines, &chunk.ours_content, &chunk.ours_crlf);
@@ -340,6 +521,10 @@ impl ConflictResolver {
         let mut out = String::new();
         let total = lines.len();
         for (i, (text, crlf)) in lines.iter().enumerate() {
+            if out.len().saturating_add(text.len()).saturating_add(2) > MAX_CONFLICT_TEXT_BYTES * 2
+            {
+                return Err("Resolved output exceeds the editor limit");
+            }
             out.push_str(text);
             if i + 1 < total || doc.trailing_newline {
                 out.push_str(if *crlf { "\r\n" } else { "\n" });
@@ -358,7 +543,7 @@ impl ConflictResolver {
 /// list, pairing each line with its recorded per-line CRLF flag. Missing flag
 /// entries mean LF.
 fn push_lf_block<'a>(lines: &mut Vec<(Cow<'a, str>, bool)>, content: &'a str, flags: &[bool]) {
-    if content.is_empty() {
+    if content.is_empty() && flags.is_empty() {
         return;
     }
     let mut parts: Vec<&str> = content.split('\n').collect();
@@ -376,18 +561,32 @@ fn push_lf_block<'a>(lines: &mut Vec<(Cow<'a, str>, bool)>, content: &'a str, fl
 
 /// Rebuilds the standard conflict marker block for previews, using the
 /// chunk's local EOL convention for synthesized lines.
-fn push_unresolved_markers<'a>(lines: &mut Vec<(Cow<'a, str>, bool)>, chunk: &'a ConflictChunk) {
+fn push_unresolved_markers<'a>(
+    lines: &mut Vec<(Cow<'a, str>, bool)>,
+    chunk: &'a ConflictChunk,
+    marker_size: usize,
+) {
     let eol = chunk.local_crlf;
-    lines.push((Cow::Owned(format!("<<<<<<< {}", chunk.ours_label)), eol));
+    lines.push((
+        Cow::Owned(format!("{} {}", "<".repeat(marker_size), chunk.ours_label)),
+        eol,
+    ));
+    push_lf_block(lines, &chunk.ours_content, &chunk.ours_crlf);
     if let Some(base) = &chunk.base_content {
-        lines.push((Cow::Borrowed("||||||| base"), eol));
+        lines.push((Cow::Owned(format!("{} base", "|".repeat(marker_size))), eol));
         let flags = chunk.base_crlf.as_deref().unwrap_or(&[]);
         push_lf_block(lines, base, flags);
     }
-    push_lf_block(lines, &chunk.ours_content, &chunk.ours_crlf);
-    lines.push((Cow::Borrowed("======="), eol));
+    lines.push((Cow::Owned("=".repeat(marker_size)), eol));
     push_lf_block(lines, &chunk.theirs_content, &chunk.theirs_crlf);
-    lines.push((Cow::Owned(format!(">>>>>>> {}", chunk.theirs_label)), eol));
+    lines.push((
+        Cow::Owned(format!(
+            "{} {}",
+            ">".repeat(marker_size),
+            chunk.theirs_label
+        )),
+        eol,
+    ));
 }
 
 /// Normalizes user-provided Custom text into logical lines without
@@ -538,7 +737,7 @@ mod tests {
             chunk.resolution = ConflictResolutionChoice::AcceptOurs;
         }
         assert!(ConflictResolver::render_resolved(&doc).is_err());
-        let preview = ConflictResolver::render_preview(&doc);
+        let preview = ConflictResolver::render_preview(&doc).unwrap();
         assert!(preview.contains("ours-a"));
         assert!(!preview.contains("theirs-a"));
         assert!(preview.contains("<<<<<<<"));

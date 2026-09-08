@@ -108,3 +108,22 @@ describe("projectWork at agent-era scale", () => {
     expect(p.rows.every((r) => r.verdicts.byStatus.allowed >= 0)).toBe(true);
   });
 });
+
+it("keeps even an unbound parked operation ahead of an arbitrarily busy task", () => {
+  const worktrees = [worktree("/blocked", "blocked"), worktree("/busy", "busy")];
+  const pullRequests = Array.from({ length: 2000 }, (_, i): PullRequestInfo => ({ number: i + 1, title: "busy", state: "OPEN", head_ref: "busy", base_ref: "main", url: "", is_draft: false, ci_status: "success", created_at: "", updated_at: "", review_decision: "", first_review_at: "" }));
+  const input: WorkInputs = { leases: [], titles: {}, worktrees, bindings: { "/busy": "T" }, pullRequests, runs: [], grants: [], events: [], operations: { "/blocked": op(), "/busy": null }, sources: sources() };
+  const p = projectWork(input);
+  expect(p.rows[0].operation?.kind).toBe("Rebase");
+  expect(p.rows[0].kind).toBe("unbound");
+  expect(p.rows[1].pullRequests).toHaveLength(2000);
+});
+
+it("bounds many-to-many PR joins and reports the exact omitted coverage", () => {
+  const worktrees = Array.from({ length: 250 }, (_, i) => worktree(`/wt/${i}`, "shared"));
+  const pullRequests = Array.from({ length: 1000 }, (_, i): PullRequestInfo => ({ number: i + 1, title: "shared", state: "OPEN", head_ref: "shared", base_ref: "main", url: "", is_draft: false, ci_status: "success", created_at: "", updated_at: "", review_decision: "", first_review_at: "" }));
+  const p = projectWork({ leases: [], titles: {}, worktrees, bindings: {}, pullRequests, runs: [], events: [], grants: [], operations: {}, sources: sources() });
+  expect(p.rows.reduce((total, row) => total + row.pullRequests.length, 0)).toBeLessThanOrEqual(20_000);
+  expect(p.sources.github.ok).toBe(false);
+  expect(p.sources.github.detail).toContain("20000 of 250000");
+});

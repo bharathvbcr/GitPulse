@@ -17,6 +17,7 @@ import type { PersistedLog } from "./types";
 /** Panels that report caught errors through this seam. */
 export type PanelSource =
   | "blame"
+  | "code-map"
   | "reflog"
   | "stack"
   | "worktrees"

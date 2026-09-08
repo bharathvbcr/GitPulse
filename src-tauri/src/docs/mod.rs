@@ -5,20 +5,29 @@
 //! `Vault::build`. Rename uses the pure `rewrite_links_in` helper plus
 //! GitPulse's git writer — never MarkDev's `rename_note`.
 
-use crate::engine::git_cli::{git_text, sandbox_join, sandbox_write, validate_repo};
+use crate::engine::git_cli::{
+    git_text, sandbox_join, sandbox_join_canonical, sandbox_write, validate_repo,
+};
 use crate::engine::git_writer::GitWriter;
-use markdev::vault::note::{has_markdown_extension, stem, strip_markdown_extension};
+use markdev::vault::note::{
+    has_markdown_extension, stem, strip_markdown_extension, MARKDOWN_EXTENSIONS,
+};
 use markdev::vault::rename::{rewrite_links_in, ProtectedRanges};
 use markdev::vault::{Backlink, Graph, GraphQuery, Note, SearchHit, Vault, DEFAULT_MAX_NOTE_BYTES};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// Soft ceiling on markdown files held in one vault. Personal / project docs
 /// sit far below this; a monorepo that vendors thousands of READMEs degrades
 /// to a partial index rather than OOM.
 const MAX_DOC_FILES: usize = 5_000;
+const MAX_DOC_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CACHED_VAULTS: usize = 8;
 
 /// Default search hit limit (also the UI honesty threshold).
 pub const DEFAULT_SEARCH_LIMIT: usize = 50;
@@ -30,9 +39,63 @@ struct CachedVault {
     status: DocsStatus,
 }
 
-fn vault_cache() -> &'static Mutex<HashMap<PathBuf, CachedVault>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedVault>>> = OnceLock::new();
+type VaultSlot = Arc<Mutex<Option<Arc<CachedVault>>>>;
+
+struct CacheEntry {
+    slot: VaultSlot,
+    used_at: Instant,
+}
+
+fn vault_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A detached/evicted slot can finish for its existing callers but cannot
+/// republish itself into the cache after invalidation. Work for a resident
+/// repository shares one slot instead of racing duplicate cold builds.
+fn vault_slot(repo: &Path) -> VaultSlot {
+    let mut cache = vault_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = cache.get_mut(repo) {
+        entry.used_at = Instant::now();
+        return Arc::clone(&entry.slot);
+    }
+    if cache.len() >= MAX_CACHED_VAULTS {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.used_at)
+            .map(|(path, _)| path.clone());
+        if let Some(path) = oldest {
+            cache.remove(&path);
+        }
+    }
+    let slot = Arc::new(Mutex::new(None));
+    cache.insert(
+        repo.to_path_buf(),
+        CacheEntry {
+            slot: Arc::clone(&slot),
+            used_at: Instant::now(),
+        },
+    );
+    slot
+}
+
+fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, String> {
+    let repo = validate_repo(repo_path)?;
+    let slot = vault_slot(&repo);
+    let mut cached = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !force {
+        if let Some(value) = cached.as_ref() {
+            return Ok(Arc::clone(value));
+        }
+    }
+    let value = build_vault(&repo, cached.as_ref())?;
+    *cached = Some(Arc::clone(&value));
+    Ok(value)
 }
 
 /// One broken link: source note path and the unresolved target as written.
@@ -66,19 +129,7 @@ pub struct DocRenameOutcome {
 
 /// Builds (or rebuilds) the vault for `repo_path` from tracked markdown files.
 pub fn refresh(repo_path: &str) -> Result<DocsStatus, String> {
-    let repo = validate_repo(repo_path)?;
-    let (vault, status) = build_vault(&repo)?;
-    let mut cache = vault_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(
-        repo,
-        CachedVault {
-            vault,
-            status: status.clone(),
-        },
-    );
-    Ok(status)
+    Ok(load_vault(repo_path, true)?.status.clone())
 }
 
 /// Drops a cached vault so the next query rebuilds.
@@ -93,22 +144,8 @@ pub fn invalidate(repo_path: &str) {
 }
 
 fn with_vault<T>(repo_path: &str, f: impl FnOnce(&Vault) -> T) -> Result<T, String> {
-    let repo = validate_repo(repo_path)?;
-    {
-        let cache = vault_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.get(&repo) {
-            return Ok(f(&cached.vault));
-        }
-    }
-    let (vault, status) = build_vault(&repo)?;
-    let result = f(&vault);
-    let mut cache = vault_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(repo, CachedVault { vault, status });
-    Ok(result)
+    let cached = load_vault(repo_path, false)?;
+    Ok(f(&cached.vault))
 }
 
 /// Repo-wide markdown full-text search.
@@ -153,40 +190,8 @@ pub fn graph(
 }
 
 pub fn status(repo_path: &str) -> Result<DocsStatus, String> {
-    // Prefer the cached build status (including truncated / skips); rebuild
-    // only when cold. Never invent `truncated: false` after a capped index.
-    let repo = validate_repo(repo_path)?;
-    {
-        let cache = vault_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.get(&repo) {
-            return Ok(DocsStatus {
-                note_count: cached.vault.notes().len() as u32,
-                truncated: cached.status.truncated,
-                skipped_oversized: cached.status.skipped_oversized,
-                skipped_unreadable: cached.status.skipped_unreadable,
-            });
-        }
-    }
-    let (vault, status) = build_vault(&repo)?;
-    let out = DocsStatus {
-        note_count: vault.notes().len() as u32,
-        truncated: status.truncated,
-        skipped_oversized: status.skipped_oversized,
-        skipped_unreadable: status.skipped_unreadable,
-    };
-    let mut cache = vault_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(
-        repo,
-        CachedVault {
-            vault,
-            status: out.clone(),
-        },
-    );
-    Ok(out)
+    // Preserve the actual build's partial/skipped status on a cache hit.
+    Ok(load_vault(repo_path, false)?.status.clone())
 }
 
 /// `git mv` plus staged link rewrites via `rewrite_links_in`.
@@ -204,7 +209,8 @@ pub fn rename_doc(repo_path: &str, from: &str, to: &str) -> Result<DocRenameOutc
         return Err("doc rename only moves markdown notes".into());
     }
 
-    let (vault, _status) = build_vault(&repo)?;
+    let built = build_vault(&repo, None)?;
+    let vault = &built.vault;
     let Some(source_index) = vault.notes().iter().position(|n| n.path == from) else {
         return Err(format!("note not in vault: {from}"));
     };
@@ -309,36 +315,103 @@ fn normalize_rel(path: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
-fn build_vault(repo: &Path) -> Result<(Vault, DocsStatus), String> {
+fn build_vault(
+    repo: &Path,
+    previous: Option<&Arc<CachedVault>>,
+) -> Result<Arc<CachedVault>, String> {
+    let started = Instant::now();
+    let previous = previous.filter(|cached| cached.vault.root() == repo);
+    let previous_notes: HashMap<&str, &Note> = previous
+        .into_iter()
+        .flat_map(|cached| cached.vault.notes())
+        .map(|note| (note.path.as_str(), note))
+        .collect();
     let paths = list_markdown_paths(repo)?;
-    let truncated = paths.len() > MAX_DOC_FILES;
+    let mut truncated = paths.len() > MAX_DOC_FILES;
+    let mut remaining = MAX_DOC_BYTES;
     let take = paths.len().min(MAX_DOC_FILES);
 
     let mut notes = Vec::with_capacity(take);
     let mut skipped_oversized = 0u32;
     let mut skipped_unreadable = 0u32;
+    let mut parsed = 0usize;
 
     for rel in paths.into_iter().take(take) {
-        let abs = repo.join(&rel);
-        let meta = match std::fs::metadata(&abs) {
-            Ok(m) => m,
+        let abs = match sandbox_join_canonical(repo, &rel) {
+            Ok(path) => path,
             Err(_) => {
                 skipped_unreadable = skipped_unreadable.saturating_add(1);
                 continue;
             }
         };
-        if meta.len() as usize > DEFAULT_MAX_NOTE_BYTES {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(target_os = "macos")]
+            let nofollow = libc::O_NOFOLLOW_ANY;
+            #[cfg(not(target_os = "macos"))]
+            let nofollow = libc::O_NOFOLLOW;
+            options.custom_flags(nofollow | libc::O_NONBLOCK);
+        }
+        let file = match options.open(&abs) {
+            Ok(file) => file,
+            Err(_) => {
+                skipped_unreadable = skipped_unreadable.saturating_add(1);
+                continue;
+            }
+        };
+        let meta = match file.metadata() {
+            Ok(meta) if meta.is_file() => meta,
+            _ => {
+                skipped_unreadable = skipped_unreadable.saturating_add(1);
+                continue;
+            }
+        };
+        if meta.len() > DEFAULT_MAX_NOTE_BYTES as u64 {
             skipped_oversized = skipped_oversized.saturating_add(1);
             continue;
         }
-        let text = match std::fs::read_to_string(&abs) {
-            Ok(t) => t,
+        if meta.len() > remaining as u64 {
+            truncated = true;
+            continue;
+        }
+        // Metadata can race a growing file; bound the actual read as well.
+        let limit = DEFAULT_MAX_NOTE_BYTES.min(remaining);
+        let mut bytes = Vec::new();
+        if file.take(limit as u64 + 1).read_to_end(&mut bytes).is_err() {
+            skipped_unreadable = skipped_unreadable.saturating_add(1);
+            continue;
+        }
+        if bytes.len() > DEFAULT_MAX_NOTE_BYTES {
+            skipped_oversized = skipped_oversized.saturating_add(1);
+            continue;
+        }
+        if bytes.len() > remaining {
+            truncated = true;
+            continue;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
             Err(_) => {
                 skipped_unreadable = skipped_unreadable.saturating_add(1);
                 continue;
             }
         };
-        notes.push(Note::parse(rel, &text));
+        remaining -= text.len();
+        // Compare exact bytes: size/mtime caches miss in-place edits, restored
+        // timestamps and coarse clocks. Borrow unchanged notes until we know
+        // whether the entire indexed snapshot can survive.
+        if let Some(note) = previous_notes
+            .get(rel.as_str())
+            .filter(|note| note.text == text)
+        {
+            notes.push(Cow::Borrowed(*note));
+        } else {
+            parsed += 1;
+            notes.push(Cow::Owned(Note::parse(rel, &text)));
+        }
     }
 
     let status = DocsStatus {
@@ -347,24 +420,37 @@ fn build_vault(repo: &Path) -> Result<(Vault, DocsStatus), String> {
         skipped_oversized,
         skipped_unreadable,
     };
-    Ok((Vault::build(repo.to_path_buf(), notes), status))
+    let unchanged = previous.is_some_and(|cached| {
+        parsed == 0 && cached.vault.notes().len() == notes.len() && cached.status == status
+    });
+    let value = if let Some(cached) = previous.filter(|_| unchanged) {
+        Arc::clone(cached)
+    } else {
+        Arc::new(CachedVault {
+            vault: Vault::build(
+                repo.to_path_buf(),
+                notes.into_iter().map(Cow::into_owned).collect(),
+            ),
+            status,
+        })
+    };
+    log::debug!(target: "performance", "docs_refresh admitted={} parsed={} reused={} index_reused={} work_ms={}",
+        value.status.note_count, parsed, value.status.note_count as usize - parsed,
+        unchanged, started.elapsed().as_millis());
+    Ok(value)
 }
 
 /// Tracked markdown paths from `git ls-files`, never a filesystem walk.
 fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
-    let stdout = git_text(
-        repo,
-        &[
-            "-c",
-            "core.quotepath=off",
-            "ls-files",
-            "-z",
-            "--",
-            "*.md",
-            "*.mdx",
-            "*.markdown",
-        ],
-    )?;
+    let patterns: Vec<String> = MARKDOWN_EXTENSIONS
+        .iter()
+        .map(|extension| format!(":(icase)*.{extension}"))
+        .collect();
+    let args: Vec<&str> = ["-c", "core.quotepath=off", "ls-files", "-z", "--"]
+        .into_iter()
+        .chain(patterns.iter().map(String::as_str))
+        .collect();
+    let stdout = git_text(repo, &args)?;
     let mut paths: Vec<String> = stdout
         .split('\0')
         .filter(|s| !s.is_empty())
@@ -380,6 +466,255 @@ fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::test_support::{git_in, git_repo, write};
+
+    #[test]
+    #[ignore = "manual before/after document refresh timing workload"]
+    fn repeated_document_refresh_workload() {
+        let dir = git_repo();
+        let path = dir.path().to_str().unwrap();
+        let body = "## Section\nText with [[note-000]] and #tag.\n\n".repeat(100);
+        for n in 0..100 {
+            write(
+                dir.path(),
+                &format!("note-{n:03}.md"),
+                &format!("# Note {n}\n{body}"),
+            );
+        }
+        git_in(dir.path(), &["add", "."]);
+        refresh(path).unwrap();
+        let mut timings = Vec::new();
+        for _ in 0..15 {
+            let started = Instant::now();
+            assert_eq!(refresh(path).unwrap().note_count, 100);
+            timings.push(started.elapsed().as_micros());
+        }
+        timings.sort_unstable();
+        println!(
+            "docs_refresh notes=100 unchanged_samples=15 median_us={} p95_us={} max_us={}",
+            timings[7], timings[14], timings[14]
+        );
+    }
+
+    #[test]
+    fn unchanged_documents_reuse_the_indexed_snapshot_on_forced_refresh() {
+        let dir = fixture_repo();
+        let path = dir.path().to_str().unwrap();
+        let before = load_vault(path, true).unwrap();
+        let after = load_vault(path, true).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "unchanged source must not allocate/rebuild the vault"
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_detects_same_size_same_timestamp_edits() {
+        let dir = fixture_repo();
+        let path = dir.path().to_str().unwrap();
+        let file_path = dir.path().join("docs/Guide.md");
+        std::fs::write(&file_path, "# Guide\noldtoken\n").unwrap();
+        let before = load_vault(path, true).unwrap();
+        let modified = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+        std::fs::write(&file_path, "# Guide\nnewtoken\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = load_vault(path, true).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        let guide = after
+            .vault
+            .notes()
+            .iter()
+            .find(|note| note.path == "docs/Guide.md")
+            .unwrap();
+        assert!(guide.text.contains("newtoken"));
+        assert!(!guide.text.contains("oldtoken"));
+    }
+
+    #[test]
+    fn incremental_refresh_is_scoped_to_the_vault_root() {
+        let first = fixture_repo();
+        let second = fixture_repo();
+        let before = build_vault(first.path(), None).unwrap();
+        let after = build_vault(second.path(), Some(&before)).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.vault.root(), second.path());
+    }
+
+    #[test]
+    fn tracked_document_extensions_match_the_parser_including_uppercase() {
+        let dir = git_repo();
+        let mut expected = Vec::new();
+        for (i, extension) in markdev::vault::note::MARKDOWN_EXTENSIONS.iter().enumerate() {
+            for (j, extension) in [extension.to_string(), extension.to_uppercase()]
+                .iter()
+                .enumerate()
+            {
+                let name = format!("docs/note-{i}-{j}.{extension}");
+                write(dir.path(), &name, "# Document\n");
+                expected.push(name);
+            }
+        }
+        write(dir.path(), "docs/ordinary.txt", "# Not Markdown\n");
+        git_in(dir.path(), &["add", "."]);
+        write(dir.path(), "untracked.md", "# Untracked\n");
+        expected.sort();
+        assert_eq!(list_markdown_paths(dir.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn incremental_refresh_matches_full_rebuild_through_file_churn() {
+        let dir = git_repo();
+        for n in 0..48 {
+            write(
+                dir.path(),
+                &format!("note-{n:03}.md"),
+                &format!("# Note {n}\n[[note-000]] #shared\n"),
+            );
+        }
+        git_in(dir.path(), &["add", "."]);
+        let mut previous = build_vault(dir.path(), None).unwrap();
+        git_in(dir.path(), &["commit", "-qm", "document churn fixture"]);
+        for step in 0..24 {
+            let changed = format!("note-{step:03}.md");
+            match step % 4 {
+                0 => write(
+                    dir.path(),
+                    &changed,
+                    &format!("# Changed {step}\n[[absent]] #different\n"),
+                ),
+                1 => {
+                    git_in(dir.path(), &["rm", &changed]);
+                }
+                2 => {
+                    git_in(
+                        dir.path(),
+                        &["mv", &changed, &format!("moved-{step:03}.md")],
+                    );
+                }
+                _ => {
+                    std::fs::write(dir.path().join(&changed), [0xff, 0xfe]).unwrap();
+                }
+            }
+            let incremental = build_vault(dir.path(), Some(&previous)).unwrap();
+            let full = build_vault(dir.path(), None).unwrap();
+            assert_eq!(incremental.status, full.status, "step {step}");
+            assert_eq!(incremental.vault.notes(), full.vault.notes(), "step {step}");
+            assert_eq!(
+                incremental.vault.broken_links(),
+                full.vault.broken_links(),
+                "step {step}"
+            );
+            assert_eq!(
+                serde_json::to_value(incremental.vault.search("shared", 100)).unwrap(),
+                serde_json::to_value(full.vault.search("shared", 100)).unwrap(),
+                "step {step}"
+            );
+            previous = incremental;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previously_cached_document_replaced_by_outside_symlink_is_removed() {
+        let dir = fixture_repo();
+        let previous = build_vault(dir.path(), None).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "outside.md", "outside private body");
+        std::fs::remove_file(dir.path().join("docs/Guide.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.md"),
+            dir.path().join("docs/Guide.md"),
+        )
+        .unwrap();
+        let next = build_vault(dir.path(), Some(&previous)).unwrap();
+        assert!(!next
+            .vault
+            .notes()
+            .iter()
+            .any(|note| note.path == "docs/Guide.md"));
+        assert_eq!(next.status.skipped_unreadable, 1);
+    }
+
+    #[test]
+    fn document_queries_do_not_hold_the_cross_repository_cache_lock() {
+        let dir = fixture_repo();
+        let path = dir.path().to_str().unwrap();
+        refresh(path).unwrap();
+        with_vault(path, |_| {
+            assert!(
+                vault_cache().try_lock().is_ok(),
+                "search/graph work must not lock out every repository"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn document_vault_cache_does_not_retain_every_repository_ever_opened() {
+        let mut repos = Vec::new();
+        for _ in 0..10 {
+            let dir = git_repo();
+            refresh(dir.path().to_str().unwrap()).unwrap();
+            repos.push(dir);
+        }
+        let cache = vault_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(cache.len() <= 8, "retained {} vaults", cache.len());
+    }
+
+    #[test]
+    fn a_slow_query_cannot_republish_a_vault_after_invalidation() {
+        let dir = fixture_repo();
+        let path = dir.path().to_str().unwrap();
+        invalidate(path);
+        with_vault(path, |_| {
+            write(dir.path(), "docs/Guide.md", "# Guide\nnewlyupdatedtoken");
+            invalidate(path);
+            refresh(path).unwrap();
+        })
+        .unwrap();
+        assert!(!search(path, "newlyupdatedtoken", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn document_vault_has_an_aggregate_byte_budget() {
+        let dir = git_repo();
+        let body = "a".repeat(1024 * 1024);
+        for i in 0..34 {
+            write(dir.path(), &format!("{i:02}.md"), &body);
+        }
+        git_in(dir.path(), &["add", "."]);
+        let built = build_vault(dir.path(), None).unwrap();
+        let vault = &built.vault;
+        let status = &built.status;
+        let bytes: usize = vault.notes().iter().map(|note| note.text.len()).sum();
+        assert!(bytes <= 32 * 1024 * 1024, "retained {bytes} bytes");
+        assert!(
+            status.truncated,
+            "a byte-capped vault must report incomplete coverage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_vault_refuses_a_tracked_link_outside_the_repository() {
+        let dir = git_repo();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "secret.md", "# Outside\nprivate-body");
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("link.md"))
+            .unwrap();
+        git_in(dir.path(), &["add", "link.md"]);
+        let built = build_vault(dir.path(), None).unwrap();
+        let vault = &built.vault;
+        let status = &built.status;
+        assert!(vault.notes().is_empty());
+        assert_eq!(status.skipped_unreadable, 1);
+    }
 
     fn fixture_repo() -> tempfile::TempDir {
         let dir = git_repo();

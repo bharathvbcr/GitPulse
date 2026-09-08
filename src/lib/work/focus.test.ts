@@ -80,7 +80,7 @@ function status(extra: Partial<FileStatus> = {}): FileStatus {
   };
 }
 
-const pr = { number: 7, title: "add caching", head_ref: "feat-cache" } as PullRequestInfo;
+const pr: PullRequestInfo = { number: 7, title: "add caching", head_ref: "feat-cache", base_ref: "main", state: "OPEN", url: "https://example.test/pr/7", is_draft: false, ci_status: "success", created_at: "", updated_at: "", review_decision: "", first_review_at: "" };
 
 const BLOCKED = row("blocked", {
   operation: {
@@ -240,4 +240,11 @@ describe("hereSummary", () => {
   it("returns nothing for a detached head rather than a branch named empty", () => {
     expect(hereSummary(null, [], [])).toBeNull();
   });
+});
+
+
+it("keeps detached-checkout changes visible without inventing a branch", () => {
+  const here = hereSummary(null, [], [{ path: "a.ts", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 }]);
+  expect(here?.staged).toBe(1);
+  expect(here?.branch).toBeNull();
 });

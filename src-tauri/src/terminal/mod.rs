@@ -12,7 +12,9 @@ use crate::engine::git_cli::{
 use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+mod flow;
+use flow::OutputFlow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -101,16 +103,15 @@ pub struct TerminalExitPayload {
     pub id: String,
     pub exit_code: Option<i32>,
     pub signal: String,
+    pub error: Option<String>,
 }
 
 struct SessionEntry {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    /// Signal handle for the shell, split off the child before the owned
-    /// child moves into the reader thread. Keeps kill_session able to
-    /// terminate the process and prevents an unreapable zombie.
-    killer: Box<dyn ChildKiller + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     dead: Arc<AtomicBool>,
+    flow: Arc<OutputFlow>,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -122,20 +123,11 @@ pub struct TerminalSessions {
 
 struct SessionReservation {
     active_sessions: Arc<AtomicUsize>,
-    armed: bool,
-}
-
-impl SessionReservation {
-    fn commit(mut self) {
-        self.armed = false;
-    }
 }
 
 impl Drop for SessionReservation {
     fn drop(&mut self) {
-        if self.armed {
-            self.active_sessions.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.active_sessions.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -148,7 +140,6 @@ fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, Strin
         .map_err(|_| format!("Terminal session limit reached ({MAX_PTY_SESSIONS})"))?;
     Ok(SessionReservation {
         active_sessions: state.active_sessions.clone(),
-        armed: true,
     })
 }
 
@@ -163,11 +154,17 @@ fn bounded_pty_size(rows: u16, cols: u16) -> PtySize {
 
 /// Determines the default shell for interactive sessions.
 fn default_shell() -> String {
-    if cfg!(windows) {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into())
+    let (key, fallback) = if cfg!(windows) {
+        ("COMSPEC", "powershell.exe")
+    } else if cfg!(target_os = "macos") {
+        ("SHELL", "/bin/zsh")
     } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
-    }
+        ("SHELL", "/bin/sh")
+    };
+    std::env::var(key)
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| fallback.into())
 }
 
 /// Shells that accept `-l` as "start as a login shell".
@@ -359,8 +356,9 @@ impl From<&portable_pty::ExitStatus> for ExitStatusLike {
 /// Reaps the shell and emits exactly one authoritative "terminal-exit" event.
 ///
 /// `wait` blocks until the child terminates; the reader thread calls this only
-/// after the master side hit EOF/error/dead-flag, so the child is already gone
-/// or dying. A successful wait reports the real exit code — on Unix a killed
+/// after the master side hit EOF/error. EOF can precede child exit, so the
+/// caller keeps its killable registry entry until reaping. A successful wait
+/// reports the real exit code — on Unix a killed
 /// shell yields the fallback code with the signal name attached — while a
 /// failed wait degrades honestly to `exit_code: None` instead of inventing a
 /// status.
@@ -386,13 +384,66 @@ where
         id: session_id.to_string(),
         exit_code,
         signal,
+        error: None,
     });
+}
+
+// PTY commands are user-authored and may contain newlines (e.g. sh -c).
+// They share size bounds with Console but do not inherit its control policy.
+fn validate_pty_options(
+    program: Option<&str>,
+    args: Option<&[String]>,
+    env: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    if let Some(program) = program {
+        if program.trim().is_empty()
+            || program.len() > TERMINAL_ARG_BYTES_CAP
+            || program.contains('\0')
+        {
+            return Err("Invalid terminal program".into());
+        }
+    }
+    let args = args.unwrap_or_default();
+    if args.len() > TERMINAL_ARG_COUNT_CAP {
+        return Err("Too many terminal arguments".into());
+    }
+    let mut total = program.map_or(0, str::len);
+    for arg in args {
+        if arg.len() > TERMINAL_ARG_BYTES_CAP || arg.contains('\0') {
+            return Err("Invalid or oversized terminal argument".into());
+        }
+        total = total.saturating_add(arg.len());
+    }
+    if total > TERMINAL_ARGV_BYTES_CAP {
+        return Err("Terminal arguments exceed 128 KiB".into());
+    }
+    if let Some(env) = env {
+        if env.len() > 256 {
+            return Err("Too many terminal environment entries".into());
+        }
+        let mut total = 0usize;
+        for (key, value) in env {
+            if key.is_empty()
+                || key.contains(['=', '\0'])
+                || value.contains('\0')
+                || key.len() > 1024
+                || value.len() > TERMINAL_ARG_BYTES_CAP
+            {
+                return Err("Invalid or oversized terminal environment entry".into());
+            }
+            total = total.saturating_add(key.len()).saturating_add(value.len());
+        }
+        if total > TERMINAL_ARGV_BYTES_CAP {
+            return Err("Terminal environment exceeds 128 KiB".into());
+        }
+    }
+    Ok(())
 }
 
 /// Spawns a PTY session running an interactive shell or agent CLI in `repo_path`.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_session(
-    app: &AppHandle,
+pub fn spawn_session<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &TerminalSessions,
     repo_path: &str,
     rows: u16,
@@ -401,6 +452,7 @@ pub fn spawn_session(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
 ) -> Result<TerminalSpawned, String> {
+    validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let repo = validate_repo(repo_path)?;
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
@@ -424,20 +476,9 @@ pub fn spawn_session(
         &PtyEnv::from_process(),
     );
 
-    // The child handle is owned: the killer is split off for SessionEntry
-    // (kill_session), and the child itself moves into the reader thread,
-    // which reaps it after EOF so no zombie survives.
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn process '{shell}': {e}"))?;
-    let killer: Box<dyn ChildKiller + Send> = child.clone_killer();
-
-    // Drop slave explicitly; master remains open.
-    drop(pair.slave);
-
-    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let session_id = format!("term-{}-{:x}", std::process::id(), count);
+    // The shared child handle serializes termination with reaping. The reader
+    // owns the capacity reservation until the child has been reaped.
+    // Obtain handles before spawning: allocation failures cannot orphan a child.
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -446,20 +487,33 @@ pub fn spawn_session(
         .master
         .take_writer()
         .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Failed to spawn process '{shell}': {e}"))?;
+    let child = Arc::new(Mutex::new(child));
 
+    // Drop slave explicitly; master remains open.
+    drop(pair.slave);
+
+    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session_id = format!("term-{}-{:x}", std::process::id(), count);
     let dead = Arc::new(AtomicBool::new(false));
+    let output_flow = Arc::new(OutputFlow::default());
+    let master = Arc::new(Mutex::new(pair.master));
     let entry = SessionEntry {
-        master: pair.master,
-        writer,
-        killer,
+        master: master.clone(),
+        writer: Arc::new(Mutex::new(writer)),
+        child: child.clone(),
         dead: dead.clone(),
+        flow: output_flow.clone(),
     };
 
     {
         let mut guard = state
             .sessions
             .lock()
-            .map_err(|e| format!("Lock error: {e}"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(session_id.clone(), entry);
     }
 
@@ -469,51 +523,72 @@ pub fn spawn_session(
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
     let sessions_map = state.sessions.clone();
-    let active_sessions = state.active_sessions.clone();
+    let thread_child = child.clone();
+    let thread_master = master.clone();
 
     let reader_thread = thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
         .spawn(move || {
+            let mut reservation = Some(reservation);
+            let mut failure = None;
             let mut buf = [0u8; 4096];
-            while !dead_flag.load(Ordering::Relaxed) {
+            loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let data_b64 = BASE64_STANDARD.encode(&buf[..n]);
-                        if let Err(e) = app_handle.emit(
-                            "terminal-output",
-                            TerminalOutputPayload {
-                                id: sid_for_thread.clone(),
-                                data_b64,
-                            },
-                        ) {
-                            log::warn!(
-                                target: "terminal",
-                                "failed to emit terminal-output: {e}"
-                            );
+                        // On close, drain kernel output until EOF. Leaving a
+                        // full tty queue undrained can prevent a killed writer
+                        // from completing on macOS, stranding its process slot.
+                        if dead_flag.load(Ordering::Relaxed) { continue; }
+                        let delivery = output_flow.reserve(n, Duration::from_secs(30)).and_then(|()| {
+                            app_handle.emit("terminal-output", TerminalOutputPayload {
+                                id: sid_for_thread.clone(), data_b64: BASE64_STANDARD.encode(&buf[..n]),
+                            }).map_err(|e| {
+                                log::warn!(target: "terminal", "failed to emit terminal-output: {e}");
+                                format!("Terminal output delivery failed: {e}")
+                            })
+                        });
+                        if let Err(error) = delivery {
+                            if !dead_flag.swap(true, Ordering::SeqCst) {
+                                failure = Some(error);
+                                output_flow.stop();
+                                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                                    log::warn!(target: "terminal", "could not signal failed terminal: {error}");
+                                }
+                            }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
 
             dead_flag.store(true, Ordering::SeqCst);
-            // Clean up session entry from map; a poisoned lock (a sibling
-            // panicked mid-write) must not skip cleanup or reaping.
-            let mut guard = sessions_map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let removed = guard.remove(&sid_for_exit).is_some();
-            drop(guard);
-            if removed {
-                active_sessions.fetch_sub(1, Ordering::AcqRel);
-            }
+            output_flow.stop();
 
             // Reap the shell and report its real exit status.
             finalize_pty_session(
                 &sid_for_exit,
-                move || child.wait().map(|status| ExitStatusLike::from(&status)),
-                |payload| {
+                move || loop {
+                    // Do not hold the child mutex across a blocking wait: EOF
+                    // can precede process exit, and Close must still work.
+                    let result = thread_child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .try_wait();
+                    match result {
+                        Ok(Some(status)) => break Ok(ExitStatusLike::from(&status)),
+                        Ok(None) => thread::sleep(Duration::from_millis(10)),
+                        Err(error) => break Err(error),
+                    }
+                },
+                |mut payload| {
+                    drop(reservation.take());
+                    sessions_map
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&sid_for_exit);
+                    payload.error = failure.take();
                     if let Err(e) = app_handle.emit("terminal-exit", payload) {
                         log::warn!(target: "terminal", "failed to emit terminal-exit event: {e}");
                     }
@@ -526,9 +601,14 @@ pub fn spawn_session(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&session_id);
+        drop(guard);
+        terminate_pty_child(&child, &master)?;
+        let _ = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait();
         return Err(format!("Failed to spawn PTY reader thread: {e}"));
     }
-    reservation.commit();
 
     let actor_kind = if shell.contains("claude")
         || shell.contains("manvi")
@@ -591,29 +671,53 @@ pub fn write_to_session(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
+    write_pty_bytes(state, session_id, data.as_bytes())
+}
+
+/// xterm's onBinary stream encodes one byte per Latin-1 character.
+pub fn write_binary_to_session(
+    state: &TerminalSessions,
+    session_id: &str,
+    data: &str,
+) -> Result<(), String> {
+    if data.len() > 2 * MAX_PTY_INPUT_BYTES {
+        return Err("Binary terminal input exceeds its limit".into());
+    }
+    let bytes: Result<Vec<u8>, _> = data.chars().map(|c| u8::try_from(u32::from(c))).collect();
+    write_pty_bytes(
+        state,
+        session_id,
+        &bytes.map_err(|_| "Invalid binary terminal input")?,
+    )
+}
+
+fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> Result<(), String> {
     if data.len() > MAX_PTY_INPUT_BYTES {
         return Err(format!(
             "Terminal input is {} bytes; the per-write limit is {MAX_PTY_INPUT_BYTES}",
             data.len()
         ));
     }
-    let mut guard = state
-        .sessions
+    let writer = {
+        let guard = state
+            .sessions
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        guard
+            .get(session_id)
+            .map(|session| session.writer.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?
+    };
+    let mut writer = writer
         .lock()
-        .map_err(|e| format!("Lock error: {e}"))?;
-    if let Some(session) = guard.get_mut(session_id) {
-        session
-            .writer
-            .write_all(data.as_bytes())
-            .map_err(|e| format!("Failed to write to terminal: {e}"))?;
-        session
-            .writer
-            .flush()
-            .map_err(|e| format!("Failed to flush terminal: {e}"))?;
-        Ok(())
-    } else {
-        Err(format!("Terminal session '{session_id}' not found"))
-    }
+        .map_err(|e| format!("Terminal writer lock error: {e}"))?;
+    writer
+        .write_all(data)
+        .map_err(|e| format!("Failed to write to terminal: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush terminal: {e}"))?;
+    Ok(())
 }
 
 /// Resizes a PTY session.
@@ -631,6 +735,8 @@ pub fn resize_session(
         let size = bounded_pty_size(rows, cols);
         session
             .master
+            .lock()
+            .map_err(|e| format!("Terminal size lock error: {e}"))?
             .resize(size)
             .map_err(|e| format!("Failed to resize terminal: {e}"))?;
         Ok(())
@@ -641,28 +747,132 @@ pub fn resize_session(
 
 /// Kills a PTY session.
 ///
-/// Signals the shell via the split [`ChildKiller`] handle, then drops the
-/// master/writer (hanging up the PTY). The reader thread observes EOF, waits
-/// the killed child, and emits the real exit status — so the process is
-/// reaped rather than left as a zombie.
+/// Signals only the still-owned child and its verified foreground tty group.
+/// Waits for the reader to reap the child and release capacity before success;
+/// a timeout retains ownership so a retry cannot signal an unrelated process.
 pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
-    let mut guard = state
-        .sessions
-        .lock()
-        .map_err(|e| format!("Lock error: {e}"))?;
-    if let Some(mut session) = guard.remove(session_id) {
-        state.active_sessions.fetch_sub(1, Ordering::AcqRel);
-        session.dead.store(true, Ordering::SeqCst);
-        // Best-effort signal; a failure here is logged but must not fail the
-        // kill — dropping the PTY master still hangs up the slave side.
-        if let Err(e) = session.killer.kill() {
-            log::warn!(
-                target: "terminal",
-                "kill: could not signal shell: {e}"
-            );
+    let handles = {
+        let guard = state
+            .sessions
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        guard.get(session_id).map(|s| {
+            (
+                s.child.clone(),
+                s.master.clone(),
+                s.flow.clone(),
+                s.dead.clone(),
+            )
+        })
+    };
+    if let Some((child, master, flow, dead)) = handles {
+        terminate_pty_child(&child, &master)?;
+        dead.store(true, Ordering::SeqCst);
+        flow.stop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let present = state
+                .sessions
+                .lock()
+                .map_err(|e| e.to_string())?
+                .contains_key(session_id);
+            if !present {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("Terminal process has not finished cleanup; retry Close".into());
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
     Ok(())
+}
+
+/// Application exit closes every owned PTY before the runtime disappears.
+pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
+    let ids: Vec<String> = state
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .keys()
+        .cloned()
+        .collect();
+    let mut failures = 0;
+    for id in ids {
+        if kill_session(state, &id).is_err() {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(format!("Could not stop {failures} terminal sessions"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.active_sessions.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let remaining = state.active_sessions.load(Ordering::Acquire);
+    if remaining > 0 {
+        Err(format!(
+            "{remaining} terminal processes have not finished cleanup"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Acknowledgements release only bytes already emitted for this session.
+pub fn acknowledge_output(
+    state: &TerminalSessions,
+    session_id: &str,
+    bytes: usize,
+) -> Result<(), String> {
+    let flow = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("Lock error: {e}"))?
+        .get(session_id)
+        .map(|s| s.flow.clone());
+    // Final renderer callbacks can arrive after EOF removed the session.
+    if let Some(flow) = flow {
+        flow.acknowledge(bytes)?;
+    }
+    Ok(())
+}
+
+fn terminate_pty_child(
+    child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+) -> Result<(), String> {
+    let mut child = child
+        .lock()
+        .map_err(|e| format!("Terminal child lock error: {e}"))?;
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.process_id().and_then(|p| i32::try_from(p).ok()) {
+        let foreground = master
+            .lock()
+            .map_err(|e| e.to_string())?
+            .process_group_leader();
+        // The tty group must belong to this still-owned child session. Never
+        // signal the app's group or a group from a reused, unrelated session.
+        if let Some(group) = foreground.filter(|g| *g > 1) {
+            // SAFETY: getsid/kill take numeric ids, and ownership is checked
+            // while the child cannot be reaped by the reader thread.
+            unsafe {
+                if libc::getsid(group) == pid && group != libc::getpgrp() {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = master;
+    child.kill().map_err(|e| {
+        log::warn!(target: "terminal", "could not signal terminal child: {e}");
+        format!("Could not stop terminal process: {e}")
+    })
 }
 
 /// One-shot bounded command execution in `repo_path`.
@@ -3193,6 +3403,33 @@ mod tests {
 
         let maximum = bounded_pty_size(u16::MAX, u16::MAX);
         assert_eq!((maximum.rows, maximum.cols), (MAX_PTY_ROWS, MAX_PTY_COLS));
+    }
+
+    #[test]
+    fn pty_launch_payloads_are_bounded_without_restricting_user_scripts() {
+        assert!(validate_pty_options(
+            Some("sh"),
+            Some(&["-c".into(), "printf hello\nprintf world".into()]),
+            None
+        )
+        .is_ok());
+        assert!(validate_pty_options(Some(""), None, None).is_err());
+        assert!(validate_pty_options(Some("sh\0bad"), None, None).is_err());
+        assert!(validate_pty_options(None, Some(&vec!["x".into(); 257]), None).is_err());
+        assert!(validate_pty_options(None, Some(&["x".repeat(16385)]), None).is_err());
+        assert!(validate_pty_options(None, Some(&vec!["x".repeat(16384); 9]), None).is_err());
+        assert!(validate_pty_options(
+            None,
+            None,
+            Some(&HashMap::from([("A=B".into(), "value".into())]))
+        )
+        .is_err());
+        assert!(validate_pty_options(
+            None,
+            None,
+            Some(&HashMap::from([("A".into(), "x".repeat(16385))]))
+        )
+        .is_err());
     }
 
     #[test]

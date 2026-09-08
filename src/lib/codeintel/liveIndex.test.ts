@@ -10,6 +10,9 @@ import { get } from "svelte/store";
 import { createLiveIndex } from "./liveIndex";
 import type { LiveRefreshOutcome } from "./types";
 
+const warnings = vi.hoisted(() => vi.fn());
+vi.mock("../diagnostics/diagnostics", () => ({ diagnostics: { warn: warnings } }));
+
 function outcome(
   decision: LiveRefreshOutcome["decision"],
   extras: Partial<LiveRefreshOutcome> = {},
@@ -40,11 +43,150 @@ function outcome(
 }
 
 describe("liveIndex controller", () => {
+  it("retains inactive updates and removes closed snapshots including late completions", async () => {
+    let release!: (result: LiveRefreshOutcome) => void;
+    const maybeRefresh = vi.fn(() => Promise.resolve(outcome("refresh")))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh,
+      scope: { activeKey: "/a", retainedKeys: ["/a", "/b"], visible: false },
+    });
+    index.onRepoChanged("/a");
+    index.onRepoChanged("/b");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(maybeRefresh).not.toHaveBeenCalled();
+    expect(index.get("/b").phase).toBe("scheduled");
+    index.setScope({ activeKey: "/a", retainedKeys: ["/a", "/b"], visible: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/a", true);
+    index.setScope({ activeKey: "/b", retainedKeys: ["/b"], visible: true });
+    release(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(index.get("/a").phase).toBe("idle");
+    expect(get(index.snapshots)).not.toHaveProperty("/a");
+    expect(index.get("/b").phase).toBe("ready");
+    index.onRepoChanged("/closed");
+    expect(get(index.snapshots)).not.toHaveProperty("/closed");
+    index.reset();
+  });
+
+  it("publishes successful content revisions even with frozen time and a queued follow-up", async () => {
+    let release!: (value: LiveRefreshOutcome) => void;
+    const maybeRefresh = vi.fn(() => Promise.resolve(outcome("skip_fresh")))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").revision).toBe(0);
+    index.onRepoChanged("/repo");
+    release(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("scheduled");
+    expect(index.get("/repo").revision).toBe(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(index.get("/repo").phase).toBe("skipped");
+    expect(index.get("/repo").revision).toBe(1);
+    index.reset();
+  });
+
+  it("never reports a refresh without a build outcome as ready", async () => {
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh: async () => outcome("refresh", { build: null }) });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("failed");
+    expect(index.get("/repo").revision).toBe(0);
+    index.reset();
+  });
   beforeEach(() => {
     vi.useFakeTimers();
+    warnings.mockClear();
   });
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("retains a follow-up after changes during an in-flight build", async () => {
+    let release!: (value: LiveRefreshOutcome) => void;
+    const maybeRefresh = vi.fn(() => Promise.resolve(outcome("refresh")))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/busy");
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 100; i++) index.onRepoChanged("/busy");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    release(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    index.reset();
+  });
+
+  it("serializes repositories and keeps the running slot across reset", async () => {
+    let release!: (value: LiveRefreshOutcome) => void;
+    const maybeRefresh = vi.fn(() => Promise.resolve(outcome("refresh")))
+      .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    for (let i = 0; i < 32; i++) index.onRepoChanged(`/repo/${i}`);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    index.reset();
+    index.onRepoChanged("/new");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    release(outcome("refresh"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    expect(index.get("/repo/0").phase).toBe("idle");
+    expect(index.get("/new").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("continuous events cannot starve the index or build continuously", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const index = createLiveIndex({ maybeRefresh });
+    for (let i = 0; i < 60; i++) {
+      index.onRepoChanged("/busy");
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(maybeRefresh.mock.calls.length).toBeGreaterThanOrEqual(4);
+    expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(6);
+    index.reset();
+  });
+
+  it("bounds flood admission, timer count, and retained snapshots", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const index = createLiveIndex({ maybeRefresh });
+    for (let i = 0; i < 1_000; i++) index.onRepoChanged(`/repo/${i}`);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(warnings).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(66_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(64);
+    for (let i = 1_000; i < 1_100; i++) {
+      index.onRepoChanged(`/repo/${i}`);
+      await vi.advanceTimersByTimeAsync(1_200);
+    }
+    expect(Object.keys(get(index.snapshots)).length).toBeLessThanOrEqual(65);
+    expect(index.get("/repo/1099").phase).toBe("ready");
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("failure does not strand queued repositories", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"))
+      .mockRejectedValueOnce(new Error("dependency unavailable"));
+    const index = createLiveIndex({ maybeRefresh });
+    index.onRepoChanged("/failed");
+    index.onRepoChanged("/next");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(index.get("/failed").phase).toBe("failed");
+    expect(index.get("/next").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("rejects invalid timer configuration", () => {
+    for (const debounceMs of [NaN, Infinity, -1]) {
+      expect(() => createLiveIndex({ debounceMs })).toThrow(RangeError);
+    }
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("stale → schedules a refresh after debounce", async () => {

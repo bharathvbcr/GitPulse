@@ -297,3 +297,63 @@ describe("loadWork", () => {
     expect(commands).toContain("cmd_repo_operation");
   });
 });
+
+
+describe("Overview source honesty", () => {
+  it("surfaces partial GitHub warnings and both relevant truncation flags", async () => {
+    const invoke = fakeInvoke(baseAnswers({ cmd_github_context: {
+      ...OK_GITHUB, warnings: ["PR response could not be parsed"], prs_truncated: true, runs_truncated: true,
+    } }));
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.sources.github.ok).toBe(false);
+    expect(p.sources.github.detail).toContain("PR response could not be parsed");
+    expect(p.sources.github.detail).toMatch(/pull request.*truncated/i);
+    expect(p.sources.github.detail).toMatch(/run.*truncated/i);
+  });
+
+  it.each([
+    ["cmd_task_view", "tasks", OK_TASKS],
+    ["cmd_github_context", "github", OK_GITHUB],
+    ["cmd_grants_view", "grants", OK_GRANTS],
+  ] as const)("keeps %s errors when available is false", async (command, source, value) => {
+    const invoke = fakeInvoke(baseAnswers({ [command]: { ...value, available: false, error: "permission denied" } }));
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.sources[source].ok).toBe(false);
+    expect(p.sources[source].detail).toContain("permission denied");
+  });
+
+  it.each([null, {}, "invalid"])("isolates a malformed worktree response: %j", async value => {
+    const invoke = fakeInvoke(baseAnswers({ cmd_list_worktrees: value }));
+    const p = await loadWork("/repo", { invoke: invoke as never });
+    expect(p.sources.worktrees.ok).toBe(false);
+    expect(p.sources.tasks.ok).toBe(true);
+  });
+
+  it("isolates a synchronous IPC failure", async () => {
+    const call = () => { throw new Error("bridge unavailable"); };
+    const p = await loadWork("/repo", { invoke: call });
+    expect(Object.values(p.sources).every(source => !source.ok)).toBe(true);
+  });
+});
+
+it("bounds a hung source while preserving sources that answered", async () => {
+  vi.useFakeTimers();
+  try {
+    const invoke = fakeInvoke(baseAnswers({ cmd_github_context: () => new Promise(() => {}) }));
+    const loading = loadWork("/repo", { invoke: invoke as never, timeoutMs: 50 });
+    await vi.advanceTimersByTimeAsync(50);
+    const result = await loading;
+    expect(result.sources.github.detail).toContain("deadline");
+    expect(result.sources.tasks.ok).toBe(false); // title lookup missed the shared deadline
+    expect(result.sources.ledger.ok).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+it("starts no IPC for a cancelled load", async () => {
+  const controller = new AbortController(); controller.abort();
+  const invoke = fakeInvoke(baseAnswers());
+  const result = await loadWork("/repo", { invoke: invoke as never, signal: controller.signal });
+  expect(invoke).not.toHaveBeenCalled();
+  expect(result.degraded).toBe(true);
+});

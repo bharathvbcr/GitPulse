@@ -239,7 +239,9 @@ describe("App overlay wiring", () => {
     expect(source).toContain('window.addEventListener("beforeunload"');
     expect(source).toContain("await editorFileSaveQueue.whenIdle()");
     expect(source).toContain("hasUnsavedEditorDrafts()");
-    expect(source).toContain("Discard Unsaved Edits and Quit?");
+    expect(source).toContain("Quit with Unsaved Edits?");
+    expect(source).toContain("Conflict drafts are retained for recovery when local storage is available");
+    expect(source.indexOf("conflictSessions.flush()")).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
   });
 });
 

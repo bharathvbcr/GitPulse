@@ -14,6 +14,7 @@
 </script>
 
 <script lang="ts">
+  import { keyedList } from "../ui/eachKeys";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import {
@@ -134,7 +135,7 @@
             whether continuing is safe.
           -->
           <ul class="mt-1.5 space-y-0.5">
-            {#each operation.warnings as warning (warning)}
+            {#each keyedList(operation.warnings, (warning) => warning) as { item: warning, key: renderKey } (renderKey)}
               <li class="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
                 <AlertTriangle size={11} class="mt-0.5 shrink-0" />
                 <span class="min-w-0 wrap-break-word">{warning}</span>

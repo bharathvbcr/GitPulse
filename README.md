@@ -56,7 +56,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(185 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(187 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -268,7 +268,7 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` (classic TypeScript 6) and `tsgo` on `tsconfig.node.json` |
-| `npm run check:ipc` | Verify 185 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 187 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |
@@ -290,6 +290,8 @@ For deep technical details, refer to the dedicated guides in [`docs/`](docs/):
 
 - 📜 **[Changelog](CHANGELOG.md)** — Release history. The release workflow reads the section matching the tag it builds, so a tag with no section fails the build rather than shipping empty notes.
 - 🏗️ **[Architecture Guide](docs/ARCHITECTURE.md)** — In-depth breakdown of Svelte 5 runes, stores, IPC contracts, and GPU canvas rendering.
+- **[Module integration](docs/MODULE_INTEGRATION.md)** — Embed, replace and update DevCouncil, devmap and Manvi modules with explicit compatibility checks.
+- **[Terminal Guide](docs/TERMINAL.md)** — Tabs, split panes, Find, shortcuts, output export, and recovery. The [terminal audit](docs/TERMINAL_AUDIT.md) records stress tests and verification limits.
 - 📋 **[Complete Features Catalog](docs/FEATURES.md)** — Comprehensive documentation for all 4 application views, their sections and keyboard shortcuts.
 - 🤝 **[Contributing Guide](CONTRIBUTING.md)** — Development setup, how to run the tests, architecture orientation, and contract check enforcement.
 - 🌱 **[Good First Issues](docs/GOOD_FIRST_ISSUES.md)** — A curated backlog of scoped, self-contained tasks for new contributors.

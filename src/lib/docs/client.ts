@@ -62,8 +62,8 @@ export interface DocRenameOutcome {
   linksRewritten: number;
 }
 
-export function docsRefresh(repoPath: string): Promise<DocsStatus> {
-  return invoke<DocsStatus>("cmd_docs_refresh", { repoPath });
+export function docsRefresh(repoPath: string, options?: { background?: boolean }): Promise<DocsStatus> {
+  return invoke<DocsStatus>("cmd_docs_refresh", { repoPath, ...(options?.background ? { background: true } : {}) });
 }
 
 export function docsStatus(repoPath: string): Promise<DocsStatus> {

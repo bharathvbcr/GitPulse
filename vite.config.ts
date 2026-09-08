@@ -2,7 +2,8 @@ import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
 import { isTauriHookEnv, portFromEnv } from "./scripts/dev-port.mjs";
-import { appVersion } from "./scripts/app-version.mjs";
+import { appVersion, appBuild } from "./scripts/app-version.mjs";
+import { privateSourceMaps } from "./scripts/build-evidence.mjs";
 
 /**
  * Entry-chunk ceiling. Vendor runtimes (svelte, xterm, lucide, tauri) are split
@@ -125,6 +126,7 @@ export function gitpulseTauriFullReload(
 }
 
 // https://vitejs.dev/config/
+const buildStamp = appBuild();
 export default defineConfig({
   plugins: [
     tailwindcss(),
@@ -137,14 +139,17 @@ export default defineConfig({
       },
     }),
     gitpulseBundleBudget(),
+    privateSourceMaps(buildStamp),
   ],
   clearScreen: false,
   // Stamped into diagnostics entries so a log copied after an upgrade says
   // which build actually recorded each line.
   define: {
     __APP_VERSION__: JSON.stringify(appVersion()),
+    __APP_BUILD_ID__: JSON.stringify(buildStamp.id),
   },
   build: {
+    sourcemap: "hidden",
     rollupOptions: {
       output: {
         manualChunks: gitpulseManualChunk,

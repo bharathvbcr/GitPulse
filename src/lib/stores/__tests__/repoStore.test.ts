@@ -187,6 +187,53 @@ function makeStore(invoke: InvokeFn = makeInvoke()) {
   return { store, graph };
 }
 
+describe("repository content revisions", () => {
+  it("advances on an identical full snapshot without turning unrelated publications into content changes", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/content");
+    const initial = get(store.contentRevisions)["/r/content"];
+    expect(initial).toBeTruthy();
+    for (let i = 0; i < 100; i++) store.setError(null);
+    expect(get(store.contentRevisions)["/r/content"]).toBe(initial);
+    await store.refresh();
+    expect(get(store.contentRevisions)["/r/content"]).not.toBe(initial);
+  });
+
+  it("never publishes a superseded or failed snapshot as fresh content", async () => {
+    const slow = deferred<unknown>();
+    let call = 0;
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => {
+      call++;
+      if (call === 2) return slow.promise as never;
+      if (call === 4) throw new Error("snapshot unavailable");
+      return snapshotFor("/r/content").statuses as never;
+    } }));
+    await store.openRepo("/r/content");
+    const pending = store.refresh();
+    await store.refresh();
+    const current = get(store.contentRevisions)["/r/content"];
+    slow.resolve(snapshotFor("/r/content").statuses);
+    await pending;
+    expect(get(store.contentRevisions)["/r/content"]).toBe(current);
+    await store.refresh();
+    expect(get(store.contentRevisions)["/r/content"]).toBe(current);
+  });
+
+  it("does not reuse a closed repository's revision or retain closed repositories indefinitely", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/content");
+    const initial = get(store.contentRevisions)["/r/content"];
+    await store.closeTab(get(store).activeTabId!);
+    await store.openRepo("/r/content");
+    expect(get(store.contentRevisions)["/r/content"]).not.toBe(initial);
+    for (let i = 0; i < 20; i++) {
+      await store.closeTab(get(store).activeTabId!);
+      await store.openRepo(`/r/content-${i}`);
+      expect(Object.keys(get(store.contentRevisions))).toHaveLength(1);
+    }
+  });
+});
+
 describe("repoStore tabs", () => {
   it("opens a new repository on Work, not Graph", async () => {
     const { store } = makeStore();
@@ -2791,4 +2838,69 @@ describe("repoStore seeds the whitespace default from the preference", () => {
     store.activateTab(get(store).openTabs[0].id);
     expect(get(store).selectedIgnoreWhitespace).toBe(false);
   });
+});
+
+describe("Overview repository-open destinations", () => {
+  it("runs the destination only after successful canonical hydration", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async () => ({ path: "/real", name: "real", is_bare: false }) as never }));
+    const ready = vi.fn(() => store.setActiveTab("work", "resolve"));
+    const options = { activate: true, onReady: ready };
+    await store.openRepo("/alias", options);
+    expect(ready).toHaveBeenCalledWith("/real");
+    expect(get(store).activeTab).toBe("work");
+    expect(get(store).viewSections.work).toBe("resolve");
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+
+  it("does not run a destination after resolution or hydration fails", async () => {
+    for (const command of ["cmd_resolve_repo", "cmd_get_status"]) {
+      const { store } = makeStore(makeInvoke({ [command]: async () => { throw new Error("denied"); } }));
+      const ready = vi.fn();
+      await store.openRepo("/failed", { activate: true, onReady: ready });
+      expect(ready).not.toHaveBeenCalled();
+      for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+    }
+  });
+
+  it("lets a newer open win over an older hydration", async () => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async (_cmd, args) => args?.repoPath === "/slow" ? pending.promise : snapshotFor("/fast").statuses as never }));
+    const ready = vi.fn();
+    const slow = store.openRepo("/slow", { activate: true, onReady: ready });
+    await vi.waitFor(() => expect(get(store).currentPath).toBe("/slow"));
+    await store.openRepo("/fast");
+    pending.resolve(snapshotFor("/slow").statuses as never);
+    await slow;
+    expect(ready).not.toHaveBeenCalled();
+    expect(get(store).currentPath).toBe("/fast");
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+
+  it("does not override a view chosen while the worktree is loading", async () => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_status: () => pending.promise }));
+    const ready = vi.fn();
+    const opened = store.openRepo("/slow", { activate: true, onReady: ready });
+    await vi.waitFor(() => expect(get(store).currentPath).toBe("/slow"));
+    store.setActiveTab("code", "explorer");
+    pending.resolve(snapshotFor("/slow").statuses as never);
+    await opened;
+    expect(ready).not.toHaveBeenCalled();
+    expect(get(store).activeTab).toBe("code");
+    for (const tab of get(store).openTabs) await store.closeTab(tab.id);
+  });
+});
+
+it("does not replace a file chosen during repository hydration with an open destination", async () => {
+  const pending = deferred<never>();
+  const { store } = makeStore(makeInvoke({ cmd_get_status: () => pending.promise }));
+  const ready = vi.fn();
+  const opened = store.openRepo("/slow", { onReady: ready });
+  await vi.waitFor(() => expect(get(store).currentPath).toBe("/slow"));
+  await store.selectFileDiff("chosen.ts", false);
+  pending.resolve(snapshotFor("/slow").statuses as never);
+  await opened;
+  expect(ready).not.toHaveBeenCalled();
+  expect(get(store).selectedFilePath).toBe("chosen.ts");
+  for (const tab of get(store).openTabs) await store.closeTab(tab.id);
 });

@@ -90,7 +90,8 @@ describe("TerminalSession PTY contracts", () => {
       source.indexOf("created.onResize("),
       source.indexOf("created.onTitleChange("),
     );
-    expect(onResizeBody).toContain('"cmd_terminal_resize"');
+    expect(onResizeBody).toContain("lifecycle?.resize(rows, cols)");
+    expect(source).toContain('resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize"');
   });
 
   it("applies the theme palette reactively from themeStore", () => {
@@ -117,18 +118,18 @@ describe("TerminalSession PTY contracts", () => {
   it("kills a session whose spawn landed after the component went away", () => {
     // Teardown can run while cmd_terminal_spawn is pending; without this the
     // late response adopts a backend session with no owner.
-    const disposedIdx = source.indexOf("if (disposed) {");
-    expect(disposedIdx).toBeGreaterThan(-1);
-    expect(source.indexOf("void killPty(spawned.id);", disposedIdx)).toBeGreaterThan(disposedIdx);
-    // …and the flag is set as the first act of cleanup, before the kill.
+    // Ownership moved into the tested sessionLifecycle controller. The
+    // component must hand over disposal before releasing its renderer.
     const cleanupIdx = source.indexOf("disposed = true;");
     expect(cleanupIdx).toBeGreaterThan(-1);
-    expect(source.indexOf("void killPty(sessionId);", cleanupIdx)).toBeGreaterThan(cleanupIdx);
+    expect(source.indexOf("lifecycle?.dispose();", cleanupIdx)).toBeGreaterThan(cleanupIdx);
+    expect(source).toContain("return createSessionLifecycle({");
+    expect(source).not.toContain("adopt(spawned)");
   });
 
   it("releases its bus subscription on teardown, not just its session", () => {
     const cleanupIdx = source.indexOf("disposed = true;");
-    expect(source.indexOf("unsubscribe?.();", cleanupIdx)).toBeGreaterThan(cleanupIdx);
+    expect(source.indexOf("lifecycle?.dispose();", cleanupIdx)).toBeGreaterThan(cleanupIdx);
   });
 
   it("spawns from mount, never from an effect that can re-run", () => {
@@ -141,13 +142,13 @@ describe("TerminalSession PTY contracts", () => {
     const mountBody = source.slice(mountIdx, source.indexOf("$effect(", mountIdx));
     expect(mountBody).toContain("void spawnPty();");
 
-    // Exactly two call sites, and the other is the explicit Retry/Restart.
-    expect(source.match(/void spawnPty\(\)/g)?.length).toBe(2);
+    // Mount starts once; explicit Restart delegates to the serial lifecycle.
+    expect(source.match(/void spawnPty\(\)/g)?.length).toBe(1);
     const restartBody = source.slice(
       source.indexOf("export function restart()"),
       source.indexOf("export function reveal()"),
     );
-    expect(restartBody).toContain("void spawnPty();");
+    expect(restartBody).toContain("void lifecycle?.restart();");
 
     // No effect body reaches spawnPty.
     for (const body of source.split("$effect(").slice(1)) {

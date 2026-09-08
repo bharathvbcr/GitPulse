@@ -58,6 +58,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_prune_worktree: "worktree argv is built in engine::worktree, not git_writer",
   cmd_write_file_content: "writes through the sandbox, gated by path not command",
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
+  cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",
 });
 
 function production(source: string): string {
@@ -152,6 +153,20 @@ describe("the command gate judges the command that actually runs", () => {
       undocumented,
       `these guarded commands are neither compared nor documented as derived: ${undocumented.join(", ")}`,
     ).toEqual([]);
+  });
+
+  it("conflict transactions gate the argv built by their canonical mutation owner", () => {
+    const body = fnBody(PRODUCTION_COMMANDS, "cmd_save_conflict");
+    expect(body).not.toBeNull();
+    expect(body).toContain("guard_file(&repo_path, file, op)");
+    expect(body).toContain("conflict_session::save_with_gate");
+    expect(body).toContain("guard(&repo_path, argv)?");
+    const session = readFileSync(new URL("../src-tauri/src/diff/conflict_session.rs", import.meta.url), "utf8");
+    const mutation = fnBody(session, "mutation");
+    expect(mutation).not.toBeNull();
+    expect(mutation).toContain("judge(&argv)?");
+    expect(mutation).toContain("git_with_index(repo, index, &argv[1..], input)");
+    expect(mutation).toContain("git_with_stdin(repo, &argv[1..], input)");
   });
 
   it("keeps the derived-argv list free of stale entries", () => {

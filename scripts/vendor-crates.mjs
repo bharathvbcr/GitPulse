@@ -44,8 +44,9 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, lstatSync, mkdtempSync, renameSync } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -121,51 +122,6 @@ function findSibling(name, from = REPO) {
 
 /** Files and directories taken from each crate. */
 const COPIED = ["src", "build.rs", "assets"];
-
-/**
- * Rewrites that keep a vendored crate buildable outside its upstream tree.
- *
- * `devmap-query`'s map preview inlines force-graph from a path that walks out
- * of the crate into DevCouncil's Python package. That path does not exist once
- * the crate lives under `src-tauri/vendored/`, and the same bytes already sit
- * in the crate's own `assets/` (what `viz.rs` reads). Point the include at the
- * local bundle so the vendored build stays self-contained.
- *
- * @param {string} crateName
- * @param {string} crateDir absolute path of the vendored crate
- * @returns {string[]} human-readable rewrite notes for the manifest
- */
-function applyStandalonePatches(crateName, crateDir) {
-  /** @type {string[]} */
-  const notes = [];
-  if (crateName !== "devmap-query") return notes;
-
-  const target = path.join(crateDir, "src", "map_preview.rs");
-  if (!existsSync(target)) return notes;
-
-  const before = readFileSync(target, "utf8");
-  // Emit the rustfmt-stable single-line form: the shorter crate-local path
-  // fits on one line, and `cargo fmt --check` fails if we only rewrite the
-  // include path while leaving upstream's two-line `const` split.
-  const upstreamConst =
-    'const FORCE_GRAPH_JS: &str =\n    include_str!("../../../../src/devcouncil/assets/vendor/force-graph.min.js");';
-  const localConst =
-    'const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");';
-  if (!before.includes(upstreamConst)) {
-    if (!before.includes(localConst)) {
-      throw new Error(
-        "devmap-query map_preview.rs no longer has the expected out-of-tree force-graph include; update applyStandalonePatches",
-      );
-    }
-    return notes;
-  }
-  const after = before.replace(upstreamConst, localConst);
-  writeFileSync(target, after);
-  notes.push(
-    "src/map_preview.rs: force-graph include_str retargeted to ../assets/force-graph.min.js.bundle (crate-local, rustfmt-stable)",
-  );
-  return notes;
-}
 
 // --- a very small TOML reader -------------------------------------------
 //
@@ -406,6 +362,7 @@ function sha256(buffer) {
  */
 function walk(dir, prefix = "") {
   if (!existsSync(dir)) return [];
+  if (lstatSync(dir).isSymbolicLink()) throw new Error(`Refusing symbolic link: ${dir}`);
   const out = [];
   for (const entry of readdirSync(dir).sort()) {
     // DevCouncil / agent local state must never be part of a vendored crate.
@@ -415,8 +372,11 @@ function walk(dir, prefix = "") {
     if (entry === ".devcouncil" || entry === ".git" || entry === "target") continue;
     const full = path.join(dir, entry);
     const rel = prefix ? `${prefix}/${entry}` : entry;
-    if (statSync(full).isDirectory()) out.push(...walk(full, rel));
-    else out.push(rel);
+    const info = lstatSync(full);
+    if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${full}`);
+    if (info.isDirectory()) out.push(...walk(full, rel));
+    else if (info.isFile()) out.push(rel);
+    else throw new Error(`Refusing non-regular source: ${full}`);
   }
   return out;
 }
@@ -431,57 +391,106 @@ function gitCommit(root) {
 }
 
 /**
- * Copies every configured crate into `src-tauri/vendored/` and writes the
- * manifest. Throws if a source repository is missing — re-vendoring is an
- * explicit act and must not half-succeed.
+ * One canonical snapshot builder for updates and drift checks. Resolve Cargo
+ * inheritance and standalone rewrites before comparing, including deletions.
+ * @param {ReturnType<typeof sources>[number]} source
+ * @param {string} name
+ * @param {string} to
  */
-export function vendor(env = process.env) {
-  const crates = [];
-  for (const source of sources(env)) {
-    if (!existsSync(source.root)) {
-      throw new Error(`${source.id}: ${source.root} is not present; set GITPULSE_${source.id.toUpperCase()}_ROOT`);
-    }
-    const workspace = readToml(readFileSync(path.join(source.root, source.workspace, "Cargo.toml"), "utf8"));
-    const commit = gitCommit(source.root);
-
-    for (const name of source.crates) {
-      const from = path.join(source.root, source.crateDir(name));
-      const to = path.join(VENDOR_DIR, name);
-      rmSync(to, { recursive: true, force: true });
-      mkdirSync(to, { recursive: true });
-
-      for (const item of COPIED) {
-        const src = path.join(from, item);
-        if (existsSync(src)) cpSync(src, path.join(to, item), { recursive: true });
-      }
-
-      const upstream = readFileSync(path.join(from, "Cargo.toml"), "utf8");
-      const { text, rewrites } = resolveManifest(upstream, workspace);
-      writeFileSync(path.join(to, "Cargo.toml"), text);
-      const patches = applyStandalonePatches(name, to);
-
-      /** @type {Record<string, string>} */
-      const files = {};
-      for (const rel of walk(to)) files[rel] = sha256(readFileSync(path.join(to, rel)));
-
-      crates.push({
-        name,
-        origin: { repo: source.id, root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`, path: source.crateDir(name), commit },
-        omitted: ["tests/", "[dev-dependencies]"],
-        rewrites: [...rewrites, ...patches],
-        files,
-      });
+function prepareCrate(source, name, to) {
+  const from = path.join(source.root, source.crateDir(name));
+  const workspace = readToml(readFileSync(path.join(source.root, source.workspace, "Cargo.toml"), "utf8"));
+  const { text, rewrites } = resolveManifest(readFileSync(path.join(from, "Cargo.toml"), "utf8"), workspace);
+  mkdirSync(to, { recursive: true });
+  for (const item of COPIED) {
+    const src = path.join(from, item);
+    const info = lstatSync(src, { throwIfNoEntry: false });
+    if (!info) continue;
+    if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${src}`);
+    const files = info.isDirectory() ? walk(src, item) : [item];
+    for (const rel of files) {
+      const input = path.join(from, rel);
+      if (!lstatSync(input).isFile()) throw new Error(`Refusing non-regular source: ${input}`);
+      const dest = path.join(to, rel);
+      mkdirSync(path.dirname(dest), { recursive: true });
+      cpSync(input, dest);
     }
   }
-
-  crates.sort((a, b) => a.name.localeCompare(b.name));
-  const manifest = {
-    note: "Generated by scripts/vendor-crates.mjs. Do not edit these crates here; change them upstream and re-vendor.",
-    crates,
+  writeFileSync(path.join(to, "Cargo.toml"), text);
+  /** @type {Record<string, string>} */
+  const files = {};
+  for (const rel of walk(to)) files[rel] = sha256(readFileSync(path.join(to, rel)));
+  return {
+    name,
+    origin: { repo: source.id, root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`, path: source.crateDir(name), commit: gitCommit(source.root) },
+    omitted: ["tests/", "[dev-dependencies]"],
+    rewrites,
+    files,
   };
-  mkdirSync(VENDOR_DIR, { recursive: true });
-  writeFileSync(MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`);
-  return manifest;
+}
+
+/**
+ * Prepare the entire update before replacing any live files. The previous
+ * tree is retained until installation succeeds and restored on rename failure.
+ * Concurrent writers fail immediately; a lock left by a killed process needs
+ * inspection, never an automatic stale-lock deletion.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string | null} onlyCrate
+ */
+export function vendor(env = process.env, onlyCrate = null) {
+  const configured = sources(env);
+  if (onlyCrate !== null && !configured.some(source => source.crates.includes(onlyCrate))) {
+    throw new Error(`Unknown crate: ${onlyCrate}`);
+  }
+  const parent = path.dirname(VENDOR_DIR);
+  mkdirSync(parent, { recursive: true });
+  const lock = path.join(parent, ".vendor-lock");
+  mkdirSync(lock);
+  let staging = "";
+  const backup = path.join(lock, "previous");
+  try {
+    staging = mkdtempSync(path.join(parent, ".vendor-stage-"));
+    const crates = onlyCrate === null ? [] : JSON.parse(readFileSync(MANIFEST, "utf8")).crates.filter(
+      (/** @type {{name: string}} */ crate) => crate.name !== onlyCrate,
+    );
+    if (onlyCrate !== null) {
+      // A scoped update keeps every unrelated byte, including unrecorded files.
+      for (const rel of walk(VENDOR_DIR)) {
+        if (rel.split("/")[0] === onlyCrate) continue;
+        const dest = path.join(staging, rel);
+        mkdirSync(path.dirname(dest), { recursive: true });
+        cpSync(path.join(VENDOR_DIR, rel), dest);
+      }
+    }
+    for (const source of configured) {
+      if (onlyCrate !== null && !source.crates.includes(onlyCrate)) continue;
+      if (!existsSync(source.root)) throw new Error(`${source.id}: ${source.root} is not present; set GITPULSE_${source.id.toUpperCase()}_ROOT`);
+      for (const name of source.crates) {
+        if (onlyCrate !== null && name !== onlyCrate) continue;
+        crates.push(prepareCrate(source, name, path.join(staging, name)));
+      }
+    }
+    crates.sort((/** @type {{name: string}} */ a, /** @type {{name: string}} */ b) => a.name.localeCompare(b.name));
+    const manifest = {
+      note: "Generated by scripts/vendor-crates.mjs. Do not edit these crates here; change them upstream and re-vendor.",
+      crates,
+    };
+    writeFileSync(path.join(staging, "VENDOR.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    if (existsSync(VENDOR_DIR)) renameSync(VENDOR_DIR, backup);
+    try {
+      renameSync(staging, VENDOR_DIR);
+      staging = "";
+    } catch (error) {
+      if (existsSync(backup)) renameSync(backup, VENDOR_DIR);
+      throw error;
+    }
+    rmSync(backup, { recursive: true, force: true });
+    return manifest;
+  } finally {
+    if (staging) rmSync(staging, { recursive: true, force: true });
+    // Never remove the only old copy if rollback itself failed.
+    if (!existsSync(backup)) rmSync(lock, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -524,29 +533,16 @@ export function check(env = process.env) {
       result.reason = `${crate.origin.repo} is not checked out here`;
     } else {
       const current = gitCommit(source.root);
-      for (const item of COPIED) {
-        const src = path.join(from, item);
-        if (!existsSync(src)) continue;
-        for (const rel of statSync(src).isDirectory() ? walk(src, item) : [item]) {
-          let theirs = readFileSync(path.join(from, rel));
-          // Compare against the post-patch bytes for files the vendor step rewrites,
-          // otherwise a deliberate standalone patch reads as permanent upstream drift.
-          if (
-            crate.name === "devmap-query" &&
-            rel === "src/map_preview.rs"
-          ) {
-            const text = theirs.toString("utf8");
-            const upstreamConst =
-              'const FORCE_GRAPH_JS: &str =\n    include_str!("../../../../src/devcouncil/assets/vendor/force-graph.min.js");';
-            const localConst =
-              'const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");';
-            if (text.includes(upstreamConst)) {
-              theirs = Buffer.from(text.replace(upstreamConst, localConst), "utf8");
-            }
-          }
+      const scratch = mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-check-"));
+      try {
+        const expected = prepareCrate(source, crate.name, scratch);
+        const allFiles = new Set([...walk(dir), ...Object.keys(expected.files)]);
+        for (const rel of [...allFiles].sort()) {
           const ours = path.join(dir, rel);
-          if (!existsSync(ours) || sha256(readFileSync(ours)) !== sha256(theirs)) result.drifted.push(rel);
+          if (!existsSync(ours) || expected.files[rel] !== sha256(readFileSync(ours))) result.drifted.push(rel);
         }
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
       }
       result.upstream = result.drifted.length === 0 ? "matches" : "drifted";
       if (current && current !== crate.origin.commit) {
@@ -570,6 +566,7 @@ function usage() {
     summary: "Vendor the sibling Rust crates GitPulse links, so a lone checkout builds.",
     flags: [
       { flag: "--check", description: "Verify the vendored tree instead of rewriting it" },
+      { flag: "--crate=NAME", description: "Update only this crate; preserve the other vendored crates" },
       { flag: "--allow-drift", description: "Allow upstream drift while verifying no local edits" },
       { flag: "--json", description: "Emit machine-readable output" },
       { flag: "--help, -h", description: "Show this message" },
@@ -584,7 +581,7 @@ export function main(argv = process.argv.slice(2)) {
     console.log(usage());
     return 0;
   }
-  const unknown = argv.find((a) => a !== "--check" && a !== "--json" && a !== "--allow-drift");
+  const unknown = argv.find((a) => a !== "--check" && a !== "--json" && a !== "--allow-drift" && !a.startsWith("--crate="));
   if (unknown) {
     console.error(`FAIL: unknown option ${JSON.stringify(unknown)}\n`);
     console.error(usage());
@@ -592,10 +589,15 @@ export function main(argv = process.argv.slice(2)) {
   }
   const asJson = argv.includes("--json");
   const allowDrift = argv.includes("--allow-drift");
+  const selected = argv.filter(a => a.startsWith("--crate="));
+  if (selected.length > 1 || (selected.length > 0 && argv.includes("--check"))) {
+    console.error("FAIL: --crate accepts one crate and cannot be combined with --check");
+    return 2;
+  }
 
   try {
     if (!argv.includes("--check")) {
-      const manifest = vendor();
+      const manifest = vendor(process.env, selected.length ? selected[0].slice("--crate=".length) : null);
       if (asJson) console.log(JSON.stringify(manifest, null, 2));
       else {
         for (const crate of manifest.crates) {

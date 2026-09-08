@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { BlameLine } from "../files/types";
   import { densityStore } from "../stores/densityStore";
   import { rowHeight } from "../ui/density";
@@ -10,6 +11,7 @@
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
   import { shortHash } from "../format";
   import { reportPanelError } from "../diagnostics/report";
+  import { paneDetails } from "../diagnostics/paneCrash";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
   import FileTreePanel from "./files/FileTreePanel.svelte";
@@ -29,9 +31,27 @@
   let errorMsg = $state<string | null>(null);
   let explorerOpen = $state(true);
   let inflight: AsyncGuard | null = null;
+  const contentRevisions = repoStore.contentRevisions;
+  let running: { repo: string; path: string } | null = null;
+  let queued: { repo: string; path: string } | null = null;
+  let disposed = false;
+  const detailScope = paneDetails.register("blame");
+  let requestCount = 0;
 
   async function loadBlameFor(repo: string, path: string) {
     if (!repo || !path) return;
+    if (running) {
+      // One IPC pair at a time, plus the latest requested refresh. Content
+      // storms cannot cancel/restart the same slow request indefinitely.
+      if (running.repo !== repo || running.path !== path) inflight?.cancel();
+      queued = { repo, path };
+      isLoading = true;
+      errorMsg = null;
+      coverageFailed = false;
+      return;
+    }
+    running = { repo, path };
+    detailScope.update(repo, "blame", { blame: ++requestCount });
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
@@ -62,6 +82,10 @@
       coverageFailed = false;
     } finally {
       if (guard.isLive()) isLoading = false;
+      running = null;
+      const next = queued;
+      queued = null;
+      if (next && !disposed) void loadBlameFor(next.repo, next.path);
     }
   }
 
@@ -84,16 +108,15 @@
   }
 
   $effect(() => {
-    return () => inflight?.cancel();
+    return () => { disposed = true; queued = null; inflight?.cancel(); detailScope.dispose(); };
   });
 
   // Selection- and freshness-driven blame load, memoized on a fingerprint of
-  // its real dependencies. Status-poll emissions re-run this effect body but
-  // skip the IPC unless something that can change blame output moved: the
+  // its real dependencies. Status-poll emissions only re-evaluate the derived
+  // fingerprint unless something that can change blame output moved: the
   // selection, the file's worktree/index status, or the checked-out branch's
   // tip (external commits land through watcher refreshes).
-  let prevKey: string | null = null;
-  $effect(() => {
+  const blameFingerprint = $derived.by(() => {
     const selected = $repoStore.selectedFilePath;
     const repo = $repoStore.currentPath;
     const statusCode = selected
@@ -101,30 +124,34 @@
       : "";
     const tip =
       $repoStore.branches.find((b) => b.is_current)?.tip_commit_id ?? "";
-    const key = `${repo ?? ""}\u0000${selected ?? ""}\u0000${statusCode}\u0000${tip}`;
-    if (key === prevKey) return;
-    prevKey = key;
-    if (selected) {
-      filePath = selected;
-    }
-    if (!repo || !selected) {
-      if (!repo) {
+    const revision = repo ? ($contentRevisions[repo] ?? "") : "";
+    return `${repo ?? ""}\u0000${selected ?? ""}\u0000${statusCode}\u0000${tip}\u0000${revision}`;
+  });
+
+  let prevKey: string | null = null;
+  $effect(() => {
+    // Only a changed fingerprint invalidates this effect. Reading the whole
+    // store here used to cancel the live guard on every poll, then skip its
+    // replacement because prevKey had not changed: Loading… forever.
+    const key = blameFingerprint;
+    return untrack(() => {
+      if (key === prevKey) return;
+      prevKey = key;
+      const selected = $repoStore.selectedFilePath;
+      const repo = $repoStore.currentPath;
+      filePath = selected ?? "";
+      if (!repo || !selected) {
+        queued = null;
         inflight?.cancel();
         blameLines = [];
         coverageHits = new Map();
         coverageFailed = false;
         errorMsg = null;
         isLoading = false;
+        return;
       }
-      return;
-    }
-    void loadBlameFor(repo, selected);
-    const started = inflight;
-    return () => {
-      if (inflight === started) {
-        started?.cancel();
-      }
-    };
+      void loadBlameFor(repo, selected);
+    });
   });
 
   function getHeatmapColor(ts: number): string {
@@ -244,8 +271,8 @@
       {:else}
         <EmptyState
           icon={Search}
-          title="No blame loaded"
-          hint={explorerOpen
+          title={filePath ? "Empty file" : "No blame loaded"}
+          hint={filePath ? "This file has no lines to annotate." : explorerOpen
             ? "Pick a file in the explorer to see line authorship and code age."
             : "Open the explorer (⌘B), or pick a file in Code → Explorer."}
         />

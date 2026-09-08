@@ -10,11 +10,20 @@
 /** Returns a function that yields a unique string for each base key. */
 export function uniqueKeyAllocator(): (base: string) => string {
   const seen = new Map<string, number>();
+  const allocated = new Set<string>();
   return (base) => {
     const key = base.length > 0 ? base : "__empty";
-    const count = seen.get(key) ?? 0;
+    let count = seen.get(key) ?? 0;
+    let candidate = count === 0 ? key : `${key}#${count}`;
+    // A literal input can equal a suffix generated for another base. Track
+    // emitted keys too; a per-base counter alone cannot guarantee uniqueness.
+    while (allocated.has(candidate)) {
+      count += 1;
+      candidate = `${key}#${count}`;
+    }
     seen.set(key, count + 1);
-    return count === 0 ? key : `${key}#${count}`;
+    allocated.add(candidate);
+    return candidate;
   };
 }
 

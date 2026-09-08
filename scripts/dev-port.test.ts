@@ -3,7 +3,7 @@ import http from "node:http";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { STRESS_TIMEOUT_MS } from "../src/lib/__tests__/perfBudget";
 import {
   DevPortError,
@@ -666,12 +666,44 @@ function waitForReady(child: ChildProcess): Promise<void> {
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode != null) return Promise.resolve();
-  return new Promise((resolve) => {
-    child.once("exit", () => resolve());
-    setTimeout(resolve, 2000);
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const exited = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", exited);
+      reject(new Error("child did not exit within the observation budget"));
+    }, 2000);
+    child.once("exit", exited);
   });
 }
+
+describe("process exit observations", () => {
+  it.runIf(process.platform !== "win32")("recognizes an already signal-terminated child immediately", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    liveChildren.push(child);
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    child.kill("SIGTERM");
+    await exited;
+    expect(child.signalCode).toBe("SIGTERM");
+    let settled = false;
+    void waitForExit(child).then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(true);
+  });
+
+  it("cannot report a live child as exited when the observation times out", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    liveChildren.push(child);
+    vi.useFakeTimers();
+    try {
+      const waiting = expect(waitForExit(child)).rejects.toThrow("child did not exit");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await waiting;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("killPid identity check", () => {
   /** Liveness via the same mechanism production killPid trusts. */

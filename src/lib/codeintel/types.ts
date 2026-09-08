@@ -360,7 +360,9 @@ export interface GraphVizLink {
   source: string;
   target: string;
   kind?: string;
-  confidence?: number;
+  confidence?: number | null;
+  /** Number of distinct source relationships aggregated into this link. */
+  evidence_count?: number;
   resolution?: string;
   label?: string;
 }

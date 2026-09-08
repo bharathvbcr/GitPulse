@@ -11,6 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Synchronize the canonical devmap query, HTML projection, extractor and store
+  modules. HTML assets are owned by the upstream query crate; GitPulse no
+  longer rewrites the HTML implementation while vendoring it.
+- Document the Rust-library, Go-module and NDJSON integration boundaries in
+  `docs/MODULE_INTEGRATION.md`, including configurable executable paths and
+  independent host/protocol/database compatibility checks.
+
+### Fixed
+
+- Prepare complete vendor updates before replacing the current tree, refuse
+  concurrent updates and symlinked sources, and retain rollback state on
+  installation failure. Drift checks now detect upstream deletions and resolved
+  Cargo manifest changes using the same snapshot builder as updates.
+- Bound unsolicited MANVI sidecar output between requests and terminate an
+  overflowing child. The per-request byte budget now has an idle-queue bound
+  enforced by the same stdout pump in production and live-process tests.
+
 ## [0.0.8] - 2026-09-07
 
 ### Fixed

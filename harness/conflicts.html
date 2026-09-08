@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitPulse · Resolve preview</title>
+<style>html,body{margin:0;height:100%}#app{height:100%;display:flex;flex-direction:column}#verdict{position:fixed;bottom:4px;left:6px;z-index:10;font:10px system-ui;padding:3px 7px;border-radius:5px;background:#132b25;color:#a7f3d0}#verdict:empty{display:none}</style></head>
+<body><div id="app"></div><output id="verdict"></output>
+<script>
+// Module/import failures must produce an explicit failed verdict in every engine.
+window.addEventListener("error", reportStartupFailure);
+window.addEventListener("unhandledrejection", reportStartupFailure);
+function reportStartupFailure(event) {
+  const params=new URLSearchParams(location.search);if(!params.has("check"))return;
+  const message=event.message??String(event.reason);
+  const result={results:[{name:message,pass:false}],passed:0,total:1,crashes:[message]};
+  document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+  document.getElementById("verdict").textContent=message;
+  if(params.has("report"))fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML}).catch(()=>{});
+}
+</script>
+<script type="module">
+import "../src/app.css";
+import {mount,unmount,tick} from "svelte";
+import {themeStore} from "../src/lib/stores/themeStore";
+import {repoStore} from "../src/lib/stores/repoStore";
+import {conflictSessions} from "../src/lib/diff/conflictSession";
+import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
+const params = new URLSearchParams(location.search);
+if(params.has("check"))conflictSessions.clear();
+themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+const results=[], crashes=[], writes=[], calls=[], unexpected=[];
+let failedRead=false, failedPreview=false, failedStage=false, delayedRead=null, delayedPreview=null, delayedWrite=null;
+const makeChunk=(index, ours, theirs, base=null)=>({chunk_index:index,start_line:4+index*12,end_line:10+index*12,ours_label:"HEAD · main",theirs_label:"feature/workspace",ours_content:ours,theirs_content:theirs,base_content:base,resolution:"Unresolved",ours_crlf:[],theirs_crlf:[],base_crlf:base===null?null:[],local_crlf:false});
+const makeDoc=(file,chunks,context="")=>({file_path:file,segments:[...(context?[{Normal:context}]:[]),...chunks.map(Conflict=>({Conflict}))],total_conflicts:chunks.length,crlf:false,trailing_newline:false,final_crlf:false,normal_crlf_flags:[],diagnostics:[],marker_size:7});
+const docs={
+  "src/lib/workspace.ts":makeDoc("src/lib/workspace.ts",[
+    makeChunk(0,'const workspace = {\n  refreshInterval: 5000,\n  preserveDrafts: true,\n};','const workspace = {\n  refreshInterval: 2500,\n  watchFiles: true,\n};','const workspace = {\n  refreshInterval: 10000,\n};'),
+    makeChunk(1,'export function openWorkspace(path: string) {\n  return restoreSession(path);\n}','export function openWorkspace(path: string) {\n  return createSession(path, { watch: true });\n}')
+  ],'import { createSession, restoreSession } from "./session";'),
+  "src/styles/theme.css":makeDoc("src/styles/theme.css",[makeChunk(0,":root { --accent: #809eff; }",":root { --accent: #a170d3; }")]),
+  "notes/empty.txt":makeDoc("notes/empty.txt",[makeChunk(0,"", "remove this text")]),
+};
+let files=Object.keys(docs);
+const renderDoc=doc=>doc.segments.map(s=>{
+ if(s.Normal!==undefined)return s.Normal;
+ const c=s.Conflict;
+ switch(c.resolution){
+ case "AcceptOurs":return c.ours_content;
+ case "AcceptTheirs":return c.theirs_content;
+ case "AcceptBothOursFirst":return [c.ours_content,c.theirs_content].filter(Boolean).join("\n");
+ case "AcceptBothTheirsFirst":return [c.theirs_content,c.ours_content].filter(Boolean).join("\n");
+ case "Unresolved":return `<<<<<<< ${c.ours_label}\n${c.ours_content}\n=======\n${c.theirs_content}\n>>>>>>> ${c.theirs_label}`;
+ default:return c.resolution.Custom;
+ }
+}).filter(Boolean).join("\n");
+const savedSnapshots=new Map();
+const snapshotOverrides=new Map();
+const stagedFiles=new Set();
+const makeSnapshot=(repo,file)=>{
+ if(snapshotOverrides.has(file))return structuredClone(snapshotOverrides.get(file));
+ if(savedSnapshots.has(repo+file))return structuredClone(savedSnapshots.get(repo+file));
+ const document=structuredClone(docs[file]);
+ const sides=[2,3].map(stage=>{const copy=structuredClone(document);for(const s of copy.segments)if(s.Conflict)s.Conflict.resolution=stage===2?"AcceptOurs":"AcceptTheirs";const text=renderDoc(copy);return {stage,mode:"100644",oid:`object-${stage}`,size:text.length,text};});
+ return {file_path:file,revision:repo+JSON.stringify(document),operation:"fixture-merge",document,stages:sides,reason:null,worktree_mode:"100644"};
+};
+const policy={status:"unchecked",checked:false,target:"fixture",rule:"",severity:"",reason:"Browser fixture",demoted:"",grant_id:"",granted_by:"",widened:"",degraded:[],task_id:"",detail:"",detail_code:""};
+const fixture={
+ cmd_resolve_repo:a=>({path:a.path,name:"GitPulse",is_bare:false}),
+ cmd_list_branches:()=>[],cmd_get_status:()=>[...files.map(path=>({path,status_code:"UU",is_staged:false,is_conflicted:true,additions:0,deletions:0})),...[...stagedFiles].map(path=>({path,status_code:"M ",is_staged:true,is_conflicted:false,additions:1,deletions:0}))],
+ cmd_list_tags:()=>({tags:[],truncated:false}),cmd_stash_list:()=>[],cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,cmd_list_repo_files:()=>files,
+ cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
+ cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
+ cmd_workspace_sync:()=>({repos:[]}),
+ cmd_repo_operation:()=>({kind:"Merge",current_step:null,total_steps:null,head_ref:"main",incoming_ref:"feature/workspace",conflicted_paths:files,conflicted_total:files.length,available:files.length?["abort"]:["continue","abort"]}),
+ cmd_conflict_snapshot:a=>{if(failedRead){failedRead=false;throw Error("Fixture read failed");}const snapshot=makeSnapshot(a.repoPath,a.filePath);if(delayedRead){const callback=delayedRead;delayedRead=null;return new Promise(resolve=>callback(()=>resolve(snapshot)));}return snapshot;},
+ cmd_preview_conflict:a=>{if(failedPreview){failedPreview=false;throw Error("Fixture preview failed");}if(delayedPreview){const callback=delayedPreview;delayedPreview=null;return new Promise(resolve=>callback(()=>resolve(renderDoc(a.document))));}return renderDoc(a.document);},
+ cmd_get_file_diff:a=>({text:`diff --git a/${a.filePath} b/${a.filePath}\n+resolved`,truncated:false,truncation_reason:null}),
+ cmd_save_conflict:a=>{
+  const snapshot=makeSnapshot(a.repoPath,a.request.file_path);
+  if(snapshot.revision!==a.request.revision)throw Error("Source changed; reload");
+  const choice=a.request.choice;let content="";
+  if(choice==="StageOnly")content=snapshot.document.segments.map(s=>s.Normal??"").join("\n");
+  else if(typeof choice==="object"){const doc=structuredClone(snapshot.document);for(const segment of doc.segments)if(segment.Conflict)segment.Conflict.resolution=choice.Chunks[segment.Conflict.chunk_index];content=renderDoc(doc);}
+  else content=snapshot.stages.find(s=>s.stage===(choice==="Ours"?2:3))?.text??"";
+  if(choice!=="StageOnly")writes.push({filePath:a.request.file_path,content});
+  const finish=()=>{
+   if(failedStage){failedStage=false;const saved={...snapshot,revision:snapshot.revision+"saved",document:makeDoc(snapshot.file_path,[],content)};savedSnapshots.set(a.repoPath+snapshot.file_path,saved);return {policy,output:{written:true,staged:false,message:"Resolution prepared, but staging failed: Fixture index locked",recovery_path:null,snapshot:saved}};}
+   files=files.filter(file=>file!==snapshot.file_path);stagedFiles.add(snapshot.file_path);savedSnapshots.delete(a.repoPath+snapshot.file_path);return {policy,output:{written:choice!=="StageOnly",staged:true,message:"Staged",recovery_path:null,snapshot:null}};
+  };
+  if(delayedWrite){const callback=delayedWrite;delayedWrite=null;return new Promise(resolve=>callback(()=>resolve(finish())));}
+  return finish();
+ },
+};
+window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{calls.push(cmd);if(fixture[cmd])return fixture[cmd](args);if(cmd.startsWith("plugin:event|"))return 1;unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const root=document.getElementById("app");
+// A task boundary flushes DOM work without relying on background timer rates.
+const settle=async()=>{await tick();await new Promise(resolve=>{const channel=new MessageChannel();channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};channel.port2.postMessage(null);});await tick();};
+const waitFor=async(test)=>{for(let i=0;i<100;i++){await settle();if(test())return;}throw Error("Timed out waiting for UI");};
+const button=name=>[...root.querySelectorAll("button")].find(b=>b.textContent.trim()===name||b.getAttribute("aria-label")===name);
+const click=async(name)=>{const b=button(name);if(!b)throw Error(`Missing button: ${name}`);if(b.disabled)throw Error(`Disabled button: ${name}`);b.click();await settle();};
+const chooseFile=async(path)=>{const select=root.querySelector("select");select.value=path;select.dispatchEvent(new Event("change",{bubbles:true}));await settle();};
+const check=(name,pass)=>results.push({name,pass:Boolean(pass)});
+await repoStore.openRepo("/fixture/resolve");
+let editor=mount(ConflictEditor,{target:root});
+await waitFor(()=>root.querySelectorAll("textarea").length===2);
+if(params.has("check")){
+ try{
+  check("initial choices are unresolved and save is disabled",button("Save & stage file").disabled);
+  check("two conflicts are grouped and ancestor is available",root.querySelectorAll(".conflict-block").length===2&&root.textContent.includes("Common ancestor"));
+  await click("Accept Ours");
+  check("selected choice is exposed and progress updates",button("Accept Ours").getAttribute("aria-pressed")==="true"&&root.textContent.includes("1 / 2 resolved"));
+  await chooseFile("src/styles/theme.css");await chooseFile("src/lib/workspace.ts");
+  check("file round trip retains accepted choice",button("Accept Ours").getAttribute("aria-pressed")==="true");
+  const loads=calls.filter(c=>c==="cmd_conflict_snapshot").length;
+  for(let i=0;i<50;i++){repoStore.setError(null);await tick();}await settle();
+  check("store publications retain choices without rereading",calls.filter(c=>c==="cmd_conflict_snapshot").length===loads&&button("Accept Ours").getAttribute("aria-pressed")==="true");
+  await click("Expand");
+  await click("Next unresolved 1");
+  check("next unresolved restores split view and focuses the unresolved block",document.activeElement?.getAttribute("data-conflict-index")==="1"&&!root.querySelector(".preview-expanded"));
+  const custom=root.querySelectorAll("textarea")[1];custom.value="custom result";custom.dispatchEvent(new Event("input",{bubbles:true}));await new Promise(r=>setTimeout(r,300));await settle();
+  check("custom result reaches preview",root.querySelector(".result-code").textContent.includes("custom result"));
+  await chooseFile("src/styles/theme.css");await chooseFile("src/lib/workspace.ts");
+  check("file round trip retains custom text",root.querySelectorAll("textarea")[1].value==="custom result");
+  await unmount(editor);editor=mount(ConflictEditor,{target:root});await waitFor(()=>root.querySelectorAll("textarea").length===2);
+  check("view remount retains presets and custom drafts",button("Accept Ours").getAttribute("aria-pressed")==="true"&&root.querySelectorAll("textarea")[1].value==="custom result");
+  await click("Reset conflict 2");check("reset returns the block to unresolved",button("Save & stage file").disabled&&root.textContent.includes("1 / 2 resolved"));
+  failedPreview=true;await click("Accept Theirs");check("preview failure disables saving",root.textContent.includes("Fixture preview failed")&&button("Save & stage file").disabled);await click("Retry preview");
+  let releasePreview;delayedPreview=callback=>releasePreview=callback;await click("Accept Ours");
+  check("pending preview is visibly pending and cannot be saved",root.textContent.includes("Updating preview")&&button("Save & stage file").disabled);
+  await click("Accept Theirs");releasePreview();await settle();
+  check("a late preview cannot restore a superseded choice",root.querySelector(".result-code").textContent.includes("refreshInterval: 2500")&&!root.querySelector(".result-code").textContent.includes("refreshInterval: 5000"));
+  await chooseFile("notes/empty.txt");await click("Accept Ours");
+  check("an empty result is visible and can be saved",root.textContent.includes("Empty file")&&!button("Save & stage file").disabled);
+  failedStage=true;await click("Save & stage file");
+  check("stage failure preserves written state and retry",writes.at(-1).content===""&&root.textContent.includes("staging failed")&&root.textContent.includes("Fixture index locked")&&!button("Retry staging").disabled);
+  const writtenBeforeRetry=writes.length;
+  let releaseWrite;delayedWrite=callback=>releaseWrite=callback;await click("Retry staging");
+  check("save locks file choices and operation controls until write completes",root.querySelector("select").disabled&&button("Accept Ours").disabled&&root.querySelector(".operation").inert);
+  releaseWrite();await waitFor(()=>!files.includes("notes/empty.txt"));check("saved file leaves the rail",!files.includes("notes/empty.txt"));check("stage-only retry never rewrites the working file",writes.length===writtenBeforeRetry);
+  await chooseFile("src/styles/theme.css");failedRead=true;await chooseFile("src/lib/workspace.ts");
+  check("load failure has retry and no stale blocks",root.textContent.includes("Fixture read failed")&&root.querySelectorAll("textarea").length===0);await click("Retry loading");
+  check("retry restores file and its choices",root.querySelectorAll("textarea").length===2&&button("Accept Ours").getAttribute("aria-pressed")==="false");
+  let release;delayedRead=callback=>release=callback;await chooseFile("src/styles/theme.css");
+  check("loading hides the previous file and disables saving",root.textContent.includes("Loading conflicts")&&root.querySelectorAll("textarea").length===0&&button("Save & stage file").disabled);
+  await chooseFile("src/lib/workspace.ts");release();await settle();
+  check("late read cannot replace the active file",root.querySelectorAll("textarea").length===2);
+  await chooseFile("src/styles/theme.css");docs["src/lib/workspace.ts"].segments[1].Conflict.theirs_content="EXTERNAL CHANGE";await chooseFile("src/lib/workspace.ts");
+  check("changed source invalidates old choices and explains why",root.textContent.includes("changed on disk")&&root.textContent.includes("0 / 2 resolved")&&root.textContent.includes("EXTERNAL CHANGE"));
+  await click("Accept Ours");await repoStore.openRepo("/fixture/other");await settle();
+  check("same relative path in another repo starts unresolved",button("Accept Ours").getAttribute("aria-pressed")==="false");
+  await click("Accept Ours");await click("Undo");
+  check("undo restores an unresolved choice",button("Accept Ours").getAttribute("aria-pressed")==="false"&&root.textContent.includes("0 / 2 resolved"));
+  await click("Redo");
+  check("redo restores the accepted choice",button("Accept Ours").getAttribute("aria-pressed")==="true");
+  await click("Accept All Incoming (Theirs)");
+  check("bulk resolution preserves an existing choice",button("Accept Ours").getAttribute("aria-pressed")==="true"&&root.textContent.includes("2 / 2 resolved"));
+  await click("Undo");check("bulk undo is one reversible step",root.textContent.includes("1 / 2 resolved"));
+  await click("Reset all choices");
+  const rapid=root.querySelector("textarea");for(let i=0;i<100;i++){rapid.value=`rapid ${i}`;rapid.dispatchEvent(new Event("input",{bubbles:true}));}
+  await chooseFile("src/styles/theme.css");await chooseFile("src/lib/workspace.ts");await waitFor(()=>root.querySelector(".result-code")?.textContent.includes("rapid 99"));
+  check("rapid typing survives a file switch before preview debounce",root.querySelector("textarea").value==="rapid 99");
+  check("the active draft can be exported before it is complete",Boolean(button("Copy current draft")));
+  const binary="assets/conflicted.bin";files.push(binary);snapshotOverrides.set(binary,{file_path:binary,revision:"binary-fixture",operation:"fixture-merge",document:null,reason:"This file is binary. Whole-file choices preserve its bytes.",worktree_mode:"100644",stages:[{stage:2,mode:"100644",oid:"binary-current",size:4,text:null},{stage:3,mode:"100644",oid:"binary-incoming",size:6,text:null}]});
+  await repoStore.refresh();await chooseFile(binary);
+  check("binary conflicts expose whole-file choices without text controls",root.querySelector(".whole-file-actions details")?.open&&root.querySelectorAll("textarea").length===0&&button("Save & stage file").disabled);
+  await click("Use the working file resolved externally");
+  check("external binary resolution can be staged without rewriting",button("Stage working file")&&!button("Stage working file").disabled);
+  root.querySelectorAll(".whole-choices button")[1].click();await settle();
+  check("a binary whole-file choice can be saved",!button("Save & stage file").disabled&&root.textContent.includes("binary-incoming"));
+  await click("Save & stage file");await waitFor(()=>!files.includes(binary));
+  const large="stress/2000-conflicts.txt";docs[large]=makeDoc(large,Array.from({length:2000},(_,i)=>makeChunk(i,`ours ${i}`,`theirs ${i}`)));files.push(large);
+  await repoStore.refresh();await chooseFile(large);await waitFor(()=>root.textContent.includes("Showing conflicts 1–25 of 2000"));
+  check("2000 conflicts render in bounded complete pages",root.querySelectorAll(".conflict-block").length===25);
+  await click("Next blocks");check("pagination exposes the next complete block range",root.textContent.includes("Showing conflicts 26–50 of 2000")&&root.querySelectorAll(".conflict-block").length===25);
+  await click("Accept All Current (Ours)");
+  check("bulk choice resolves all 2000 blocks including unmounted pages",root.textContent.includes("2000 / 2000 resolved")&&!button("Save & stage file").disabled&&root.querySelector(".result-code").textContent.includes("ours 1999"));
+  await click("Undo");check("large bulk resolution is reversible",root.textContent.includes("0 / 2000 resolved")&&button("Save & stage file").disabled);
+  await click("Redo");let finishPending;delayedWrite=callback=>finishPending=callback;await click("Save & stage file");
+  await unmount(editor);editor=mount(ConflictEditor,{target:root});await settle();finishPending();await waitFor(()=>!files.includes(large));
+  check("an accepted save completes after its view unmounts",stagedFiles.has(large)&&!conflictSessions.get("/fixture/other",large));
+  for(const file of [...files]){await chooseFile(file);await click("Accept All Incoming (Theirs)");await click("Save & stage file");await waitFor(()=>!files.includes(file));}
+  await waitFor(()=>root.textContent.includes("All conflicts resolved"));
+  check("completion exposes final staged review",root.querySelector("[aria-label='Final staged review']")&&root.querySelectorAll(".review-files button").length===stagedFiles.size);
+  root.querySelector(".review-files button").click();await settle();check("staged review loads the staged payload",root.querySelector(".staged-review pre")?.textContent.includes("+resolved"));
+  await repoStore.openRepo("/fixture/third");await settle();check("repository switching clears the previous staged diff",!root.querySelector(".staged-review pre"));
+  check("no uncaught runtime errors",crashes.length===0);
+  check("all IPC calls have explicit fixtures",unexpected.length===0);
+ }catch(error){results.push({name:String(error),pass:false});}
+ const result={results,passed:results.filter(r=>r.pass).length,total:results.length,crashes};
+ window.__gpResult=result;document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));document.getElementById("verdict").textContent=`${result.passed}/${result.total} checks passed`;
+ if(params.has("report"))await fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML});
+}
+</script></body></html>

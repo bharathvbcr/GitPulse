@@ -1,0 +1,161 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>GitPulse diagnostics stress</title>
+<style>body{font:14px system-ui;background:#141821;color:#dae2ef}#app{height:700px;width:1200px;overflow:auto}button,input{margin:4px}#result{white-space:pre-wrap}</style></head>
+<body><pre id="result">Running…</pre><div id="app"></div>
+<script>
+  (() => {
+    let finished = false;
+    const deadline = setTimeout(() => window.__finishDiagnostics({results:[{name:"harness deadline",pass:false}],passed:0,total:1}),45000);
+    window.__finishDiagnostics = result => {
+      if(finished)return;
+      finished=true;clearTimeout(deadline);
+      window.__gpResult=result;
+      document.querySelector("#result").textContent=JSON.stringify(result,null,2);
+      document.title=`GitPulse diagnostics ${result.passed}/${result.total}`;
+      document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+      const report=new URL(location.href).searchParams.get("report");
+      if(report?.startsWith("/__gp_result/"))fetch(report,{method:"POST",body:document.documentElement.outerHTML}).catch(error=>console.error("Harness result delivery failed",error));
+    };
+  })();
+</script>
+<script type="module">
+  await import("../src/app.css");
+  const results = [], crashes = [], reports = [], unexpected = new Set();
+  const calls = new Map();
+  const requests = [];
+  const defer = (kind, args) => new Promise((resolve, reject) => requests.push({kind,args,resolve,reject}));
+  const fixture = {
+    cmd_resolve_repo: a => ({path:a.path,name:"diagnostics",is_bare:false}),
+    cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({tags:[],truncated:false}),
+    cmd_repo_operation: () => null, cmd_stash_list: () => [], cmd_watch_repo: () => null,
+    cmd_unwatch_repo: () => null, cmd_list_repo_files: () => ["A.md", "B.md"],
+    cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
+    cmd_get_file_blame: a => defer("blame",a),
+    cmd_get_file_coverage: () => ({path:"A.md",lines:[],functions:[],branches:[]}),
+    cmd_devmap_repo_map: () => ({available:false,reason:"Harness: map not indexed",map:null,path:null}),
+    cmd_devmap_status: () => ({available:true,reason:null,status:null}),
+    cmd_devmap_refresh: () => ({ok:false,binary:"/fixture/devmap",lookup:"test_override",stdout:"",stderr:"BUILD-FAILURE-DETAIL",exit_code:1,timed_out:false}),
+    cmd_set_recent_menu: () => null,
+    cmd_branch_stats: () => ({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
+    cmd_docs_refresh: () => ({noteCount:2,truncated:false,skippedOversized:0,skippedUnreadable:0}),
+    cmd_docs_broken_links: () => Array.from({length:250},()=>({source:"A.md",target:"missing.md"})),
+    cmd_docs_search: a => defer("search",a),
+    cmd_docs_backlinks: () => Array.from({length:20},(_,i)=>({path:"B.md",line:1,offset:i*20,title:"B",context:`backlink-${i}`})),
+    cmd_markdown_render: () => "<h1>Hello</h1>",
+    cmd_devmap_viz: a => defer("graph",a),
+    cmd_workspace_link_candidates: () => ({available:true,links:[],reason:null}),
+    cmd_workspace_sync: () => ({repos:[]}),
+    cmd_diagnostic_log_tail: () => [],
+    cmd_diagnostic_persisted_log: () => ({path:"",lines:[],degraded:"Harness: no backend log"}),
+  };
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd,args) => {
+      calls.set(cmd,(calls.get(cmd)??0)+1);
+      if (fixture[cmd]) return fixture[cmd](args);
+      if(cmd.startsWith("plugin:event|")) return 1;
+      unexpected.add(cmd);
+      throw new Error(`Unconfigured harness command: ${cmd}`);
+    }, transformCallback: cb => cb,
+  };
+  window.addEventListener("error", e => crashes.push(e.message));
+  window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
+  const {mount, tick, unmount} = await import("svelte");
+  const {repoStore} = await import("../src/lib/stores/repoStore.ts");
+  const {default: Host} = await import("./DiagnosticsHost.svelte");
+  const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
+  const settle = async () => { await tick(); await sleep(30); await tick(); };
+  const check = (name,pass,detail="") => results.push({name,pass,detail});
+  const take = kind => {const i=requests.findIndex(r=>r.kind===kind);if(i<0)throw Error(`No pending ${kind}`);return requests.splice(i,1)[0];};
+  const line = content => [{line_no:1,commit_id:"0".repeat(40),author_name:"Not Committed Yet",author_email:"",timestamp:0,content}];
+  const target = document.querySelector("#app");
+  let host;
+  try {
+    await repoStore.openRepo("/r/diagnostics");
+    repoStore.selectFilePath("A.md");
+    host = mount(Host,{target,props:{crashes,reports}});
+    await settle();
+    for(let i=0;i<50;i++){repoStore.setError(null);await tick();}
+    while(requests.some(r=>r.kind==="blame")) take("blame").resolve(line("alpha-content"));
+    await settle();
+    check("blame survives 50 unrelated store publications",target.textContent.includes("alpha-content"),target.textContent.slice(-200));
+    await repoStore.refresh();await settle();
+    check("same-status full refresh requests fresh blame",requests.some(r=>r.kind==="blame"));
+    if(requests.some(r=>r.kind==="blame")) {
+      const refresh=take("blame");
+      for(let i=0;i<20;i++){await repoStore.refresh();await tick();}
+      check("refresh storm keeps one blame request in flight",!requests.some(r=>r.kind==="blame"));
+      refresh.resolve(line("intermediate-content"));await settle();
+      take("blame").resolve(line("latest-content"));await settle();
+      check("coalesced refresh eventually renders latest blame",target.textContent.includes("latest-content"));
+    }
+    repoStore.selectFilePath("B.md"); await settle();
+    const stale=take("blame"); repoStore.selectFilePath(null); await settle();
+    stale.resolve(line("STALE-BETA")); await settle();
+    check("clearing selection clears pending blame and file name",!target.textContent.includes("STALE-BETA")&&!target.textContent.includes("Loading blame")&&target.textContent.includes("No file selected"),target.textContent.slice(-200));
+    repoStore.selectFilePath("A.md");await settle();const abandoned=take("blame");
+    repoStore.selectFilePath("B.md");await tick();repoStore.selectFilePath(null);await tick();repoStore.selectFilePath("A.md");await settle();
+    check("queued selection after clearing stays visibly loading",target.textContent.includes("Loading blame for A.md"));
+    abandoned.resolve(line("ABANDONED-A"));await settle();take("blame").resolve(line("REOPENED-A"));await settle();
+    check("A-B-clear-A selection rejects the abandoned request",target.textContent.includes("REOPENED-A")&&!target.textContent.includes("ABANDONED-A"));
+    host.show("markdown"); await settle();
+    check("20 backlinks on one line render",target.querySelectorAll("li").length===20);
+    host.show("map"); await settle();
+    const click = async name => {const button=[...target.querySelectorAll("button")].find(b=>b.textContent.trim()===name);if(!button)throw Error(`Missing button ${name}`);button.click();await settle();};
+    await click("Refresh");
+    check("build failure remains visible after status reload",target.textContent.includes("BUILD-FAILURE-DETAIL"));
+    await click("Docs");
+    check("250 repeated broken links show the honest 200-row cap",target.querySelectorAll("li").length===200 && target.textContent.includes("250"),target.textContent.slice(-150));
+    const priorLoads=calls.get("cmd_devmap_repo_map");
+    for(let i=0;i<200;i++){repoStore.setError(null);await tick();}
+    check("200 store emissions do not reload the map",calls.get("cmd_devmap_repo_map")===priorLoads);
+    const {liveIndex}=await import("../src/lib/codeintel/liveIndex.ts");
+    const mapBefore=calls.get("cmd_devmap_repo_map");
+    liveIndex.snapshots.set({"/r/diagnostics":{phase:"ready",decision:"refresh",reason:null,updatedAt:1,refreshing:false,revision:1}});
+    await settle();
+    check("completed background index refresh updates the visible map",calls.get("cmd_devmap_repo_map")===mapBefore+1);
+    const search = async query => {const input=target.querySelector('input[type="search"]');input.value=query;input.dispatchEvent(new Event("input",{bubbles:true}));await tick();input.closest("form").dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));await settle();};
+    await search("old"); const old=take("search"); await search("new"); const fresh=take("search");
+    fresh.resolve([{path:"new.md",line:1,score:1,title:"NEW-SEARCH",context:"new"}]);await settle();
+    old.resolve([{path:"old.md",line:1,score:1,title:"STALE-SEARCH",context:"old"}]);await settle();
+    check("newer doc search wins out-of-order completion",target.textContent.includes("NEW-SEARCH")&&!target.textContent.includes("STALE-SEARCH"));
+    await search("pending");const cleared=take("search");await search("");cleared.resolve([{path:"old.md",line:1,score:1,title:"CLEARED-SEARCH",context:"old"}]);await settle();
+    check("cleared search rejects pending results",!target.textContent.includes("CLEARED-SEARCH"));
+    await click("Files");const oldGraph=take("graph");
+    await click("Symbols");const newGraph=take("graph");
+    newGraph.resolve({available:false,reason:"NEW-SYMBOL-GRAPH",kind:"code_graph",payload:null});await settle();
+    oldGraph.resolve({available:false,reason:"STALE-FILE-GRAPH",kind:"code_graph",payload:null});await settle();
+    check("graph mode switch rejects older mode results",target.textContent.includes("NEW-SYMBOL-GRAPH")&&!target.textContent.includes("STALE-FILE-GRAPH"));
+    fixture.cmd_docs_broken_links = a => defer("docs",a);
+    await click("Docs");const olderDocs=take("docs");
+    await click("Files");take("graph").resolve({available:false,reason:"file graph",kind:"code_graph",payload:null});await settle();
+    await click("Docs");const newerDocs=take("docs");
+    newerDocs.resolve([{source:"FRESH-DOCS.md",target:"missing"}]);await settle();
+    olderDocs.resolve([{source:"STALE-DOCS.md",target:"missing"}]);await settle();
+    check("document reload rejects previous visits to the same repository",target.textContent.includes("FRESH-DOCS.md")&&!target.textContent.includes("STALE-DOCS.md"));
+    const {paneDetails}=await import("../src/lib/diagnostics/paneCrash.ts");
+    const detail=paneDetails.read({view:"code",section:"map",repo:"/r/diagnostics",file:null});
+    check("map crash context identifies subview and request IDs",detail?.includes('"subview":"docs"')&&detail?.includes('"docs":'));
+    const {diagnostics,DIAGNOSTIC_STORAGE_KEY}=await import("../src/lib/diagnostics/diagnostics.ts");
+    const originalSetItem=Storage.prototype.setItem;
+    try {
+      Storage.prototype.setItem=function(key,value){if(key===DIAGNOSTIC_STORAGE_KEY)throw Error("Harness quota failure");return originalSetItem.call(this,key,value);};
+      diagnostics.error("storage-canary","Harness diagnostic save failure");
+      host.show("diagnostics");await settle();
+      check("diagnostics window identifies memory-only errors",target.textContent.includes("memory only")&&target.textContent.includes("Harness quota failure"));
+    } finally {Storage.prototype.setItem=originalSetItem;}
+    await click("Retry saving");
+    check("diagnostics retry restores saved status",target.textContent.includes("App diagnostics saved locally")&&!target.textContent.includes("Retry saving"));
+    host.show("keys");await settle();
+    const rows=Array.from({length:2000},(_,i)=>i%3===0?"a":i%3===1?"a#1":"");
+    for(let i=0;i<200;i++){host.setRows(i%2?[...rows].reverse():rows);await tick();}
+    check("2,000 hostile keys survive 200 reconciliations",target.querySelectorAll("[data-key-row]").length===2000);
+    const before=crashes.length;
+    host.show("canary");await settle();
+    check("duplicate-key canary is detected",crashes.slice(before).some(e=>e.includes("each_key_duplicate")));
+    check("canary records contextual stack once",reports.length===1&&reports[0].includes("code-harness")&&reports[0].includes("Stack:"));
+    check("no unexpected pane failures",before===0,JSON.stringify(crashes.slice(0,before)));
+  } catch(error){check("harness completed",false,String(error));}
+  if(host)await unmount(host);
+  check("all invoked commands have explicit fixtures",unexpected.size===0,JSON.stringify([...unexpected]));
+  window.__finishDiagnostics({results,passed:results.filter(r=>r.pass).length,total:results.length,unexpectedCommands:[...unexpected],crashes,reports});
+</script></body></html>

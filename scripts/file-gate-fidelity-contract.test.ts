@@ -30,6 +30,16 @@ const WRITER = readFileSync(
   "utf8",
 );
 
+describe("conflict file authorization", () => {
+  it("derives the operation from the checked native source instead of always declaring modify", () => {
+    const body = fnBody(production(COMMANDS), "cmd_save_conflict");
+    expect(body).not.toBeNull();
+    expect(body).not.toContain('guard_file(&repo_path, &request.file_path, "modify")');
+    expect(body).toContain("guard_file(&repo_path, file, op)");
+    expect(body).toContain("conflict_session::save_with_gate");
+  });
+});
+
 /** Git subcommands that can remove a file from the working tree. */
 const DESTRUCTIVE_SUBCOMMANDS = ["clean", "rm"];
 

@@ -12,6 +12,7 @@
 use crate::engine::git_cli::validate_repo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Default ranked node cap — matches `devmap_query::viz::VizOptions::default`.
@@ -19,6 +20,10 @@ pub const DEFAULT_VIZ_MAX_NODES: usize = 1_500;
 
 /// Hard ceiling so a caller cannot ask the canvas for the uncapped graph.
 pub const MAX_VIZ_MAX_NODES: usize = 5_000;
+
+/// Match DevCouncil's default artifact-reader budget; never allocate an
+/// unbounded JSON document before applying the much smaller canvas sample cap.
+const MAX_VIZ_JSON_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -50,24 +55,38 @@ impl GraphVizLoad {
     }
 }
 
-/// Resolve `graph/code_graph.json` the same way `repo_map_path` resolves the map.
+/// Resolve `graph/code_graph.json` through devmap's canonical state-directory owner.
 pub fn code_graph_path(repo: impl AsRef<Path>) -> PathBuf {
-    let root = repo.as_ref();
-    let legacy = root.join(".devcouncil");
-    if legacy.is_dir() {
-        return legacy.join("graph").join("code_graph.json");
-    }
-    let standalone = root.join(".devmap");
-    if standalone.is_dir() {
-        return standalone.join("graph").join("code_graph.json");
-    }
-    legacy.join("graph").join("code_graph.json")
+    devmap_query::paths::code_graph_path(repo)
 }
 
 fn read_json_file(path: &Path) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular graph file", path.display()));
+    }
+    let too_large = || {
+        format!(
+            "{} exceeds the 128 MiB visualization input limit; use a smaller graph export",
+            path.display()
+        )
+    };
+    if metadata.len() > MAX_VIZ_JSON_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_VIZ_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+    // The file may grow after metadata was read.
+    if bytes.len() as u64 > MAX_VIZ_JSON_BYTES {
+        return Err(too_large());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
 }
 
 fn clamp_max_nodes(requested: Option<usize>) -> usize {
@@ -101,6 +120,24 @@ pub fn load_code_graph_viz(
             return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, e, Some(path_str));
         }
     };
+    if !graph.get("nodes").is_some_and(Value::is_array)
+        || !graph.get("edges").is_some_and(Value::is_array)
+    {
+        return GraphVizLoad::unavailable(
+            GraphVizKind::CodeGraph,
+            "Invalid code graph: nodes and edges must be arrays; rebuild the map",
+            Some(path_str),
+        );
+    }
+    let tier = graph.pointer("/meta/compatibility_export_tier");
+    if tier.is_some_and(|value| !value.is_null() && value.as_str() != Some("slim"))
+        || graph
+            .pointer("/meta/graph_export_incomplete_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+    {
+        return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, "Code graph is an incomplete or unsupported compatibility export; rebuild the map with a complete graph export", Some(path_str));
+    }
     let options = devmap_query::viz::VizOptions {
         symbols: symbols.unwrap_or(false),
         max_nodes: clamp_max_nodes(max_nodes),
@@ -137,6 +174,13 @@ pub fn load_map_preview(repo_path: &str) -> GraphVizLoad {
             return GraphVizLoad::unavailable(GraphVizKind::MapPreview, e, Some(path_str));
         }
     };
+    if !repo_map.get("subsystems").is_some_and(Value::is_array) {
+        return GraphVizLoad::unavailable(
+            GraphVizKind::MapPreview,
+            "Invalid repo map: subsystems must be an array; rebuild the map",
+            Some(path_str),
+        );
+    }
     let payload = devmap_query::map_preview::build_preview_payload(&repo_map);
     GraphVizLoad {
         available: true,
@@ -200,12 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn code_graph_path_prefers_devcouncil_when_present() {
+    fn code_graph_path_prefers_standalone_when_both_state_directories_exist() {
         let root = scratch("path");
         fs::create_dir_all(root.join(".devcouncil")).unwrap();
         fs::create_dir_all(root.join(".devmap")).unwrap();
         let path = code_graph_path(&root);
-        assert!(path.ends_with(".devcouncil/graph/code_graph.json"));
+        assert!(path.ends_with(".devmap/graph/code_graph.json"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -277,6 +321,67 @@ mod tests {
         assert!(!nodes.is_empty());
         assert!(nodes.iter().any(|n| n["id"] == "src/lib"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_and_incomplete_graphs_are_unavailable() {
+        let root = scratch("invalid");
+        for graph in [json!(null), json!({}), json!({"nodes": [], "edges": {}})] {
+            write_code_graph(&root, &graph);
+            let load = load_code_graph_viz(root.to_str().unwrap(), None, None);
+            assert!(
+                !load.available,
+                "malformed graph reported available: {graph}"
+            );
+            assert!(load.reason.unwrap().contains("nodes and edges"));
+        }
+        for tier in [
+            json!("stub"),
+            json!("compact"),
+            json!("future-tier"),
+            json!(12),
+        ] {
+            write_code_graph(
+                &root,
+                &json!({"meta":{"compatibility_export_tier":tier},"nodes":[],"edges":[]}),
+            );
+            let load = load_code_graph_viz(root.to_str().unwrap(), None, None);
+            assert!(!load.available, "incomplete export reported available");
+            assert!(load.reason.unwrap().contains("export"));
+        }
+        for tier in [Value::Null, json!("slim")] {
+            write_code_graph(
+                &root,
+                &json!({"meta":{"compatibility_export_tier":tier},"nodes":[],"edges":[]}),
+            );
+            assert!(load_code_graph_viz(root.to_str().unwrap(), None, None).available);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_subsystem_shape_is_unavailable_but_an_empty_list_is_valid() {
+        let root = scratch("invalid-map");
+        let path = root.join(".devcouncil/repo_map.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for text in ["null", "{}", "{\"subsystems\":{}}"] {
+            fs::write(&path, text).unwrap();
+            assert!(!load_map_preview(root.to_str().unwrap()).available);
+        }
+        fs::write(&path, "{\"subsystems\":[]}").unwrap();
+        assert!(load_map_preview(root.to_str().unwrap()).available);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_json_is_rejected_before_parsing() {
+        let root = scratch("oversized");
+        let path = root.join("oversized.json");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(128 * 1024 * 1024 + 1).unwrap();
+        let reason = read_json_file(&path).unwrap_err();
+        assert!(reason.contains("exceeds"), "{reason}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

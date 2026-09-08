@@ -39,6 +39,7 @@
   import {
     APP_VERSION,
     diagnostics,
+    diagnosticPersistenceLabel,
     formatDiagnosticReport,
     formatDiagnosticTime,
     redactDiagnosticText,
@@ -92,6 +93,7 @@
   let memoryReadError = $state<string | null>(null);
   let backendLoadGeneration = 0;
   let backendLoad: Promise<void> | null = null;
+  const diagnosticHealth = diagnostics.health;
 
   $effect(() => {
     return () => {
@@ -213,7 +215,7 @@
       return;
     }
 
-    let report = withBackendLogSection(formatDiagnosticReport($diagnostics), backendLines);
+    let report = withBackendLogSection(formatDiagnosticReport($diagnostics, new Date(), APP_VERSION, $diagnosticHealth), backendLines);
     if (memoryReadError) {
       report = [
         report,
@@ -308,6 +310,24 @@
                 class="gp-btn py-0.5! px-2! ml-auto"
                 onclick={() => void beginBackendLoad()}
               >Retry</button>
+            {/if}
+          </div>
+
+          <div class="border-t border-border/50 pt-2 space-y-1">
+            <div class="flex items-center gap-2" role="status" aria-live="polite">
+              <span>{diagnosticPersistenceLabel($diagnosticHealth)}</span>
+              {#if $diagnosticHealth.persistence === "memory-only"}
+                <button type="button" class="gp-btn py-0.5! px-2! ml-auto" onclick={() => diagnostics.retryPersistence()}>Retry saving</button>
+              {/if}
+            </div>
+            {#if $diagnosticHealth.persistenceError}
+              <p class="text-[11px] text-amber-300 wrap-break-word">{$diagnosticHealth.persistenceError}</p>
+            {/if}
+            {#if $diagnosticHealth.restorationError}
+              <p class="text-[11px] text-amber-300 wrap-break-word">Saved history incomplete: {$diagnosticHealth.restorationError}</p>
+            {/if}
+            {#if $diagnosticHealth.suppressedRuntimeEvents > 0}
+              <p class="text-[11px] text-textMuted">{$diagnosticHealth.suppressedRuntimeEvents} development reload messages suppressed this session.</p>
             {/if}
           </div>
 

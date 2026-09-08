@@ -158,6 +158,12 @@ describe("terminal tab model", () => {
   });
 
   describe("keyboard chords", () => {
+    it("leaves IME composition untouched and consumes destructive repeats", () => {
+      expect(terminalTabChord({ ...chord("W", { ctrlKey: true, shiftKey: true }), isComposing: true })).toBeNull();
+      expect(terminalTabChord({ ...chord("T", { ctrlKey: true, shiftKey: true }), keyCode: 229 })).toBeNull();
+      expect(terminalTabChord({ ...chord("W", { ctrlKey: true, shiftKey: true }), repeat: true })).toBe("ignore");
+    });
+
     it("recognises the four bindings", () => {
       expect(terminalTabChord(chord("T", { ctrlKey: true, shiftKey: true }))).toBe("new");
       expect(terminalTabChord(chord("W", { ctrlKey: true, shiftKey: true }))).toBe("close");
@@ -182,4 +188,12 @@ describe("terminal tab model", () => {
       }
     });
   });
+});
+
+
+it("bounds stored titles and consumes repeated tab chords without shell input", () => {
+  const state = initialState();
+  const next = setTabTitle(state, state.tabs[0].id, "x".repeat(100000));
+  expect(next.tabs[0].title?.length).toBeLessThanOrEqual(256);
+  expect(terminalTabChord({key:"W", ctrlKey:true, metaKey:false, shiftKey:true, altKey:false, repeat:true})).toBe("ignore");
 });

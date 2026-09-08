@@ -57,6 +57,8 @@ function chunk(index: number, resolution: ConflictResolutionChoice): ConflictChu
 
 function doc(path: string, chunks: ConflictChunk[]): ConflictDocument {
   return {
+    diagnostics: [],
+    marker_size: 7,
     file_path: path,
     segments: chunks.map((Conflict) => ({ Conflict })),
     total_conflicts: chunks.length,
@@ -68,6 +70,19 @@ function doc(path: string, chunks: ConflictChunk[]): ConflictDocument {
 }
 
 describe("adoptResolutions (stale-parse protection)", () => {
+  it("does not apply an old choice to changed conflict content", () => {
+    const current = doc("a.txt", [chunk(0, "AcceptOurs")]);
+    const next = doc("a.txt", [chunk(0, "Unresolved")]);
+    next.segments[0].Conflict!.theirs_content = "new incoming change";
+    expect(adoptResolutions(next, current).segments[0].Conflict?.resolution).toBe("Unresolved");
+  });
+
+  it("does not carry choices when surrounding content or line endings change", () => {
+    const current = doc("a.txt", [chunk(0, "AcceptTheirs")]);
+    const next = doc("a.txt", [chunk(0, "Unresolved")]);
+    next.trailing_newline = false;
+    expect(adoptResolutions(next, current).segments[0].Conflict?.resolution).toBe("Unresolved");
+  });
   it("carries same-file resolutions onto a fresh parse by chunk index", () => {
     const current = doc("a.txt", [chunk(0, "Unresolved"), chunk(1, "AcceptTheirs"), chunk(2, { Custom: "merged line" })]);
     const next = doc("a.txt", [chunk(0, "Unresolved"), chunk(1, "Unresolved"), chunk(2, "Unresolved")]);
@@ -104,7 +119,7 @@ describe("ConflictEditor load-effect memo guard", () => {
   it("reloads only when the conflicted file or repo actually changes", () => {
     // repoStore republishes fresh objects every ~6s status poll; reloading
     // per emission would churn IPC and replace parsedDoc mid-edit.
-    expect(source).toContain("if (key === loadedKey) return;");
+    expect(source).toContain("if (key === loadedKey && loadedRetry === retryRevision) return;");
     expect(source).toContain("loadedKey = key;");
     // The memo key derives only from repo path + conflicted file.
     expect(source).toContain("`${repo}\\u0000${file}`");
@@ -120,9 +135,10 @@ describe("ConflictEditor load-effect memo guard", () => {
     expect(source.match(/return \(\) => \{\s*guard\.cancel\(\);\s*\};/g)).toBeNull();
   });
 
-  it("routes a landed parse through adoptResolutions instead of assigning raw", () => {
-    expect(source).toContain("const adopted = adoptResolutions(doc, parsedDoc);");
-    expect(source).toContain("parsedDoc = adopted;");
+  it("routes landed snapshots through persistent recovery and waits for accepted saves", () => {
+    expect(source).toContain("const next = conflictSessions.open(repo, snapshot);");
+    expect(source).toContain("parsedDoc = materializeResolution(next);");
+    expect(source).toContain("await editorFileSaveQueue.whenIdle(fileSaveKey(repo, file));");
   });
 });
 
@@ -132,21 +148,29 @@ describe("ConflictEditor journal completeness", () => {
       source.indexOf("async function saveResolved"),
       source.indexOf("</script>", source.indexOf("async function saveResolved")),
     );
-    const write = body.indexOf('await invoke("cmd_write_file_content"');
+    const write = body.indexOf('await invoke<Guarded<ConflictSaveOutcome>>("cmd_save_conflict"');
     const successJournal = body.indexOf("harnessStore.recordAction", write);
     const nextGuard = body.indexOf("if (!guard.isLive()", write);
+    expect(write).toBeGreaterThan(-1);
     expect(successJournal).toBeGreaterThan(write);
     expect(successJournal).toBeLessThan(nextGuard);
 
     const caught = body.indexOf("} catch", nextGuard);
     const failureJournal = body.indexOf("harnessStore.recordAction", caught);
-    const failureGuard = body.indexOf("if (!guard.isLive()", caught);
+    const failureGuard = body.indexOf("if (guard.isLive()", caught);
     expect(failureJournal).toBeGreaterThan(caught);
     expect(failureJournal).toBeLessThan(failureGuard);
   });
 });
 
 describe("ConflictEditor custom draft lifecycle", () => {
+  it.each(["", " ", "\n\t"])("preserves intentional blank custom content %j", (value) => {
+    const document = doc("a.txt", [chunk(0, "Unresolved")]);
+    flushCustomDrafts(document, "/repo", "a.txt", {
+      [conflictDraftKey("/repo", "a.txt", 0)]: { value, active: true },
+    });
+    expect(document.segments[0].Conflict?.resolution).toEqual({ Custom: value });
+  });
   it("keeps chunk-zero drafts isolated when switching between files", () => {
     const drafts: ConflictCustomDrafts = {
       [conflictDraftKey("/repo", "a.txt", 0)]: { value: "draft for a", active: true },
@@ -164,7 +188,7 @@ describe("ConflictEditor custom draft lifecycle", () => {
       conflictDraftKey("/repo", "b.txt", 0),
     );
     expect(source).toContain("const customTimers = new Map<string");
-    expect(source).toContain("flushCustomDrafts(adopted, repo, file, customDrafts);");
+    expect(source).toContain("conflictDraftKey(next.repo, next.snapshot.file_path, Number(index))");
   });
 
   it("refuses to save while a newly selected file is still showing the prior parse", () => {
@@ -172,8 +196,8 @@ describe("ConflictEditor custom draft lifecycle", () => {
       source.indexOf("async function saveResolved"),
       source.indexOf("</script>", source.indexOf("async function saveResolved")),
     );
-    expect(save).toContain("if (document.file_path !== file) return;");
-    expect(source).toContain("parsedDoc?.file_path !== selectedFile");
+    expect(save).toContain("if (document && document.file_path !== file) return;");
+    expect(source).toContain("document.file_path !== selectedFile");
   });
 
   it("flushes the latest custom value before an immediate save resolves the document", () => {
@@ -191,7 +215,7 @@ describe("ConflictEditor custom draft lifecycle", () => {
     );
     expect(save.indexOf("flushCustomDrafts(")).toBeGreaterThan(-1);
     expect(save.indexOf("flushCustomDrafts(")).toBeLessThan(
-      save.indexOf('invoke<string>("cmd_resolve_conflict"'),
+      save.indexOf('invoke<Guarded<ConflictSaveOutcome>>("cmd_save_conflict"'),
     );
   });
 
@@ -219,14 +243,16 @@ describe("ConflictEditor custom draft lifecycle", () => {
       source.indexOf("async function saveResolved"),
       source.indexOf("</script>", source.indexOf("async function saveResolved")),
     );
-    const write = save.indexOf('await invoke("cmd_write_file_content"');
+    const write = save.indexOf('await invoke<Guarded<ConflictSaveOutcome>>("cmd_save_conflict"');
     const clear = save.indexOf("clearCustomDraftsForDocument(");
-    const failedSave = save.slice(save.indexOf("} catch (err)"), save.indexOf("} finally"));
+    const outerCatch = save.lastIndexOf("} catch (error)", save.indexOf("} finally"));
+    expect(outerCatch).toBeGreaterThan(clear);
+    const failedSave = save.slice(outerCatch, save.indexOf("} finally"));
     expect(clear).toBeGreaterThan(write);
     expect(failedSave).not.toContain("clearCustomDraftsForDocument(");
   });
 
-  it("does not clear or stage a newer resolution edit after an older save returns", () => {
+  it("does not clear newer choices and sends write and stage through one native transaction", () => {
     expect(canFinalizeConflictSave(7, 7)).toBe(true);
     expect(canFinalizeConflictSave(7, 8)).toBe(false);
 
@@ -234,13 +260,15 @@ describe("ConflictEditor custom draft lifecycle", () => {
       source.indexOf("async function saveResolved"),
       source.indexOf("</script>", source.indexOf("async function saveResolved")),
     );
-    const write = save.indexOf('await invoke("cmd_write_file_content"');
+    const write = save.indexOf('await invoke<Guarded<ConflictSaveOutcome>>("cmd_save_conflict"');
     const superseded = save.indexOf("canFinalizeConflictSave(saveRevision, editRevision)");
     const clear = save.indexOf("clearCustomDraftsForDocument(");
-    const stage = save.indexOf("repoStore.stageFile(");
+    const stage = save.indexOf("await editorFileSaveQueue.run(");
     expect(superseded).toBeGreaterThan(write);
     expect(clear).toBeGreaterThan(superseded);
-    expect(stage).toBeGreaterThan(superseded);
+    expect(stage).toBeGreaterThan(-1);
+    expect(save).not.toContain("repoStore.stageFile(");
+    expect(save).toContain("request.revision, savedState");
     expect(save.slice(superseded, clear)).toContain("return");
   });
 
@@ -250,13 +278,13 @@ describe("ConflictEditor custom draft lifecycle", () => {
     for (const label of [
       "Accept All Current (Ours)",
       "Accept All Incoming (Theirs)",
-      "Accept Ours",
-      "Both (Ours First)",
-      "Accept Theirs",
-      "Both (Theirs First)",
     ]) {
       expect(openingTagContaining("button", label), label).toContain("disabled={isSaving}");
     }
+    expect(source).toContain("<ConflictComparison {chunk} disabled={isSaving}");
+    const comparison = readFileSync(new URL("./ConflictComparison.svelte", import.meta.url), "utf8");
+    expect(comparison).toContain("<button {disabled} aria-pressed={chunk.resolution === accept}");
+    expect(comparison).toContain("<button {disabled} aria-pressed={chunk.resolution === both}");
     expect(openingTagContaining("textarea", "Type the exact content this conflict"))
       .toContain("disabled={isSaving}");
 
@@ -265,10 +293,10 @@ describe("ConflictEditor custom draft lifecycle", () => {
       source.indexOf("</script>", source.indexOf("async function saveResolved")),
     );
     expect(save.indexOf("isSaving = true")).toBeLessThan(
-      save.indexOf('invoke<string>("cmd_resolve_conflict"'),
+      save.indexOf('invoke<Guarded<ConflictSaveOutcome>>("cmd_save_conflict"'),
     );
     expect(save.indexOf("isSaving = false")).toBeGreaterThan(
-      save.indexOf("await repoStore.stageFile(file)"),
+      save.indexOf("await editorFileSaveQueue.run("),
     );
   });
 
@@ -288,5 +316,6 @@ describe("ConflictEditor rendering", () => {
   it("renders the empty state when no conflicts exist", () => {
     const { body } = render(ConflictEditor);
     expect(body).toContain("No merge conflicts");
+    expect(body).not.toContain("working tree is clean");
   });
 });

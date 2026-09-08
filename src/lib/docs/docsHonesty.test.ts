@@ -6,6 +6,11 @@ import {
 } from "./docsHonesty";
 
 describe("docsStatusHonesty", () => {
+  it("does not mislabel every budget cap as a file-count overflow", () => {
+    const line = docsStatusHonesty({ noteCount: 32, truncated: true, skippedOversized: 0, skippedUnreadable: 0 });
+    expect(line).toContain("resource limit");
+    expect(line).not.toContain("file list exceeded");
+  });
   it("returns null when the vault is complete", () => {
     expect(
       docsStatusHonesty({

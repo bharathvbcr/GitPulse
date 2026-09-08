@@ -1,4 +1,4 @@
-//! GitPulse-owned mirror of `.devcouncil/repo_map.json`.
+//! GitPulse-owned mirror of devmap's `repo_map.json`.
 //!
 //! Upstream builds that artifact as a hand-assembled `json!` payload
 //! (`devmap_query::manifest`) — there is no single deserialize-all struct to
@@ -283,22 +283,9 @@ impl RepoMapLoad {
     }
 }
 
-/// Resolve `.devcouncil/repo_map.json` (or `.devmap/`) the same way the CLI does.
-///
-/// Prefer `.devcouncil` when that directory exists, else `.devmap`, else the
-/// default `.devcouncil` path. Mirrors `devmap_extract::paths::state_dir`
-/// without pulling that crate into the app binary.
+/// Resolve `repo_map.json` through devmap's canonical state-directory owner.
 pub fn repo_map_path(repo: impl AsRef<Path>) -> PathBuf {
-    let root = repo.as_ref();
-    let legacy = root.join(".devcouncil");
-    if legacy.is_dir() {
-        return legacy.join("repo_map.json");
-    }
-    let standalone = root.join(".devmap");
-    if standalone.is_dir() {
-        return standalone.join("repo_map.json");
-    }
-    legacy.join("repo_map.json")
+    devmap_query::paths::repo_map_path(repo)
 }
 
 /// Parse a consumer map document from JSON text.
@@ -431,6 +418,25 @@ mod tests {
         // Renaming the honesty block to a scalar must fail the mirror.
         let err = parse_repo_map(r#"{"liveness_meta":"gone"}"#).expect_err("scalar meta");
         assert!(err.contains("repo_map.json is not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn repo_map_path_uses_the_canonical_standalone_default_and_dual_dir_precedence() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            repo_map_path(root.path()),
+            root.path().join(".devmap/repo_map.json")
+        );
+        std::fs::create_dir_all(root.path().join(".devcouncil")).expect("legacy state");
+        assert_eq!(
+            repo_map_path(root.path()),
+            root.path().join(".devcouncil/repo_map.json")
+        );
+        std::fs::create_dir_all(root.path().join(".devmap")).expect("standalone state");
+        assert_eq!(
+            repo_map_path(root.path()),
+            root.path().join(".devmap/repo_map.json")
+        );
     }
 
     #[test]

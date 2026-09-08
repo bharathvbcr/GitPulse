@@ -20,14 +20,16 @@
 import type { BranchInfo } from "../branches/types";
 import type { FileStatus } from "../stores/repoStore";
 import { agentKindsOn } from "./agentWorktree";
-import { dirtyCount, type WorkRow } from "./projection";
+import { dirtyCount, rowNeedsAttention, type WorkRow } from "./projection";
 
 /** Which subset of the rows is on screen. */
-export type WorkFacet = "all" | "blocked" | "dirty" | "agents" | "pullRequests";
+export type WorkFacet = "all" | "attention" | "blocked" | "dirty" | "agents" | "pullRequests";
 
 /** The facets a tile can select, in strip order. */
 export const WORK_FACETS: readonly WorkFacet[] = [
   "all",
+  "attention",
+  "dirty",
   "agents",
   "blocked",
   "pullRequests",
@@ -38,6 +40,8 @@ export function rowInFacet(row: WorkRow, facet: WorkFacet): boolean {
   switch (facet) {
     case "all":
       return true;
+    case "attention":
+      return rowNeedsAttention(row);
     case "blocked":
       return row.operation !== null;
     case "dirty":
@@ -115,7 +119,7 @@ export function rowLastActivity(
 
 /** What the checked-out repository looks like right now. */
 export interface HereSummary {
-  branch: string;
+  branch: string | null;
   /** Tracking state, or null when the branch has no upstream configured. */
   upstream: { name: string; ahead: number; behind: number; gone: boolean } | null;
   /** Commits behind the branch the backend compared this one against. */
@@ -131,21 +135,20 @@ export interface HereSummary {
 /**
  * The one-line answer to "where am I and what is uncommitted".
  *
- * Null without a checked-out branch (a detached HEAD or a bare repository),
- * which is a state the caller renders differently rather than as a branch
- * named "".
+ * A detached checkout keeps its file status without inventing a branch.
+ * Bare repositories have no working tree and return null.
  *
- * `unmeasured` exists because the branch list arrives progressively: ahead,
- * behind and base counts are zero until the stats pass lands, and a strip
- * that renders those zeroes says "up to date with your remote" when what it
- * knows is nothing at all.
+ * `unmeasured` distinguishes a missing branch record from measured tracking
+ * counts. Base comparisons arrive separately; the caller consults statsPending
+ * before showing them.
  */
 export function hereSummary(
   currentBranch: string | null,
   branches: readonly BranchInfo[],
   statuses: readonly FileStatus[],
+  hasWorkingTree = Boolean(currentBranch) || statuses.length > 0,
 ): HereSummary | null {
-  if (!currentBranch) return null;
+  if (!hasWorkingTree) return null;
   const info = branches.find((b) => !b.is_remote && b.name === currentBranch);
   let staged = 0;
   let unstaged = 0;

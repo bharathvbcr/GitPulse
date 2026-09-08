@@ -1,4 +1,6 @@
 import { writable } from "svelte/store";
+import { clampTerminalFontSize, TERMINAL_FONT_DEFAULT } from "../terminal/viewControls";
+import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
 import {
   isGraphWidthMode,
   type GraphWidthMode,
@@ -124,6 +126,8 @@ export interface InterfacePrefs {
   terminalDockOpen: boolean;
   /** Dock height in CSS pixels, clamped on read; the user drags to resize. */
   terminalDockHeight: number;
+  terminalFontSize: number;
+  terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
   /**
@@ -172,6 +176,8 @@ const DEFAULTS: InterfacePrefs = {
   fleetCompact: false,
   terminalDockOpen: false,
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
+  terminalFontSize: TERMINAL_FONT_DEFAULT,
+  terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
   lastUpdateCheckAt: 0,
@@ -283,6 +289,8 @@ function readPrefs(): InterfacePrefs {
       fleetHiddenColumns: columnKeys(parsed.fleetHiddenColumns, DEFAULTS.fleetHiddenColumns),
       fleetCompact: bool(parsed.fleetCompact, DEFAULTS.fleetCompact),
       terminalDockOpen: bool(parsed.terminalDockOpen, DEFAULTS.terminalDockOpen),
+      terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
+      terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
       // to grab or tall enough to swallow the view.
@@ -406,6 +414,8 @@ function createInterfaceStore() {
       })),
     showAllFleetColumns: () => patch({ fleetHiddenColumns: [] }),
     toggleFleetCompact: () => patch((prefs) => ({ fleetCompact: !prefs.fleetCompact })),
+    setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
+    setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockOpen: (open: boolean) => patch({ terminalDockOpen: open }),
     toggleTerminalDock: () =>
       patch((prefs) => ({ terminalDockOpen: !prefs.terminalDockOpen })),

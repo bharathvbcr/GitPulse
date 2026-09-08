@@ -7,6 +7,27 @@ import {
 } from "./eachKeys";
 
 describe("uniqueKeyAllocator", () => {
+  it.each([
+    ["a", "a", "a#1"],
+    ["a#1", "a", "a"],
+    ["", "__empty", "", "__empty#1"],
+    ["a", "a", "a#1", "a#1", "a#1#1"],
+  ])("keeps literal suffixes and generated keys disjoint: %j", (...bases) => {
+    const key = uniqueKeyAllocator();
+    const keys = bases.map(key);
+    expect(new Set(keys).size).toBe(bases.length);
+  });
+
+  it("survives 100,000 adversarial claims without losing a row", () => {
+    const bases = Array.from({ length: 100_000 }, (_, i) =>
+      i % 3 === 0 ? "" : i % 3 === 1 ? "__empty" : `__empty#${Math.floor(i / 3)}`,
+    );
+    const rows = keyedList(bases, (base) => base);
+    expect(new Set(rows.map((row) => row.key)).size).toBe(bases.length);
+    expect(rows.map((row) => row.item)).toEqual(bases);
+    expect(keyedList(bases, (base) => base)).toEqual(rows);
+  });
+
   it("leaves the first claimant alone and suffixes collisions", () => {
     const key = uniqueKeyAllocator();
     expect(key("a")).toBe("a");

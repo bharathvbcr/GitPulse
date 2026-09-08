@@ -1,5 +1,11 @@
 <script lang="ts">
+  import { onDestroy, untrack } from "svelte";
+  import { beginGeneration } from "../async/guard";
+  import { reportPanelError } from "../diagnostics/report";
+  import { paneDetails } from "../diagnostics/paneCrash";
+  import { keyedList } from "../ui/eachKeys";
   import { repoStore } from "../stores/repoStore";
+  import { liveIndex } from "../codeintel/liveIndex";
   import {
     buildDevmap,
     getCodeGraphViz,
@@ -127,23 +133,71 @@
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
 
-  let inflightPath = "";
-  let graphInflight = "";
-  let docsInflight = "";
-  let linksInflight = "";
+  const currentRepo = $derived($repoStore.currentPath);
+  const indexSnapshots = liveIndex.snapshots;
+  const contentRevisions = repoStore.contentRevisions;
+  const indexRevision = $derived(currentRepo ? ($indexSnapshots[currentRepo]?.revision ?? 0) : 0);
+  const contentRevision = $derived(currentRepo ? ($contentRevisions[currentRepo] ?? "") : "");
+  let observedRepo: string | null = null;
+  let observedIndex = 0;
+  let observedContent = "";
+  const detailScope = paneDetails.register("map");
+  const requestIds: Record<string, number> = {};
+  function trackedRequests(operation: string) {
+    const generation = beginGeneration();
+    return {
+      isCurrent: generation.isCurrent,
+      next() {
+        const request = generation.next();
+        requestIds[operation] = request;
+        detailScope.update(currentRepo, mapView, requestIds);
+        return request;
+      },
+    };
+  }
+  const mapRequests = trackedRequests("map");
+  const graphRequests = trackedRequests("graph");
+  const docsRequests = trackedRequests("docs");
+  const searchRequests = trackedRequests("search");
+  const linkRequests = trackedRequests("links");
+  const buildRequests = trackedRequests("build");
 
-  async function reload(path?: string) {
+  function cancelRequests() {
+    for (const requests of [mapRequests, graphRequests, docsRequests, searchRequests, linkRequests, buildRequests]) requests.next();
+  }
+  onDestroy(cancelRequests);
+  onDestroy(detailScope.dispose);
+
+  $effect(() => {
+    const path = currentRepo;
+    const index = indexRevision;
+    const content = contentRevision;
+    untrack(() => {
+      if (path && path === observedRepo) {
+        if (index && index !== observedIndex) void reload(path);
+        else if (content !== observedContent && (mapView === "docs" || mapView === "docgraph")) reloadView(path, mapView);
+      }
+      observedRepo = path;
+      observedIndex = index;
+      observedContent = content;
+    });
+  });
+
+  function reportMapFailure(operation: string, repo: string, error: unknown): string {
+    return reportPanelError("code-map", `Operation: ${operation}\nRepository: ${repo}\n${formatError(error)}`);
+  }
+
+  async function reload(path?: string, refreshView = true) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
     loading = true;
     errorMsg = null;
-    actionNote = null;
-    inflightPath = repoPath;
+    const request = mapRequests.next();
     const [mapResult, statusResult] = await Promise.allSettled([
       getDevmapRepoMap(repoPath),
       getDevmapCliStatus(repoPath),
     ]);
-    if (inflightPath !== repoPath || $repoStore.currentPath !== repoPath) return;
+    if (!mapRequests.isCurrent(request) || currentRepo !== repoPath) return;
     loading = false;
     if (mapResult.status === "fulfilled") {
       load = mapResult.value;
@@ -154,97 +208,101 @@
       }
     } else {
       load = null;
-      errorMsg = formatError(mapResult.reason);
+      errorMsg = reportMapFailure("map", repoPath, mapResult.reason);
     }
     if (statusResult.status === "fulfilled") {
       cliStatus = statusResult.value;
     } else {
       cliStatus = null;
+      reportMapFailure("status", repoPath, statusResult.reason);
     }
-    if (CODE_GRAPH_VIEWS.has(mapView)) {
-      void reloadGraph(repoPath);
-    } else if (mapView === "docs") {
-      void reloadDocs(repoPath);
-    } else if (mapView === "links") {
-      void reloadLinks(repoPath);
-    }
+    if (refreshView) reloadView(repoPath, mapView);
   }
 
   async function reloadGraph(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath || !CODE_GRAPH_VIEWS.has(mapView)) return;
     graphLoading = true;
-    graphInflight = `${repoPath}:${mapView}`;
+    const request = graphRequests.next();
+    const view = mapView;
+    const live = () => graphRequests.isCurrent(request) && currentRepo === repoPath && mapView === view;
     try {
       let result: GraphVizLoad;
-      if (mapView === "files") {
+      if (view === "files") {
         result = await getCodeGraphViz(repoPath, false);
-      } else if (mapView === "symbols") {
+      } else if (view === "symbols") {
         result = await getCodeGraphViz(repoPath, true);
-      } else if (mapView === "docgraph") {
+      } else if (view === "docgraph") {
         const graph = await docsGraph(repoPath);
         result = docGraphToLoad(graph, null);
       } else {
         result = await getMapPreviewViz(repoPath);
       }
-      if (graphInflight !== `${repoPath}:${mapView}`) return;
+      if (!live()) return;
       graphLoad = result;
     } catch (err) {
-      if (graphInflight !== `${repoPath}:${mapView}`) return;
+      if (!live()) return;
       graphLoad = {
         available: false,
-        reason: formatError(err),
+        reason: reportMapFailure(view, repoPath, err),
         kind:
-          mapView === "subsystems"
+          view === "subsystems"
             ? "map_preview"
-            : mapView === "docgraph"
+            : view === "docgraph"
               ? "doc_graph"
               : "code_graph",
         payload: null,
       };
     } finally {
-      if (graphInflight === `${repoPath}:${mapView}`) graphLoading = false;
+      if (live()) graphLoading = false;
     }
   }
 
   async function reloadDocs(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
-    docsInflight = repoPath;
+    const request = docsRequests.next();
+    const live = () => docsRequests.isCurrent(request) && currentRepo === repoPath && mapView === "docs";
     docsError = null;
     brokenLoading = true;
     try {
       const status = await docsRefresh(repoPath);
-      if (docsInflight !== repoPath) return;
+      if (!live()) return;
+      const links = await docsBrokenLinks(repoPath);
+      if (!live()) return;
       docsStatus = status;
-      brokenLinks = await docsBrokenLinks(repoPath);
-      if (docsInflight !== repoPath) return;
+      brokenLinks = links;
     } catch (err) {
-      if (docsInflight !== repoPath) return;
-      docsError = formatError(err);
+      if (!live()) return;
+      docsError = reportMapFailure("documents", repoPath, err);
       docsStatus = null;
       brokenLinks = [];
     } finally {
-      if (docsInflight === repoPath) brokenLoading = false;
+      if (live()) brokenLoading = false;
     }
   }
 
   async function runDocsSearch() {
+    const request = searchRequests.next();
     const repoPath = $repoStore.currentPath;
     const q = docsQuery.trim();
     if (!repoPath || !q) {
       docsHits = [];
+      docsSearching = false;
       return;
     }
     docsSearching = true;
     docsError = null;
+    const live = () => searchRequests.isCurrent(request) && currentRepo === repoPath && docsQuery.trim() === q && mapView === "docs";
     try {
-      docsHits = await docsSearch(repoPath, q, DOCS_SEARCH_DEFAULT_LIMIT);
+      const hits = await docsSearch(repoPath, q, DOCS_SEARCH_DEFAULT_LIMIT);
+      if (live()) docsHits = hits;
     } catch (err) {
+      if (!live()) return;
       docsHits = [];
-      docsError = formatError(err);
+      docsError = reportMapFailure("search", repoPath, err);
     } finally {
-      docsSearching = false;
+      if (live()) docsSearching = false;
     }
   }
 
@@ -253,44 +311,50 @@
     if (!registryRoot) return;
     linksLoading = true;
     linksError = null;
-    linksInflight = registryRoot;
+    const request = linkRequests.next();
+    const live = () => linkRequests.isCurrent(request) && currentRepo === registryRoot && mapView === "links";
     try {
       const result = await getWorkspaceLinkCandidates(registryRoot);
-      if (linksInflight !== registryRoot) return;
+      if (!live()) return;
       linkResult = result;
     } catch (err) {
-      if (linksInflight !== registryRoot) return;
+      if (!live()) return;
       linkResult = null;
-      linksError = formatError(err);
+      linksError = reportMapFailure("links", registryRoot, err);
     } finally {
-      if (linksInflight === registryRoot) linksLoading = false;
+      if (live()) linksLoading = false;
     }
   }
 
   async function runBuild(kind: "build" | "refresh") {
     const repoPath = $repoStore.currentPath;
     if (!repoPath) return;
+    const request = buildRequests.next();
+    const live = () => buildRequests.isCurrent(request) && currentRepo === repoPath;
     building = true;
     actionNote = null;
     errorMsg = null;
     try {
       const outcome = kind === "build" ? await buildDevmap(repoPath) : await refreshDevmap(repoPath);
+      if (!live()) return;
       if (!outcome.ok) {
-        actionNote = outcome.stderr.trim() || outcome.stdout.trim() || `devmap ${kind} failed`;
+        actionNote = reportMapFailure(kind, repoPath,
+          outcome.stderr.trim() || outcome.stdout.trim() || `devmap ${kind} failed`);
       } else {
         actionNote = `Map ${kind === "build" ? "built" : "refreshed"}.`;
       }
       await reload(repoPath);
     } catch (err) {
-      actionNote = formatError(err);
+      if (live()) actionNote = reportMapFailure(kind, repoPath, err);
     } finally {
-      building = false;
+      if (live()) building = false;
     }
   }
 
   $effect(() => {
-    const path = $repoStore.currentPath;
-    if (!path) {
+    const path = currentRepo;
+    untrack(() => {
+      cancelRequests();
       load = null;
       cliStatus = null;
       selectedArea = null;
@@ -299,15 +363,39 @@
       docsHits = [];
       brokenLinks = [];
       linkResult = null;
-      return;
-    }
-    void reload(path);
+      errorMsg = null;
+      docsError = null;
+      linksError = null;
+      actionNote = null;
+      loading = building = graphLoading = brokenLoading = docsSearching = linksLoading = false;
+      // The view effect below owns the initial subview request.
+      if (path) void reload(path, false);
+    });
   });
 
   $effect(() => {
     const view = mapView;
-    const path = $repoStore.currentPath;
-    if (!path) return;
+    const path = currentRepo;
+    untrack(() => {
+      graphRequests.next();
+      docsRequests.next();
+      searchRequests.next();
+      linkRequests.next();
+      graphLoading = brokenLoading = docsSearching = linksLoading = false;
+      if (path) reloadView(path, view);
+    });
+  });
+
+  $effect(() => {
+    docsQuery;
+    untrack(() => {
+      searchRequests.next();
+      docsSearching = false;
+      docsHits = [];
+    });
+  });
+
+  function reloadView(path: string, view: MapView) {
     if (CODE_GRAPH_VIEWS.has(view)) {
       void reloadGraph(path);
     } else if (view === "docs") {
@@ -315,7 +403,7 @@
     } else if (view === "links") {
       void reloadLinks(path);
     }
-  });
+  }
 
   function coverageGapSummary(payload: DevmapStatusPayload | null): string | null {
     const gaps = payload?.coverage_gaps;
@@ -348,13 +436,9 @@
   }
 
   function openGraphNode(path: string, _nodeId: string) {
-    // File paths open in the explorer; bare symbol ids are not files.
-    if (
-      path.includes("/") ||
-      /\.(rs|ts|tsx|js|svelte|py|go|md|mdx)$/.test(path)
-    ) {
-      openFile(path.split("::")[0] ?? path);
-    }
+    // The canvas resolves explicit file ownership, including root-level and
+    // extensionless files. Do not add a second language whitelist here.
+    openFile(path);
   }
 
   function setView(view: MapView) {
@@ -533,7 +617,7 @@
 
   {#if CODE_GRAPH_VIEWS.has(mapView)}
     <div class="flex-1 min-h-0 flex flex-col">
-      <CodeGraphCanvas load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} />
+      <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} />
     </div>
   {:else if mapView === "docs"}
     <div class="flex-1 min-h-0 overflow-y-auto p-3 space-y-4" data-testid="docs-panel">
@@ -582,7 +666,7 @@
           <p class="mt-2 text-[11px] text-textMuted">No hits.</p>
         {:else if docsHits.length > 0}
           <ul class="mt-2 space-y-1.5">
-            {#each docsHits as hit (hit.path + ":" + hit.line + ":" + hit.score)}
+            {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button
                   type="button"
@@ -617,7 +701,7 @@
             </p>
           {/if}
           <ul class="space-y-0.5 max-h-64 overflow-y-auto">
-            {#each brokenDisplay.shown as link (`${link.source}->${link.target}`)}
+            {#each keyedList(brokenDisplay.shown, (link) => JSON.stringify([link.source, link.target])) as { item: link, key: renderKey } (renderKey)}
               <li class="text-[11px]">
                 <button
                   type="button"
@@ -654,7 +738,7 @@
         <p class="text-[11px] text-textMuted">Loading…</p>
       {:else if linkResult && linkResult.links.length > 0}
         <ul class="space-y-1.5">
-          {#each linkResult.links as link (`${link.from_repo}:${link.from_file}:${link.module_specifier}:${link.to_repo}`)}
+          {#each keyedList(linkResult.links, (link) => JSON.stringify([link.from_repo, link.from_file, link.module_specifier, link.to_repo])) as { item: link, key: renderKey } (renderKey)}
             <li class="rounded-md border border-border/40 px-2 py-1.5 text-[11px]">
               <div class="font-mono text-textPrimary truncate">
                 [{link.from_repo}] {link.from_file}

@@ -131,9 +131,10 @@ export interface TerminalOutputPayload {
   data_b64: string;
 }
 
-/** Sent once when a session ends: `exit_code` is null when a signal killed it. */
+/** Sent once when a session ends. Unknown exit status is null; signals and transport failures are separate. */
 export interface TerminalExitPayload {
   id: string;
   exit_code: number | null;
   signal: string;
+  error: string | null;
 }

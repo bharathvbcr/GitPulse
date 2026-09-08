@@ -6,6 +6,8 @@
  * without a PTY, a webview, or an xterm instance behind it.
  */
 
+import { isImeComposition } from "../keyboard/imeGuard";
+
 /** What a tab runs. `shell` is the user's own login shell; the rest are agent CLIs. */
 export type LauncherKind = "shell" | "claude" | "manvi" | "codex";
 
@@ -35,6 +37,7 @@ export interface TerminalTab {
    * been reported yet", and {@link tabLabel} is what turns either into text.
    */
   title: string | null;
+  name?: string;
 }
 
 export interface TabState {
@@ -52,7 +55,7 @@ export function launcherLabel(kind: LauncherKind): string {
  * arbitrarily long one, and a tab strip is not the place to discover that.
  */
 export function tabLabel(tab: TerminalTab): string {
-  const reported = tab.title?.trim() ?? "";
+  const reported = tab.name?.trim() || tab.title?.trim() || "";
   if (!reported) return launcherLabel(tab.launcher);
   return reported.length > 28 ? `${reported.slice(0, 27)}…` : reported;
 }
@@ -122,7 +125,7 @@ export function setTabTitle(state: TabState, id: string, title: string): TabStat
   if (!state.tabs.some((tab) => tab.id === id)) return state;
   return {
     ...state,
-    tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, title } : tab)),
+    tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, title: cleanTabName(title, 256) } : tab)),
   };
 }
 
@@ -141,7 +144,7 @@ export function cycleTab(state: TabState, step: 1 | -1): TabState {
 }
 
 /** What a terminal keyboard chord asks the strip to do. */
-export type TabChord = "new" | "close" | "next" | "prev";
+export type TabChord = "new" | "close" | "next" | "prev" | "ignore";
 
 /**
  * The chord this event is, or null when it is ordinary input.
@@ -158,10 +161,15 @@ export function terminalTabChord(event: {
   metaKey: boolean;
   altKey: boolean;
   shiftKey: boolean;
+  isComposing?: boolean;
+  keyCode?: number;
+  repeat?: boolean;
 }): TabChord | null {
+  if (isImeComposition(event)) return null;
   if (!event.ctrlKey || event.metaKey || event.altKey) return null;
   if (event.key === "Tab") return event.shiftKey ? "prev" : "next";
   if (!event.shiftKey) return null;
+  if (event.repeat && ["t", "w"].includes(event.key.toLowerCase())) return "ignore";
   // Shift makes `key` the uppercase letter; compare on one case only.
   switch (event.key.toLowerCase()) {
     case "t":
@@ -171,4 +179,32 @@ export function terminalTabChord(event: {
     default:
       return null;
   }
+}
+
+/** Arrow navigation belongs to the tab strip, never the shell's input. */
+export function terminalTabDestination(state: TabState, key: string): string | null {
+  if (!state.tabs.length) return null;
+  if (key === "Home") return state.tabs[0].id;
+  if (key === "End") return state.tabs[state.tabs.length - 1].id;
+  if (key === "ArrowRight") return cycleTab(state, 1).activeId;
+  if (key === "ArrowLeft") return cycleTab(state, -1).activeId;
+  return null;
+}
+
+/** Titles are display data, never terminal control sequences or unbounded state. */
+export function cleanTabName(value: string, limit = 64): string {
+  return Array.from(value.slice(0, limit * 2).replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim()).slice(0, limit).join("");
+}
+
+export function renameTab(state: TabState, id: string, name: string): TabState {
+  return { ...state, tabs: state.tabs.map((tab) => tab.id === id ? { ...tab, name: cleanTabName(name) } : tab) };
+}
+
+export function moveTab(state: TabState, id: string, step: -1 | 1): TabState {
+  const from = state.tabs.findIndex((tab) => tab.id === id);
+  const to = from + step;
+  if (from < 0 || to < 0 || to >= state.tabs.length) return state;
+  const tabs = [...state.tabs];
+  [tabs[from], tabs[to]] = [tabs[to], tabs[from]];
+  return { ...state, tabs };
 }

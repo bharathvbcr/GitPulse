@@ -928,6 +928,129 @@ fn test_get_file_blame_sha256_repo() {
     assert_eq!(blame[0].author_name, "Test User");
 }
 
+#[test]
+fn blame_new_files_are_uncommitted_without_mutating_the_index() {
+    for seeded in [false, true] {
+        for staged in [false, true] {
+            let repo = TestRepo::init();
+            if seeded {
+                repo.write("seed.txt", "seed\n");
+                repo.commit_all("seed");
+            }
+            let path = ".devcouncil/weird [*] ü.yaml";
+            repo.write(path, "first\n\nlast");
+            if staged {
+                run_git(repo.dir.path(), &["add", "--", path]);
+            }
+            let before = git_out(repo.dir.path(), &["status", "--porcelain=v1"]);
+            let lines = GitReader::get_file_blame(&repo.path_str(), path).expect("new file blame");
+            assert_eq!(
+                lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
+                ["first", "", "last"]
+            );
+            assert!(lines
+                .iter()
+                .all(|l| l.commit_id.chars().all(|c| c == '0') && l.commit_id.len() == 40));
+            assert_eq!(
+                lines.iter().map(|l| l.line_no).collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(
+                git_out(repo.dir.path(), &["status", "--porcelain=v1"]),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn blame_new_empty_files_succeed_but_missing_and_binary_files_do_not() {
+    let repo = TestRepo::init();
+    repo.write("empty.txt", "");
+    assert!(GitReader::get_file_blame(&repo.path_str(), "empty.txt")
+        .expect("empty file")
+        .is_empty());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "absent.txt").is_err());
+    repo.write("binary.dat", "a\0b");
+    assert!(GitReader::get_file_blame(&repo.path_str(), "binary.dat").is_err());
+}
+
+#[test]
+fn blame_new_paths_and_hash_formats_preserve_content() {
+    for format in ["sha1", "sha256"] {
+        let repo = TestRepo::init_with(&[&format!("--object-format={format}")]);
+        for path in ["--option.txt", "a\tb.txt", "line\nbreak.txt", "文档.md"] {
+            repo.write(path, "alpha\r\n\r\nω-last");
+            let lines =
+                GitReader::get_file_blame(&repo.path_str(), path).expect("literal new path");
+            assert_eq!(
+                lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
+                ["alpha", "", "ω-last"]
+            );
+            assert!(lines
+                .iter()
+                .all(|l| l.commit_id.len() == if format == "sha256" { 64 } else { 40 }));
+        }
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.write("ignored.txt", "ignored content\n");
+        assert_eq!(
+            GitReader::get_file_blame(&repo.path_str(), "ignored.txt").unwrap()[0].content,
+            "ignored content"
+        );
+    }
+}
+
+#[test]
+fn blame_keeps_committed_authorship_through_edits() {
+    let repo = TestRepo::init();
+    repo.write("old.txt", "kept\noriginal\n");
+    repo.commit_all("seed");
+    let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    repo.write("old.txt", "kept\nchanged\n");
+    let lines = GitReader::get_file_blame(&repo.path_str(), "old.txt").expect("edited blame");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].commit_id, head);
+    assert!(lines[1].commit_id.chars().all(|c| c == '0'));
+    assert_eq!(lines[1].content, "changed");
+}
+
+#[test]
+fn blame_new_file_budgets_and_invalid_inputs_fail_explicitly() {
+    let repo = TestRepo::init();
+    let large = std::fs::File::create(repo.dir.path().join("large.txt")).unwrap();
+    large.set_len(9 * 1024 * 1024).unwrap();
+    assert!(GitReader::get_file_blame(&repo.path_str(), "large.txt")
+        .unwrap_err()
+        .contains("limit"));
+    repo.write("many.txt", &"\n".repeat(200_000));
+    let result = GitReader::get_file_blame(&repo.path_str(), "many.txt");
+    assert!(matches!(result, Err(error) if error.contains("budget")));
+    fs::write(repo.dir.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
+    assert!(GitReader::get_file_blame(&repo.path_str(), "invalid.txt")
+        .unwrap_err()
+        .contains("UTF-8"));
+    assert!(GitReader::get_file_blame(&repo.path_str(), ".").is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "../escape.txt").is_err());
+}
+
+#[test]
+fn blame_corrupt_history_is_not_misclassified_as_a_new_file() {
+    let repo = TestRepo::init();
+    repo.write("tracked.txt", "committed\n");
+    repo.commit_all("seed");
+    let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
+    fs::remove_file(
+        repo.dir
+            .path()
+            .join(".git/objects")
+            .join(&head[..2])
+            .join(&head[2..]),
+    )
+    .unwrap();
+    repo.write("new.txt", "new\n");
+    assert!(GitReader::get_file_blame(&repo.path_str(), "new.txt").is_err());
+}
+
 /// Regression (item 5): glob metacharacters in a filename must not widen the
 /// pathspec used by log/diff queries.
 #[test]

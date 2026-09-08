@@ -24,6 +24,7 @@ pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
 pub mod paths;
+pub mod progress;
 pub mod subprocess;
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
@@ -470,9 +471,29 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
 
 #[cfg(feature = "parse")]
 pub fn extract_all(files: &[FileRef]) -> Vec<Extraction> {
+    extract_all_with_progress(files, None)
+}
+
+#[cfg(feature = "parse")]
+pub fn extract_all_with_progress(
+    files: &[FileRef],
+    progress: Option<&progress::FileProgress>,
+) -> Vec<Extraction> {
+    if let Some(progress) = progress {
+        progress.start(files.len());
+    }
     files
         .par_iter()
-        .map(|f| extract_file(f.path, f.source))
+        .map(|f| {
+            let extraction = extract_file(f.path, f.source);
+            if let Some(progress) = progress {
+                progress.finish_file(
+                    false,
+                    matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }),
+                );
+            }
+            extraction
+        })
         .collect()
 }
 
@@ -711,11 +732,22 @@ impl ScannedTree {
     /// rename with byte-identical content leaves the count and every hash
     /// intact while changing the graph.
     pub fn matches_file_hashes(&self, previous: &BTreeMap<String, u64>) -> bool {
-        previous.len() == self.sources.len()
-            && self
-                .file_hashes()
-                .iter()
-                .all(|(path, hash)| previous.get(*path).is_some_and(|stored| stored == hash))
+        previous.len() == self.sources.len() && self.file_delta(previous).is_unchanged()
+    }
+
+    pub fn file_delta(&self, previous: &BTreeMap<String, u64>) -> progress::FileDelta {
+        let mut delta = progress::FileDelta::default();
+        for (path, hash) in self.file_hashes() {
+            match previous.get(path) {
+                None => delta.added += 1,
+                Some(stored) if *stored == hash => delta.unchanged += 1,
+                Some(_) => delta.changed += 1,
+            }
+        }
+        delta.removed = previous
+            .len()
+            .saturating_sub(delta.changed + delta.unchanged);
+        delta
     }
 }
 
@@ -737,18 +769,34 @@ pub fn collect_sources_with_report(
 /// parallelism. Ordering is not at stake: both outputs are sorted by path
 /// before this returns, exactly as they were when the reads were inline.
 pub fn scan_tree(root: &Path) -> anyhow::Result<ScannedTree> {
+    scan_tree_with_progress(root, None)
+}
+
+pub fn scan_tree_with_progress(
+    root: &Path,
+    progress: Option<&progress::FileProgress>,
+) -> anyhow::Result<ScannedTree> {
     let (candidates, mut report) = walk_candidates(root)?;
+    if let Some(progress) = progress {
+        progress.start(candidates.len());
+    }
 
     let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
         .into_par_iter()
-        .map(|(relative, absolute)| match fs::read_to_string(&absolute) {
-            Ok(source) => Ok((relative, source)),
-            Err(error) => Err((
-                relative,
-                DiscoverySkipReason::Unreadable {
-                    reason: error.to_string(),
-                },
-            )),
+        .map(|(relative, absolute)| {
+            let result = match fs::read_to_string(&absolute) {
+                Ok(source) => Ok((relative, source)),
+                Err(error) => Err((
+                    relative,
+                    DiscoverySkipReason::Unreadable {
+                        reason: error.to_string(),
+                    },
+                )),
+            };
+            if let Some(progress) = progress {
+                progress.finish_file(false, result.is_err());
+            }
+            result
         })
         .collect();
 

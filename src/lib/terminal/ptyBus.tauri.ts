@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { createPtyBus, type EventListen, type PtyBus } from "./ptyBus";
+import { createPtyBus, type PtyBus } from "./ptyBus";
 
 /**
  * The one bus every terminal tab shares, bound to Tauri's event transport.
@@ -9,4 +9,4 @@ import { createPtyBus, type EventListen, type PtyBus } from "./ptyBus";
  * unit test has no business standing up just to prove that a chunk reached the
  * right session.
  */
-export const ptyBus: PtyBus = createPtyBus(listen as EventListen);
+export const ptyBus: PtyBus = createPtyBus(listen);

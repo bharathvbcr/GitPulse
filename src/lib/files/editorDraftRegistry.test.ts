@@ -34,4 +34,14 @@ describe("editor draft registry", () => {
       { repo: "/repo", paths: ["src/a.ts"] },
     ]);
   });
+
+  it("keeps conflict and file editor owners independent", () => {
+    recordEditorDrafts("/repo", ["editor.txt"]);
+    recordEditorDrafts("/repo", ["conflict.txt"], "conflicts");
+    recordEditorDrafts("/repo", []);
+    expect(unsavedEditorDrafts()).toEqual([{ repo: "/repo", paths: ["conflict.txt"] }]);
+    recordEditorDrafts("/repo", ["editor.txt"]);
+    recordEditorDrafts("/repo", [], "conflicts");
+    expect(unsavedEditorDrafts()).toEqual([{ repo: "/repo", paths: ["editor.txt"] }]);
+  });
 });

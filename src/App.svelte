@@ -7,7 +7,8 @@
   import { repoStore } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { liveIndex } from "./lib/codeintel/liveIndex";
-  import { onDocsRepoChanged } from "./lib/docs/liveVault";
+  import { onDocsRepoChanged, setDocsVaultRefreshScope } from "./lib/docs/liveVault";
+  import { installBackgroundScope } from "./lib/async/backgroundScope";
   import { graphStore } from "./lib/stores/graphStore";
   import { themeStore } from "./lib/stores/themeStore";
   import { filterStore } from "./lib/stores/filterStore";
@@ -19,6 +20,9 @@
   import { formatError } from "./lib/ui/formatError";
   import { LAYERS } from "./lib/ui/layers";
   import { diagnostics } from "./lib/diagnostics/diagnostics";
+  import { formatDiagnosticFailure } from "./lib/diagnostics/diagnostics";
+  import { createPaneCrashReporter } from "./lib/diagnostics/paneCrash";
+  import { get } from "svelte/store";
   import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
     subscribeNativeShell,
@@ -135,6 +139,7 @@
     unsavedEditorDrafts,
   } from "./lib/files/editorDraftRegistry";
   import { editorFileSaveQueue } from "./lib/files/serialSave";
+  import { conflictSessions } from "./lib/diff/conflictSession";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
@@ -242,10 +247,24 @@
     $diagnostics.reduce((total, entry) => (entry.severity === "error" ? total + entry.count : total), 0),
   );
 
-  function reportPaneCrash(error: unknown) {
-    // Deferred out of the render pass: boundary failures happen mid-render.
-    setTimeout(() => diagnostics.error("pane-crash", error), 0);
-  }
+  const paneCrashes = createPaneCrashReporter(diagnostics, () => {
+    const state = get(repoStore);
+    return {
+      view: state.activeTab,
+      section: activeSectionFor(state.activeTab, state.viewSections),
+      repo: state.currentPath,
+      file: state.selectedFilePath,
+    };
+  });
+
+  $effect(() => {
+    paneCrashes.observe({
+      view: $repoStore.activeTab,
+      section: activeSectionFor($repoStore.activeTab, $repoStore.viewSections),
+      repo: $repoStore.currentPath,
+      file: $repoStore.selectedFilePath,
+    });
+  });
 
   async function openFromExternal(path: string) {
     await repoStore.openRepo(path);
@@ -299,9 +318,9 @@
         .join("\n");
       const omitted = Math.max(0, fileCount - 5);
       const confirmed = await askConfirm({
-        title: "Discard Unsaved Edits and Quit?",
-        message: `${fileCount} unsaved editor ${fileCount === 1 ? "draft" : "drafts"} across ${drafts.length} ${drafts.length === 1 ? "repository" : "repositories"}:\n${preview}${omitted > 0 ? `\n…and ${omitted} more` : ""}`,
-        confirmLabel: "Discard and Quit",
+        title: "Quit with Unsaved Edits?",
+        message: `${fileCount} unsaved editor ${fileCount === 1 ? "draft" : "drafts"} across ${drafts.length} ${drafts.length === 1 ? "repository" : "repositories"}:\n${preview}${omitted > 0 ? `\n…and ${omitted} more` : ""}\nConflict drafts are retained for recovery when local storage is available. Other editor drafts will be discarded.`,
+        confirmLabel: "Quit Without Saving",
         cancelLabel: "Keep Editing",
       });
       if (!confirmed) {
@@ -310,6 +329,7 @@
       }
     }
 
+    conflictSessions.flush();
     exitApproved = true;
     try {
       await invoke("cmd_exit_app");
@@ -332,6 +352,15 @@
       if (disposed) unsub();
       else unsubs.push(unsub);
     };
+
+    track(installBackgroundScope({
+      subscribe: repoStore.subscribe,
+      target: document,
+      apply: (scope) => {
+        liveIndex.setScope(scope);
+        setDocsVaultRefreshScope(scope);
+      },
+    }));
 
     const guardBrowserUnload = (event: BeforeUnloadEvent) => {
       if (exitApproved || !hasUnsavedEditorDrafts()) return;
@@ -524,7 +553,7 @@
     };
     // Every boot step fails independently: a throw in restoreWorkspace must
     // not take down, say, the repo-changed listener registration with it.
-    // Boot errors surface between renders, so unlike reportPaneCrash they
+    // Boot errors surface between renders, so unlike pane crash reports they
     // need no setTimeout deferral.
     void runBootSequence(
       {
@@ -720,9 +749,9 @@
 
   {#snippet paneFailed(error: unknown, reset: () => void)}
     <!-- Minimal crash isolation: a broken pane never takes down the window. -->
-    {reportPaneCrash(error)}
-    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatError(error)}>
+    <div class="flex-1 flex flex-col items-center justify-center gap-2 p-4" title={formatDiagnosticFailure(error)}>
       <span class="text-xs text-textMuted font-sans">Pane failed to render</span>
+      <span class="text-[11px] text-textMuted">See Diagnostics for crash details</span>
       <button type="button" class="gp-btn" onclick={() => reset()}>Reset</button>
     </div>
   {/snippet}
@@ -731,7 +760,7 @@
   class="gp-shell h-screen w-screen flex flex-col bg-background text-textPrimary overflow-hidden font-sans relative"
 >
   <!-- Top App Navigation Bar -->
-  <svelte:boundary failed={paneFailed}>
+  <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("header", error)}>
     <header
     class="gp-glass gp-titlebar bg-surface border-b border-border gp-section-edge flex items-center select-none shrink-0 min-w-0 overflow-hidden {macos
       ? 'h-12 pr-3'
@@ -886,11 +915,11 @@
   {:else}
       <div class="flex-1 flex overflow-hidden">
         {#key $repoStore.currentPath}
-        <svelte:boundary failed={paneFailed}>
+        <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("sidebar", error)}>
           <Sidebar />
         </svelte:boundary>
         {/key}
-        <svelte:boundary failed={paneFailed}>
+        <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("workspace", error)}>
           <main id={VIEW_PANE_ID} class="gp-workspace flex-1 flex flex-col min-w-0 bg-background gp-pane">
             <!-- No {#key activeTab}: keying here destroyed and rebuilt the
                  entire pane on every view switch and replayed the .gp-view
@@ -924,7 +953,7 @@
                  prompted it. A crash in the shell must not take the view with
                  it, hence its own boundary. Outside the {#key} so a repository
                  tab switch cannot unmount the PTY. -->
-            <svelte:boundary failed={paneFailed}>
+            <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("terminal", error)}>
               <TerminalDock
                 open={terminalDockOpen}
                 onClose={() => interfaceStore.setTerminalDockOpen(false)}
@@ -985,7 +1014,7 @@
   {#if fleetMounted}
     <!-- Workspace-scoped, so it survives repository switches; hidden rather
          than unmounted for the same reason the terminal is. -->
-    <svelte:boundary failed={paneFailed}>
+    <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
         <LazyView load={loadFleetView} name="the Fleet dashboard" />
       </div>
@@ -1008,7 +1037,7 @@
   <!-- Overlay widgets: repo views stay in the pane boundaries above. Prompt
        and Diagnostics are isolated so a PromptModal render crash cannot take
        down the log that records it. -->
-  <svelte:boundary failed={paneFailed}>
+  <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("overlays", error)}>
     {#if rebaseMounted}
       <LazyMount load={loadRebaseModal} name="The rebase planner" props={{ isOpen: isRebaseModalOpen, onClose: () => (isRebaseModalOpen = false) }} />
     {/if}
@@ -1026,10 +1055,10 @@
     {/if}
     <Tooltip />
   </svelte:boundary>
-  <svelte:boundary failed={paneFailed}>
+  <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("prompt", error)}>
     <PromptModal />
   </svelte:boundary>
-  <svelte:boundary failed={paneFailed}>
+  <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("diagnostics", error)}>
     {#if diagnosticsMounted}
       <LazyMount load={loadDiagnosticsModal} name="Diagnostics" props={{ isOpen: isDiagnosticsOpen, onClose: () => (isDiagnosticsOpen = false) }} />
     {/if}

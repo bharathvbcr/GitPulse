@@ -337,7 +337,7 @@ describe("createDiagnostics", () => {
     expect(get(store)).toHaveLength(1);
   });
 
-  it("does not record host-runtime noise that is not a GitPulse failure", () => {
+  it("filters explicit development reload noise while retaining module failures", () => {
     const { store } = makeStore();
     store.warn(
       "console",
@@ -354,7 +354,10 @@ describe("createDiagnostics", () => {
     store.error("console", "Importing a module script failed.");
     store.error("unhandled-rejection", "undefined is not an object (evaluating 'module.default')");
     store.error("repo", "clone failed");
-    expect(get(store).map((entry) => entry.message)).toEqual(["clone failed"]);
+    expect(get(store).map((entry) => entry.message)).toEqual([
+      "clone failed", "undefined is not an object (evaluating 'module.default')", "Importing a module script failed.",
+    ]);
+    expect(get(store.health).suppressedRuntimeEvents).toBe(3);
   });
 
   it("drops host-runtime noise when restoring a persisted blob", () => {
@@ -392,10 +395,6 @@ describe("isHostRuntimeNoise", () => {
       "[TAURI] Couldn't find callback id 3802601472. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
       "IPC custom protocol failed, Tauri will now use the postMessage interface instead Load failed",
       "[hmr] Failed to reload /src/lib/components/SettingsModal.svelte. This could be due to syntax errors or importing non-existent modules. (see errors above)",
-      "Importing a module script failed.",
-      "undefined is not an object (evaluating 'module.default')",
-      "ResizeObserver loop completed with undelivered notifications.",
-      "ResizeObserver loop limit exceeded",
     ];
     for (const message of fromDump) {
       expect(isHostRuntimeNoise(message), message).toBe(true);
@@ -441,7 +440,7 @@ describe("formatDiagnosticReport", () => {
     ];
     // Recorded by the running build, so the header carries no build note.
     const report = formatDiagnosticReport(entries, generatedAt, "1.2.3");
-    expect(report).toContain("(t)\n  line one\n  line two");
+    expect(report).toContain("(t) [build unknown]\n  line one\n  line two");
   });
 
   it("marks single occurrences without an x-count suffix", () => {
@@ -539,7 +538,7 @@ describe("installGlobalDiagnostics", () => {
     uninstall();
   });
 
-  it("forwards host-runtime noise to the original console without recording it", () => {
+  it("forwards every global event to the sink that owns filtering and suppression counts", () => {
     const { recorded, originalWarn, originalError, con, target, uninstall } = setup();
     con.warn(
       "[TAURI] Couldn't find callback id 1. This might happen when the app is reloaded while Rust is running an asynchronous operation.",
@@ -548,7 +547,8 @@ describe("installGlobalDiagnostics", () => {
     target.emit("unhandledrejection", {
       reason: "undefined is not an object (evaluating 'module.default')",
     });
-    expect(recorded).toEqual([]);
+    expect(recorded.map(entry => entry.source)).toEqual(["console", "console", "unhandled-rejection"]);
+    expect(recorded[1].message).toBe("Importing a module script failed.");
     expect(originalWarn).toHaveBeenCalledTimes(1);
     expect(originalError).toHaveBeenCalled();
     uninstall();
@@ -703,9 +703,9 @@ describe("build stamping", () => {
     expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("says nothing when the entry came from the running build", () => {
+  it("omits the version mismatch note when versions match and identifies missing bundle provenance", () => {
     const report = formatDiagnosticReport([entry({ version: "0.0.3" })], generatedAt, "0.0.3");
-    expect(report).toContain("] ERROR (coverage)\n");
+    expect(report).toContain("] ERROR (coverage) [build unknown]\n");
     expect(report).not.toContain("recorded by");
   });
 

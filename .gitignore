@@ -1,4 +1,7 @@
 node_modules/
+/.build-evidence/
+/src-tauri/.vendor-lock/
+/src-tauri/.vendor-stage-*/
 dist/
 src-tauri/target/
 src-tauri/gen/

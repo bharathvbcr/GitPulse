@@ -43,6 +43,8 @@ export interface ConflictChunk {
 export type FileSegment = { Normal?: string; Conflict?: ConflictChunk };
 
 export interface ConflictDocument {
+  diagnostics: string[];
+  marker_size: number;
   file_path: string;
   segments: FileSegment[];
   total_conflicts: number;

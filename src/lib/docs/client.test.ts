@@ -17,6 +17,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 beforeEach(() => invoke.mockReset());
 
 describe("docs client", () => {
+  it("marks watcher refreshes as background work without demoting explicit refreshes", async () => {
+    invoke.mockResolvedValue({});
+    await docsRefresh("/r", { background: true });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_docs_refresh", { repoPath: "/r", background: true });
+    await docsRefresh("/r");
+    expect(invoke).toHaveBeenLastCalledWith("cmd_docs_refresh", { repoPath: "/r" });
+  });
+
   it("invokes refresh / status / search / broken / backlinks / graph / rename", async () => {
     invoke.mockResolvedValue({});
     await docsRefresh("/r");

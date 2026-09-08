@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyedList } from "../../ui/eachKeys";
   import {
     Eye,
     Code,
@@ -318,7 +319,7 @@
                 Backlinks ({backlinks.length})
               </div>
               <ul class="space-y-1.5">
-                {#each backlinks as link (link.path + ":" + link.line)}
+                {#each keyedList(backlinks, (link) => JSON.stringify([link.path, link.line, link.offset])) as { item: link, key: renderKey } (renderKey)}
                   <li class="text-[11px]">
                     <span class="font-mono text-accent">{link.path}</span>
                     <span class="text-textMuted"> — {link.context}</span>

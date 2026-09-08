@@ -548,3 +548,36 @@ describe("interfaceStore display preferences", () => {
     }
   });
 });
+
+it("persists bounded terminal preferences through the existing store", () => {
+  interfaceStore.reset();
+  interfaceStore.setTerminalFontSize(1000);
+  interfaceStore.setTerminalLauncher("codex");
+  expect(get(interfaceStore).terminalFontSize).toBe(24);
+  expect(get(interfaceStore).terminalLauncher).toBe("codex");
+  interfaceStore.setTerminalFontSize(Number.NaN);
+  expect(get(interfaceStore).terminalFontSize).toBe(12);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalLauncher).toBe("shell");
+});
+
+it("reloads terminal preferences and rejects corrupt stored values", async () => {
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalFontSize: 20, terminalLauncher: "manvi" }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: {localStorage:storage}, configurable:true, writable:true });
+    vi.resetModules();
+    const first = (await import("../interfaceStore")).interfaceStore;
+    expect(get(first)).toMatchObject({ terminalFontSize:20, terminalLauncher:"manvi" });
+    first.setTerminalFontSize(18); first.setTerminalLauncher("codex");
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({ terminalFontSize:18, terminalLauncher:"codex" });
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({terminalFontSize:"large", terminalLauncher:"unknown"}));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore)).toMatchObject({terminalFontSize:12, terminalLauncher:"shell"});
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});

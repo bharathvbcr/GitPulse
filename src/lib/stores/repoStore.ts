@@ -608,6 +608,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   };
 
   const { subscribe, set } = writable<RepoState>(emptyProjected());
+  // A full watcher/manual refresh can observe M→M content edits while every
+  // status field stays equal. Keep this signal separate from the UI snapshot
+  // so content readers update without invalidating every repository subscriber.
+  const contentRevisions = writable<Record<string, string>>({});
   let openEpoch = 0;
   let syncingFilter = false;
   let shortcutLocked = false;
@@ -1157,6 +1161,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // failed drain must retry on the next refresh, and the backend
       // memoizes per-tip so an unchanged repo costs one cheap call.
       if (internal.sessions[id]?.generation === generation) {
+        contentRevisions.update((revisions) => ({
+          ...Object.fromEntries(Object.values(internal.sessions)
+            .filter((session) => revisions[session.path] !== undefined)
+            .map((session) => [session.path, revisions[session.path]])),
+          [path]: `${generation}:${run}`,
+        }));
         void fetchBranchStats(id, path, generation);
       }
     } catch (err: unknown) {
@@ -1326,6 +1336,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   const store = {
     subscribe,
+    contentRevisions: { subscribe: contentRevisions.subscribe },
     setError: (error: string | null) => {
       // Every user-facing error funnels through here; mirror it into the
       // diagnostics log so the banner's dismissal never loses it.
@@ -1341,6 +1352,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       rawPath: string,
       extras: {
         allowBroken?: boolean;
+        /** Runs only while this successfully hydrated open still owns navigation. */
+        onReady?: (canonicalPath: string) => void;
         activate?: boolean;
         pinned?: boolean;
         restore?: {
@@ -1501,6 +1514,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       ) {
         revealGraph(latest);
       }
+      if (shouldPresent && requestId === openEpoch && latest &&
+          latest.generation === session.generation && !latest.error &&
+          latest.activeTab === session.activeTab && latest.viewSections === session.viewSections &&
+          latest.selectedFilePath === session.selectedFilePath && latest.selectedCommitId === session.selectedCommitId &&
+          latest.selectedDiffPending === session.selectedDiffPending &&
+          internal.workspace.activeId === opened.id) extras.onReady?.(path);
       ensureStatusPoll();
       flushPersist();
       return true;
@@ -1517,6 +1536,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
     },
     activateTab: async (id: string, extras: { force?: boolean } = {}) => {
+      openEpoch += 1;
       if (!extras.force && internal.workspace.activeId === id) return;
       if (internal.workspace.activeId !== id) {
         const next = activateTab(internal.workspace, id);
@@ -2383,6 +2403,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * being separate destinations.
      */
     setActiveTab: (tab: ViewTab, section?: string) => {
+      openEpoch += 1;
       const session = activeSession();
       if (!session) return;
       const resolved = section ? resolveSection(tab, section) : null;
@@ -2398,6 +2419,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     /** Change the lens within a view without leaving it. */
     setViewSection: (tab: ViewTab, section: string) => {
+      openEpoch += 1;
       const session = activeSession();
       if (!session) return;
       const resolved = resolveSection(tab, section);
@@ -2408,6 +2430,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       flushPersist();
     },
     inspectCommitInHistory: (commitId: string) => {
+      openEpoch += 1;
       const session = activeSession();
       if (!session || !commitId) return;
       applyToSession(session.id, session.generation, {

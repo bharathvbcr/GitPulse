@@ -13,20 +13,14 @@
  * nobody has claimed are held, bounded, and replayed the moment it subscribes.
  */
 
-export interface TerminalOutputEvent {
-  id: string;
-  data_b64: string;
-}
-
-export interface TerminalExitEvent {
-  id: string;
-  exit_code: number | null;
-  signal: string;
-}
+import type { TerminalOutputPayload, TerminalExitPayload } from "./runResult";
+export type TerminalOutputEvent = TerminalOutputPayload;
+export type TerminalExitEvent = TerminalExitPayload;
 
 export interface PtySessionHandlers {
   onOutput: (dataB64: string) => void;
   onExit: (event: TerminalExitEvent) => void;
+  onError?: (message: string) => void;
 }
 
 /** The subset of Tauri's `listen` this needs, injectable for tests. */
@@ -50,9 +44,12 @@ const MAX_PENDING_IDS = 32;
 interface Pending {
   chunks: string[];
   exit: TerminalExitEvent | null;
+  incomplete: boolean;
 }
 
 export interface PtyBus {
+  /** Hold ready listeners across a spawn, including the first session. */
+  prepare(): Promise<() => void>;
   /**
    * Routes one session's events until the returned function is called.
    * Anything already buffered for `id` is delivered synchronously first.
@@ -66,22 +63,33 @@ export function createPtyBus(listen: EventListen): PtyBus {
   const handlers = new Map<string, PtySessionHandlers>();
   const pending = new Map<string, Pending>();
   let unlisteners: Array<() => void> = [];
-  /**
-   * Bumped on every teardown so a `listen()` promise that resolves afterwards
-   * unregisters itself instead of leaving a live listener behind — the same
-   * race `createListenerTracker` exists for, inlined here because attachment
-   * is refcounted rather than owned by one component.
-   */
-  let generation = 0;
-  /**
-   * True between requesting the subscriptions and holding them. Without it,
-   * closing the last tab and opening another before the first `listen()`
-   * settled started a SECOND subscription beside the still-live first one,
-   * and every chunk in that window reached the session twice — duplicated
-   * bytes in the terminal, which reads as a corrupted shell rather than a
-   * bookkeeping slip.
-   */
-  let attaching = false;
+  let preparing = 0;
+  let attaching: Promise<void> | null = null;
+
+  const wanted = () => preparing > 0 || handlers.size > 0;
+
+  function report(message: string) {
+    for (const handler of handlers.values()) handler.onError?.(message);
+  }
+
+  // Tauri subscriptions can fail independently or resolve after a timeout.
+  // Each late success releases itself; every partial pair is also unwound.
+  function boundedListen<T>(event: string, handler: (event: { payload: T }) => void) {
+    return new Promise<() => void>((resolve, reject) => {
+      let expired = false;
+      const timer = setTimeout(() => {
+        expired = true;
+        reject(new Error(`Timed out listening for ${event}`));
+      }, 5000);
+      try {
+        void listen<T>(event, handler).then((release) => {
+          clearTimeout(timer);
+          if (expired) safely(release);
+          else resolve(release);
+        }, (error: unknown) => { clearTimeout(timer); reject(error); });
+      } catch (error) { clearTimeout(timer); reject(error); }
+    });
+  }
 
   function pendingFor(id: string): Pending {
     const existing = pending.get(id);
@@ -91,12 +99,20 @@ export function createPtyBus(listen: EventListen): PtyBus {
       const oldest = pending.keys().next();
       if (!oldest.done) pending.delete(oldest.value);
     }
-    const fresh: Pending = { chunks: [], exit: null };
+    const fresh: Pending = { chunks: [], exit: null, incomplete: false };
     pending.set(id, fresh);
     return fresh;
   }
 
   function handleOutput(payload: TerminalOutputEvent) {
+    if (!payload || typeof payload.id !== "string" || typeof payload.data_b64 !== "string") {
+      report("Invalid terminal output event");
+      return;
+    }
+    if (payload.data_b64.length > 8192) {
+      handlers.get(payload.id)?.onError?.("Terminal output chunk exceeded its limit");
+      return;
+    }
     const target = handlers.get(payload.id);
     if (target) {
       target.onOutput(payload.data_b64);
@@ -104,10 +120,19 @@ export function createPtyBus(listen: EventListen): PtyBus {
     }
     const held = pendingFor(payload.id);
     held.chunks.push(payload.data_b64);
-    if (held.chunks.length > MAX_PENDING_CHUNKS_PER_ID) held.chunks.shift();
+    if (held.chunks.length > MAX_PENDING_CHUNKS_PER_ID) {
+      held.chunks.shift();
+      held.incomplete = true;
+    }
   }
 
   function handleExit(payload: TerminalExitEvent) {
+    if (!payload || typeof payload.id !== "string" || typeof payload.signal !== "string" ||
+        !(payload.exit_code === null || (Number.isInteger(payload.exit_code) && Number.isFinite(payload.exit_code))) ||
+        (payload.error != null && typeof payload.error !== "string")) {
+      report("Invalid terminal exit event");
+      return;
+    }
     const target = handlers.get(payload.id);
     if (target) {
       target.onExit(payload);
@@ -119,30 +144,26 @@ export function createPtyBus(listen: EventListen): PtyBus {
     pendingFor(payload.id).exit = payload;
   }
 
-  function attach() {
-    if (attaching || unlisteners.length > 0 || handlers.size === 0) return;
-    attaching = true;
-    const mine = ++generation;
-    void Promise.all([
-      listen<TerminalOutputEvent>("terminal-output", (e) => handleOutput(e.payload)),
-      listen<TerminalExitEvent>("terminal-exit", (e) => handleExit(e.payload)),
-    ]).then((fns) => {
-      attaching = false;
-      if (mine === generation && handlers.size > 0) {
-        unlisteners = fns;
-        return;
-      }
-      // Invalidated while in flight: drop what arrived, then re-evaluate —
-      // a tab opened during the unwind still needs a live subscription.
-      for (const fn of fns) safely(fn);
-      attach();
-    });
+  function attach(): Promise<void> {
+    if (unlisteners.length > 0) return Promise.resolve();
+    if (attaching) return attaching;
+    const attempt = Promise.allSettled([
+      boundedListen<TerminalOutputEvent>("terminal-output", (e) => handleOutput(e.payload)),
+      boundedListen<TerminalExitEvent>("terminal-exit", (e) => handleExit(e.payload)),
+    ]).then((results) => {
+      const releases = results.flatMap((r) => r.status === "fulfilled" ? [r.value] : []);
+      const failure = results.find((r) => r.status === "rejected");
+      if (failure || !wanted()) {
+        for (const release of releases) safely(release);
+        if (failure?.status === "rejected") throw failure.reason;
+      } else unlisteners = releases;
+    }).finally(() => { attaching = null; });
+    attaching = attempt;
+    return attempt;
   }
 
   function detach() {
-    if (handlers.size > 0) return;
-    // Invalidates any attach still in flight, so it unregisters itself.
-    generation += 1;
+    if (wanted()) return;
     const fns = unlisteners;
     unlisteners = [];
     for (const fn of fns) safely(fn);
@@ -150,12 +171,25 @@ export function createPtyBus(listen: EventListen): PtyBus {
   }
 
   return {
+    async prepare() {
+      preparing += 1;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        preparing -= 1;
+        detach();
+      };
+      try { await attach(); return release; }
+      catch (error) { release(); throw error; }
+    },
     subscribe(id, session) {
       handlers.set(id, session);
-      attach();
+      void attach().catch((error: unknown) => session.onError?.(String(error)));
       const held = pending.get(id);
       if (held) {
         pending.delete(id);
+        if (held.incomplete) session.onError?.("Terminal output is incomplete: early output exceeded its buffer limit");
         for (const chunk of held.chunks) session.onOutput(chunk);
         if (held.exit) session.onExit(held.exit);
       }

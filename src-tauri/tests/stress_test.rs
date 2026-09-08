@@ -617,11 +617,14 @@ theirs line without end marker
 "#;
 
     let doc = ConflictResolver::parse("broken.txt", broken_conflict);
-    // Unclosed markers fallback to normal text segments to prevent data loss
+    // Recovery keeps all source bytes, while malformed markers cannot be
+    // finalized as a successfully resolved file.
     assert_eq!(doc.total_conflicts, 0);
-    let resolved = ConflictResolver::render_resolved(&doc).unwrap();
-    assert!(resolved.contains("ours line"));
-    assert!(resolved.contains("theirs line without end marker"));
+    assert!(ConflictResolver::render_resolved(&doc).is_err());
+    assert_eq!(
+        ConflictResolver::render_preview(&doc).unwrap(),
+        broken_conflict
+    );
 }
 
 #[test]

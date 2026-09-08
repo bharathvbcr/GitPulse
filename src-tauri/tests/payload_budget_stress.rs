@@ -147,18 +147,12 @@ fn blame_on_a_large_file_stays_within_its_budget() {
     let (dir, _) = huge_diff_repo(60_000, 120);
     let repo = dir.path().to_str().expect("utf8 path");
 
-    let lines = GitReader::get_file_blame(repo, "big.txt").expect("blame");
-    // Bounded by the porcelain budget rather than by the file's line count.
-    let bytes: usize = lines.iter().map(|l| l.content.len() + 96).sum();
+    // Vec<BlameLine> cannot carry a truncation verdict. Returning a prefix
+    // used to satisfy this budget test while claiming a complete file in UI.
+    let error =
+        GitReader::get_file_blame(repo, "big.txt").expect_err("partial blame must be explicit");
     assert!(
-        bytes <= budget::MAX_BLAME_BYTES,
-        "blame payload of ~{bytes} bytes exceeded the {} byte budget",
-        budget::MAX_BLAME_BYTES
-    );
-    assert!(!lines.is_empty(), "blame must still return what it read");
-    // No fabricated record from a half-parsed porcelain block.
-    assert!(
-        lines.iter().all(|l| l.commit_id.len() == 40),
-        "every surviving blame line must carry a whole commit id"
+        error.contains("Blame unavailable") && error.contains("exceeded"),
+        "the incomplete read must explain its limit: {error}"
     );
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   ALL_STATUSES,
+  latestRuns,
+  rowNeedsAttention,
   degradedSummary,
   emptyTally,
   insightSummary,
@@ -633,4 +635,68 @@ describe("insightSummary", () => {
     expect(summary.dirtyWorktrees).toBe(0);
     expect(summary.unscannedDirty).toBe(1);
   });
+});
+
+
+describe("Overview adversarial joins", () => {
+  it("does not call a partly scanned task clean", () => {
+    const p = projectWork(inputs({
+      leases: [lease("T")], bindings: { "/a": "T", "/b": "T" },
+      worktrees: [worktree("/a", "a"), { ...worktree("/b", "b"), dirty_files: null }],
+    }));
+    expect(dirtyCount(p.rows[0])).toBe(-1);
+    expect(insightSummary(p).unscannedDirty).toBe(1);
+  });
+
+  it.each([NaN, Infinity, -2, 0.5])("rejects an invalid dirty count %s as unmeasured", (dirty) => {
+    const p = projectWork(inputs({ worktrees: [{ ...worktree("/a", "a"), dirty_files: dirty }] }));
+    expect(dirtyCount(p.rows[0])).toBe(-1);
+    expect(insightSummary(p).unscannedDirty).toBe(1);
+  });
+
+  it("counts unique PRs even when two worktrees share a branch", () => {
+    const p = projectWork(inputs({ worktrees: [worktree("/a", "shared"), worktree("/b", "shared")], pullRequests: [pr(1, "shared")] }));
+    expect(p.rows.every(row => row.pullRequests.length === 1)).toBe(true);
+    expect(insightSummary(p).pullRequests).toBe(1);
+  });
+
+  it("deduplicates repeated worktree, PR and run identities", () => {
+    const wt = worktree("/a", "a");
+    const p = projectWork(inputs({ worktrees: [wt, wt], pullRequests: [pr(1, "a"), pr(1, "a")], runs: [run(1, "a"), run(1, "a")] }));
+    expect(p.rows[0].worktrees).toHaveLength(1);
+    expect(p.rows[0].pullRequests).toHaveLength(1);
+    expect(p.rows[0].runs).toHaveLength(1);
+    expect(insightSummary(p).worktrees).toBe(1);
+  });
+
+  it("never reads task titles from the object prototype", () => {
+    const p = projectWork(inputs({ leases: [lease("constructor")] }));
+    expect(p.rows[0].title).toBe("");
+  });
+});
+
+it("keeps the latest observed workflow state regardless of response order", () => {
+  const passed = { ...run(3, "a"), created_at: "2026-09-07T12:00:00Z" };
+  const failed = { ...run(2, "a"), created_at: "2026-09-06T12:00:00Z", conclusion: "failure" };
+  for (const runs of [[failed, passed], [passed, failed], [failed, passed, passed]]) {
+    const p = projectWork(inputs({ worktrees: [worktree("/a", "a")], operations: { "/a": null }, runs }));
+    expect(latestRuns(p.rows[0])).toEqual([passed]);
+    expect(rowNeedsAttention(p.rows[0])).toBe(false);
+  }
+});
+
+it("attention includes failed CI, requested changes and unmeasured operations", () => {
+  const base = { worktrees: [worktree("/a", "a")], operations: { "/a": null } };
+  for (const extra of [
+    { pullRequests: [{ ...pr(1, "a"), ci_status: "failure" }] },
+    { pullRequests: [{ ...pr(1, "a"), review_decision: "CHANGES_REQUESTED" }] },
+    { runs: [{ ...run(2, "a"), conclusion: "timed_out" }] },
+    { operations: {} },
+  ]) expect(rowNeedsAttention(projectWork(inputs({ ...base, ...extra })).rows[0])).toBe(true);
+});
+
+it("does not require a working-tree scan for bare repositories", () => {
+  const p = projectWork(inputs({ worktrees: [{ ...worktree("/bare", null), is_bare: true, dirty_files: null }] }));
+  expect(insightSummary(p).unscannedDirty).toBe(0);
+  expect(rowNeedsAttention(p.rows[0])).toBe(false);
 });

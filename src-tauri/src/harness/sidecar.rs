@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,6 +72,12 @@ const MAX_SIDECAR_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// flooding, and the cycle faults instead of reading forever within its
 /// timeout window.
 const MAX_RESPONSE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// Frames that may wait between the stdout pump and the serial caller. The
+/// per-call byte budget only applies while a request is actively draining the
+/// queue; without a channel bound an idle or unsolicited child could retain
+/// arbitrary `String` frames in this process. Eight maximum-sized frames match
+/// [`MAX_RESPONSE_TOTAL_BYTES`]. A ninth faults the connection immediately.
+const MAX_QUEUED_STDOUT_FRAMES: usize = MAX_RESPONSE_TOTAL_BYTES / MAX_SIDECAR_FRAME_BYTES;
 
 /// Why the harness is not answering, in terms a user can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +182,45 @@ fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
     // helper holding our pipes is exactly the case this reader is faulting on.
     guard.kill_tree(&mut child);
     let _ = guard.reap(|| child.wait());
+}
+
+/// Starts the one canonical stdout pump used by production and live sidecar
+/// tests. The bounded channel covers time spent between calls, when no request
+/// loop exists to enforce [`MAX_RESPONSE_TOTAL_BYTES`]. Backpressure alone is
+/// insufficient here: it would leave a hostile child blocked on its pipe and
+/// apparently healthy, so queue overflow kills and reaps the connection.
+fn spawn_stdout_pump(
+    stdout: std::process::ChildStdout,
+    child: std::sync::Arc<Mutex<Child>>,
+    guard: std::sync::Arc<crate::procguard::Registration>,
+) -> Receiver<String> {
+    let (tx, rx) = mpsc::sync_channel::<String>(MAX_QUEUED_STDOUT_FRAMES);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match tx.try_send(line) {
+                        Ok(()) => {}
+                        Err(TrySendError::Disconnected(_)) => return,
+                        Err(TrySendError::Full(_)) => {
+                            force_kill(&child, &guard);
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    force_kill(&child, &guard);
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Clean-shutdown escalation ladder, factored out of [`Drop for Sidecar`]
@@ -756,30 +801,7 @@ fn spawn() -> Result<Sidecar, HarnessError> {
 
     let child = std::sync::Arc::new(Mutex::new(child));
     let guard = std::sync::Arc::new(guard);
-    let child_for_stdout = child.clone();
-    let guard_for_stdout = guard.clone();
-
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
-                Ok(Some(line)) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if tx.send(line).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => return,
-                Err(_) => {
-                    force_kill(&child_for_stdout, &guard_for_stdout);
-                    return;
-                }
-            }
-        }
-    });
+    let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone());
 
     let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let tail_writer = tail.clone();
@@ -1323,14 +1345,9 @@ mod tests {
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
 
-        let (tx, rx) = mpsc::channel::<String>();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    return;
-                }
-            }
-        });
+        let child = std::sync::Arc::new(Mutex::new(child));
+        let guard = std::sync::Arc::new(guard);
+        let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone());
 
         let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         let tail_writer = tail.clone();
@@ -1346,8 +1363,8 @@ mod tests {
         });
 
         Sidecar {
-            child: std::sync::Arc::new(Mutex::new(child)),
-            guard: std::sync::Arc::new(guard),
+            child,
+            guard,
             stdin: Some(stdin),
             lines: rx,
             stderr: tail,
@@ -1356,6 +1373,43 @@ mod tests {
             next_id: 0,
             write_deadline,
         }
+    }
+
+    /// Regression: the response byte budget is enforced by `call`, so it did
+    /// nothing while the sidecar was idle. The production stdout pump used an
+    /// unbounded channel and could retain arbitrary unsolicited frames until a
+    /// later call happened to drain them. Overflow now kills the live child at
+    /// the pump seam even when no request is active.
+    #[test]
+    fn unsolicited_idle_stdout_flood_faults_the_live_sidecar() {
+        let script = format!(
+            "i=0; while [ $i -lt {} ]; do printf 'noise-%s\\n' \"$i\"; i=$((i + 1)); done; exec sleep 30",
+            MAX_QUEUED_STDOUT_FRAMES + 1
+        );
+        let sidecar = scripted_sidecar(&script, WRITE_DEADLINE);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = sidecar
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_wait()
+                .expect("poll flooded sidecar")
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle stdout overflow left the sidecar alive"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            sidecar.lines.try_iter().count(),
+            MAX_QUEUED_STDOUT_FRAMES,
+            "the retained frame count must stay at the declared bound"
+        );
     }
 
     /// Regression (stdin write stall): `write_all` on a child that never

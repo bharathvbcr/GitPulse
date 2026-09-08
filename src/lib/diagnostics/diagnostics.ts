@@ -1,4 +1,4 @@
-import { writable } from "svelte/store";
+import { writable, type Readable } from "svelte/store";
 import { formatError } from "../ui/formatError";
 import { browserStorage, type StorageLike } from "../repos/persist";
 import { escapeRegExp } from "../text/lineSearch";
@@ -22,6 +22,8 @@ export type DiagnosticSeverity = "error" | "warning";
  */
 export const APP_VERSION: string =
   typeof __APP_VERSION__ === "string" && __APP_VERSION__ ? __APP_VERSION__ : "unknown";
+export const APP_BUILD_ID: string =
+  typeof __APP_BUILD_ID__ === "string" && __APP_BUILD_ID__ ? __APP_BUILD_ID__ : "unknown";
 
 export interface DiagnosticEntry {
   /** Monotonic sequence id; higher is newer. */
@@ -44,6 +46,8 @@ export interface DiagnosticEntry {
    * is exactly how a fixed bug reads as a live one.
    */
   readonly version?: string;
+  /** Exact bundle identity; absent on entries saved by older versions. */
+  readonly buildId?: string;
   /**
    * Set when the folded occurrences were not textually identical.
    *
@@ -497,6 +501,14 @@ function redactValueAtDepth(value: string, depth: number): string {
   return redactContextualDiagnosticText(redactEmbeddedCliArrays(serialized, depth));
 }
 
+// Use the same credential vocabulary for JSON, argv, and plain assignments.
+const SECRET_ASSIGNMENT_NAMES = SECRET_FIELD_NAMES
+  // Header-specific stages above preserve auth schemes and consume cookies
+  // through end-of-line. Reprocessing them as scalar fields loses that shape.
+  .filter(name => !["authorization", "cookie", "set_cookie"].includes(name))
+  .map(name => escapeRegExp(name).replaceAll("_", "[_-]?"))
+  .join("|");
+
 function redactContextualDiagnosticText(value: string): string {
   let out = value
     // A private-key body has no reliable prefix of its own, so remove the
@@ -570,15 +582,15 @@ function redactContextualDiagnosticText(value: string): string {
       "$1<redacted>@",
     )
     .replace(
-      /((?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")/gi,
+      new RegExp(String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")`, "gi"),
       redactEmbeddedAssignment,
     )
     .replace(
-      /((?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])/gi,
+      new RegExp(String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])`, "gi"),
       redactEmbeddedAssignment,
     )
     .replace(
-      /(["']?(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|aws[_-]?access[_-]?key[_-]?id)["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)/gi,
+      new RegExp(String.raw`(["']?(?:${SECRET_ASSIGNMENT_NAMES})["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)`, "gi"),
       redactAssignedValue,
     )
     .replace(
@@ -619,8 +631,18 @@ export function formatDiagnosticFailure(detail: unknown): string {
   }
 }
 
+export interface DiagnosticsHealth {
+  persistence: "ready" | "saved" | "memory-only";
+  persistenceError: string | null;
+  restorationError: string | null;
+  suppressedRuntimeEvents: number;
+}
+
 export interface DiagnosticsStore {
   subscribe: (run: (entries: readonly DiagnosticEntry[]) => void) => () => void;
+  readonly health: Readable<DiagnosticsHealth>;
+  /** Retry explicitly after unavailable/quota-limited storage; never loop per error. */
+  retryPersistence(): void;
   error(source: string, detail: unknown): void;
   warn(source: string, detail: unknown): void;
   clear(): void;
@@ -720,7 +742,8 @@ export function diagnosticFingerprint(message: string): string {
  * otherwise drown the diagnostics ring (and survive relaunch via the
  * persisted blob).
  */
-export function isHostRuntimeNoise(message: string): boolean {
+export function isHostRuntimeNoise(message: string, development = import.meta.env.DEV): boolean {
+  if (!development) return false;
   const text = message.trim();
   if (text.startsWith("[TAURI] Couldn't find callback id ")) return true;
   if (
@@ -731,12 +754,8 @@ export function isHostRuntimeNoise(message: string): boolean {
     return true;
   }
   if (text.startsWith("[hmr] Failed to reload ")) return true;
-  if (text === "Importing a module script failed." || text === "Importing a module script failed") {
-    return true;
-  }
-  if (text.includes("(evaluating 'module.default')")) return true;
-  if (text.includes("ResizeObserver loop completed with undelivered notifications")) return true;
-  if (text.includes("ResizeObserver loop limit exceeded")) return true;
+  // A module-load or observer error also occurs in real product failures.
+  // Only identifiable development reload chatter is safe to suppress.
   return false;
 }
 
@@ -745,9 +764,9 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   const record = raw as Record<string, unknown>;
   if (
     typeof record.id !== "number" ||
-    !Number.isFinite(record.id) ||
+    !Number.isSafeInteger(record.id) || record.id < 1 ||
     typeof record.at !== "number" ||
-    !Number.isFinite(record.at) ||
+    !Number.isFinite(record.at) || !Number.isFinite(new Date(record.at).getTime()) ||
     typeof record.source !== "string" ||
     typeof record.message !== "string" ||
     !record.message
@@ -774,48 +793,64 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
     message: clampMessage(redactDiagnosticText(record.message)),
     count,
     ...(version ? { version } : {}),
+    ...(typeof record.buildId === "string" && record.buildId.trim()
+      ? { buildId: redactDiagnosticText(record.buildId).slice(0, 96) } : {}),
     // Strictly `true`; a truthy string from a hostile blob must not become a
     // disclosure the app never made.
     ...(record.varied === true ? { varied: true } : {}),
   };
 }
 
-function loadPersisted(storage: StorageLike | null): {
+function loadPersisted(storage: StorageLike | null, development: boolean): {
   entries: DiagnosticEntry[];
   nextId: number;
   rewritten: boolean;
+  restorationError: string | null;
 } {
-  if (!storage) return { entries: [], nextId: 0, rewritten: false };
+  const empty = { entries: [], nextId: 0, rewritten: false, restorationError: null };
+  if (!storage) return empty;
   let parsed: unknown = null;
   try {
     const raw = storage.getItem(DIAGNOSTIC_STORAGE_KEY);
+    if (raw && raw.length > 16 * 1024 * 1024) {
+      return { ...empty, restorationError: "Saved diagnostics exceeded the 16 MiB read limit." };
+    }
     parsed = raw ? (JSON.parse(raw) as unknown) : null;
-  } catch {
-    /* corrupt blob behaves like an empty log */
+  } catch (error) {
+    return { ...empty, restorationError: clampMessage(formatDiagnosticFailure(error)) };
   }
-  if (!Array.isArray(parsed)) return { entries: [], nextId: 0, rewritten: false };
+  if (parsed === null) return empty;
+  if (!Array.isArray(parsed)) return { ...empty, restorationError: "Saved diagnostics are not a log array." };
   const sanitized = parsed
     .map(sanitizeEntry)
     .filter((entry): entry is DiagnosticEntry => entry !== null);
-  const entries = sanitized
-    .filter((entry) => !isHostRuntimeNoise(entry.message))
+  let entries = sanitized
+    .filter((entry) => !isHostRuntimeNoise(entry.message, development))
     // Newest first regardless of how the blob was written.
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_DIAGNOSTIC_ENTRIES);
-  const nextId = entries.length > 0 ? entries[0].id : 0;
+  // Persisted IDs are untrusted. Keep every valid event, repairing duplicate
+  // or exhausted IDs before they can crash Diagnostics' keyed list.
+  const repairIds = new Set(entries.map(entry => entry.id)).size !== entries.length ||
+    (entries[0]?.id ?? 0) >= Number.MAX_SAFE_INTEGER - MAX_DIAGNOSTIC_ENTRIES;
+  if (repairIds) entries = entries.map((entry, index) => ({ ...entry, id: entries.length - index }));
+  const nextId = entries[0]?.id ?? 0;
   const sanitizedChanged = sanitized.some(
     (entry, index) => JSON.stringify(entry) !== JSON.stringify(parsed[index]),
   );
   const rewritten =
-    sanitized.length !== parsed.length || entries.length !== sanitized.length || sanitizedChanged;
-  return { entries, nextId, rewritten };
+    repairIds || sanitized.length !== parsed.length || entries.length !== sanitized.length || sanitizedChanged;
+  const invalid = parsed.length - sanitized.length;
+  return { entries, nextId, rewritten, restorationError: invalid > 0 ? `${invalid} invalid saved diagnostic entries could not be restored.` : null };
 }
 
-export function createDiagnostics(deps: { storage?: StorageLike | null; now?: () => number } = {}): DiagnosticsStore {
+export function createDiagnostics(deps: { storage?: StorageLike | null; now?: () => number; development?: boolean; buildId?: string } = {}): DiagnosticsStore {
+  const buildId = redactDiagnosticText(deps.buildId ?? APP_BUILD_ID).slice(0, 96);
   // `undefined` means "pick the browser storage"; explicit null disables it.
   const storage = deps.storage !== undefined ? deps.storage : browserStorage();
   const now = deps.now ?? (() => Date.now());
-  const restored = loadPersisted(storage);
+  const development = deps.development ?? import.meta.env.DEV;
+  const restored = loadPersisted(storage, development);
 
   let entries: DiagnosticEntry[] = restored.entries;
   let nextId = restored.nextId;
@@ -824,13 +859,23 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
   let headKey: string | null =
     entries.length > 0 ? diagnosticFingerprint(entries[0].message) : null;
   const store = writable<readonly DiagnosticEntry[]>(entries);
+  const health = writable<DiagnosticsHealth>({
+    persistence: storage && !restored.restorationError ? "ready" : "memory-only",
+    persistenceError: storage ? null : "Persistent storage is unavailable.",
+    restorationError: restored.restorationError,
+    suppressedRuntimeEvents: 0,
+  });
+  let persistenceBlocked = false;
 
-  function persist() {
-    if (!storage) return;
+  function persist(force = false) {
+    if (!storage || (persistenceBlocked && !force)) return;
     try {
       storage.setItem(DIAGNOSTIC_STORAGE_KEY, JSON.stringify(entries));
-    } catch {
-      /* quota / private mode — the in-memory ring stays authoritative */
+      persistenceBlocked = false;
+      health.update(state => ({ ...state, persistence: "saved", persistenceError: null }));
+    } catch (error) {
+      persistenceBlocked = true;
+      health.update(state => ({ ...state, persistence: "memory-only", persistenceError: clampMessage(formatDiagnosticFailure(error)) }));
     }
   }
 
@@ -839,7 +884,10 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
   function record(severity: DiagnosticSeverity, source: string, detail: unknown) {
     const safeSource = clampMessage(redactDiagnosticText(source));
     const message = clampMessage(formatDiagnosticFailure(detail));
-    if (isHostRuntimeNoise(message)) return;
+    if (isHostRuntimeNoise(message, development)) {
+      health.update(state => ({ ...state, suppressedRuntimeEvents: Math.min(Number.MAX_SAFE_INTEGER, state.suppressedRuntimeEvents + 1) }));
+      return;
+    }
     const key = diagnosticFingerprint(message);
     const newest = entries[0];
     if (
@@ -850,7 +898,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       // Never fold a new occurrence into an entry recorded by a different
       // build: coalescing rewrites the timestamp, so the merged entry would
       // claim the older build produced something it never saw.
-      newest.version === APP_VERSION
+      newest.version === APP_VERSION && newest.buildId === buildId
     ) {
       // Coalesce repeats (error storms) into one entry with a counter. The
       // retained text is the newest occurrence's, because `at` moves to the
@@ -861,7 +909,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
         {
           ...newest,
           message,
-          count: newest.count + 1,
+          count: Math.min(Number.MAX_SAFE_INTEGER, newest.count + 1),
           at: now(),
           ...(varied ? { varied: true as const } : {}),
         },
@@ -871,9 +919,13 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       persist();
       return;
     }
+    if (nextId >= Number.MAX_SAFE_INTEGER - 1) {
+      entries = entries.map((entry, index) => ({ ...entry, id: entries.length - index }));
+      nextId = entries.length;
+    }
     nextId += 1;
     entries = [
-      { id: nextId, at: now(), severity, source: safeSource, message, count: 1, version: APP_VERSION },
+      { id: nextId, at: now(), severity, source: safeSource, message, count: 1, version: APP_VERSION, buildId },
       ...entries,
     ];
     headKey = key;
@@ -886,6 +938,8 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
 
   return {
     subscribe: store.subscribe,
+    health: { subscribe: health.subscribe },
+    retryPersistence: () => persist(true),
     error: (source, detail) => record("error", source, detail),
     warn: (source, detail) => record("warning", source, detail),
     clear: () => {
@@ -893,11 +947,15 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
       nextId = 0;
       headKey = null;
       store.set(entries);
+      health.update(state => ({ ...state, restorationError: null, suppressedRuntimeEvents: 0 }));
       if (storage) {
         try {
           storage.removeItem(DIAGNOSTIC_STORAGE_KEY);
-        } catch {
-          /* ignore removal failures; memory is already cleared */
+          persistenceBlocked = false;
+          health.update(state => ({ ...state, persistence: "saved", persistenceError: null }));
+        } catch (error) {
+          persistenceBlocked = true;
+          health.update(state => ({ ...state, persistence: "memory-only", persistenceError: clampMessage(formatDiagnosticFailure(error)) }));
         }
       }
     },
@@ -932,18 +990,25 @@ export function formatDiagnosticReport(
   entries: readonly DiagnosticEntry[],
   generatedAt: Date = new Date(),
   runningVersion: string = APP_VERSION,
+  health?: DiagnosticsHealth,
 ): string {
+  const storageNotes = health ? [
+    diagnosticPersistenceLabel(health),
+    ...(health.persistenceError ? [`Saving unavailable: ${formatDiagnosticFailure(health.persistenceError)}`] : []),
+    ...(health.restorationError ? [`Saved history incomplete: ${formatDiagnosticFailure(health.restorationError)}`] : []),
+    ...(health.suppressedRuntimeEvents ? [`Development reload messages suppressed this session: ${health.suppressedRuntimeEvents}`] : []),
+  ] : [];
   const occurrences = (severity: DiagnosticSeverity) =>
     entries.reduce((total, entry) => (entry.severity === severity ? total + entry.count : total), 0);
   if (entries.length === 0) {
-    return `GitPulse diagnostics — nothing recorded as of ${generatedAt.toISOString()}`;
+    return [`GitPulse diagnostics — nothing recorded as of ${generatedAt.toISOString()}`, ...storageNotes].join("\n");
   }
   const blocks = entries.map((entry) => {
     const repeats = entry.count > 1 ? ` x${entry.count}` : "";
     // `x3` on its own would read as three verbatim repeats.
     const spread =
       entry.count > 1 && entry.varied ? " [occurrences differed; showing the most recent]" : "";
-    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${redactDiagnosticText(entry.source)})${spread}${staleBuildNote(entry.version, runningVersion)}`;
+    const header = `[${new Date(entry.at).toISOString()}] ${entry.severity.toUpperCase()}${repeats} (${redactDiagnosticText(entry.source)})${spread}${staleBuildNote(entry.version, runningVersion)} [build ${redactDiagnosticText(entry.buildId ?? "unknown")}]`;
     const body = redactDiagnosticText(entry.message)
       .split("\n")
       .map((line) => `  ${line}`)
@@ -953,9 +1018,19 @@ export function formatDiagnosticReport(
   return [
     `GitPulse diagnostics — ${occurrences("error")} error(s), ${occurrences("warning")} warning(s), ${entries.length} distinct`,
     `Generated: ${generatedAt.toISOString()} by GitPulse ${runningVersion}`,
+    `Running build: ${APP_BUILD_ID}`,
+    ...storageNotes,
     "",
     ...blocks,
   ].join("\n");
+}
+
+export function diagnosticPersistenceLabel(health: DiagnosticsHealth): string {
+  switch (health.persistence) {
+    case "saved": return "App diagnostics saved locally";
+    case "ready": return "App diagnostics storage ready";
+    case "memory-only": return "App diagnostics are memory only — may be lost on restart";
+  }
 }
 
 /** Local-clock rendering for the panel list: time only for today, date+time otherwise. */
@@ -1005,7 +1080,6 @@ export function installGlobalDiagnostics(
   function note(severity: DiagnosticSeverity, source: string, parts: unknown[]) {
     if (forwarding) return;
     const message = parts.map(formatDiagnosticFailure).join(" ");
-    if (isHostRuntimeNoise(message)) return;
     forwarding = true;
     try {
       // Severity names ("warning") differ from sink method names ("warn").
@@ -1027,13 +1101,11 @@ export function installGlobalDiagnostics(
 
   const onUnhandledRejection = (event: DiagnosticEventLike) => {
     const detail = formatDiagnosticFailure(event.reason);
-    if (isHostRuntimeNoise(detail)) return;
     note("error", "unhandled-rejection", [detail]);
     originalError(`[gitpulse] unhandled promise rejection: ${detail}`);
   };
   const onUncaughtError = (event: DiagnosticEventLike) => {
     const detail = formatDiagnosticFailure(event.error ?? event.message);
-    if (isHostRuntimeNoise(detail)) return;
     note("error", "uncaught-error", [detail]);
     originalError(`[gitpulse] uncaught error: ${detail}`);
   };

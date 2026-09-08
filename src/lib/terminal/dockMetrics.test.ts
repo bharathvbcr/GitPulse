@@ -8,6 +8,9 @@ import {
 } from "./dockMetrics";
 
 describe("clampTerminalDockHeight", () => {
+  it("reserves room for the toolbar, search, status and at least two terminal rows", () => {
+    expect(clampTerminalDockHeight(120)).toBeGreaterThanOrEqual(200);
+  });
   it("keeps a sensible height unchanged", () => {
     expect(clampTerminalDockHeight(300)).toBe(300);
   });

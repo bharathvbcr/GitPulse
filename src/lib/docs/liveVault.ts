@@ -1,39 +1,29 @@
-/**
- * Debounced doc-vault refresh on the same watcher path as the live index.
- */
-
+/** Paced document rebuilds on the watcher path. */
 import { docsRefresh } from "./client";
+import { diagnostics } from "../diagnostics/diagnostics";
+import { createPacedQueue, type BackgroundScope } from "../async/pacedQueue";
 
-const DEBOUNCE_MS = 200;
-const timers = new Map<string, ReturnType<typeof setTimeout>>();
-const inflight = new Set<string>();
+const queue = createPacedQueue({
+  debounceMs: 200,
+  maxWaitMs: 1_000,
+  restMs: 1_000,
+  capacity: 64,
+  run: async (repoPath) => { await docsRefresh(repoPath, { background: true }); },
+  onError: (repoPath, error) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    diagnostics.warn("docs-refresh", `${repoPath}: ${detail}`);
+  },
+  onOverflow: () => diagnostics.warn("docs-refresh", "Background document refresh queue is full (64 repositories); additional repositories were not refreshed."),
+});
 
 export function onDocsRepoChanged(repoPath: string): void {
-  const existing = timers.get(repoPath);
-  if (existing) clearTimeout(existing);
-  timers.set(
-    repoPath,
-    setTimeout(() => {
-      timers.delete(repoPath);
-      void run(repoPath);
-    }, DEBOUNCE_MS),
-  );
-}
-
-async function run(repoPath: string): Promise<void> {
-  if (inflight.has(repoPath)) return;
-  inflight.add(repoPath);
-  try {
-    await docsRefresh(repoPath);
-  } catch {
-    // Soft: a vault rebuild failure must not break the watcher path.
-  } finally {
-    inflight.delete(repoPath);
-  }
+  queue.enqueue(repoPath);
 }
 
 export function resetDocsVaultRefresh(): void {
-  for (const timer of timers.values()) clearTimeout(timer);
-  timers.clear();
-  inflight.clear();
+  queue.reset();
+}
+
+export function setDocsVaultRefreshScope(scope: BackgroundScope | null): void {
+  queue.setScope(scope);
 }

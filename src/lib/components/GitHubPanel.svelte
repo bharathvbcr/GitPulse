@@ -18,6 +18,7 @@
 </script>
 
 <script lang="ts">
+  import { keyedList } from "../ui/eachKeys";
   import { SvelteSet } from "svelte/reactivity";
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
@@ -631,7 +632,7 @@
       {/if}
       {#if ciReportOpen}
         <div class="space-y-1 px-3">
-          {#each ciReport.steps as step (step.name)}
+          {#each keyedList(ciReport.steps, (step) => step.name) as { item: step, key: renderKey } (renderKey)}
             <details class="group rounded-lg px-2 py-1 hover:bg-surfaceHover/60">
               <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
                 <span class="flex min-w-0 items-center gap-2">

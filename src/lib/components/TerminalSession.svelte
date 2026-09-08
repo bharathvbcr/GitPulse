@@ -62,18 +62,30 @@
 </script>
 
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
+  import { SearchAddon } from "@xterm/addon-search";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { AlertCircle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine } from "@lucide/svelte";
+  import { get } from "svelte/store";
+  import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
   import { themeStore } from "../stores/themeStore";
   import { formatError } from "../ui/formatError";
+  import { createSessionLifecycle } from "../terminal/sessionLifecycle";
+  import { terminalSessions } from "../terminal/sessionRegistry";
+  import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind } from "../terminal/tabs";
   import type { TerminalSpawned } from "../terminal/runResult";
+  import { isImeComposition } from "../keyboard/imeGuard";
+  import {
+    clampTerminalFontSize, terminalViewChord, terminalSearchSummary,
+    TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
+    SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
+  } from "../terminal/viewControls";
 
   /**
    * One interactive PTY: a shell or agent CLI, its xterm, and nothing else.
@@ -91,31 +103,49 @@
    */
   let {
     repoPath,
+    tabId,
     launcher,
     active,
     onTitle,
     onChord,
+    onStatus = () => {},
+    onActivity = () => {},
   }: {
     repoPath: string;
+    tabId: string;
     launcher: LauncherKind;
     active: boolean;
     onTitle: (title: string) => void;
+    onStatus?: (status: string) => void;
+    onActivity?: () => void;
     /** Returns true when the panel consumed the event; xterm then ignores it. */
     onChord: (event: KeyboardEvent) => boolean;
   } = $props();
 
   let container = $state<HTMLDivElement | null>(null);
-  let sessionId = $state<string | null>(null);
+  let warning = $state<string | null>(null);
   let shellPath = $state("");
   let exited = $state(false);
   let error = $state<string | null>(null);
   let spawning = $state(false);
+  let findOpen = $state(false);
+  let findInput = $state<HTMLInputElement | null>(null);
+  let query = $state("");
+  let caseSensitive = $state(false);
+  let resultIndex = $state(-1);
+  let resultCount = $state(0);
+  let fontSize = $state(get(interfaceStore).terminalFontSize);
+  let scrolledBack = $state(false);
 
   /** Non-reactive handles: observers and the emulator must not tear down with runes. */
   let term: XTerm | null = null;
   let fitAddon: FitAddon | null = null;
+  let searchAddon: SearchAddon | null = null;
+  let searchKey: string | null = null;
   let resizeObserver: ResizeObserver | null = null;
-  let unsubscribe: (() => void) | null = null;
+  let resizeFrame: number | null = null;
+  let themeObserver: MutationObserver | null = null;
+  let lifecycle: ReturnType<typeof createSessionLifecycle> | null = null;
   /**
    * Set once the component is gone. A spawn IPC in flight at that moment still
    * returns a live backend session, which has to be killed rather than adopted
@@ -143,28 +173,37 @@
     const created = new XTerm({
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
-      fontSize: 12,
+      fontSize,
+      lineHeight: 1.15,
+      // The official search addon uses xterm's proposed decoration API.
+      allowProposedApi: true,
       cursorBlink: true,
       convertEol: false,
       theme: termTheme(),
       // Required before `open()` for a non-opaque background, and not
       // changeable afterwards. Its documented cost is the texture-atlas
-      // renderers; this terminal loads only the fit addon, so the DOM renderer
+      // renderers; this terminal loads fit/search addons, so the DOM renderer
       // draws the background as a plain CSS colour.
       allowTransparency: true,
       scrollback: 5000,
     });
     fitAddon = new FitAddon();
     created.loadAddon(fitAddon);
-    created.onData((data) => {
-      if (sessionId && !exited) {
-        void invoke("cmd_terminal_write", { sessionId, data }).catch(() => {});
-      }
+    searchAddon = new SearchAddon({ highlightLimit: SEARCH_HIGHLIGHT_LIMIT });
+    created.loadAddon(searchAddon);
+    searchAddon.onDidChangeResults((result) => {
+      resultIndex = result.resultIndex;
+      resultCount = result.resultCount;
     });
+    created.onScroll(() => {
+      scrolledBack = created.buffer.active.viewportY < created.buffer.active.baseY;
+    });
+    created.onData((data) => {
+      lifecycle?.write(data);
+    });
+    created.onBinary((data) => { lifecycle?.write(data, true); });
     created.onResize(({ cols, rows }) => {
-      if (sessionId && !exited) {
-        void invoke("cmd_terminal_resize", { sessionId, rows, cols }).catch(() => {});
-      }
+      lifecycle?.resize(rows, cols);
     });
     // OSC 0/2: what the running program calls itself. A shell configured to
     // report its directory, or an agent CLI reporting its task, then names its
@@ -177,6 +216,7 @@
     // falls through to the shell untouched.
     created.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+      if (handleViewChord(event)) return false;
       return !onChord(event);
     });
     term = created;
@@ -186,9 +226,12 @@
   function refitIfResized() {
     if (!fitAddon || !term) return;
     try {
-      const proposed = fitAddon.proposeDimensions();
+      const proposal = fitAddon.proposeDimensions();
+      const proposed = proposal ? { cols: Math.min(1000, proposal.cols), rows: Math.min(1000, proposal.rows) } : proposal;
       if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed)) return;
-      fitAddon.fit();
+      if (proposal && (proposal.cols > 1000 || proposal.rows > 1000) && proposed) {
+        term.resize(proposed.cols, proposed.rows);
+      } else fitAddon.fit();
     } catch {
       /* container collapsed; refit when it has size again */
     }
@@ -201,15 +244,6 @@
     return bytes;
   }
 
-  async function killPty(id: string | null) {
-    if (!id) return;
-    try {
-      await invoke("cmd_terminal_kill", { sessionId: id });
-    } catch {
-      /* already gone — the exit event or backend reap handled it */
-    }
-  }
-
   function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
     // A bare name, resolved backend-side against the same PATH repair every
     // other GitPulse spawn uses — a GUI-launched app's own PATH does not
@@ -217,70 +251,188 @@
     return kind === "shell" ? {} : { program: kind, args: [] };
   }
 
-  function adopt(spawned: TerminalSpawned) {
-    sessionId = spawned.id;
-    shellPath = spawned.shell;
-    unsubscribe = ptyBus.subscribe(spawned.id, {
-      onOutput: (b64) => term?.write(base64ToBytes(b64)),
-      onExit: (event) => {
-        exited = true;
-        sessionId = null;
-        const why =
-          event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
-        term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
+  function createLifecycle() {
+    return createSessionLifecycle({
+      key: tabId, repoPath, label: launcherLabel(launcher), bus: ptyBus, registry: terminalSessions,
+      transport: {
+        spawn: () => {
+          const dims = fitAddon?.proposeDimensions();
+          const cfg = launcherConfig(launcher);
+          return invoke<TerminalSpawned>("cmd_terminal_spawn", {
+            repoPath, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2),
+            program: cfg.program, args: cfg.args,
+          });
+        },
+        write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
+        resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
+        kill: (sessionId) => invoke("cmd_terminal_kill", { sessionId }),
+      },
+      hooks: {
+        state(status, message) {
+          spawning = status === "starting";
+          exited = status === "exited";
+          error = status === "error" ? message ?? "Terminal failed" : null;
+          onStatus(status);
+        },
+        started(spawned) {
+          shellPath = spawned.shell;
+          harnessStore.recordAction({
+            repoPath,
+            kind: "terminal-session",
+            label: `${launcherLabel(launcher)} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
+            ok: true,
+          });
+          if (active) reveal();
+        },
+        output(b64, sessionId) {
+          try {
+            const bytes = base64ToBytes(b64);
+            term?.write(bytes, () => {
+              if (disposed) return;
+              void invoke("cmd_terminal_ack", { sessionId, bytes: bytes.length }).catch((err: unknown) => { if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`); });
+            });
+            if (!active) onActivity();
+          } catch (err) { lifecycle?.fail(`Invalid terminal output: ${formatError(err)}`); }
+        },
+        exit(event) {
+          const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
+          term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
+        },
+        reset() {
+          return new Promise<void>((resolve) => {
+            if (!term || disposed) { resolve(); return; }
+            term.write("", () => {
+              if (!disposed) { term?.reset(); warning = null; searchKey = null; }
+              resolve();
+            });
+          });
+        },
+        warning(message) { warning = message; },
       },
     });
-    harnessStore.recordAction({
-      repoPath,
-      kind: "terminal-session",
-      label: `${launcher === "shell" ? "Interactive shell" : `Agent (${launcherLabel(launcher)})`} started in ${spawned.cwd} (${spawned.shell}) — not gate-checked`,
-      ok: true,
-    });
   }
 
-  async function spawnPty() {
-    const t = ensureTerm();
-    if (!t) return;
-    spawning = true;
-    error = null;
-    exited = false;
-    try {
-      const dims = fitAddon?.proposeDimensions();
-      const cfg = launcherConfig(launcher);
-      const spawned = await invoke<TerminalSpawned>("cmd_terminal_spawn", {
-        repoPath,
-        rows: Math.max(dims?.rows ?? 24, 2),
-        cols: Math.max(dims?.cols ?? 80, 2),
-        program: cfg.program,
-        args: cfg.args,
-      });
-      if (disposed) {
-        void killPty(spawned.id);
-        return;
-      }
-      adopt(spawned);
-    } catch (err) {
-      if (!disposed) error = formatError(err);
-    } finally {
-      if (!disposed) {
-        spawning = false;
-        if (active) term?.focus();
-      }
+  async function spawnPty() { await lifecycle?.start(); }
+
+  export function restart() { void lifecycle?.restart(); }
+
+  export async function copySelection() {
+    const text = term?.getSelection() ?? "";
+    if (!text) warning = "Select terminal text to copy.";
+    else warning = await copyText(text) ? null : "Could not copy terminal selection.";
+  }
+
+  export function retainedOutput(): string {
+    const buffer = term?.buffer.active;
+    if (!buffer) return "";
+    const lines: string[] = [];
+    for (let i = 0; i < buffer.length; i++) {
+      const line = buffer.getLine(i);
+      const next = buffer.getLine(i + 1);
+      lines.push((line?.translateToString(!next?.isWrapped) ?? "") + (next?.isWrapped ? "" : "\n"));
     }
+    return lines.join("").trimEnd();
   }
 
-  export function restart() {
-    unsubscribe?.();
-    unsubscribe = null;
-    void killPty(sessionId);
-    sessionId = null;
-    term?.reset();
-    void spawnPty();
+  export async function copyOutput() {
+    warning = await copyText(retainedOutput()) ? null : "Could not copy retained terminal output.";
+  }
+
+  export async function exportOutput() {
+    try { await invoke<boolean>("cmd_terminal_export", { data: retainedOutput() }); }
+    catch (err) { if (!disposed) warning = formatError(err); }
   }
 
   /** Called by the panel when this tab becomes visible again. */
   export function reveal() {
     refitIfResized();
+    if (findOpen) findInput?.focus();
+    else term?.focus();
+  }
+
+  export async function openFind() {
+    const selected = term?.getSelection();
+    if (selected && !selected.includes("\n")) query = selected.slice(0, SEARCH_QUERY_LIMIT);
+    findOpen = true;
+    await tick();
+    if (!disposed && active) {
+      findInput?.focus();
+      findInput?.select();
+    }
+  }
+
+  function closeFind() {
+    findOpen = false;
+    searchAddon?.clearDecorations();
+    if (active) term?.focus();
+  }
+
+  function runFind(backwards = false, incremental = false) {
+    if (!searchAddon) return;
+    const nextKey = JSON.stringify([query, caseSensitive]);
+    // addon-search 0.16 assigns its options before comparing them, so a case
+    // toggle alone leaves old highlights/counts cached. Invalidate at this seam.
+    if (searchKey !== nextKey) searchAddon.clearDecorations();
+    searchKey = nextKey;
+    if (!query) {
+      searchAddon.clearDecorations();
+      resultCount = 0;
+      resultIndex = -1;
+      return;
+    }
+    const options = {
+      caseSensitive, incremental,
+      decorations: {
+        matchBorder: "#b79538", matchOverviewRuler: "#b79538",
+        activeMatchBorder: "#809eff", activeMatchColorOverviewRuler: "#809eff",
+      },
+    };
+    if (backwards) searchAddon.findPrevious(query, options);
+    else searchAddon.findNext(query, options);
+  }
+
+  function handleFindKey(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeFind();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      runFind(event.shiftKey);
+    }
+  }
+
+  function setFontSize(size: number) {
+    fontSize = clampTerminalFontSize(size);
+    interfaceStore.setTerminalFontSize(fontSize);
+    if (term) term.options.fontSize = fontSize;
+    // Font metrics settle at layout; ResizeObserver also handles the changed box.
+    void tick().then(() => { if (!disposed && active) refitIfResized(); });
+  }
+
+  export function handleViewChord(event: KeyboardEvent): boolean {
+    if (!active || event.defaultPrevented) return false;
+    const chord = terminalViewChord(event);
+    if (!chord) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if (chord === "find") void openFind();
+    else if (chord === "zoom-reset") setFontSize(TERMINAL_FONT_DEFAULT);
+    else setFontSize(fontSize + (chord === "zoom-in" ? 1 : -1));
+    return true;
+  }
+
+  export function clearScrollback() {
+    searchAddon?.clearDecorations();
+    term?.clear();
+    if (findOpen) runFind(false, true);
+    else if (active) term?.focus();
+  }
+
+  function scrollToLatest() {
+    term?.scrollToBottom();
     term?.focus();
   }
 
@@ -289,22 +441,35 @@
     if (host) {
       const t = ensureTerm();
       t?.open(host);
-      resizeObserver = new ResizeObserver(refitIfResized);
+      resizeObserver = new ResizeObserver(() => {
+        if (resizeFrame !== null) return;
+        resizeFrame = requestAnimationFrame(() => { resizeFrame = null; if (!disposed) refitIfResized(); });
+      });
       resizeObserver.observe(host);
       refitIfResized();
     }
+    // themeStore publishes before a View Transition applies its CSS. Observe
+    // the actual class/style commit too, including accent and glass changes.
+    themeObserver = new MutationObserver(() => {
+      if (term) term.options.theme = termTheme();
+    });
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
+    lifecycle = createLifecycle();
     void spawnPty();
     return () => {
       disposed = true;
-      unsubscribe?.();
-      unsubscribe = null;
+      lifecycle?.dispose();
+      lifecycle = null;
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      resizeFrame = null;
       resizeObserver?.disconnect();
       resizeObserver = null;
-      void killPty(sessionId);
-      sessionId = null;
+      themeObserver?.disconnect();
+      themeObserver = null;
       term?.dispose();
       term = null;
       fitAddon = null;
+      searchAddon = null;
     };
   });
 
@@ -323,27 +488,57 @@
   $effect(() => {
     if (active) reveal();
   });
+
+  $effect(() => {
+    query;
+    caseSensitive;
+    if (!findOpen || !active) return;
+    const timer = setTimeout(() => runFind(false, true), 120);
+    return () => clearTimeout(timer);
+  });
 </script>
 
-<div class="h-full w-full flex flex-col min-h-0">
-  <div class="flex-1 min-h-0 p-3">
+<div class="h-full w-full flex flex-col min-h-0 min-w-0">
+  {#if warning}
+    <div role="status" class="shrink-0 flex gap-2 items-center text-[11px] text-amber-300 px-3 py-1 border-b border-border/60">
+      <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
+      <button type="button" aria-label="Dismiss terminal message" class="gp-icon-btn" onclick={() => (warning = null)}><X size={12} /></button>
+    </div>
+  {/if}
+  {#if findOpen}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <!-- Justified: Enter/Escape bubble from the input and search buttons, retaining their ordinary focus order. -->
+    <div class="flex items-center gap-1.5 px-3 h-9 shrink-0 bg-surface border-b border-border/60" role="search" aria-label="Find in terminal" onkeydown={handleFindKey}>
+      <Search size={13} class="text-textMuted shrink-0" />
+      <input bind:this={findInput} bind:value={query} maxlength={SEARCH_QUERY_LIMIT} aria-label="Find in terminal output" placeholder="Find in terminal…" class="min-w-0 w-48 flex-1 bg-transparent text-textPrimary text-xs outline-none" />
+      <span role="status" class="text-[10px] text-textMuted whitespace-nowrap tabular-nums">{query ? terminalSearchSummary(resultIndex, resultCount) : ""}</span>
+      <button type="button" class="gp-icon-btn text-[11px]!" class:text-accent={caseSensitive} aria-label="Match case" aria-pressed={caseSensitive} title="Match case" onclick={() => (caseSensitive = !caseSensitive)}>Aa</button>
+      <button type="button" class="gp-icon-btn" aria-label="Previous match" title="Previous match (Shift+Enter)" disabled={!query} onclick={() => runFind(true)}><ChevronUp size={13} /></button>
+      <button type="button" class="gp-icon-btn" aria-label="Next match" title="Next match (Enter)" disabled={!query} onclick={() => runFind()}><ChevronDown size={13} /></button>
+      <button type="button" class="gp-icon-btn" aria-label="Close find" title="Close find (Esc)" onclick={closeFind}><X size={13} /></button>
+    </div>
+  {/if}
+  <div class="flex-1 min-h-0 relative p-2">
     <div
       bind:this={container}
-      class="h-full w-full rounded-xl border border-border/70 bg-surface overflow-hidden p-1.5"
+      class="h-full w-full bg-surface overflow-hidden"
       data-terminal-session
     ></div>
+    {#if scrolledBack}
+      <button type="button" class="gp-btn absolute bottom-3 right-5 text-[11px]! shadow-lg" onclick={scrollToLatest}><ArrowDownToLine size={12} /> Latest output</button>
+    {/if}
   </div>
   {#if error || exited || spawning || shellPath}
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
-    <div class="shrink-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
+    <div class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
         <span class="text-textMuted text-[11px]">Starting {launcherLabel(launcher)}…</span>
       {:else if error}
         <AlertCircle size={13} class="text-rose-400 shrink-0" />
-        <span class="text-rose-300 flex-1 truncate text-[11px]">{error}</span>
+        <span class="text-rose-300 flex-1 min-w-0 truncate text-[11px]" title={error}>{error}</span>
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
           <RotateCw size={12} /> Retry
         </button>
@@ -353,8 +548,15 @@
           <RotateCw size={12} /> Restart
         </button>
       {:else}
-        <span class="text-[10px] text-textMuted font-mono truncate">{shellPath} · cwd {repoPath}</span>
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
+        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${repoPath}`}>{shellPath.split(/[\\/]/).pop()} · {repoPath.split(/[\\/]/).pop()}</span>
       {/if}
+      <div class="ml-auto flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
+
+        <button type="button" class="gp-icon-btn p-0.5!" aria-label="Decrease terminal text size" title="Smaller text (⌘− / Ctrl+Shift+−)" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
+        <button type="button" class="text-[10px] text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size (⌘0 / Ctrl+Shift+0)" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>
+        <button type="button" class="gp-icon-btn p-0.5!" aria-label="Increase terminal text size" title="Larger text (⌘+ / Ctrl+Shift++)" disabled={fontSize >= TERMINAL_FONT_MAX} onclick={() => setFontSize(fontSize + 1)}><Plus size={12} /></button>
+      </div>
     </div>
   {/if}
 </div>

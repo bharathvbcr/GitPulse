@@ -54,7 +54,7 @@ function fakeTransport() {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const output = (id: string, data_b64: string) => ({ id, data_b64 });
-const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "" });
+const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "", error: null });
 
 describe("ptyBus routing", () => {
   it("delivers each session only its own output", () => {
@@ -223,4 +223,77 @@ describe("ptyBus attachment race", () => {
     transport.emit("terminal-output", output("b", "Qg=="));
     expect(handlers.onOutput).toHaveBeenCalledTimes(1);
   });
+});
+
+
+describe("ptyBus failure recovery", () => {
+  it("releases a successful listener when its sibling fails, then allows retry", async () => {
+    const unlisten = vi.fn();
+    let failed = true;
+    const listen: EventListen = async (event) => {
+      if (event === "terminal-exit" && failed) throw new Error("transport unavailable");
+      return unlisten;
+    };
+    const bus = createPtyBus(listen);
+    const onError = vi.fn();
+    const release = bus.subscribe("a", { onOutput: vi.fn(), onExit: vi.fn(), onError });
+    await settle();
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("transport unavailable"));
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    release();
+    failed = false;
+    const releaseReady = await bus.prepare();
+    releaseReady();
+    expect(unlisten).toHaveBeenCalledTimes(3);
+  });
+
+  it("listens before the very first spawn, preserving its early output and exit", async () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const releaseReady = await bus.prepare();
+    transport.emit("terminal-output", output("first", "cHJvbXB0"));
+    transport.emit("terminal-exit", exit("first"));
+    const handlers = { onOutput: vi.fn(), onExit: vi.fn() };
+    const release = bus.subscribe("first", handlers);
+    releaseReady();
+    expect(handlers.onOutput).toHaveBeenCalledWith("cHJvbXB0");
+    expect(handlers.onExit).toHaveBeenCalledWith(exit("first"));
+    release();
+    expect(transport.attached).toBe(0);
+  });
+
+  it("discloses eviction instead of presenting an incomplete buffer as intact", () => {
+    const transport = fakeTransport();
+    const bus = createPtyBus(transport.listen);
+    const anchor = bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
+    for (let i = 0; i < 500; i++) transport.emit("terminal-output", output("late", "eA=="));
+    const onError = vi.fn();
+    bus.subscribe("late", { onOutput: vi.fn(), onExit: vi.fn(), onError });
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("incomplete"));
+    anchor();
+  });
+});
+
+it("rejects malformed exit events without breaking other terminal sessions", () => {
+  const transport = fakeTransport(), bus = createPtyBus(transport.listen), onError = vi.fn(), onExit = vi.fn();
+  bus.subscribe("a", { onOutput: vi.fn(), onExit, onError });
+  expect(() => transport.emit("terminal-exit", null)).not.toThrow();
+  transport.emit("terminal-exit", { id: "a", exit_code: "success", signal: 7 });
+  expect(onExit).not.toHaveBeenCalled();
+  expect(onError).toHaveBeenCalledTimes(2);
+});
+
+it("bounds listener setup time and releases listeners that arrive after timeout", async () => {
+  vi.useFakeTimers();
+  let finish: ((release: () => void) => void) | undefined;
+  const release = vi.fn();
+  const listen: EventListen = (event) => event === "terminal-output" ? Promise.resolve(release) : new Promise((resolve) => { finish = resolve; });
+  const bus = createPtyBus(listen);
+  const ready = bus.prepare();
+  const rejected = expect(ready).rejects.toThrow("Timed out listening");
+  await vi.advanceTimersByTimeAsync(5000); await rejected;
+  expect(release).toHaveBeenCalledTimes(1);
+  finish?.(release); await vi.advanceTimersByTimeAsync(0);
+  expect(release).toHaveBeenCalledTimes(2);
+  vi.useRealTimers();
 });

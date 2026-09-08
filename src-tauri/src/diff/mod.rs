@@ -1,4 +1,6 @@
 pub mod conflict;
+mod conflict_fs;
+pub mod conflict_session;
 pub mod patch_builder;
 pub mod word_diff;
 

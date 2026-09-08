@@ -38,11 +38,9 @@ const REPO_LANG_CAP: usize = 32;
 
 /// The vendored force-graph build, inlined so the page works offline.
 ///
-/// Read from the Python package tree because that is where the bundle is
-/// vendored and wheel-packaged, and `graph.html` — still rendered in Python —
-/// reads the same bytes. One copy, two readers. If the file moves, this
-/// `include_str!` fails the build rather than silently shipping a page with no
-/// renderer.
+/// Read from this crate's own asset tree so `devmap-query` can be vendored or
+/// published without preserving DevCouncil's Python-package layout. The graph
+/// visualizer uses this same copy; one crate owns the renderer bytes.
 const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");
 
 const MAP_HTML_TEMPLATE: &str = include_str!("map_preview.html");

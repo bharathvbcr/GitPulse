@@ -6,7 +6,7 @@
  * persisted preference cannot drift apart.
  */
 
-export const TERMINAL_DOCK_MIN_HEIGHT = 120;
+export const TERMINAL_DOCK_MIN_HEIGHT = 200;
 export const TERMINAL_DOCK_MAX_HEIGHT = 900;
 export const TERMINAL_DOCK_DEFAULT_HEIGHT = 280;
 /** Keyboard resize step for the dock separator (ArrowUp/ArrowDown). */

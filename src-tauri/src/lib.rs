@@ -131,8 +131,8 @@ pub fn run() {
             cmd_delete_branch,
             cmd_rename_branch,
             cmd_clone_repo,
-            cmd_parse_conflict,
-            cmd_resolve_conflict,
+            cmd_conflict_snapshot,
+            cmd_save_conflict,
             cmd_preview_conflict,
             cmd_detect_language,
             cmd_count_loc,
@@ -210,6 +210,8 @@ pub fn run() {
             cmd_ai_coverage_report,
             cmd_terminal_spawn,
             cmd_terminal_write,
+            cmd_terminal_ack,
+            cmd_terminal_export,
             cmd_terminal_resize,
             cmd_terminal_kill,
             cmd_terminal_run,
@@ -293,6 +295,14 @@ pub fn run() {
         .build(context())
         .expect("error while building GitPulse")
         .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                if let Err(error) =
+                    terminal::shutdown_sessions(&app.state::<terminal::TerminalSessions>())
+                {
+                    log::warn!(target: "terminal", "terminal shutdown incomplete: {error}");
+                }
+            }
             desktop::handle_run_event(app, &event);
         });
 }

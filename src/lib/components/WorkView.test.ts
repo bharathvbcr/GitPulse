@@ -15,13 +15,13 @@ const source = readFileSync(
 describe("WorkView", () => {
   it("renders its header without a repository open", () => {
     const { body } = render(WorkView);
-    expect(body).toContain("Work");
+    expect(body).toContain("Overview");
     expect(body).toContain("No repository open");
   });
 
   it("hydrates the cached projection before refetching on remount", () => {
-    expect(source).toContain("createRepoPanelCache<WorkProjection>()");
-    expect(source).toContain("workCache.set(repo, result);");
+    expect(source).toContain("createRepoPanelCache<{ projection: WorkProjection; loadedAt: number }>()");
+    expect(source).toContain("workCache.set(repo, { projection: result, loadedAt: time });");
     expect(source).toContain("workCache.get(repo)");
   });
 
@@ -48,7 +48,7 @@ describe("WorkView", () => {
 
   it("states an incomplete screen above the rows, not below them", () => {
     const warning = source.indexOf("degradedSummary");
-    const rows = source.indexOf("{#each visibleRows as row");
+    const rows = source.indexOf("{#each renderedRows as row");
     expect(warning).toBeGreaterThan(-1);
     expect(rows).toBeGreaterThan(-1);
     expect(source.indexOf("{degraded}")).toBeLessThan(rows);
@@ -90,7 +90,7 @@ describe("WorkView", () => {
     // The strip's counts and the rows must answer to the same list, or a
     // tile can say three and the list show none of them.
     expect(source).toContain("filterWorkRows(projection.rows, facet, query)");
-    expect(source).toContain("{#each visibleRows as row");
+    expect(source).toContain("{#each renderedRows as row");
   });
 
   it("does not dress a filter that matches nothing as a repository with nothing in it", () => {
@@ -156,8 +156,8 @@ describe("WorkView", () => {
     // A parked operation still goes to Resolve — a section of Work now, so
     // it switches section without leaving the view the row was clicked in.
     // Anything else lands on the working-tree diff, a section of History.
-    expect(source).toContain('if (binding.operation) repoStore.setViewSection("work", "resolve")');
-    expect(source).toContain('repoStore.setActiveTab("history", "diff")');
+    expect(source).toContain('repoStore.setActiveTab("work", "resolve")');
+    expect(source).toContain('repoStore.setActiveTab("history", "graph")');
   });
 
   it("refreshes when repository status generation changes", () => {
@@ -167,12 +167,12 @@ describe("WorkView", () => {
 
   it("shows an insights strip derived from the projection, not a second guess", () => {
     expect(source).toContain("insightSummary(projection)");
-    expect(source).toContain("Agent sessions");
+    expect(source).toContain("Agent worktrees");
     expect(source).toContain("unscanned");
   });
 
   it("never treats a failed collision scan as no overlap", () => {
-    expect(source).toContain("getCollisionRisk");
+    expect(source).toContain("createWorkRefresh");
     expect(source).toContain("Could not check overlapping files");
     expect(source).toContain("Absence of a list is not");
   });
@@ -181,5 +181,23 @@ describe("WorkView", () => {
     expect(source).toContain("gitpulse:settings");
     expect(source).toContain("Connect an agent");
     expect(source).toContain("gitpulse_insights");
+  });
+
+  it("exposes the existing dirty facet as an accessible filter", () => {
+    expect(source).toContain('aria-pressed={facet === "dirty"}');
+    expect(source).toContain('toggleFacet("dirty")');
+    expect(source).toContain("Uncommitted changes");
+  });
+
+  it("offers named review and repository navigation actions", () => {
+    expect(source).toContain("Review changes");
+    expect(source).toContain('repoStore.setActiveTab("code", "explorer")');
+    expect(source).toContain('repoStore.setActiveTab("history", "graph")');
+  });
+
+  it("identifies the current checkout and renders worktree paths visibly", () => {
+    expect(source).toContain("Current repository");
+    expect(source).toContain("Current worktree");
+    expect(source).toContain("{row.worktrees[0].worktree.path}");
   });
 });

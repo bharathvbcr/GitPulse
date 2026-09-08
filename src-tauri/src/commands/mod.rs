@@ -3,6 +3,9 @@ use crate::analyzer::{
     DepsHealthReport, DepsScanner, FileCoverage, LanguageDetector, LanguageInfo, LineCounts,
     LocCounter,
 };
+use crate::diff::conflict_session::{
+    self, ConflictSaveOutcome, ConflictSaveRequest, ConflictSnapshot,
+};
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
@@ -237,9 +240,16 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(body)
-        .await
-        .map_err(|e| format!("background task failed: {e}"))?
+    let queued = std::time::Instant::now();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut timing =
+            crate::logging::performance::CommandTiming::start(std::any::type_name::<F>(), queued);
+        let result = body();
+        timing.finish(&result);
+        result
+    })
+    .await
+    .map_err(|e| format!("background task failed: {e}"))?
 }
 
 #[tauri::command(async)]
@@ -870,18 +880,40 @@ pub async fn cmd_clone_repo(url: String, target_dir: String) -> Result<String, S
 }
 
 #[tauri::command(async)]
-pub fn cmd_parse_conflict(file_path: String, content: String) -> ConflictDocument {
-    ConflictResolver::parse(&file_path, &content)
+pub async fn cmd_conflict_snapshot(
+    repo_path: String,
+    file_path: String,
+) -> Result<ConflictSnapshot, String> {
+    off_thread(move || conflict_session::snapshot(&repo_path, &file_path)).await
 }
 
 #[tauri::command(async)]
-pub fn cmd_resolve_conflict(document: ConflictDocument) -> Result<String, String> {
-    ConflictResolver::render_resolved(&document).map_err(|e| e.to_string())
+pub async fn cmd_save_conflict(
+    repo_path: String,
+    request: ConflictSaveRequest,
+) -> Result<Guarded<ConflictSaveOutcome>, String> {
+    off_thread(move || {
+        // Authorize the literal target and the exact object/index commands.
+        // The native transaction builds argv once for judging and execution.
+        let mut policy = None;
+        let output = conflict_session::save_with_gate(
+            &repo_path,
+            &request,
+            |file, op| crate::harness::guard_file(&repo_path, file, op).map(|_| ()),
+            |argv| {
+                policy = Some(guard(&repo_path, argv)?);
+                Ok(())
+            },
+        )?;
+        let policy = policy.ok_or("Conflict transaction did not produce a command verdict")?;
+        Ok(Guarded { policy, output })
+    })
+    .await
 }
 
 #[tauri::command(async)]
-pub fn cmd_preview_conflict(document: ConflictDocument) -> String {
-    ConflictResolver::render_preview(&document)
+pub fn cmd_preview_conflict(document: ConflictDocument) -> Result<String, String> {
+    ConflictResolver::render_preview(&document).map_err(str::to_owned)
 }
 
 #[tauri::command(async)]
@@ -2857,9 +2889,11 @@ pub async fn cmd_terminal_spawn(
     args: Option<Vec<String>>,
     env: Option<std::collections::HashMap<String, String>>,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
-    // Fast allocation work only; nothing here blocks long enough to need the
-    // thread pool.
-    crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols, program, args, env)
+    let state = state.inner().clone();
+    off_thread(move || {
+        crate::terminal::spawn_session(&app, &state, &repo_path, rows, cols, program, args, env)
+    })
+    .await
 }
 
 /// Feeds keystrokes into a live session's PTY.
@@ -2868,8 +2902,17 @@ pub async fn cmd_terminal_write(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     data: String,
+    binary: Option<bool>,
 ) -> Result<(), String> {
-    crate::terminal::write_to_session(&state, &session_id, &data)
+    let state = state.inner().clone();
+    off_thread(move || {
+        if binary.unwrap_or(false) {
+            crate::terminal::write_binary_to_session(&state, &session_id, &data)
+        } else {
+            crate::terminal::write_to_session(&state, &session_id, &data)
+        }
+    })
+    .await
 }
 
 /// Resizes a live session's PTY to the frontend grid.
@@ -2889,7 +2932,39 @@ pub async fn cmd_terminal_kill(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
 ) -> Result<(), String> {
-    crate::terminal::kill_session(&state, &session_id)
+    let state = state.inner().clone();
+    off_thread(move || crate::terminal::kill_session(&state, &session_id)).await
+}
+
+/// Exports user-selected terminal output through the native save dialog.
+#[tauri::command(async)]
+pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {
+    if data.len() > 16 * 1024 * 1024 {
+        return Err("Terminal export exceeds 16 MiB".into());
+    }
+    let Some(file) = rfd::AsyncFileDialog::new()
+        .set_title("Export retained terminal output")
+        .set_file_name("terminal-output.txt")
+        .add_filter("Text", &["txt"])
+        .save_file()
+        .await
+    else {
+        return Ok(false);
+    };
+    file.write(data.as_bytes())
+        .await
+        .map_err(|e| format!("Could not export terminal output: {e}"))?;
+    Ok(true)
+}
+
+/// Releases rendered output bytes so the PTY reader can continue.
+#[tauri::command(async)]
+pub async fn cmd_terminal_ack(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    bytes: usize,
+) -> Result<(), String> {
+    crate::terminal::acknowledge_output(&state, &session_id, bytes)
 }
 
 /// Runs one argv to completion with a hard timeout and capped tails.
@@ -3323,10 +3398,12 @@ pub async fn cmd_devmap_maybe_refresh(
     repo_changed: Option<bool>,
 ) -> Result<crate::devmap::LiveRefreshOutcome, String> {
     off_thread(move || {
-        Ok(crate::devmap::maybe_refresh(
-            &repo_path,
-            repo_changed.unwrap_or(true),
-        ))
+        crate::engine::git_cli::with_background_processes(|| {
+            Ok(crate::devmap::maybe_refresh(
+                &repo_path,
+                repo_changed.unwrap_or(true),
+            ))
+        })
     })
     .await
 }
@@ -3521,10 +3598,20 @@ pub async fn cmd_markdown_render(text: String) -> Result<String, String> {
     off_thread(move || crate::markdown::render(&text)).await
 }
 
-/// Rebuilds the repo doc vault from `git ls-files '*.md'`.
+/// Refreshes tracked documents; watcher work yields subprocess capacity to user actions.
 #[tauri::command(async)]
-pub async fn cmd_docs_refresh(repo_path: String) -> Result<crate::docs::DocsStatus, String> {
-    off_thread(move || crate::docs::refresh(&repo_path)).await
+pub async fn cmd_docs_refresh(
+    repo_path: String,
+    background: Option<bool>,
+) -> Result<crate::docs::DocsStatus, String> {
+    off_thread(move || {
+        if background.unwrap_or(false) {
+            crate::engine::git_cli::with_background_processes(|| crate::docs::refresh(&repo_path))
+        } else {
+            crate::docs::refresh(&repo_path)
+        }
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -3759,6 +3846,27 @@ pub async fn cmd_provenance_freshness_batch(
 mod assemble_tests {
     use super::*;
     use crate::graph::{MAINLINE_COLOR, MAINLINE_COLUMN};
+
+    #[test]
+    fn slow_command_is_visible_in_diagnostics_without_recording_its_payload() {
+        crate::logging::init();
+        crate::logging::performance::enable_test_facade();
+        let result = tauri::async_runtime::block_on(off_thread(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            Err::<(), _>("private command payload".to_string())
+        }));
+        assert_eq!(result.unwrap_err(), "private command payload");
+        let lines = crate::logging::diagnostic_tail(500);
+        let line = lines.iter().find(|line| {
+            line.contains("[performance]")
+                && line.contains("slow_command_is_visible_in_diagnostics")
+        });
+        let line = line.expect("a slow failed command must leave a timing record");
+        assert!(line.contains("outcome=error"), "{line}");
+        assert!(line.contains("queue_ms="), "{line}");
+        assert!(line.contains("work_ms="), "{line}");
+        assert!(!line.contains("private command payload"), "{line}");
+    }
 
     fn commit(id: &str, parents: &[&str], author: &str, summary: &str) -> RawCommitNode {
         RawCommitNode {

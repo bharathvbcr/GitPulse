@@ -98,6 +98,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm test
 
+      - name: Svelte Browser Regressions (Chrome)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: npm run test:browser
+
+      - name: Native Renderer Regressions (WKWebView)
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        run: npm run test:webkit
+
       # Backlog B2, investigated and declined. The frontend bundle is
       # platform-independent, so in principle one leg could build it and share
       # `dist/` with the others through upload-artifact/download-artifact.

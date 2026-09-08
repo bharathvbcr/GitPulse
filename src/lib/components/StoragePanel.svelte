@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyedList } from "../ui/eachKeys";
   import { repoStore } from "../stores/repoStore";
   import { requestManviFocus } from "../ui/manviFocus";
   import {
@@ -574,7 +575,7 @@
             {/if}
           </div>
           <div class="space-y-1">
-            {#each report.reclaim as item (item.category + item.label)}
+            {#each keyedList(report.reclaim, (item) => JSON.stringify([item.category, item.label])) as { item, key: renderKey } (renderKey)}
               <div class="rounded border border-border/60 bg-surface/40 px-3 py-2 space-y-1">
                 <div class="flex items-baseline justify-between gap-3">
                   <span class="font-mono text-textPrimary truncate" title={item.label}>

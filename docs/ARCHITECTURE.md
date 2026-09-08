@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (185 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (187 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -150,7 +150,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +185 Registered Handlers
+        +187 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -233,7 +233,7 @@ classDiagram
 - **`docs/`**: Repo markdown vault from `git ls-files`, search / broken links / backlinks / doc graph, and link-preserving rename (`git mv` + staged rewrites).
 - **`workspace_registry`**: Registers open tabs into DevMap's workspace for cross-repo `::` search.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
-- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved command diagnostics and subprocess exit status tracking.
+- **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 256 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. See [Terminal](TERMINAL.md) and [terminal audit](TERMINAL_AUDIT.md).
 - **`grants/`**: Policy grant model, scoped overrides, and override lifecycle for elevated paths.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
@@ -279,8 +279,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 185 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 858 data fields, in 49 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 187 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 881 data fields, in 50 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts the version it reports is this tree's. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 
@@ -288,20 +288,20 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 ## 5. Diagnostics
 
-Everything that goes wrong is recorded on both sides of the IPC boundary, and
-the two halves differ in one way that matters: **only the durable half can
-describe a crash, because the other half dies with the process it was
-describing.**
+Diagnostics capture reported errors and performance observations on both
+sides of IPC. Frontend entries persist in localStorage; backend entries mirror
+to a bounded log file. Neither is a complete profiler or proof that an
+unreported operation was healthy.
 
 | | Frontend | Backend |
 | --- | --- | --- |
 | Owner | `src/lib/diagnostics/` | `src-tauri/src/logging.rs` |
-| Captures | uncaught errors, unhandled rejections, `console.error/warn`, `<svelte:boundary>` pane crashes, panel catches via `reportPanelError` | `log::*` calls and the panic hook (payload, location, bounded backtrace) |
+| Captures | uncaught errors, unhandled rejections, `console.error/warn`, `<svelte:boundary>` pane crashes, panel catches via `reportPanelError`, visible-window event-loop delays | `log::*` calls, slow commands through `off_thread`, and the panic hook (payload, location, bounded backtrace) |
 | In memory | 500-entry ring, coalesced by fingerprint | 1,000-entry ring |
-| Survives a crash | yes — persisted to `localStorage` | yes — appended to `<log dir>/<binary>.log` |
+| Survives a crash | when `localStorage` is writable; failed saves are visible | when the durable mirror is writable; degradation is reported |
 | Read back by | the Diagnostics panel | `cmd_diagnostic_log_tail` (this session) and `cmd_diagnostic_persisted_log` (durable, spans sessions) |
 
-Each of the three shipped binaries — `gitpulse`, `gitpulsed`, `gitpulse-mcp` —
+Each of the four shipped binaries — `gitpulse`, `gitpulsed`, `gitpulse-mcp`, `gitpulse-hook` —
 installs the logger and the panic hook and writes its own log file. The file is
 appended rather than truncated at startup, so the lines above a session marker
 are the previous run's: after a crash and a relaunch, the reason is still there
@@ -326,3 +326,105 @@ Three properties are deliberate and are pinned by
 There is no remote crash reporting, by design: nothing here leaves the machine.
 The Diagnostics panel copies the whole report to the clipboard and the user
 decides where it goes.
+
+The frontend exposes storage readiness, successful saves, memory-only failures,
+incomplete restored history, and the count of suppressed development reload
+messages. A failed write suspends automatic retries until **Retry saving**;
+the in-memory ring continues recording. Production module-load, WebView, and
+ResizeObserver errors are retained. Saved duplicate IDs are repaired before
+rendering; invalid calendar dates are rejected with an incomplete-history note.
+
+Entries carry both the app version and a unique bundle ID, so consecutive
+errors from different builds never coalesce. Pane crashes snapshot navigation,
+stack head/tail, and the visible Code subpane's bounded request IDs before a
+deferred store write. `npm run build` saves matching chunks, SHA-256 hashes,
+and source maps under `.build-evidence/<build-id>/`; source maps are removed
+from `dist/`. This directory is ignored and stays local. The distributable
+`build-info.json` contains only build ID, version, time, Git revision, and
+dirty-state metadata. Retain the matching evidence directory for any build
+being diagnosed; no remote source-map upload is configured.
+
+`npm run test:browser` and the macOS `npm run test:webkit` mount the actual
+Code components and Diagnostics window with explicit IPC fixtures. Both
+require the duplicate-key crash canary and every assertion to complete.
+
+### Performance observations
+
+`logging/performance.rs` observes the existing `off_thread` command boundary:
+commands taking at least one second produce `[performance]` warnings with a
+compiler-provided operation label, outcome, blocking-pool queue time, and work
+time. The label is diagnostic text, not a stable command identifier. No
+arguments, result bodies, or error payloads enter these records. Each label
+reports at most once per 30 seconds; subsequent reports include accumulated
+slow-call counts and separate queue/work maxima. State holds at most 256
+labels plus an explicitly grouped overflow bucket. Fast commands take clock
+readings without acquiring the timing-state mutex. Commands that never finish
+cannot emit a completion timing; existing panic logging remains independent.
+
+`diagnostics/responsiveness.ts` samples the visible UI every 500 ms and records
+timer lateness of at least 250 ms under `performance:ui`. It stops while the
+document is hidden, rebases on return, and aggregates repeated observations
+into at most one report per 30 seconds. Gaps of 30 seconds or more are labelled
+as possibly including system sleep or suspension. This detects scheduling
+delays, not frame rate or root cause, and does not cover every short stall.
+
+`async/pacedQueue.ts` owns bounded background scheduling for document and
+code-index refreshes. Each service admits one scan across the workspace, with
+a one-second pause after completion. Its 200 ms debounce has a one-second
+maximum wait before a request becomes eligible; queue and active-scan time can
+add further delay. A change during a rebuild retains one follow-up. Each queue
+holds 64 repository paths and reports overflow through Diagnostics. Reset
+cancels pending work without pretending an issued native command has stopped;
+old code-index outcomes cannot repopulate reset state. Index status retention
+is capped at 65 entries. Explicit document queries and native callers do not
+pass through this background scheduling gate.
+
+`async/backgroundScope.ts` connects the queues to the open repository tabs,
+active repository and document visibility. Hidden and inactive repositories
+retain coalesced dirty work without scheduling polling timers. Closing a tab
+forgets its pending work and invalidates any old index publication; reopening
+cannot revive that old result. Activation gives rendering a 200 ms grace
+period, and the normal completion cooldown still applies. Explicit queries
+remain available immediately. This scope applies to the docs/index queues;
+repository state and metrics retain their own refresh policies.
+
+The native document cache retains eight vaults, evicting the least recently used entry.
+Queries hold an immutable vault snapshot after releasing the cache mutexes, so graph
+layout and search do not block cache access for other repositories. Concurrent cold loads share a slot per resident repository;
+invalidation detaches the slot, so an older build cannot restore stale cached
+state. A vault
+admits at most 5,000 files and 32 MiB of source text; metadata and actual reads
+are both bounded, and the existing `truncated` field reports a resource cap.
+Reads require regular files within the repository. These are input/retention
+bounds, not a hard process-RSS ceiling; parsed indexes and active readers add
+memory.
+
+Refresh rereads admitted source bytes and borrows previously parsed notes
+whose path and exact text match. An unchanged note set and scan status reuse
+the entire indexed snapshot. Changed notes are parsed and link/search indexes
+are rebuilt; size and modification time alone never establish freshness.
+The Git pathspecs use the parser's canonical extension list with case-insensitive
+matching, retaining tracked-file authority for all supported Markdown variants.
+
+Git commands resolve their executable against the child's extended PATH on
+Unix to preserve Rust's `posix_spawn` fast path on macOS. Relative PATH entries
+retain OS resolution semantics and the fork fallback. The subprocess deadline
+includes admission to the process gate and child runtime. Pipe settlement has
+an additional bounded grace period. Unix stdin writers use nonblocking writes
+and readiness polling, allowing cancellation without throttling input with a
+fixed sleep. On other platforms the caller still bounds its wait, but a
+blocked OS write may outlive that caller until the pipe closes.
+
+Automatic indexing and watcher-triggered document refresh carry a synchronous
+background-process scope. Background children may hold at most a quarter of
+the global slots (at least one); a waiting background class reserves the next
+available slot when none is running. This leaves interactive capacity while
+allowing indexing to progress under foreground traffic. Timeout and panic
+cleanup release both counts and reservations. Priority is restored before a
+blocking worker is reused, and is not inherited by unrelated new threads.
+Explicit document refresh defaults to foreground priority through the optional
+`background` IPC argument. This is application admission priority, not an OS
+QoS assignment.
+
+See [Performance diagnostics](PERFORMANCE.md) for capture instructions and
+verification limits.

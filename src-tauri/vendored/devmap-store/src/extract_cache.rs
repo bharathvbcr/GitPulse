@@ -47,15 +47,35 @@ pub fn extract_scanned_cached(
     store: &Store,
     scanned: &devmap_extract::ScannedTree,
 ) -> anyhow::Result<Vec<Extraction>> {
+    extract_scanned_cached_with_progress(store, scanned, None)
+}
+
+pub fn extract_scanned_cached_with_progress(
+    store: &Store,
+    scanned: &devmap_extract::ScannedTree,
+    progress: Option<&devmap_extract::progress::FileProgress>,
+) -> anyhow::Result<Vec<Extraction>> {
+    if let Some(progress) = progress {
+        progress.start(scanned.sources.len());
+    }
     scanned
         .sources
         .par_iter()
-        .map(|(path, src)| extract_one_cached(store, path, src))
+        .map(|(path, src)| {
+            let result = extract_one_cached_with(store, path, src, extract_file);
+            if let Some(progress) = progress {
+                let cached = result.as_ref().is_ok_and(|(_, cached)| *cached);
+                let failed = result.as_ref().map_or(true, |(extraction, _)| {
+                    matches!(
+                        extraction.parse_outcome,
+                        devmap_extract::ParseOutcome::Failed { .. }
+                    )
+                });
+                progress.finish_file(cached, failed);
+            }
+            result.map(|(extraction, _)| extraction)
+        })
         .collect::<anyhow::Result<Vec<_>>>()
-}
-
-fn extract_one_cached(store: &Store, path: &str, src: &str) -> anyhow::Result<Extraction> {
-    extract_one_cached_with(store, path, src, extract_file)
 }
 
 fn extract_one_cached_with(
@@ -63,7 +83,7 @@ fn extract_one_cached_with(
     path: &str,
     src: &str,
     extractor: impl FnOnce(&str, &str) -> Extraction,
-) -> anyhow::Result<Extraction> {
+) -> anyhow::Result<(Extraction, bool)> {
     let language = detect_language(Path::new(path));
     let key = CacheKey::for_source(language, src);
     if let Some(cached) = store.try_get_cached_extraction(&key)? {
@@ -71,14 +91,14 @@ fn extract_one_cached_with(
         // wiring, and file identity. A content key may be shared by many files;
         // never reuse a path-bound payload for a different path.
         if cached.file_path == path {
-            return Ok(cached);
+            return Ok((cached, true));
         }
     }
     let ext = extractor(path, src);
     if cache_admits(&ext.parse_outcome) {
         store.admit_cached_extraction(&key, &ext)?;
     }
-    Ok(ext)
+    Ok((ext, false))
 }
 
 #[cfg(test)]
@@ -87,6 +107,70 @@ mod tests {
     use devmap_extract::model::ParseOutcome;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn progress_preserves_extractions_across_cache_collisions_and_parse_failures() {
+        let mut scanned = devmap_extract::ScannedTree::default();
+        for index in 0..64 {
+            scanned.sources.push((
+                format!("copy_{index}.py"),
+                "def shared(): return 42\n".into(),
+            ));
+        }
+        scanned
+            .sources
+            .push(("invalid.py".into(), "def ((( invalid\n".into()));
+        scanned.sources.push(("empty.py".into(), String::new()));
+        scanned
+            .sources
+            .push(("failed.unknown".into(), String::new()));
+        let refs: Vec<_> = scanned
+            .sources
+            .iter()
+            .map(|(path, source)| devmap_extract::FileRef { path, source })
+            .collect();
+        let expected = devmap_extract::extract_all(&refs);
+        let store = Store::open_in_memory().unwrap();
+        for _ in 0..3 {
+            let progress = devmap_extract::progress::FileProgress::default();
+            let observed =
+                extract_scanned_cached_with_progress(&store, &scanned, Some(&progress)).unwrap();
+            let snapshot = progress.snapshot();
+            assert!(snapshot.valid);
+            assert_eq!(snapshot.total, Some(67));
+            assert_eq!(snapshot.completed, 67);
+            assert!(snapshot.failed > 0, "fixture must exercise a failed parse");
+            assert_eq!(observed.len(), expected.len());
+            let mut stripped_sources = 0;
+            for (actual, expected) in observed.iter().zip(&expected) {
+                // The cache's canonical admission path intentionally strips
+                // source_code. Every graph-bearing field must still agree.
+                let mut expected = expected.clone();
+                if actual.source_code.is_none() && expected.source_code.is_some() {
+                    stripped_sources += 1;
+                    expected.source_code = None;
+                }
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "{}",
+                    actual.file_path
+                );
+            }
+            assert_eq!(stripped_sources, snapshot.cache_hits);
+            assert!(snapshot.cache_hits <= snapshot.completed - snapshot.failed);
+            assert_eq!(
+                snapshot.failed,
+                observed
+                    .iter()
+                    .filter(|extraction| matches!(
+                        extraction.parse_outcome,
+                        ParseOutcome::Failed { .. }
+                    ))
+                    .count()
+            );
+        }
+    }
 
     #[test]
     fn test_cache_admission_end_to_end() {
@@ -235,12 +319,14 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let source = "def cached():\n    return 1\n";
         let first = extract_one_cached_with(&store, "cached.py", source, extract_file).unwrap();
-        assert_eq!(first.file_path, "cached.py");
+        assert_eq!(first.0.file_path, "cached.py");
+        assert!(!first.1);
 
         let second = extract_one_cached_with(&store, "cached.py", source, |_, _| {
             panic!("parser must not run on a cache hit")
         })
         .unwrap();
-        assert_eq!(second.file_path, "cached.py");
+        assert_eq!(second.0.file_path, "cached.py");
+        assert!(second.1);
     }
 }

@@ -126,6 +126,39 @@ fn main() {
         );
     }
     println!();
+
+    // Match the GUI's actual Git launch shape. A changed PATH with a bare
+    // executable also disqualifies Rust's posix_spawn path, even with the
+    // declarative process_group spelling above. Keep the parent resident so
+    // the benchmark includes fork's address-space cost.
+    let resident = vec![7u8; 128 * 1024 * 1024];
+    std::hint::black_box(&resident);
+    let cwd = std::env::current_dir().expect("cwd");
+    let build = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(&cwd)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        cmd
+    };
+    let bare = measure("changed PATH + bare executable", || build("true"));
+    let resolved = measure("changed PATH + absolute executable", || {
+        build("/usr/bin/true")
+    });
+    for row in [&bare, &resolved] {
+        println!(
+            "{:<42} p50={:.3?} p95={:.3?} worst={:.3?}",
+            row.name, row.p50, row.p95, row.worst
+        );
+    }
+    println!(
+        "resolved p50 change: {:+.1}%",
+        (resolved.p50.as_secs_f64() / bare.p50.as_secs_f64() - 1.0) * 100.0
+    );
+    std::hint::black_box(&resident);
 }
 
 #[cfg(not(unix))]

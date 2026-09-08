@@ -3,6 +3,7 @@ import App from "./App.svelte";
 import { mount } from "svelte";
 import { applyPlatformClass } from "./lib/platform";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
+import { installResponsivenessDiagnostics } from "./lib/diagnostics/responsiveness";
 
 applyPlatformClass();
 
@@ -11,6 +12,8 @@ applyPlatformClass();
 // reach devtools with the same prefixes as before. Retrieve via the
 // Diagnostics panel (header bug icon or the command palette).
 installGlobalDiagnostics(diagnostics);
+const stopResponsivenessDiagnostics = installResponsivenessDiagnostics(diagnostics);
+import.meta.hot?.dispose(stopResponsivenessDiagnostics);
 
 const app = mount(App, {
   target: document.getElementById("app")!,
