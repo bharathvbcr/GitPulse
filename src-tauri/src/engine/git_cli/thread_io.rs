@@ -286,7 +286,9 @@ impl InputFeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{reader, InputFeed, OutputDrains, Worker};
+    use super::{reader, Worker};
+    #[cfg(unix)]
+    use super::{InputFeed, OutputDrains};
     use crate::engine::git_cli::SpawnPermit;
     use std::io;
     use std::sync::Arc;

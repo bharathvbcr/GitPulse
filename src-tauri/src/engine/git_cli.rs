@@ -506,6 +506,13 @@ pub(crate) fn git_with_index(
     stdin_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut command = git_command(Some(repo), args);
+    // Canonical paths carry the Windows verbatim prefix, which Git rejects
+    // in GIT_INDEX_FILE. The transaction may create this file, so do not
+    // canonicalize it again or require it to exist before read-tree.
+    #[cfg(windows)]
+    let plain_index = index.to_str().and_then(simplified_windows_path);
+    #[cfg(windows)]
+    let index = plain_index.as_deref().map(Path::new).unwrap_or(index);
     command.env("GIT_INDEX_FILE", index);
     let output = run_bounded(
         command,
@@ -3446,6 +3453,21 @@ mod tests {
                 "{program} must not gain a second suffix"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn index_transaction_accepts_a_canonical_windows_parent_and_new_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git(dir.path(), &["init"]).unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let index = canonical.join(".git").join("transaction-index");
+        assert!(!index.exists());
+        git_with_index(dir.path(), &index, &["read-tree", "--empty"], b"").unwrap();
+        assert!(index.is_file());
+        assert!(!dir.path().join(".git/index").exists());
+        let paths = git_with_index(dir.path(), &index, &["ls-files", "-z"], b"").unwrap();
+        assert!(paths.is_empty());
     }
 
     /// git refuses a verbatim path as a working tree

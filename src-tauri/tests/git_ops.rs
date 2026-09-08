@@ -971,7 +971,10 @@ fn blame_new_files_are_uncommitted_without_mutating_the_index() {
                 repo.write("seed.txt", "seed\n");
                 repo.commit_all("seed");
             }
+            #[cfg(not(windows))]
             let path = ".devcouncil/weird [*] ü.yaml";
+            #[cfg(windows)]
+            let path = ".devcouncil/weird [x] ü.yaml";
             repo.write(path, "first\n\nlast");
             if staged {
                 run_git(repo.dir.path(), &["add", "--", path]);
@@ -1013,7 +1016,16 @@ fn blame_new_empty_files_succeed_but_missing_and_binary_files_do_not() {
 fn blame_new_paths_and_hash_formats_preserve_content() {
     for format in ["sha1", "sha256"] {
         let repo = TestRepo::init_with(&[&format!("--object-format={format}")]);
-        for path in ["--option.txt", "a\tb.txt", "line\nbreak.txt", "文档.md"] {
+        let paths = [
+            "--option.txt",
+            "space [x].txt",
+            "文档.md",
+            #[cfg(not(windows))]
+            "a\tb.txt",
+            #[cfg(not(windows))]
+            "line\nbreak.txt",
+        ];
+        for path in paths {
             repo.write(path, "alpha\r\n\r\nω-last");
             let lines =
                 GitReader::get_file_blame(&repo.path_str(), path).expect("literal new path");

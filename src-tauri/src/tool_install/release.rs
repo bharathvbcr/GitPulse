@@ -199,6 +199,21 @@ pub fn parse_checksum_file(text: &str) -> Result<String, String> {
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .ok_or_else(|| "checksum file is empty".to_string())?;
+    // GNU checksum tools prefix the record with one backslash when the
+    // filename contains backslashes/newlines. It is not part of the digest.
+    // Only accept that marker with the full GNU digest + mode + filename shape.
+    let line = if let Some(escaped) = line.strip_prefix('\\') {
+        let bytes = escaped.as_bytes();
+        if bytes.len() <= 66
+            || bytes.get(64) != Some(&b' ')
+            || !matches!(bytes.get(65), Some(b' ' | b'*'))
+        {
+            return Err("malformed escaped checksum record".into());
+        }
+        escaped
+    } else {
+        line
+    };
     let hex = line
         .split_whitespace()
         .next()
@@ -408,6 +423,22 @@ mod tests {
     }
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn parse_checksum_accepts_gnu_escaped_filename_marker() {
+        let digest = "abcdef0123456789".repeat(4);
+        for separator in ["  ", " *"] {
+            let record = format!("\\{digest}{separator}C:\\\\temp\\\\blob\\nname\n");
+            assert_eq!(parse_checksum_file(&record).unwrap(), digest);
+        }
+        for malformed in [
+            format!("\\{digest}"),
+            format!("\\\\{digest}  file"),
+            format!("\\{digest} wrong"),
+        ] {
+            assert!(parse_checksum_file(&malformed).is_err(), "{malformed}");
+        }
+    }
 
     #[test]
     fn parse_checksum_accepts_gnu_and_bare() {
