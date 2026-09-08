@@ -6,8 +6,8 @@ work-overview changes, and the canonical library changes those features consume.
 It is local verification, not a release or proof that every possible defect has
 been eliminated. The integration contract is in [MODULE_INTEGRATION.md](MODULE_INTEGRATION.md).
 
-The coordinated GitPulse snapshot includes 164 non-Markdown files with 14,613
-lines added and 2,236 removed, including work pending before this audit.
+The coordinated GitPulse snapshot includes 164 non-Markdown files with 14,655
+lines added and 2,234 removed, including work pending before this audit.
 The refreshed GitNexus staged analysis classified its impact as HIGH: 990
 indexed symbols and 14 execution flows. The affected Git execution, document
 rename and repository-refresh paths were covered by the full local gate.
@@ -26,6 +26,7 @@ rename and repository-refresh paths were covered by the full local gate.
 | Replaceable Manvi adapters | A custom adapter could return nil status or nil query data/index and receive `ok: true`; malformed stock producer envelopes could also be accepted. | Validate adapter results at the host boundary, preserve kind-specific completeness evidence and refuse missing or malformed results. |
 | Query error classification | A caller's invalid depth was classified as `E_DEPENDENCY`. | Shared query validation distinguishes malformed requests (`E_BAD_REQUEST`) from unavailable/incompatible producers (`E_DEPENDENCY`). |
 | Polling-latency regression test | The test passed alone but repeatedly failed in the concurrent library suite, where only its bounded path shared spawn-admission contention. | Move the timing check into its own integration executable through the existing public capture API, preserving all twelve alternating samples and the exact 8 ms allowance. A real flat-15 ms polling-loop mutation still fails it. |
+| Extraction progress classification | The full GitPulse index reported 83 failed files and invalid progress, while its stored coverage correctly reported zero parse failures. SQLite showed all 83 were `NotApplicable` prose/data files. | Use canonical `Extraction::is_parse_failure()` for progress, preserving genuine failure counts and valid cached-file accounting. Separate cold and legacy-cache regressions failed before correction. |
 
 The vendor suite passed 29 tests, including twelve update/delete cycles,
 idempotence, inherited metadata, scoped preservation, preparation failures,
@@ -79,6 +80,12 @@ require recompiling their host; arbitrary ABI compatibility is not promised.
   The self-build indexed 1,626 files in 8.462 seconds with a 152 MiB database
   and 720 MiB peak RSS against the gate's 867 MiB limit. Five incremental
   cycles matched cold builds. Optional mutation testing was skipped.
+  The final progress-classification correction then passed 187 store tests
+  (one ignored), 570 extraction tests, formatting and strict Clippy. A real
+  GitPulse rebuild at generation 189 completed all 1,120 files with 1,119 cache
+  hits, zero failures, valid progress and 100% completion. A separate malformed
+  notebook fixture still reported one genuine failure. The repository index
+  remains fresh/query-ready with one explicit Swift import-extraction gap.
 - **MarkDev:** 334 default-feature tests and 869 test executions across the
   other three feature configurations passed, with zero ignored tests. Strict
   Clippy, formatting and 166 release-contract tests passed. The reusable core
@@ -92,17 +99,29 @@ require recompiling their host; arbitrary ABI compatibility is not promised.
   model endpoint also passed a real wire-contract request. `golangci-lint`,
   `govulncheck` and `nilaway` were outside that run's PATH; their existing
   executables were subsequently located under `/Users/bharath/go/bin`.
+  Re-running with that task-local PATH exposed six new lint-debt violations;
+  after correction, all 21 enforced linters and ten debt ratchets passed.
+  The reproduced pre-fix result is retained at
+  `/tmp/manvi-analyzer-debt-failure-a828c01.log`.
+  `govulncheck` found zero reachable vulnerabilities and zero advisories in
+  imported packages, while reporting 21 advisories in required modules that
+  this call graph does not reach. `nilaway` remained at its existing 78-finding
+  ceiling. The analyzer-enabled full verification then passed with the live
+  hosted-provider checks still unexecuted. Its evidence is
+  `/tmp/manvi-verify-final-with-analyzers-20260908.log`.
   Anthropic, Gemini and xAI were
   exercised through scripted servers, not live hosted endpoints. The log is
   `/tmp/manvi-verify-final-20260908.log`. That run also reported a graph/index
   generation mismatch after live interoperation tests advanced the index;
-  post-run synchronization restored matching graph/database generation 27,
+  post-run synchronization restored matching graph/database generation 28,
   with 666 file paths and zero missing files.
 - **Installed Manvi process:** a separate seven-request probe against a fresh
   standalone `.devmap` repository passed `hello`, status and all four advanced
   query kinds (`explore`, `impact`, `trace`, `affected`). Status reported schema
   19, generation 1 and fresh/query-ready state; an invalid depth returned
   `E_BAD_REQUEST`. Evidence: `/tmp/manvi-installed-standalone-smoke.json`.
+  The final installed revision also passed six requests against its repository
+  at generation 28: `/tmp/manvi-installed-protocol-smoke-final.ndjson`.
 - **Installed GitPulse MCP:** the replaced executable reports 0.0.8 and passes
   `npm run mcp:doctor`. Against the same standalone fixture, the previous
   0.0.7 process returned `available: false` because it searched the legacy
@@ -158,6 +177,25 @@ Path-discovery failures are retained in
 The polling control and restored run are retained in
 `/tmp/gitpulse-process-spawn-timing-flat15-loop-red.log` and
 `/tmp/gitpulse-process-spawn-timing-restored-green.log`.
+Progress-classification regressions are retained in
+`/tmp/devmap-progress-regression-red-20260908.log`,
+`/tmp/devmap-progress-cached-regression-red-20260908.log` and
+`/tmp/devmap-progress-regression-green-20260908.log`.
+The complete targeted follow-up and real-workload results are in
+`/tmp/devmap-progress-store-green-20260908.log`,
+`/tmp/devmap-progress-extract-green-20260908.log`,
+`/tmp/gitpulse-devmap-progress-fixed-20260908.json` and
+`/tmp/devmap-supported-failure-fixed-20260908.json`.
+
+The only vendored source change after GitPulse's complete gate was
+`devmap-store/src/extract_cache.rs`; every other crate file still matched its
+tested SHA-256. That module and its exports require `devmap-store/parse`, which
+GitPulse's resolved Cargo feature tree disables. Therefore the final progress
+fix changes the installed devmap builder and packaged source inventory, while
+the compiled GitPulse reader/desktop/MCP paths retain their tested code.
+Final-inventory verification also passed strict all-target Clippy, formatting,
+the two real-store integration tests and the feature assertion above:
+`/tmp/gitpulse-final-vendor-native-focused-20260908.log`.
 
 ## Limits and recovery
 
@@ -171,3 +209,8 @@ absolute confidence, every third-party provider, every operating system, or
 unbounded workload behavior. MarkDev's core checks do not prove physical
 AppKit behavior. Local application installation does not constitute signing,
 notarization or publication of a trusted release.
+
+Manvi retains governed static-analysis debt, including 78 potential nil
+findings. That count matches the baseline and does not establish which warnings
+are runtime defects. Passing the ratchet means the count did not increase; it
+does not mean every existing finding was resolved or the code is free of defects.

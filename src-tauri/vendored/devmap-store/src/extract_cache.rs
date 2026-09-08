@@ -64,18 +64,22 @@ pub fn extract_scanned_cached_with_progress(
         .map(|(path, src)| {
             let result = extract_one_cached_with(store, path, src, extract_file);
             if let Some(progress) = progress {
-                let cached = result.as_ref().is_ok_and(|(_, cached)| *cached);
-                let failed = result.as_ref().map_or(true, |(extraction, _)| {
-                    matches!(
-                        extraction.parse_outcome,
-                        devmap_extract::ParseOutcome::Failed { .. }
-                    )
-                });
-                progress.finish_file(cached, failed);
+                finish_extraction_progress(progress, &result);
             }
             result.map(|(extraction, _)| extraction)
         })
         .collect::<anyhow::Result<Vec<_>>>()
+}
+
+fn finish_extraction_progress(
+    progress: &devmap_extract::progress::FileProgress,
+    result: &anyhow::Result<(Extraction, bool)>,
+) {
+    let cached = result.as_ref().is_ok_and(|(_, cached)| *cached);
+    let failed = result
+        .as_ref()
+        .map_or(true, |(extraction, _)| extraction.is_parse_failure());
+    progress.finish_file(cached, failed);
 }
 
 fn extract_one_cached_with(
@@ -123,7 +127,7 @@ mod tests {
         scanned.sources.push(("empty.py".into(), String::new()));
         scanned
             .sources
-            .push(("failed.unknown".into(), String::new()));
+            .push(("failed.ipynb".into(), "not json".into()));
         let refs: Vec<_> = scanned
             .sources
             .iter()
@@ -163,13 +167,53 @@ mod tests {
                 snapshot.failed,
                 observed
                     .iter()
-                    .filter(|extraction| matches!(
-                        extraction.parse_outcome,
-                        ParseOutcome::Failed { .. }
-                    ))
+                    .filter(|extraction| extraction.is_parse_failure())
                     .count()
             );
         }
+    }
+
+    #[test]
+    fn progress_counts_only_genuine_parse_failures_for_cold_files() {
+        let mut scanned = devmap_extract::ScannedTree::default();
+        scanned
+            .sources
+            .push(("guide.md".into(), "# prose\n".into()));
+        scanned
+            .sources
+            .push(("broken.ipynb".into(), "not json".into()));
+
+        let store = Store::open_in_memory().unwrap();
+        let cold_progress = devmap_extract::progress::FileProgress::default();
+        let cold =
+            extract_scanned_cached_with_progress(&store, &scanned, Some(&cold_progress)).unwrap();
+        assert!(!cold[0].is_parse_failure());
+        assert!(cold[1].is_parse_failure());
+        let cold_snapshot = cold_progress.snapshot();
+        assert!(cold_snapshot.valid);
+        assert_eq!(cold_snapshot.completed, 2);
+        assert_eq!(cold_snapshot.cache_hits, 0);
+        assert_eq!(cold_snapshot.failed, 1);
+    }
+
+    #[test]
+    fn progress_counts_a_cached_not_applicable_file_as_successful_work() {
+        // Old stores may contain a NotApplicable payload admitted by an older
+        // cache policy. A hit is still successful work and must not invalidate
+        // progress merely because its wire outcome is the legacy `Failed`.
+        let prose = devmap_extract::extract_file("guide.md", "# prose\n");
+        let cached_progress = devmap_extract::progress::FileProgress::default();
+        cached_progress.start(2);
+        finish_extraction_progress(&cached_progress, &Ok((prose.clone(), true)));
+        let broken = devmap_extract::extract_file("broken.ipynb", "not json");
+        finish_extraction_progress(&cached_progress, &Ok((broken.clone(), false)));
+        assert!(!prose.is_parse_failure());
+        assert!(broken.is_parse_failure());
+        let cached_snapshot = cached_progress.snapshot();
+        assert!(cached_snapshot.valid);
+        assert_eq!(cached_snapshot.completed, 2);
+        assert_eq!(cached_snapshot.cache_hits, 1);
+        assert_eq!(cached_snapshot.failed, 1);
     }
 
     #[test]
