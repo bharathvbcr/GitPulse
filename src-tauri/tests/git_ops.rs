@@ -14,6 +14,40 @@ use tempfile::TempDir;
 mod common;
 use common::run_git;
 
+#[test]
+fn shared_fixture_can_commit_without_global_identity() {
+    let dir = tempfile::TempDir::new().unwrap();
+    run_git(dir.path(), &["init", "-b", "main"]);
+    let empty_global = dir.path().join(".git/empty-global-config");
+    std::fs::write(&empty_global, "").unwrap();
+    std::fs::write(dir.path().join("file"), "content\n").unwrap();
+    run_git(dir.path(), &["add", "file"]);
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.useConfigOnly=true",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture identity",
+        ])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_GLOBAL", empty_global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct TestRepo {
     dir: TempDir,
 }

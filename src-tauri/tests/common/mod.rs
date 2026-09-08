@@ -20,10 +20,9 @@ use std::process::Command;
 
 /// Runs `git` in `cwd` and asserts it succeeded.
 ///
-/// The identity comes from the environment rather than `-c` flags so that
-/// commands which write their own config still see it; each caller's `init`
-/// additionally pins `commit.gpgsign=false` on the repository, without which
-/// a developer with global signing on would block on a passphrase prompt.
+/// Identity is supplied to setup commands and persisted after initialization
+/// so application Git calls also work on machines without a global identity.
+/// Each caller additionally pins `commit.gpgsign=false` on the repository.
 pub fn run_git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -40,4 +39,11 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.first() == Some(&"init") {
+        run_git(cwd, &["config", "--local", "user.name", "Test User"]);
+        run_git(
+            cwd,
+            &["config", "--local", "user.email", "test@example.com"],
+        );
+    }
 }
