@@ -80,7 +80,10 @@ fn wide(path: &Path) -> Result<Vec<u16>, String> {
 
 fn pin_directory(path: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
-        .access_mode(0x80) // FILE_READ_ATTRIBUTES; no backup privilege is enabled.
+        // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES. Metadata-only opens do
+        // not participate in Windows share-access checks, so they cannot pin
+        // a directory name. No backup privilege or ACL override is enabled.
+        .access_mode(0x81)
         .share_mode(SHARE_READ | SHARE_WRITE) // No DELETE: the name stays pinned.
         .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
         .open(path)
