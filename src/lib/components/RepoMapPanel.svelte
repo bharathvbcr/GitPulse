@@ -16,7 +16,12 @@
     refreshDevmap,
   } from "../codeintel/client";
   import { linkCandidatesHonesty } from "../codeintel/linkCandidates";
-  import { formatCap, preferredDeadLists, roleSample } from "../codeintel/repoMap";
+  import {
+    coverageGapSummary,
+    formatCap,
+    preferredDeadLists,
+    roleSample,
+  } from "../codeintel/repoMap";
   import type {
     DevmapCliStatus,
     DevmapStatusPayload,
@@ -403,27 +408,6 @@
     } else if (view === "links") {
       void reloadLinks(path);
     }
-  }
-
-  function coverageGapSummary(payload: DevmapStatusPayload | null): string | null {
-    const gaps = payload?.coverage_gaps;
-    if (!gaps || typeof gaps !== "object") return null;
-    const parts: string[] = [];
-    for (const [key, value] of Object.entries(gaps)) {
-      const n = Array.isArray(value)
-        ? value.length
-        : typeof value === "number"
-          ? value
-          : value && typeof value === "object" && "length" in value
-            ? Number((value as { length: unknown }).length)
-            : null;
-      if (n != null && n > 0) parts.push(`${key}: ${n}`);
-      else if (value && !Array.isArray(value) && typeof value === "object") {
-        const count = Object.keys(value as object).length;
-        if (count > 0) parts.push(`${key}: ${count}`);
-      }
-    }
-    return parts.length > 0 ? parts.join(" · ") : null;
   }
 
   function selectSubsystem(area: string) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCap, preferredDeadLists, roleSample } from "./repoMap";
+import { coverageGapSummary, formatCap, preferredDeadLists, roleSample } from "./repoMap";
 import type { RepoMapDocument, RepoMapSubsystem } from "./types";
 
 function emptyMeta() {
@@ -57,6 +57,94 @@ function baseMap(overrides: Partial<RepoMapDocument> = {}): RepoMapDocument {
 }
 
 describe("repoMap honesty helpers", () => {
+  it("reads explicit totals from the current devmap coverage envelopes", () => {
+    expect(
+      coverageGapSummary({
+        coverage_gaps: {
+          call_blind: { paths: [], shown: 0, total: 0, truncated: false },
+          discovery_refused: { paths: [], shown: 0, total: 0, truncated: false },
+          import_blind: {
+            paths: [{ path: "scripts/webkit-regressions.swift", reason: "no extractor" }],
+            shown: 1,
+            total: 1,
+            truncated: false,
+          },
+          not_parsed: { paths: [], shown: 0, total: 0, truncated: false },
+          parse_failed: { paths: [], shown: 0, total: 0, truncated: false },
+          pattern_recovered: { paths: [], shown: 0, total: 0, truncated: false },
+        },
+      }),
+    ).toBe("import_blind: 1");
+  });
+
+  it("uses the complete total for a truncated current envelope", () => {
+    expect(
+      coverageGapSummary({
+        coverage_gaps: {
+          discovery_refused: { paths: [{ path: "shown.rs" }], shown: 1, total: 7, truncated: true },
+        },
+      }),
+    ).toBe("discovery_refused: 7");
+  });
+
+  it("keeps supported legacy count, array, and length shapes", () => {
+    expect(
+      coverageGapSummary({
+        coverage_gaps: {
+          numeric: 3,
+          paths: ["a.rs", "b.rs"],
+          counted: { length: 4 },
+          zero: 0,
+        },
+      }),
+    ).toBe("numeric: 3 · paths: 2 · counted: 4");
+  });
+
+  it("renders malformed categories as unavailable without turning keys into counts", () => {
+    expect(
+      coverageGapSummary({
+        coverage_gaps: {
+          malformed_total: { paths: ["a.rs"], shown: 1, total: "one", truncated: false },
+          negative_total: { paths: [], shown: 0, total: -1, truncated: false },
+          fractional_total: { paths: [], shown: 0, total: 1.5, truncated: false },
+          nan_total: { paths: [], shown: 0, total: Number.NaN, truncated: false },
+          unsafe_total: {
+            paths: [],
+            shown: 0,
+            total: Number.MAX_SAFE_INTEGER + 1,
+            truncated: false,
+          },
+          negative_legacy: -2,
+          fractional_legacy: 2.5,
+          malformed_length: { length: "four" },
+          arbitrary_object: { reason: "producer drift", code: 7 },
+        },
+      }),
+    ).toBe(
+      "malformed_total: unavailable · negative_total: unavailable · " +
+        "fractional_total: unavailable · nan_total: unavailable · " +
+        "unsafe_total: unavailable · negative_legacy: unavailable · " +
+        "fractional_legacy: unavailable · malformed_length: unavailable · " +
+        "arbitrary_object: unavailable",
+    );
+  });
+
+  it("keeps verified zero distinct from malformed-only input", () => {
+    expect(
+      coverageGapSummary({
+        coverage_gaps: {
+          zero_envelope: { paths: [], shown: 0, total: 0, truncated: false },
+          zero_legacy: 0,
+          zero_array: [],
+          zero_length: { length: 0 },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      coverageGapSummary({ coverage_gaps: { malformed: { total: null } } }),
+    ).toBe("malformed: unavailable");
+  });
+
   it("formats caps without implying a truncated sample is complete", () => {
     expect(formatCap(2, 7, true)).toBe("2 of 7");
     expect(formatCap(2, 2, false)).toBe("2");

@@ -6,8 +6,8 @@ work-overview changes, and the canonical library changes those features consume.
 It is local verification, not a release or proof that every possible defect has
 been eliminated. The integration contract is in [MODULE_INTEGRATION.md](MODULE_INTEGRATION.md).
 
-The coordinated GitPulse snapshot includes 164 non-Markdown files with 14,655
-lines added and 2,234 removed, including work pending before this audit.
+The coordinated GitPulse snapshot includes 166 non-Markdown files with 14,787
+lines added and 2,257 removed, including work pending before this audit.
 The refreshed GitNexus staged analysis classified its impact as HIGH: 990
 indexed symbols and 14 execution flows. The affected Git execution, document
 rename and repository-refresh paths were covered by the full local gate.
@@ -27,6 +27,7 @@ rename and repository-refresh paths were covered by the full local gate.
 | Query error classification | A caller's invalid depth was classified as `E_DEPENDENCY`. | Shared query validation distinguishes malformed requests (`E_BAD_REQUEST`) from unavailable/incompatible producers (`E_DEPENDENCY`). |
 | Polling-latency regression test | The test passed alone but repeatedly failed in the concurrent library suite, where only its bounded path shared spawn-admission contention. | Move the timing check into its own integration executable through the existing public capture API, preserving all twelve alternating samples and the exact 8 ms allowance. A real flat-15 ms polling-loop mutation still fails it. |
 | Extraction progress classification | The full GitPulse index reported 83 failed files and invalid progress, while its stored coverage correctly reported zero parse failures. SQLite showed all 83 were `NotApplicable` prose/data files. | Use canonical `Extraction::is_parse_failure()` for progress, preserving genuine failure counts and valid cached-file accounting. Separate cold and legacy-cache regressions failed before correction. |
+| Native Map coverage summary | The installed app rendered four gaps in every category by counting envelope keys, while the real status had one import gap and zero in the other categories. | Interpret producer counts at the shared repository-map boundary, preserving zero, truncated and unavailable evidence instead of counting metadata keys. |
 
 The vendor suite passed 29 tests, including twelve update/delete cycles,
 idempotence, inherited metadata, scoped preservation, preparation failures,
@@ -137,6 +138,28 @@ require recompiling their host; arbitrary ABI compatibility is not promised.
 - **WebKit:** the 24-case native WebKit harness passed on retry. The first
   attempt timed out after 60 seconds under concurrent verification load;
   that failed attempt is retained as evidence.
+- **Native navigation and Manvi:** the installed app loaded its existing ten
+  repository tabs. The file map showed 1,120 nodes, 18,195 links and 130 groups,
+  with one rejected projection record reported explicitly. Searching for
+  `src-tauri/src/codeintel/mod.rs`, selecting it and opening it reached the
+  actual source file in Explorer. The Manvi panel showed protocol 1, host
+  posture, `/Users/bharath/.local/bin/manvi`, and both `devmap.status` and
+  `devmap.query` among its negotiated operations.
+
+The subsequent native coverage-summary correction passed all 5,095 frontend
+tests in 389 files, 20 focused map tests, Svelte/TypeScript checks and 24/24
+Chrome regressions. Final frontend coverage rounds to 96.00% lines (9,324/9,713)
+and 88.59% branches (8,265/9,330); the combined coverage-floor gate passes.
+Malformed counts now remain visibly unavailable;
+known zero counts are omitted, and valid truncated envelopes retain their
+complete total. GitNexus could not index the former Svelte-local helper;
+file-level impact was LOW with zero indexed upstream dependants/processes.
+The component's delegation to the shared helper was inspected directly.
+Evidence: `/tmp/gitpulse-coverage-gap-summary-prefix-red.log`,
+`/tmp/gitpulse-coverage-gap-malformed-prefix-red.log`,
+`/tmp/gitpulse-coverage-gap-malformed-postfix-green.log`,
+`/tmp/gitpulse-coverage-gap-malformed-coverage.log` and
+`/tmp/gitpulse-coverage-gap-malformed-browser.log`.
 
 An early final GitPulse attempt failed the Rust spawn-latency test: the
 bounded path added 13.272625 ms over a bare 16.457 ms spawn/reap, exceeding
@@ -214,3 +237,15 @@ Manvi retains governed static-analysis debt, including 78 potential nil
 findings. That count matches the baseline and does not establish which warnings
 are runtime defects. Passing the ratchet means the count did not increase; it
 does not mean every existing finding was resolved or the code is free of defects.
+
+Freshness also does not establish full language coverage. The refreshed four
+repositories report their gaps explicitly. DevCouncil's own corpus includes
+unsupported-language fixtures, an unparsed minified bundle, and a generated
+30.7 MB grammar file refused by the 1 MiB source ceiling; its status correctly
+remains partial. Import extraction is unavailable for some languages,
+including Swift. No complete-language-coverage claim is made.
+
+The native build also retains two non-fatal advisories: Vite's entry-chunk size
+and Tauri's deprecated `STATIC_VCRUNTIME` setting. Windows/Linux execution,
+trusted release signing/notarization and live hosted-provider behavior were
+not established by the local macOS checks.

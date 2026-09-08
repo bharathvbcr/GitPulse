@@ -5,7 +5,7 @@
  * pairs shown length with `liveness_meta` / `role_file_counts` totals.
  */
 
-import type { RepoMapDocument, RepoMapSubsystem } from "./types";
+import type { DevmapStatusPayload, RepoMapDocument, RepoMapSubsystem } from "./types";
 import { dedupePreserveOrder } from "../ui/eachKeys";
 
 export function formatCap(shown: number, total: number, truncated: boolean): string {
@@ -13,6 +13,43 @@ export function formatCap(shown: number, total: number, truncated: boolean): str
     return `${shown} of ${total}`;
   }
   return String(shown);
+}
+
+export function coverageGapSummary(payload: DevmapStatusPayload | null): string | null {
+  const gaps = payload?.coverage_gaps;
+  if (!gaps || typeof gaps !== "object") return null;
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(gaps)) {
+    const n = coverageGapCount(value);
+    if (n === "unavailable") parts.push(`${key}: unavailable`);
+    else if (n > 0) parts.push(`${key}: ${n}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+function coverageGapCount(value: unknown): number | "unavailable" {
+  if (Array.isArray(value)) return value.length;
+  if (isCount(value)) return value;
+  if (!value || typeof value !== "object") return "unavailable";
+
+  // Current devmap envelopes carry a capped sample beside the complete total.
+  // Presence is decisive: a malformed `total` is producer drift, not permission
+  // to reinterpret the envelope's four structural keys as four gaps.
+  if ("total" in value) {
+    const total = value.total;
+    return isCount(total) ? total : "unavailable";
+  }
+
+  // Legacy producers exposed array-like objects with a numeric length.
+  if ("length" in value) {
+    const length = value.length;
+    return isCount(length) ? length : "unavailable";
+  }
+  return "unavailable";
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function roleSample(
