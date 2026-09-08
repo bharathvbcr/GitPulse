@@ -14,6 +14,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 mod flow;
+#[cfg(unix)]
+mod input;
 use flow::OutputFlow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -483,6 +485,9 @@ pub fn spawn_session<R: tauri::Runtime>(
         .master
         .try_clone_reader()
         .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
+    #[cfg(unix)]
+    let writer = input::open(pair.master.as_ref())?;
+    #[cfg(not(unix))]
     let writer = pair
         .master
         .take_writer()
@@ -559,6 +564,10 @@ pub fn spawn_session<R: tauri::Runtime>(
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    #[cfg(unix)]
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
                     Err(_) => break,
                 }
             }
@@ -698,26 +707,36 @@ fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> R
             data.len()
         ));
     }
-    let writer = {
+    let (writer, dead) = {
         let guard = state
             .sessions
             .lock()
             .map_err(|e| format!("Lock error: {e}"))?;
         guard
             .get(session_id)
-            .map(|session| session.writer.clone())
+            .map(|session| (session.writer.clone(), session.dead.clone()))
             .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?
     };
-    let mut writer = writer
-        .lock()
-        .map_err(|e| format!("Terminal writer lock error: {e}"))?;
-    writer
-        .write_all(data)
-        .map_err(|e| format!("Failed to write to terminal: {e}"))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush terminal: {e}"))?;
-    Ok(())
+    #[cfg(unix)]
+    {
+        input::write(&writer, &dead, data)
+    }
+    #[cfg(not(unix))]
+    {
+        if dead.load(Ordering::Acquire) {
+            return Err("Terminal session is closed".into());
+        }
+        let mut writer = writer
+            .lock()
+            .map_err(|e| format!("Terminal writer lock error: {e}"))?;
+        writer
+            .write_all(data)
+            .map_err(|e| format!("Failed to write to terminal: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush terminal: {e}"))?;
+        Ok(())
+    }
 }
 
 /// Resizes a PTY session.

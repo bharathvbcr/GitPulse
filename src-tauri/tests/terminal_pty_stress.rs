@@ -142,9 +142,14 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
     let writing_state = state.clone();
     let id = a.id.clone();
-    let blocked =
-        std::thread::spawn(move || write_to_session(&writing_state, &id, &"x".repeat(65536)));
-    std::thread::sleep(Duration::from_millis(50));
+    let (written_send, written_receive) = mpsc::channel();
+    let blocked = std::thread::spawn(move || {
+        let result = write_to_session(&writing_state, &id, &"x".repeat(65536));
+        let _ = written_send.send(result);
+    });
+    assert!(written_receive
+        .recv_timeout(Duration::from_millis(50))
+        .is_err());
     let start = Instant::now();
     let b = spawn_session(
         app.handle(),
@@ -161,7 +166,52 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     kill_session(&state, &a.id).unwrap();
     kill_session(&state, &b.id).unwrap();
     assert!(start.elapsed() < Duration::from_secs(3));
-    let _ = blocked.join().unwrap();
+    assert!(written_receive
+        .recv_timeout(Duration::from_secs(3))
+        .expect("closing a session must release its blocked input request")
+        .is_err());
+    blocked.join().unwrap();
+}
+
+#[test]
+fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let dir = repo();
+    let (ready_send, ready_receive) = mpsc::channel();
+    app.listen("terminal-output", move |_| {
+        let _ = ready_send.send(());
+    });
+    let session = spawn_session(
+        app.handle(),
+        &state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec![
+            "-c".into(),
+            "stty -echo -icanon; printf ready; sleep 30".into(),
+        ]),
+        None,
+    )
+    .unwrap();
+    ready_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    let writing = state.clone();
+    let id = session.id.clone();
+    let (send, receive) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _ = send.send(write_to_session(&writing, &id, &"x".repeat(65536)));
+    });
+    let result = receive
+        .recv_timeout(Duration::from_secs(4))
+        .expect("input must have its own deadline");
+    assert!(result.unwrap_err().contains("Terminal input timed out"));
+    thread.join().unwrap();
+    kill_session(&state, &session.id).unwrap();
 }
 
 #[test]

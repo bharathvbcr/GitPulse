@@ -33,6 +33,12 @@ before that tag is pushed.
   by ID, verify uploaded asset digests, and confirm changelog notes after writing.
 - Accept GNU checksum records with escaped filenames and normalize Windows index
   transaction paths for Git. Preserve hostile filename tests on supported systems.
+- Resolve regular-file conflicts on Windows with pinned directories, exact staged
+  bytes and retained recovery content on replacement or staging failure. Preserve
+  executable Git modes in the index; Windows reparse points require external resolution.
+- Bound Unix terminal input delivery and lock waits, cancel pending input on close,
+  and report partial delivery without retrying accepted bytes. Closing a Linux PTY
+  no longer leaves a full input-queue write blocked after its child exits.
 - Avoid redundant JSON parsing during diagnostic breadcrumbs while retaining the
   existing credential redaction and stress-test budgets.
 - Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.
