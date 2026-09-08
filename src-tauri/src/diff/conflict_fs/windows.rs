@@ -61,7 +61,16 @@ fn identity(file: &File) -> Result<Identity, String> {
 }
 
 fn wide(path: &Path) -> Result<Vec<u16>, String> {
-    let mut value: Vec<_> = path.as_os_str().encode_wide().collect();
+    // Repo roots are simplified for Git, but a descendant or recovery path
+    // can cross MAX_PATH. Canonicalize only its pinned parent to recover the
+    // verbatim Windows namespace without following or requiring the final file.
+    let parent = path
+        .parent()
+        .ok_or("Missing conflict parent")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let absolute = parent.join(path.file_name().ok_or("Missing conflict filename")?);
+    let mut value: Vec<_> = absolute.as_os_str().encode_wide().collect();
     if value.contains(&0) || value.len() >= 32_767 {
         return Err("Conflict path contains NUL or exceeds the Windows path limit".into());
     }
@@ -509,5 +518,39 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(root.join("alias")).unwrap(), b"external");
         recovery.keep = false;
+    }
+
+    #[test]
+    fn long_descendants_of_short_roots_support_replacement_and_missing_destinations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut parent = dir.path().canonicalize().unwrap();
+        for _ in 0..18 {
+            parent.push("nested-directory");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let canonical = parent.join("file");
+        fs::write(&canonical, b"original").unwrap();
+        let plain =
+            std::path::PathBuf::from(canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        assert!(plain.as_os_str().len() > 260);
+        let encoded = super::wide(&plain).unwrap();
+        assert!(String::from_utf16(&encoded[..encoded.len() - 1])
+            .unwrap()
+            .starts_with(r"\\?\"));
+        let mut recovery = replace(&plain, &content(b"original"), &content(b"resolved"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(&canonical).unwrap(), b"resolved");
+        recovery.keep = false;
+        drop(recovery);
+        let missing = Worktree {
+            bytes: None,
+            mode: "missing".into(),
+        };
+        let new_path = plain.with_file_name("new");
+        assert!(replace(&new_path, &missing, &content(b"created"))
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(parent.join("new")).unwrap(), b"created");
     }
 }
