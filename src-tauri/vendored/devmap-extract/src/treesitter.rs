@@ -20,7 +20,6 @@ pub mod vendored {
 
     unsafe extern "C" {
         fn tree_sitter_vue() -> *const ();
-        fn tree_sitter_COBOL() -> *const ();
         fn tree_sitter_liquid() -> *const ();
     }
 
@@ -29,18 +28,11 @@ pub mod vendored {
     /// pointer to a `'static` grammar table.
     pub const VUE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_vue) };
 
-    /// SAFETY: as `VUE`. COBOL's generated entry point is upper-case because
-    /// the grammar declares its name that way.
-    pub const COBOL: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_COBOL) };
     /// SAFETY: as `VUE`.
     pub const LIQUID: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_liquid) };
 
     pub fn vue() -> Language {
         VUE.into()
-    }
-
-    pub fn cobol() -> Language {
-        COBOL.into()
     }
 
     pub fn liquid() -> Language {

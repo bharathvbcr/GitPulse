@@ -18,6 +18,7 @@
 //! "1,000 of 12,103 nodes" is what the reader sees, never "1,000 nodes".
 
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 /// The vendored renderer, embedded so the page works offline and from a file://
 /// URL. force-graph v1.51.4, MIT (<https://github.com/vasturiano/force-graph>).
@@ -38,6 +39,7 @@ const FILE_EDGE_KINDS: &[&str] = &["imports"];
 /// Edge kinds that mean one *symbol* reaches another.
 const SYMBOL_EDGE_KINDS: &[&str] = &[
     "calls",
+    "references",
     "inherits",
     "implements",
     "overrides",
@@ -110,39 +112,164 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
     let unwired = strings(graph, "unwired_candidates");
     let entry_roots = strings(graph, "entry_roots");
 
-    // A node belongs to this level, or it does not. Mixing files and symbols in
-    // one layout draws two graphs on top of each other and reads as neither.
-    let in_level = |node: &Value| -> bool {
-        let kind = node.get("kind").and_then(Value::as_str).unwrap_or("");
-        if options.symbols {
-            kind != "file"
-        } else {
-            kind == "file"
+    // IDs are opaque. Reject ambiguous identities instead of picking whichever
+    // duplicate happened to arrive last, and resolve symbol ownership by path.
+    let mut node_ids: BTreeMap<&str, Option<&Value>> = BTreeMap::new();
+    let mut invalid_nodes = 0usize;
+    for node in all_nodes {
+        let Some(id) = node
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            invalid_nodes += 1;
+            continue;
+        };
+        if node
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            invalid_nodes += 1;
+            continue;
         }
-    };
-
-    let keep_edge = |edge: &Value| -> bool {
-        let kind = edge.get("kind").and_then(Value::as_str).unwrap_or("");
-        let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
-        let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
-        let symbol_endpoints = source.contains("::") || target.contains("::");
-        if options.symbols {
-            SYMBOL_EDGE_KINDS.contains(&kind) && symbol_endpoints
-        } else {
-            FILE_EDGE_KINDS.contains(&kind) && !symbol_endpoints
-        }
-    };
-
-    let mut degree: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for edge in all_edges.iter().filter(|edge| keep_edge(edge)) {
-        for end in ["source", "target"] {
-            if let Some(id) = edge.get(end).and_then(Value::as_str) {
-                *degree.entry(id).or_insert(0) += 1;
+        match node_ids.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(node));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                invalid_nodes += 1 + usize::from(entry.get().is_some());
+                entry.insert(None);
             }
         }
     }
+    let node_ids: BTreeMap<&str, &Value> = node_ids
+        .into_iter()
+        .filter_map(|(id, node)| node.map(|node| (id, node)))
+        .collect();
+    let mut files: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for (&id, &node) in &node_ids {
+        if node["kind"] == "file" {
+            let path = node
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .unwrap_or(id);
+            files
+                .entry(path)
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(id));
+        }
+    }
+    let owner = |id: &str| -> Option<&str> {
+        let node = node_ids.get(id)?;
+        if node["kind"] == "file" {
+            Some(node.get("id")?.as_str()?)
+        } else {
+            files.get(node.get("path")?.as_str()?).copied().flatten()
+        }
+    };
+    let in_level = |node: &&Value| (node["kind"] != "file") == options.symbols;
 
-    let mut candidates: Vec<&Value> = all_nodes.iter().filter(|node| in_level(node)).collect();
+    // Merge duplicate source evidence deterministically before projecting it.
+    // Unknown confidence stays unknown; mixed resolutions are never promoted
+    // to an exact match. Distinct symbol edges contribute once to each link.
+    #[derive(Clone)]
+    struct Evidence<'a> {
+        confidence: Option<f64>,
+        resolution: &'a str,
+        count: usize,
+    }
+    let merge = |previous: &mut Evidence<'_>, next: &Evidence<'_>| {
+        previous.confidence = previous
+            .confidence
+            .zip(next.confidence)
+            .map(|(a, b)| a.min(b));
+        if previous.resolution != next.resolution {
+            previous.resolution = "mixed";
+        }
+    };
+    let mut raw: BTreeMap<(&str, &str, &str), Evidence<'_>> = BTreeMap::new();
+    let mut invalid_edges = 0usize;
+    let mut duplicate_edges = 0usize;
+    for edge in all_edges {
+        let Some(kind) = edge.get("kind").and_then(Value::as_str) else {
+            invalid_edges += 1;
+            continue;
+        };
+        if !SYMBOL_EDGE_KINDS.contains(&kind)
+            && (options.symbols || !FILE_EDGE_KINDS.contains(&kind))
+        {
+            continue;
+        }
+        let (Some(source), Some(target)) = (
+            edge.get("source").and_then(Value::as_str),
+            edge.get("target").and_then(Value::as_str),
+        ) else {
+            invalid_edges += 1;
+            continue;
+        };
+        let (Some(a), Some(b)) = (node_ids.get(source), node_ids.get(target)) else {
+            invalid_edges += 1;
+            continue;
+        };
+        if options.symbols && (a["kind"] == "file" || b["kind"] == "file") {
+            continue;
+        }
+        let evidence = Evidence {
+            confidence: edge
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            resolution: edge
+                .get("resolution")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            count: 1,
+        };
+        match raw.entry((source, target, kind)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(evidence);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                merge(entry.get_mut(), &evidence);
+                duplicate_edges += 1;
+            }
+        }
+    }
+    let mut projected: BTreeMap<(&str, &str, &str), Evidence<'_>> = BTreeMap::new();
+    let mut internal_edges = 0usize;
+    for ((source, target, kind), evidence) in raw {
+        let (source, target) = if options.symbols {
+            (source, target)
+        } else {
+            let (Some(a), Some(b)) = (owner(source), owner(target)) else {
+                invalid_edges += 1;
+                continue;
+            };
+            if a == b {
+                internal_edges += 1;
+                continue;
+            }
+            (a, b)
+        };
+        match projected.entry((source, target, kind)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(evidence);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let previous = entry.get_mut();
+                merge(previous, &evidence);
+                previous.count += evidence.count;
+            }
+        }
+    }
+    let mut degree: BTreeMap<&str, usize> = BTreeMap::new();
+    for &(source, target, _) in projected.keys() {
+        *degree.entry(source).or_default() += 1;
+        *degree.entry(target).or_default() += 1;
+    }
+    let mut candidates: Vec<&Value> = node_ids.values().copied().filter(in_level).collect();
     let total_nodes = candidates.len();
     // Most-connected first, then by id so the choice is deterministic across
     // runs (R4) rather than depending on map iteration.
@@ -195,23 +322,23 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
     // Only edges whose *both* ends survived the cap. An edge to a node that is
     // not drawn is a line into empty space, and force-graph would invent a
     // phantom node for it — a node the graph does not contain.
-    let mut total_links = 0usize;
-    let links: Vec<Value> = all_edges
-        .iter()
-        .filter(|edge| keep_edge(edge))
-        .inspect(|_| total_links += 1)
-        .filter(|edge| {
-            let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
-            let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
-            shown.contains(source) && shown.contains(target)
-        })
-        .map(|edge| {
+    let total_links = projected.len();
+    // A node cap alone cannot bound a dense graph. Keep the strongest visible
+    // relationships with a deterministic tie break and report the full total.
+    const MAX_LINKS: usize = 50_000;
+    let mut visible: Vec<_> = projected
+        .into_iter()
+        .filter(|((a, b, _), _)| shown.contains(a) && shown.contains(b))
+        .collect();
+    visible.sort_by(|(a_key, a), (b_key, b)| b.count.cmp(&a.count).then_with(|| a_key.cmp(b_key)));
+    visible.truncate(MAX_LINKS);
+    let links: Vec<Value> = visible
+        .into_iter()
+        .map(|((source, target, kind), evidence)| {
             json!({
-                "source": edge.get("source").and_then(Value::as_str).unwrap_or(""),
-                "target": edge.get("target").and_then(Value::as_str).unwrap_or(""),
-                "kind": edge.get("kind").and_then(Value::as_str).unwrap_or(""),
-                "confidence": edge.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
-                "resolution": edge.get("resolution").and_then(Value::as_str).unwrap_or(""),
+                "source": source, "target": target, "kind": kind,
+                "confidence": evidence.confidence, "resolution": evidence.resolution,
+                "evidence_count": evidence.count,
             })
         })
         .collect();
@@ -241,6 +368,12 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
             "max_nodes": options.max_nodes,
         },
         "communities": communities,
+        "meta": {"projection": {
+            "scope": if options.symbols { "symbol relationships" } else { "cross-file dependencies" },
+            "invalid_nodes": invalid_nodes, "invalid_edges": invalid_edges,
+            "internal_edges_omitted": internal_edges, "duplicate_edges_merged": duplicate_edges,
+            "max_links": MAX_LINKS,
+        }},
         "generation_id": graph.pointer("/meta/generation_id").cloned().unwrap_or(Value::Null),
     })
 }
@@ -424,6 +557,9 @@ if (!DATA.nodes.length) {{
   // filter below rebuilds from a pristine copy rather than from live state.
   const source = JSON.parse(JSON.stringify(DATA));
   let showLabels = true;
+  const MAX_FILTER_ZOOM = 4;
+  const FILTER_FIT_DELAY_MS = 80;
+  let filterFitTimer;
 
   const graph = ForceGraph()(el)
     .backgroundColor('#0f1419')
@@ -493,7 +629,34 @@ if (!DATA.nodes.length) {{
     return '<dt>' + label + '</dt><dd><ul>' +
       items.map(i => '<li>' + esc(String(i)) + '</li>').join('') + '</ul></dd>';
   }}
+  function fitFiltered(nodes) {{
+    const placed = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
+    if (!placed.length) return;
+    let minX = placed[0].x;
+    let maxX = placed[0].x;
+    let minY = placed[0].y;
+    let maxY = placed[0].y;
+    for (const node of placed.slice(1)) {{
+      minX = Math.min(minX, node.x);
+      maxX = Math.max(maxX, node.x);
+      minY = Math.min(minY, node.y);
+      maxY = Math.max(maxY, node.y);
+    }}
+    // A singleton and coincident nodes have a zero-size world bounding box.
+    // Give that box a real extent before deriving camera scale, then cap the
+    // scale so filtering cannot turn one ordinary node into a full-pane disk.
+    const spanX = Math.max(maxX - minX, 1);
+    const spanY = Math.max(maxY - minY, 1);
+    const width = Math.max(el.clientWidth - 80, 1);
+    const height = Math.max(el.clientHeight - 80, 1);
+    const targetZoom = Math.max(0.05,
+      Math.min(width / spanX, height / spanY, MAX_FILTER_ZOOM));
+    graph.centerAt((minX + maxX) / 2, (minY + maxY) / 2, 250);
+    graph.zoom(targetZoom, 250);
+  }}
   function apply() {{
+    clearTimeout(filterFitTimer);
+    filterFitTimer = undefined;
     const term = document.getElementById('q').value.trim().toLowerCase();
     const required = (VIEW.flag_filters || [])
       .filter(([flag]) => {{
@@ -515,11 +678,16 @@ if (!DATA.nodes.length) {{
         .filter(l => ids.has(l.source) && ids.has(l.target))
         .map(l => Object.assign({{}}, l)),
     }});
-    // The survivors are fresh copies with no coordinates, so the simulation
-    // seeds them wherever it likes while the camera stays where it was. Without
-    // this the pane goes blank on a filter that matched — which reads as "no
-    // results" and is the same failure as a silent cap.
-    if (keep.length) setTimeout(() => graph.zoomToFit(400, 40), 60);
+    // The survivors are fresh copies with no coordinates, so let the
+    // simulation place them before deriving a bounded camera. Canceling the
+    // previous timer prevents a stale quick-typing result from moving the
+    // camera after a newer filter has already won.
+    if (keep.length) {{
+      filterFitTimer = setTimeout(() => {{
+        filterFitTimer = undefined;
+        fitFiltered(graph.graphData().nodes);
+      }}, FILTER_FIT_DELAY_MS);
+    }}
   }}
   document.getElementById('q').addEventListener('input', apply);
   for (const [flag, label] of (VIEW.flag_filters || [])) {{
@@ -667,7 +835,8 @@ mod tests {
         );
         assert!(payload["links"].as_array().unwrap().is_empty());
         // Still reported against the true total, so the emptiness is legible.
-        assert_eq!(payload["counts"]["links_total"], json!(2));
+        // Two imports plus the projected call between a.py and b.py.
+        assert_eq!(payload["counts"]["links_total"], json!(3));
     }
 
     #[test]

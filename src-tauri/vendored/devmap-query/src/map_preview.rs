@@ -38,11 +38,9 @@ const REPO_LANG_CAP: usize = 32;
 
 /// The vendored force-graph build, inlined so the page works offline.
 ///
-/// Read from the Python package tree because that is where the bundle is
-/// vendored and wheel-packaged, and `graph.html` — still rendered in Python —
-/// reads the same bytes. One copy, two readers. If the file moves, this
-/// `include_str!` fails the build rather than silently shipping a page with no
-/// renderer.
+/// Read from this crate's own asset tree so `devmap-query` can be vendored or
+/// published without preserving DevCouncil's Python-package layout. The graph
+/// visualizer uses this same copy; one crate owns the renderer bytes.
 const FORCE_GRAPH_JS: &str = include_str!("../assets/force-graph.min.js.bundle");
 
 const MAP_HTML_TEMPLATE: &str = include_str!("map_preview.html");
@@ -462,6 +460,24 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
             .map(|items| items.iter().take(LIVENESS_CAP).cloned().collect::<Vec<_>>())
             .unwrap_or_default())
     };
+    let liveness_count = |key: &str, meta_key: &str| -> Value {
+        let available = repo_map
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let shown = available.min(LIVENESS_CAP);
+        let producer = &repo_map["liveness_meta"][meta_key];
+        let total = producer["total"].as_u64().filter(|total| {
+            producer["shown"].as_u64() == Some(available as u64)
+                && *total >= available as u64
+                && producer["truncated"].as_bool() == Some(*total > available as u64)
+        });
+        // A legacy sample provides a lower bound, not proof of the real total.
+        let truncated = total
+            .map(|total| total > shown as u64)
+            .or_else(|| (available > shown).then_some(true));
+        json!({"shown": shown, "available": available, "total": total, "truncated": truncated})
+    };
 
     json!({
         "nodes": nodes,
@@ -469,6 +485,12 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
         "subsystems": subsystems.into_iter().map(Value::Object).collect::<Vec<_>>(),
         "unresolved_handoffs": unresolved,
         "liveness": {
+            "counts": {
+                "entry_roots": liveness_count("entry_roots", "entry_roots"),
+                "unwired_candidates": liveness_count("unwired_candidates", "unwired"),
+                "unreachable_files": liveness_count("unreachable_files", "unreachable_files"),
+                "dead_symbol_candidates": liveness_count("dead_symbol_candidates", "dead_symbol"),
+            },
             "entry_roots": liveness_list("entry_roots"),
             "unwired_candidates": liveness_list("unwired_candidates"),
             "unreachable_files": liveness_list("unreachable_files"),
@@ -738,6 +760,57 @@ mod tests {
                 .len(),
             LIVENESS_CAP
         );
+    }
+
+    #[test]
+    fn liveness_projection_preserves_producer_totals_through_its_own_cap() {
+        let mut map = sample_map();
+        map["liveness_meta"] = json!({
+            "unwired": {"shown": 400, "total": 900, "truncated": true},
+            "entry_roots": {"shown": 1, "total": 1, "truncated": false}
+        });
+        let payload = build_preview_payload(&map);
+        assert_eq!(
+            payload["liveness"]["counts"]["unwired_candidates"],
+            json!({
+                "shown": 256, "available": 400, "total": 900, "truncated": true
+            })
+        );
+        assert_eq!(
+            payload["liveness"]["counts"]["entry_roots"],
+            json!({
+                "shown": 1, "available": 1, "total": 1, "truncated": false
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_and_contradictory_liveness_totals_remain_unknown() {
+        for meta in [
+            json!(null),
+            json!({"unwired": {
+                "shown": 400, "total": 2, "truncated": false
+            }}),
+            json!({"unwired": {
+                "shown": 399, "total": 900, "truncated": true
+            }}),
+        ] {
+            let mut map = sample_map();
+            map["liveness_meta"] = meta;
+            let payload = build_preview_payload(&map);
+            assert_eq!(
+                payload["liveness"]["counts"]["unwired_candidates"],
+                json!({
+                    "shown": 256, "available": 400, "total": null, "truncated": true
+                })
+            );
+            assert_eq!(
+                payload["liveness"]["counts"]["unreachable_files"],
+                json!({
+                    "shown": 0, "available": 0, "total": null, "truncated": null
+                })
+            );
+        }
     }
 
     #[test]

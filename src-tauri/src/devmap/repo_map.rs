@@ -283,22 +283,9 @@ impl RepoMapLoad {
     }
 }
 
-/// Resolve `.devcouncil/repo_map.json` (or `.devmap/`) the same way the CLI does.
-///
-/// Prefer `.devcouncil` when that directory exists, else `.devmap`, else the
-/// default `.devcouncil` path. Mirrors `devmap_extract::paths::state_dir`
-/// without pulling that crate into the app binary.
+/// Resolve the map through the same owner used by the CLI and HTML module.
 pub fn repo_map_path(repo: impl AsRef<Path>) -> PathBuf {
-    let root = repo.as_ref();
-    let legacy = root.join(".devcouncil");
-    if legacy.is_dir() {
-        return legacy.join("repo_map.json");
-    }
-    let standalone = root.join(".devmap");
-    if standalone.is_dir() {
-        return standalone.join("repo_map.json");
-    }
-    legacy.join("repo_map.json")
+    devmap_query::paths::repo_map_path(repo)
 }
 
 /// Parse a consumer map document from JSON text.
@@ -320,23 +307,23 @@ pub fn load_repo_map(repo_path: &str) -> RepoMapLoad {
             Some(path_str),
         );
     }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) => {
-            return RepoMapLoad::unavailable(
-                format!("failed to read {path_str}: {e}"),
-                Some(path_str),
-            );
-        }
+    use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let document = match provider.read_repo_map() {
+        Ok(document) => document,
+        Err(error) => return RepoMapLoad::unavailable(error.to_string(), Some(path_str)),
     };
-    match parse_repo_map(&text) {
+    match serde_json::from_value(document) {
         Ok(map) => RepoMapLoad {
             available: true,
             reason: None,
             path: Some(path_str),
             map: Some(map),
         },
-        Err(e) => RepoMapLoad::unavailable(e, Some(path_str)),
+        Err(e) => RepoMapLoad::unavailable(
+            format!("repo_map.json is not valid JSON: {e}"),
+            Some(path_str),
+        ),
     }
 }
 

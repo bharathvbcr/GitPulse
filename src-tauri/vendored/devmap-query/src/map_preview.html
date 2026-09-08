@@ -384,15 +384,26 @@ function select(id, fromList) {
 
 function renderLiveness() {
   const live = DATA.liveness || {};
+  const count = key => {
+    const shown = (live[key] || []).length;
+    const meta = (live.counts || {})[key] || {};
+    if (Number.isSafeInteger(meta.total) && meta.total >= shown) {
+      return shown < meta.total ? fmt(shown) + ' of ' + fmt(meta.total) : fmt(meta.total);
+    }
+    if (Number.isSafeInteger(meta.available) && meta.available > shown) {
+      return fmt(shown) + ' of at least ' + fmt(meta.available);
+    }
+    return fmt(shown) + ' shown · total unknown';
+  };
   const parts = [
-    '<span class="badge entry">entry roots <b>' + fmt((live.entry_roots || []).length) + '</b></span>',
-    '<span class="badge dead">unwired <b>' + fmt((live.unwired_candidates || []).length) + '</b></span>',
-    '<span class="badge dead">dead symbols <b>' + fmt((live.dead_symbol_candidates || []).length) + '</b></span>'
+    '<span class="badge entry">entry roots <b>' + count('entry_roots') + '</b></span>',
+    '<span class="badge dead">unwired <b>' + count('unwired_candidates') + '</b></span>',
+    '<span class="badge dead">dead symbols <b>' + count('dead_symbol_candidates') + '</b></span>'
   ];
   if (live.liveness_unreachable_unreliable) {
     parts.push('<span class="badge warn">unreachable unreliable</span>');
   } else {
-    parts.push('<span class="badge">unreachable <b>' + fmt((live.unreachable_files || []).length) + '</b></span>');
+    parts.push('<span class="badge">unreachable <b>' + count('unreachable_files') + '</b></span>');
   }
   document.getElementById('livenessBadges').innerHTML = parts.join('');
 }
@@ -574,6 +585,8 @@ function redraw() {
 /* ---- canvas chrome ------------------------------------------------------ */
 
 let zoomK = 1;
+const MAX_AUTO_FIT_ZOOM = 4;
+let fitFrame = null;
 // The startup sequence reheats the simulation *after* the first run begins, so
 // the first `onEngineStop` reports a half-placed layout. Fitting once on that
 // stop left 3 of 14 nodes outside the stage. Fit on every stop instead, until
@@ -586,11 +599,38 @@ function updateZoomPct(k) {
 }
 function fitView() {
   if (!g) return;
-  // Padding proportional to the stage. A fixed 80px is a comfortable margin on
-  // a wide canvas and most of the canvas on a narrow one — at a 300px stage it
-  // fit the graph to 12% and stacked every label on top of its neighbour.
-  const pad = Math.max(16, Math.min(80, Math.min(stage.clientWidth, stage.clientHeight) * 0.08));
-  requestAnimationFrame(() => g.zoomToFit(400, pad));
+  // One quick filter can schedule a fit while the next filter is already
+  // replacing its graph. Only the newest requested viewport may move camera.
+  cancelAnimationFrame(fitFrame);
+  fitFrame = requestAnimationFrame(() => {
+    fitFrame = null;
+    const placed = (g.graphData().nodes || [])
+      .filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
+    if (!placed.length) return;
+    let minX = placed[0].x;
+    let maxX = placed[0].x;
+    let minY = placed[0].y;
+    let maxY = placed[0].y;
+    for (const node of placed.slice(1)) {
+      minX = Math.min(minX, node.x);
+      maxX = Math.max(maxX, node.x);
+      minY = Math.min(minY, node.y);
+      maxY = Math.max(maxY, node.y);
+    }
+    // Padding proportional to the stage. A fixed 80px is a comfortable margin
+    // on a wide canvas and most of a narrow one. A real minimum world span and
+    // a camera ceiling keep singleton/coincident layouts finite and readable.
+    const pad = Math.max(16, Math.min(80,
+      Math.min(stage.clientWidth, stage.clientHeight) * 0.08));
+    const spanX = Math.max(maxX - minX, 1);
+    const spanY = Math.max(maxY - minY, 1);
+    const width = Math.max(stage.clientWidth - 2 * pad, 1);
+    const height = Math.max(stage.clientHeight - 2 * pad, 1);
+    const targetZoom = Math.max(0.05,
+      Math.min(width / spanX, height / spanY, MAX_AUTO_FIT_ZOOM));
+    g.centerAt((minX + maxX) / 2, (minY + maxY) / 2, 400);
+    g.zoom(targetZoom, 400);
+  });
 }
 function bumpZoom(factor) {
   if (!g) return;

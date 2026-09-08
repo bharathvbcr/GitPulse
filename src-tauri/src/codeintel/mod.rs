@@ -142,9 +142,7 @@ pub fn devmap_db_path(repo_path: &str) -> PathBuf {
 }
 
 fn map_path(repo: &Path) -> PathBuf {
-    repo.join(".devcouncil")
-        .join("codeintel")
-        .join("devmap.sqlite")
+    devmap_query::paths::store_path(repo)
 }
 
 /// Resolves `repo_path` through the same gate every other repository-scoped
@@ -190,7 +188,7 @@ fn open_store(repo: &Path) -> Result<Store, String> {
             db_path.to_string_lossy()
         ));
     }
-    Store::open(&db_path).map_err(|e| {
+    Store::open_read_only(&db_path).map_err(|e| {
         let raw = e.to_string();
         if let Some(friendly) = rewrite_schema_mismatch(&raw) {
             return friendly;
@@ -1260,7 +1258,7 @@ mod tests {
     #[test]
     fn devmap_db_path_construction() {
         let path = devmap_db_path("/test/repo");
-        assert!(path.ends_with(".devcouncil/codeintel/devmap.sqlite"));
+        assert!(path.ends_with(".devmap/codeintel/devmap.sqlite"));
     }
 
     #[test]

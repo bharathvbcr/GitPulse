@@ -10,6 +10,7 @@
 //! the whole graph.
 
 use crate::engine::git_cli::validate_repo;
+use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -52,22 +53,7 @@ impl GraphVizLoad {
 
 /// Resolve `graph/code_graph.json` the same way `repo_map_path` resolves the map.
 pub fn code_graph_path(repo: impl AsRef<Path>) -> PathBuf {
-    let root = repo.as_ref();
-    let legacy = root.join(".devcouncil");
-    if legacy.is_dir() {
-        return legacy.join("graph").join("code_graph.json");
-    }
-    let standalone = root.join(".devmap");
-    if standalone.is_dir() {
-        return standalone.join("graph").join("code_graph.json");
-    }
-    legacy.join("graph").join("code_graph.json")
-}
-
-fn read_json_file(path: &Path) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+    devmap_query::paths::code_graph_path(repo)
 }
 
 fn clamp_max_nodes(requested: Option<usize>) -> usize {
@@ -95,18 +81,22 @@ pub fn load_code_graph_viz(
             Some(path_str),
         );
     }
-    let graph = match read_json_file(&path) {
-        Ok(graph) => graph,
-        Err(e) => {
-            return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, e, Some(path_str));
-        }
-    };
     let options = devmap_query::viz::VizOptions {
         symbols: symbols.unwrap_or(false),
         max_nodes: clamp_max_nodes(max_nodes),
         title: "Code graph".to_string(),
     };
-    let payload = devmap_query::viz::build_payload(&graph, &options);
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let payload = match provider.code_graph_payload(&options) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return GraphVizLoad::unavailable(
+                GraphVizKind::CodeGraph,
+                error.to_string(),
+                Some(path_str),
+            );
+        }
+    };
     GraphVizLoad {
         available: true,
         reason: None,
@@ -131,13 +121,17 @@ pub fn load_map_preview(repo_path: &str) -> GraphVizLoad {
             Some(path_str),
         );
     }
-    let repo_map = match read_json_file(&path) {
-        Ok(map) => map,
-        Err(e) => {
-            return GraphVizLoad::unavailable(GraphVizKind::MapPreview, e, Some(path_str));
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let payload = match provider.repo_map_payload() {
+        Ok(payload) => payload,
+        Err(error) => {
+            return GraphVizLoad::unavailable(
+                GraphVizKind::MapPreview,
+                error.to_string(),
+                Some(path_str),
+            );
         }
     };
-    let payload = devmap_query::map_preview::build_preview_payload(&repo_map);
     GraphVizLoad {
         available: true,
         reason: None,
@@ -203,7 +197,6 @@ mod tests {
     fn code_graph_path_prefers_devcouncil_when_present() {
         let root = scratch("path");
         fs::create_dir_all(root.join(".devcouncil")).unwrap();
-        fs::create_dir_all(root.join(".devmap")).unwrap();
         let path = code_graph_path(&root);
         assert!(path.ends_with(".devcouncil/graph/code_graph.json"));
         let _ = fs::remove_dir_all(&root);

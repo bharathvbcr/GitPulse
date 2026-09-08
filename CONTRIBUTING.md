@@ -142,7 +142,7 @@ flowchart TD
 | `npm run check` | Runs `svelte-check` (classic TypeScript 6 for Svelte) and `tsgo` type validation on `tsconfig.node.json` |
 | `npm test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `npm run check:ipc` | Verifies the Rust `cmd_*` registry (185 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
-| `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares each against its upstream when that repository is present — reporting *not compared* when it is not |
+| `npm run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `npm run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `npm run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so a schema-19 store cannot silently go dead again |
 | `npm run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 49 contracts (858 fields) |
 | `npm run check:release` | Asserts all version manifests are in sync: `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
@@ -164,6 +164,7 @@ several were added after the drift had already happened.
 
 | Test | What breaks without it |
 | --- | --- |
+| `devmap-html` | Executes the vendored HTML camera and badge logic: singleton/degenerate fits stay bounded, repeated filters cancel stale fits, and capped liveness samples keep their totals. |
 | `invoke-args-contract` | A renamed command argument. `check:ipc` proves the command exists; nothing proved the call sites send what it declares, and a wrong name fails at runtime with a deserialization error in whichever path calls it. 94 call sites. |
 | `view-menu-contract` | A registered view missing from the native menu, in either direction. This happened three times — `tab-manvi`, then Storage and Reflog — because view ids are derived from the registry in TypeScript and hand-written as constants in Rust. |
 | `event-contract` | An event name that drifts. An emit nobody hears looks like a feature that never fires; a listener for an event nobody sends waits forever. Neither produces an error. |

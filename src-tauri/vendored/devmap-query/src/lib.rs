@@ -17,6 +17,7 @@ pub mod escape;
 pub mod export;
 pub mod freshness;
 pub mod guides;
+pub mod host;
 pub mod inventory;
 pub mod linguist;
 pub mod manifest;
@@ -29,6 +30,15 @@ pub mod snapshots;
 pub mod semantic;
 pub mod viz;
 pub mod workspace;
+
+// Embedder facade: a host that depends on `devmap-query` should not need a
+// second path dependency merely to name the Store accepted by
+// `StoreQueryEngine`. This re-exports the exact crate instance used here.
+pub use devmap_store;
+
+// A host should not need another direct dependency merely to resolve the exact
+// state and artifact paths this crate reads. Re-export the canonical owner.
+pub use devmap_extract::paths;
 
 pub use artifacts::{
     should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
