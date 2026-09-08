@@ -222,6 +222,42 @@ the two real-store integration tests and the feature assertion above:
 
 ## Limits and recovery
 
+The final local application at `/Applications/GitPulse.app` is version 0.0.8,
+built from functional revision `a69cad25d1474dc018b98c7ef9d399f776031a94`.
+Its main executable SHA-256 is
+`2564057f227f4873235372f9384faa2e5f7cd97ba42c6cc822b4b4687549ff01`.
+Ad hoc signing and strict verification of the installed bundle, including its
+nested executables, passed. The build receipt verified all 54 frontend chunk
+hashes; 54 source maps remain private and none are distributed. The build's
+dirty flag records two intentionally preserved local artifacts:
+`.devcouncil/config.yaml` and `harness/.devmap-preview.json`. Tracked source
+was committed before building. Subsequent audit-only commits do not change
+the installed executable's source revision.
+
+The native navigation observations above were made before the final coverage
+summary correction. The final corrected bundle compiled and was installed,
+but the native app-control tool became unavailable before it could be reopened.
+Its final on-screen header therefore remains unverified; the 5,095-test
+frontend run and 24 browser checks cover the corrected code. The app was left
+closed after a graceful quit of the earlier build.
+
+The installed `devmap` and `manvi` match DevCouncil revision `ebd5718f` and
+Manvi revision `6e9bd64d`. Installed `gitpulse-mcp` and `gitpulsed` match
+GitPulse revision `95e60612`; the later frontend-only correction does not alter
+their source. Fresh process probes passed. Existing long-lived MCP clients
+must restart or reconnect to load the replaced executable.
+
+Recoverable application/binary backups, full source revisions, installed hashes
+and the verification-log inventory are retained under
+`/Users/bharath/.local/state/toolchain-backups/20260908-092631`.
+`GitPulse-installation.json` and `CLI-installation.json` identify the installed
+artifacts and their previous copies. `verification/MANIFEST.json` records the
+SHA-256 and byte count of each archived log, including failed regression runs.
+The final build log and frontend receipt are
+`gitpulse-app-build-gap-summary-final-20260908.log` and
+`gitpulse-final-frontend-build-receipt-20260908.json` in that verification
+directory. No commit was pushed and no release was published.
+
 The vendor directory lock excludes other vendor updates, not Cargo readers.
 A process killed between directory renames can leave the previous tree in
 `src-tauri/.vendor-lock/previous`; inspect and restore it before clearing the
@@ -230,8 +266,8 @@ lock. This is not a power-loss-atomic transaction.
 The test runs exercise bounded hostile workloads. They cannot establish
 absolute confidence, every third-party provider, every operating system, or
 unbounded workload behavior. MarkDev's core checks do not prove physical
-AppKit behavior. Local application installation does not constitute signing,
-notarization or publication of a trusted release.
+AppKit behavior. Local application installation and ad hoc signing do not
+constitute trusted release signing, notarization or publication.
 
 Manvi retains governed static-analysis debt, including 78 potential nil
 findings. That count matches the baseline and does not establish which warnings
