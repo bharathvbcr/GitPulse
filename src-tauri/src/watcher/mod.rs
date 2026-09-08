@@ -412,8 +412,12 @@ pub(crate) fn start_watch_inner<F>(
 where
     F: Fn(String) + Send + 'static,
 {
+    #[cfg(test)]
+    eprintln!("watch setup {repo_path}: validate repository");
     let canonical = validate_repo(&repo_path)?;
     let key = canonical.to_string_lossy().into_owned();
+    #[cfg(test)]
+    eprintln!("watch setup {repo_path}: resolve git directory");
     let git_dir = resolve_git_dir(&canonical)?;
     // Bare repos have no separate worktree root (git dir == repo); a normal
     // checkout and a linked worktree both do. The non-recursive worktree
@@ -436,6 +440,8 @@ where
 
     // Linked worktrees keep refs/heads in the COMMON dir; watch it too so
     // checkouts made in any worktree refresh every view of the repo.
+    #[cfg(test)]
+    eprintln!("watch setup {repo_path}: resolve common directory");
     let common_dir = match resolve_git_common_dir(&canonical) {
         Ok(dir) => Some(dir),
         Err(e) => {
@@ -446,9 +452,13 @@ where
             None
         }
     };
+    #[cfg(test)]
+    eprintln!("watch setup {repo_path}: register native backend");
     let watcher =
         RepoFileWatcher::watch_repo(&git_dir, worktree_root.as_deref(), common_dir.as_deref())?;
 
+    #[cfg(test)]
+    eprintln!("watch setup {repo_path}: reserve and launch session");
     let stop = {
         let mut guard = state.lock_sessions()?;
         match insert_watch_session(&mut guard, &key, std::slice::from_ref(&repo_path))? {
@@ -867,25 +877,53 @@ mod tests {
 
     #[test]
     fn test_unwatch_raw_and_aliased_paths_match_canonical_key() {
+        // A native backend hang must fail this regression promptly, rather
+        // than consuming the CI job and hiding all later integration tests.
+        let (phase, phases) = std::sync::mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut current = "create fixture";
+            loop {
+                match phases.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(next) => {
+                        current = next;
+                        eprintln!("watch alias regression: {current}");
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!("watch alias regression exceeded 60 seconds during: {current}");
+                        // Panicking on this helper thread would leave the
+                        // blocked test alive. Fail the binary; Cargo's
+                        // --no-fail-fast still runs the other test binaries.
+                        std::process::exit(124);
+                    }
+                }
+            }
+        });
         let dir = TempDir::new().unwrap();
+        phase.send("git init").unwrap();
         git_init(dir.path(), false);
         let state = WatcherState::default();
         let raw = dir.path().to_string_lossy().into_owned();
+        phase.send("initial watch").unwrap();
         let key = start_watch_inner(&state, raw.clone(), |_| {}).expect("watch");
         assert_eq!(state.watch_count().unwrap(), 1);
 
         let trailing = format!("{}/", raw.trim_end_matches('/'));
         if trailing != raw {
+            phase.send("unwatch trailing slash").unwrap();
             unwatch(&state, trailing).unwrap();
             assert_eq!(
                 state.watch_count().unwrap(),
                 0,
                 "trailing-slash alias must unwatch the canonical slot"
             );
+            phase.send("rewatch after trailing slash").unwrap();
             start_watch_inner(&state, raw.clone(), |_| {}).expect("rewatch");
         }
 
         let dotted = dir.path().join(".").to_string_lossy().into_owned();
+        phase.send("unwatch dotted path").unwrap();
         unwatch(&state, dotted).unwrap();
         assert_eq!(
             state.watch_count().unwrap(),
@@ -893,8 +931,10 @@ mod tests {
             "path/./ alias must unwatch the canonical slot"
         );
 
+        phase.send("rewatch after dotted path").unwrap();
         let key_again = start_watch_inner(&state, raw.clone(), |_| {}).expect("rewatch");
         assert_eq!(key_again, key);
+        phase.send("unwatch original path").unwrap();
         if raw != key {
             unwatch(&state, raw).unwrap();
             assert_eq!(
@@ -906,6 +946,12 @@ mod tests {
             unwatch(&state, key).unwrap();
             assert_eq!(state.watch_count().unwrap(), 0);
         }
+        phase.send("drop watcher state").unwrap();
+        drop(state);
+        phase.send("remove fixture").unwrap();
+        drop(dir);
+        drop(phase);
+        watchdog.join().unwrap();
     }
 
     /// After the watched directory is deleted, `canonicalize()` and
