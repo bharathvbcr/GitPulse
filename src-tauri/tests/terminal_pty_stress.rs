@@ -113,6 +113,47 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
 }
 
 #[test]
+fn interactive_round_trips_do_not_accumulate_polling_delays() {
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let (send, receive) = mpsc::channel();
+    app.listen("terminal-output", move |event| {
+        let _ = send.send(event.payload().to_string());
+    });
+    let (exit_send, exit_receive) = mpsc::channel();
+    app.listen("terminal-exit", move |event| {
+        let _ = exit_send.send(event.payload().to_string());
+    });
+    let dir = repo();
+    let spawned = spawn_session(
+        app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), "stty -echo; i=0; while [ $i -lt 512 ]; do printf .; read -r line || exit 91; i=$((i+1)); done".into()]),
+        None,
+    ).unwrap();
+    let started = Instant::now();
+    for round in 0..512 {
+        let data: serde_json::Value =
+            serde_json::from_str(&receive.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+        let bytes = STANDARD.decode(data["data_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, b".");
+        acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
+        write_to_session(&state, &spawned.id, "\n").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "round {round}: readiness must wake the reader without a fixed delay"
+        );
+    }
+    let exit: serde_json::Value =
+        serde_json::from_str(&exit_receive.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+    assert_eq!(exit["exit_code"], 0);
+    assert!(exit["error"].is_null());
+}
+
+#[test]
 fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())

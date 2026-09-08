@@ -38,7 +38,8 @@ before that tag is pushed.
   executable Git modes in the index; Windows reparse points require external resolution.
 - Bound Unix terminal input delivery and lock waits, cancel pending input on close,
   and report partial delivery without retrying accepted bytes. Closing a Linux PTY
-  no longer leaves a full input-queue write blocked after its child exits.
+  no longer leaves a full input-queue write blocked after its child exits. Wake
+  output readers on readiness so interactive and bulk output avoid polling delays.
 - Avoid redundant JSON parsing during diagnostic breadcrumbs while retaining the
   existing credential redaction and stress-test budgets.
 - Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.

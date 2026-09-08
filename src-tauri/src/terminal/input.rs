@@ -9,6 +9,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+/// Wait for the shared nonblocking master to become readable. A readiness
+/// notification, including hangup, only triggers another read: buffered bytes
+/// must still be drained before the reader can declare EOF.
+pub(super) fn wait_for_output(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: descriptor is one initialized pollfd, and poll only borrows it.
+    // The reader thread retains the master owning fd throughout this call.
+    let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    } else if fd < 0 || descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // Timeout and interruption return control to the caller, preserving its
+    // shutdown checks. Never sleep after the descriptor has become ready.
+    Ok(())
+}
+
 pub(super) fn open(master: &dyn MasterPty) -> Result<Box<dyn Write + Send>, String> {
     let fd = master
         .as_raw_fd()
@@ -94,11 +119,38 @@ fn write_with_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::write_with_timeout;
-    use std::io::{self, Write};
+    use super::{wait_for_output, write_with_timeout};
+    use std::io::{self, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn output_wait_is_bounded_and_hangup_preserves_buffered_bytes() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        wait_for_output(reader.as_raw_fd()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"tail").unwrap();
+        drop(writer);
+        wait_for_output(reader.as_raw_fd()).unwrap();
+        let mut tail = [0; 4];
+        reader.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"tail");
+        wait_for_output(reader.as_raw_fd()).unwrap();
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        assert_eq!(
+            wait_for_output(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
 
     struct PartialThenBlocked {
         remaining: usize,

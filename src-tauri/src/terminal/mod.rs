@@ -487,6 +487,11 @@ pub fn spawn_session<R: tauri::Runtime>(
         .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
     #[cfg(unix)]
     let writer = input::open(pair.master.as_ref())?;
+    #[cfg(unix)]
+    let reader_fd = pair
+        .master
+        .as_raw_fd()
+        .ok_or("PTY has no Unix master descriptor")?;
     #[cfg(not(unix))]
     let writer = pair
         .master
@@ -566,7 +571,19 @@ pub fn spawn_session<R: tauri::Runtime>(
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     #[cfg(unix)]
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
+                        // thread_master owns reader_fd until this thread exits.
+                        // Readiness wakes interactive output promptly; the wait
+                        // remains bounded even if a child stops producing data.
+                        if let Err(error) = input::wait_for_output(reader_fd) {
+                            if !dead_flag.swap(true, Ordering::SeqCst) {
+                                failure = Some(format!("Terminal output readiness failed: {error}"));
+                                output_flow.stop();
+                                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                                    log::warn!(target: "terminal", "could not signal failed terminal: {error}");
+                                }
+                            }
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
