@@ -28,6 +28,12 @@ before that tag is pushed.
 
 ### Fixed
 
+- Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.
+  Embedded readers preserve distinct symbol identities and withhold source
+  snippets when the indexed content hash no longer matches the current file.
+  The external builder checks lexical binding scope, source freshness and
+  bounded input reads. See DevCouncil's September 8 reliability audit for
+  adversarial regression and stress-test evidence.
 - Prepare complete vendor updates before replacing the current tree, refuse
   concurrent updates and symlinked sources, and retain rollback state on
   installation failure. Drift checks now detect upstream deletions and resolved

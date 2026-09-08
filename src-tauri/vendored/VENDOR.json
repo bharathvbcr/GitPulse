@@ -7,7 +7,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-glob",
-        "commit": "1de1df6dec522c7c847045325f7e661254a4ffad"
+        "commit": "6fc0faf9ef9fd80ab5e590b667cf07f30fdb70f1"
       },
       "omitted": [
         "tests/",
@@ -30,7 +30,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-store",
-        "commit": "1de1df6dec522c7c847045325f7e661254a4ffad"
+        "commit": "6fc0faf9ef9fd80ab5e590b667cf07f30fdb70f1"
       },
       "omitted": [
         "tests/",
@@ -56,7 +56,7 @@
         "repo": "manvi",
         "root_env": "GITPULSE_MANVI_ROOT",
         "path": "crates/dc-verify",
-        "commit": "1de1df6dec522c7c847045325f7e661254a4ffad"
+        "commit": "6fc0faf9ef9fd80ab5e590b667cf07f30fdb70f1"
       },
       "omitted": [
         "tests/",
@@ -82,7 +82,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-analyze",
-        "commit": "89a1d676d88a72ecfb3f539d20d2d439208ef4cf"
+        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
       },
       "omitted": [
         "tests/",
@@ -120,7 +120,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "a6ea92e0f8fcaf81e2ab171cd5645628bb3f6453"
+        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
       },
       "omitted": [
         "tests/",
@@ -244,7 +244,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "a6ea92e0f8fcaf81e2ab171cd5645628bb3f6453"
+        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
       },
       "omitted": [
         "tests/",
@@ -297,7 +297,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-resolve",
-        "commit": "a6ea92e0f8fcaf81e2ab171cd5645628bb3f6453"
+        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
       },
       "omitted": [
         "tests/",
@@ -326,7 +326,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "a6ea92e0f8fcaf81e2ab171cd5645628bb3f6453"
+        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
       },
       "omitted": [
         "tests/",
