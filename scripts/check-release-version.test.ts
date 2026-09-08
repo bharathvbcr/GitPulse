@@ -265,11 +265,11 @@ describe("release version gate", () => {
     expect(suffixed.stdout).toMatch(/must be v<major>\.<minor>\.<patch> with no suffix/);
   });
 
-  it("treats an empty --tag as 'no tag', which is how a tag-push run invokes it", async () => {
+  it("rejects an explicitly empty tag; branch CI omits the flag", async () => {
     const dir = await scratchTree("empty-tag");
     const { code, stdout } = await runScript(["--root", dir, "--tag", ""]);
-    expect(code).toBe(0);
-    expect(stdout).not.toMatch(/git tag/);
+    expect(code).toBe(2);
+    expect(stdout).toContain("--tag requires a non-empty value");
   });
 
   it("reports a missing or unreadable manifest rather than letting the rest agree", async () => {
@@ -386,4 +386,9 @@ describe("manifest parsers", () => {
     expect(parseTag("release-1.2.3").ok).toBe(false);
     expect(parseTag("v1.2.3+build").ok).toBe(false);
   });
+});
+
+
+it.each(["v01.2.3", "v1.02.3", "v1.2.03", "v9007199254740992.0.0"])("rejects noncanonical or unsafe release tag %s", tag => {
+  expect(parseTag(tag).ok).toBe(false);
 });

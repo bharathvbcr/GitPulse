@@ -6,9 +6,8 @@ on:
       - 'v*'
   # Manual dispatch (GitHub UI or GitPulse's workflow trigger) requires an
   # explicit tag, since a branch ref has no tag name to release. The tag must
-  # already exist: every job checks out the tag itself, so a dispatch for a
-  # tag that was never pushed fails at checkout rather than quietly building
-  # the branch head and publishing it under that tag's name.
+  # already exist: preflight resolves it once and every later job uses that
+  # exact commit. Remote tag identity is checked again before uploads.
   workflow_dispatch:
     inputs:
       tag:
@@ -37,14 +36,17 @@ jobs:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
     steps:
       - name: Checkout Release Tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-tags: true
 
       - name: Confirm Checkout Is The Tagged Commit
+        id: identity
         run: |
           set -euo pipefail
           tagged=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
@@ -56,6 +58,7 @@ jobs:
             echo "::error::Checkout is not the tagged commit — refusing to build."
             exit 1
           fi
+          echo "commit=$head" >> "$GITHUB_OUTPUT"
 
       - name: Install System Dependencies (Linux)
         run: |
@@ -81,6 +84,9 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      - name: Vendored Schema Gate
+        run: npm run check:vendor-schema
+
       - name: IPC Command Contract Gate
         run: npm run check:ipc
 
@@ -101,9 +107,8 @@ jobs:
       - name: Changelog Has Notes For This Tag
         run: npm run release:notes -- --tag "$RELEASE_TAG"
 
-      # Preflight mirrors ci.yml step-for-step. Previously it ran only the
-      # type check and clippy, so a tag whose commit CI never covered — or
-      # covered red — could still ship binaries.
+      # Repeat local build checks on the tag; prepare also requires successful
+      # cross-platform CI and coverage runs for this exact commit.
       - name: Frontend Svelte Check
         run: npm run check
 
@@ -125,11 +130,41 @@ jobs:
         # the first, and --nocapture keeps panic text on the job log.
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
 
+  prepare:
+    name: Prepare Verified Draft
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Require Green CI And Prepare The Draft
+        id: draft
+        run: node scripts/release-state.mjs prepare
+
   release:
     name: Build & Upload (${{ matrix.platform }})
     permissions:
       contents: write
-    needs: [preflight]
+    needs: [preflight, prepare]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
     strategy:
       fail-fast: false
       matrix:
@@ -153,7 +188,7 @@ jobs:
       - name: Checkout Release Tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-tags: true
 
       - name: Install System Dependencies (Linux)
@@ -181,23 +216,17 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      - name: Confirm Draft And Tag Before Uploads
+        run: node scripts/release-state.mjs check
+
       - name: Build Tauri Desktop Application
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
-          # releaseCommitish is deliberately unset: the action only uses it to
-          # create a tag that does not exist yet, and the tag checkout above
-          # has already failed the job in that case. Setting it here would be
-          # dead on a tag push and actively wrong on a dispatch, where
-          # github.sha is the branch head rather than the tagged commit.
-          releaseName: 'GitPulse v__VERSION__'
-          # Stub only. The v0.0.5 changelog section is 54 KB, past GitHub's
-          # 48 KB cap on an environment-file variable, so the full notes cannot
-          # pass through the runner env into this input. The verify job writes
-          # them from CHANGELOG.md with `gh release edit --notes-file`.
-          releaseBody: 'Draft — changelog notes are applied after every platform uploads.'
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          releaseCommitish: ${{ needs.preflight.outputs.commit }}
           releaseDraft: true
           prerelease: false
           # No updater plugin is configured in tauri.conf.json, so there is no
@@ -220,7 +249,7 @@ jobs:
 
   verify:
     name: Verify Release Completeness
-    needs: [release]
+    needs: [preflight, prepare, release]
     # Runs even when a platform leg failed — that is precisely the case this
     # job exists to report. Without it, `fail-fast: false` produces a draft
     # release that looks finished while silently missing a platform.
@@ -233,8 +262,7 @@ jobs:
       # access, so a `contents: read` token 404s on the very release this job
       # exists to inspect and the check fails for the wrong reason. After the
       # inventory holds, this job also writes the changelog onto the draft
-      # (`gh release edit --notes-file`) because the notes do not fit in
-      # an environment-file variable.
+      # through a bounded API request and verifies its exact round trip.
       contents: write
     steps:
       - name: Report Build Matrix Outcome
@@ -249,47 +277,25 @@ jobs:
       - name: Checkout Release Tag for Verifier
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-tags: true
 
-      - name: Inventory Draft Release Assets
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Verify Draft Assets And Apply Changelog Notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
           set -euo pipefail
-          # Independent of job status: assert the assets themselves exist, one
-          # per platform. A green matrix that uploaded nothing is still a
-          # failed release.
-          if ! gh release view "$RELEASE_TAG" --json assets > assets.json 2>view-err.txt; then
-            echo "::error::Could not read release $RELEASE_TAG to verify its assets. This check did NOT run — treat the release as unverified."
-            cat view-err.txt
-            exit 1
-          fi
-
-          node scripts/check-release-assets.mjs --tag "$RELEASE_TAG" --json assets.json | tee asset-manifest.txt
-
+          node scripts/release-state.mjs finalize
           {
-            echo "### Release $RELEASE_TAG — draft assets verified"
+            echo "### Release $RELEASE_TAG — draft verified"
             echo
-            echo '```'
-            cat asset-manifest.txt
-            echo '```'
-            echo
-            echo "All three platforms produced an installer. The release is a **draft**; publish it manually."
+            echo "All seven installers have uploaded SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
+            echo "The release remains a **draft** for manual publication."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Apply Changelog Notes To The Draft
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # File, not env: v0.0.5 notes are 54 KB and GitHub caps an
-          # environment-file variable at 48 KB. `gh release edit --notes-file`
-          # reads the changelog section from disk. Leave the release a draft.
-          node scripts/release-notes.mjs --tag "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
-          bytes=$(wc -c < "$RUNNER_TEMP/release-notes.md" | tr -d ' ')
-          echo "changelog notes: ${bytes} bytes"
-          gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
-          gh release view "$RELEASE_TAG" --json body --jq '.body | length'

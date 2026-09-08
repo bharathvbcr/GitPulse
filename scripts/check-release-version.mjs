@@ -88,7 +88,7 @@ export function parseTag(tag) {
     return { ok: false, reason: `tag ${JSON.stringify(tag)} must start with "v" (workflow triggers on tags: ['v*'])` };
   }
   const version = tag.slice(1);
-  if (!/^\d+\.\d+\.\d+$/.test(version)) {
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || !version.split(".").every(part => Number.isSafeInteger(Number(part)))) {
     return {
       ok: false,
       reason: `tag ${JSON.stringify(tag)} must be v<major>.<minor>.<patch> with no suffix, got version part ${JSON.stringify(version)}`,
@@ -384,9 +384,7 @@ export function parseArgs(argv) {
     else throw new Error(`unknown argument: ${arg}`);
   }
 
-  // An empty --tag is how CI passes "no tag known" (e.g. `${{ inputs.tag }}`
-  // on a tag-push run). Treat it as absent rather than as an invalid tag.
-  if (tag !== undefined && tag.trim() === "") tag = undefined;
+  if (tag !== undefined && tag.trim() === "") throw new Error("--tag requires a non-empty value");
 
   return { root, sources: { ...defaultSources(root), ...overrides }, tag, json };
 }
@@ -401,7 +399,7 @@ export function usage() {
     name: "check-release-version",
     summary: "Assert every version manifest names one version, and that it matches the release tag when given.",
     flags: [
-      { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag the manifests must match (empty means no tag known)" },
+      { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag the manifests must match (omit for branch checks)" },
       { flag: "--root <dir>".replace(/^"|"$/g, ""), description: "repository root to resolve the default manifest paths from" },
       { flag: "--package <path>".replace(/^"|"$/g, ""), description: "override package.json" },
       { flag: "--package-lock <path>".replace(/^"|"$/g, ""), description: "override package-lock.json" },

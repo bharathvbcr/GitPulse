@@ -71,7 +71,7 @@ function parseAssets(value) {
     if (typeof asset.size !== "number" || !Number.isSafeInteger(asset.size) || asset.size <= 0) {
       throw new Error(`assets[${index}] ${JSON.stringify(asset.name)} must have a positive safe integer size`);
     }
-    if (asset.state !== undefined && asset.state !== "uploaded") {
+    if (asset.state !== "uploaded") {
       throw new Error(`assets[${index}] ${JSON.stringify(asset.name)} is not uploaded (state=${JSON.stringify(asset.state)})`);
     }
     assets.push({

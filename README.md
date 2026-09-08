@@ -282,6 +282,14 @@ npm run tauri dev
 | `npm run build` | Build frontend production bundle |
 | `npm run tauri build` | Bundle native installers for the host platform |
 
+For a release, commit the candidate and run `npm run ci:local`, then push the
+commit and wait for both **CI** and **Code Coverage** to pass for that exact SHA.
+Push the matching version tag only after those gates pass. The release workflow
+pins every platform to that commit and prepares one draft by ID. It verifies all
+seven uploaded assets and the changelog notes before reporting success. A failed
+run can resume the matching draft; published releases and moved tags are refused.
+Publish the draft only after **Verify Release Completeness** succeeds.
+
 ---
 
 ## In-Depth Documentation

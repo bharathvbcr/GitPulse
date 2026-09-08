@@ -144,3 +144,11 @@ describe("release asset completeness contract", () => {
     expect(result.violations.join(" ")).toContain(".msi");
   });
 });
+
+
+describe("release metadata cannot imply an unperformed upload", () => {
+  it.each([undefined, null, "new", "starter", "failed"])("rejects upload state %s", (state) => {
+    const assets = expectedAssetNames("0.0.9").map(name => ({ name, size: 10, state }));
+    expect(inspectReleaseAssets({tag: "v0.0.9", json: {assets}}).invalid).toBe(true);
+  });
+});

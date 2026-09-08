@@ -28,6 +28,13 @@ before that tag is pushed.
 
 ### Fixed
 
+- Pin release builds to one verified commit and require successful CI and coverage
+  for that commit. Refuse published or mismatched releases, resume matching drafts
+  by ID, verify uploaded asset digests, and confirm changelog notes after writing.
+- Accept GNU checksum records with escaped filenames and normalize Windows index
+  transaction paths for Git. Preserve hostile filename tests on supported systems.
+- Avoid redundant JSON parsing during diagnostic breadcrumbs while retaining the
+  existing credential redaction and stress-test budgets.
 - Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.
   Embedded readers preserve distinct symbol identities and withhold source
   snippets when the indexed content hash no longer matches the current file.

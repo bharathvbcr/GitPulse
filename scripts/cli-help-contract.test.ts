@@ -5,6 +5,7 @@ import * as checkReleaseVersion from "./check-release-version.mjs";
 import * as checkReleaseAssets from "./check-release-assets.mjs";
 import * as checkCoverageFloor from "./check-coverage-floor.mjs";
 import * as checkMcpInstall from "./check-mcp-install.mjs";
+import * as releaseState from "./release-state.mjs";
 import * as releaseNotes from "./release-notes.mjs";
 import * as vendorCrates from "./vendor-crates.mjs";
 
@@ -21,6 +22,7 @@ const ENTRY_POINTS: Array<[string, { main: (argv: string[]) => number | Promise<
   ["check-coverage-floor", checkCoverageFloor],
   ["check-mcp-install", checkMcpInstall],
   ["release-notes", releaseNotes],
+  ["release-state", releaseState],
   ["vendor-crates", vendorCrates],
 ];
 
