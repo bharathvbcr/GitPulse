@@ -219,6 +219,18 @@ classDiagram
 ```
 
 ### Subsystem Responsibilities
+
+Finite subprocesses share `engine/git_cli.rs::run_observed`: admission, execution
+and Git lock retries consume one command budget. Unix owns nonblocking stdin,
+stdout and stderr on the waiting thread; the blocking-platform fallback retains
+bounded shared output and keeps its admission permit until every worker exits.
+After child exit, output gets one shared two-second EOF grace. Incomplete output
+remains distinguishable from complete empty output. Structured-output callers
+require complete streams; partial diff and command views retain explicit reasons.
+Optional tool installation uses this same runner with cancellation and bounded
+progress callbacks. See the [subprocess audit](SUBPROCESS_DIAGNOSTICS_AUDIT.md)
+for contracts, regression evidence and platform verification limits.
+
 - **`engine/`**: Git execution sandbox, output parsers, safe diff generation, blame readers, and repository status pollers.
 - **`graph/`**: Native commit-history lane solver — stable columns by interval allocation, a pinned mainline (the default branch's first-parent chain holds column 0 for the whole window), history simplification for server-side commit filters (a dropped commit hands its lineage to its children, git-style, so a filtered graph stays connected and the mainline re-anchors on the chain's first survivor), parent-child edge layout, and nogap lookback bounds.
 - **`analyzer/`**: 

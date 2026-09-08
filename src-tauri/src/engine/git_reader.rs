@@ -953,7 +953,13 @@ impl GitReader {
         // Canonical join resolves existing prefixes through symlinks so a
         // symlinked directory cannot redirect the read outside the repository;
         // not-yet-tracked leaves stay lexical.
-        sandbox_join_canonical(&repo, file_path)?;
+        let dest = sandbox_join_canonical(&repo, file_path)?;
+        let metadata = std::fs::metadata(&dest)
+            .map_err(|e| format!("Blame unavailable: cannot read file: {e}"))?;
+        if !metadata.is_file() {
+            return Err("Blame unavailable: selected path is not a regular file".into());
+        }
+        check_working_tree_size(&dest, MAX_WORKING_TREE_BYTES)?;
         // NOTE: no :(literal) magic here. `git blame` treats its <file>
         // argument as a literal path, NOT a pathspec (globs do not widen:
         // "weird?.txt" with no such literal file fails outright), and it
@@ -961,19 +967,52 @@ impl GitReader {
         // ':(literal)...' in HEAD"), so prefixing would break every call.
         // `--line-porcelain` emits ~10 metadata lines per source line, so a
         // large file's blame is an order of magnitude bigger than the file
-        // itself. Capped at a line boundary: a partial porcelain record would
-        // parse into a `BlameLine` with fabricated fields, which is worse than
-        // a short list.
-        let (stdout, incomplete) = git_text_capped(
+        // itself. This Vec-only API cannot label a prefix as incomplete, so
+        // hitting the cap must fail visibly instead of returning partial data.
+        let result = git_text_capped(
             &repo,
             &["blame", "--line-porcelain", "--", file_path],
             budget::MAX_BLAME_BYTES,
-        )?;
-        let stdout = if incomplete.is_some() {
-            budget::drop_partial_last_line(stdout)
-        } else {
-            stdout
+        );
+        let (stdout, incomplete) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // Classify via Git's status protocol, not English stderr.
+                // Try real blame first to preserve Git's own attribution.
+                let spec = literal_pathspec(file_path);
+                let status = git_text(
+                    &repo,
+                    &[
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=all",
+                        "--ignored=matching",
+                        "--",
+                        &spec,
+                    ],
+                )?;
+                let records = parse_status_records(status.as_bytes());
+                let mut new_file = false;
+                for record in records.iter().filter(|record| record.path == file_path) {
+                    let codes = (record.index_status, record.work_status);
+                    if matches!(codes, ('?', '?') | ('!', '!') | ('A', ' ' | 'M')) {
+                        new_file = true;
+                    } else {
+                        // Conflicts and staged deletions still need real
+                        // history; an untracked duplicate must not hide them.
+                        return Err(error);
+                    }
+                }
+                if !new_file {
+                    return Err(error);
+                }
+                return uncommitted_file_blame(&repo, &dest);
+            }
         };
+        if let Some(reason) = incomplete {
+            return Err(format!("Blame unavailable: {}", reason.describe()));
+        }
         Ok(parse_blame_porcelain(&stdout))
     }
 
@@ -2947,6 +2986,69 @@ fn parse_status_records(bytes: &[u8]) -> Vec<RawStatusRecord> {
         });
     }
     records
+}
+
+/// A new file has content but no committed author. Preserve every line while
+/// using the same zero-OID convention as Git's uncommitted porcelain records.
+fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Refuse leaf replacement with a symlink and never block on a FIFO
+        // substituted between the initial stat and this open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("Blame unavailable: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Blame unavailable: {e}"))?;
+    if !metadata.is_file() {
+        return Err("Blame unavailable: selected path is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_WORKING_TREE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Blame unavailable: {e}"))?;
+    if bytes.len() as u64 > MAX_WORKING_TREE_BYTES {
+        return Err("Blame unavailable: file exceeded the working-tree size limit".into());
+    }
+    if bytes.contains(&0) {
+        return Err("Blame unavailable: file is binary".into());
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| "Blame unavailable: file is not UTF-8 text".to_string())?;
+    let format = git_text(repo, &["rev-parse", "--show-object-format"])?;
+    let oid_len = match format.trim() {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return Err("Blame unavailable: unsupported repository object format".into()),
+    };
+    let mut lines = Vec::new();
+    let mut payload_bytes = 2;
+    for (index, content) in text.lines().enumerate() {
+        let line = BlameLine {
+            line_no: index + 1,
+            commit_id: "0".repeat(oid_len),
+            author_name: "Not Committed Yet".into(),
+            author_email: String::new(),
+            timestamp: 0,
+            content: content.into(),
+        };
+        payload_bytes += serde_json::to_vec(&line)
+            .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?
+            .len()
+            + 1;
+        if payload_bytes > budget::MAX_BLAME_BYTES {
+            return Err("Blame unavailable: uncommitted lines exceeded the output budget".into());
+        }
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 /// Returns the commit oid when `line` opens a `--line-porcelain` header.

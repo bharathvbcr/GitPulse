@@ -11,6 +11,20 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Git subprocess reads retain captured output when descendants hold pipes open.
+  Unix pumps input and output without reader threads; Windows cancels blocked
+  I/O and retains resource permits until workers exit. Queueing and lock retries
+  share the command deadline, and the Windows tree-kill helper has a deadline.
+- Optional tool installation shares the bounded runner, including cancellation
+  and progress. Machine-output consumers refuse incomplete output, failed version
+  commands cannot pass verification, and schema integers cannot wrap. Digest
+  output uses the existing hexadecimal validator.
+- Blame handles new, staged, ignored and unborn-repository text files without
+  fabricating committed attribution. Oversized or incomplete blame is reported
+  as unavailable instead of returning an unmarked prefix.
+
 ## [0.0.8] - 2026-09-07
 
 ### Fixed

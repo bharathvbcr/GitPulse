@@ -540,16 +540,21 @@ fn regression_go_cover_allowance_exhaustion_sets_truncated() {
 fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() {
     let repo = git_repo();
     write(repo.path(), "src/lib.rs", "fn a() {}\n");
-    // One blob just over the drain cap. `hash-object -w --stdin` parks it in
-    // the object database without index/commit; `cat-file` streams it back.
+    // Park an over-cap blob from disk: stdin has its own memory limit. This
+    // fixture tests oversized output, without bypassing that input boundary.
     let big = "x".repeat(MAX_OUTPUT_BYTES + 1024);
-    let sha_bytes = git_with_stdin(
+    let error = git_with_stdin(
         repo.path(),
         &["hash-object", "-w", "--stdin"],
         big.as_bytes(),
     )
-    .expect("hash-object");
-    let sha = String::from_utf8_lossy(&sha_bytes).trim().to_string();
+    .expect_err("oversized input must be refused before spawning");
+    assert!(error.contains("input/output budget exceeds"), "{error}");
+    write(repo.path(), "huge.bin", &big);
+    let sha = git_text(repo.path(), &["hash-object", "-w", "huge.bin"])
+        .expect("hash-object")
+        .trim()
+        .to_string();
 
     // Existing contract intact: over-cap output is an error here.
     assert!(git_text(repo.path(), &["cat-file", "blob", &sha]).is_err());

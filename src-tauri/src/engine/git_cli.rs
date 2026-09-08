@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(any(not(unix), test))]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,8 +17,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Grace window [`run_bounded`] grants pipe EOF after a timeout kill before
-/// it deliberately detaches any still-blocked drain threads.
+#[cfg(unix)]
+mod pipe_drain;
+
+#[cfg(any(not(unix), test))]
+mod thread_io;
+
+/// Shared grace window for pipe EOF after child exit. Unix closes unfinished
+/// descriptors; Windows cancels workers and retains their resource slots until
+/// they exit. This cleanup grace is separate from the command deadline.
 const DRAIN_JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Canonical work tree or bare repository resolved from a user-supplied path.
@@ -984,10 +995,7 @@ pub(crate) fn capture_command_with_env(
 ) -> Result<CapturedOutput, String> {
     let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
 
-    let out = run_bounded(cmd, program, timeout, None)?;
-    if let Some(reason) = &out.incomplete {
-        return Err(format!("{} output {}", program, reason.describe()));
-    }
+    let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
     Ok(CapturedOutput {
         stdout: out.stdout,
         stderr: out.stderr,
@@ -1126,7 +1134,7 @@ fn is_timeout_error(program: &str, err: &str) -> bool {
 
 /// What one pipe drain produced.
 ///
-/// `error` is the field that keeps a broken read distinguishable from a short
+/// `stop` is the field that keeps a broken read distinguishable from a short
 /// one: `bytes` may be a perfectly well-formed prefix either way, and only
 /// this says whether the rest is missing because there was no more or because
 /// we stopped being able to read it.
@@ -1139,6 +1147,14 @@ struct Drained {
     stop: Option<Stop>,
 }
 
+impl Drained {
+    fn append(&mut self, bytes: &[u8], cap: usize) {
+        let take = bytes.len().min(cap.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..take]);
+        self.truncated |= take < bytes.len();
+    }
+}
+
 /// The two ways a drain ends without reaching end-of-stream. They are kept
 /// apart because they deserve different answers: one is a fault, the other is
 /// a known-incomplete read of a child that did exit cleanly.
@@ -1146,9 +1162,8 @@ enum Stop {
     /// The read itself failed. What arrived is a fragment of unknown length,
     /// and nothing downstream can tell it from a complete short output.
     Broken(String),
-    /// The reader never handed its result over inside the grace window —
-    /// a daemonized grandchild is still holding the pipe's write end open, so
-    /// EOF will not come. The child's own status is still trustworthy.
+    /// EOF was not observed inside the grace window, or the blocking fallback
+    /// reader did not deliver. The child's own status is still trustworthy.
     Undelivered(String),
 }
 
@@ -1167,8 +1182,8 @@ pub enum Incomplete {
     /// stdout reached the caller's byte budget; the rest was dropped. The
     /// amount missing is unknown but the child was read to the end of the cap.
     OverCap(usize),
-    /// The reader never handed its result over inside the grace window, so how
-    /// much is missing — if anything — is unknown. See [`collect_drained`].
+    /// The read did not finish inside the grace window, so how much is missing
+    /// — if anything — is unknown. Captured bytes may still be available.
     Unread(String),
 }
 
@@ -1204,13 +1219,68 @@ pub(crate) struct BoundedRun {
     /// stream. Carried as a reason rather than a flag so no caller has to
     /// guess which of the two causes it is looking at.
     pub incomplete: Option<Incomplete>,
+    pub stderr_incomplete: Option<Incomplete>,
+    pub cancelled: bool,
+}
+
+impl BoundedRun {
+    /// Parsers must establish completeness before interpreting a prefix.
+    pub(crate) fn require_complete(self, label: &str) -> Result<Self, String> {
+        for (stream, reason) in [
+            ("output", &self.incomplete),
+            ("stderr", &self.stderr_incomplete),
+        ] {
+            if let Some(reason) = reason {
+                return Err(format!("{label} {stream} {}", reason.describe()));
+            }
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Callbacks run on the waiter, must return promptly, and receive only the
+/// bounded captured prefix. They never run on a pipe worker.
+pub(crate) trait ProcessObserver {
+    fn cancelled(&self) -> bool {
+        false
+    }
+    fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+}
+
+impl ProcessObserver for () {}
+
+fn observe_output(
+    observer: &mut dyn ProcessObserver,
+    cursors: &mut [usize; 2],
+    stdout: &[u8],
+    stderr: &[u8],
+) {
+    for (index, (stream, bytes)) in [
+        (OutputStream::Stdout, stdout),
+        (OutputStream::Stderr, stderr),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if bytes.len() > cursors[index] {
+            observer.output(stream, &bytes[cursors[index]..]);
+            cursors[index] = bytes.len();
+        }
+    }
 }
 
 /// Ceiling on how many child processes this engine keeps alive at once.
 ///
 /// Every `git`, `gh` and `npm` invocation in the app funnels through
 /// [`run_bounded`], and each live one costs the parent two pipe descriptors,
-/// two drain threads, and up to `MAX_OUTPUT_BYTES + 4 MiB` of buffered output.
+/// up to two fallback drain threads off Unix, and up to
+/// `MAX_OUTPUT_BYTES + 4 MiB` of buffered output.
 /// Nothing bounded how many could be in flight at once, and three layers above
 /// this one are happy to ask for hundreds: Tauri's blocking pool admits 512
 /// concurrent tasks (tokio's default `max_blocking_threads`), `off_thread`
@@ -1258,22 +1328,39 @@ impl SpawnGate {
         }
     }
 
-    fn acquire(&self) -> SpawnPermit<'_> {
+    #[cfg(test)]
+    fn acquire(&self, deadline: Instant) -> Option<SpawnPermit<'_>> {
+        self.acquire_until(deadline, &|| false)
+    }
+
+    fn acquire_until(
+        &self,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<SpawnPermit<'_>> {
         // A poisoned gate must not deadlock the app: a panic inside a permit
         // holder still ran the `Drop` below, so the count is accurate.
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.in_flight >= self.limit {
-            state = self
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || cancelled() {
+                return None;
+            }
+            if state.in_flight < self.limit {
+                break;
+            }
+            let (next, _) = self
                 .released
-                .wait(state)
+                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
         }
         state.in_flight += 1;
         state.peak = state.peak.max(state.in_flight);
-        SpawnPermit { gate: self }
+        Some(SpawnPermit { gate: self })
     }
 
     #[cfg(test)]
@@ -1324,8 +1411,8 @@ fn spawn_gate() -> &'static SpawnGate {
 ///
 /// `label` names the process in spawn/timeout/wait errors (callers keep their
 /// own wording for truncation). When `stdin_bytes` is set, the child gets a
-/// piped stdin fed from a dedicated thread, so the deadline loop below stays
-/// responsive even while megabytes are still being pushed into the child.
+/// piped stdin pumped without blocking the deadline loop, even while megabytes
+/// are still being pushed into the child.
 pub(crate) fn run_bounded(
     cmd: Command,
     label: &str,
@@ -1350,6 +1437,59 @@ pub(crate) fn run_bounded_capped(
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
 ) -> Result<BoundedRun, String> {
+    run_observed(&mut cmd, label, timeout, stdin_bytes, stdout_cap, &mut ())
+}
+
+pub(crate) fn run_observed(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    observer: &mut dyn ProcessObserver,
+) -> Result<BoundedRun, String> {
+    run_with_gate(
+        cmd,
+        label,
+        timeout,
+        stdin_bytes,
+        stdout_cap,
+        observer,
+        spawn_gate(),
+    )
+}
+
+fn run_with_gate(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    observer: &mut dyn ProcessObserver,
+    gate: &'static SpawnGate,
+) -> Result<BoundedRun, String> {
+    let start = Instant::now();
+    if timeout > NETWORK_TIMEOUT {
+        return Err(format!(
+            "{label} deadline exceeds {}s",
+            NETWORK_TIMEOUT.as_secs()
+        ));
+    }
+    if timeout.is_zero() {
+        return Err(format!(
+            "{label}{TIMEOUT_MARKER}{}s: deadline must be positive and at most {}s",
+            timeout.as_secs_f64(),
+            NETWORK_TIMEOUT.as_secs()
+        ));
+    }
+    if stdout_cap > MAX_OUTPUT_BYTES
+        || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
+    {
+        return Err(format!(
+            "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
+        ));
+    }
+    let deadline = start + timeout;
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1358,85 +1498,147 @@ pub(crate) fn run_bounded_capped(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Held until this function returns, covering the child's descriptors, its
-    // two drain threads and their buffers -- see [`SpawnGate`] for why an
+    // output buffers and fallback reader threads -- see [`SpawnGate`] for why an
     // unbounded fan-out here exhausted the process descriptor table.
-    let _permit = spawn_gate().acquire();
+    let _permit = Arc::new(
+        gate.acquire_until(deadline, &|| observer.cancelled())
+            .ok_or_else(|| {
+                if observer.cancelled() {
+                    return format!("{label} cancelled before spawn");
+                }
+                format!(
+                    "{label}{TIMEOUT_MARKER}{}s waiting for a process slot",
+                    timeout.as_secs_f64()
+                )
+            })?,
+    );
 
     // Spawned into a process group of its own and registered, so a SIGTERM to
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
     // shutdown path — takes this child and everything it forked down with it
     // instead of orphaning them. See [`crate::procguard`].
-    let (mut child, guard) = crate::procguard::spawn(&mut cmd, label)
+    let (mut child, guard) = crate::procguard::spawn(cmd, label)
         .map_err(|e| format!("Failed to spawn {}: {}", label, e))?;
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    // Drain results travel over channels rather than `JoinHandle::join()`:
-    // join has no timeout, so a drain thread stuck behind an orphaned
-    // grandchild holding a pipe write end would block this function forever.
-    // [`collect_drained`] bounds that wait instead.
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    let (stderr_tx, stderr_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = stdout_tx.send(drain_capped(stdout_pipe, stdout_cap));
-    });
-    thread::spawn(move || {
-        let _ = stderr_tx.send(drain_capped(
-            stderr_pipe,
-            MAX_OUTPUT_BYTES.min(4 * 1024 * 1024),
-        ));
-    });
-
-    // Feed stdin from its own thread: a child that exits early (rejecting our
-    // input) makes the write fail with EPIPE, which is not an error of ours —
-    // the exit status decides. Dropping `stdin` at closure end is what sends
-    // the child EOF.
-    let stdin_handle = stdin_bytes.map(|bytes| {
-        // The writer thread may outlive this stack frame. Own the bounded
-        // payload rather than leaking a caller borrow into a `'static` task.
-        let bytes = bytes.to_vec();
-        let stdin = child.stdin.take();
-        thread::spawn(move || {
-            if let Some(mut stdin) = stdin {
-                use std::io::Write;
-                let _ = stdin.write_all(&bytes);
+    // On Unix the command waiter owns and drains both nonblocking pipes.
+    // EOF no longer depends on two separately scheduled reader threads
+    // handing their entire result over inside a two-second window.
+    #[cfg(unix)]
+    let mut output =
+        match pipe_drain::OutputDrains::new(child.stdout.take(), child.stderr.take(), stdout_cap) {
+            Ok(output) => output,
+            Err(error) => {
+                guard.kill_tree(&mut child);
+                let _ = guard.reap(|| child.wait());
+                return Err(format!("Failed to prepare {label} output: {error}"));
             }
-        })
-    });
+        };
+    #[cfg(not(unix))]
+    let output = match thread_io::OutputDrains::new(
+        child.stdout.take(),
+        child.stderr.take(),
+        stdout_cap,
+        _permit.clone(),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            guard.kill_tree(&mut child);
+            let _ = guard.reap(|| child.wait());
+            return Err(format!("Failed to prepare {label} output: {error}"));
+        }
+    };
 
-    let start = Instant::now();
+    // Input delivery is bounded independently of child exit. A successful
+    // exit cannot conceal rejected or undelivered stdin.
+    #[cfg(unix)]
+    let mut input =
+        match pipe_drain::InputFeed::new(child.stdin.take(), stdin_bytes.unwrap_or_default()) {
+            Ok(input) => input,
+            Err(error) => {
+                guard.kill_tree(&mut child);
+                let _ = guard.reap(|| child.wait());
+                return Err(format!("Failed to prepare {label} stdin: {error}"));
+            }
+        };
+    #[cfg(not(unix))]
+    let input = match thread_io::InputFeed::new(
+        child.stdin.take(),
+        stdin_bytes.unwrap_or_default(),
+        _permit.clone(),
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            guard.kill_tree(&mut child);
+            let _ = guard.reap(|| child.wait());
+            return Err(format!("Failed to prepare {label} stdin: {error}"));
+        }
+    };
+
     let mut backoff = POLL_BACKOFF_START;
+    let mut cursors = [0; 2];
     let outcome = loop {
+        #[cfg(unix)]
+        output.drain_ready();
+        #[cfg(unix)]
+        input.pump();
+        output.observe(observer, &mut cursors);
+        if observer.cancelled() {
+            guard.kill_tree(&mut child);
+            break guard
+                .reap(|| child.wait())
+                .map(|status| (status, true))
+                .map_err(|e| format!("Failed to reap cancelled {label}: {e}"));
+        }
         // Every wait goes through the registration so the registry never
         // holds a pid that has already been reaped — see `procguard` for why
         // signalling a recycled pid is the thing to avoid.
         match guard.poll(|| child.try_wait()) {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break Ok((status, false)),
             Ok(None) => {
-                if start.elapsed() > timeout {
+                if Instant::now() >= deadline {
                     guard.kill_tree(&mut child);
                     let _ = guard.reap(|| child.wait());
-                    break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs()));
+                    break Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
                 }
+                #[cfg(unix)]
+                if let Err(error) = output.wait_with_input(
+                    backoff.min(deadline.saturating_duration_since(Instant::now())),
+                    Some(&input),
+                ) {
+                    guard.kill_tree(&mut child);
+                    let _ = guard.reap(|| child.wait());
+                    break Err(format!("Failed to poll {label} output: {error}"));
+                }
+                #[cfg(not(unix))]
                 thread::sleep(backoff);
                 backoff = next_poll_backoff(backoff);
             }
-            Err(e) => break Err(format!("Failed to wait on {}: {}", label, e)),
+            Err(e) => {
+                guard.kill_tree(&mut child);
+                let _ = guard.reap(|| child.wait());
+                break Err(format!("Failed to wait on {}: {}", label, e));
+            }
         }
     };
-    if let Some(handle) = stdin_handle {
-        // After a kill the write end fails with EPIPE promptly; on a natural
-        // exit the thread has already finished.
-        let _ = handle.join();
-    }
     match outcome {
-        Ok(status) => {
+        Ok((status, cancelled)) => {
+            if let Err(error) = input.finish() {
+                if status.success() && !cancelled {
+                    return Err(format!("Failed to deliver {label} {error}"));
+                }
+            }
             // Normal exit: EOF is imminent unless the child daemonized a
             // grandchild that inherited the pipes; then we take whatever was
             // buffered after the grace window instead of hanging forever.
-            let mut stdout = collect_drained(&stdout_rx);
-            let mut stderr = collect_drained(&stderr_rx);
+            let (mut stdout, mut stderr) = output.finish(
+                Instant::now()
+                    + if cancelled {
+                        Duration::ZERO
+                    } else {
+                        DRAIN_JOIN_GRACE
+                    },
+            );
+            observe_output(observer, &mut cursors, &stdout.bytes, &stderr.bytes);
             // A stdout we could not read to the end is not a shorter stdout:
             // every caller past this point parses what it is handed as the
             // whole answer. A broken read is a fault and fails the run; an
@@ -1457,16 +1659,21 @@ pub(crate) fn run_bounded_capped(
             // stderr is diagnosis, not payload: losing it must not fail a
             // command that worked, but a message built from a partial stderr
             // has to say that is what it is.
+            let mut stderr_incomplete = None;
             if let Some(Stop::Broken(e) | Stop::Undelivered(e)) = stderr.stop.take() {
                 stderr
                     .bytes
                     .extend_from_slice(format!("\n[stderr incomplete: {e}]").as_bytes());
+                stderr_incomplete = Some(Incomplete::Unread(e));
             }
-            // The two are mutually exclusive in practice — `truncated` can only
-            // be set by a drain that DID deliver — but the order is fixed
-            // rather than left to chance: an over-cap read is the stronger,
-            // more specific claim and is the one worth reporting if both ever
-            // arrive together.
+            if stderr.truncated {
+                stderr_incomplete = Some(Incomplete::OverCap(4 * 1024 * 1024));
+                stderr
+                    .bytes
+                    .extend_from_slice(b"\n[stderr incomplete: exceeded 4 MB]");
+            }
+            // A capped stream may also miss EOF. The proven cap violation is
+            // reported first; the read diagnosis remains in stderr.
             let incomplete = if stdout.truncated {
                 Some(Incomplete::OverCap(stdout_cap))
             } else {
@@ -1475,47 +1682,20 @@ pub(crate) fn run_bounded_capped(
             Ok(BoundedRun {
                 stdout: stdout.bytes,
                 stderr: stderr.bytes,
-                success: status.success(),
+                success: status.success() && !cancelled,
                 status_code: status.code().unwrap_or(-1),
                 incomplete,
+                stderr_incomplete,
+                cancelled,
             })
         }
-        Err(e) => {
-            // Timeout/wait failure: the pipes are dead weight now. Grant one
-            // shared grace window for EOF (a tree-kill on Windows usually delivers
-            // it), then detach any still-blocked drain threads — see
-            // [`collect_drained`] for the documented residual leak.
-            let deadline = Instant::now() + DRAIN_JOIN_GRACE;
-            let _ = collect_drained_deadline(&stdout_rx, deadline);
-            let _ = collect_drained_deadline(&stderr_rx, deadline);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
-/// Collects a pipe-drain result, waiting at most [`DRAIN_JOIN_GRACE`] for EOF.
-///
-/// A drain thread can be left blocked on read when the command forked a
-/// grandchild that inherited stdout/stderr: killing the direct child does not
-/// close the pipe write ends. The honest options are hanging forever or
-/// detaching; we detach, and the thread unblocks when the holder exits (pipe
-/// EOF) or at app shutdown, holding at most [`MAX_OUTPUT_BYTES`], at most two
-/// per command. Bytes read but not delivered when the grace expires are
-/// discarded, which is why the caller reports that stdout as truncated rather
-/// than as a shorter answer.
-///
-/// What that costs is now much smaller than it was. `crate::procguard` puts
-/// every child in a process group of its own, so the timeout path kills the
-/// grandchild along with the child on Unix and EOF arrives immediately. Two
-/// cases still reach the grace window: Windows, where `taskkill /T` is
-/// best-effort, and a command that *succeeded* after daemonising something
-/// that kept the pipes — there the group must not be killed, because the
-/// command worked and the descendant outliving it is what the caller asked
-/// for.
-fn collect_drained(rx: &mpsc::Receiver<Drained>) -> Drained {
-    collect_drained_deadline(rx, Instant::now() + DRAIN_JOIN_GRACE)
-}
-
+/// Characterizes the retired channel handoff in regression tests. Production
+/// owns captured prefixes independently of worker completion on every platform.
+#[cfg(test)]
 fn collect_drained_deadline(rx: &mpsc::Receiver<Drained>, deadline: Instant) -> Drained {
     let remaining = deadline.saturating_duration_since(Instant::now());
     rx.recv_timeout(remaining).unwrap_or_else(|e| Drained {
@@ -1573,39 +1753,44 @@ fn git_run_capped(
 ) -> Result<(Vec<u8>, Option<Incomplete>), String> {
     let sub = args.first().unwrap_or(&"");
     let label = format!("git {}", sub);
+    let started = Instant::now();
     let mut attempts = 0;
     const MAX_LOCK_RETRIES: usize = 3;
 
     loop {
         let cmd = git_command(repo, args);
-        let out = run_bounded_capped(cmd, &label, timeout, stdin_bytes, stdout_cap)?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
+        }
+        let out = run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?;
         if out.success {
             return Ok((out.stdout, out.incomplete));
-        }
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !err.is_empty() {
-            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(&err) {
-                attempts += 1;
-                std::thread::sleep(Duration::from_millis(lock_retry_backoff_ms(attempts)));
-                continue;
-            }
-            return Err(err);
         }
         // Some git failures report entirely on stdout — notably `commit`'s
         // "nothing added to commit" (exit 1, empty stderr). A bare status code
         // hides the one string callers match on to retry; surface the diagnosis.
-        let stdout_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !stdout_text.is_empty() {
-            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(&stdout_text) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let diagnosis = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        if !diagnosis.is_empty() {
+            if attempts < MAX_LOCK_RETRIES && is_transient_git_lock_error(diagnosis) {
                 attempts += 1;
-                std::thread::sleep(Duration::from_millis(lock_retry_backoff_ms(attempts)));
+                std::thread::sleep(
+                    Duration::from_millis(lock_retry_backoff_ms(attempts))
+                        .min(timeout.saturating_sub(started.elapsed())),
+                );
                 continue;
             }
-            if stdout_text.len() > MAX_FAILURE_MESSAGE_BYTES {
-                let cut = truncate_utf8_bytes(&stdout_text, MAX_FAILURE_MESSAGE_BYTES);
+            if diagnosis.len() > MAX_FAILURE_MESSAGE_BYTES {
+                let cut = truncate_utf8_bytes(diagnosis, MAX_FAILURE_MESSAGE_BYTES);
                 return Err(format!("{cut}… (git {} output truncated)", sub));
             }
-            return Err(stdout_text);
+            return Err(diagnosis.to_owned());
         }
         return Err(format!(
             "git {} failed with status {}",
@@ -1628,8 +1813,7 @@ fn git_timeout(
     Ok(stdout)
 }
 
-/// Upper bound on stdout text embedded in a failure message when git put its
-/// diagnosis on stdout instead of stderr. Bounded so a chatty failure never
+/// Upper bound on either stream embedded in a failure message. A chatty failure never
 /// drags megabytes into an error string.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2_000;
 
@@ -1645,6 +1829,7 @@ fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
     &s[..cut]
 }
 
+#[cfg(test)]
 fn drain_capped<R: Read>(pipe: Option<R>, max_bytes: usize) -> Drained {
     let mut out = Drained::default();
     let Some(mut pipe) = pipe else {
@@ -1654,18 +1839,8 @@ fn drain_capped<R: Read>(pipe: Option<R>, max_bytes: usize) -> Drained {
     loop {
         match pipe.read(&mut tmp) {
             Ok(0) => break,
-            Ok(n) => {
-                if out.bytes.len() < max_bytes {
-                    let room = max_bytes - out.bytes.len();
-                    let take = n.min(room);
-                    out.bytes.extend_from_slice(&tmp[..take]);
-                    if take < n {
-                        out.truncated = true;
-                    }
-                } else {
-                    out.truncated = true;
-                }
-            }
+            Ok(n) => out.append(&tmp[..n], max_bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // Not end-of-stream. Breaking here and handing back the prefix as
             // if the child had simply said less is how a half-read `git show`
             // reached a parser as a complete record and came back as "failed
@@ -1783,6 +1958,187 @@ pub fn repo_name_from_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn audit_failure_diagnostics_bound_stderr_as_well_as_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = git_run_capped(
+            Some(dir.path()),
+            &[
+                "-c",
+                "alias.noisy=!head -c 10000 /dev/zero >&2; exit 1",
+                "noisy",
+            ],
+            Duration::from_secs(5),
+            None,
+            1024,
+        )
+        .unwrap_err();
+        assert!(
+            error.len() < MAX_FAILURE_MESSAGE_BYTES + 100,
+            "unbounded failure message: {} bytes",
+            error.len()
+        );
+        assert!(error.contains("output truncated"));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn audit_capture_refuses_incomplete_stderr() {
+        let result = capture_command(
+            "sh",
+            &["-c", "echo version >&2; sleep 3 >/dev/null &"],
+            None,
+            Duration::from_secs(5),
+            &[],
+        );
+        assert!(result.is_err(), "capture erased stderr completeness");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn audit_lock_retries_share_one_total_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let error = git_run_capped(Some(dir.path()), &[
+            "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
+        ], Duration::from_millis(150), None, 1024).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "retries renewed the timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.contains("timed out"),
+            "deadline expiry must be explicit: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_zero_deadline_never_starts_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "touch \"$1\"", "test"]).arg(&marker);
+        assert!(run_bounded(cmd, "sh", Duration::ZERO, None).is_err());
+        assert!(
+            !marker.exists(),
+            "an expired request must not mutate anything"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_admission_wait_consumes_the_command_deadline() {
+        // Exercise the production runner with an isolated gate. Acquiring
+        // the global gate one permit at a time can monopolize most slots
+        // while waiting for the last, starving unrelated concurrent tests.
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(2)));
+        let permits: Vec<_> = (0..gate.limit)
+            .map(|_| {
+                gate.acquire(Instant::now() + Duration::from_secs(30))
+                    .unwrap()
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let copy = marker.clone();
+        let worker = thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "touch \"$1\"", "test"]).arg(copy);
+            run_with_gate(
+                &mut cmd,
+                "sh",
+                Duration::from_millis(50),
+                None,
+                1024,
+                &mut (),
+                gate,
+            )
+        });
+        thread::sleep(Duration::from_millis(300));
+        drop(permits);
+        let result = worker.join().unwrap();
+        assert!(result.is_err(), "queued request ran after its deadline");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_retained_stdin_does_not_block_after_child_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec 3<&0; sleep 3 <&3 >/dev/null 2>&1 & exit 0"]);
+        let started = Instant::now();
+        let result = run_bounded(
+            cmd,
+            "sh",
+            Duration::from_secs(1),
+            Some(&vec![b'x'; 1024 * 1024]),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stdin join outlived the child: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result.is_err(),
+            "undelivered stdin is not successful delivery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_stderr_cap_is_reported() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 5000000 /dev/zero >&2"]);
+        let out = run_bounded(cmd, "sh", Duration::from_secs(10), None).unwrap();
+        assert!(out.success && out.incomplete.is_none());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("stderr incomplete"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_output_cap_cannot_disable_the_global_memory_bound() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf ok"]);
+        assert!(run_bounded_capped(cmd, "sh", Duration::from_secs(5), None, usize::MAX).is_err());
+    }
+
+    /// A descendant retaining the write ends must not erase bytes the parent
+    /// already emitted. The result remains explicitly incomplete until EOF.
+    #[cfg(unix)]
+    #[test]
+    fn inherited_output_pipes_preserve_the_captured_prefix() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "printf payload; printf diagnostic >&2; sleep 6 & exit 0",
+        ]);
+        let out = run_bounded(cmd, "sh", Duration::from_secs(10), None).expect("run");
+        assert!(out.success);
+        assert!(matches!(out.incomplete, Some(Incomplete::Unread(_))));
+        assert_eq!(out.stdout, b"payload");
+        assert!(out.stderr.starts_with(b"diagnostic"));
+    }
+
+    #[test]
+    fn interrupted_output_reads_resume_without_losing_bytes() {
+        struct InterruptedOnce(bool);
+        impl Read for InterruptedOnce {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        // Stop after the first real byte so the synthetic source is finite.
+        let result = drain_capped(Some(InterruptedOnce(false).take(1)), 8);
+        assert_eq!(result.bytes, b"x");
+        assert!(result.stop.is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -3453,15 +3809,21 @@ mod tests {
     #[test]
     fn spawn_gate_parks_callers_once_the_limit_is_reached() {
         let gate = std::sync::Arc::new(SpawnGate::new(2));
-        let first = gate.acquire();
-        let second = gate.acquire();
+        let first = gate
+            .acquire(Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let second = gate
+            .acquire(Instant::now() + Duration::from_secs(30))
+            .unwrap();
         assert_eq!(gate.peak(), 2);
 
         let (tx, rx) = mpsc::channel();
         let waiter = {
             let gate = std::sync::Arc::clone(&gate);
             thread::spawn(move || {
-                let permit = gate.acquire();
+                let permit = gate
+                    .acquire(Instant::now() + Duration::from_secs(30))
+                    .unwrap();
                 let _ = tx.send(());
                 drop(permit);
             })
@@ -3491,7 +3853,9 @@ mod tests {
         let poisoner = {
             let gate = std::sync::Arc::clone(&gate);
             thread::spawn(move || {
-                let _permit = gate.acquire();
+                let _permit = gate
+                    .acquire(Instant::now() + Duration::from_secs(30))
+                    .unwrap();
                 panic!("holder blew up mid-run");
             })
         };
@@ -3500,7 +3864,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let gate2 = std::sync::Arc::clone(&gate);
         thread::spawn(move || {
-            let _permit = gate2.acquire();
+            let _permit = gate2
+                .acquire(Instant::now() + Duration::from_secs(30))
+                .unwrap();
             let _ = tx.send(());
         });
         rx.recv_timeout(Duration::from_secs(5))
@@ -3750,5 +4116,60 @@ mod tests {
         assert_eq!(parse_u64_saturating("1024"), Some(1024));
         assert_eq!(parse_left_right_count("3\t9"), (3, 9));
         assert_eq!(parse_left_right_count("3 9"), (3, 9));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_full_duplex_stress_preserves_bytes_and_deadline() {
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        for _ in 0..8 {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "head -c 2000000 /dev/zero >&2 & cat; wait"]);
+            let out = run_bounded(cmd, "duplex", Duration::from_secs(10), Some(&payload)).unwrap();
+            assert!(out.success);
+            assert!(out.incomplete.is_none() && out.stderr_incomplete.is_none());
+            assert_eq!(out.stdout, payload);
+            assert_eq!(out.stderr, vec![0; 2_000_000]);
+        }
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do head -c 65536 /dev/zero; done"]);
+        let started = Instant::now();
+        assert!(
+            run_bounded_capped(cmd, "hot-output", Duration::from_millis(100), None, 1024)
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_observer_cancellation_preserves_progress_and_kills_child() {
+        struct CancelOnOutput(Vec<u8>);
+        impl ProcessObserver for CancelOnOutput {
+            fn cancelled(&self) -> bool {
+                !self.0.is_empty()
+            }
+            fn output(&mut self, _: OutputStream, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+        }
+        let mut observer = CancelOnOutput(Vec::new());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf progress; sleep 30"]);
+        let started = Instant::now();
+        let out = run_observed(
+            &mut cmd,
+            "cancel",
+            Duration::from_secs(10),
+            None,
+            1024,
+            &mut observer,
+        )
+        .unwrap();
+        assert!(out.cancelled && !out.success);
+        assert_eq!(out.stdout, b"progress");
+        assert_eq!(observer.0, b"progress");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

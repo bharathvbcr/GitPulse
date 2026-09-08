@@ -769,11 +769,50 @@ mod sys {
     }
 }
 
+#[cfg(any(windows, test))]
+fn run_tree_killer(cmd: &mut Command, timeout: Duration) -> io::Result<bool> {
+    let started = Instant::now();
+    let mut child = cmd.spawn()?;
+    let failure = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(
+                    Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Ok(None) => {
+                break io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "process-tree cleanup helper exceeded its deadline",
+                )
+            }
+            Err(error) => break error,
+        }
+    };
+    // The cleanup helper itself must not outlive a timed-out cleanup. As for
+    // the ordinary child path, reaping follows the direct OS kill.
+    child.kill().map_err(|error| {
+        io::Error::new(
+            failure.kind(),
+            format!("{failure}; could not terminate cleanup helper: {error}"),
+        )
+    })?;
+    child.wait().map_err(|error| {
+        io::Error::new(
+            failure.kind(),
+            format!("{failure}; could not reap cleanup helper: {error}"),
+        )
+    })?;
+    Err(failure)
+}
+
 #[cfg(windows)]
 mod sys {
     use super::SignalGuard;
     use std::io;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     /// `taskkill` without `/F` sends WM_CLOSE, which a console `git` never
     /// sees, so there is no graceful step to take.
@@ -792,13 +831,13 @@ mod sys {
         // often as it is a real failure, and the two are not distinguishable
         // from the exit code alone, so this reports "already gone" rather than
         // inventing an error.
-        let status = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        Ok(status.success())
+            .stderr(Stdio::null());
+        super::run_tree_killer(&mut command, Duration::from_secs(2))
     }
 
     /// Never called: [`CAN_ASK_TO_STOP`] is false, so there is no grace window
@@ -827,6 +866,20 @@ mod sys {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn tree_killer_cannot_hold_cleanup_past_its_deadline() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("2");
+        let started = std::time::Instant::now();
+        let result = super::run_tree_killer(&mut cmd, std::time::Duration::from_millis(100));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "tree killer waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
     use super::*;
     // Only the `#[cfg(unix)]` cases below spawn and signal real children, so on
     // Windows these are unused imports and clippy's `-D warnings` rejects them.
