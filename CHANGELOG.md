@@ -41,7 +41,8 @@ before that tag is pushed.
   no longer leaves a full input-queue write blocked after its child exits. Wake
   output readers on readiness so interactive and bulk output avoid polling delays.
 - Avoid redundant JSON parsing during diagnostic breadcrumbs while retaining the
-  existing credential redaction and stress-test budgets.
+  existing credential redaction and stress-test budgets. Reuse fixed credential
+  matchers instead of rebuilding them for every navigation field.
 - Release watcher sessions when their backend event stream closes so watching
   again starts a live backend. An old backend cannot remove a replacement session.
 - Rebuild the desktop, MCP and daemon from the current DevMap 0.1.1 integration.
