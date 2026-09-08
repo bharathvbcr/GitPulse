@@ -220,21 +220,18 @@ pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
         cmd.arg(path);
         let run =
             git_cli::run_bounded_capped(cmd, program, Duration::from_secs(60), None, 64 * 1024)?;
-        if !run.success {
-            return Err(format!("{program} failed"));
-        }
-        let out = String::from_utf8_lossy(&run.stdout);
-        let hex = out
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| format!("{program} produced no digest"))?
-            .to_ascii_lowercase();
-        if hex.len() != 64 {
-            return Err(format!("{program} digest looks wrong: {hex}"));
-        }
-        Ok(hex)
+        digest_from_run(run, program)
     };
     try_cmd("shasum", &["-a", "256"]).or_else(|_| try_cmd("sha256sum", &[]))
+}
+
+fn digest_from_run(run: git_cli::BoundedRun, program: &str) -> Result<String, String> {
+    let run = run.require_complete(program)?;
+    if !run.success {
+        return Err(format!("{program} failed"));
+    }
+    let out = String::from_utf8_lossy(&run.stdout);
+    parse_checksum_file(&out).map_err(|error| format!("{program}: {error}"))
 }
 
 /// Verify `path`'s digest equals `expected_hex`. Mismatch is a hard error.
@@ -388,6 +385,27 @@ pub fn install_bytes_with_checksum(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_digest_requires_complete_hex_output() {
+        for (digest, incomplete) in [
+            ("z".repeat(64), None),
+            (
+                "a".repeat(64),
+                Some(crate::engine::git_cli::Incomplete::OverCap(64)),
+            ),
+        ] {
+            let run = crate::engine::git_cli::BoundedRun {
+                stdout: digest.into_bytes(),
+                stderr: Vec::new(),
+                success: true,
+                status_code: 0,
+                incomplete,
+                stderr_incomplete: None,
+                cancelled: false,
+            };
+            assert!(super::digest_from_run(run, "fixture").is_err());
+        }
+    }
     use super::*;
     use std::io::Write;
 

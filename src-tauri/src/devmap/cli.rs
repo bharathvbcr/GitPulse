@@ -282,7 +282,8 @@ fn run_devmap(
     if args.contains(&"--json") && !args.contains(&"--progress") {
         cmd.arg("--progress").arg("never");
     }
-    git_cli::run_bounded_capped(cmd, "devmap", deadline, stdin, STDOUT_CAP)
+    git_cli::run_bounded_capped(cmd, "devmap", deadline, stdin, STDOUT_CAP)?
+        .require_complete("devmap")
 }
 
 fn parse_json_stdout(stdout: &str) -> Option<Value> {
@@ -575,6 +576,26 @@ pub fn preview_many(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_devmap_refuses_valid_json_with_unfinished_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_fake_devmap(dir.path());
+        fs::write(&path, "#!/bin/sh\nprintf '{\"ok\":true}'\nsleep 3 &\n").unwrap();
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        let result = run_devmap(
+            &binary,
+            dir.path(),
+            &["status", "--json"],
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(result.is_err(), "incomplete JSON was accepted: {result:?}");
+    }
     use std::fs;
 
     fn git_repo() -> tempfile::TempDir {

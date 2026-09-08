@@ -15,9 +15,8 @@ use crate::engine::git_cli::{self, BoundedRun};
 use crate::tool_capability;
 use crate::tool_config;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -405,7 +404,12 @@ fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
     }
     let run =
         git_cli::run_bounded_capped(cmd, tool.as_str(), Duration::from_secs(5), None, 64 * 1024)
+            .ok()?
+            .require_complete(tool.as_str())
             .ok()?;
+    if !run.success {
+        return None;
+    }
     let text = String::from_utf8_lossy(&run.stdout);
     let err = String::from_utf8_lossy(&run.stderr);
     let combined = if text.trim().is_empty() {
@@ -739,45 +743,32 @@ enum InstallRun {
     Failed(String),
 }
 
-fn drain_capped_progress(
-    pipe: Option<impl Read>,
-    cap: usize,
+struct InstallProgress {
     tool: ExternalTool,
     rung: Option<InstallRung>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    let Some(mut pipe) = pipe else {
-        return out;
-    };
-    let mut buf = [0u8; 8192];
-    let mut line_buf = String::new();
-    loop {
-        match pipe.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let chunk = &buf[..n];
-                let room = cap.saturating_sub(out.len());
-                if room > 0 {
-                    out.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                if let Ok(text) = std::str::from_utf8(chunk) {
-                    for ch in text.chars() {
-                        if ch == '\n' {
-                            emit_progress(tool, &line_buf, rung);
-                            line_buf.clear();
-                        } else if ch != '\r' && line_buf.len() < 500 {
-                            line_buf.push(ch);
-                        }
-                    }
-                }
+    lines: [Vec<u8>; 2],
+}
+
+impl git_cli::ProcessObserver for InstallProgress {
+    fn cancelled(&self) -> bool {
+        cancelled()
+    }
+
+    fn output(&mut self, stream: git_cli::OutputStream, bytes: &[u8]) {
+        let index = match stream {
+            git_cli::OutputStream::Stdout => 0,
+            git_cli::OutputStream::Stderr => 1,
+        };
+        let line = &mut self.lines[index];
+        for &byte in bytes {
+            if byte == b'\n' {
+                emit_progress(self.tool, &String::from_utf8_lossy(line), self.rung);
+                line.clear();
+            } else if byte != b'\r' && line.len() < 500 {
+                line.push(byte);
             }
-            Err(_) => break,
         }
     }
-    if !line_buf.is_empty() {
-        emit_progress(tool, &line_buf, rung);
-    }
-    out
 }
 
 fn run_cancellable_install(
@@ -786,83 +777,35 @@ fn run_cancellable_install(
     tool: ExternalTool,
     rung: Option<InstallRung>,
 ) -> InstallRun {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let (mut child, guard) = match crate::procguard::spawn(cmd, label) {
-        Ok(pair) => pair,
-        Err(e) => return InstallRun::Failed(format!("Failed to spawn {label}: {e}")),
+    let mut progress = InstallProgress {
+        tool,
+        rung,
+        lines: [Vec::new(), Vec::new()],
     };
-
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = stdout_tx.send(drain_capped_progress(
-            stdout_pipe,
-            INSTALL_STDOUT_CAP,
-            tool,
-            rung,
-        ));
-    });
-    std::thread::spawn(move || {
-        let _ = stderr_tx.send(drain_capped_progress(
-            stderr_pipe,
-            INSTALL_STDOUT_CAP,
-            tool,
-            rung,
-        ));
-    });
-
-    let start = Instant::now();
-    let outcome = loop {
-        match guard.poll(|| child.try_wait()) {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => {
-                if cancelled() {
-                    guard.kill_tree(&mut child);
-                    let _ = guard.reap(|| child.wait());
-                    break Err("cancelled");
-                }
-                if start.elapsed() > INSTALL_DEADLINE {
-                    guard.kill_tree(&mut child);
-                    let _ = guard.reap(|| child.wait());
-                    break Err("timed out");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_e) => {
-                guard.kill_tree(&mut child);
-                let _ = guard.reap(|| child.wait());
-                break Err("wait failed");
-            }
+    let result = git_cli::run_observed(
+        cmd,
+        label,
+        INSTALL_DEADLINE,
+        None,
+        INSTALL_STDOUT_CAP,
+        &mut progress,
+    );
+    for line in &progress.lines {
+        if !line.is_empty() {
+            emit_progress(tool, &String::from_utf8_lossy(line), rung);
         }
-    };
-
-    let stdout = stdout_rx.recv().unwrap_or_default();
-    let stderr = stderr_rx.recv().unwrap_or_default();
-    let stdout_s = bytes_to_string(stdout);
-    let stderr_s = bytes_to_string(stderr);
-
-    match outcome {
-        Ok(status) => InstallRun::Finished(BoundedRun {
-            success: status.success(),
-            status_code: status.code().unwrap_or(-1),
-            stdout: stdout_s.into_bytes(),
-            stderr: stderr_s.into_bytes(),
-            incomplete: None,
-        }),
-        Err("cancelled") => InstallRun::Cancelled {
-            stdout: stdout_s,
-            stderr: stderr_s,
+    }
+    match result {
+        Ok(run) if run.cancelled => InstallRun::Cancelled {
+            stdout: bytes_to_string(run.stdout),
+            stderr: bytes_to_string(run.stderr),
         },
-        Err("timed out") => InstallRun::Failed(format!(
-            "{label} timed out after {}s",
-            INSTALL_DEADLINE.as_secs()
-        )),
-        Err(_) => InstallRun::Failed(format!("{label} wait failed")),
+        Ok(run) => InstallRun::Finished(run),
+        Err(_) if cancelled() => InstallRun::Cancelled {
+            stdout: String::new(),
+            stderr: format!("{label} cancelled before completion"),
+        },
+        Err(error) => InstallRun::Failed(error),
     }
 }
 
@@ -1460,6 +1403,8 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
                 cmd.arg("--version");
                 git_cli::run_bounded_capped(cmd, "cargo", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
+                    .and_then(|run| run.require_complete("cargo").ok())
+                    .filter(|run| run.success)
                     .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
             });
             requirements.push(PreflightRequirement {
@@ -1494,6 +1439,8 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
                 cmd.arg("version");
                 git_cli::run_bounded_capped(cmd, "go", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
+                    .and_then(|run| run.require_complete("go").ok())
+                    .filter(|run| run.success)
                     .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
             });
             let satisfies = ver
@@ -1572,7 +1519,7 @@ fn parse_doctor_json(v: &serde_json::Value) -> DoctorSchemas {
                 if x.is_null() {
                     None
                 } else {
-                    x.as_i64().map(|n| n as i32)
+                    x.as_i64().and_then(|n| i32::try_from(n).ok())
                 }
             })
         })
@@ -1583,7 +1530,7 @@ fn parse_doctor_json(v: &serde_json::Value) -> DoctorSchemas {
                 if x.is_null() {
                     None
                 } else {
-                    x.as_u64().map(|n| n as u32)
+                    x.as_u64().and_then(|n| u32::try_from(n).ok())
                 }
             })
         })
@@ -1632,7 +1579,7 @@ fn verify_devmap() -> VerifyReport {
         None,
         256 * 1024,
     ) {
-        if run.success {
+        if run.success && run.incomplete.is_none() && run.stderr_incomplete.is_none() {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&run.stdout) {
                 let parsed = parse_doctor_json(&v);
                 // Handshake the binary's declared schema against the vendored
@@ -1698,7 +1645,10 @@ fn verify_devmap() -> VerifyReport {
         String::from_utf8_lossy(&run.stderr)
     );
     let store = scrape_schema(&text, "store schema");
-    let ok = store == Some(expected_store);
+    let ok = run.success
+        && run.incomplete.is_none()
+        && run.stderr_incomplete.is_none()
+        && store == Some(expected_store);
     VerifyReport {
         tool: ExternalTool::Devmap,
         ok,
@@ -1835,9 +1785,79 @@ pub fn select_rung_for_test(rungs: &[RungStatus]) -> Option<InstallRung> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_schema_numbers_cannot_wrap_into_supported_versions() {
+        let value = serde_json::json!({"expected_schema_version": 4294967315_i64, "code_graph_schema_version": 4294967298_i64});
+        let parsed = super::parse_doctor_json(&value);
+        assert_eq!(parsed.expected_schema_version, None);
+        assert_eq!(parsed.code_graph_schema_version, None);
+    }
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn audit_binary(dir: &Path, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("devmap");
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_version_probe_requires_success_and_complete_output() {
+        let dir = TempDir::new().unwrap();
+        for script in [
+            "echo 'devmap version 1'; exit 1",
+            "echo 'devmap version 1' >&2; sleep 3 &",
+        ] {
+            let binary = audit_binary(dir.path(), script);
+            assert!(
+                probe_version(&binary, ExternalTool::Devmap).is_none(),
+                "accepted: {script}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_schema_handshake_requires_success() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let dir = TempDir::new().unwrap();
+        let binary = audit_binary(
+            dir.path(),
+            &format!(
+                "echo 'devmap (store schema {})'; exit 1",
+                devmap_store::schema::CURRENT_SCHEMA_VERSION
+            ),
+        );
+        crate::devmap::cli::set_test_binary(Some(binary));
+        let report = verify_devmap();
+        crate::devmap::cli::set_test_binary(None);
+        assert!(!report.ok, "failed command approved: {report:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_installer_retained_pipes_are_bounded_and_incomplete() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_cancel();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf progress; sleep 4 &"]);
+        let started = Instant::now();
+        let run = run_cancellable_install(&mut cmd, "fixture", ExternalTool::Devmap, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "install drain hung: {:?}",
+            started.elapsed()
+        );
+        match run {
+            InstallRun::Finished(run) => assert!(run.incomplete.is_some()),
+            _ => panic!("lost child exit status"),
+        }
+    }
 
     #[test]
     fn find_sibling_walks_ancestors() {

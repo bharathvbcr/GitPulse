@@ -344,6 +344,7 @@ fn orphan_head_reader_contract() {
     assert_eq!(blame[0].commit_id, "0".repeat(40));
     assert_eq!(blame[0].author_name, "Not Committed Yet");
     assert!(GitReader::get_file_blame(path, "missing.txt").is_err());
+    assert_eq!(blame[0].timestamp, 0);
     assert!(GitReader::get_commit_files(path, FAKE_OID).is_err());
 }
 
