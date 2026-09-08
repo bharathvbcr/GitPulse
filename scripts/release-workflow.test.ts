@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
@@ -56,4 +58,20 @@ it("guards draft identity before uploads and verifies the notes round trip", () 
   expect(workflow).toContain("node scripts/release-state.mjs prepare");
   expect(workflow).toContain("node scripts/release-state.mjs check");
   expect(workflow).toContain("node scripts/release-state.mjs finalize");
+});
+
+
+it("supports hosted runners without an external devmap CLI and reports that absence", () => {
+  const line = workflow.split("\n").find(line => line.includes("run: npm run check:vendor-schema"));
+  expect(line).toBeDefined();
+  const extra = line?.split(" -- ")[1]?.trim().split(/\s+/) ?? [];
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("./check-vendor-schema.mjs", import.meta.url)), ...extra], {
+    encoding: "utf8", env: {...process.env, PATH: "", Path: ""}, timeout: 5_000,
+  });
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  expect(result.stdout).toContain("CLI unavailable");
+});
+
+it("exposes GH_TOKEN only to the individual release API steps", () => {
+  expect(workflow).not.toMatch(/^    env:\n      GH_TOKEN:/m);
 });

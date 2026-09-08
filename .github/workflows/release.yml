@@ -84,8 +84,10 @@ jobs:
       - name: Install Frontend Dependencies
         run: npm ci
 
+      # Hosted runners build the embedded reader; the optional external CLI
+      # is absent there. Validate the vendored schema and report CLI absence.
       - name: Vendored Schema Gate
-        run: npm run check:vendor-schema
+        run: npm run check:vendor-schema -- --allow-missing-cli
 
       - name: IPC Command Contract Gate
         run: npm run check:ipc
@@ -141,7 +143,6 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
@@ -153,6 +154,8 @@ jobs:
           node-version: 22
       - name: Require Green CI And Prepare The Draft
         id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/release-state.mjs prepare
 
   release:
@@ -161,7 +164,6 @@ jobs:
       contents: write
     needs: [preflight, prepare]
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
       RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
@@ -217,6 +219,8 @@ jobs:
         run: npm ci
 
       - name: Confirm Draft And Tag Before Uploads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/release-state.mjs check
 
       - name: Build Tauri Desktop Application

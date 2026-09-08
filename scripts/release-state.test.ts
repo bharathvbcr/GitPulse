@@ -3,11 +3,11 @@ import { expectedAssetNames } from "./check-release-assets.mjs";
 import { runReleaseStage, runCommand, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
-const tag = "v0.0.9";
+const tag = "v1.2.3";
 const options = { stage: "prepare", repo: "owner/repo", tag, commit };
 function draft() {
   return {id: 42, tag_name: tag, target_commitish: commit, draft: true, prerelease: false,
-    immutable: false, published_at: null, body: "pending", assets: expectedAssetNames("0.0.9")
+    immutable: false, published_at: null, body: "pending", assets: expectedAssetNames("1.2.3")
       .map((name, index) => ({id: index + 1, name, size: 123, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}))};
 }
 function fixture(change: {

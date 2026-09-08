@@ -148,7 +148,7 @@ describe("release asset completeness contract", () => {
 
 describe("release metadata cannot imply an unperformed upload", () => {
   it.each([undefined, null, "new", "starter", "failed"])("rejects upload state %s", (state) => {
-    const assets = expectedAssetNames("0.0.9").map(name => ({ name, size: 10, state }));
-    expect(inspectReleaseAssets({tag: "v0.0.9", json: {assets}}).invalid).toBe(true);
+    const assets = expectedAssetNames("1.2.3").map(name => ({ name, size: 10, state }));
+    expect(inspectReleaseAssets({tag: "v1.2.3", json: {assets}}).invalid).toBe(true);
   });
 });
