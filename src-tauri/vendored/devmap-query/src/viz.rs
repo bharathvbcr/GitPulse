@@ -557,6 +557,9 @@ if (!DATA.nodes.length) {{
   // filter below rebuilds from a pristine copy rather than from live state.
   const source = JSON.parse(JSON.stringify(DATA));
   let showLabels = true;
+  const MAX_FILTER_ZOOM = 4;
+  const FILTER_FIT_DELAY_MS = 80;
+  let filterFitTimer;
 
   const graph = ForceGraph()(el)
     .backgroundColor('#0f1419')
@@ -626,7 +629,34 @@ if (!DATA.nodes.length) {{
     return '<dt>' + label + '</dt><dd><ul>' +
       items.map(i => '<li>' + esc(String(i)) + '</li>').join('') + '</ul></dd>';
   }}
+  function fitFiltered(nodes) {{
+    const placed = nodes.filter(n => Number.isFinite(n.x) && Number.isFinite(n.y));
+    if (!placed.length) return;
+    let minX = placed[0].x;
+    let maxX = placed[0].x;
+    let minY = placed[0].y;
+    let maxY = placed[0].y;
+    for (const node of placed.slice(1)) {{
+      minX = Math.min(minX, node.x);
+      maxX = Math.max(maxX, node.x);
+      minY = Math.min(minY, node.y);
+      maxY = Math.max(maxY, node.y);
+    }}
+    // A singleton and coincident nodes have a zero-size world bounding box.
+    // Give that box a real extent before deriving camera scale, then cap the
+    // scale so filtering cannot turn one ordinary node into a full-pane disk.
+    const spanX = Math.max(maxX - minX, 1);
+    const spanY = Math.max(maxY - minY, 1);
+    const width = Math.max(el.clientWidth - 80, 1);
+    const height = Math.max(el.clientHeight - 80, 1);
+    const targetZoom = Math.max(0.05,
+      Math.min(width / spanX, height / spanY, MAX_FILTER_ZOOM));
+    graph.centerAt((minX + maxX) / 2, (minY + maxY) / 2, 250);
+    graph.zoom(targetZoom, 250);
+  }}
   function apply() {{
+    clearTimeout(filterFitTimer);
+    filterFitTimer = undefined;
     const term = document.getElementById('q').value.trim().toLowerCase();
     const required = (VIEW.flag_filters || [])
       .filter(([flag]) => {{
@@ -648,11 +678,16 @@ if (!DATA.nodes.length) {{
         .filter(l => ids.has(l.source) && ids.has(l.target))
         .map(l => Object.assign({{}}, l)),
     }});
-    // The survivors are fresh copies with no coordinates, so the simulation
-    // seeds them wherever it likes while the camera stays where it was. Without
-    // this the pane goes blank on a filter that matched — which reads as "no
-    // results" and is the same failure as a silent cap.
-    if (keep.length) setTimeout(() => graph.zoomToFit(400, 40), 60);
+    // The survivors are fresh copies with no coordinates, so let the
+    // simulation place them before deriving a bounded camera. Canceling the
+    // previous timer prevents a stale quick-typing result from moving the
+    // camera after a newer filter has already won.
+    if (keep.length) {{
+      filterFitTimer = setTimeout(() => {{
+        filterFitTimer = undefined;
+        fitFiltered(graph.graphData().nodes);
+      }}, FILTER_FIT_DELAY_MS);
+    }}
   }}
   document.getElementById('q').addEventListener('input', apply);
   for (const [flag, label] of (VIEW.flag_filters || [])) {{

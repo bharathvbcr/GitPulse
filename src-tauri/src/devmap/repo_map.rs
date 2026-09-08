@@ -307,23 +307,23 @@ pub fn load_repo_map(repo_path: &str) -> RepoMapLoad {
             Some(path_str),
         );
     }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) => {
-            return RepoMapLoad::unavailable(
-                format!("failed to read {path_str}: {e}"),
-                Some(path_str),
-            );
-        }
+    use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let document = match provider.read_repo_map() {
+        Ok(document) => document,
+        Err(error) => return RepoMapLoad::unavailable(error.to_string(), Some(path_str)),
     };
-    match parse_repo_map(&text) {
+    match serde_json::from_value(document) {
         Ok(map) => RepoMapLoad {
             available: true,
             reason: None,
             path: Some(path_str),
             map: Some(map),
         },
-        Err(e) => RepoMapLoad::unavailable(e, Some(path_str)),
+        Err(e) => RepoMapLoad::unavailable(
+            format!("repo_map.json is not valid JSON: {e}"),
+            Some(path_str),
+        ),
     }
 }
 

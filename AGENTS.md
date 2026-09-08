@@ -1,3 +1,26 @@
+# Code navigation for every agent
+
+Start with DevMap in this repository. Read `.devcouncil/repo_map.json` for file
+ownership, then run `devmap status --json` before relying on graph answers.
+The CLI and GitPulse MCP both query the DevMap store:
+
+- Use `gitpulse_codeintel_search` with this repository's absolute `repo_path`,
+  or `devmap search <name> --json`, for symbol discovery.
+- Use `devmap explore <name> --json` for callers and callees and
+  `devmap impact <target> --json` before editing the implementation.
+- Use `devmap affected <target> --json` for candidate tests. Read `truncated`,
+  `shown`, `total`, and `walk_incomplete`; partial results never justify skipping
+  the full required checks.
+- If DevMap is unavailable or stale, state the reason and use source inspection
+  or GitNexus while rebuilding with `devmap build`. An unavailable query is not
+  evidence that there are no callers or affected tests.
+
+GitNexus complements DevMap with its process graph and the required impact and
+change checks below. Run both tools' applicable checks; the generated GitNexus
+block does not replace this DevMap workflow. Keep this section outside that block
+so indexing preserves it. Do not add DevMap's whole-file ownership marker to this
+mixed, maintained guide.
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

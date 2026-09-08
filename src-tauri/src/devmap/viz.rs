@@ -10,9 +10,9 @@
 //! the whole graph.
 
 use crate::engine::git_cli::validate_repo;
+use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Default ranked node cap — matches `devmap_query::viz::VizOptions::default`.
@@ -20,10 +20,6 @@ pub const DEFAULT_VIZ_MAX_NODES: usize = 1_500;
 
 /// Hard ceiling so a caller cannot ask the canvas for the uncapped graph.
 pub const MAX_VIZ_MAX_NODES: usize = 5_000;
-
-/// Match DevCouncil's default artifact-reader budget; never allocate an
-/// unbounded JSON document before applying the much smaller canvas sample cap.
-const MAX_VIZ_JSON_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -60,35 +56,6 @@ pub fn code_graph_path(repo: impl AsRef<Path>) -> PathBuf {
     devmap_query::paths::code_graph_path(repo)
 }
 
-fn read_json_file(path: &Path) -> Result<Value, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular graph file", path.display()));
-    }
-    let too_large = || {
-        format!(
-            "{} exceeds the 128 MiB visualization input limit; use a smaller graph export",
-            path.display()
-        )
-    };
-    if metadata.len() > MAX_VIZ_JSON_BYTES {
-        return Err(too_large());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_VIZ_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    // The file may grow after metadata was read.
-    if bytes.len() as u64 > MAX_VIZ_JSON_BYTES {
-        return Err(too_large());
-    }
-    serde_json::from_slice(&bytes).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
-}
-
 fn clamp_max_nodes(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_VIZ_MAX_NODES)
@@ -114,36 +81,22 @@ pub fn load_code_graph_viz(
             Some(path_str),
         );
     }
-    let graph = match read_json_file(&path) {
-        Ok(graph) => graph,
-        Err(e) => {
-            return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, e, Some(path_str));
-        }
-    };
-    if !graph.get("nodes").is_some_and(Value::is_array)
-        || !graph.get("edges").is_some_and(Value::is_array)
-    {
-        return GraphVizLoad::unavailable(
-            GraphVizKind::CodeGraph,
-            "Invalid code graph: nodes and edges must be arrays; rebuild the map",
-            Some(path_str),
-        );
-    }
-    let tier = graph.pointer("/meta/compatibility_export_tier");
-    if tier.is_some_and(|value| !value.is_null() && value.as_str() != Some("slim"))
-        || graph
-            .pointer("/meta/graph_export_incomplete_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.is_empty())
-    {
-        return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, "Code graph is an incomplete or unsupported compatibility export; rebuild the map with a complete graph export", Some(path_str));
-    }
     let options = devmap_query::viz::VizOptions {
         symbols: symbols.unwrap_or(false),
         max_nodes: clamp_max_nodes(max_nodes),
         title: "Code graph".to_string(),
     };
-    let payload = devmap_query::viz::build_payload(&graph, &options);
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let payload = match provider.code_graph_payload(&options) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return GraphVizLoad::unavailable(
+                GraphVizKind::CodeGraph,
+                error.to_string(),
+                Some(path_str),
+            );
+        }
+    };
     GraphVizLoad {
         available: true,
         reason: None,
@@ -168,20 +121,17 @@ pub fn load_map_preview(repo_path: &str) -> GraphVizLoad {
             Some(path_str),
         );
     }
-    let repo_map = match read_json_file(&path) {
-        Ok(map) => map,
-        Err(e) => {
-            return GraphVizLoad::unavailable(GraphVizKind::MapPreview, e, Some(path_str));
+    let provider = FilesystemArtifactProvider::for_repo(&repo);
+    let payload = match provider.repo_map_payload() {
+        Ok(payload) => payload,
+        Err(error) => {
+            return GraphVizLoad::unavailable(
+                GraphVizKind::MapPreview,
+                error.to_string(),
+                Some(path_str),
+            );
         }
     };
-    if !repo_map.get("subsystems").is_some_and(Value::is_array) {
-        return GraphVizLoad::unavailable(
-            GraphVizKind::MapPreview,
-            "Invalid repo map: subsystems must be an array; rebuild the map",
-            Some(path_str),
-        );
-    }
-    let payload = devmap_query::map_preview::build_preview_payload(&repo_map);
     GraphVizLoad {
         available: true,
         reason: None,
@@ -333,7 +283,15 @@ mod tests {
                 !load.available,
                 "malformed graph reported available: {graph}"
             );
-            assert!(load.reason.unwrap().contains("nodes and edges"));
+            let reason = load.reason.unwrap();
+            let expected = if graph.is_null() {
+                "top level must be an object"
+            } else if graph.get("nodes").is_none() {
+                "nodes"
+            } else {
+                "edges"
+            };
+            assert!(reason.contains(expected), "{reason}");
         }
         for tier in [
             json!("stub"),
@@ -376,11 +334,17 @@ mod tests {
     #[test]
     fn oversized_json_is_rejected_before_parsing() {
         let root = scratch("oversized");
-        let path = root.join("oversized.json");
+        let path = code_graph_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = fs::File::create(&path).unwrap();
         file.set_len(128 * 1024 * 1024 + 1).unwrap();
-        let reason = read_json_file(&path).unwrap_err();
-        assert!(reason.contains("exceeds"), "{reason}");
+        let result = load_code_graph_viz(root.to_str().unwrap(), None, None);
+        assert!(!result.available);
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("134217729 bytes, above the 134217728-byte limit"),
+            "{reason}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

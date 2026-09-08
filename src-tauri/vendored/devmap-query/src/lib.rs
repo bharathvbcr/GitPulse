@@ -17,6 +17,7 @@ pub mod escape;
 pub mod export;
 pub mod freshness;
 pub mod guides;
+pub mod host;
 pub mod inventory;
 pub mod linguist;
 pub mod manifest;

@@ -9,7 +9,7 @@ description = "DevCouncil state store: tasks and the lease that makes concurrent
 # Pinned to the same line as DevCouncil's rust-port so the two Rust codebases
 # do not carry two SQLite builds between them. "bundled" compiles SQLite from
 # source, which keeps the store independent of whatever libsqlite3 the host has.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints.rust]
 unsafe_code = "forbid"

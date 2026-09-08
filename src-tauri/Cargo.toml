@@ -1,6 +1,6 @@
 [package]
 name = "gitpulse"
-version = "0.0.8"
+version = "0.0.9"
 description = "High-Performance Native Git Desktop Client"
 authors = ["GitPulse Team"]
 edition = "2021"
@@ -85,9 +85,9 @@ log = "0.4"
 # Phase 1 ledger. WAL SQLite is the durable substrate for the action history;
 # the bundled feature avoids depending on a system libsqlite3.
 #
-# Kept at 0.31 to match vendored `dc-store` / `devmap-store` (do not bump here
+# Kept on the same line as vendored `dc-store` / `devmap-store` (do not bump here
 # without re-vendoring those crates against the same rusqlite line).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Vendored copies, under `vendored/`, so a lone checkout of GitPulse builds.
 # These crates are owned by Manvi and DevCouncil; nothing here edits them.

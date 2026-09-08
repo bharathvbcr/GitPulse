@@ -188,7 +188,7 @@ fn open_store(repo: &Path) -> Result<Store, String> {
             db_path.to_string_lossy()
         ));
     }
-    Store::open(&db_path).map_err(|e| {
+    Store::open_read_only(&db_path).map_err(|e| {
         let raw = e.to_string();
         if let Some(friendly) = rewrite_schema_mismatch(&raw) {
             return friendly;

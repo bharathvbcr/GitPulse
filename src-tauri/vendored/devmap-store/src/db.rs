@@ -1834,7 +1834,7 @@ impl Store {
         // reclaim is the only thing that mode serves and reclaim is a write.
         const INCREMENTAL: i64 = 2;
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::MAIN_DB)? {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         }
         Ok(())
@@ -1862,7 +1862,7 @@ impl Store {
         // rollback-journal otherwise — and both serve reads; retrying the
         // switch would spend the whole back-off below to report a mode this
         // process could never change.
-        if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        if conn.is_readonly(rusqlite::MAIN_DB)? {
             return Ok(());
         }
         let mut last: Option<rusqlite::Error> = None;
@@ -2537,6 +2537,58 @@ impl Store {
         Ok(())
     }
 
+    /// Open an existing, current-schema store for an embedding reader.
+    ///
+    /// Unlike `open`, this cannot create, migrate, repair indexes, switch the
+    /// journal mode, or repair permissions. SQLite enforces the read boundary
+    /// even when the application has write access to the file. A writer must
+    /// upgrade an older store explicitly before an advisory reader can use it.
+    pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+        let path = db_path.as_ref();
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            refusal(format!(
+                "cannot inspect devmap store {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(refusal(format!(
+                "devmap store {} is not a regular file",
+                path.display()
+            )));
+        }
+        let mut conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(version) => version,
+            Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                conn = Self::open_immutable(path)?;
+                conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
+            }
+            Err(error) => return Err(error),
+        };
+        if stamped != CURRENT_SCHEMA_VERSION {
+            return Err(Self::unsupported_schema(
+                &path.display().to_string(),
+                stamped,
+            ));
+        }
+        Self::configure_connection(&conn)?;
+        Self::validate_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            edge_index: Mutex::new(None),
+            generation_counts: Mutex::new(None),
+            generation_analysis_status: Mutex::new(None),
+            db_path: Some(path.to_path_buf()),
+            read_only: true,
+        })
+    }
+
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
         // Before the connection exists: SQLite maps the `-shm` sidecar as it
@@ -2579,7 +2631,7 @@ impl Store {
         if !Self::schema_is_migratable(stamped) {
             return Err(Self::unsupported_schema(&store, stamped));
         }
-        let read_only = conn.is_readonly(rusqlite::DatabaseName::Main)?;
+        let read_only = conn.is_readonly(rusqlite::MAIN_DB)?;
         if read_only && stamped != CURRENT_SCHEMA_VERSION {
             // Migration is a write. A read-only store at an older schema can
             // neither be migrated nor, with the columns this kernel reads
@@ -2890,6 +2942,7 @@ impl Store {
     /// private to this process and this `Store`, whose mutex already serialises
     /// its writers, so there is no second writer to exclude.
     pub fn lock_writer(&self, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        self.refuse_if_read_only()?;
         match &self.db_path {
             Some(path) => Self::lock_writer_at(path, wait),
             None => Ok(WriterLock {
@@ -3821,8 +3874,12 @@ impl Store {
                             sym.name,
                             sym.qualified_name,
                             sym.kind.as_str(),
-                            sym.span.start_byte,
-                            sym.span.end_byte,
+                            i64::try_from(sym.span.start_byte).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?,
+                            i64::try_from(sym.span.end_byte).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?,
                             sym.is_exported as i32,
                             // SQLite integers are signed. The cast is
                             // bit-preserving and reversed on read, so the stored

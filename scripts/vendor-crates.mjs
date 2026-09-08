@@ -44,9 +44,25 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, lstatSync, mkdtempSync, renameSync } from "node:fs";
-import path from "node:path";
+import {
+  closeSync,
+  constants,
+  cpSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -64,11 +80,11 @@ export const MANIFEST = path.join(VENDOR_DIR, "VENDOR.json");
  * Overridable by environment variable so a machine that keeps its checkouts
  * somewhere else can still re-vendor, and so this is testable without them.
  */
-export function sources(env = process.env) {
+export function sources(env = process.env, from = REPO) {
   return [
     {
       id: "manvi",
-      root: env.GITPULSE_MANVI_ROOT ?? findSibling("Manvi"),
+      root: env.GITPULSE_MANVI_ROOT ?? findSibling("Manvi", from),
       // The workspace root inside that repository, whose inheritance applies.
       workspace: "crates",
       crates: ["dc-glob", "dc-store", "dc-verify"],
@@ -76,7 +92,7 @@ export function sources(env = process.env) {
     },
     {
       id: "devcouncil",
-      root: env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil"),
+      root: env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil", from),
       workspace: "rust-port",
       crates: ["devmap-analyze", "devmap-extract", "devmap-query", "devmap-resolve", "devmap-store"],
       crateDir: (/** @type {string} */ name) => path.join("rust-port", "crates", name),
@@ -86,7 +102,7 @@ export function sources(env = process.env) {
       // crate lives at `core/` and has no workspace inheritance of its own,
       // so `workspace` points at that same directory for resolveManifest.
       id: "markdev",
-      root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev"),
+      root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev", from),
       workspace: "core",
       crates: ["markdev"],
       crateDir: (/** @type {string} */ _name) => "core",
@@ -117,11 +133,73 @@ function findSibling(name, from = REPO) {
     if (parent === dir) break;
     dir = parent;
   }
+
+  // A linked worktree's ancestors do not include the directory that contains
+  // the canonical checkout. Its common Git directory does: for
+  // `/Code/devtools/GitPulse/.git`, the sibling checkout is
+  // `/Code/devtools/<name>`. This also works when the worktree lives under an
+  // agent-owned `.codex/worktrees/` directory at an unrelated depth.
+  try {
+    const commonDir = execFileSync(
+      "git",
+      ["-C", from, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    const gitDir = path.resolve(from, commonDir);
+    const canonical = path.dirname(gitDir);
+    const candidate = path.join(path.dirname(canonical), name);
+    if (existsSync(candidate)) return candidate;
+  } catch {
+    // The explicit environment variables remain the escape hatch for a
+    // non-Git source tree or an unusual Git directory layout.
+  }
   return path.join(path.dirname(from), name);
 }
 
 /** Files and directories taken from each crate. */
 const COPIED = ["src", "build.rs", "assets"];
+
+/** Cargo manifests are small text files. Bound reads before parsing so a
+ * special file cannot block the vendor command and a damaged manifest cannot
+ * consume memory without limit. The source trees are trusted local inputs;
+ * descriptor checks narrow path races but are not a filesystem transaction. */
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+
+/**
+ * Read one Cargo manifest from a regular file, through the opened descriptor.
+ *
+ * @param {string} manifestPath
+ * @returns {string}
+ */
+function readManifest(manifestPath) {
+  const before = lstatSync(manifestPath);
+  if (before.isSymbolicLink()) throw new Error(`refusing symbolic link manifest: ${manifestPath}`);
+  if (!before.isFile()) throw new Error(`refusing non-regular manifest: ${manifestPath}`);
+  if (before.size > MAX_MANIFEST_BYTES) {
+    throw new Error(`manifest is too large (${before.size} bytes; maximum ${MAX_MANIFEST_BYTES}): ${manifestPath}`);
+  }
+
+  const fd = openSync(manifestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) throw new Error(`refusing non-regular manifest: ${manifestPath}`);
+    if (opened.size > MAX_MANIFEST_BYTES) {
+      throw new Error(`manifest is too large (${opened.size} bytes; maximum ${MAX_MANIFEST_BYTES}): ${manifestPath}`);
+    }
+
+    const bytes = Buffer.alloc(opened.size + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length !== opened.size) throw new Error(`manifest changed while it was read: ${manifestPath}`);
+    return bytes.subarray(0, length).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
 
 // --- a very small TOML reader -------------------------------------------
 //
@@ -362,7 +440,7 @@ function sha256(buffer) {
  */
 function walk(dir, prefix = "") {
   if (!existsSync(dir)) return [];
-  if (lstatSync(dir).isSymbolicLink()) throw new Error(`Refusing symbolic link: ${dir}`);
+  if (lstatSync(dir).isSymbolicLink()) throw new Error(`refusing symbolic link: ${dir}`);
   const out = [];
   for (const entry of readdirSync(dir).sort()) {
     // DevCouncil / agent local state must never be part of a vendored crate.
@@ -373,10 +451,10 @@ function walk(dir, prefix = "") {
     const full = path.join(dir, entry);
     const rel = prefix ? `${prefix}/${entry}` : entry;
     const info = lstatSync(full);
-    if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${full}`);
+    if (info.isSymbolicLink()) throw new Error(`refusing symbolic link: ${full}`);
     if (info.isDirectory()) out.push(...walk(full, rel));
     else if (info.isFile()) out.push(rel);
-    else throw new Error(`Refusing non-regular source: ${full}`);
+    else throw new Error(`refusing non-regular file: ${full}`);
   }
   return out;
 }
@@ -384,45 +462,61 @@ function walk(dir, prefix = "") {
 /** @param {string} root */
 function gitCommit(root) {
   try {
-    return execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    return execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
   } catch {
     return "";
   }
 }
 
 /**
- * One canonical snapshot builder for updates and drift checks. Resolve Cargo
- * inheritance and standalone rewrites before comparing, including deletions.
+ * Build the exact standalone snapshot used by both refresh and drift checks.
+ * Comparing this output with the recorded manifest catches source deletions,
+ * Cargo inheritance changes, and changes to standalone rewrites through one
+ * canonical transform.
+ *
  * @param {ReturnType<typeof sources>[number]} source
  * @param {string} name
  * @param {string} to
+ * @param {Map<string, Map<string, string>>} workspace
+ * @param {string} commit
  */
-function prepareCrate(source, name, to) {
+function prepareCrate(source, name, to, workspace, commit) {
   const from = path.join(source.root, source.crateDir(name));
-  const workspace = readToml(readFileSync(path.join(source.root, source.workspace, "Cargo.toml"), "utf8"));
-  const { text, rewrites } = resolveManifest(readFileSync(path.join(from, "Cargo.toml"), "utf8"), workspace);
+  const upstream = readManifest(path.join(from, "Cargo.toml"));
+  const { text, rewrites } = resolveManifest(upstream, workspace);
   mkdirSync(to, { recursive: true });
+
   for (const item of COPIED) {
     const src = path.join(from, item);
     const info = lstatSync(src, { throwIfNoEntry: false });
     if (!info) continue;
-    if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${src}`);
+    if (info.isSymbolicLink()) throw new Error(`refusing symbolic link: ${src}`);
     const files = info.isDirectory() ? walk(src, item) : [item];
+    if (!info.isDirectory() && !info.isFile()) throw new Error(`refusing non-regular file: ${src}`);
     for (const rel of files) {
       const input = path.join(from, rel);
-      if (!lstatSync(input).isFile()) throw new Error(`Refusing non-regular source: ${input}`);
-      const dest = path.join(to, rel);
-      mkdirSync(path.dirname(dest), { recursive: true });
-      cpSync(input, dest);
+      const output = path.join(to, rel);
+      mkdirSync(path.dirname(output), { recursive: true });
+      cpSync(input, output);
     }
   }
+
   writeFileSync(path.join(to, "Cargo.toml"), text);
+
   /** @type {Record<string, string>} */
   const files = {};
   for (const rel of walk(to)) files[rel] = sha256(readFileSync(path.join(to, rel)));
   return {
     name,
-    origin: { repo: source.id, root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`, path: source.crateDir(name), commit: gitCommit(source.root) },
+    origin: {
+      repo: source.id,
+      root_env: `GITPULSE_${source.id.toUpperCase()}_ROOT`,
+      path: source.crateDir(name),
+      commit,
+    },
     omitted: ["tests/", "[dev-dependencies]"],
     rewrites,
     files,
@@ -430,52 +524,70 @@ function prepareCrate(source, name, to) {
 }
 
 /**
- * Prepare the entire update before replacing any live files. The previous
- * tree is retained until installation succeeds and restored on rename failure.
- * Concurrent writers fail immediately; a lock left by a killed process needs
- * inspection, never an automatic stale-lock deletion.
+ * Copy recorded, unrelated crates into a scoped refresh's staging tree.
+ * @param {string} staging
+ * @param {string} onlyCrate
+ */
+function copyUnselectedSnapshot(staging, onlyCrate) {
+  if (!existsSync(MANIFEST)) throw new Error(`${MANIFEST} is missing; run a full vendor refresh first`);
+  for (const rel of walk(VENDOR_DIR)) {
+    if (rel.split("/")[0] === onlyCrate) continue;
+    const output = path.join(staging, rel);
+    mkdirSync(path.dirname(output), { recursive: true });
+    cpSync(path.join(VENDOR_DIR, rel), output);
+  }
+  const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
+  if (!Array.isArray(manifest.crates)) throw new Error(`${MANIFEST} has no crates array`);
+  return manifest.crates.filter((/** @type {{ name: string }} */ crate) => crate.name !== onlyCrate);
+}
+
+/**
+ * Prepare a complete snapshot before replacing the live vendor tree. A lock
+ * rejects concurrent writers. If installation fails after moving the old
+ * tree aside, it is restored before the error escapes.
+ *
  * @param {NodeJS.ProcessEnv} env
  * @param {string | null} onlyCrate
  */
 export function vendor(env = process.env, onlyCrate = null) {
   const configured = sources(env);
-  if (onlyCrate !== null && !configured.some(source => source.crates.includes(onlyCrate))) {
-    throw new Error(`Unknown crate: ${onlyCrate}`);
+  if (onlyCrate !== null && !configured.some((source) => source.crates.includes(onlyCrate))) {
+    throw new Error(`unknown crate ${JSON.stringify(onlyCrate)}`);
   }
+
   const parent = path.dirname(VENDOR_DIR);
-  mkdirSync(parent, { recursive: true });
   const lock = path.join(parent, ".vendor-lock");
-  mkdirSync(lock);
-  let staging = "";
   const backup = path.join(lock, "previous");
+  mkdirSync(parent, { recursive: true });
+  mkdirSync(lock);
+
+  let staging = "";
   try {
     staging = mkdtempSync(path.join(parent, ".vendor-stage-"));
-    const crates = onlyCrate === null ? [] : JSON.parse(readFileSync(MANIFEST, "utf8")).crates.filter(
-      (/** @type {{name: string}} */ crate) => crate.name !== onlyCrate,
-    );
-    if (onlyCrate !== null) {
-      // A scoped update keeps every unrelated byte, including unrecorded files.
-      for (const rel of walk(VENDOR_DIR)) {
-        if (rel.split("/")[0] === onlyCrate) continue;
-        const dest = path.join(staging, rel);
-        mkdirSync(path.dirname(dest), { recursive: true });
-        cpSync(path.join(VENDOR_DIR, rel), dest);
-      }
-    }
+    const crates = onlyCrate === null ? [] : copyUnselectedSnapshot(staging, onlyCrate);
+
     for (const source of configured) {
       if (onlyCrate !== null && !source.crates.includes(onlyCrate)) continue;
-      if (!existsSync(source.root)) throw new Error(`${source.id}: ${source.root} is not present; set GITPULSE_${source.id.toUpperCase()}_ROOT`);
+      if (!existsSync(source.root)) {
+        throw new Error(`${source.id}: ${source.root} is not present; set GITPULSE_${source.id.toUpperCase()}_ROOT`);
+      }
+      const workspace = readToml(readManifest(path.join(source.root, source.workspace, "Cargo.toml")));
+      const commit = gitCommit(source.root);
       for (const name of source.crates) {
         if (onlyCrate !== null && name !== onlyCrate) continue;
-        crates.push(prepareCrate(source, name, path.join(staging, name)));
+        crates.push(prepareCrate(source, name, path.join(staging, name), workspace, commit));
       }
     }
-    crates.sort((/** @type {{name: string}} */ a, /** @type {{name: string}} */ b) => a.name.localeCompare(b.name));
+
+    crates.sort(
+      (/** @type {{ name: string }} */ a, /** @type {{ name: string }} */ b) => a.name.localeCompare(b.name),
+    );
     const manifest = {
       note: "Generated by scripts/vendor-crates.mjs. Do not edit these crates here; change them upstream and re-vendor.",
       crates,
     };
     writeFileSync(path.join(staging, "VENDOR.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+
     if (existsSync(VENDOR_DIR)) renameSync(VENDOR_DIR, backup);
     try {
       renameSync(staging, VENDOR_DIR);
@@ -488,7 +600,8 @@ export function vendor(env = process.env, onlyCrate = null) {
     return manifest;
   } finally {
     if (staging) rmSync(staging, { recursive: true, force: true });
-    // Never remove the only old copy if rollback itself failed.
+    // A retained backup means rollback itself failed. Keep both it and the
+    // lock for explicit recovery rather than deleting the only old snapshot.
     if (!existsSync(backup)) rmSync(lock, { recursive: true, force: true });
   }
 }
@@ -535,11 +648,14 @@ export function check(env = process.env) {
       const current = gitCommit(source.root);
       const scratch = mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-check-"));
       try {
-        const expected = prepareCrate(source, crate.name, scratch);
-        const allFiles = new Set([...walk(dir), ...Object.keys(expected.files)]);
-        for (const rel of [...allFiles].sort()) {
-          const ours = path.join(dir, rel);
-          if (!existsSync(ours) || expected.files[rel] !== sha256(readFileSync(ours))) result.drifted.push(rel);
+        const workspace = readToml(readManifest(path.join(source.root, source.workspace, "Cargo.toml")));
+        const expected = prepareCrate(source, crate.name, scratch, workspace, current);
+        // Compare upstream's transformed snapshot with the hashes recorded at
+        // the last refresh. Local edits are an independent verdict above and
+        // must not be misreported as upstream drift.
+        const files = new Set([...Object.keys(crate.files), ...Object.keys(expected.files)]);
+        for (const rel of [...files].sort()) {
+          if (crate.files[rel] !== expected.files[rel]) result.drifted.push(rel);
         }
       } finally {
         rmSync(scratch, { recursive: true, force: true });
@@ -566,7 +682,7 @@ function usage() {
     summary: "Vendor the sibling Rust crates GitPulse links, so a lone checkout builds.",
     flags: [
       { flag: "--check", description: "Verify the vendored tree instead of rewriting it" },
-      { flag: "--crate=NAME", description: "Update only this crate; preserve the other vendored crates" },
+      { flag: "--crate=NAME", description: "Refresh one crate and preserve every unrelated crate" },
       { flag: "--allow-drift", description: "Allow upstream drift while verifying no local edits" },
       { flag: "--json", description: "Emit machine-readable output" },
       { flag: "--help, -h", description: "Show this message" },
@@ -581,7 +697,9 @@ export function main(argv = process.argv.slice(2)) {
     console.log(usage());
     return 0;
   }
-  const unknown = argv.find((a) => a !== "--check" && a !== "--json" && a !== "--allow-drift" && !a.startsWith("--crate="));
+  const unknown = argv.find(
+    (a) => a !== "--check" && a !== "--json" && a !== "--allow-drift" && !a.startsWith("--crate="),
+  );
   if (unknown) {
     console.error(`FAIL: unknown option ${JSON.stringify(unknown)}\n`);
     console.error(usage());
@@ -589,15 +707,16 @@ export function main(argv = process.argv.slice(2)) {
   }
   const asJson = argv.includes("--json");
   const allowDrift = argv.includes("--allow-drift");
-  const selected = argv.filter(a => a.startsWith("--crate="));
-  if (selected.length > 1 || (selected.length > 0 && argv.includes("--check"))) {
+  const selected = argv.filter((arg) => arg.startsWith("--crate="));
+  if (selected.length > 1 || (selected.length === 1 && argv.includes("--check"))) {
     console.error("FAIL: --crate accepts one crate and cannot be combined with --check");
     return 2;
   }
 
   try {
     if (!argv.includes("--check")) {
-      const manifest = vendor(process.env, selected.length ? selected[0].slice("--crate=".length) : null);
+      const crate = selected.length === 1 ? selected[0].slice("--crate=".length) : null;
+      const manifest = vendor(process.env, crate);
       if (asJson) console.log(JSON.stringify(manifest, null, 2));
       else {
         for (const crate of manifest.crates) {

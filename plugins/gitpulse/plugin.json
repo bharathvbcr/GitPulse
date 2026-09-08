@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "gitpulse",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "description": "Read-only GitPulse control plane for agents: worktrees, collisions, ledger, provenance, and in-process code intelligence.",
   "author": {
     "name": "GitPulse Team",
@@ -10,5 +10,11 @@
   "homepage": "https://gitpulse.vbcr.dev",
   "repository": "https://github.com/bharathvbcr/GitPulse",
   "license": "MIT",
-  "keywords": ["git", "mcp", "worktrees", "code-intelligence", "insights"]
+  "keywords": [
+    "git",
+    "mcp",
+    "worktrees",
+    "code-intelligence",
+    "insights"
+  ]
 }

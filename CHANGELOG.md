@@ -11,7 +11,13 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-09-08
+
 ### Changed
+
+- Consolidate all outstanding worktrees and align the embedded SQLite dependency
+  with MANVI and DevMap. Add explicit DevMap navigation to both agent guides,
+  with regression coverage that preserves the workflow across regeneration.
 
 - Synchronize the canonical devmap query, HTML projection, extractor and store
   modules. HTML assets are owned by the upstream query crate; GitPulse no

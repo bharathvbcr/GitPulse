@@ -334,18 +334,18 @@ mod tests {
     fn picks_the_highest_stable_tag() {
         let output = format!(
             "{}{}{}{}",
-            line("v0.0.9"),
-            line("v0.1.0"),
-            line("v0.0.10"),
-            line("v0.1.0-rc.1"),
+            line("v1.2.9"),
+            line("v1.3.0"),
+            line("v1.2.10"),
+            line("v1.3.0-rc.1"),
         );
         let (tag, version) = latest_stable_tag(&output).unwrap().unwrap();
-        assert_eq!(tag, "v0.1.0");
+        assert_eq!(tag, "v1.3.0");
         assert_eq!(
             version,
             Version {
-                major: 0,
-                minor: 1,
+                major: 1,
+                minor: 3,
                 patch: 0
             }
         );
@@ -353,10 +353,10 @@ mod tests {
 
     #[test]
     fn compares_numerically_not_lexically() {
-        // "0.0.10" sorts before "0.0.9" as text; the check must not.
-        let output = format!("{}{}", line("v0.0.9"), line("v0.0.10"));
+        // Multi-digit patch versions must compare numerically, not lexically.
+        let output = format!("{}{}", line("v1.2.9"), line("v1.2.10"));
         let (tag, _) = latest_stable_tag(&output).unwrap().unwrap();
-        assert_eq!(tag, "v0.0.10");
+        assert_eq!(tag, "v1.2.10");
     }
 
     #[test]
