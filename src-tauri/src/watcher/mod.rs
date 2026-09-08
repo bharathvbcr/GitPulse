@@ -949,9 +949,37 @@ mod tests {
         phase.send("drop watcher state").unwrap();
         drop(state);
         phase.send("remove fixture").unwrap();
-        drop(dir);
+        dir.close()
+            .expect("remove fixture after watches were stopped");
         drop(phase);
         watchdog.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_alias_watch_lifecycles_do_not_stall() {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        thread::scope(|scope| {
+            let mut lanes = Vec::new();
+            for lane in 0..2 {
+                lanes.push(scope.spawn(move || {
+                    for cycle in 0..16 {
+                        assert!(
+                            Instant::now() < deadline,
+                            "watch lifecycle stress exceeded its total budget"
+                        );
+                        eprintln!("watch alias stress lane {lane}, cycle {cycle}");
+                        test_unwatch_raw_and_aliased_paths_match_canonical_key();
+                    }
+                }));
+            }
+            for lane in lanes {
+                lane.join().unwrap();
+            }
+        });
+        assert!(
+            Instant::now() < deadline,
+            "watch lifecycle stress exceeded its total budget"
+        );
     }
 
     /// After the watched directory is deleted, `canonicalize()` and
