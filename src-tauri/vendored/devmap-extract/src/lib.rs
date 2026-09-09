@@ -493,10 +493,7 @@ pub fn extract_all_with_progress(
         .map(|f| {
             let extraction = extract_file(f.path, f.source);
             if let Some(progress) = progress {
-                progress.finish_file(
-                    false,
-                    matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }),
-                );
+                progress.finish_file(false, extraction.is_parse_failure());
             }
             extraction
         })
@@ -1117,6 +1114,35 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn uncached_progress_does_not_call_data_files_parse_failures() {
+        let files = [
+            FileRef {
+                path: "notes.md",
+                source: "# Notes",
+            },
+            FileRef {
+                path: "data.json",
+                source: "{}",
+            },
+            FileRef {
+                path: "broken.ipynb",
+                source: "not JSON",
+            },
+        ];
+        let progress = progress::FileProgress::default();
+        let extracted = extract_all_with_progress(&files, Some(&progress));
+        assert_eq!(
+            extracted
+                .iter()
+                .filter(|file| file.is_parse_failure())
+                .count(),
+            1
+        );
+        assert_eq!(progress.snapshot().failed, 1);
+        assert_eq!(progress.snapshot().completed, 3);
+    }
 
     #[test]
     fn extract_tree_skips_non_source_and_finds_py() {

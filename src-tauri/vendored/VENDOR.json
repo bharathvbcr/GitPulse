@@ -120,7 +120,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
+        "commit": "5ffdd6d2a24b7997efee1eb774a584891df477c5"
       },
       "omitted": [
         "tests/",
@@ -181,7 +181,7 @@
         "src/fallback.rs": "35c7bb1dde061964e8ecfb92fae823ea191abcba7a20c0a5f38dd24a14635e62",
         "src/frameworks.rs": "1899508a57f6b4a06c01fc9b9852ce5a667573460619e9ac18582f97a3b4d4e0",
         "src/git_metadata.rs": "38bd4f6e6703e140c699d9a93751bfbd812cad10965a59d03101fb3b4c7d4f22",
-        "src/gomod.rs": "21b120ec0bfd4bdc4c5bb8cf34d0058537bb03cfcc7b1df65741b6b311771a56",
+        "src/gomod.rs": "748f65fd657ab7a43e1d8b41733c3fe6512cb55b663335aff9a5bd9c756496a6",
         "src/heritage.rs": "6f4682ef7cb0d5e5e57aa6543df57a23ab4d7133288968fb474993496b7b4ff0",
         "src/langcalls/csharp.rs": "cccad4267800c472c1a43bd06b460a5c42e3143d1ee97f0ec8329ebbc531a05c",
         "src/langcalls/dart.rs": "bbd82289bd96b106d4ccb361453f61deed1861ab69084a8cc7083cd1df4025b0",
@@ -229,7 +229,7 @@
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
-        "src/lib.rs": "ade15ca01a81541f7f7c569d8d569a5481830748ce6a9b90e1f586d1148b0642",
+        "src/lib.rs": "119d4ef0f630f539fb73c65e40e419d763623a5f1ff4e294cf3fe704c072bd08",
         "src/model.rs": "0059b938eccbf8f48a2e64ada08ec7cf306a1d61d6cd4debaa6fe831afa9a4e6",
         "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
         "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
@@ -245,7 +245,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
+        "commit": "64ae747e0430d786a43edecf52e15f865b1eebdc"
       },
       "omitted": [
         "tests/",
@@ -265,7 +265,7 @@
         "Cargo.toml": "272f92a130fbfb3421d3bcb15fed45be392805a7216aec2fc0d0d15745e07d9e",
         "assets/force-graph.min.js.bundle": "1008539bb9e171a0dc343453366451a1b3a6ded06028ef4f978608b658ba2d0a",
         "src/api_routes.rs": "3758344d1bd33fc3506df19d9d29f682ff5468b6af9abba68d723b5ba7926743",
-        "src/artifacts.rs": "070658cd837afbe63be0673d48153c9c44816abe0774018c7656a5ddff65aed2",
+        "src/artifacts.rs": "fbf5284851dc8250ddec56b8d5ea05aab7124a5edbe2a306a17d7249ebbdc205",
         "src/ast.rs": "6ec0da5812f4036a78976a45b183ff8fb000f7b817403e352487034101d7a6f0",
         "src/cancel.rs": "529599c39eb77c586f4cbea523676d39de0d4d0496b971f2f8814a6dcddac4cc",
         "src/code_graph.rs": "0c6650916e7a1af7bb49ffd8dfc9dc3680e1db0ed5e9cd932ebe2ba24374e24c",
@@ -281,14 +281,14 @@
         "src/lib.rs": "d6f3f566976dd09103a288196508fc987b7cbdfe5472df0e1bae4982ccba8a28",
         "src/linguist.rs": "08832b5a4215e7c3242f31af0672391ad9c33b25e1d050e7c365b11b3a418908",
         "src/manifest.rs": "279fdb350bcaee24bddb29123192661d413802afd630eb5dafc06d9a73121437",
-        "src/map_preview.html": "04e15b5c2722ccf260e08cc2b7c05595f5a93c573595add5e49878dfe771ecde",
-        "src/map_preview.rs": "35c0f66cb7b0aae702007be39064c5debcaac95c24f26fa944e5b9fb2d7fe4bf",
+        "src/map_preview.html": "090e7abcb22ca1e091de2f4158f316e481610c2821f7e5c054260c34333aa185",
+        "src/map_preview.rs": "ab3e8abfbdb30cccab224f8462a29ccd1cedb9495e7cc27aebb90796f5b2ba95",
         "src/model.rs": "58efcfe224f223d9ec52e8a9514b100bda541aa87328c7201842ff3079a8ddaa",
         "src/query_match.rs": "d3895702cdfac77fe87cfffb7f729555f7da5f20a762c58c7437fa92c51ca51d",
         "src/rung.rs": "e962ef23a3dc51e7595bb0708bb6a132cf5bf3172f8c2b9b1050ffeaf0c7f243",
         "src/semantic.rs": "bf045dad9afd1e87a50872983081db999575d9aae54ece304c2cd9c563fc38e4",
         "src/snapshots.rs": "2021b47ec10f2743c162e453bba882180494b57c99e07139f8e9f7a9c5daa942",
-        "src/viz.rs": "f06edb11498ee017e9e6a377baa601c089a915bdfe5b89cd28d2965a3ae4164b",
+        "src/viz.rs": "2771be757c19e94c40aa27efcf1a26f239e64b437284d6f5b6dbbca6abf11c71",
         "src/workspace.rs": "a143523a44881f0f4589a38d8edf2d0ca676747b41f530a1cd9c5ca56ddb32ee"
       }
     },
@@ -327,7 +327,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
+        "commit": "64ae747e0430d786a43edecf52e15f865b1eebdc"
       },
       "omitted": [
         "tests/",
@@ -347,7 +347,7 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "e3380b51a596c6775ac541bfbf282767f9b279494a1f198b244a01b60a650f25",
+        "src/db.rs": "694bf00f16ea548e878dfb748f5b1d327d2fe9c4f3f779d5d2ccfe527988240e",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "a8447e286fe81b754e324ffaacddb818e6b7d0f27477612a18e7fbcd1a3ac693",
         "src/lib.rs": "25d0b62fa04bc399620b16a92b8615deb0abdbb5b255518326db5b74a9c19de1",

@@ -142,16 +142,8 @@ fn canonical_pending_entry(root: &Path, raw: &str) -> PendingEntry {
     if is_control_token(raw) {
         return PendingEntry::Canonical(raw.to_string());
     }
-    // `\` is a path separator on Windows and an ordinary, legal filename
-    // character everywhere else. Rewriting it unconditionally renamed the Unix
-    // file `a\b.py` to `a/b.py`, which then matched nothing on disk, failed
-    // classification, and was deleted from the queue as garbage — the file was
-    // never indexed and `status` still reported fresh.
-    #[cfg(windows)]
-    let normalized = raw.replace('\\', "/");
-    #[cfg(windows)]
-    let candidate = Path::new(&normalized);
-    #[cfg(not(windows))]
+    // Let Path parse platform separators. Replacing backslashes corrupts both
+    // legal Unix filenames and Windows canonical \\?\ prefixes.
     let candidate = Path::new(raw);
 
     let relative = if candidate.is_absolute() {
@@ -3138,6 +3130,14 @@ impl Store {
         let _ = file.rewind();
         let _ = write!(file, "{}", std::process::id());
         let _ = file.flush();
+        // Windows byte-range locks also prohibit another handle from reading
+        // the locked bytes. Keep diagnostic identity outside that locked range;
+        // the kernel lock remains the sole authority for exclusion.
+        #[cfg(windows)]
+        std::fs::write(
+            lock_path.with_extension("lock.owner"),
+            std::process::id().to_string(),
+        )?;
         Ok(WriterLock {
             file: Some(file),
             path: Some(lock_path),
@@ -3200,12 +3200,16 @@ impl Store {
     fn writer_lock_holder(lock_path: &Path) -> String {
         use std::io::Read;
 
+        #[cfg(windows)]
+        let owner_path = lock_path.with_extension("lock.owner");
+        #[cfg(not(windows))]
+        let owner_path = lock_path;
         let mut holder = String::new();
-        std::fs::File::open(lock_path)
-            .and_then(|mut handle| handle.read_to_string(&mut holder))
+        std::fs::File::open(owner_path)
+            .and_then(|handle| handle.take(64).read_to_string(&mut holder))
             .ok()
             .map(|_| holder.trim().to_string())
-            .filter(|pid| !pid.is_empty())
+            .filter(|pid| pid.parse::<u32>().is_ok_and(|pid| pid > 0))
             .unwrap_or_else(|| "unknown".to_string())
     }
 

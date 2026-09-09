@@ -95,9 +95,15 @@ fn parse_replace_spec(spec: &str) -> Option<(String, String)> {
 /// Collect every non-gitignored `go.mod` under `root`.
 pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
     let mut modules = Vec::new();
+    let walk_root = root.to_path_buf();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
+        .filter_entry(move |entry| {
+            entry.path() == walk_root
+                || !entry.file_type().is_some_and(|kind| kind.is_dir())
+                || !crate::is_cache_directory(entry.path())
+        })
         .build();
     for result in walker {
         let entry = match result {
@@ -177,6 +183,34 @@ pub fn git_worktree_root(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_discovery_prunes_build_caches_like_source_discovery() {
+        let root = std::env::temp_dir().join(format!("devmap-module-cache-{}", std::process::id()));
+        fs::create_dir_all(root.join("output/deep")).unwrap();
+        fs::write(root.join("go.mod"), "module example.com/source\n").unwrap();
+        fs::write(
+            root.join("output/CACHEDIR.TAG"),
+            crate::CACHEDIR_TAG_SIGNATURE,
+        )
+        .unwrap();
+        fs::write(
+            root.join("output/deep/go.mod"),
+            "module example.com/cache\n",
+        )
+        .unwrap();
+        let modules = collect_go_modules(&root).unwrap();
+        assert_eq!(
+            modules
+                .iter()
+                .map(|module| module.prefix.as_str())
+                .collect::<Vec<_>>(),
+            ["example.com/source"]
+        );
+        // Explicitly choosing the cache itself as root must still work.
+        assert_eq!(collect_go_modules(&root.join("output")).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parse_module_and_block_replace() {

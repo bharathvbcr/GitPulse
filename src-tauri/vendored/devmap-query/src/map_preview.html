@@ -128,6 +128,7 @@ a.link:hover { text-decoration:underline; }
         <input id="search" placeholder="Filter area or summary" autocomplete="off" aria-label="Filter subsystems"/>
         <select id="langFilter" aria-label="Filter by language"></select>
       </div>
+      <label class="inline" title="Hide subsystems whose indexed files are all notes or documentation; mixed subsystems stay visible"><input type="checkbox" id="hideNotes"/> Hide notes &amp; Markdown</label>
       <div class="badges" id="livenessBadges" style="margin-top:10px"></div>
     </section>
     <section class="block">
@@ -279,7 +280,9 @@ function subsystemHasLang(s, lang) { return (s.languages || []).some(p => p[0] =
 
 function filtered() {
   const q = (document.getElementById('search').value || '').toLowerCase();
+  const hideNotes = document.getElementById('hideNotes').checked;
   const nodes = (DATA.nodes || []).filter(n => {
+    if (hideNotes && n.documentation === true) return false;
     const sub = subsystemById(n.id) || {};
     if (langFilter && !subsystemHasLang(sub, langFilter)) return false;
     if (!q) return true;
@@ -372,6 +375,7 @@ function showDetail(id) {
 }
 
 function select(id, fromList) {
+  if (!filtered().nodes.some(n => n.id === id)) return;
   selected = [id];
   showDetail(id);
   redraw();
@@ -569,6 +573,10 @@ function updateCounts(fd) {
 
 function redraw() {
   const fd = filtered();
+  if (selected.some(id => !fd.nodes.some(n => n.id === id))) {
+    selected = [];
+    document.getElementById('detail').innerHTML = '<span class="none">Select a subsystem to inspect.</span>';
+  }
   if (g) {
     g.graphData(fd);
     g.width(stage.clientWidth).height(stage.clientHeight);
@@ -706,6 +714,7 @@ if (g) {
 }
 
 document.getElementById('search').addEventListener('input', redraw);
+document.getElementById('hideNotes').addEventListener('change', redraw);
 document.getElementById('langFilter').addEventListener('change', ev => { langFilter = ev.target.value; redraw(); });
 // A resize changes how much canvas the same layout has to sit in, so the zoom
 // that fitted the old stage does not fit the new one. Refit unless the reader
@@ -727,6 +736,7 @@ document.addEventListener('keydown', ev => {
   else if (ev.key === 'Escape') {
     selected = [];
     langFilter = '';
+    document.getElementById('hideNotes').checked = false;
     document.getElementById('langFilter').value = '';
     document.getElementById('detail').innerHTML = '<span class="none">Select a subsystem to inspect.</span>';
     redraw();
