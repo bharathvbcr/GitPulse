@@ -67,3 +67,32 @@ If you discover a security vulnerability in GitPulse, please report it via GitHu
 👉 **[Open a Security Advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new)**
 
 We take security issues seriously and will respond promptly to investigate and patch confirmed vulnerabilities.
+
+## 3. Unresolved Dependency Advisory
+
+As of 2026-09-08, **GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429 remains
+unresolved** in `src-tauri/Cargo.lock` (`glib 0.18.5`). The upstream advisory
+describes undefined behavior in `VariantStrIter` and identifies `0.20.0` as the
+first fixed version. See the [RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2024-0429.html)
+and [upstream fix](https://github.com/gtk-rs/gtk-rs-core/pull/1343).
+
+**Verified:** Tauri's Linux GTK3/WebKitGTK stack resolves `gtk 0.18.2` and
+`webkit2gtk 2.0.2`, which require `glib 0.18` and `^0.18.0` respectively.
+`0.18.5` is the latest published release on that compatible line. Cargo rejects
+the suggested `0.20.0` update with `failed to select a version for the requirement
+glib = "^0.18"`. Reproduce without changing the lockfile:
+
+```sh
+cargo tree --manifest-path src-tauri/Cargo.toml --locked --target all -i glib@0.18.5
+cargo update --manifest-path src-tauri/Cargo.toml -p glib@0.18.5 --precise 0.20.0 --dry-run
+```
+
+The Apple Silicon macOS dependency graph has no `glib` edge; this does not clear
+the advisory for Linux builds. The [Wry GTK4 port](https://github.com/tauri-apps/wry/pull/1767)
+and [Tauri GTK4 port](https://github.com/tauri-apps/tauri/pull/14684) were still
+unmerged when checked. A resolution requires either a compatible maintained
+backport of the upstream fix or a compatible migration of the parent stack.
+Adding `glib 0.20` directly cannot replace GTK3's incompatible dependency.
+
+**Unverified:** reachability of the affected iterator in a running Linux build.
+The alert remains open; no advisory suppression or version override is applied.
