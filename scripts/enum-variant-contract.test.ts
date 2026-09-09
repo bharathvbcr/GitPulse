@@ -1,6 +1,8 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse } from "svelte/compiler";
 import {
   createSourceFile, isIdentifier, isLiteralTypeNode, isParenthesizedTypeNode,
   isPropertySignature, isStringLiteral, isTypeAliasDeclaration, isTypeLiteralNode,
@@ -215,22 +217,73 @@ describe("TypeScript enum contract extraction", () => {
 });
 
 /** String literals in the TS union named `name`, if one exists. */
-function tsUnion(name: string, tag?: string): { literals: Set<string>; file: string } | null {
-  for (const file of walk(TS_ROOT, [".ts", ".svelte"])) {
+function tsUnion(name: string, tag?: string, root = TS_ROOT): { literals: Set<string>; file: string } | null {
+  for (const file of walk(root, [".ts", ".svelte"])) {
     const source = readFileSync(file, "utf8");
     if (!new RegExp(`\\btype\\s+${name}\\s*=`).test(source)) continue;
-    const script = file.endsWith(".svelte")
-      ? [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]).join("\n")
-      : source;
+    let script = source;
+    if (file.endsWith(".svelte")) {
+      // Only Svelte's top-level module/instance scripts declare component
+      // types. Comments, nested markup and similarly named tags do not.
+      const component = parse(source, { modern: true, filename: file });
+      script = [component.module, component.instance].flatMap((block) => {
+        if (!block) return [];
+        const content = block.content;
+        if (!("start" in content) || typeof content.start !== "number"
+          || !("end" in content) || typeof content.end !== "number") {
+          throw new Error(`Missing Svelte script source span in ${file}`);
+        }
+        return [source.slice(content.start, content.end)];
+      }).join("\n");
+    }
     const literals = typeAliasLiterals(script, name, tag);
     if (literals === null) continue;
     return {
       literals,
-      file: path.relative(TS_ROOT, file),
+      file: path.relative(root, file),
     };
   }
   return null;
 }
+
+describe("Svelte enum contract extraction", () => {
+  it.each([
+    { name: "plain TypeScript", file: "Choice.ts", source: `type Choice = "Unit";`, expected: ["Unit"] },
+    { name: "instance script", source: `<script lang="ts">type Choice = "Unit";</script>`, expected: ["Unit"] },
+    { name: "module and instance aliases", source: `<script module lang="ts">type Base = "Unit";</script>
+      <script lang="ts">type Choice = Base | "Other";</script>`, expected: ["Other", "Unit"] },
+    { name: "quoted greater-than attribute", source: `<script lang="ts" data-note="a > b">type Choice = "Unit";</script>`, expected: ["Unit"] },
+    { name: "closing-tag whitespace", source: `<script lang="ts">type Choice = "Unit";</script >`, expected: ["Unit"] },
+    { name: "commented-out script", source: `<!-- <script lang="ts">type Choice = "Fake";</script> -->`, expected: null },
+    { name: "comment after a real script", source: `<script lang="ts">type Choice = "Unit";</script>
+      <!-- <script lang="ts">type Choice = "Fake";</script> -->`, expected: ["Unit"] },
+    { name: "nested script in markup", source: `<div><script>type Choice = "Fake";</script></div>`, expected: null },
+    { name: "uppercase component, not a Svelte script", source: `<SCRIPT>type Choice = "Fake";</SCRIPT>`, expected: null },
+    { name: "similarly named element", source: `<script-example>type Choice = "Fake";</script-example>`, expected: null },
+    { name: "no script", source: `<p>type Choice = "Fake";</p>`, expected: null },
+    { name: "empty component", source: "", expected: null },
+  ])("reads $name using component syntax", ({ file = "Choice.svelte", source, expected }) => {
+    const root = mkdtempSync(path.join(tmpdir(), "gitpulse-enum-contract-"));
+    try {
+      writeFileSync(path.join(root, file), source);
+      const result = tsUnion("Choice", undefined, root);
+      expect(result ? [...result.literals].sort() : null).toEqual(expected);
+      if (result) expect(result.file).toBe(file);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports malformed components instead of silently skipping their enum", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "gitpulse-enum-contract-"));
+    try {
+      writeFileSync(path.join(root, "Choice.svelte"), `<script lang="ts">type Choice = "Unit";`);
+      expect(() => tsUnion("Choice", undefined, root)).toThrow(/left open/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("serde enum variants match their TypeScript unions", () => {
   const enums = rustEnums();
