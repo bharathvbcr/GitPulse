@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [main, master, develop, codex/gitpulse-schema20-qualification-20260909]
   pull_request:
     branches: [main, master, develop]
 

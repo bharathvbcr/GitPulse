@@ -246,7 +246,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "b5d95033a554d19db502b69c394072c8ce066c3c"
+        "commit": "d9678f331be6e65b271701addfe38a1a4c3e8517"
       },
       "omitted": [
         "tests/",
