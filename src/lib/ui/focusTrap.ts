@@ -5,8 +5,8 @@ export interface FocusableProbe {
 
 /**
  * Elements that can receive keyboard focus, in the order Tab would visit
- * them. `[tabindex="-1"]` is excluded (programmatically focusable only) and
- * `disabled` form controls are excluded at the selector level.
+ * them. Disabled controls are excluded here; enumeration filters negative
+ * tab indices even when a native control matches another selector below.
  */
 export const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -43,6 +43,7 @@ export function enumerateFocusables<T extends FocusableProbe>(
   const candidates = container.querySelectorAll(FOCUSABLE_SELECTOR);
   for (let i = 0; i < candidates.length; i += 1) {
     const candidate = candidates[i];
+    if (Number.parseInt(candidate.getAttribute("tabindex") ?? "", 10) < 0) continue;
     if (!isHiddenFromTabOrder(candidate)) found.push(candidate);
   }
   return found;

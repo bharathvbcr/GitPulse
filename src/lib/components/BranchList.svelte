@@ -9,6 +9,8 @@
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
+  import { mergeRef, type MergeRequest } from "../branches/mergeSelection";
+  import MergeBranchDialog from "./MergeBranchDialog.svelte";
   import { enumerateFocusables } from "../ui/focusTrap";
   import {
     branchLeafName,
@@ -102,6 +104,7 @@
   let openerEl: HTMLElement | null = null;
   /** Roving index among [role=menuitem] children for arrow-key cycling. */
   let menuIndex = $state(-1);
+  let mergeRequest = $state<MergeRequest | null>(null);
 
   let containerEl: HTMLDivElement | undefined = $state();
   let chipScroller: HTMLDivElement | undefined = $state();
@@ -312,6 +315,9 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    // Native buttons own Enter/Space. The list must not turn a copy or merge
+    // click into history selection just because a row was previously selected.
+    if (e.target instanceof HTMLButtonElement && (e.key === "Enter" || e.key === " ")) return;
     if (e.key === "Escape") {
       if (query || menu) {
         e.preventDefault();
@@ -520,15 +526,24 @@
   }
 
   async function copyText(value: string) {
+    closeMenu({ restoreFocus: true });
     if (!(await copyToClipboard(value))) {
       repoStore.setError("Could not copy to clipboard");
+    } else {
+      toastStore.success(`Copied ${value}`);
     }
-    closeMenu();
   }
 
-  async function runMerge(branch: BranchInfo, ffOnly: boolean) {
-    closeMenu();
-    await repoStore.mergeBranch(localNameFor(branch), ffOnly);
+  function runMerge(branch?: BranchInfo, ffOnly = false) {
+    closeMenu({ restoreFocus: true });
+    const repoPath = $repoStore.currentPath;
+    if (!repoPath) return;
+    mergeRequest = {
+      repoPath,
+      targetBranch: $repoStore.currentBranch,
+      sourceRef: branch ? mergeRef(branch) : "",
+      ffOnly,
+    };
   }
 
   async function runCreateTag(at?: { name: string; commitId: string }) {
@@ -757,6 +772,13 @@
       type="button"
       onclick={() => selectRef(branch.name)}
       ondblclick={() => checkoutName(localNameFor(branch))}
+      onkeydown={(event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          event.preventDefault();
+          event.stopPropagation();
+          checkoutName(localNameFor(branch));
+        }
+      }}
       oncontextmenu={(e) => openBranchMenu(e, branch)}
       title={branchTooltip(branch, undefined, $interfaceStore.timestampStyle)}
       class="flex-1 min-w-0 flex items-center gap-1.5 text-left truncate"
@@ -801,6 +823,13 @@
       {#if branch.is_current}
         <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shadow-xs shrink-0"></span>
       {/if}
+      <button
+        type="button"
+        class="p-1 rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0"
+        onclick={() => void copyText(branch.name)}
+        title="Copy branch name"
+        aria-label="Copy branch name {branch.name}"
+      ><Copy size={12} /></button>
       <button
         type="button"
         class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
@@ -964,6 +993,12 @@
     </div>
   </div>
 
+  <div class="px-1 {gapBand}">
+    <button type="button" class="gp-btn w-full justify-center gap-1.5" aria-label="Merge branches" disabled={!$repoStore.currentPath} onclick={() => runMerge()}>
+      <GitMerge size={13} /> Merge…
+    </button>
+  </div>
+
   {#if $repoStore.tagsFailed}
     <!-- An unreadable tag list must not render as "no tags". -->
     <p class="px-2 {gapBand} flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
@@ -1122,6 +1157,10 @@
   </div>
 </div>
 
+{#if mergeRequest}
+  <MergeBranchDialog request={mergeRequest} onClose={() => { mergeRequest = null; }} />
+{/if}
+
 {#if menu}
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
   <!-- Justified: `menu` is an interactive role the rule does not model. The
@@ -1149,10 +1188,10 @@
           <GitBranch size={12} /> Checkout
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, false)}>
-          <GitMerge size={12} /> Merge into current
+          <GitMerge size={12} /> Merge into current…
         </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, true)}>
-          <GitMerge size={12} /> Fast-forward merge
+          <GitMerge size={12} /> Fast-forward merge…
         </button>
       {/if}
       <button role="menuitem" class="gp-menu-item" onclick={() => void runCompare(b)}>

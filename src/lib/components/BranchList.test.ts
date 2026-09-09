@@ -11,6 +11,11 @@ const source = readFileSync(
 );
 
 describe("BranchList", () => {
+  it("offers a visible merge picker without opening a branch menu", () => {
+    const { body } = render(BranchList);
+    expect(body).toContain('aria-label="Merge branches"');
+  });
+
   it("labels the create-branch button for screen readers", () => {
     const { body } = render(BranchList);
     expect(body).toContain('aria-label="Create branch"');

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitPulse · Branch merge preview</title>
+<style>html,body{margin:0;height:100%}body{background:var(--color-background);color:var(--color-textPrimary);font:13px system-ui}main{display:flex;height:100%;gap:36px}#sidebar{width:320px;flex-shrink:0;padding:18px 8px;box-sizing:border-box;background:var(--color-surface)}article{padding:40px 20px;max-width:440px}article h1{font-size:26px}article p{line-height:1.7;color:var(--color-textMuted)}#verdict{position:fixed;bottom:4px;right:6px;z-index:100;font:11px system-ui;background:#132b25;color:#a7f3d0;padding:4px 8px;border-radius:6px}#verdict:empty{display:none}</style></head>
+<body><main><div id="sidebar"></div><article><h1>Branch merging</h1><p>Copy a full branch name from the sidebar, or choose Merge to review a local or remote source and its destination. Branch actions also open the review with a source selected.</p><p>This preview uses fixture repositories. Merge actions here do not change a real repository.</p></article></main><div id="toasts"></div><output id="verdict"></output>
+<script type="module">
+import "../src/app.css";
+import { mount, tick } from "svelte";
+import { get } from "svelte/store";
+import { themeStore } from "../src/lib/stores/themeStore";
+import { repoStore } from "../src/lib/stores/repoStore";
+import { filterStore } from "../src/lib/stores/filterStore";
+import { toastStore } from "../src/lib/stores/toastStore";
+import BranchList from "../src/lib/components/BranchList.svelte";
+import ToastContainer from "../src/lib/components/ToastContainer.svelte";
+const params = new URLSearchParams(location.search);
+themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+const results = [], crashes = [], merges = [], copies = [], unexpected = [];
+let current = "main", failMerge = false, pendingMerge = null, operation = null, probeFailed = false, copyFailed = false;
+const branch = (name, remote = false) => ({name, is_current: name === current && !remote, is_remote: remote, remote_name: remote ? name.split("/")[0] : null, tip_commit_id: "abc123456789", ahead_count: 0, behind_count: 0, is_default: name === "main", is_gone: false, last_commit_timestamp: Date.now()/1000, last_author: "Alex", last_summary: "Refine branch interactions", commits_ahead_of_base: 0, commits_behind_base: 0, additions: 0, deletions: 0, files_changed: 0});
+const names = ["main", "feature/branch-selection", "feature/keyboard-navigation", "release/0.0.9"];
+let branches = [...names.map(n => branch(n)), branch("origin/feature/branch-selection", true), branch("upstream/main", true), branch("origin/HEAD", true)];
+const fixture = {
+  cmd_resolve_repo: a => ({path:a.path,name:"GitPulse",is_bare:false}),
+  cmd_list_branches: () => branches.map(b => ({...b,is_current:!b.is_remote&&b.name===current})),
+  cmd_get_status: () => operation ? [{path:"conflict.txt",status_code:"UU",is_staged:false,is_conflicted:true,additions:0,deletions:0}] : [],
+  cmd_list_tags: () => ({tags:[],truncated:false}), cmd_stash_list: () => [],
+  cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_list_repo_files: () => [],
+  cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
+  cmd_set_recent_menu: () => null, cmd_workspace_sync: () => ({repos:[]}),
+  cmd_provenance_freshness_batch: a => a.revisions.map(commit_sha=>({commit_sha,distance:null,confidence:null,is_fresh:false,unmeasured_reason:"Fixture",notes_readable:true,verification:null,session:null})),
+  cmd_branch_stats: () => ({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
+  cmd_repo_operation: () => {if(probeFailed)throw Error("Fixture probe failed");return operation;},
+  cmd_merge_branch: async a => {merges.push(a);if(pendingMerge)await new Promise(resolve => {pendingMerge(resolve);});if(failMerge)throw Error("Fixture merge failed");return "Merged";},
+};
+window.__TAURI_INTERNALS__ = {invoke:async(cmd,args) => {if(fixture[cmd])return fixture[cmd](args);if(cmd.startsWith("plugin:event|"))return 1;unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
+if(params.has("check")) {
+  Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{if(copyFailed)throw Error("Fixture clipboard denied");copies.push(text);}}});
+  document.execCommand = () => false;
+}
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const settle = async () => {await tick();await new Promise(resolve=>{const channel=new MessageChannel();channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};channel.port2.postMessage(null);});await tick();};
+const waitFor = async test => {for(let i=0;i<100;i++){await settle();if(test())return;}throw Error("Timed out waiting for UI");};
+const button = name => [...document.querySelectorAll("button")].find(b=>b.textContent.trim()===name||b.getAttribute("aria-label")===name);
+const click = async name => {const b=button(name);if(!b)throw Error(`Missing button: ${name}`);if(b.disabled)throw Error(`Disabled button: ${name}`);b.focus();b.click();await settle();};
+const search = async text => {const input=document.querySelector("#merge-branch-search");input.value=text;input.dispatchEvent(new Event("input",{bubbles:true}));await settle();};
+const check = (name,pass) => results.push({name,pass:Boolean(pass)});
+const dialog = () => document.querySelector('[role="dialog"]');
+await repoStore.openRepo("/fixture/branches");
+mount(BranchList,{target:document.getElementById("sidebar")});
+mount(ToastContainer,{target:document.getElementById("toasts")});
+await settle();
+if(params.has("check")) {
+  try {
+    check("visible merge entry point",button("Merge branches"));
+    await click("Copy branch name feature/branch-selection");
+    check("copy preserves full branch path",copies.at(-1)==="feature/branch-selection");
+    check("copy success is announced",get(toastStore).some(t=>t.message==="Copied feature/branch-selection"));
+    check("copy leaves history filter unchanged",get(filterStore).selectedBranch===null);
+    document.querySelector('[role="tree"]').dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}));
+    const copyKey=new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true});
+    button("Copy branch name main").dispatchEvent(copyKey);
+    check("row navigation does not consume copy button activation",!copyKey.defaultPrevented);
+    copyFailed=true;await click("Copy branch name main");
+    check("copy denial is reported",get(repoStore).error==="Could not copy to clipboard");
+    copyFailed=false;repoStore.setError(null);
+    const sourceRow=[...document.querySelectorAll("button")].find(b=>b.title.startsWith("feature/branch-selection\n"));
+    sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
+    await click("Fast-forward merge…");
+    check("context menu opens review without merging",merges.length===0&&dialog());
+    check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[type="checkbox"]').checked);
+    await click("Cancel");
+    await click("Merge branches");
+    check("picker opens without mutating",dialog()&&merges.length===0);
+    check("search receives initial focus",document.activeElement?.id==="merge-branch-search");
+    check("merge starts disabled",button("Merge branch").disabled);
+    check("source choices announce single selection",document.querySelector('[role="radiogroup"][aria-label="Source branches"]'));
+    check("source choices occupy one Tab stop",[...document.querySelectorAll('[data-merge-choice]')].filter(choice=>choice.tabIndex===0).length===1);
+    check("branch origin filters are discoverable",button("Local branches")&&button("Remote branches"));
+    button("Cancel").focus();button("Cancel").dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true}));await settle();
+    check("Tab wraps around disabled submit within the dialog",document.activeElement===button("Close merge dialog"));
+    document.querySelector("#merge-branch-search").focus();
+    check("destination is explicit",dialog().textContent.includes("Into current")&&dialog().textContent.includes("main"));
+    check("current and remote HEAD excluded",!button("Select local branch main")&&!button("Select remote branch origin/HEAD"));
+    await click("Local branches");
+    check("local filter excludes remote choices",document.querySelectorAll('[data-merge-choice]').length===3&&!button("Select remote branch upstream/main"));
+    await click("Select local branch feature/branch-selection");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
+    check("arrow navigation selects exactly one source",button("Select local branch feature/keyboard-navigation").getAttribute("aria-checked")==="true"&&document.querySelectorAll('[role="radio"][aria-checked="true"]').length===1);
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true}));await settle();
+    check("Tab leaves the entire branch list for merge options",document.activeElement===dialog().querySelector('input[type="checkbox"]'));
+    document.querySelector("#merge-branch-search").focus();document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
+    check("search reenters the selected radio",document.activeElement===button("Select local branch feature/keyboard-navigation"));
+    await click("Remote branches");
+    check("remote filter preserves and explains a hidden selection",document.querySelectorAll('[data-merge-choice]').length===2&&dialog().textContent.includes("outside these results")&&!button("Merge branch").disabled);
+    await click("Show selected");
+    check("show selected reveals and focuses the exact source",document.activeElement===button("Select local branch feature/keyboard-navigation")&&document.querySelectorAll('[data-merge-choice]').length===1);
+    await click("Clear selected branch");
+    check("clear selection disables merging and restores search focus",button("Merge branch").disabled&&document.activeElement?.id==="merge-branch-search");
+    await search("missing");await click("Reset filters");
+    check("reset filters recovers every eligible branch",document.querySelectorAll('[data-merge-choice]').length===5&&button("All branches").getAttribute("aria-pressed")==="true");
+    await search("ORIGIN/FEATURE");
+    check("search includes full remote path",document.querySelectorAll("[data-merge-choice]").length===1);
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}));await settle();
+    check("arrow key enters branch choices",document.activeElement?.hasAttribute("data-merge-choice"));
+    await click("Select remote branch origin/feature/branch-selection");
+    check("selection is explicit and enables merge",button("Select remote branch origin/feature/branch-selection").getAttribute("aria-checked")==="true"&&!button("Merge branch").disabled);
+    const checkbox=dialog().querySelector('input[type="checkbox"]');checkbox.click();await settle();
+    await click("Merge branch");await waitFor(()=>!dialog());
+    check("remote identity survives the merge IPC",merges.at(-1).branchName==="refs/remotes/origin/feature/branch-selection");
+    check("fast-forward setting is preserved",merges.at(-1).ffOnly===true);
+    check("success identifies source and destination",get(toastStore).some(t=>t.message==="Merged origin/feature/branch-selection into main"));
+    await click("Merge branches");await search("no-match");
+    check("empty search has recovery copy",dialog().textContent.includes("No branches match"));
+    await click("Clear merge search");
+    await click("Select local branch feature/keyboard-navigation");
+    branches=branches.filter(b=>b.name!=="feature/keyboard-navigation");await repoStore.refresh();await settle();
+    check("deleted selection blocks merge",button("Merge branch").disabled&&dialog().textContent.includes("no longer available"));
+    await click("Select local branch feature/branch-selection");
+    current="release/0.0.9";await repoStore.refresh();await settle();
+    check("changed destination requires review",button("Merge branch").disabled&&dialog().textContent.includes("checked-out branch changed"));
+    await click("Cancel");current="main";await repoStore.refresh();await settle();
+    await click("Merge branches");await click("Select local branch feature/branch-selection");
+    let finish;pendingMerge=resolve=>finish=resolve;
+    await click("Merge branch");await waitFor(()=>finish);
+    check("pending merge locks submission and cancellation",button("Merging…").disabled&&button("Cancel").disabled);
+    dialog().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}));await settle();
+    check("pending merge cannot be dismissed with Escape",dialog());
+    pendingMerge=null;finish();await waitFor(()=>!dialog());
+    check("local identity is fully qualified",merges.at(-1).branchName==="refs/heads/feature/branch-selection");
+    await click("Merge branches");await click("Select local branch feature/branch-selection");failMerge=true;
+    await click("Merge branch");await waitFor(()=>dialog()?.textContent.includes("Fixture merge failed")&&!button("Merge branch").disabled);
+    check("failure retains selection and allows retry",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true");
+    operation={kind:"Merge",current_step:null,total_steps:null,head_ref:"main",incoming_ref:"topic",conflicted_paths:["conflict.txt"],conflicted_total:1,available:["abort"]};
+    await click("Merge branch");await waitFor(()=>button("Resolve conflicts"));
+    check("conflicts prevent a second merge",button("Merge branch").disabled);
+    await click("Resolve conflicts");
+    check("conflict recovery opens Work Resolve",!dialog()&&get(repoStore).activeTab==="work"&&get(repoStore).viewSections.work==="resolve");
+    operation=null;failMerge=false;await repoStore.refresh();await settle();
+    await click("Merge branches");await click("Select local branch feature/branch-selection");
+    await repoStore.openRepo("/fixture/other");await settle();
+    check("repository switching invalidates review",button("Merge branch").disabled&&dialog().textContent.includes("repository changed"));
+    await click("Cancel");
+    probeFailed=true;await repoStore.refresh();await settle();await click("Merge branches");
+    check("unavailable operation check is not idle",dialog().textContent.includes("Could not check for an operation"));
+    await click("Cancel");probeFailed=false;current=null;await repoStore.refresh();await settle();await click("Merge branches");
+    check("detached HEAD explains the required action",dialog().textContent.includes("Check out a local branch")&&button("Merge branch").disabled);
+    await click("Cancel");current="main";branches=[branch("main")];await repoStore.refresh();await settle();await click("Merge branches");
+    check("no eligible branches has an honest empty state",dialog().textContent.includes("No other branches are available")&&button("Merge branch").disabled);
+    await click("Cancel");branches=[branch("main"),...Array.from({length:105},(_,i)=>branch(`topic/${String(i).padStart(3,"0")}`))];await repoStore.refresh();await settle();await click("Merge branches");
+    check("large list states shown and total counts",dialog().textContent.includes("Showing 100 of 105")&&document.querySelectorAll("[data-merge-choice]").length===100);
+    await search("topic/104");check("search reaches beyond the displayed cap",button("Select local branch topic/104"));
+    await click("Select local branch topic/104");await click("Clear merge search");
+    check("selection beyond the cap remains explicit",dialog().textContent.includes("outside these results"));
+    await click("Show selected");
+    check("show selected reaches a branch beyond the cap",button("Select local branch topic/104").getAttribute("aria-checked")==="true"&&document.activeElement===button("Select local branch topic/104"));
+    await click("Cancel");
+    check("dismissal restores the merge opener",document.activeElement===button("Merge branches"));
+    check("no uncaught runtime errors",crashes.length===0);
+    check("all IPC calls have explicit fixtures",unexpected.length===0);
+  } catch(error) { results.push({name:String(error),pass:false}); }
+  const result={results,passed:results.filter(r=>r.pass).length,total:results.length,crashes,unexpected};
+  document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+  document.getElementById("verdict").textContent=`${result.passed}/${result.total} checks passed`;
+  if(params.has("report"))await fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML});
+}
+</script></body></html>
