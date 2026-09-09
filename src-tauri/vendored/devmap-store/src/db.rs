@@ -8715,6 +8715,8 @@ mod bounded_claim_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lock_path = dir.join("index.sqlite.writer.lock");
         std::fs::write(&lock_path, "4242\n").unwrap();
+        #[cfg(windows)]
+        std::fs::write(lock_path.with_extension("lock.owner"), "4242\n").unwrap();
 
         let mut attempts = 0usize;
         let started = std::time::Instant::now();

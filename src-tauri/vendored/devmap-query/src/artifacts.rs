@@ -52,12 +52,37 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         let mut file = fs::File::create(&tmp)?;
         file.write_all(content)?;
         file.sync_all()?;
+        drop(file);
         if path.exists() {
             let existing = fs::read(path)?;
             if existing == content {
                 return Ok(false);
             }
         }
+        // Windows can transiently deny replacement while another publisher is
+        // completing its rename. Retry only that sharing/permission class,
+        // within both a deadline and an attempt cap; leave the old file intact.
+        #[cfg(windows)]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut attempts = 0;
+            loop {
+                match fs::rename(&tmp, path) {
+                    Ok(()) => break,
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(error.raw_os_error(), Some(32 | 33)))
+                            && attempts < 100
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        #[cfg(not(windows))]
         fs::rename(&tmp, path)?;
         Ok(true)
     })();
