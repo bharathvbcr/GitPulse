@@ -169,6 +169,7 @@ export const CONTRACTS = Object.freeze([
   { label: "submodules", rustPath: rust("engine", "submodules.rs"), tsPath: ts("repos", "submodules.ts"), structs: ["SubmoduleInfo", "SubmoduleList"] },
   // Events are a second wire surface: emitted payloads, not command returns.
   { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload"] },
+  { label: "native-menu-state", rustPath: rust("desktop", "state.rs"), tsPath: ts("desktop", "menuState.ts"), structs: ["MenuState", "MenuLabel", "MenuRepository", "StatusCard"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },
   { label: "provenance", rustPath: rust("engine", "provenance.rs"), tsPath: ts("provenance", "types.ts"), structs: ["VerificationNote", "SessionEpisodeNote", "ProvenanceFreshness"] },

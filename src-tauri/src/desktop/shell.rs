@@ -119,6 +119,15 @@ pub fn cmd_reveal_worktree_path(
         .map_err(|e| format!("Could not reveal {relative}: {e}"))
 }
 
+/// Reveal the canonical repository root, including linked worktrees and bare repositories.
+#[tauri::command(async)]
+pub fn cmd_reveal_repository(app: AppHandle, repo: String) -> Result<(), String> {
+    let resolved = crate::engine::resolve_repo(&repo)?;
+    app.opener()
+        .reveal_item_in_dir(std::path::Path::new(&resolved.path))
+        .map_err(|error| format!("Could not reveal repository: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

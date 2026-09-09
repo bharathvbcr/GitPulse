@@ -609,6 +609,15 @@
                 </div>
               {:else if entry.id === "layout"}
                 <div class="space-y-4">
+                  <div data-setting="status-icon" hidden={!shown("status-icon")}>
+                    <SettingToggle
+                      label="Menu bar status icon"
+                      description="Show repository status while GitPulse is in the background. Closing the window hides it; use Quit to exit."
+                      ariaLabel="Show menu bar status icon"
+                      checked={$interfaceStore.showStatusIcon}
+                      onchange={(next) => interfaceStore.setShowStatusIcon(next)}
+                    />
+                  </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
                     <div class="text-textMuted text-[10px] mb-1.5">Status bar</div>
                     <SettingSegment

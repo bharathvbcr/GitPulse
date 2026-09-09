@@ -1432,6 +1432,29 @@ describe("repoStore diff selection", () => {
     expect(calls).toEqual(["stage", "unstage"]);
   });
 
+  it.each([false, true])("bulk staging stays on its originating repository (staged=%s)", async (is_staged) => {
+    const first = deferred<unknown>();
+    const paths: string[] = [];
+    const mutate: InvokeFn = async (_cmd, args) => {
+      paths.push(String(args?.repoPath));
+      if (paths.length === 1) await first.promise;
+      return undefined as never;
+    };
+    const { store } = makeStore(makeInvoke({
+      cmd_get_status: async () => ["a.ts", "b.ts"].map((path) => ({
+        path, status_code: "M", is_staged, is_conflicted: false, additions: 1, deletions: 0,
+      })) as never,
+      cmd_stage_file: mutate,
+      cmd_unstage_file: mutate,
+    }));
+    await store.openRepo("/r/origin");
+    const batch = is_staged ? store.unstageAll() : store.stageAll();
+    await store.openRepo("/r/other");
+    first.resolve(undefined);
+    expect((await batch).ok).toBe(true);
+    expect(paths).toEqual(["/r/origin", "/r/origin"]);
+  });
+
   it("stageAll and unstageAll walk the current status lists", async () => {
     const staged: string[] = [];
     const unstaged: string[] = [];
@@ -1456,6 +1479,48 @@ describe("repoStore diff selection", () => {
     expect(staged).toEqual(["a.ts"]);
     await store.unstageAll();
     expect(unstaged).toEqual(["b.ts"]);
+  });
+
+  it("bulk activity lasts through the final refresh and is counted once", async () => {
+    const refreshed = deferred<unknown>();
+    let mutated = false;
+    const { store } = makeStore(makeInvoke({
+      cmd_stage_file: async () => { mutated = true; return undefined as never; },
+      cmd_get_status: async () => {
+        if (mutated) await refreshed.promise;
+        return snapshotFor("/r/batch").statuses as never;
+      },
+    }));
+    await store.openRepo("/r/batch");
+    const work = store.stageAll();
+    await vi.waitFor(() => expect(mutated).toBe(true));
+    expect(get(store.mutationActivity)).toEqual({ "/r/batch": ["stage-all"] });
+    refreshed.resolve(undefined); await work;
+    expect(get(store.mutationActivity)).toEqual({});
+  });
+
+  it("interactive rebase uses the same policy outcome and activity owner", async () => {
+    const result = deferred<unknown>();
+    const { store } = makeStore(makeInvoke({ cmd_rebase_interactive: async () => { await result.promise; throw new Error("Rebase blocked"); } }));
+    await store.openRepo("/r/rebase");
+    const work = store.rebaseInteractive("main", [{ commit_id: "a".repeat(40), action: "Pick" }]);
+    expect(get(store.mutationActivity)).toEqual({ "/r/rebase": ["rebase"] });
+    result.resolve(undefined);
+    expect(await work).toMatchObject({ ok: false, error: "Rebase blocked" });
+    expect(get(store.mutationActivity)).toEqual({});
+  });
+
+  it("clear recents persists the empty list while retaining open and recently closed tabs", async () => {
+    const storage = memoryStorage();
+    const store = createRepoStore({ invoke: makeInvoke(), storage, graph: makeGraph().api, filter: makeFilter() });
+    await store.openRepo("/r/a"); await store.openRepo("/r/b");
+    await store.closeActiveTab();
+    const before = get(store);
+    store.clearRecents();
+    expect(get(store).recentRepos).toEqual([]);
+    expect(get(store).openTabs).toEqual(before.openTabs);
+    expect(get(store).lastClosed).toEqual(before.lastClosed);
+    expect(JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}").recents).toEqual([]);
   });
 
   it("quickCommit invokes cmd_quick_commit rather than stage-then-commit", async () => {

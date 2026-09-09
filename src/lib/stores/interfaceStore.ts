@@ -79,6 +79,8 @@ export interface InterfacePrefs {
   showHeaderActionLabels: boolean;
   /** Drop the repository tab strip while a single repository is open. */
   autoHideRepoTabs: boolean;
+  /** Keep a status icon available; closing the window hides it while enabled. */
+  showStatusIcon: boolean;
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
   /**
@@ -169,6 +171,7 @@ const DEFAULTS: InterfacePrefs = {
   statusBarMode: "full",
   showHeaderActionLabels: true,
   autoHideRepoTabs: false,
+  showStatusIcon: false,
   diagnosticsButton: "always",
   fleetOpen: false,
   fleetPulseOpen: true,
@@ -281,6 +284,7 @@ function readPrefs(): InterfacePrefs {
         DEFAULTS.showHeaderActionLabels,
       ),
       autoHideRepoTabs: bool(parsed.autoHideRepoTabs, DEFAULTS.autoHideRepoTabs),
+      showStatusIcon: parsed.showStatusIcon === true,
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
@@ -385,6 +389,7 @@ function createInterfaceStore() {
       patch((prefs) => ({ showGraphAvatars: !prefs.showGraphAvatars })),
     setStatusBarMode: (mode: StatusBarMode) => patch({ statusBarMode: mode }),
     setShowHeaderActionLabels: (show: boolean) => patch({ showHeaderActionLabels: show }),
+    setShowStatusIcon: (show: boolean) => patch({ showStatusIcon: show }),
     setAutoHideRepoTabs: (hide: boolean) => patch({ autoHideRepoTabs: hide }),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),

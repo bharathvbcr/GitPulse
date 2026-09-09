@@ -72,6 +72,7 @@ function applyWithTransition(theme: Theme) {
 
 export function createThemeStore() {
   let preference = readPreference();
+  const preferenceState = writable<ThemePreference>(preference);
   const initial = preference === "system" ? systemTheme() : preference;
   // First paint applies directly — there is nothing to crossfade from.
   applyResolved(initial);
@@ -85,6 +86,7 @@ export function createThemeStore() {
 
   function apply(nextPreference: ThemePreference) {
     preference = nextPreference;
+    preferenceState.set(preference);
     // Only an explicit user selection is durable; OS flips re-resolve at
     // runtime through the listener below instead of rewriting "system" on
     // every event.
@@ -109,6 +111,7 @@ export function createThemeStore() {
 
   return {
     subscribe,
+    preferenceState: { subscribe: preferenceState.subscribe },
     toggle: () => {
       const current = preference === "system" ? systemTheme() : preference;
       apply(current === "dark" ? "light" : "dark");

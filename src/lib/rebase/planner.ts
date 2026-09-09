@@ -2,6 +2,11 @@ import type { VisualCommitRow } from "../canvas/GraphRenderer";
 
 export type PlannerAction = "Pick" | "Squash" | "Fixup" | "Drop" | "Reword";
 
+export interface RebaseStep {
+  commit_id: string;
+  action: "Pick" | "Squash" | "Fixup" | "Drop" | { Reword: string };
+}
+
 export interface PlannerItem {
   id: string;
   action: PlannerAction;

@@ -32,6 +32,27 @@ const menu = readFileSync(new URL("../src-tauri/src/desktop/menu.rs", import.met
  */
 const MENU_VIEWS = REGISTERED_VIEWS;
 
+describe("native section menus match the frontend registry", () => {
+  it("lists every destination exactly once, with the same label", () => {
+    const entries = [...actions.matchAll(/\("(section:[^\"]+)", "([^\"]+)"\)/g)]
+      .map((match) => [match[1], match[2]]);
+    const expected = REGISTERED_VIEWS.flatMap((view) =>
+      (view.sections ?? []).map((section) => [`section:${view.id}:${section.id}`, section.label]),
+    );
+    expect(expected).toHaveLength(15);
+    expect(entries.sort()).toEqual(expected.sort());
+    expect(menu).toContain("actions::SECTION_MENUS");
+  });
+
+  it("exposes all Help and zoom actions in the built menu", () => {
+    for (const name of ["SHORTCUTS", "DIAGNOSTICS", "DOCUMENTATION", "RELEASE_NOTES",
+      "REPORT_ISSUE", "SETUP_TOOLS", "ZOOM_IN", "ZOOM_OUT", "RESET_ZOOM"]) {
+      expect(menu).toContain(`actions::${name}`);
+      expect(actions).toContain(`${name} => Self::`);
+    }
+  });
+});
+
 describe("native menu covers every registered view", () => {
   it("has views to check", () => {
     // Guards the loop below against passing vacuously.

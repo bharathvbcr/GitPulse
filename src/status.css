@@ -1,0 +1,5 @@
+html,body { margin:0; padding:0; background:transparent; }
+body { overflow:hidden; }
+*,*::before,*::after { box-sizing:border-box; }
+#status-root { max-height:100vh; overflow:auto; }
+button { -webkit-tap-highlight-color:transparent; }

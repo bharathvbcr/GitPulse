@@ -151,6 +151,7 @@ export default defineConfig({
   build: {
     sourcemap: "hidden",
     rollupOptions: {
+      input: { main: "index.html", status: "status.html" },
       output: {
         manualChunks: gitpulseManualChunk,
       },

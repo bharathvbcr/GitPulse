@@ -14,6 +14,14 @@ describe("interfaceStore", () => {
     expect(prefs.showHarnessBadges).toBe(true);
   });
 
+  it("status icon is opt-in and resets with interface preferences", () => {
+    expect(get(interfaceStore).showStatusIcon).toBe(false);
+    interfaceStore.setShowStatusIcon(true);
+    expect(get(interfaceStore).showStatusIcon).toBe(true);
+    interfaceStore.reset();
+    expect(get(interfaceStore).showStatusIcon).toBe(false);
+  });
+
   it("hides and re-shows the language bar independently", () => {
     interfaceStore.setShowLanguageBar(false);
     expect(get(interfaceStore).showLanguageBar).toBe(false);

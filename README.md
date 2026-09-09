@@ -56,7 +56,7 @@ flowchart TB
 
     subgraph IPC["Tauri 2 IPC Boundary (Type-Safe & Contract-Checked)"]
         direction TB
-        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(187 Handlers verified by <code>npm run check:ipc</code>)</i>"]
+        IPCBridge["<code>invoke('cmd_*', payload)</code><br/><i>(193 Handlers verified by <code>npm run check:ipc</code>)</i>"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -104,7 +104,7 @@ flowchart LR
 
     subgraph Docked["⚙️ Docked & Workspace Surfaces"]
         Terminal["<b>Terminal</b> (<code>⌃`</code>)<br/>Native PTY, docked under the current view"]
-        Fleet["<b>Fleet</b> (<code>Shift+F10</code>)<br/>Every open repository at once — not a view"]
+        Fleet["<b>Fleet</b> (<code>Cmd/Ctrl+Shift+F</code>)<br/>Every open repository at once — not a view"]
         MCP["<b>MCP</b><br/>Read-only Agent Plugins tools"]
     end
 ```
@@ -134,7 +134,7 @@ command-palette entry, so no door was closed by the consolidation.
 | **Precision Diff Viewer** | File, commit, and range diffs that name what they show, in a true side-by-side or unified layout sharing one row model. Syntax colouring under the intra-line word diff, find-in-diff with regex, block-to-block stepping, both line-number columns behind a pinned gutter, a filterable and resizable file rail, image diff modes, natural-flow bounded word wrap, impact edge annotations, and selective patch staging from either layout. |
 | **3-Way Conflict Resolver** | Dedicated merge conflict editor with syntax highlighting, marker jumping, and instant ours/theirs/both resolution. |
 | **Worktree & Stack Manager** | Complete linked-worktree lifecycle (add, remove, lock, dirty counts) and stacked branch navigation. |
-| **Fleet Dashboard** | Workspace-wide grid (`Shift+F10`) covering every open repository and every recent one: changes, sync, conflicts, stash, worktrees, agent sessions and last activity live; lines of code, disk usage, dependency audits and coverage on demand, cached with their age. Every cell is a value, *not scanned*, or *could not read* — never a reassuring zero — and every total states what it could not count. |
+| **Fleet Dashboard** | Workspace-wide grid (`Cmd/Ctrl+Shift+F`) covering every open repository and every recent one: changes, sync, conflicts, stash, worktrees, agent sessions and last activity live; lines of code, disk usage, dependency audits and coverage on demand, cached with their age. Every cell is a value, *not scanned*, or *could not read* — never a reassuring zero — and every total states what it could not count. |
 | **Language Vector Logos & Path Scannability** | Zero-dependency vector logos for 34+ programming languages, configs, and markups across the file tree, editor tabs, diff toolbar, and dashboard, with dimmed path hierarchy for scannable file lists. |
 
 ### 🛡️ Code Intelligence & Auditing
@@ -268,7 +268,7 @@ npm run tauri dev
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
 | `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
-| `npm run check:ipc` | Verify 187 Rust commands match frontend `invoke()` calls with zero drift |
+| `npm run check:ipc` | Verify 193 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
 | `npm run check:release` | Assert every version manifest agrees (`package.json`, `Cargo.toml`, `tauri.conf.json`, and each discovered plugin manifest) |

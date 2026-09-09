@@ -56,6 +56,17 @@ function deps(
 }
 
 describe("promptQuickCommit", () => {
+  it("does not commit to another repository after the message dialog", async () => {
+    let current = state();
+    const d = deps({ getState: () => current, askMessage: async () => {
+      current = state({ currentPath: "/r/other" });
+      return "message for original repository";
+    } });
+    expect((await promptQuickCommit(d)).ok).toBe(false);
+    expect(d.commits).toEqual([]);
+    expect(d.drafts).toEqual([]);
+  });
+
   it("refuses when no repository is open, without prompting", async () => {
     const d = deps({
       getState: () => state({ currentPath: null, statuses: [] }),
