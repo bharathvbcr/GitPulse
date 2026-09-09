@@ -24,7 +24,7 @@ const actions = repo("src-tauri/src/desktop/actions.rs");
 const menu = repo("src-tauri/src/desktop/menu.rs");
 const nativeActions = repo("src/lib/desktop/nativeActions.ts");
 const tabBar = repo("src/lib/components/RepoTabBar.svelte");
-const palette = repo("src/lib/components/CommandPalette.svelte");
+const palette = repo("src/lib/components/CommandPalette.svelte") + repo("src/lib/palette/catalog.ts");
 const app = repo("src/App.svelte");
 const persist = repo("src/lib/repos/persist.ts");
 

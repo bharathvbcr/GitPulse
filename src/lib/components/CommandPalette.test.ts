@@ -3,10 +3,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const source = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "CommandPalette.svelte"),
-  "utf8",
-);
+// Commands and query behavior now live in the typed palette modules; preserve
+// these entry-point contracts across the component and its canonical owners.
+const source = ["CommandPalette.svelte", "../palette/catalog.ts", "../palette/model.ts"]
+  .map(path => readFileSync(join(dirname(fileURLToPath(import.meta.url)), path), "utf8")).join("\n");
 
 describe("CommandPalette", () => {
   it("lists Quick Commit as a command that prompts then commits all", () => {

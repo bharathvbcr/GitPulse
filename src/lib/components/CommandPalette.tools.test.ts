@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 
 describe("CommandPalette optional-tools entry points", () => {
-  const source = readFileSync(join(here, "CommandPalette.svelte"), "utf8");
+  const source = ["CommandPalette.svelte", "../palette/catalog.ts", "../palette/search.ts"]
+    .map(path => readFileSync(join(here, path), "utf8")).join("\n");
 
   it("distinguishes cannot-search from zero symbol hits", () => {
     expect(source).toContain("symbolSearchNote");

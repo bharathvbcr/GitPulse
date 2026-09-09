@@ -1,5 +1,17 @@
 # Runtime harness
 
+## Command palette
+
+Run `npm run test:browser -- --harness palette`, or
+`npm run test:webkit -- --harness palette` on macOS. The palette harness mounts the
+production palette and prompt components with explicit repository/code-intelligence
+fixtures. It tests help-mode transitions, stale responses, failed and partial
+searches, registry-resolved workspace navigation, file paging, keyboard/IME behavior,
+focus handoff, unavailable actions and duplicate execution. Missing completion and
+runtime errors fail the gate. Open `/harness/palette.html` on the development server
+for manual inspection; `?theme=light` selects light appearance. No Git mutation is
+performed by these fixtures. See `docs/COMMAND_PALETTE.md` for contracts and limits.
+
 ## Code diagnostics
 
 Run `npm run test:browser` for the automated Chrome gate, or
