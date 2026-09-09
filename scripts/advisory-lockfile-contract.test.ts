@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -12,8 +13,12 @@ import { describe, expect, it } from "vitest";
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const LOCK = readFileSync(join(REPO, "src-tauri", "Cargo.lock"), "utf8");
 const PKG = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
+  scripts: Record<string, string>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+};
+const NPM_LOCK = JSON.parse(readFileSync(join(REPO, "package-lock.json"), "utf8")) as {
+  packages: Record<string, { name?: string; version?: string }>;
 };
 
 function packageVersion(name: string): string | undefined {
@@ -44,8 +49,39 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
     expect(packageVersion("wry")).toMatch(/^0\.56\./);
   });
 
+  it("uses maintained GTK3 bindings and excludes both abandoned macro diagnostic crates", () => {
+    expect(packageVersion("gtk")).toMatch(/^0\.19\./);
+    expect(packageVersion("glib")).toMatch(/^0\.22\./);
+    for (const block of LOCK.split("[[package]]\n")) {
+      if (/^name = "glib"$/m.test(block)) {
+        expect(block).toMatch(/^version = "0\.22\./m);
+      }
+    }
+    expect(LOCK).not.toMatch(/^name = "proc-macro-error(?:2|-attr|-attr2)?"$/m);
+  });
+
   it("uses @lucide/svelte, not the deprecated lucide-svelte package", () => {
     expect(PKG.dependencies?.["@lucide/svelte"]).toBeDefined();
     expect(PKG.dependencies?.["lucide-svelte"]).toBeUndefined();
+  });
+
+  it("installs the refreshed Lucide release", () => {
+    expect(PKG.dependencies?.["@lucide/svelte"]).toBe("^1.43.0");
+    expect(NPM_LOCK.packages["node_modules/@lucide/svelte"]?.version).toBe("1.43.0");
+  });
+
+  it("runs stable TypeScript 7 while preserving the compiler API for Svelte and contracts", () => {
+    expect(PKG.devDependencies?.["@typescript/native-preview"]).toBeUndefined();
+    expect(NPM_LOCK.packages["node_modules/@typescript/native"]?.version).toBe("7.0.2");
+    expect(NPM_LOCK.packages["node_modules/typescript"]?.name).toBe("@typescript/typescript6");
+    expect(PKG.scripts.typecheck).toBe("node node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit");
+    // Run the actual installed CLI: a renamed dependency alone does not prove
+    // the check command selects the stable compiler instead of the old API.
+    const version = execFileSync(process.execPath, [join(REPO, "node_modules/@typescript/native/bin/tsc"), "--version"], {
+      cwd: REPO,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    expect(version.trim()).toBe("Version 7.0.2");
   });
 });

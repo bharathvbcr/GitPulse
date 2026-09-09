@@ -14,7 +14,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json && npm run typecheck",
-    "typecheck": "tsgo -p tsconfig.node.json --noEmit",
+    "typecheck": "node node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit",
     "check:ipc": "node scripts/check-ipc-contract.mjs",
     "check:types": "node scripts/check-coverage-types.mjs",
     "check:release": "node scripts/check-release-version.mjs",
@@ -34,7 +34,7 @@
     "test:webkit": "node scripts/browser-regressions.mjs --webkit"
   },
   "dependencies": {
-    "@lucide/svelte": "^1.42.0",
+    "@lucide/svelte": "^1.43.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-opener": "^2.5.5",
     "@xterm/addon-fit": "^0.11.0",
@@ -46,12 +46,12 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^26.5.0",
-    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@vitest/coverage-v8": "^5.0.0",
     "svelte": "^5.57.0",
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
-    "typescript": "~6.0.3",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vite": "^8.2.2",
     "vitest": "^5.0.0"
   }

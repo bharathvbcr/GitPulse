@@ -32,7 +32,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -141,4 +141,10 @@ jobs:
         # BINARY, so every later one -- the whole tests/ directory -- is
         # skipped and the job reports one failure when there may be several.
         # A suite that never ran must not read like a suite that passed.
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast -- --nocapture
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
+          else
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture
+          fi
