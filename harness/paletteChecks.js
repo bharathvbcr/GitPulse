@@ -112,7 +112,7 @@ if (params.has("check")) {
   await type("Create New Branch"); await key("Enter"); await waitFor(() => promptRoot.querySelector("input"));
   check("follow-on prompts receive focus after the palette closes", !input() && document.activeElement === promptRoot.querySelector("input"));
   await key("k", { metaKey: true }); check("the palette cannot cover an active prompt", !input());
-  cancelPrompt(); await new Promise(resolve => setTimeout(resolve, 100)); await open();
+  cancelPrompt(); await waitFor(() => !promptRoot.querySelector('[aria-modal="true"]')); await open(); await waitFor(input);
   check("cancelled prompts do not record command use", !Object.hasOwn(JSON.parse(localStorage.getItem(FRECENCY_KEY) ?? "{}"), "new_branch"));
   await type("?"); check("help is filtered by its search text", Boolean(option("Type #")));
   await type("?workspace"); check("help search narrows the mode list", Boolean(option("Type ::")) && !option("Type #"));

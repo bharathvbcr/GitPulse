@@ -262,7 +262,6 @@ it("cancels a stale code-graph filter before its camera callback runs", () => {
     flagsOf: () => [],
     detail: { innerHTML: "" },
     noMatch: { hidden: false },
-    detail: { innerHTML: "" },
     document: { getElementById: () => q },
     setTimeout: (callback: () => void) => {
       const id = nextTimer++;

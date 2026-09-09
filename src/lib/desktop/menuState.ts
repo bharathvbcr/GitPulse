@@ -107,14 +107,14 @@ export function buildMenuState(
   label("terminal-dock", prefs.terminalDockOpen ? "Hide Terminal" : "Show Terminal");
   label("copy-commit", repo.selectedCommitId ? "Copy Selected Commit SHA" : "Copy HEAD SHA");
   if (prefs.terminalDockOpen && hasRepo) checked.push("terminal-dock");
-  if (prefs.fleetOpen) checked.push("fleet");
+  if (prefs.globalSurface === "fleet") checked.push("fleet");
   for (const view of REGISTERED_VIEWS) {
     allow(`tab-${view.id}`, hasRepo);
-    if (hasRepo && !prefs.fleetOpen && repo.activeTab === view.id) checked.push(`tab-${view.id}`);
+    if (hasRepo && prefs.globalSurface === "repository" && repo.activeTab === view.id) checked.push(`tab-${view.id}`);
     for (const section of view.sections ?? []) {
       const id = `section:${view.id}:${section.id}`;
       allow(id, hasRepo);
-      if (hasRepo && !prefs.fleetOpen && repo.activeTab === view.id && resolveSection(view.id, repo.viewSections[view.id]) === section.id) checked.push(id);
+      if (hasRepo && prefs.globalSurface === "repository" && repo.activeTab === view.id && resolveSection(view.id, repo.viewSections[view.id]) === section.id) checked.push(id);
     }
   }
   const gitBusy = repo.currentPath ? gitActivity[repo.currentPath] ?? [] : [];

@@ -79,6 +79,7 @@ pub const SECTION_MENUS: &[SectionMenu] = &[
             ("section:work:remote", "Remote"),
             ("section:work:stack", "Stack"),
             ("section:work:policy", "Policy"),
+            ("section:work:tasks", "Tasks"),
         ],
     },
     SectionMenu {
@@ -322,7 +323,7 @@ mod tests {
             .iter()
             .flat_map(|group| group.entries)
             .collect();
-        assert_eq!(entries.len(), 15);
+        assert_eq!(entries.len(), 16);
         let unique: std::collections::HashSet<_> = entries.iter().map(|(id, _)| id).collect();
         assert_eq!(unique.len(), entries.len());
         for (id, _) in entries {

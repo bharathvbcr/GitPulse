@@ -12,21 +12,32 @@ use gitpulse_lib::codeintel;
 /// DevCouncil's own repository, which carries a built map.
 const REAL_REPO: &str = "/Users/bharath/Code/devtools/DevCouncil";
 
-fn have_real_store() -> bool {
-    codeintel::devmap_db_path(REAL_REPO).exists()
+fn have_real_store(repo: &str) -> bool {
+    codeintel::devmap_db_path(repo).exists()
 }
 
 #[test]
 fn answers_impact_from_the_real_map_in_process() {
-    if !have_real_store() {
+    // A candidate schema can be tested against an isolated source checkout
+    // without migrating the developer's live store and its installed readers.
+    let selected_repo = std::env::var_os("GITPULSE_CODEINTEL_TEST_REPO");
+    let repo = selected_repo
+        .as_deref()
+        .map(|path| path.to_str().expect("test repository path must be UTF-8"))
+        .unwrap_or(REAL_REPO);
+    if !have_real_store(repo) {
+        assert!(
+            selected_repo.is_none(),
+            "GITPULSE_CODEINTEL_TEST_REPO has no map: {repo}"
+        );
         eprintln!(
             "SKIPPED: no devmap store at {}",
-            codeintel::devmap_db_path(REAL_REPO).display()
+            codeintel::devmap_db_path(repo).display()
         );
         return;
     }
 
-    let status = codeintel::status(REAL_REPO);
+    let status = codeintel::status(repo);
     assert!(
         status.available,
         "the map is on disk but unreadable: {:?}",
@@ -42,7 +53,7 @@ fn answers_impact_from_the_real_map_in_process() {
     );
 
     let started = std::time::Instant::now();
-    let hits = codeintel::search(REAL_REPO, "StoreQueryEngine", Some(2000));
+    let hits = codeintel::search(repo, "StoreQueryEngine", Some(2000));
     let elapsed = started.elapsed();
     assert!(
         hits.available,
@@ -60,7 +71,7 @@ fn answers_impact_from_the_real_map_in_process() {
         "the real map contains this symbol; the query found nothing"
     );
 
-    let impact = codeintel::impact(REAL_REPO, "StoreQueryEngine", Some(2000));
+    let impact = codeintel::impact(repo, "StoreQueryEngine", Some(2000));
     assert!(
         impact.available,
         "impact reported unavailable: {:?}",

@@ -75,7 +75,7 @@ async function run(){
   await clickPreview("WorkView",'button[title="Preview uncommitted files in /workspace/beta"]',other);
   interfaceStore.setFleetOpen(true);
   await clickPreview("FleetView",'button[title="Preview uncommitted files and modifications in beta"]',other);
-  check("Fleet closes after a preview",get(interfaceStore).fleetOpen===false);
+  check("Fleet closes after a preview",get(interfaceStore).globalSurface==="repository");
   await oldCommit();await show("WorkspaceActions");
   surface.querySelector('[data-workspace-wip-trigger]').click();await tick();
   const workspace=document.querySelector('[data-workspace-wip]');

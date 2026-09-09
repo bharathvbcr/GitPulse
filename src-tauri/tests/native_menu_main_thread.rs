@@ -90,6 +90,7 @@ fn check_additions(app: &tauri::App<tauri::test::MockRuntime>, failures: &mut Ve
         "section:work:remote",
         "section:work:stack",
         "section:work:policy",
+        "section:work:tasks",
         "section:code:explorer",
         "section:code:blame",
         "section:code:map",
@@ -106,7 +107,7 @@ fn check_additions(app: &tauri::App<tauri::test::MockRuntime>, failures: &mut Ve
         .filter(|id| ids.iter().filter(|found| found == id).count() != 1)
         .collect();
     check(
-        "all 24 additions exist once with accurate startup availability",
+        "all 25 additions exist once with accurate startup availability",
         missing.is_empty(),
         &format!("missing or duplicated: {missing:?}"),
         failures,

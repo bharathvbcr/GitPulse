@@ -70,7 +70,16 @@ async function main() {
   // Attach a handler before server startup can fail or exceed the deadline.
   void completed.catch(() => {});
   try {
-    server = await createServer({ plugins: [receiver], cacheDir: path.join(profile, "vite-cache"), server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false } });
+    server = await createServer({
+      plugins: [receiver],
+      cacheDir: path.join(profile, "vite-cache"),
+      // Production has explicit entry points, and fixtures select components
+      // dynamically. Discover their dependencies before any fixture starts.
+      optimizeDeps: {
+        entries: [`harness/${harness}.html`, "src/lib/components/**/*.svelte"],
+      },
+      server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
+    });
     await server.listen();
     const address = server.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");

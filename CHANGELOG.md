@@ -13,7 +13,7 @@ before that tag is pushed.
 
 ### Added
 
-- Expand the native application menu with Go submenus for all 15 view sections,
+- Expand the native application menu with Go submenus for all 16 view sections,
   zoom controls, and Help entries for documentation, shortcuts, diagnostics,
   optional-tool setup, release notes and issue reporting. Section navigation
   reveals the repository pane from Fleet. Repository commands disable when unavailable.

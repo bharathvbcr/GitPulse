@@ -73,7 +73,7 @@ describe("dispatchNativeMenu", () => {
         expected.push(`tab:${view.id}:${section.id}`);
       }
     }
-    expect(expected).toHaveLength(15);
+    expect(expected).toHaveLength(16);
     expect(h.calls).toEqual(expected);
   });
 

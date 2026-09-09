@@ -39,7 +39,7 @@ describe("native section menus match the frontend registry", () => {
     const expected = REGISTERED_VIEWS.flatMap((view) =>
       (view.sections ?? []).map((section) => [`section:${view.id}:${section.id}`, section.label]),
     );
-    expect(expected).toHaveLength(15);
+    expect(expected).toHaveLength(16);
     expect(entries.sort()).toEqual(expected.sort());
     expect(menu).toContain("actions::SECTION_MENUS");
   });
