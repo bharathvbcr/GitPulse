@@ -38,6 +38,13 @@ Native stack sampling includes waiting threads and does not profile the
 separate WebKit JavaScript process. Interpret sample counts as stack
 observations, not percentages of exclusive CPU time.
 
+The [September 9 diagnostics audit](DIAGNOSTICS_SYMLINK_AUDIT.md) covers the
+symlink diff failure and subsequent metric-scheduling regressions. Automatic
+LOC, coverage, and storage refreshes now follow the same visibility and active
+repository scope as document and code-index refreshes. Repeated Rescan requests
+coalesce behind a running measurement instead of launching overlapping scans.
+These are scheduling guarantees, not measured application-wide FPS gains.
+
 ## September 7 audit and measured changes
 
 **Verified:** the installed 0.0.8 process showed approximately 54–56% CPU in

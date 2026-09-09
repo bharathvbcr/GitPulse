@@ -46,6 +46,8 @@
  * quiet one.
  */
 
+import type { BackgroundScope } from "../async/pacedQueue";
+
 /** Why a snapshot's `value` may no longer describe the repository. */
 export type StaleReason =
   /** Nothing has been measured yet. */
@@ -149,6 +151,8 @@ export interface Metric<T> {
    * "out of date" the instant it is, not when the refresh lands.
    */
   invalidate(repoPath: string): void;
+  /** Automatic measurements follow the application's visible repository. */
+  setScope(scope: BackgroundScope | null): void;
   /** Drops all state and pending timers for one repository. */
   forget(repoPath: string): void;
   /** Drops everything. Cancels pending timers; in-flight work is ignored. */
@@ -163,11 +167,14 @@ interface Cell<T> {
   /** Rejects results from superseded measurements. */
   generation: number;
   inflight: Promise<void> | null;
+  queuedRefresh: Promise<void> | null;
   timer: unknown | null;
   /** Completion time of the last measurement attempt, success or failure. */
   lastAttemptAt: number | null;
   /** A change arrived while a measurement was running or throttled. */
   pending: boolean;
+  /** Explicit refreshes still run when no panel is subscribed. */
+  pendingManual: boolean;
 }
 
 const IDLE: MetricSnapshot<never> = Object.freeze({
@@ -204,6 +211,12 @@ export function createMetric<T>(
   // Insertion-ordered, so the head is the least recently touched repository.
   const cells = new Map<string, Cell<T>>();
   let disposed = false;
+  let scope: BackgroundScope | null = null;
+
+  function canMeasureAutomatically(repoPath: string, cell: Cell<T>): boolean {
+    return cell.listeners.size > 0 && (scope === null ||
+      (scope.visible && scope.activeKey === repoPath && scope.retainedKeys.includes(repoPath)));
+  }
 
   function touch(repoPath: string): Cell<T> {
     const existing = cells.get(repoPath);
@@ -217,9 +230,11 @@ export function createMetric<T>(
       listeners: new Set(),
       generation: 0,
       inflight: null,
+      queuedRefresh: null,
       timer: null,
       lastAttemptAt: null,
       pending: false,
+      pendingManual: false,
     };
     cells.set(repoPath, cell);
     evictIfNeeded(repoPath);
@@ -281,22 +296,28 @@ export function createMetric<T>(
   async function measureNow(repoPath: string, cell: Cell<T>): Promise<void> {
     const generation = ++cell.generation;
     cell.pending = false;
+    cell.pendingManual = false;
     cancelTimer(cell);
+    // Reserve before invoking either subscribers or the provider. Providers
+    // may throw synchronously, and subscribers may request another refresh.
+    let complete!: () => void;
+    const run = new Promise<void>((resolve) => { complete = resolve; });
+    cell.inflight = run;
     publish(repoPath, cell, { ...cell.snapshot, state: "loading" });
 
-    const run = (async () => {
+    void (async () => {
       try {
         const value = await definition.measure(repoPath);
-        if (disposed || generation !== cell.generation) return;
+        if (disposed || generation !== cell.generation || cell.queuedRefresh) return;
         publish(repoPath, cell, {
           state: "ready",
           value,
           measuredAt: clock.now(),
-          stale: staleAfterMeasure(value),
+          stale: staleAfterMeasure(value) ?? (cell.pending ? "repository-changed" : null),
           error: null,
         });
       } catch (err) {
-        if (disposed || generation !== cell.generation) return;
+        if (disposed || generation !== cell.generation || cell.queuedRefresh) return;
         const message = definition.formatError
           ? definition.formatError(err)
           : describeError(err, definition.name);
@@ -319,11 +340,11 @@ export function createMetric<T>(
           cell.lastAttemptAt = clock.now();
           // A change that arrived mid-flight is honoured now, through the
           // normal throttled path rather than immediately.
-          if (cell.pending) schedule(repoPath, cell);
+          if (cell.pending && !cell.queuedRefresh) schedule(repoPath, cell);
         }
+        complete();
       }
     })();
-    cell.inflight = run;
     return run;
   }
 
@@ -331,9 +352,16 @@ export function createMetric<T>(
    * Schedules a coalesced refresh, respecting both the debounce window and the
    * minimum interval between completed measurements.
    */
-  function schedule(repoPath: string, cell: Cell<T>): void {
+  function schedule(repoPath: string, cell: Cell<T>, manual = false): void {
     if (disposed) return;
     cell.pending = true;
+    cell.pendingManual ||= manual;
+    // Keep staleness, but spend no background work on an unobserved cell.
+    // The next subscriber resumes this pending request through the same floor.
+    if (!cell.pendingManual && !canMeasureAutomatically(repoPath, cell)) {
+      cancelTimer(cell);
+      return;
+    }
     // An in-flight measurement will re-schedule from its own `finally`; a
     // second timer here would only race it.
     if (cell.inflight) return;
@@ -343,7 +371,7 @@ export function createMetric<T>(
     cancelTimer(cell);
     cell.timer = clock.setTimeout(() => {
       cell.timer = null;
-      if (disposed || !cell.pending) return;
+      if (disposed || !cell.pending || (!cell.pendingManual && !canMeasureAutomatically(repoPath, cell))) return;
       void measureNow(repoPath, cell);
     }, wait);
   }
@@ -369,36 +397,45 @@ export function createMetric<T>(
       // First subscriber for a never-measured repository starts the first
       // measurement. Later subscribers join the same one.
       if (cell.snapshot.state === "idle" && !cell.inflight) {
-        void measureNow(repoPath, cell);
+        if (canMeasureAutomatically(repoPath, cell)) void measureNow(repoPath, cell);
+        else schedule(repoPath, cell);
+      } else if (cell.pending) {
+        schedule(repoPath, cell);
       }
       let live = true;
       return () => {
         if (!live) return;
         live = false;
         cell.listeners.delete(listener);
-        if (cell.listeners.size === 0) cancelTimer(cell);
+        if (cell.listeners.size === 0 && !cell.pendingManual) cancelTimer(cell);
       };
     },
 
     async refresh(repoPath, options): Promise<void> {
       if (disposed) return;
       const cell = touch(repoPath);
-      // Join an in-flight measurement rather than starting a second one: two
-      // concurrent storage scans of the same tree is exactly the duplication
-      // this module exists to remove.
-      //
-      // `force` is the exception, and it has to be. A forced refresh is the
-      // user pressing Rescan, which means "measure the repository as it is
-      // now". Joining a scan that started before their change would answer
-      // with pre-change state and stamp it with a current `measuredAt` — a
-      // stale reading presented as fresh, which is the one thing this module
-      // must never do. The superseded measurement is discarded by the
-      // generation guard when it lands.
+      if (cell.queuedRefresh) return cell.queuedRefresh;
+      // A forced rescan needs a measurement STARTED after the request. Keep
+      // the native work slot until it drains, then run one coalesced follow-up.
+      // Discarding an IPC promise cannot cancel the scan running in Rust.
+      if (cell.inflight && options?.force) {
+        cell.pending = true;
+        cell.queuedRefresh = cell.inflight.then(() => {
+          cell.queuedRefresh = null;
+          if (disposed || cells.get(repoPath) !== cell) return;
+          return measureNow(repoPath, cell);
+        });
+        publish(repoPath, cell, {
+          ...cell.snapshot,
+          stale: cell.snapshot.value === null ? "never-measured" : "repository-changed",
+        });
+        return cell.queuedRefresh;
+      }
       if (cell.inflight && !options?.force) return cell.inflight;
       if (!options?.force && cell.lastAttemptAt !== null) {
         const sinceLast = clock.now() - cell.lastAttemptAt;
         if (sinceLast < minIntervalMs) {
-          schedule(repoPath, cell);
+          schedule(repoPath, cell, true);
           return;
         }
       }
@@ -415,6 +452,13 @@ export function createMetric<T>(
         publish(repoPath, cell, { ...cell.snapshot, stale: "repository-changed" });
       }
       schedule(repoPath, cell);
+    },
+
+    setScope(next): void {
+      scope = next ? { ...next, retainedKeys: [...next.retainedKeys] } : null;
+      for (const [repoPath, cell] of cells) {
+        if (cell.pending) schedule(repoPath, cell);
+      }
     },
 
     forget(repoPath): void {
@@ -451,6 +495,7 @@ export function createMetric<T>(
  */
 export interface MetricRegistry {
   register(metric: Metric<unknown>): void;
+  setScope(scope: BackgroundScope | null): void;
   /** Route a `repo-changed` event to every registered metric. */
   invalidate(repoPath: string): void;
   /** A repository was closed: drop its state everywhere. */
@@ -461,9 +506,17 @@ export interface MetricRegistry {
 
 export function createMetricRegistry(): MetricRegistry {
   const metrics: Metric<unknown>[] = [];
+  let scope: BackgroundScope | null = null;
   return {
     register(metric) {
-      if (!metrics.includes(metric)) metrics.push(metric);
+      if (!metrics.includes(metric)) {
+        metrics.push(metric);
+        metric.setScope(scope);
+      }
+    },
+    setScope(next) {
+      scope = next ? { ...next, retainedKeys: [...next.retainedKeys] } : null;
+      for (const metric of metrics) metric.setScope(scope);
     },
     invalidate(repoPath) {
       for (const metric of metrics) metric.invalidate(repoPath);
