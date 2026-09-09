@@ -245,13 +245,17 @@ fn codeintel_output() -> Value {
         "type": "object",
         "properties": {
             "available": { "type": "boolean" },
-            "reason": { "type": "string" },
+            "source_freshness": {
+                "type": ["boolean", "null"],
+                "description": "Null means this query did not verify whole-tree freshness. Availability describes the indexed snapshot."
+            },
+            "reason": { "type": ["string", "null"] },
             "items": { "type": "array" },
             "total": { "type": "integer" },
             "shown": { "type": "integer" },
             "truncated": { "type": "boolean" }
         },
-        "required": ["available", "items", "total", "shown", "truncated"]
+        "required": ["available", "source_freshness", "items", "total", "shown", "truncated"]
     })
 }
 
@@ -1575,6 +1579,24 @@ mod tests {
                     "{name}.{which} uses a keyword the validator ignores"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn staleness_audit_navigation_payloads_match_the_advertised_field_types() {
+        let schema = codeintel_output();
+        for response in [
+            crate::codeintel::CodeintelResponse::<Value>::ok(Vec::new(), 0, 0, false),
+            crate::codeintel::CodeintelResponse::<Value>::unavailable("source is unavailable"),
+        ] {
+            let payload = serde_json::to_value(response).unwrap();
+            for (name, field_schema) in schema["properties"].as_object().unwrap() {
+                let violations = validate::validate(&payload[name], field_schema);
+                assert!(violations.is_empty(), "{name}: {violations:?}");
+            }
+        }
+        for (name, wrong_type) in [("reason", json!(42)), ("source_freshness", json!("true"))] {
+            assert!(!validate::validate(&wrong_type, &schema["properties"][name]).is_empty());
         }
     }
 
