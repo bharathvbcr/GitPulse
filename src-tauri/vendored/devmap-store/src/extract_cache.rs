@@ -55,6 +55,37 @@ pub fn extract_scanned_cached_with_progress(
     scanned: &devmap_extract::ScannedTree,
     progress: Option<&devmap_extract::progress::FileProgress>,
 ) -> anyhow::Result<Vec<Extraction>> {
+    extract_scanned_with_progress(store, scanned, progress, CacheAdmission::Immediate)
+}
+
+/// Reuse committed extraction payloads while preparing the next generation.
+///
+/// `save_generation` durably records every new payload in its transaction, and
+/// `try_get_cached_extraction` already reads those rows. Writing misses into
+/// `extraction_cache` first duplicated the entire corpus only to delete it at
+/// commit, forcing extra WAL writes and vacuum work on every cold build.
+/// An interrupted generation may repeat uncommitted extraction; it cannot lose
+/// a published generation or acknowledge pending work before commit.
+pub fn extract_scanned_for_generation(
+    store: &Store,
+    scanned: &devmap_extract::ScannedTree,
+    progress: Option<&devmap_extract::progress::FileProgress>,
+) -> anyhow::Result<Vec<Extraction>> {
+    extract_scanned_with_progress(store, scanned, progress, CacheAdmission::AtGenerationCommit)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheAdmission {
+    Immediate,
+    AtGenerationCommit,
+}
+
+fn extract_scanned_with_progress(
+    store: &Store,
+    scanned: &devmap_extract::ScannedTree,
+    progress: Option<&devmap_extract::progress::FileProgress>,
+    admission: CacheAdmission,
+) -> anyhow::Result<Vec<Extraction>> {
     if let Some(progress) = progress {
         progress.start(scanned.sources.len());
     }
@@ -62,7 +93,7 @@ pub fn extract_scanned_cached_with_progress(
         .sources
         .par_iter()
         .map(|(path, src)| {
-            let result = extract_one_cached_with(store, path, src, extract_file);
+            let result = extract_one_cached_with(store, path, src, admission, extract_file);
             if let Some(progress) = progress {
                 finish_extraction_progress(progress, &result);
             }
@@ -86,6 +117,7 @@ fn extract_one_cached_with(
     store: &Store,
     path: &str,
     src: &str,
+    admission: CacheAdmission,
     extractor: impl FnOnce(&str, &str) -> Extraction,
 ) -> anyhow::Result<(Extraction, bool)> {
     let language = detect_language(Path::new(path));
@@ -99,7 +131,7 @@ fn extract_one_cached_with(
         }
     }
     let ext = extractor(path, src);
-    if cache_admits(&ext.parse_outcome) {
+    if admission == CacheAdmission::Immediate && cache_admits(&ext.parse_outcome) {
         store.admit_cached_extraction(&key, &ext)?;
     }
     Ok((ext, false))
@@ -362,13 +394,24 @@ mod tests {
     fn cache_hit_returns_before_invoking_the_parser() {
         let store = Store::open_in_memory().unwrap();
         let source = "def cached():\n    return 1\n";
-        let first = extract_one_cached_with(&store, "cached.py", source, extract_file).unwrap();
+        let first = extract_one_cached_with(
+            &store,
+            "cached.py",
+            source,
+            CacheAdmission::Immediate,
+            extract_file,
+        )
+        .unwrap();
         assert_eq!(first.0.file_path, "cached.py");
         assert!(!first.1);
 
-        let second = extract_one_cached_with(&store, "cached.py", source, |_, _| {
-            panic!("parser must not run on a cache hit")
-        })
+        let second = extract_one_cached_with(
+            &store,
+            "cached.py",
+            source,
+            CacheAdmission::Immediate,
+            |_, _| panic!("parser must not run on a cache hit"),
+        )
         .unwrap();
         assert_eq!(second.0.file_path, "cached.py");
         assert!(second.1);

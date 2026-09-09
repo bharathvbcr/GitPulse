@@ -120,7 +120,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "db606e8573abbb3b231b1e1311c7208e9d54dfbd"
+        "commit": "b5d95033a554d19db502b69c394072c8ce066c3c"
       },
       "omitted": [
         "tests/",
@@ -229,13 +229,14 @@
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
-        "src/lib.rs": "3dae528988efa042c95d73927291698ff2fae499d2146f886b381278bfdb4690",
+        "src/lib.rs": "d16efc2eb7fb1018444ff8b1902bfc3674d1d46dc8c57878c17a0569d14dedc2",
         "src/model.rs": "0059b938eccbf8f48a2e64ada08ec7cf306a1d61d6cd4debaa6fe831afa9a4e6",
         "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
+        "src/parent_index.rs": "3117a0e489e04f71e5a7879a0a3c14a8515ec10e35df529e3f05a9c950748311",
         "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
         "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
-        "src/treesitter.rs": "b14a53d23f0acbafa94ec7f531bcbf467cb367c67cb7a956b879ca7ba3064d41",
+        "src/treesitter.rs": "6d3dcf4ff1da31fc8e5b72104f9498ef810d8307118541bf1d45b4bd733927d5",
         "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
       }
     },
@@ -327,7 +328,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "d9678f331be6e65b271701addfe38a1a4c3e8517"
+        "commit": "b5d95033a554d19db502b69c394072c8ce066c3c"
       },
       "omitted": [
         "tests/",
@@ -349,8 +350,8 @@
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
         "src/db.rs": "10d8a1d145cbd2847d1ee9386428d4f10a67f772e2ce649fbae6d219368ed587",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
-        "src/extract_cache.rs": "a8447e286fe81b754e324ffaacddb818e6b7d0f27477612a18e7fbcd1a3ac693",
-        "src/lib.rs": "25d0b62fa04bc399620b16a92b8615deb0abdbb5b255518326db5b74a9c19de1",
+        "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
+        "src/lib.rs": "2d86459f879e5eb3d7f73d536d6f747a0d8b4509b391a9b2c2b1360df5aa750f",
         "src/schema.rs": "872e889252bafc98f6b5dd4ee4c18cd9aaf5ed5a502db18bd8f1759484764d7a"
       }
     },

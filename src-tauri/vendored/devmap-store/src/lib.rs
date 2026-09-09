@@ -25,7 +25,7 @@ pub use edge_index::{
 };
 #[cfg(feature = "parse")]
 pub use extract_cache::{
-    extract_scanned_cached, extract_scanned_cached_with_progress, extract_tree_cached,
-    extract_tree_cached_with_report,
+    extract_scanned_cached, extract_scanned_cached_with_progress, extract_scanned_for_generation,
+    extract_tree_cached, extract_tree_cached_with_report,
 };
 pub use schema::*;

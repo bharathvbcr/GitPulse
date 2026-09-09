@@ -33,6 +33,8 @@ pub use git_metadata::{git_metadata, GitMetadata};
 #[cfg(feature = "parse")]
 pub mod notebook;
 #[cfg(feature = "parse")]
+mod parent_index;
+#[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
 
