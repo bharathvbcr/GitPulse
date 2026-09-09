@@ -20,7 +20,7 @@
 </script>
 <svelte:head><title>GitPulse status popover preview</title></svelte:head>
 <main class:dark={theme === "dark"}>
-  <div class="controls"><span>UI preview · sample data</span><label>Appearance <select bind:value={theme}><option>light</option><option>dark</option></select></label><label>State <select bind:value={scenario}>{#each ["changes","conflicts","clean","loading","unavailable","empty","long names"] as name}<option>{name}</option>{/each}</select></label></div>
+  <div class="controls"><span>UI preview · sample data</span><label>Appearance <select bind:value={theme}><option>light</option><option>dark</option></select></label><label>State <select bind:value={scenario}>{#each ["changes","conflicts","clean","loading","unavailable","empty","long names","busy","operation"] as name}<option>{name}</option>{/each}</select></label></div>
   <div class="stage"><StatusPopover {snapshot} onaction={action} /></div>
   <p class="action" aria-live="polite">Last action: {lastAction}</p>
 </main>

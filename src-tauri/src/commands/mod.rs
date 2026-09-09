@@ -104,6 +104,20 @@ pub struct GraphNotes {
     pub notices: Vec<String>,
 }
 
+/// `git rev-parse HEAD` fails this way when the branch has no commits yet —
+/// a brand-new repository, or `git checkout --orphan`. That is a true
+/// statement about the repository, not a probe GitPulse failed to run, so it
+/// belongs in `notices` rather than the diagnostics ring.
+fn is_unborn_head_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("ambiguous argument 'head'")
+        || lower.contains("needed a single revision")
+        || (lower.contains("unknown revision") && lower.contains("head"))
+}
+
+const UNBORN_HEAD_NOTICE: &str =
+    "This repository has no commits yet, so the graph has no HEAD marker.";
+
 /// The refs that anchor the straight mainline column, resolved once per
 /// graph load from the decoration list already in hand.
 pub struct ResolvedMainline {
@@ -430,9 +444,13 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                notes.warnings.push(format!(
-                    "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
-                ));
+                if is_unborn_head_error(&err) {
+                    notes.notices.push(UNBORN_HEAD_NOTICE.into());
+                } else {
+                    notes.warnings.push(format!(
+                        "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
+                    ));
+                }
                 None
             }
             Err(_) => {
@@ -2775,6 +2793,48 @@ mod tests {
         // Anything that is not an object id is refused before it reaches argv.
         assert!(
             GitWriter::prepare_restack(&canon, "feature", "main", Some("--exec=boom")).is_err()
+        );
+    }
+
+    #[test]
+    fn unborn_head_errors_are_notices_not_faults() {
+        assert!(is_unborn_head_error(
+            "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
+        ));
+        assert!(is_unborn_head_error("fatal: Needed a single revision"));
+        assert!(is_unborn_head_error(
+            "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions"
+        ));
+        assert!(!is_unborn_head_error("fatal: bad object HEAD"));
+        assert!(!is_unborn_head_error("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn an_empty_repository_graph_is_a_notice_not_a_fault() {
+        let repo = crate::test_support::git_repo();
+        let payload = tauri::async_runtime::block_on(cmd_get_commit_graph(
+            repo.path().to_string_lossy().into_owned(),
+            100,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect("empty repository graph must load");
+        assert!(payload.rows.is_empty(), "no commits to draw");
+        assert!(payload.head_id.is_none());
+        assert!(
+            payload
+                .warnings
+                .iter()
+                .all(|w| !w.to_ascii_lowercase().contains("head unavailable")),
+            "unborn HEAD must not be a diagnostics fault: {:?}",
+            payload.warnings
+        );
+        assert!(
+            payload.notices.iter().any(|n| n.contains("no commits yet")),
+            "unborn HEAD must be disclosed as a notice: {:?}",
+            payload.notices
         );
     }
 

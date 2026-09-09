@@ -82,7 +82,7 @@ describe("onboardingStore", () => {
           ok: true,
           binary: "/bin/devmap",
           lookup: "path_search",
-          version: "0.1.0",
+          version: "1.2.3",
           source_used: null,
           command: "cargo install",
           exit_code: 0,

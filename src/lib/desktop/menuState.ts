@@ -21,7 +21,34 @@ export interface StatusCard {
   primaryLabel: string;
   watchStatus: string;
   reduceMotion: boolean;
+  stashes: number | null;
+  operation: string | null;
+  activity: string | null;
+  elsewhere: number;
 }
+
+export interface StatusShortcut {
+  id: string;
+  label: string;
+  group: "go" | "tool";
+}
+
+export interface StatusInsight {
+  id: string;
+  text: string;
+  tone: "warning" | "busy";
+}
+
+const STATUS_SHORTCUTS: StatusShortcut[] = [
+  { id: "section:history:graph", label: "History", group: "go" },
+  { id: "section:insights:pulse", label: "Pulse", group: "go" },
+  { id: "fleet", label: "Fleet", group: "go" },
+  { id: "terminal-dock", label: "Terminal", group: "go" },
+  { id: "copy-branch", label: "Copy branch", group: "tool" },
+  { id: "reveal-repo", label: "Reveal", group: "tool" },
+  { id: "open-remote", label: "Remote", group: "tool" },
+  { id: "toggle-theme", label: "Appearance", group: "tool" },
+];
 /** Bounded presentation, shared with desktop::state. Git authorization stays in the existing commands. */
 export interface MenuState {
   enabled: string[];
@@ -172,6 +199,13 @@ export function buildMenuState(
         : conflicts ? "Resolve conflicts" : trayTarget === "section:history:graph" ? "View history" : "Review changes",
       watchStatus: repo.watch.status,
       reduceMotion: prefs.reduceMotion,
+      stashes: loaded && !repo.isBare && !repo.stashFailed ? repo.stashEntries.length : null,
+      operation: operation ? menuText(headline(operation), 120) : null,
+      activity: gitBusy.length
+        ? menuText(labels.find((entry) => entry.id === (gitBusy[0] === "unstash" ? "stash-pop" : gitBusy[0]))?.text
+          ?? "Git action running…", 72)
+        : null,
+      elsewhere: Math.max(0, elsewhere),
     },
     trayDetails: details.map((detail) => menuText(detail)),
     traySummary: { id: trayTarget, text: menuText([brief, sync,
@@ -183,6 +217,60 @@ export function buildMenuState(
 
 export function menuActionEnabled(state: MenuState, id: string): boolean {
   return state.enabled.includes(id);
+}
+
+export function statusShortcuts(state: MenuState): StatusShortcut[] {
+  return STATUS_SHORTCUTS.filter((item) => state.enabled.includes(item.id));
+}
+
+export function statusInsights(card: StatusCard): StatusInsight[] {
+  const items: StatusInsight[] = [];
+  if (card.operation) items.push({ id: "section:work:overview", text: card.operation, tone: "warning" });
+  if (card.activity) items.push({ id: "section:work:overview", text: card.activity, tone: "busy" });
+  if (card.elsewhere > 0) {
+    items.push({
+      id: "fleet",
+      text: `${card.elsewhere} running elsewhere`,
+      tone: "busy",
+    });
+  }
+  return items;
+}
+
+/** Copy, refresh and appearance stay in the popover; navigation still opens GitPulse. */
+export function statusKeepsPopover(id: string): boolean {
+  return id === "refresh" || id === "toggle-theme" || id.startsWith("copy-") || id.startsWith("activate-repo:");
+}
+
+export function statusDetailRows(lines: string[]): { label: string | null; value: string }[] {
+  return lines.map((line) => {
+    const at = line.indexOf(": ");
+    if (at > 0 && at <= 18) return { label: line.slice(0, at), value: line.slice(at + 2) };
+    return { label: null, value: line };
+  });
+}
+
+export function statusKeyAction(
+  event: { key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean },
+  snapshot: MenuState | null,
+  ui: { choosing: boolean; expanded: boolean },
+): { dismiss?: true; collapse?: "chooser" | "details"; id?: string } | null {
+  if (event.metaKey || event.ctrlKey || event.altKey) return null;
+  if (event.key === "Escape") {
+    if (ui.choosing) return { collapse: "chooser" };
+    if (ui.expanded) return { collapse: "details" };
+    return { dismiss: true };
+  }
+  if (!snapshot || ui.choosing) return null;
+  const can = (id: string) => snapshot.enabled.includes(id);
+  if (event.key === "r" || event.key === "R") return can("refresh") ? { id: "refresh" } : null;
+  if (event.key === "Enter") return can(snapshot.traySummary.id) ? { id: snapshot.traySummary.id } : null;
+  const card = snapshot.status;
+  if (event.key === "1" && can("section:work:overview") && card.changed) return { id: "section:work:overview" };
+  if (event.key === "2" && can("section:work:overview") && card.staged) return { id: "section:work:overview" };
+  if (event.key === "3" && can("section:work:resolve") && card.conflicts) return { id: "section:work:resolve" };
+  if (event.key === "4" && can("section:work:overview") && card.stashes) return { id: "section:work:overview" };
+  return null;
 }
 
 export function canDispatchMenuEvent(event: NativeEvent, state: MenuState, repo: RepoState): boolean {

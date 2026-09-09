@@ -970,6 +970,9 @@ const MAX_RUST_COVERAGE_COMMANDS: usize = 4;
 /// Cap on Go modules we emit a coverage command for. Matches the health
 /// scanner's `MAX_GO_MODS` bound so a polyglot monorepo cannot drown the UI.
 const MAX_GO_COVERAGE_COMMANDS: usize = 4;
+/// Cap on Swift packages we emit a coverage command for. Matches the Go/Rust
+/// bounds so a tree of Package.swift files cannot drown the UI.
+const MAX_SWIFT_COVERAGE_COMMANDS: usize = 4;
 /// Bound on `package.json` we will parse for a coverage script. A hostile
 /// multi-megabyte manifest is skipped; we do not invent npx vitest/jest.
 const MAX_PACKAGE_JSON_BYTES: u64 = 256 * 1024;
@@ -1002,6 +1005,18 @@ fn rel_is_command_unsafe(rel: &str) -> bool {
                 | b'"'
                 | b'\''
                 | 0
+        )
+    })
+}
+
+/// Directories that hold someone else's tree, not this repository's tests.
+/// `vendor` is already skipped by [`skip_source`]; `framework` and `vendored`
+/// are how this app (and many desktop checkouts) vendor Tauri and similar.
+fn coverage_third_party_dir(dir: &str) -> bool {
+    dir.split('/').filter(|c| !c.is_empty()).any(|c| {
+        matches!(
+            c,
+            "framework" | "vendored" | "vendor" | "third_party" | "third-party"
         )
     })
 }
@@ -1437,6 +1452,33 @@ fn pytest_generate_command(python_rel: Option<&str>) -> String {
     }
 }
 
+fn swift_test_cover_command(dir: &str) -> Option<String> {
+    let command = if dir.is_empty() {
+        "swift test --enable-code-coverage".to_string()
+    } else {
+        let package = quote_rel(dir);
+        format!("swift test --package-path {package} --enable-code-coverage")
+    };
+    command_line_is_argv_safe(&command).then_some(command)
+}
+
+fn swift_coverage_commands(package_swift_dirs: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = package_swift_dirs
+        .iter()
+        .filter(|d| !rel_is_command_unsafe(d) && !coverage_third_party_dir(d))
+        .cloned()
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut commands = Vec::new();
+    for dir in dirs.into_iter().take(MAX_SWIFT_COVERAGE_COMMANDS) {
+        if let Some(command) = swift_test_cover_command(&dir) {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
 fn go_test_cover_command(dir: &str) -> Option<String> {
     let command = if dir.is_empty() {
         "go test ./... -coverprofile=coverage.out".to_string()
@@ -1747,7 +1789,7 @@ fn javascript_coverage_plan(repo: &Path, npm_ready: bool) -> LanguageCoveragePla
 ///
 /// An interpreter that already has pytest is used as-is — GitPulse does not
 /// impose a virtualenv on a project whose toolchain already works.
-fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
+fn python_coverage_plan(repo: &Path, has_python_tests: bool) -> LanguageCoveragePlan {
     let venv = match existing_venv_python(repo) {
         Ok(found) => found,
         Err(reason) => {
@@ -1759,6 +1801,14 @@ fn python_coverage_plan(repo: &Path) -> LanguageCoveragePlan {
             ));
         }
     };
+    // pytest without collectable tests exits 5 ("no tests ran") and the
+    // auto-generator logs that as a coverage ERROR. A lone script is a missing
+    // suite, the same way JavaScript without a runner is not offered vitest.
+    if !has_python_tests {
+        return LanguageCoveragePlan::unavailable(
+            "No Python tests found (pytest's test_*.py / *_test.py, conftest.py, pytest.ini, or a tests/ directory). Running pytest would collect nothing.",
+        );
+    }
     if let Some(python) = venv {
         let generate = vec![pytest_generate_command(Some(python))];
         if interpreter_has_pytest(repo, python) {
@@ -2022,10 +2072,11 @@ fn native_coverage_plan(repo: &Path, cmake_ready: bool, gcovr: GcovrRoute) -> La
 
 fn swift_coverage_plan(
     repo: &Path,
-    has_package_swift: bool,
+    package_swift_dirs: &[String],
     swift_ready: bool,
 ) -> LanguageCoveragePlan {
-    if !has_package_swift {
+    let generate = swift_coverage_commands(package_swift_dirs);
+    if generate.is_empty() {
         return LanguageCoveragePlan::unavailable("No Package.swift in this repository.");
     }
     if !swift_ready {
@@ -2036,7 +2087,7 @@ fn swift_coverage_plan(
         ));
     }
     LanguageCoveragePlan::ready(
-        vec!["swift test --enable-code-coverage".into()],
+        generate,
         "Swift test coverage usually finishes in a few minutes.",
     )
 }
@@ -2197,7 +2248,8 @@ struct CoverageCommandLayout<'a> {
     cargo_dirs: &'a [String],
     go_mod_dirs: &'a [String],
     go_work_at_root: bool,
-    has_package_swift: bool,
+    package_swift_dirs: &'a [String],
+    has_python_tests: bool,
     has_pubspec: bool,
     has_dotnet_proj: bool,
 }
@@ -2208,7 +2260,8 @@ impl<'a> CoverageCommandLayout<'a> {
             cargo_dirs: &detected.cargo_dirs,
             go_mod_dirs: &detected.go_mod_dirs,
             go_work_at_root: detected.go_work_at_root,
-            has_package_swift: detected.has_package_swift,
+            package_swift_dirs: &detected.package_swift_dirs,
+            has_python_tests: detected.has_python_tests,
             has_pubspec: detected.has_pubspec,
             has_dotnet_proj: detected.has_dotnet_proj,
         }
@@ -2238,7 +2291,7 @@ fn fill_suggested_commands(
     );
     let rust = rust_coverage_plan(repo, layout.cargo_dirs, llvm_cov_ready);
     let python = if family_present(families, "python") {
-        python_coverage_plan(repo)
+        python_coverage_plan(repo, layout.has_python_tests)
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
     };
@@ -2262,8 +2315,8 @@ fn fill_suggested_commands(
     let swift = if family_present(families, "swift") {
         swift_coverage_plan(
             repo,
-            layout.has_package_swift,
-            layout.has_package_swift && program_on_path("swift"),
+            layout.package_swift_dirs,
+            !layout.package_swift_dirs.is_empty() && program_on_path("swift"),
         )
     } else {
         LanguageCoveragePlan::ready(Vec::new(), "")
@@ -2329,7 +2382,8 @@ struct FamilyScan {
     cargo_dirs: Vec<String>,
     go_mod_dirs: Vec<String>,
     go_work_at_root: bool,
-    has_package_swift: bool,
+    package_swift_dirs: Vec<String>,
+    has_python_tests: bool,
     has_pubspec: bool,
     has_dotnet_proj: bool,
     listing_partial: bool,
@@ -2359,7 +2413,8 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     let mut cargo_dirs: Vec<String> = Vec::new();
     let mut go_mod_dirs: Vec<String> = Vec::new();
     let mut go_work_at_root = false;
-    let mut has_package_swift = false;
+    let mut package_swift_dirs: Vec<String> = Vec::new();
+    let mut has_python_tests = false;
     let mut has_pubspec = false;
     let mut has_dotnet_proj = false;
     let mut classified = 0usize;
@@ -2389,7 +2444,10 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
         } else if name == "go.work" && rel_parent_dir(&rel).is_empty() {
             go_work_at_root = true;
         } else if name.eq_ignore_ascii_case("Package.swift") {
-            has_package_swift = true;
+            let dir = rel_parent_dir(&rel);
+            if !coverage_third_party_dir(&dir) && !package_swift_dirs.contains(&dir) {
+                package_swift_dirs.push(dir);
+            }
         } else if name.eq_ignore_ascii_case("pubspec.yaml") {
             has_pubspec = true;
         } else {
@@ -2401,6 +2459,9 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
             {
                 has_dotnet_proj = true;
             }
+        }
+        if is_python_test_path(&rel) {
+            has_python_tests = true;
         }
         let info = LanguageDetector::detect_from_path(&rel);
         let Some(family) = LanguageDetector::coverage_family_hint(&rel, &info) else {
@@ -2448,12 +2509,14 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     }
     cargo_dirs.sort();
     go_mod_dirs.sort();
+    package_swift_dirs.sort();
     Ok(FamilyScan {
         families,
         cargo_dirs,
         go_mod_dirs,
         go_work_at_root,
-        has_package_swift,
+        package_swift_dirs,
+        has_python_tests,
         has_pubspec,
         has_dotnet_proj,
         listing_partial,
@@ -3276,6 +3339,21 @@ fn totals_of(map: &HashMap<String, BTreeMap<usize, u64>>) -> CoverageTotals {
 
 fn skip_source(path: &str) -> bool {
     LanguageDetector::is_ignored_source_path(path)
+}
+
+fn is_python_test_path(rel: &str) -> bool {
+    let name = file_name_of_rel(rel);
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name == "conftest.py" || lower_name == "pytest.ini" {
+        return true;
+    }
+    if !lower_name.ends_with(".py") {
+        return false;
+    }
+    let stem = &lower_name[..lower_name.len() - 3];
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || rel.split('/').any(|c| c.eq_ignore_ascii_case("tests"))
 }
 
 fn file_name_of_rel(rel: &str) -> &str {
@@ -4250,7 +4328,7 @@ src/main.go:4.1,4.8 1 0
         write(
             repo.path(),
             "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"demo\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
         );
         let report = CoverageScanner::scan(repo.path().to_str().unwrap()).unwrap();
         let rust = report
@@ -4360,7 +4438,7 @@ src/main.go:4.1,4.8 1 0
         write(
             repo.path(),
             "src-tauri/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"app\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
         );
         write(repo.path(), "src-tauri/src/main.rs", "fn main() {}\n");
         write(
@@ -4408,7 +4486,7 @@ src/main.go:4.1,4.8 1 0
         write(
             repo.path(),
             "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"demo\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
         );
         write(
             repo.path(),
@@ -4523,7 +4601,7 @@ src/main.go:4.1,4.8 1 0
         std::fs::create_dir_all(repo.path().join(".venv/bin")).unwrap();
         symlink("/bin/sh", repo.path().join(".venv/bin/python")).unwrap();
 
-        let plan = python_coverage_plan(repo.path());
+        let plan = python_coverage_plan(repo.path(), true);
         assert!(plan.generate.is_empty(), "no step may be planned around it");
         assert!(plan.setup.is_empty());
         assert!(!plan.tool_ready);
@@ -4629,7 +4707,7 @@ src/main.go:4.1,4.8 1 0
              nothing must fail here rather than be read as a refused virtualenv"
         );
 
-        let plan = python_coverage_plan(repo.path());
+        let plan = python_coverage_plan(repo.path(), true);
         assert!(!plan.tool_ready, "a venv without pytest is not ready");
         assert_eq!(
             plan.generate,
@@ -4652,7 +4730,12 @@ src/main.go:4.1,4.8 1 0
     fn python_plan_is_never_a_dead_end_when_python_exists() {
         let repo = git_repo();
         write(repo.path(), "app/main.py", "print(1)\n");
-        let plan = python_coverage_plan(repo.path());
+        write(
+            repo.path(),
+            "app/test_main.py",
+            "def test_ok():\n    assert True\n",
+        );
+        let plan = python_coverage_plan(repo.path(), true);
         if plan.tool_detail.contains("No Python interpreter") {
             // No interpreter to build a venv with: an honest refusal, not a
             // silent one.
@@ -4662,7 +4745,7 @@ src/main.go:4.1,4.8 1 0
         }
         assert!(
             !plan.generate.is_empty(),
-            "a repository with Python sources must always get a generate command"
+            "a repository with Python tests must always get a generate command"
         );
         if !plan.tool_ready {
             assert!(
@@ -4727,16 +4810,162 @@ src/main.go:4.1,4.8 1 0
     }
 
     #[test]
+    fn python_test_path_matches_pytest_defaults() {
+        assert!(is_python_test_path("test_app.py"));
+        assert!(is_python_test_path("app_test.py"));
+        assert!(is_python_test_path("tests/helpers.py"));
+        assert!(is_python_test_path("pkg/conftest.py"));
+        assert!(is_python_test_path("pytest.ini"));
+        assert!(!is_python_test_path("contracts/tools/checksums.py"));
+        assert!(!is_python_test_path("app.py"));
+    }
+
+    #[test]
     fn swift_plan_requires_package_manifest() {
-        let plan = swift_coverage_plan(Path::new("."), false, true);
+        let plan = swift_coverage_plan(Path::new("."), &[], true);
         assert!(plan.generate.is_empty());
         assert!(plan.tool_detail.contains("Package.swift"));
-        let ready = swift_coverage_plan(Path::new("."), true, true);
+        let ready = swift_coverage_plan(Path::new("."), &[String::new()], true);
         assert_eq!(
             ready.generate,
             vec!["swift test --enable-code-coverage".to_string()]
         );
         assert!(ready.tool_ready);
+        let nested = swift_coverage_plan(Path::new("."), &["ios".to_string()], true);
+        assert_eq!(
+            nested.generate,
+            vec!["swift test --package-path ios --enable-code-coverage".to_string()]
+        );
+        let vendored = swift_coverage_plan(
+            Path::new("."),
+            &["src-tauri/framework/tauri/mobile/ios-api".to_string()],
+            true,
+        );
+        assert!(
+            vendored.generate.is_empty(),
+            "vendored Package.swift must not plan swift test: {:?}",
+            vendored.generate
+        );
+    }
+
+    #[test]
+    fn vendored_package_swift_does_not_plan_root_swift_test() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "src-tauri/framework/tauri/mobile/ios-api/Package.swift",
+            "// swift-tools-version:5.9\n",
+        );
+        write(
+            repo.path(),
+            "scripts/webkit-regressions.swift",
+            "import Foundation\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let swift = report
+            .families
+            .iter()
+            .find(|f| f.family == "swift")
+            .expect("swift sources must seed the family");
+        assert!(
+            swift.suggested_commands.is_empty(),
+            "vendored Package.swift must not plan root swift test: {:?}",
+            swift.suggested_commands
+        );
+        assert!(!swift.tool_ready);
+        assert!(
+            swift.tool_detail.contains("Package.swift"),
+            "missing first-party package must be named: {:?}",
+            swift.tool_detail
+        );
+    }
+
+    #[test]
+    fn nested_first_party_package_swift_plans_package_path() {
+        let repo = git_repo();
+        write(
+            repo.path(),
+            "ios/Package.swift",
+            "// swift-tools-version:5.9\n",
+        );
+        write(
+            repo.path(),
+            "ios/Sources/App/App.swift",
+            "import Foundation\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let swift = report
+            .families
+            .iter()
+            .find(|f| f.family == "swift")
+            .expect("swift");
+        let expected = "swift test --package-path ios --enable-code-coverage".to_string();
+        if swift.suggested_commands.is_empty() {
+            assert!(!swift.tool_ready);
+            assert!(
+                swift.tool_detail.to_ascii_lowercase().contains("swift"),
+                "missing Swift runtime must be named: {:?}",
+                swift.tool_detail
+            );
+        } else {
+            assert_eq!(swift.suggested_commands, vec![expected]);
+            assert_argv_safe(&swift.suggested_commands);
+        }
+    }
+
+    #[test]
+    fn python_sources_without_tests_do_not_plan_pytest() {
+        let repo = git_repo();
+        write(repo.path(), "contracts/tools/checksums.py", "print(1)\n");
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let python = report
+            .families
+            .iter()
+            .find(|f| f.family == "python")
+            .expect("python");
+        assert!(
+            python.suggested_commands.is_empty(),
+            "a script without tests must not plan pytest: {:?}",
+            python.suggested_commands
+        );
+        assert!(!python.tool_ready);
+        assert!(
+            python.tool_detail.contains("No Python tests"),
+            "missing tests must be named: {:?}",
+            python.tool_detail
+        );
+    }
+
+    #[test]
+    fn python_tests_plan_pytest() {
+        let repo = git_repo();
+        write(repo.path(), "app.py", "def add(a, b):\n    return a + b\n");
+        write(
+            repo.path(),
+            "test_app.py",
+            "def test_add():\n    assert True\n",
+        );
+        let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan");
+        let python = report
+            .families
+            .iter()
+            .find(|f| f.family == "python")
+            .expect("python");
+        assert!(
+            !python.suggested_commands.is_empty() || !python.tool_detail.is_empty(),
+            "python with tests must plan pytest or explain a missing interpreter"
+        );
+        if !python.suggested_commands.is_empty() {
+            assert!(
+                python
+                    .suggested_commands
+                    .iter()
+                    .any(|c| c.contains("pytest")),
+                "generate must be pytest: {:?}",
+                python.suggested_commands
+            );
+            assert_argv_safe(&python.suggested_commands);
+        }
     }
 
     /// GitPulse itself is a Tauri tree: cargo lives under `src-tauri/`, and
@@ -4749,7 +4978,7 @@ src/main.go:4.1,4.8 1 0
         write(
             repo.path(),
             "src-tauri/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"app\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
         );
         write(repo.path(), "src-tauri/src/lib.rs", "pub fn x() {}\n");
         write(repo.path(), "src/app.ts", "export const x = 1;\n");
@@ -4970,44 +5199,19 @@ src/main.go:4.1,4.8 1 0
             .iter()
             .find(|f| f.family == "python")
             .expect("python");
-        // pytest runs from any directory, so unlike `go test ./...` there is no
-        // manifest that must exist first — a command here is planned, not
-        // invented. What must hold is that it targets a real interpreter and,
-        // when the toolchain is missing, comes with the steps that supply it.
-        if python.tool_ready {
-            assert_eq!(
-                python.suggested_commands,
-                vec!["pytest --cov --cov-report=xml".to_string()]
-            );
-            assert!(python.setup_commands.is_empty());
-            assert!(python.duration_hint.contains("few minutes"));
-        } else if python.suggested_commands.is_empty() {
-            // No interpreter at all: an honest refusal.
-            assert!(python.tool_detail.contains("Python"));
-        } else {
-            assert_eq!(
-                python.suggested_commands,
-                vec![format!(
-                    "{} -m pytest --cov --cov-report=xml",
-                    managed_venv_python()
-                )],
-                "coverage must run the virtualenv interpreter GitPulse creates"
-            );
-            assert!(
-                python.setup_commands.iter().any(|c| c.contains("venv")),
-                "the virtualenv must be created first: {:?}",
-                python.setup_commands
-            );
-            assert!(
-                python
-                    .setup_commands
-                    .iter()
-                    .any(|c| c.contains("pip install pytest")),
-                "pytest must actually be installed: {:?}",
-                python.setup_commands
-            );
-            assert!(python.tool_detail.contains("pytest"));
-        }
+        // A lone .py file is not a test suite. Planning pytest here used to
+        // emit a Run button that collected 0 items and logged a coverage ERROR.
+        assert!(
+            python.suggested_commands.is_empty(),
+            "python sources without tests must not plan pytest: {:?}",
+            python.suggested_commands
+        );
+        assert!(!python.tool_ready);
+        assert!(
+            python.tool_detail.contains("No Python tests"),
+            "missing tests must be named: {:?}",
+            python.tool_detail
+        );
         let go = report
             .families
             .iter()
@@ -5862,7 +6066,10 @@ src/main.go:4.1,4.8 1 0
                     "go",
                     go_coverage_plan(repo.path(), &[String::new()], false, false),
                 ),
-                ("swift", swift_coverage_plan(repo.path(), true, false)),
+                (
+                    "swift",
+                    swift_coverage_plan(repo.path(), &[String::new()], false),
+                ),
                 ("dotnet", dotnet_coverage_plan(repo.path(), true, false)),
                 ("dart", dart_coverage_plan(repo.path(), true, false)),
             ];
@@ -5984,7 +6191,10 @@ src/main.go:4.1,4.8 1 0
                 ),
                 ("javascript", javascript_coverage_plan(repo.path(), false)),
                 ("php", php_coverage_plan(repo.path(), false)),
-                ("swift", swift_coverage_plan(repo.path(), true, false)),
+                (
+                    "swift",
+                    swift_coverage_plan(repo.path(), &[String::new()], false),
+                ),
                 ("dotnet", dotnet_coverage_plan(repo.path(), true, false)),
                 ("dart", dart_coverage_plan(repo.path(), true, false)),
             ];
@@ -6359,7 +6569,10 @@ src/main.go:4.1,4.8 1 0
             let root = repo.path();
 
             let plans: Vec<(&str, LanguageCoveragePlan)> = vec![
-                ("swift", swift_coverage_plan(Path::new("."), true, true)),
+                (
+                    "swift",
+                    swift_coverage_plan(Path::new("."), &[String::new()], true),
+                ),
                 ("dotnet", dotnet_coverage_plan(Path::new("."), true, true)),
                 ("dart", dart_coverage_plan(root, true, true)),
                 ("rust", rust_coverage_plan(root, &["".to_string()], true)),

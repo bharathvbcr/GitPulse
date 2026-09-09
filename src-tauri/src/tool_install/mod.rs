@@ -1940,7 +1940,7 @@ mod tests {
             "code_graph_schema_version": 2,
             "linked_grammar_count": 33,
             "store_path": "./.devcouncil/codeintel/devmap.sqlite",
-            "version": "0.1.0"
+            "version": "1.2.3"
         });
         let parsed = parse_doctor_json(&v);
         assert_eq!(parsed.expected_schema_version, Some(19));

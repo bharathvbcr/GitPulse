@@ -55,8 +55,8 @@ export function shouldAutoCheck(
 /**
  * Whether this specific version has already been dismissed by the user.
  *
- * Scoped to the version string, so dismissing 0.1.0 stays quiet for 0.1.0 and
- * speaks up again for 0.2.0. An unchecked or unavailable result is never
+ * Scoped to the version string, so dismissing 1.2.3 stays quiet for 1.2.3 and
+ * speaks up again for 1.3.0. An unchecked or unavailable result is never
  * "dismissed" — there is nothing to dismiss.
  */
 export function isDismissed(result: UpdateCheck, dismissedVersion: string): boolean {

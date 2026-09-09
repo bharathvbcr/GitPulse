@@ -139,7 +139,7 @@ export function releaseTagSuggestion(tags: string[]): string {
       best = candidate;
     }
   }
-  if (!best) return "v0.1.0";
+  if (!best) return "v0.0.1";
   return `v${best[0]}.${best[1]}.${best[2] + 1}`;
 }
 

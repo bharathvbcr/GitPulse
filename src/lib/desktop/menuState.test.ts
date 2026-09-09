@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import { createRepoStore, type RepoState } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
-import { buildMenuState, menuActionEnabled } from "./menuState";
+import { buildMenuState, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
 
 const empty = () => get(createRepoStore({ storage: null }));
 const prefs = () => get(interfaceStore);
@@ -100,5 +100,48 @@ describe("native menu projection", () => {
     expect(state.trayDetails.join(" ")).not.toContain("running");
     expect(menuActionEnabled(state, "fetch")).toBe(false);
     expect(model(loaded(), { "/r/a": ["unstash"] }).traySummary.text).toBe("Popping Stash…");
+  });
+  it("projects stash, parked-operation and other-repo activity onto the status card", () => {
+    const parked: RepoState = { ...loaded(), stashEntries: [
+      { index: 0, selector: "stash@{0}", oid: "a".repeat(40), subject: "wip", message: "wip", branch: "main", timestamp: 0 },
+      { index: 1, selector: "stash@{1}", oid: "b".repeat(40), subject: "old", message: "old", branch: null, timestamp: 0 },
+    ], operation: { probeFailed: false, operation: { kind: "Merge", current_step: null, total_steps: null,
+      head_ref: "main", incoming_ref: null, conflicted_paths: [], conflicted_total: 0, available: ["abort"] } } };
+    const state = model(parked, { "/r/b": ["fetch"] });
+    expect(state.status.stashes).toBe(2);
+    expect(state.status.operation).toContain("Merge in progress");
+    expect(state.status.activity).toBeNull();
+    expect(state.status.elsewhere).toBe(1);
+    expect(statusInsights(state.status).map((item) => item.id)).toEqual(["section:work:overview", "fleet"]);
+    expect(statusShortcuts(state).map((item) => item.id)).toEqual(expect.arrayContaining([
+      "section:history:graph", "section:insights:pulse", "fleet", "terminal-dock",
+    ]));
+    expect(statusShortcuts(state).some((item) => item.id === "copy-branch")).toBe(true);
+    expect(model({ ...loaded(), stashFailed: true }).status.stashes).toBeNull();
+  });
+  it("routes compact status keys without mutating Git", () => {
+    const snapshot = model({ ...loaded(), statuses: [{ path: "a", is_staged: true, is_conflicted: false,
+      status_code: "M", additions: 0, deletions: 0 }] });
+    const idle = { choosing: false, expanded: false };
+    expect(statusKeyAction({ key: "Escape", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
+      .toEqual({ dismiss: true });
+    expect(statusKeyAction({ key: "Escape", metaKey: false, ctrlKey: false, altKey: false }, snapshot,
+      { choosing: true, expanded: true })).toEqual({ collapse: "chooser" });
+    expect(statusKeyAction({ key: "r", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
+      .toEqual({ id: "refresh" });
+    expect(statusKeyAction({ key: "1", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle))
+      .toEqual({ id: "section:work:overview" });
+    expect(statusKeyAction({ key: "3", metaKey: false, ctrlKey: false, altKey: false }, snapshot, idle)).toBeNull();
+    expect(statusKeyAction({ key: "r", metaKey: true, ctrlKey: false, altKey: false }, snapshot, idle)).toBeNull();
+  });
+  it("keeps copy, refresh and appearance in the popover and labels details", () => {
+    expect(statusKeepsPopover("copy-branch")).toBe(true);
+    expect(statusKeepsPopover("refresh")).toBe(true);
+    expect(statusKeepsPopover("toggle-theme")).toBe(true);
+    expect(statusKeepsPopover("section:work:overview")).toBe(false);
+    expect(statusDetailRows(["Repository: /r/a", "Live updates"])).toEqual([
+      { label: "Repository", value: "/r/a" },
+      { label: null, value: "Live updates" },
+    ]);
   });
 });

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatError } from "../ui/formatError";
 import { isTauri } from "../platform";
+import { reduceFileDrop } from "./fileDrop";
 import {
   dispatchNativeMenu,
   type NativeMenuHandlers,
@@ -52,21 +53,25 @@ export async function subscribeNativeShell(handlers: NativeMenuHandlers): Promis
     // Dynamic import mirrors windowChrome.ts: a static import here would pin
     // @tauri-apps/api/window into the main chunk and warn under Vite.
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    // In-app HTML5/pointer drags also emit native enter/over, but without file
+    // paths. reduceFileDrop is what keeps the "Drop a Git repository" veil off
+    // the Kanban board and the tab strip.
+    let sawFiles = false;
+    let overlay = false;
     unlistenAll.push(
       await getCurrentWindow().onDragDropEvent(async (event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          handlers.setDropActive?.(true);
-          return;
+        const decision = reduceFileDrop(event.payload, { sawFiles });
+        sawFiles = decision.sawFiles;
+        // `over` during a file drag must re-assert true so App's hide-grace
+        // timer from a spurious leave is cancelled. False→false is skipped so
+        // Kanban card drags do not start that timer on every pointer move.
+        if (decision.overlay || decision.overlay !== overlay) {
+          handlers.setDropActive?.(decision.overlay);
         }
-        if (event.payload.type === "leave") {
-          handlers.setDropActive?.(false);
-          return;
-        }
-        handlers.setDropActive?.(false);
-        const dropped = event.payload.paths[0];
-        if (!dropped) return;
+        overlay = decision.overlay;
+        if (decision.dropped === null) return;
         try {
-          const root = await resolveGitRoot(dropped);
+          const root = await resolveGitRoot(decision.dropped);
           handlers.openRepo(root);
         } catch (err) {
           handlers.openError(formatError(err));

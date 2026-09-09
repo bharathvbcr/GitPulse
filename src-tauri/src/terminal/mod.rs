@@ -2076,6 +2076,7 @@ pub(crate) fn validate_manvi_paths(
     const NEXT_PATH_FLAGS: &[&str] = &[
         "--manifest-path",
         "--output-path",
+        "--package-path",
         "--junitxml",
         "--cov-config",
         "--rcfile",
@@ -2097,6 +2098,7 @@ pub(crate) fn validate_manvi_paths(
     const PREFIX_PATH_FLAGS: &[&str] = &[
         "--manifest-path=",
         "--output-path=",
+        "--package-path=",
         "--junitxml=",
         "--cov-config=",
         "--rcfile=",
@@ -3169,6 +3171,13 @@ mod tests {
                 "test".into(),
                 "--enable-code-coverage".into(),
             ],
+            vec![
+                "swift".into(),
+                "test".into(),
+                "--package-path".into(),
+                "ios".into(),
+                "--enable-code-coverage".into(),
+            ],
             vec!["dart".into(), "test".into(), "--coverage=coverage".into()],
         ] {
             validate_manvi_action(&argv, ManviActionKind::CoverageGenerator)
@@ -3227,6 +3236,17 @@ mod tests {
         )
         .unwrap();
         validate_manvi_action(
+            &[
+                "swift".into(),
+                "test".into(),
+                "--package-path".into(),
+                "ios".into(),
+                "--enable-code-coverage".into(),
+            ],
+            ManviActionKind::CoverageGenerator,
+        )
+        .unwrap();
+        validate_manvi_action(
             &["dart".into(), "test".into(), "--coverage=coverage".into()],
             ManviActionKind::CoverageGenerator,
         )
@@ -3239,6 +3259,33 @@ mod tests {
                 .expect_err("non-test swift/dart must stay refused");
             assert!(err.contains("allowlist"), "{argv:?}: {err}");
         }
+    }
+
+    #[test]
+    fn coverage_package_path_must_stay_inside_the_repository() {
+        let repo = TempDir::new().unwrap();
+        init_test_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("ios")).unwrap();
+        let inside = vec![
+            "swift".to_string(),
+            "test".to_string(),
+            "--package-path".to_string(),
+            "ios".to_string(),
+            "--enable-code-coverage".to_string(),
+        ];
+        validate_manvi_action(&inside, ManviActionKind::CoverageGenerator).unwrap();
+        validate_manvi_paths(repo.path(), &inside, ManviActionKind::CoverageGenerator)
+            .expect("first-party --package-path must be accepted");
+        let escape = vec![
+            "swift".to_string(),
+            "test".to_string(),
+            "--package-path".to_string(),
+            "../outside".to_string(),
+            "--enable-code-coverage".to_string(),
+        ];
+        let err = validate_manvi_paths(repo.path(), &escape, ManviActionKind::CoverageGenerator)
+            .expect_err("escaped --package-path must be refused");
+        assert!(err.contains("escapes"), "{err}");
     }
 
     // REGRESSION GUARD: repo-local wrapper spellings are the only executable

@@ -61,7 +61,7 @@ describe("toolStatusSummary", () => {
           installed: true,
           path: "/Users/me/.cargo/bin/devmap",
           lookup: "path_search",
-          version: "devmap 0.1.0",
+          version: "devmap 1.2.3",
         }),
       ),
     ).toContain("/Users/me/.cargo/bin/devmap");

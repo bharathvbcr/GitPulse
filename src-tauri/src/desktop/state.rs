@@ -32,6 +32,10 @@ pub struct StatusCard {
     pub primary_label: String,
     pub watch_status: String,
     pub reduce_motion: bool,
+    pub stashes: Option<u32>,
+    pub operation: Option<String>,
+    pub activity: Option<String>,
+    pub elsewhere: u32,
 }
 
 impl Default for StatusCard {
@@ -50,6 +54,10 @@ impl Default for StatusCard {
             primary_label: "Open repository".into(),
             watch_status: "unknown".into(),
             reduce_motion: false,
+            stashes: None,
+            operation: None,
+            activity: None,
+            elsewhere: 0,
         }
     }
 }
@@ -161,6 +169,16 @@ impl MenuState {
             || self
                 .status
                 .upstream
+                .as_ref()
+                .is_some_and(|text| text.len() > 2048)
+            || self
+                .status
+                .operation
+                .as_ref()
+                .is_some_and(|text| text.len() > 2048)
+            || self
+                .status
+                .activity
                 .as_ref()
                 .is_some_and(|text| text.len() > 2048)
         {
@@ -275,5 +293,12 @@ mod tests {
         state.tray_details = vec!["line".into(); 17];
         assert!(state.validate().is_err());
         assert_eq!(menu_text("A\tB\nC & D"), "A B C && D");
+        state = MenuState::default();
+        state.status.operation = Some("x".repeat(2049));
+        assert!(state.validate().is_err());
+        state.status.operation = Some("Merge in progress".into());
+        state.status.stashes = Some(2);
+        state.status.elsewhere = 1;
+        state.validate().unwrap();
     }
 }

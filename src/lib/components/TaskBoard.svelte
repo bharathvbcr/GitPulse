@@ -2,8 +2,15 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { Inbox, Plus, RefreshCw, Search } from "@lucide/svelte";
   import { isTauri } from "../platform";
-  import { explainError, getTask, getWorkspace, listRepositories, listTasks, listWorkspaces, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, type Page, type Repository, type Scope, type Task, type TaskCard, type TaskStatus, type Workspace, type WorkspaceCard } from "../workbench/client";
+  import { isCaseInsensitiveFs } from "../repos/paths";
+  import { repoStore } from "../stores/repoStore";
+  import { LAYERS } from "../ui/layers";
+  import { shouldDismissOverlay } from "../ui/dismiss";
+  import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove, visibleStatuses } from "../workbench/boardDrag";
+  import { explainError, getTask, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, putWorkspace, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, workspaceDraft, type Page, type Repository, type Scope, type Task, type TaskCard, type TaskStatus, type Workspace, type WorkspaceCard } from "../workbench/client";
+  import { addableOpenTabs, membershipAfterAttach, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
   import AutomaticEnhancements from "./AutomaticEnhancements.svelte";
@@ -16,20 +23,36 @@
   let repositoryTotal = $state(0), workspaceTotal = $state(0);
   let columns = $state<Partial<Record<TaskStatus, Page<TaskCard>>>>({});
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
-  let error = $state(""); let catalogError = $state(""); let notice = $state("");
+  let error = $state(""); let catalogError = $state(""); let announce = $state("");
   let taskEditor = $state<{ value: Task | null } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
-  let opening = $state(false); let moving = $state(false); let drag = $state<TaskCard | null>(null);
+  let opening = $state(false); let moving = $state(false);
+  let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
+  let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; x: number; y: number } | null>(null);
+  let skipClick = false;
   let showInbox = $state(false);
+  let unread = $state(0);
+  let addMenu = $state(false);
+  let adding = $state(false);
+  let addMenuEl: HTMLDivElement | undefined = $state();
+  let workspaceMemberIds = $state<string[] | null>(null);
   let revision = 0; let disposed = false; let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
+  const openTabRefs = $derived($repoStore.openTabs.map((tab) => ({ path: tab.path, label: tab.label })));
+  const catalogIds = $derived(repositories.map((repo) => repo.id));
+  const selectedForMenu = $derived(pickerSelectionIds(scope.kind, workspaceMemberIds, catalogIds));
+  const menuTabs = $derived(addableOpenTabs(openMembershipCandidates(openTabRefs, repositories, selectedForMenu, pathOpts)));
+  const emptyAddLabel = $derived(openAddActionLabel(menuTabs));
   const title = $derived.by(() => {
     const target = scope;
-    return target.kind === "global" ? "All tasks" : target.kind === "workspace"
-      ? workspaces.find((w) => w.id === target.id)?.name ?? "Workspace tasks"
-      : repositories.find((r) => r.id === target.id)?.name ?? "Repository tasks";
+    return target.kind === "global" ? "Tasks" : target.kind === "workspace"
+      ? workspaces.find((w) => w.id === target.id)?.name ?? "Workspace"
+      : repositories.find((r) => r.id === target.id)?.name ?? "Repository";
   });
   const total = $derived(STATUSES.reduce((sum, status) => sum + (columns[status]?.total ?? 0), 0));
-  const mounted = $derived(STATUSES.reduce((sum, status) => sum + (columns[status]?.shown ?? 0), 0));
+  const counts = $derived(Object.fromEntries(STATUSES.map((status) => [status, columns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
+  const shown = $derived(visibleStatuses(counts, drag !== null));
+  function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
 
   async function catalog() {
     const [repos, groups] = await Promise.all([listRepositories(), listWorkspaces()]);
@@ -39,7 +62,7 @@
     catalogError = "";
   }
   async function loadBoard(target: Scope = scope, query: string = search) {
-    const generation = ++revision; loading = true; error = ""; columns = {};
+    const generation = ++revision; loading = true; error = "";
     try {
       const pages = await Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query)] as const));
       if (generation !== revision || disposed) return;
@@ -47,9 +70,15 @@
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
+  async function loadUnread() {
+    try {
+      const page = await listAttention(scope, "unread");
+      if (!disposed) unread = page.total;
+    } catch { /* keep the last badge rather than invent a zero */ }
+  }
   async function refresh() {
     try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
-    if (initialized && active && !disposed) await loadBoard();
+    if (initialized && active && !disposed) { await loadBoard(); await loadUnread(); }
   }
   function scheduleRefresh() {
     if (!active || disposed) return;
@@ -67,20 +96,91 @@
   onMount(() => {
     void initialize();
     let unlisten: (() => void) | undefined;
-    if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => { if (disposed) stop(); else unlisten = stop; }).catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Refresh to check for changes.`; });
+    if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => { if (disposed) stop(); else unlisten = stop; }).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
+    const onPointerDown = (event: PointerEvent) => { if (addMenu && shouldDismissOverlay(event.target, "[data-add-repo]")) addMenu = false; };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && addMenu) addMenu = false; };
     window.addEventListener("focus", scheduleRefresh);
-    return () => { disposed = true; revision++; clearTimeout(refreshTimer); unlisten?.(); window.removeEventListener("focus", scheduleRefresh); };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      disposed = true; revision++; clearTimeout(refreshTimer); unlisten?.();
+      window.removeEventListener("focus", scheduleRefresh);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKey);
+    };
   });
   $effect(() => {
     if (!initialized || !active) return;
     const target = scope, query = search;
-    columns = {}; loading = true;
-    const timer = setTimeout(() => { void loadBoard(target, query); }, 250);
+    loading = true;
+    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
-  async function addRepository() {
-    try { const path = await invoke<string | null>("cmd_pick_folder"); if (!path) return; const repo = await registerRepository(path); await catalog(); notice = `Added ${repo.name}`; }
-    catch (cause) { catalogError = explainError(cause); }
+  $effect(() => {
+    if (scope.kind !== "workspace") {
+      workspaceMemberIds = null;
+      return;
+    }
+    const id = scope.id;
+    void getWorkspace(id).then((full) => {
+      if (disposed || scope.kind !== "workspace" || scope.id !== id) return;
+      workspaceMemberIds = full.repository_ids;
+    }).catch((cause) => { if (!disposed) catalogError = explainError(cause); });
+  });
+  $effect(() => {
+    if (addMenu && addMenuEl) addMenuEl.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+  });
+  async function attachRegistered(repos: Repository[]) {
+    if (scope.kind !== "workspace" || repos.length === 0) return;
+    const full = await getWorkspace(scope.id);
+    if (disposed) return;
+    const next = membershipAfterAttach(full.repository_ids, repos.map((repo) => repo.id));
+    if (next.length === full.repository_ids.length) {
+      workspaceMemberIds = full.repository_ids;
+      return;
+    }
+    const saved = await putWorkspace({ ...workspaceDraft(full), id: full.id, expected_revision: full.revision, request_id: newID(), repository_ids: next });
+    if (scope.kind === "workspace" && scope.id === saved.id) workspaceMemberIds = saved.repository_ids;
+  }
+  async function addPaths(paths: string[]) {
+    addMenu = false;
+    if (paths.length === 0 || adding) return;
+    adding = true;
+    try {
+      const added: Repository[] = [];
+      for (const path of paths) {
+        added.push(await registerRepository(path));
+        if (disposed) return;
+      }
+      await attachRegistered(added);
+      if (disposed) return;
+      await catalog();
+      announce = added.length === 1 ? `Added ${added[0].name}` : `Added ${added.length} repositories`;
+    } catch (cause) { catalogError = explainError(cause); }
+    finally { adding = false; }
+  }
+  async function pickFolder() {
+    addMenu = false;
+    try {
+      const path = await invoke<string | null>("cmd_pick_folder");
+      if (!path) return;
+      await addPaths([path]);
+    } catch (cause) { catalogError = explainError(cause); }
+  }
+  function toggleAddMenu() {
+    if (adding) return;
+    if (menuTabs.length === 0) { void pickFolder(); return; }
+    addMenu = !addMenu;
+  }
+  function onAddMenuKey(event: KeyboardEvent) {
+    const items = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('[role="menuitem"]')];
+    if (items.length === 0) return;
+    const index = Math.max(0, items.indexOf(event.target as HTMLElement));
+    if (event.key === "ArrowDown") { event.preventDefault(); items[(index + 1) % items.length]?.focus(); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); items[(index - 1 + items.length) % items.length]?.focus(); }
+    else if (event.key === "Home") { event.preventDefault(); items[0]?.focus(); }
+    else if (event.key === "End") { event.preventDefault(); items[items.length - 1]?.focus(); }
+    else if (event.key === "Escape") { event.preventDefault(); addMenu = false; }
   }
   async function moreRepositories() {
     if (!repositoryCursor) return;
@@ -109,15 +209,81 @@
     catch (cause) { if (generation === revision) error = explainError(cause); }
     finally { if (generation === revision) loading = false; }
   }
-  async function drop(status: TaskStatus) {
-    const card = drag; drag = null;
-    if (!card || card.status === status || moving) return;
+  function statusAtPoint(x: number, y: number): TaskStatus | null {
+    const node = document.elementFromPoint(x, y);
+    if (!(node instanceof Element)) return null;
+    return parseColumnStatus(node.closest("[data-task-column]")?.getAttribute("data-task-column"));
+  }
+  function slotAtPoint(y: number, status: TaskStatus | null, draggedId: string): number {
+    if (!status) return 0;
+    const col = document.querySelector(`[data-task-column="${status}"]`);
+    if (!col) return 0;
+    const mids: number[] = [];
+    for (const el of col.querySelectorAll("[data-task-card]")) {
+      if (!(el instanceof HTMLElement) || el.dataset.cardId === draggedId) continue;
+      const rect = el.getBoundingClientRect();
+      mids.push(rect.top + rect.height / 2);
+    }
+    return insertIndexFromY(mids, y);
+  }
+  function releasePointer(target: EventTarget | null, pointerId: number) {
+    if (target instanceof HTMLElement && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+  }
+  function onCardPointerDown(e: PointerEvent, card: TaskCard) {
+    if (e.button !== 0 || moving || opening) return;
+    press = { card, x: e.clientX, y: e.clientY };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onCardPointerMove(e: PointerEvent) {
+    if (!press) return;
+    if (!drag) {
+      if (!dragExceeded(e.clientX - press.x, e.clientY - press.y)) return;
+      drag = { card: press.card, over: press.card.status, insertIndex: 0, x: e.clientX, y: e.clientY };
+    }
+    const over = statusAtPoint(e.clientX, e.clientY);
+    drag = { card: drag.card, over, insertIndex: slotAtPoint(e.clientY, over, drag.card.id), x: e.clientX, y: e.clientY };
+  }
+  function onCardPointerUp(e: PointerEvent) {
+    const current = drag;
+    drag = null;
+    press = null;
+    releasePointer(e.currentTarget, e.pointerId);
+    if (!current) return;
+    skipClick = true;
+    requestAnimationFrame(() => { skipClick = false; });
+    const over = current.over;
+    const fromIndex = (columns[current.card.status]?.items ?? []).findIndex((item) => item.id === current.card.id);
+    if (!shouldCommitMove(current.card.status, over, { moving, fromIndex, insertIndex: current.insertIndex })) return;
+    const items = columns[over]?.items ?? [];
+    const { before, after } = insertionNeighbors(items, current.card.id, current.insertIndex);
+    void moveCard(current.card, over, insertionPosition(before, after));
+  }
+  function onCardClick(card: TaskCard) {
+    if (skipClick) return;
+    void openTask(card.id);
+  }
+  function onCardPointerCancel(e: PointerEvent) {
+    drag = null;
+    press = null;
+    releasePointer(e.currentTarget, e.pointerId);
+  }
+  function onCardKeydown(e: KeyboardEvent, card: TaskCard) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const next = neighborStatus(card.status, e.key === "ArrowRight" ? 1 : -1);
+    if (!next) return;
+    const last = (columns[next]?.items ?? []).at(-1);
+    void moveCard(card, next, insertionPosition(last?.position ?? null, null));
+  }
+  async function moveCard(card: TaskCard, status: TaskStatus, position: number) {
+    if (moving) return;
+    if (card.status === status && card.position === position) return;
     moving = true; error = "";
     try {
       const full = await getTask(card.id);
       if (full.revision !== card.revision) throw new Error("This task changed while you were moving it. Refresh and try again.");
-      await putTask(taskWrite(full.id, full.revision, { ...taskDraft(full), status, position: Date.now() }));
-      notice = `Moved “${full.title}” to ${STATUS_LABELS[status]}`;
+      await putTask(taskWrite(full.id, full.revision, { ...taskDraft(full), status, position }));
+      announce = `Moved to ${STATUS_LABELS[status]}`;
       await loadBoard();
     } catch (cause) { error = explainError(cause); } finally { moving = false; }
   }
@@ -125,52 +291,175 @@
     if (taskEditor && !window.confirm("Start a new task and discard the current unsaved edits?")) return;
     workspaceEditor = null; taskEditor = { value: null };
   }
+  function insertBefore(status: TaskStatus, cardId: string): boolean {
+    if (!drag || drag.over !== status || drag.card.id === cardId) return false;
+    const rest = (columns[status]?.items ?? []).filter((item) => item.id !== drag?.card.id);
+    return rest.findIndex((item) => item.id === cardId) === drag.insertIndex;
+  }
+  function insertAtEnd(status: TaskStatus): boolean {
+    if (!drag || drag.over !== status) return false;
+    const rest = (columns[status]?.items ?? []).filter((item) => item.id !== drag?.card.id);
+    return drag.insertIndex >= rest.length;
+  }
 </script>
 
-<div class="workbench" data-testid="task-board">
+<div class="workbench" class:is-dragging={drag !== null} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator" aria-label="Task scopes">
-      <div class="nav-heading">Workspaces<button type="button" title="Create workspace" onclick={() => { workspaceEditor = { value: null }; taskEditor = null; }}>+</button></div>
-      <button class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>All tasks</button>
+      <div class="nav-heading">Workspaces<button type="button" class="icon" title="New workspace" aria-label="New workspace" onclick={() => { workspaceEditor = { value: null }; taskEditor = null; }}><Plus size={12} /></button></div>
+      <button type="button" class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>All</button>
       {#each [...workspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        <div class="nav-row"><button type="button" class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
-      {#if workspaceCursor}<button onclick={moreWorkspaces}>More workspaces ({workspaces.length}/{workspaceTotal})</button>{/if}
-      <div class="nav-heading">Repositories<button type="button" onclick={addRepository} title="Add repository">+</button></div>
-      {#each repositories as repo (repo.id)}<button class:selected={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>{repo.name}</button>{/each}
-      {#if repositoryCursor}<button onclick={moreRepositories}>More repositories ({repositories.length}/{repositoryTotal})</button>{/if}
-      {#if repositories.length === 0 && initialized}<p>Add repositories to start creating linked tasks.</p>{/if}
+      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
+      <div class="nav-heading" data-add-repo>Repositories<button type="button" class="icon" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title="Add repository" aria-label="Add repository" disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
+        {#if addMenu}
+          <div bind:this={addMenuEl} id="task-add-repo-menu" class="add-menu gp-menu" role="menu" aria-label="Add repository" tabindex="-1" style="z-index: {LAYERS.MENU}" onkeydown={onAddMenuKey}>
+            {#if menuTabs.length}<div class="add-menu-label">Open</div>{/if}
+            {#each menuTabs as tab (tab.path)}
+              <button type="button" class="add-item" role="menuitem" title={tab.path} onclick={() => void addPaths([tab.path])}>
+                <span class="add-name">{tab.label}</span>
+                <span class="add-path">{tab.path}</span>
+              </button>
+            {/each}
+            {#if menuTabs.length > 1}<button type="button" role="menuitem" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))}>Add all open</button>{/if}
+            <button type="button" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
+          </div>
+        {/if}
+      </div>
+      {#each repositories as repo (repo.id)}<button type="button" class:selected={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>{repo.name}</button>{/each}
+      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
     </nav>
   {/if}
   <main class="board-main">
-    <header><div><div class="eyebrow">{scope.kind === "global" ? "GLOBAL BOARD" : scope.kind === "workspace" ? "WORKSPACE BOARD" : "REPOSITORY BOARD"}</div><h1>{title}</h1><small>{loading ? "Loading…" : `${total} tasks · ${mounted} shown`}</small></div><div class="actions"><input aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks…" maxlength="512" /><button onclick={() => initialized ? refresh() : initialize()} disabled={loading}>Refresh</button><button class="primary" onclick={createTask} disabled={!initialized || !repositories.length}>New task</button></div></header>
-    {#if initialized}<AutomaticEnhancements {active} />{/if}
-    {#if initialized}<div class="actions" style="padding:0 18px"><button aria-expanded={showInbox} onclick={() => { showInbox = !showInbox; }}>{showInbox ? "Hide activity inbox" : "Activity inbox"}</button></div>{/if}
+    <header>
+      <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
+      <div class="actions">
+        <label class="search"><Search size={12} /><input aria-label="Search tasks" type="search" bind:value={search} placeholder="Search" maxlength="512" /></label>
+        {#if initialized}<AutomaticEnhancements {active} compact />{/if}
+        {#if initialized}
+          <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title="Inbox" onclick={() => { showInbox = !showInbox; }}>
+            <Inbox size={13} />
+            {#if unread > 0}<span class="gp-pill">{unread}</span>{/if}
+          </button>
+        {/if}
+        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
+        <button type="button" class="gp-btn-primary" onclick={createTask} disabled={!initialized || !repositories.length}>New</button>
+        {#if initialized && !repositories.length}
+          {#if emptyAddLabel}
+            <button type="button" class="hint-action" onclick={() => void addPaths(menuTabs.map((tab) => tab.path))} disabled={adding}>{emptyAddLabel}</button>
+          {:else}
+            <span class="hint">Add a repository to create tasks</span>
+          {/if}
+        {/if}
+      </div>
+    </header>
     {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
-    {#if catalogError}<div class="banner error" role="alert">{catalogError}<button onclick={() => initialized ? refresh() : initialize()}>Retry loading workspaces</button></div>{/if}
+    {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
-    {#if notice}<div class="banner" role="status">{notice}<button onclick={() => { notice = ""; }} aria-label="Dismiss notice">✕</button></div>{/if}
-    <div class="columns" aria-busy={loading || moving}>
-      {#each STATUSES as status}
-        <section class="column" aria-label={STATUS_LABELS[status]}>
-          <button class="column-title" ondragover={(e) => { if (drag) e.preventDefault(); }} ondrop={(e) => { e.preventDefault(); void drop(status); }} title="Drop a task here to change its status; use the task editor for keyboard access"><span>{STATUS_LABELS[status]}</span><span>{columns[status]?.total ?? "—"}</span></button>
+    <div class="sr-only" role="status" aria-live="polite">{announce}</div>
+    <div class="columns" aria-busy={loading || moving} data-testid="task-columns">
+      {#each shown as status (status)}
+        <section
+          class="column"
+          class:drop-target={drag !== null && drag.over === status}
+          data-task-column={status}
+          data-testid="task-column"
+          aria-label={STATUS_LABELS[status]}
+        >
+          <div class="column-title"><span>{STATUS_LABELS[status]}</span><span>{columns[status]?.total ?? "—"}</span></div>
           <div class="cards">
             {#each columns[status]?.items ?? [] as card (card.id)}
-              <button class="card" draggable={!moving} ondragstart={(e) => { drag = card; e.dataTransfer?.setData("text/plain", card.id); }} ondragend={() => { drag = null; }} onclick={() => openTask(card.id)} disabled={opening}>
-                <div class="card-meta"><span>{card.kind}</span><span>{["Urgent", "High", "Normal", "Low"][card.priority]}</span></div><h3>{card.title}</h3><div class="card-repos">{card.repository_ids.map((id) => repositories.find((r) => r.id === id)?.name ?? id).join(" · ")}</div>{#if card.labels.length}<div class="labels">{#each card.labels.slice(0, 3) as label}<span>{label}</span>{/each}{#if card.labels.length > 3}<span>+{card.labels.length - 3}</span>{/if}</div>{/if}
+              {@const face = cardFace(card, repoName)}
+              {#if insertBefore(status, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
+              <button
+                type="button"
+                class="card"
+                class:dragging={drag?.card.id === card.id}
+                data-testid="task-card"
+                data-task-card
+                data-card-id={card.id}
+                draggable="false"
+                aria-grabbed={drag?.card.id === card.id}
+                aria-keyshortcuts="ArrowLeft ArrowRight"
+                disabled={opening}
+                onpointerdown={(e) => onCardPointerDown(e, card)}
+                onpointermove={onCardPointerMove}
+                onpointerup={onCardPointerUp}
+                onpointercancel={onCardPointerCancel}
+                onclick={() => onCardClick(card)}
+                onkeydown={(e) => onCardKeydown(e, card)}
+              >
+                <div class="card-meta">
+                  {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
+                  <h3>{face.title}</h3>
+                </div>
+                {#if face.repo}<div class="card-repos">{face.repo}</div>{/if}
+                {#if face.labels.length}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}</div>{/if}
               </button>
             {/each}
-            {#if !loading && columns[status]?.total === 0}<p class="empty">No tasks</p>{/if}
+            {#if insertAtEnd(status)}<div class="insert" aria-hidden="true"></div>{/if}
           </div>
-          {#if columns[status] && (columns[status]?.total ?? 0) > 30}<div class="paging"><button onclick={() => pageColumn(status)} disabled={loading}>First page</button>{#if columns[status]?.next_cursor}<button onclick={() => pageColumn(status, columns[status]?.next_cursor ?? undefined)} disabled={loading}>Next 30 →</button>{/if}</div>{/if}
+          {#if columns[status] && (columns[status]?.total ?? 0) > 30}<div class="paging"><button type="button" class="gp-btn" onclick={() => pageColumn(status)} disabled={loading}>First</button>{#if columns[status]?.next_cursor}<button type="button" class="gp-btn" onclick={() => pageColumn(status, columns[status]?.next_cursor ?? undefined)} disabled={loading}>Next</button>{/if}</div>{/if}
         </section>
       {/each}
     </div>
   </main>
-  {#if taskEditor}{#key taskEditor}<TaskEditor {active} value={taskEditor.value} {repositories} {workspaces} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
-  {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor value={workspaceEditor.value} {repositories} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
+  {#if drag}
+    <div class="ghost" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
+  {/if}
+  {#if taskEditor}{#key taskEditor}<TaskEditor {active} value={taskEditor.value} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
+  {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
 <style>
-  .workbench{display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));background:rgb(var(--c-bg));overflow:hidden}.navigator{width:205px;flex-shrink:0;border-right:1px solid rgb(var(--c-border));padding:14px 10px;overflow:auto}.navigator button{display:block;width:100%;text-align:left;border:0;padding:7px 10px;border-radius:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.navigator button:hover,button:hover{background:rgb(var(--c-surface-hover))}.navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}.nav-heading{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;margin-top:8px;color:rgb(var(--c-text-muted));font-size:11px;font-weight:650}.nav-heading button,.nav-row>button:last-child{width:30px;flex-shrink:0;text-align:center}.nav-row{display:flex}.nav-row>button:first-child{min-width:0;flex:1}.navigator p{font-size:12px;padding:10px;color:rgb(var(--c-text-muted))}.board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}header{padding:22px 24px 18px;display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border))}h1{font-size:23px;line-height:1.3;font-weight:650;margin:4px 0}.eyebrow{font-size:9px;font-weight:700;letter-spacing:.14em;color:rgb(var(--c-text-muted))}small{color:rgb(var(--c-text-muted));font-size:11px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}button,input{font-size:12px}button{border:1px solid rgb(var(--c-border));padding:7px 11px;border-radius:7px}button:disabled{opacity:.5}.primary{background:rgb(var(--c-accent));color:white}input{background:rgb(var(--c-surface));border:1px solid rgb(var(--c-border));border-radius:7px;padding:8px 10px;color:inherit;width:180px}.columns{display:flex;gap:13px;padding:20px;overflow:auto;flex:1;min-height:0;align-items:stretch}.column{width:245px;min-width:210px;flex:1;display:flex;flex-direction:column;background:color-mix(in srgb,rgb(var(--c-surface)) 50%,transparent);border-radius:10px;border:1px solid rgb(var(--c-border));overflow:hidden}.column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;background:rgb(var(--c-surface));border:0;border-bottom:1px solid rgb(var(--c-border));border-radius:0;padding:11px}.column-title span:last-child{color:rgb(var(--c-text-muted));font-weight:400}.cards{padding:8px;overflow:auto;flex:1;min-height:120px}.card{width:100%;display:block;text-align:left;padding:11px;margin-bottom:8px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-surface));box-shadow:0 1px 3px #00000008}.card:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}.card h3{font-size:12px;line-height:1.5;font-weight:550;margin:8px 0;overflow-wrap:anywhere}.card-meta{display:flex;justify-content:space-between;gap:8px;font-size:9px;color:rgb(var(--c-text-muted));text-transform:uppercase;letter-spacing:.04em}.card-repos{font-size:10px;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.labels{display:flex;gap:4px;margin-top:8px;font-size:9px;flex-wrap:wrap}.labels span{padding:2px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent);color:rgb(var(--c-text-muted))}.empty{text-align:center;color:rgb(var(--c-text-muted));font-size:11px;margin:22px}.paging{display:flex;gap:5px;padding:8px}.paging button{font-size:10px;padding:4px 6px}.banner{padding:8px 20px;font-size:12px;border-bottom:1px solid rgb(var(--c-border));display:flex;align-items:center;justify-content:space-between;gap:10px}.error{color:#d15a64}
+  .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));background:rgb(var(--c-bg));overflow:hidden}
+  .workbench.is-dragging{cursor:grabbing;user-select:none}
+  .navigator{width:188px;flex-shrink:0;border-right:1px solid rgb(var(--c-border));padding:10px 8px;overflow:auto}
+  .navigator button{display:block;width:100%;text-align:left;border:0;padding:6px 8px;border-radius:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+  .navigator button:hover,button:hover{background:rgb(var(--c-surface-hover))}
+  .navigator button.selected{background:color-mix(in srgb,rgb(var(--c-accent)) 13%,transparent);color:rgb(var(--c-accent))}
+  .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
+  .nav-heading > button,.icon,.nav-row>button:last-child{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+  .add-menu{position:absolute;right:0;top:calc(100% + 4px);width:min(260px,70vw);max-height:min(16rem,50vh);overflow:auto}
+  .add-menu-label{padding:4px 8px;font-size:10px;color:rgb(var(--c-text-muted))}
+  .navigator .add-menu button{width:100%;height:auto;padding:6px 8px;white-space:normal;overflow:visible}
+  .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px}
+  .add-name,.add-path{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .add-path{font-size:10px;color:rgb(var(--c-text-muted))}
+  .hint-action{border:0;background:transparent;padding:0;color:rgb(var(--c-accent));font-size:11px}
+  .nav-row{display:flex}
+  .nav-row>button:first-child{min-width:0;flex:1}
+  .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
+  header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border))}
+  h1{font-size:15px;line-height:1.2;font-weight:650;margin:0;display:flex;align-items:baseline;gap:8px}
+  h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
+  .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  button,input{font-size:12px}
+  button:disabled{opacity:.5}
+  .hint{font-size:11px;color:rgb(var(--c-text-muted))}
+  .search{display:flex;align-items:center;gap:6px;background:rgb(var(--c-surface));border:1px solid rgb(var(--c-border));border-radius:7px;padding:0 8px;color:rgb(var(--c-text-muted))}
+  .search input{border:0;background:transparent;padding:6px 0;width:140px;color:inherit}
+  .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
+  .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;background:color-mix(in srgb,rgb(var(--c-surface)) 45%,transparent);border-radius:10px;border:1px solid rgb(var(--c-border));overflow:hidden;min-height:0}
+  .column.drop-target{border-color:rgb(var(--c-accent));background:color-mix(in srgb,rgb(var(--c-accent)) 10%,transparent)}
+  .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;background:rgb(var(--c-surface));border-bottom:1px solid rgb(var(--c-border));padding:8px 10px}
+  .column-title span:last-child{color:rgb(var(--c-text-muted));font-weight:400}
+  .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
+  .card{width:100%;display:block;text-align:left;padding:8px 9px;margin-bottom:6px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-surface));cursor:grab;touch-action:none;user-select:none}
+  .card:focus-visible{outline:2px solid rgb(var(--c-accent));outline-offset:2px}
+  .card.dragging{opacity:.35;cursor:grabbing}
+  .card h3{font-size:12px;line-height:1.4;font-weight:550;margin:0;overflow-wrap:anywhere;min-width:0}
+  .card-meta{display:flex;align-items:flex-start;gap:6px}
+  .pip{width:7px;height:7px;margin-top:4px;border-radius:99px;flex-shrink:0;background:rgb(var(--c-accent))}
+  .pip[data-priority="0"]{background:#d15a64}
+  .insert{height:2px;margin:2px 4px;border-radius:2px;background:rgb(var(--c-accent))}
+  .card-repos{font-size:10px;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px}
+  .labels{display:flex;gap:4px;margin-top:6px;font-size:9px;flex-wrap:wrap}
+  .labels span{padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent);color:rgb(var(--c-text-muted))}
+  .paging{display:flex;gap:5px;padding:6px}
+  .paging button{font-size:10px;padding:3px 6px}
+  .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border));display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .error{color:#d15a64}
+  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;border-radius:8px;background:rgb(var(--c-surface));border:1px solid rgb(var(--c-accent));font-size:12px;font-weight:550;box-shadow:0 8px 24px #00000022;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>

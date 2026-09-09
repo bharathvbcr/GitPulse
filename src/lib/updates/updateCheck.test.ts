@@ -12,9 +12,9 @@ import {
 function result(overrides: Partial<UpdateCheck> = {}): UpdateCheck {
   return {
     currentVersion: "0.0.3",
-    latestVersion: "0.1.0",
+    latestVersion: "1.2.3",
     updateAvailable: true,
-    releaseUrl: "https://github.com/bharathvbcr/GitPulse/releases/tag/v0.1.0",
+    releaseUrl: "https://github.com/bharathvbcr/GitPulse/releases/tag/v1.2.3",
     checked: true,
     error: null,
     ...overrides,
@@ -87,7 +87,7 @@ describe("describeUpdateCheck", () => {
   it("names both versions when an update exists", () => {
     const status = describeUpdateCheck(result());
     expect(status.kind).toBe("available");
-    expect(status.message).toContain("0.1.0");
+    expect(status.message).toContain("1.2.3");
     expect(status.message).toContain("0.0.3");
   });
 
@@ -99,14 +99,14 @@ describe("describeUpdateCheck", () => {
 
 describe("isDismissed", () => {
   it("matches only the exact dismissed version", () => {
-    expect(isDismissed(result({ latestVersion: "0.1.0" }), "0.1.0")).toBe(true);
-    expect(isDismissed(result({ latestVersion: "0.2.0" }), "0.1.0")).toBe(false);
+    expect(isDismissed(result({ latestVersion: "1.2.3" }), "1.2.3")).toBe(true);
+    expect(isDismissed(result({ latestVersion: "0.2.0" }), "1.2.3")).toBe(false);
     expect(isDismissed(result(), "")).toBe(false);
   });
 
   it("never treats an unchecked result as dismissed", () => {
-    expect(isDismissed(result({ checked: false }), "0.1.0")).toBe(false);
-    expect(isDismissed(result({ updateAvailable: false }), "0.1.0")).toBe(false);
+    expect(isDismissed(result({ checked: false }), "1.2.3")).toBe(false);
+    expect(isDismissed(result({ updateAvailable: false }), "1.2.3")).toBe(false);
   });
 });
 
@@ -170,7 +170,7 @@ describe("maybeNotifyUpdate", () => {
       prefs: {
         checkForUpdates: true,
         lastUpdateCheckAt: 0,
-        dismissedUpdateVersion: "0.1.0",
+        dismissedUpdateVersion: "1.2.3",
       },
     });
     await expect(maybeNotifyUpdate(d)).resolves.toBe("current");
@@ -185,7 +185,7 @@ describe("maybeNotifyUpdate", () => {
       prefs: {
         checkForUpdates: true,
         lastUpdateCheckAt: 0,
-        dismissedUpdateVersion: "0.1.0",
+        dismissedUpdateVersion: "1.2.3",
       },
     });
     await expect(maybeNotifyUpdate(d)).resolves.toBe("notified");

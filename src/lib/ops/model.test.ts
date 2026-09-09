@@ -11,7 +11,7 @@ import {
 describe("MANVI ops helpers", () => {
   it("suggests the next stable patch without being confused by prereleases", () => {
     expect(releaseTagSuggestion(["v1.2.9", "v1.3.0-beta.1", "not-a-release"])).toBe("v1.2.10");
-    expect(releaseTagSuggestion([])).toBe("v0.1.0");
+    expect(releaseTagSuggestion([])).toBe("v0.0.1");
   });
 
   it("formats release dates gracefully", () => {

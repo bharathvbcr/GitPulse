@@ -102,11 +102,19 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     if !recent && !state.enabled(id) {
         return;
     }
-    // Refresh and repository switching are useful without leaving the status menu.
+    // Refresh, switching, copy and appearance stay in the status menu. Reveal and
+    // remote website run in the background so Finder or a browser can take over.
     if from_tray
         && !matches!(
             action,
-            NativeAction::Refresh | NativeAction::ActivateRepo(_)
+            NativeAction::Refresh
+                | NativeAction::ActivateRepo(_)
+                | NativeAction::ToggleTheme
+                | NativeAction::CopyBranch
+                | NativeAction::CopyRepoPath
+                | NativeAction::CopyCommit
+                | NativeAction::RevealRepo
+                | NativeAction::OpenRemote
         )
     {
         if let Err(error) = reveal_main(app) {
@@ -332,6 +340,7 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         || previous.tray_details != next.tray_details
         || previous.repositories != next.repositories
         || previous.enabled(actions::REFRESH) != next.enabled(actions::REFRESH)
+        || previous.status.primary_label != next.status.primary_label
     {
         tray::apply(app, &next)?;
     }

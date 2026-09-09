@@ -395,7 +395,7 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
 fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
     // The old text-heavy left-click menu is replaced by the popover. A minimal
     // right-click menu remains an independent escape path if its webview fails.
-    let menu = gitpulse_lib::desktop::build_tray_menu(app.handle()).unwrap();
+    let menu = gitpulse_lib::desktop::build_tray_menu(app.handle(), &MenuState::default()).unwrap();
     let items = menu.items().unwrap();
     assert_eq!(items.len(), 3);
     for (item, id) in items
@@ -405,6 +405,32 @@ fn check_status_menu(app: &tauri::App<tauri::test::MockRuntime>) {
         assert_eq!(item.id().as_ref(), id);
         assert!(item.as_menuitem().unwrap().is_enabled().unwrap());
     }
+    let mut busy = MenuState::default();
+    busy.enabled.push("refresh".into());
+    busy.enabled.push("section:work:overview".into());
+    busy.tray_summary.id = "section:work:overview".into();
+    busy.status.primary_label = "Review changes".into();
+    busy.validate().unwrap();
+    let ids: Vec<String> = gitpulse_lib::desktop::build_tray_menu(app.handle(), &busy)
+        .unwrap()
+        .items()
+        .unwrap()
+        .iter()
+        .filter_map(|item| {
+            item.as_menuitem()
+                .map(|entry| entry.id().as_ref().to_string())
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "tray:show",
+            "tray:section:work:overview",
+            "tray:refresh",
+            "tray:settings",
+            "tray:quit"
+        ]
+    );
     println!(
         "ok   status popover retains an independent native Open, Settings and Quit escape path"
     );

@@ -21,7 +21,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     .unwrap();
     fs::write(
         repo.join("Cargo.toml"),
-        "[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
+        "[package]\nname='fixture'\nversion='1.2.3'\nedition='2021'\n",
     )
     .unwrap();
     fs::create_dir_all(repo.join("target/debug")).unwrap();

@@ -402,11 +402,11 @@ mod tests {
 
     #[test]
     fn reports_an_available_update() {
-        let result = evaluate("0.0.3", &line("v0.1.0"));
+        let result = evaluate("0.0.3", &line("v1.2.3"));
         assert!(result.checked);
         assert!(result.update_available);
-        assert_eq!(result.latest_version, "0.1.0");
-        assert!(result.release_url.ends_with("/releases/tag/v0.1.0"));
+        assert_eq!(result.latest_version, "1.2.3");
+        assert!(result.release_url.ends_with("/releases/tag/v1.2.3"));
         assert_eq!(result.error, None);
     }
 
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn a_remote_behind_us_is_not_an_update() {
         // Running a locally-built newer version than anything published.
-        let result = evaluate("0.2.0", &line("v0.1.0"));
+        let result = evaluate("2.0.0", &line("v1.2.3"));
         assert!(result.checked);
         assert!(!result.update_available);
     }

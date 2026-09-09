@@ -207,7 +207,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.2.3"
 edition = "2021"
 license = "MIT"
 
@@ -230,7 +230,7 @@ unsafe_code = "forbid"
       `[package]\nname = "a"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nserde.workspace = true\nanyhow = { workspace = true, optional = true }\n`,
       workspace,
     );
-    expect(text).toContain(`version = "0.1.0"`);
+    expect(text).toContain(`version = "1.2.3"`);
     expect(text).toContain(`edition = "2021"`);
     expect(text).toContain(`serde = { version = "1.0", features = ["derive"] }`);
     // A bare string spec becomes a table so the extras have somewhere to go,

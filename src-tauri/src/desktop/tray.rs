@@ -1,6 +1,7 @@
+use super::actions;
 use super::state::MenuState;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     AppHandle, Runtime,
 };
 
@@ -36,22 +37,35 @@ fn pulse_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new_owned(rgba, SIZE, SIZE)
 }
 
-/// Right-click escape hatch. Left click opens the card popover.
-pub fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+fn tray_item<R: Runtime>(app: &AppHandle<R>, id: &str, label: &str) -> tauri::Result<MenuItem<R>> {
+    MenuItem::with_id(app, format!("tray:{id}"), label, true, None::<&str>)
+}
+
+/// Right-click escape hatch plus the current primary/refresh actions. Left click opens the card popover.
+pub fn build_tray_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &MenuState,
+) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
-    for (id, label) in [
-        ("show", "Open GitPulse"),
-        ("settings", "Settings…"),
-        ("quit", "Quit GitPulse"),
-    ] {
-        menu.append(&MenuItem::with_id(
-            app,
-            format!("tray:{id}"),
-            label,
-            true,
-            None::<&str>,
-        )?)?;
+    menu.append(&tray_item(app, "show", "Open GitPulse")?)?;
+    let primary = state.tray_summary.id.as_str();
+    let extra = primary != "open"
+        && primary != "show"
+        && state.enabled(primary)
+        && !state.status.primary_label.is_empty();
+    let refresh = state.enabled(actions::REFRESH);
+    if extra || refresh {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        if extra {
+            menu.append(&tray_item(app, primary, &state.status.primary_label)?)?;
+        }
+        if refresh {
+            menu.append(&tray_item(app, actions::REFRESH, "Refresh")?)?;
+        }
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
+    menu.append(&tray_item(app, "settings", "Settings…")?)?;
+    menu.append(&tray_item(app, "quit", "Quit GitPulse")?)?;
     Ok(menu)
 }
 
@@ -66,7 +80,7 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
         }
         return Ok(());
     }
-    let menu = build_tray_menu(app).map_err(|error| error.to_string())?;
+    let menu = build_tray_menu(app, state).map_err(|error| error.to_string())?;
     let tooltip = format!(
         "GitPulse\n{}\n{}",
         state.tray_detail, state.tray_summary.text

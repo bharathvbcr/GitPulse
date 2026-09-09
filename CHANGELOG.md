@@ -11,6 +11,12 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-09
+
+First minor release after the 0.0.x desktop series. Native menus, the macOS
+status popover, repository hygiene, the rebuilt command palette, and the
+workbench board land together on `main`.
+
 ### Added
 
 - Expand the native application menu with Go submenus for all 16 view sections,
@@ -21,11 +27,16 @@ before that tag is pushed.
   clear-recents, staging and branch actions, parked-operation controls,
   copy/reveal/remote utilities and manual update checks.
 - Add an optional icon-only macOS status item opening a compact light/dark
-  popover: repository switching, changed/staged/conflict cards, last-fetch sync
-  counts, expandable details and contextual review/recovery actions. Refresh
-  stays in the panel. Open GitPulse restores the main window; closing the main
-  window while enabled preserves its session. Right-click retains native app
-  controls, and Quit preserves draft and running-work checks.
+  popover: repository switching, changed/staged/conflict/stash cards, last-fetch
+  sync counts, parked-operation and busy-work chips, History/Pulse/Fleet/Terminal
+  shortcuts, copy/reveal/remote/appearance utilities, expandable details and
+  contextual review/recovery actions. Refresh and appearance stay in the panel.
+  Open GitPulse restores the main window; closing the main window while enabled
+  preserves its session. Copy, refresh and appearance stay in the popover; Reveal
+  and Remote dismiss it without bringing GitPulse forward. Right-click retains
+  native app controls and adds the current primary action and Refresh when
+  available. Escape collapses the switcher or details first; `R` refreshes and
+  `1`–`4` open a nonzero metric. The status window still cannot mutate Git.
 - Add a global build cleaner to Fleet and Settings, with selected roots,
   exclusions, retention and run budgets, opt-in native scheduling, closed-repo
   discovery, durable history and an optional macOS headless LaunchAgent.
@@ -35,6 +46,13 @@ before that tag is pushed.
 - Add Repository hygiene to Storage: stale-output previews across supported
   language ecosystems, shared-cache inspection and tool-owned maintenance,
   saved retention/weekly-review preferences, cancellation and explicit outcomes.
+- Drag task cards across Kanban columns with a movement threshold, mid-card
+  insertion, and neighbor-column keyboard moves. Positions stay strictly between
+  neighbors instead of appending `Date.now()` in the middle of a column.
+- Add currently open GitPulse tabs as workspace or task members from the board
+  and workspace editor, registering a path only when it is not already linked.
+- Keep selected task title and description locked while automatic enhancements
+  run.
 
 ### Fixed
 
@@ -48,6 +66,13 @@ before that tag is pushed.
   and scratch directories as automatically safe to reclaim. Cleanup previews
   validate ignored paths, tracked content, activity and file identities, and
   refuse stale, repeated or incomplete plans.
+- Ignore in-app HTML5 and pointer drags on the native window drop path, so
+  moving a Kanban card or tab no longer paints "Drop a Git repository to open".
+- Treat an unborn HEAD (empty or orphan branch) as a graph notice, not a
+  diagnostics fault.
+- Keep Swift coverage `--package-path` inside the repository. Plan Go coverage
+  from a root `go.work` or each nested module, and prefer a JavaScript project's
+  declared coverage script or runner instead of inventing `npx` commands.
 
 ### Changed
 
@@ -59,6 +84,11 @@ before that tag is pushed.
   deadlines, failures, retry and partial coverage. Resolve cross-repository symbols
   through the workspace registry before opening files, preserve help-mode transitions,
   and make the status-bar palette entry work before its first lazy load.
+- Compact the Work inbox to open-and-read, fold notification settings, and give
+  automatic suggestions a board-sized control. Fold task enhancement locks and
+  repository membership into editor details.
+- Consolidate remaining agent worktrees onto `main` and retire detached checkouts
+  whose commits were already ancestors of this release.
 
 ## [0.0.9] - 2026-09-08
 
@@ -901,7 +931,9 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
+[0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
 [0.0.7]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6

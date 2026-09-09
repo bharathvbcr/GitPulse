@@ -105,7 +105,8 @@ presentation snapshots and routes a limited set of actions to the existing main
 webview. It creates no repository store or polling loop. The status capability
 grants only event listen/unlisten; its snapshot/action/resize commands validate
 the calling window and action context. `StatusPopover.svelte` renders compact
-metric cards and expandable details. See [macOS menus](MACOS_MENUS.md).
+metric cards, insight chips, navigation/utility shortcuts and expandable details.
+See [macOS menus](MACOS_MENUS.md).
 
 ### Workspace surfaces
 

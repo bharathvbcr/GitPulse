@@ -1,4 +1,5 @@
 //! One lightweight status window. The main webview remains the workspace owner.
+use super::actions::NativeAction;
 use super::{menu_state, MenuState};
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewUrl,
@@ -121,22 +122,54 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     window.set_focus().map_err(|e| e.to_string())
 }
 
+fn keeps_popover(id: &str) -> bool {
+    matches!(
+        id,
+        "refresh" | "toggle-theme" | "copy-branch" | "copy-repo-path" | "copy-commit"
+    ) || id.starts_with(super::actions::REPOSITORY_PREFIX)
+}
+
+fn is_status_allowed(id: &str) -> bool {
+    matches!(id, "show" | "settings" | "quit" | "dismiss")
+        || matches!(
+            NativeAction::parse(id),
+            Some(
+                NativeAction::Open
+                    | NativeAction::Clone
+                    | NativeAction::Refresh
+                    | NativeAction::Section(_)
+                    | NativeAction::TabWork
+                    | NativeAction::TabHistory
+                    | NativeAction::TabCode
+                    | NativeAction::TabInsights
+                    | NativeAction::Fleet
+                    | NativeAction::TerminalDock
+                    | NativeAction::Palette
+                    | NativeAction::CopyBranch
+                    | NativeAction::CopyRepoPath
+                    | NativeAction::CopyCommit
+                    | NativeAction::RevealRepo
+                    | NativeAction::OpenRemote
+                    | NativeAction::ToggleTheme
+                    | NativeAction::Shortcuts
+                    | NativeAction::Diagnostics
+                    | NativeAction::ActivateRepo(_),
+            )
+        )
+}
+
 fn validate_action(state: &MenuState, id: &str, repo_path: Option<&str>) -> Result<(), String> {
-    if matches!(id, "show" | "settings" | "quit" | "dismiss") {
+    if matches!(id, "show" | "settings" | "quit" | "dismiss" | "palette") {
         return Ok(());
     }
-    let allowed = matches!(
-        id,
-        "open"
-            | "refresh"
-            | "section:work:overview"
-            | "section:work:resolve"
-            | "section:history:graph"
-    ) || id.starts_with(super::actions::REPOSITORY_PREFIX);
-    if !allowed || !state.enabled(id) {
+    if !is_status_allowed(id) || !state.enabled(id) {
         return Err("This status action is unavailable".into());
     }
-    if id != "open" && state.active_path.as_deref() != repo_path {
+    let workspace = matches!(
+        id,
+        "open" | "clone" | "fleet" | "palette" | "toggle-theme" | "shortcuts" | "diagnostics"
+    ) || id.starts_with(super::actions::REPOSITORY_PREFIX);
+    if !workspace && state.active_path.as_deref() != repo_path {
         return Err("Repository changed. Review the current status and try again.".into());
     }
     Ok(())
@@ -169,7 +202,7 @@ pub async fn cmd_status_action(
         if id == "dismiss" {
             return hide(app);
         }
-        if id != "refresh" && !id.starts_with(super::actions::REPOSITORY_PREFIX) {
+        if !keeps_popover(&id) {
             hide(app)?;
         }
         super::handle_menu_event(app, &format!("tray:{id}"));
@@ -229,11 +262,29 @@ mod tests {
             active_path: Some("/a".into()),
             ..Default::default()
         };
-        state.enabled.extend(["refresh".into(), "push".into()]);
+        state.enabled.extend([
+            "refresh".into(),
+            "push".into(),
+            "fleet".into(),
+            "copy-branch".into(),
+            "section:insights:pulse".into(),
+            "toggle-theme".into(),
+        ]);
         assert!(validate_action(&state, "refresh", Some("/a")).is_ok());
         assert!(validate_action(&state, "refresh", Some("/b")).is_err());
         assert!(validate_action(&state, "push", Some("/a")).is_err());
+        assert!(validate_action(&state, "fetch", Some("/a")).is_err());
+        assert!(validate_action(&state, "quick-commit", Some("/a")).is_err());
+        assert!(validate_action(&state, "fleet", Some("/a")).is_ok());
+        assert!(validate_action(&state, "copy-branch", Some("/a")).is_ok());
+        assert!(validate_action(&state, "section:insights:pulse", Some("/a")).is_ok());
+        assert!(validate_action(&state, "toggle-theme", Some("/a")).is_ok());
         assert!(validate_action(&state, "activate-repo:/missing", Some("/a")).is_err());
         assert!(validate_action(&state, "quit", None).is_ok());
+        assert!(validate_action(&state, "clone", None).is_ok());
+        assert!(keeps_popover("copy-branch"));
+        assert!(keeps_popover("refresh"));
+        assert!(!keeps_popover("section:work:overview"));
+        assert!(!keeps_popover("reveal-repo"));
     }
 }

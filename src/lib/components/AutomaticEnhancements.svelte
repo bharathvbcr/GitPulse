@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { automaticQueueCount, automaticUpdates, enhancementConfiguration, explainError, getAutomation, newID, putAutomation, wakeAutomatic, watchAutomatic, WorkbenchError, type AutomationSettings } from "../workbench/client";
 
-  let { active = true }: { active?: boolean } = $props();
+  let { active = true, compact = false }: { active?: boolean; compact?: boolean } = $props();
   let opened = $state(false), loading = $state(false), saving = $state(false), visible = $state(true);
   let settings = $state<AutomationSettings | null>(null), error = $state(""), note = $state("");
   let enabled = $state(true), override = $state(false), provider = $state(""), model = $state("");
@@ -59,13 +59,13 @@
   function toggle() { if (pending || saving) return; opened = !opened; if (opened) void load(); }
 </script>
 
-<section class="automation" aria-label="Automatic Manvi suggestions">
+<section class="automation" class:compact aria-label="Automatic Manvi suggestions">
   <div class="summary">
-    <button type="button" aria-expanded={opened} disabled={saving || pending !== null} onclick={toggle}>Automatic suggestions <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
-    {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" onclick={() => wakeAutomatic()}>Resume saved work</button>{/if}
+    <button type="button" class={compact ? "gp-pill" : ""} aria-expanded={opened} disabled={saving || pending !== null} onclick={toggle}>{compact ? "Auto" : "Automatic suggestions"} <span>{$automaticUpdates.error ? "Unavailable" : status ? labels[status.state] : "Checking…"}</span></button>
+    {#if $automaticUpdates.error || status?.state === "paused" || status?.state === "stopped"}<button type="button" class={compact ? "gp-btn" : ""} onclick={() => wakeAutomatic()}>Resume</button>{/if}
   </div>
-  {#if $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions could not start: {$automaticUpdates.error}</p>{/if}
-  {#if status?.reason}<p role="status">{status.reason}</p>{/if}
+  {#if (!compact || opened) && $automaticUpdates.error}<p role="alert">Tasks remain saved. Automatic suggestions could not start: {$automaticUpdates.error}</p>{/if}
+  {#if (!compact || opened) && status?.reason}<p role="status">{status.reason}</p>{/if}
   {#if opened}
     <div class="settings">
       <p>Applies to this GitPulse profile across all workspaces and repositories. Saved title and description changes are queued after one second; moving cards does not generate suggestions.</p>
@@ -89,5 +89,8 @@
 </section>
 
 <style>
-  .automation{border-bottom:1px solid rgb(var(--c-border));padding:8px 24px;font-size:12px}.summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:11px}button{border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px;font-size:11px}button:disabled,fieldset:disabled{opacity:.55}button:hover{background:rgb(var(--c-surface-hover))}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:#d15a64}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.check{display:flex;align-items:center;gap:8px;margin:9px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.pair input{padding:7px;border:1px solid rgb(var(--c-border));background:rgb(var(--c-surface));border-radius:6px;color:inherit}.actions{display:flex;gap:8px;margin-top:12px}
+  .automation{border-bottom:1px solid rgb(var(--c-border));padding:8px 24px;font-size:12px;position:relative}
+  .automation.compact{border:0;padding:0}
+  .automation.compact .settings{position:absolute;right:0;top:calc(100% + 6px);z-index:8;width:min(360px,70vw);padding:10px 12px;border:1px solid rgb(var(--c-border));border-radius:10px;background:rgb(var(--c-surface));box-shadow:0 8px 24px #00000022}
+  .summary{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.summary>button:first-child{display:flex;gap:12px;align-items:center}.summary span{color:rgb(var(--c-text-muted));font-size:11px}button{border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px;font-size:11px}button:disabled,fieldset:disabled{opacity:.55}button:hover{background:rgb(var(--c-surface-hover))}p{margin:8px 0;line-height:1.5;color:rgb(var(--c-text-muted));max-width:850px}p[role="alert"]{color:#d15a64}.settings{padding:5px 0 10px;max-width:850px}fieldset{border:0;padding:0;margin:10px 0}.check{display:flex;align-items:center;gap:8px;margin:9px 0}.pair{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.pair label{display:grid;gap:5px;flex:1;min-width:160px}.pair input{padding:7px;border:1px solid rgb(var(--c-border));background:rgb(var(--c-surface));border-radius:6px;color:inherit}.actions{display:flex;gap:8px;margin-top:12px}
 </style>

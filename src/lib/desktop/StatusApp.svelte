@@ -42,5 +42,4 @@
     return () => { disposed = true; connection.dispose(); observer.disconnect(); resize.dispose(); };
   });
 </script>
-<svelte:window onkeydown={(event) => { if (event.key === "Escape") { event.preventDefault(); void action("dismiss"); } }} />
 <div bind:this={host}><StatusPopover {snapshot} {error} {pending} onaction={(id) => void action(id)} /></div>

@@ -12,9 +12,11 @@ reflect repository availability and running work; checkmarks follow selection
 and appearance. Repository menus include staging, branches, parked-operation
 actions and copy/reveal/remote utilities. Enable the compact pulse icon in
 **Settings → Layout → Menu bar status icon** for a compact popover with repository switching,
-changed/staged/conflict cards, last-fetch sync counts, expandable details and
-contextual review/recovery actions. Refresh stays in the panel; Open GitPulse
-restores the main window. See the [menu inventory](MACOS_MENUS.md).
+changed/staged/conflict/stash cards, last-fetch sync counts, parked-operation and
+busy-work chips, History/Pulse/Fleet/Terminal shortcuts, copy/reveal/remote/appearance
+utilities, expandable details and contextual review/recovery actions. Refresh and
+appearance stay in the panel; Open GitPulse restores the main window. See the
+[menu inventory](MACOS_MENUS.md).
 
 ```mermaid
 flowchart TD

@@ -1296,7 +1296,7 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), "{}").unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+            "[package]\nname=\"t\"\nversion=\"1.2.3\"\n",
         )
         .unwrap();
         let seeds = vec!["src/lib.rs".into()];
@@ -1362,7 +1362,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+            "[package]\nname=\"t\"\nversion=\"1.2.3\"\n",
         )
         .unwrap();
         let seeds = vec!["src/lib.rs".into()];
@@ -1403,7 +1403,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname=\"t\"\nversion=\"0.1.0\"\n",
+            "[package]\nname=\"t\"\nversion=\"1.2.3\"\n",
         )
         .unwrap();
         let plan = plan_ci_from_affected(

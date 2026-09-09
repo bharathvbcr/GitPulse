@@ -3268,7 +3268,7 @@ mod tests {
         write(
             repo.path(),
             "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"demo\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
         );
         git_add(repo.path(), "package.json");
         git_add(repo.path(), "src/main.rs");
@@ -4211,7 +4211,7 @@ not-json-at-all
         write(
             repo.path(),
             "src-tauri/Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"demo\"\nversion = \"1.2.3\"\n",
         );
         git_add(repo.path(), "src-tauri/Cargo.lock");
         git_add(repo.path(), "src-tauri/Cargo.toml");

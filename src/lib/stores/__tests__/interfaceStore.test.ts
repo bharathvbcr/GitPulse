@@ -301,8 +301,8 @@ describe("interfaceStore", () => {
     // Re-enabling later must report honestly rather than stay silent about a
     // version dismissed under settings the user has since changed.
     interfaceStore.setCheckForUpdates(true);
-    interfaceStore.dismissUpdateVersion("0.1.0");
-    expect(get(interfaceStore).dismissedUpdateVersion).toBe("0.1.0");
+    interfaceStore.dismissUpdateVersion("1.2.3");
+    expect(get(interfaceStore).dismissedUpdateVersion).toBe("1.2.3");
 
     interfaceStore.setCheckForUpdates(false);
     expect(get(interfaceStore).dismissedUpdateVersion).toBe("");
@@ -310,9 +310,9 @@ describe("interfaceStore", () => {
 
   it("keeps a dismissal across an unrelated toggle-on", () => {
     interfaceStore.setCheckForUpdates(true);
-    interfaceStore.dismissUpdateVersion("0.1.0");
+    interfaceStore.dismissUpdateVersion("1.2.3");
     interfaceStore.setCheckForUpdates(true);
-    expect(get(interfaceStore).dismissedUpdateVersion).toBe("0.1.0");
+    expect(get(interfaceStore).dismissedUpdateVersion).toBe("1.2.3");
   });
 });
 
