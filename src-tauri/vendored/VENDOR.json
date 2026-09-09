@@ -120,7 +120,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "b5d95033a554d19db502b69c394072c8ce066c3c"
+        "commit": "da7d2d106201073e14d7ab43cc2f78981f6755ed"
       },
       "omitted": [
         "tests/",
@@ -236,7 +236,7 @@
         "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
         "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
-        "src/treesitter.rs": "6d3dcf4ff1da31fc8e5b72104f9498ef810d8307118541bf1d45b4bd733927d5",
+        "src/treesitter.rs": "7197f582c981c5f7e9c64104bac0a52815c0c1478f519ac55faf6c01c1d9da78",
         "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
       }
     },

@@ -284,6 +284,11 @@ fn parse_within_budget(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXTRACTION_FINISH_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
 pub fn extract_treesitter_with_budget(
     path: &str,
     lang: &str,
@@ -302,7 +307,35 @@ pub fn extract_treesitter_with_budget(
     let started = std::time::Instant::now();
     let deadline = started + budget;
     let _budget = BudgetGuard::arm(deadline);
+    let extraction = extract_treesitter_before_deadline(path, lang, source, budget, deadline);
+    // All tree, parser and parent-index temporaries have been released. A
+    // helper in the final scope/embedded pass can still have stopped early, or
+    // cleanup can have crossed the deadline after the last phase check.
+    if !matches!(
+        extraction.parse_outcome,
+        ParseOutcome::Failed { .. } | ParseOutcome::Skipped { .. }
+    ) && extraction_overran(deadline)
+    {
+        refused_extraction(
+            path,
+            lang,
+            source,
+            format!(
+                "extraction finalization exceeded the {budget:?} budget; no symbols are claimed for this file"
+            ),
+        )
+    } else {
+        extraction
+    }
+}
 
+fn extract_treesitter_before_deadline(
+    path: &str,
+    lang: &str,
+    source: &str,
+    budget: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Extraction {
     // Before anything else: a language whose grammar is deliberately not linked
     // must be refused here, not fall through to `unavailable_extraction`. That
     // path's reason — "no linked tree-sitter grammar for {lang}" — is true but
@@ -678,6 +711,12 @@ pub fn extract_treesitter_with_budget(
                     lang,
                     deadline,
                 );
+                #[cfg(test)]
+                EXTRACTION_FINISH_HOOK.with(|hook| {
+                    if let Some(finish) = hook.take() {
+                        finish();
+                    }
+                });
                 extraction
             });
         }
@@ -5837,10 +5876,8 @@ impl BudgetGuard {
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
         WALK_DEADLINE.with(|slot| slot.set(None));
-        // `WALK_OVERRAN` is deliberately *not* cleared here. It is read by
-        // `extract_treesitter_with_budget` after the guard's scope ends to
-        // decide whether the file must be refused, and clearing it here would
-        // erase the one signal that says the answer is incomplete.
+        // Retain the incomplete-walk signal until the next extraction arms
+        // its budget. The publication gate must not lose a helper's refusal.
     }
 }
 
@@ -6703,6 +6740,53 @@ pub(crate) fn node_span(node: Node) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_finalization_refused(hook: fn()) {
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+            }
+        }
+        let _clear = ClearHook;
+        EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(hook)));
+        let extraction = extract_treesitter_with_budget(
+            "finish.py",
+            "python",
+            "def work():\n    return 1\ndef caller():\n    return work()\n",
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            EXTRACTION_FINISH_HOOK.with(|slot| slot.get().is_none()),
+            "the finalization boundary must be reached"
+        );
+        assert!(
+            matches!(&extraction.parse_outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+            "late finalization published {:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(extraction.symbols.len(), 1, "only the File node may remain");
+        assert!(extraction.calls.is_empty());
+    }
+
+    #[test]
+    fn finalization_cannot_publish_after_deadline_expiry() {
+        fn expire() {
+            let deadline = WALK_DEADLINE.with(|slot| slot.get().expect("armed extraction"));
+            while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        assert_finalization_refused(expire);
+    }
+
+    #[test]
+    fn finalization_cannot_publish_after_a_late_incomplete_walk() {
+        fn incomplete() {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+        }
+        assert_finalization_refused(incomplete);
+    }
 
     /// Every discovered file is addressable, whether or not it parsed. (K1)
     ///
