@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitPulse · Command palette</title></head>
+<body><main style="padding:40px"><h1>GitPulse</h1><p>Command palette interaction preview</p><button id="opener">Open command palette</button></main><div id="app"></div><output id="verdict" style="position:fixed;bottom:8px;left:12px;font:12px system-ui"></output>
+<script>
+window.addEventListener("error", reportStartupFailure);
+window.addEventListener("unhandledrejection", reportStartupFailure);
+function reportStartupFailure(event) {
+ const params=new URLSearchParams(location.search);if(!params.has("check"))return;
+ const result={results:[{name:event.message??String(event.reason),pass:false}]};
+ document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+ document.getElementById("verdict").textContent=JSON.stringify(result);
+ if(params.has("report"))fetch(params.get("report"),{method:"POST",body:document.documentElement.outerHTML}).catch(()=>{});
+}
+</script>
+<script type="module" src="./paletteChecks.js"></script></body></html>

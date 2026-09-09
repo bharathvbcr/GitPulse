@@ -1,752 +1,329 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { get } from "svelte/store";
   import { fade, scale } from "svelte/transition";
+  import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
-  import { isCaseInsensitiveFs, displayName, isPathAmong } from "../repos/paths";
-  import type { ViewTab } from "../repos/persist";
-  import { VIEW_REGISTRY, type ViewRegistration } from "../views/viewRegistry";
-  import { themeStore } from "../stores/themeStore";
-  import { interfaceStore } from "../stores/interfaceStore";
-  import { askText, promptState } from "../stores/modalStore";
-  import { promptQuickCommit } from "../commit/quickCommit";
-  import {
-    backdropFade,
-    backdropFadeOut,
-    cardScale,
-    cardScaleOut,
-  } from "../ui/transitions";
-  import { isImeComposition } from "../keyboard/imeGuard";
+  import { promptState } from "../stores/modalStore";
+  import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
+  import { backdropFade, cardScale } from "../ui/transitions";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import {
-    GitBranch,
-    GitCommit,
-    Moon,
-    RefreshCw,
-    Plus,
-    Search,
-    Download,
-    Upload,
-    Layers,
-    Percent,
-    ShieldAlert,
-    FolderOpen,
-    FolderGit2,
-    X,
-    Bug,
-    Terminal,
-    CircleUserRound,
-    FileCode,
-    Keyboard,
-    LayoutGrid,
-    Settings,
-    Plug,
-    Wrench,
-  } from "@lucide/svelte";
-  import LanguageLogo from "./LanguageLogo.svelte";
+  import { isImeComposition } from "../keyboard/imeGuard";
+  import { isMacOS } from "../platform";
   import { highlightMatches } from "../branches/groupBranches";
-  import { searchSymbols, searchWorkspaceSymbols } from "../codeintel/client";
-  import type { CodeintelSymbolHit, WorkspaceFederatedHit } from "../codeintel/types";
+  import LanguageLogo from "./LanguageLogo.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
+  import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
+  import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
+  import { emptySearch, scheduleSearch, workspaceRoot } from "../palette/search";
 
+  let { openSignal = 0, onClone, onRebase }: { openSignal?: number } & PaletteHostActions = $props();
+  let servedSignal = 0;
+  let openEpoch = 0;
   let isOpen = $state(false);
   let query = $state("");
-  let symbolHits = $state<CodeintelSymbolHit[]>([]);
-  let symbolSearchNote = $state<string | null>(null);
-  let workspaceHits = $state<WorkspaceFederatedHit[]>([]);
-  let workspaceSearchNote = $state<string | null>(null);
   let highlighted = $state(0);
+  let page = $state(0);
+  let pendingAction = $state<string | null>(null);
+  let actionError = $state<string | null>(null);
+  let retrySignal = $state(0);
+  let searchResult = $state(emptySearch());
+  let history = $state<Frecency>(new Map());
   let inputEl: HTMLInputElement | undefined = $state();
   let listEl: HTMLDivElement | undefined = $state();
 
-  const FRECENCY_KEY = "gitpulse_palette_frecency";
-
-  function readFrecency(): Record<string, number> {
-    if (typeof window === "undefined" || !window.localStorage) return {};
-    try {
-      const raw = window.localStorage.getItem(FRECENCY_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
-    }
+  function storage(): PaletteStorage | null {
+    try { return window.localStorage; } catch { return null; }
   }
 
-  function recordFrecency(id: string) {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    try {
-      const frecency = readFrecency();
-      frecency[id] = (frecency[id] ?? 0) + 1;
-      window.localStorage.setItem(FRECENCY_KEY, JSON.stringify(frecency));
-    } catch {
-      /* ignore quota errors */
+  let parsed = $derived(parsePaletteQuery(query));
+  let mode = $derived.by(() => parsed.mode);
+  let effectiveSearchText = $derived(parsed.text);
+  let currentMode = $derived(PALETTE_MODES.find(entry => entry.mode === mode) ?? PALETTE_MODES[0]);
+  let repoPath = $derived($repoStore.currentPath);
+  let commands = $derived(buildCommands($repoStore, changeMode, { onClone, onRebase }));
+  let isRemoteSearch = $derived(mode === "files" || mode === "symbols" || mode === "workspace");
+  let symbolSearchNote = $derived(mode === "symbols" ? searchResult.note : null);
+  let workspaceSearchNote = $derived(mode === "workspace" ? searchResult.note : null);
+
+  // Query text does not reload the file list; filtering operates on the current
+  // snapshot. The opening epoch, repository generation and Retry refresh it.
+  $effect(() => {
+    const open = isOpen;
+    const searchMode = mode;
+    const path = repoPath;
+    const generation = $repoStore.generation;
+    const searchText = searchMode === "files" ? "" : effectiveSearchText;
+    const semantic = searchMode === "workspace" ? parsed.semantic : false;
+    void generation; void retrySignal;
+    if (!open || !path || !(searchMode === "files" || searchMode === "symbols" || searchMode === "workspace") || (searchMode !== "files" && !searchText)) {
+      searchResult = emptySearch();
+      return;
     }
+    return scheduleSearch({ mode: searchMode, repoPath: path, text: searchText, semantic }, result => { searchResult = result; });
+  });
+
+  function changeMode(next: PaletteMode) {
+    query = PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">";
+    actionError = null;
+    inputEl?.focus();
   }
 
-  function tabForWorkspaceRepo(repoName: string) {
-    const needle = repoName.toLowerCase();
-    return $repoStore.openTabs.find((tab) => {
-      if (tab.label.toLowerCase() === needle) return true;
-      if (tab.name.toLowerCase() === needle) return true;
-      const parts = tab.path.replace(/\\/g, "/").split("/").filter(Boolean);
-      const suffix = needle.split("/");
-      if (parts.length >= suffix.length) {
-        const tail = parts
-          .slice(-suffix.length)
-          .map((p) => p.toLowerCase())
-          .join("/");
-        if (tail === needle) return true;
-      }
-      return false;
-    });
-  }
-
-  async function openWorkspaceHit(hit: WorkspaceFederatedHit) {
-    const match = tabForWorkspaceRepo(hit.repo);
-    if (match && !match.isActive) {
-      await repoStore.activateTab(match.id);
-    }
-    repoStore.selectFilePath(hit.file_path);
+  function selectFile(path: string) {
+    repoStore.selectFilePath(path);
     repoStore.setActiveTab("code", "explorer");
   }
 
-  // Keyboard navigation keeps the highlighted row visible.
-  $effect(() => {
-    void highlighted;
-    listEl
-      ?.querySelector('[data-highlighted="true"]')
-      ?.scrollIntoView({ block: "nearest" });
-  });
-
-  const VIEW_COMMAND_ICONS: Partial<Record<ViewTab, typeof ShieldAlert>> = {
-    code: FileCode,
-    work: GitBranch,
-    insights: Percent,
-    history: Search,
-  };
-
-  const viewCommands = Object.values(VIEW_REGISTRY)
-    .filter((view): view is ViewRegistration & { paletteCommand: string } =>
-      Boolean(view.paletteCommand)
-    )
-    .map((view) => ({
-      id: view.id,
-      label: view.paletteCommand,
-      icon: VIEW_COMMAND_ICONS[view.id] ?? GitBranch,
-      shortcut: undefined as string | undefined,
-      action: () => repoStore.setActiveTab(view.id),
-    }));
-
-  /**
-   * One command per section that declares a palette label.
-   *
-   * This is what keeps a retired view reachable. Diff and Reflog stopped
-   * being tabs; without an entry here, consolidation would have quietly taken
-   * away the only door a user who types rather than clicks ever used. The
-   * labels live in the registry beside the sections, so a new section cannot
-   * be added without deciding whether it needs one.
-   */
-  const sectionCommands = Object.values(VIEW_REGISTRY).flatMap((view) =>
-    (view.sections ?? [])
-      .filter((section): section is typeof section & { paletteCommand: string } =>
-        Boolean(section.paletteCommand),
-      )
-      .map((section) => ({
-        id: `${view.id}:${section.id}`,
-        label: section.paletteCommand,
-        icon: VIEW_COMMAND_ICONS[view.id] ?? GitBranch,
-        shortcut: undefined as string | undefined,
-        action: () => repoStore.setActiveTab(view.id, section.id),
-      })),
-  );
-
-  const commands = [
-    {
-      // Workspace-scoped rather than a view, so it is listed here rather than
-      // derived from VIEW_REGISTRY — and it works with nothing open.
-      id: "fleet",
-      label: "Open Fleet — every repository at a glance",
-      icon: LayoutGrid,
-      shortcut: undefined,
-      action: () => interfaceStore.setFleetOpen(true),
-    },
-    {
-      // Also not a view any more — the terminal is a dock under whichever
-      // view is open. Listed by hand for the same reason as Fleet: it left
-      // VIEW_REGISTRY, and a retired view whose only door was the header
-      // would simply be gone.
-      id: "terminal-dock",
-      label: "Toggle Terminal — the shell, docked under the current view",
-      icon: Terminal,
-      shortcut: "⌃`",
-      action: () => interfaceStore.toggleTerminalDock(),
-    },
-    {
-      id: "refresh",
-      label: "Refresh Repository Status",
-      icon: RefreshCw,
-      shortcut: "⌘R",
-      action: () => repoStore.refresh(),
-    },
-    {
-      id: "shortcuts",
-      label: "Keyboard Shortcuts Cheat Sheet",
-      icon: Keyboard,
-      shortcut: "?",
-      action: () => window.dispatchEvent(new CustomEvent("gitpulse:shortcuts")),
-    },
-    {
-      id: "theme",
-      label: "Toggle Dark / Light Theme",
-      icon: Moon,
-      shortcut: undefined,
-      action: () => themeStore.toggle(),
-    },
-    {
-      id: "toggle_author_avatars",
-      label: "Toggle Author Avatars",
-      icon: CircleUserRound,
-      shortcut: undefined,
-      action: () => interfaceStore.toggleGraphAvatars(),
-    },
-    {
-      id: "theme_system",
-      label: "Use System Appearance",
-      icon: Moon,
-      shortcut: undefined,
-      action: () => themeStore.setPreference("system"),
-    },
-    {
-      id: "new_branch",
-      label: "Create New Branch…",
-      icon: Plus,
-      shortcut: undefined,
-      action: async () => {
-        const name = await askText({
-          title: "Create New Branch",
-          message: "New branch name",
-          placeholder: "feat/name",
-          confirmLabel: "Create",
-        });
-        if (name?.trim()) repoStore.createBranch(name.trim());
-      },
-    },
-    {
-      id: "rename_branch",
-      label: "Rename Current Branch…",
-      icon: GitBranch,
-      shortcut: undefined,
-      action: async () => {
-        const current = $repoStore.currentBranch;
-        if (!current) return;
-        const name = await askText({
-          title: "Rename branch",
-          message: current,
-          initialValue: current,
-          confirmLabel: "Rename",
-        });
-        if (name?.trim() && name.trim() !== current) repoStore.renameBranch(current, name.trim());
-      },
-    },
-    { id: "fetch", label: "Fetch All Remotes", icon: Download, shortcut: undefined, action: () => repoStore.fetch() },
-    { id: "pull", label: "Pull (fast-forward)", icon: Download, shortcut: undefined, action: () => repoStore.pull() },
-    { id: "push", label: "Push Current Branch", icon: Upload, shortcut: undefined, action: () => repoStore.push() },
-    ...viewCommands,
-    ...sectionCommands,
-    { id: "stash", label: "Stash Working Tree", icon: Layers, shortcut: undefined, action: () => repoStore.stashSave() },
-    { id: "stash_pop", label: "Pop Stash", icon: Layers, shortcut: undefined, action: () => repoStore.stashPop() },
-    {
-      id: "quick_commit",
-      label: "Quick Commit…",
-      icon: GitCommit,
-      shortcut: "⌘Enter",
-      action: () => void promptQuickCommit(),
-    },
-    {
-      id: "diagnostics",
-      label: "Open Diagnostics",
-      icon: Bug,
-      shortcut: undefined,
-      action: () => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics")),
-    },
-    {
-      id: "settings",
-      label: "Open Settings",
-      icon: Settings,
-      shortcut: "⌘,",
-      action: () => window.dispatchEvent(new CustomEvent("gitpulse:settings")),
-    },
-    {
-      id: "mcp_setup",
-      label: "Connect an agent (MCP 2.0 / Agent Plugins)",
-      icon: Plug,
-      shortcut: undefined,
-      action: () => window.dispatchEvent(new CustomEvent("gitpulse:settings")),
-    },
-    {
-      id: "optional_tools_setup",
-      label: "Set up optional tools (devmap / manvi)",
-      icon: Wrench,
-      shortcut: undefined,
-      action: () => openSetupWizard("devmap", "explain"),
-    },
-  ];
-
-  let repoCommands = $derived([
-    { id: "open_repo", label: "Open Repository…", icon: FolderOpen, shortcut: "⌘T", action: () => repoStore.pickAndOpenRepo() },
-    { id: "close_tab", label: "Close Repository Tab", icon: X, shortcut: "⌘⇧W", action: () => void repoStore.closeActiveTab() },
-    { id: "next_tab", label: "Next Repository Tab", icon: FolderGit2, shortcut: "Ctrl+Tab", action: () => void repoStore.nextTab() },
-    { id: "prev_tab", label: "Previous Repository Tab", icon: FolderGit2, shortcut: "Ctrl+⇧+Tab", action: () => void repoStore.prevTab() },
-    { id: "reopen_tab", label: "Reopen Closed Repository", icon: FolderGit2, shortcut: undefined, action: () => void repoStore.reopenLastClosed() },
-    { id: "move_tab_left", label: "Move Repository Tab Left", icon: FolderGit2, shortcut: "Ctrl+⇧+←", action: () => {
-      const active = $repoStore.openTabs.find((tab) => tab.isActive);
-      if (active) repoStore.moveTabBy(active.id, -1);
-    } },
-    { id: "move_tab_right", label: "Move Repository Tab Right", icon: FolderGit2, shortcut: "Ctrl+⇧+→", action: () => {
-      const active = $repoStore.openTabs.find((tab) => tab.isActive);
-      if (active) repoStore.moveTabBy(active.id, 1);
-    } },
-    ...$repoStore.openTabs.map((tab) => ({
-      id: `switch:${tab.id}`,
-      label: `Switch to ${tab.label}`,
-      icon: FolderGit2,
-      shortcut: undefined,
-      action: () => void repoStore.activateTab(tab.id),
-    })),
-    ...$repoStore.recentRepos
-      .filter((path) => !isPathAmong(path, $repoStore.openTabs.map((tab) => tab.path), { caseInsensitive: isCaseInsensitiveFs() }))
-      .map((path) => ({
-        id: `recent:${path}`,
-        label: `Open recent ${displayName(path)}`,
-        icon: FolderGit2,
-        shortcut: undefined,
-        action: () => void repoStore.openRepo(path),
-      })),
-  ]);
-
-  interface PaletteItem {
-    id: string;
-    label: string;
-    icon: any;
-    filePath?: string;
-    shortcut?: string;
-    category?: string;
-    action: () => void;
+  async function openWorkspaceHit(root: string, filePath: string) {
+    const opened = await repoStore.openRepo(root);
+    const current = get(repoStore);
+    if (!opened || !current.currentPath || !sameRepo(root, current.currentPath, { caseInsensitive: isCaseInsensitiveFs() })) {
+      throw Error(current.error || "The target repository could not be opened. No file was selected.");
+    }
+    selectFile(filePath);
   }
 
-  let mode = $derived.by<"commands" | "commits" | "branches" | "symbols" | "workspace" | "help">(() => {
-    const trimmed = query.trim();
-    if (trimmed.startsWith("#")) return "commits";
-    if (trimmed.startsWith("@")) return "branches";
-    // `::` is cross-repo (TF-IDF when trailing `~`); bare `:` stays single-repo.
-    if (trimmed.startsWith("::")) return "workspace";
-    if (trimmed.startsWith(":")) return "symbols";
-    if (trimmed.startsWith("?")) return "help";
-    return "commands";
-  });
-
-  let effectiveSearchText = $derived.by(() => {
-    const trimmed = query.trim();
-    if (trimmed.startsWith("::")) return trimmed.slice(2).trim();
-    if (trimmed.startsWith(">") || trimmed.startsWith("#") || trimmed.startsWith("@") || trimmed.startsWith(":") || trimmed.startsWith("?")) {
-      return trimmed.slice(1).trim();
-    }
-    return trimmed;
-  });
-
-  /** Trailing `~` requests TF-IDF name ranking for workspace search. */
-  let workspaceQuery = $derived.by(() => {
-    const text = effectiveSearchText;
-    if (text.endsWith("~")) {
-      return { query: text.slice(0, -1).trim(), semantic: true };
-    }
-    return { query: text, semantic: false };
-  });
-
-  $effect(() => {
-    const currentMode = mode;
-    const text = effectiveSearchText;
-    const repoPath = $repoStore.currentPath;
-    if (currentMode !== "symbols" || !repoPath || !text) {
-      symbolHits = [];
-      symbolSearchNote = null;
-      return;
-    }
-    void searchSymbols(repoPath, text, 30).then((res) => {
-      if (res.available) {
-        symbolHits = res.items;
-        symbolSearchNote = null;
-      } else {
-        symbolHits = [];
-        // Cannot-search must not render like zero hits.
-        symbolSearchNote =
-          res.reason ??
-          "Symbol search unavailable — not the same as zero matches. Install or build the code map.";
-      }
-    }).catch(() => {
-      symbolHits = [];
-      symbolSearchNote = "Symbol search failed — not the same as zero matches.";
-    });
-  });
-
-  $effect(() => {
-    const currentMode = mode;
-    const { query: text, semantic } = workspaceQuery;
-    const registryRoot = $repoStore.currentPath;
-    if (currentMode !== "workspace" || !registryRoot || !text) {
-      workspaceHits = [];
-      workspaceSearchNote = null;
-      return;
-    }
-    void searchWorkspaceSymbols(registryRoot, text, 40, semantic)
-      .then((res) => {
-        workspaceHits = res.items;
-        const parts: string[] = [];
-        if (semantic) parts.push("TF-IDF name search");
-        if (res.unavailable.length > 0) {
-          parts.push(
-            `${res.unavailable.length} repo${res.unavailable.length === 1 ? "" : "s"} unavailable`,
-          );
-        }
-        if (res.truncated) parts.push(`${res.shown} of ${res.total} shown`);
-        workspaceSearchNote = parts.length > 0 ? parts.join(" · ") : null;
-      })
-      .catch(() => {
-        workspaceHits = [];
-        workspaceSearchNote = "Workspace search failed";
-      });
-  });
-
   let allAvailableItems = $derived.by<PaletteItem[]>(() => {
-    const currentMode = mode;
-    const search = effectiveSearchText.toLowerCase();
-
-    if (currentMode === "workspace") {
-      return workspaceHits.map((hit) => ({
-        id: `ws:${hit.repo}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`,
-        label: `[${hit.repo}] ${hit.symbol_name} (${hit.kind}) — ${hit.file_path}:${hit.span_start_line}`,
-        icon: FileCode,
-        filePath: hit.file_path,
-        category: workspaceSearchNote
-          ? `Cross-repo · ${workspaceSearchNote}`
-          : "Cross-repo symbols",
-        action: () => {
-          void openWorkspaceHit(hit);
-        },
-      }));
+    if (mode === "help") return helpCommands(changeMode);
+    if (mode === "repositories") return commands.filter(command => ["Repositories", "Open repositories", "Recent repositories"].includes(command.category));
+    if (mode === "files") return searchResult.files.map(path => ({ id: `file:${repoPath}:${path}`, label: path.split("/").pop() ?? path, description: path, filePath: path, category: "Repository files", icon: FileCode, action: () => selectFile(path) }));
+    if (mode === "symbols") return searchResult.symbols.map(hit => ({ id: `symbol:${repoPath}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`, label: hit.symbol_name, description: `${hit.kind} · ${hit.file_path}:${hit.span_start_line}`, filePath: hit.file_path, category: "Code Intelligence", icon: FileCode, action: () => selectFile(hit.file_path) }));
+    if (mode === "workspace") return searchResult.workspace.map(hit => {
+      const root = workspaceRoot(hit.repo, searchResult.repos);
+      return { id: `ws:${hit.repo}:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`, label: hit.symbol_name, description: `${hit.repo} · ${hit.kind} · ${hit.file_path}:${hit.span_start_line}`, filePath: hit.file_path, category: "Cross-repo symbols", icon: FileCode, disabledReason: root ? undefined : `The workspace registry cannot uniquely resolve ${hit.repo}. Open Map to repair its registration.`, action: () => { if (root) return openWorkspaceHit(root, hit.file_path); } };
+    });
+    if (mode === "branches") return $repoStore.branches.map(branch => ({ id: `branch:${repoPath}:${branch.name}`, label: branch.name, description: branch.is_current ? "Current branch" : `${branch.last_author} · ${branch.last_summary}`, category: branch.is_remote ? "Remote branches" : "Local branches", icon: GitBranch, disabledReason: branch.is_current ? "This branch is already checked out." : worktreeUnavailable($repoStore), action: () => repoStore.checkoutBranch(branch.name) }));
+    if (mode === "commits") {
+      if ($graphStore.visiblePath !== repoPath) return [];
+      return $graphStore.commits.map(commit => ({ id: `commit:${repoPath}:${commit.id}`, label: commit.summary, description: `${commit.id.slice(0, 8)} · ${commit.author_name}`, keywords: `${commit.id} ${commit.author_email}`, category: "Loaded commits", icon: GitCommit, action: async () => { await repoStore.selectCommitDiff(commit.id); repoStore.setActiveTab("history", "diff"); } }));
     }
-
-    if (currentMode === "symbols") {
-      // Symbol & Code Search Mode (devmap)
-      return symbolHits.map((hit) => ({
-        id: `symbol:${hit.file_path}:${hit.symbol_name}:${hit.span_start_line}`,
-        label: `${hit.symbol_name} (${hit.kind}) — ${hit.file_path}:${hit.span_start_line}`,
-        icon: FileCode,
-        filePath: hit.file_path,
-        category: "Code Intelligence",
-        action: () => {
-          repoStore.selectFilePath(hit.file_path);
-          repoStore.setActiveTab("code", "explorer");
-        },
-      }));
-    }
-
-    if (currentMode === "commits") {
-      // Commit Search Mode
-      return $graphStore.rows
-        .filter((r) => r.id.toLowerCase().includes(search) || r.summary.toLowerCase().includes(search))
-        .slice(0, 30)
-        .map((r) => ({
-          id: `commit:${r.id}`,
-          label: `${r.id.slice(0, 7)} — ${r.summary}`,
-          icon: GitCommit,
-          category: "Commit",
-          action: () => {
-            repoStore.selectCommitDiff(r.id);
-            repoStore.setActiveTab("history");
-          },
-        }));
-    }
-
-    if (currentMode === "branches") {
-      // Branch Jump Mode
-      return $repoStore.branches
-        .filter((b) => b.name.toLowerCase().includes(search))
-        .map((b) => ({
-          id: `branch:${b.name}`,
-          label: b.name,
-          icon: GitBranch,
-          category: b.is_remote ? "Remote Branch" : "Local Branch",
-          action: () => {
-            if (!b.is_current) repoStore.checkoutBranch(b.name);
-          },
-        }));
-    }
-
-    if (currentMode === "help") {
-      return [
-        {
-          id: "help_shortcuts",
-          label: "View All Keyboard Shortcuts",
-          icon: Keyboard,
-          shortcut: "?",
-          action: () => window.dispatchEvent(new CustomEvent("gitpulse:shortcuts")),
-        },
-        {
-          id: "help_commits",
-          label: "Type # to search and jump to commits",
-          icon: GitCommit,
-          action: () => { query = "#"; },
-        },
-        {
-          id: "help_branches",
-          label: "Type @ to jump between branches",
-          icon: GitBranch,
-          action: () => { query = "@"; },
-        },
-        {
-          id: "help_symbols",
-          label: "Type : to search symbols in the active repository",
-          icon: FileCode,
-          action: () => { query = ":"; },
-        },
-        {
-          id: "help_workspace",
-          label: "Type :: for cross-repo symbols (append ~ for TF-IDF name search)",
-          icon: FileCode,
-          action: () => { query = "::"; },
-        },
-        {
-          id: "help_map_docs",
-          label: "Open Map for docs search, doc graph, and cross-repo link candidates",
-          icon: FileCode,
-          action: () => repoStore.setActiveTab("code", "map"),
-        },
-      ];
-    }
-
-    // Default: General Commands & Repos with Frecency
-    const frecency = readFrecency();
-    const list: PaletteItem[] = [...repoCommands, ...commands];
-    return list
-      .filter((c) => c.label.toLowerCase().includes(search))
-      .sort((a, b) => {
-        if (!search) {
-          const scoreA = frecency[a.id] ?? 0;
-          const scoreB = frecency[b.id] ?? 0;
-          if (scoreA !== scoreB) return scoreB - scoreA;
-        }
-        return 0;
-      });
+    return commands;
   });
 
-  let filteredCommands = $derived(allAvailableItems);
+  // Remote providers own relevance (including TF-IDF); do not refilter their
+  // results by the literal query or reorder them by local usage counts.
+  let matchedItems = $derived(mode === "symbols" || mode === "workspace"
+    ? allAvailableItems.filter((item, index, items) => items.findIndex(other => other.id === item.id) === index)
+    : rankItems(allAvailableItems, effectiveSearchText, history));
+  let pageCount = $derived(Math.max(1, Math.ceil(matchedItems.length / PAGE_SIZE)));
+  let filteredCommands = $derived(matchedItems.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE));
+  let activeCommand = $derived(filteredCommands[highlighted]);
+  let requiresRepo = $derived(!["commands", "help", "repositories"].includes(mode));
+  let unavailable = $derived(requiresRepo ? repoUnavailable($repoStore) : undefined);
+  let searchNote = $derived(symbolSearchNote ?? workspaceSearchNote ?? (mode === "files" ? searchResult.note : null));
+  let historyNote = $derived(mode === "commits" ?
+    ($graphStore.visiblePath !== repoPath ? "History has not loaded for this repository. Open History to load commits." :
+      $graphStore.error ? `History unavailable: ${$graphStore.error}` :
+      `${$graphStore.commits.length} loaded commits${$graphStore.hasMore ? "; older commits are available in History" : ""}. ${$graphStore.notices.join(" ")}`) : null);
+  let resultSummary = $derived(searchResult.loading && isRemoteSearch ? "Searching…" :
+    `${matchedItems.length ? page * PAGE_SIZE + 1 : 0}–${Math.min((page + 1) * PAGE_SIZE, matchedItems.length)} of ${matchedItems.length} results`);
 
   $effect(() => {
-    if (highlighted > 0 && highlighted >= filteredCommands.length) {
-      highlighted = Math.max(0, filteredCommands.length - 1);
-    }
+    void query; void repoPath;
+    page = 0; highlighted = 0; actionError = null;
   });
-
   $effect(() => {
-    if (isOpen) {
-      inputEl?.focus();
-      inputEl?.select();
-    }
+    if (page >= pageCount) page = pageCount - 1;
+    if (highlighted >= filteredCommands.length) highlighted = Math.max(0, filteredCommands.length - 1);
+  });
+  $effect(() => {
+    void highlighted; void filteredCommands;
+    listEl?.querySelector('[data-highlighted="true"]')?.scrollIntoView({ block: "nearest" });
   });
 
-  function run(index: number) {
-    const cmd = filteredCommands[index];
-    if (!cmd) return;
-    recordFrecency(cmd.id);
-    cmd.action();
-    isOpen = false;
+  function close() { isOpen = false; }
+
+  async function run(index: number) {
+    const command = filteredCommands[index];
+    if (!command || command.disabledReason || pendingAction) return;
+    const epoch = openEpoch;
+    pendingAction = command.id;
+    actionError = null;
+    try {
+      if (command.closeBefore) { close(); await tick(); }
+      const result = await command.action();
+      const failure = actionFailure(result);
+      if (failure) {
+        if (isOpen && openEpoch === epoch) actionError = failure;
+        return;
+      }
+      if (!command.keepOpen) history = recordFrecency(history, command.id, storage());
+      if (!command.keepOpen && openEpoch === epoch) close();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isOpen && openEpoch === epoch) actionError = message;
+      else repoStore.setError(message);
+    } finally { pendingAction = null; }
   }
 
   function modalOccupied(): boolean {
-    return get(promptState) !== null;
+    return get(promptState) !== null || Boolean(document.querySelector('[aria-modal="true"]:not([data-command-palette])'));
   }
-
-  function handleKeyDown(e: KeyboardEvent) {
-    if (isImeComposition(e)) return;
-    if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-      if (modalOccupied()) return;
-      e.preventDefault();
-      isOpen = !isOpen;
-      query = "";
-      highlighted = 0;
-    } else if (e.key === "Escape" && isOpen) {
-      isOpen = false;
-    } else if (isOpen && e.key === "ArrowDown") {
-      e.preventDefault();
-      highlighted = Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1));
-    } else if (isOpen && e.key === "ArrowUp") {
-      e.preventDefault();
-      highlighted = Math.max(highlighted - 1, 0);
-    } else if (isOpen && e.key === "Enter") {
-      e.preventDefault();
-      run(highlighted);
-    }
-  }
-
-  /**
-   * Opens on a request App made before this component existed.
-   *
-   * The palette is deferred until first use, so the ⌘K that asks for it is
-   * caught by App's global handler and cannot be delivered as an event — the
-   * listener below is registered a chunk-load later, and the keystroke would
-   * be lost. App raises a counter instead; the effect below reads it after
-   * mount, so the FIRST ⌘K opens the palette exactly like every one after it.
-   * Zero means "no request yet" and is the initial value, so a fresh mount
-   * with no request does not open on its own.
-   */
-  let { openSignal = 0 }: { openSignal?: number } = $props();
-  let servedSignal = 0;
 
   function requestOpen() {
     if (modalOccupied()) return;
+    openEpoch += 1;
+    history = readFrecency(storage());
+    query = ""; page = 0; highlighted = 0; actionError = null;
     isOpen = true;
-    query = "";
+    inputEl?.focus();
+  }
+
+  function changePage(next: number) {
+    page = Math.max(0, Math.min(next, pageCount - 1));
     highlighted = 0;
+    inputEl?.focus();
+  }
+
+  function handleKeyDown(event: KeyboardEvent) {
+    if (isImeComposition(event)) return;
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+      if (modalOccupied()) return;
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (isOpen) close(); else requestOpen();
+      return;
+    }
+    if (!isOpen) return;
+    if (event.key === "Escape") {
+      event.preventDefault(); event.stopImmediatePropagation(); close(); return;
+    }
+    // Buttons (mode chips, Retry, paging) keep native Enter/Space behavior.
+    if (event.target !== inputEl || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (!["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp", "Enter"].includes(event.key)) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    if (event.key === "ArrowDown") highlighted = Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1));
+    else if (event.key === "ArrowUp") highlighted = Math.max(0, highlighted - 1);
+    else if (event.key === "Home") highlighted = 0;
+    else if (event.key === "End") highlighted = Math.max(0, filteredCommands.length - 1);
+    else if (event.key === "PageDown") changePage(page + 1);
+    else if (event.key === "PageUp") changePage(page - 1);
+    else void run(highlighted);
   }
 
   $effect(() => {
     if (openSignal > servedSignal) {
       servedSignal = openSignal;
-      requestOpen();
+      untrack(requestOpen);
     }
   });
-
   onMount(() => {
-    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, true);
     window.addEventListener("gitpulse:palette", requestOpen);
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("gitpulse:palette", requestOpen);
     };
   });
-
 </script>
 
 {#if isOpen}
-  <div
-    role="dialog"
-    aria-modal="true"
-    aria-labelledby="command-palette-title"
-    tabindex="-1"
-    onclick={(e) => e.target === e.currentTarget && (isOpen = false)}
-    onkeydown={(e) => e.key === "Escape" && (isOpen = false)}
-    in:fade={backdropFade()}
-    out:fade={backdropFadeOut()}
-    class="gp-scrim bg-black/40 flex items-start justify-center pt-24 select-none gp-gpu"
-    style="z-index: {LAYERS.MODAL}"
-  >
-    <!-- Modal Card -->
-    <div
-      use:trapFocus={{ initial: () => inputEl ?? null }}
-      in:scale={cardScale()}
-      out:scale={cardScaleOut()}
-      class="w-full max-w-lg gp-card shadow-float rounded-2xl overflow-hidden flex flex-col gp-gpu bg-surface border border-border/80"
-    >
-      <h2 id="command-palette-title" class="sr-only">Command palette</h2>
-      <div class="p-3.5 border-b border-border/60 gp-section-edge flex items-center gap-2.5 bg-surface">
-        <Search size={16} class="text-accent shrink-0" />
-        <input
-          bind:this={inputEl}
-          type="text"
-          bind:value={query}
-          placeholder="Type a command or #commit, @branch, :symbol, ::cross-repo, ?help..."
-          class="w-full bg-transparent text-textPrimary placeholder:text-textMuted text-sm focus:outline-hidden"
-          role="combobox"
-          aria-expanded="true"
-          aria-autocomplete="list"
-          aria-controls="command-palette-listbox"
-          aria-activedescendant={filteredCommands.length > 0
-            ? `palette-option-${highlighted}`
-            : undefined}
-        />
-        {#if mode !== "commands"}
-          <span class="gp-chip text-[10px] uppercase font-bold text-accent border-accent/40 bg-accent/10 shrink-0">
-            {mode}
-          </span>
+  <div role="dialog" aria-modal="true" aria-labelledby="command-palette-title" data-command-palette tabindex="-1"
+    onclick={event => { if (event.target === event.currentTarget) close(); }}
+    onkeydown={event => event.stopPropagation()}
+    in:fade={backdropFade()} class="gp-scrim palette-scrim bg-black/40" style="z-index: {LAYERS.MODAL}">
+    <!-- Immediate teardown restores focus before a follow-on prompt mounts. -->
+    <div use:trapFocus={{ initial: () => inputEl ?? null }} in:scale={cardScale()} class="palette-card gp-card bg-surface text-textPrimary border border-border/80 shadow-float">
+      <header class="palette-header">
+        <div class="palette-heading"><span class="palette-brand"><Search size={14} /> <h2 id="command-palette-title">Command palette</h2></span>
+          <span class="palette-repo" title={repoPath ?? "No repository open"}><FolderGit2 size={12} />{repoPath ? displayName(repoPath) : "Workspace"}</span>
+          <button type="button" class="palette-close" onclick={close} aria-label="Close command palette"><X size={15} /></button>
+        </div>
+        <div class="palette-search"><Search size={20} class="text-accent shrink-0" />
+          <input bind:this={inputEl} bind:value={query} type="text" maxlength={MAX_QUERY_LENGTH} autocomplete="off" spellcheck="false"
+            placeholder={currentMode.hint} aria-label="Search commands and repositories" role="combobox" aria-expanded="true" aria-autocomplete="list"
+            aria-controls="command-palette-listbox" aria-describedby="palette-status palette-detail"
+            aria-activedescendant={activeCommand ? `palette-option-${highlighted}` : undefined} />
+          {#if query}<button type="button" class="palette-clear" onclick={() => { query = ""; inputEl?.focus(); }} aria-label="Clear search"><X size={14} /></button>{/if}
+        </div>
+        <nav class="palette-modes" aria-label="Search mode">
+          {#each PALETTE_MODES as entry}<button type="button" aria-pressed={mode === entry.mode} title={entry.hint} onclick={() => changeMode(entry.mode)}><span>{entry.label}</span><kbd>{entry.prefix}</kbd></button>{/each}
+        </nav>
+      </header>
+      <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="palette-status" role="status" aria-live="polite">{resultSummary}</span></div>
+      {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
+      {#if searchNote || historyNote}
+        <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
+          <p>{searchNote ?? historyNote}</p>
+          {#if isRemoteSearch}
+            <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Retry search</button>
+            {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { close(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up devmap</button>{/if}
+          {/if}
+          {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
+        </div>
+      {/if}
+      <div bind:this={listEl} id="command-palette-listbox" class="palette-results" role="listbox" aria-label={currentMode.label} aria-busy={searchResult.loading || Boolean(pendingAction)}>
+        {#if searchResult.loading && isRemoteSearch}
+          <div class="palette-empty" role="status"><LoaderCircle size={22} class="palette-spinner" /><strong>Searching {currentMode.label.toLowerCase()}…</strong><span>Results will appear here.</span></div>
+        {:else}
+          {#each filteredCommands as cmd, i (cmd.id)}
+            <button id={`palette-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`palette-description-${i}`}
+              tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
+              onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
+              <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
+              <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`palette-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
+              <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{isMacOS() ? cmd.shortcut : cmd.shortcut.replaceAll("⌘", "Ctrl+").replaceAll("⇧", "Shift+")}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
+            </button>
+          {/each}
+          {#if filteredCommands.length === 0}
+            <div class="palette-empty"><Search size={24} /><strong>{unavailable ? "Choose a repository to start" : !effectiveSearchText && (mode === "symbols" || mode === "workspace") ? "Start with a symbol name" : searchResult.failed ? "Search needs attention" : "No matching results"}</strong><span>{searchResult.failed ? "Use the recovery actions above to try again." : "Try another search or choose a mode above."}</span></div>
+          {/if}
         {/if}
       </div>
-
-      <div
-        bind:this={listEl}
-        id="command-palette-listbox"
-        class="max-h-72 overflow-y-auto p-1.5"
-        role="listbox"
-        aria-label="Commands"
-      >
-        {#each filteredCommands as cmd, i (`${cmd.id}#${i}`)}
-          {@const parts = highlightMatches(cmd.label, effectiveSearchText)}
-          <button
-            id={`palette-option-${i}`}
-            onclick={() => run(i)}
-            role="option"
-            aria-selected={i === highlighted}
-            aria-label={cmd.label}
-            data-highlighted={i === highlighted ? "true" : "false"}
-            class="w-full px-3 py-2 text-left rounded-xl text-xs flex items-center justify-between gap-3 transition-colors {i === highlighted ? 'bg-surfaceHover ring-1 ring-accent/25' : 'hover:bg-surfaceHover'}"
-          >
-            <div class="flex items-center gap-2.5 min-w-0 flex-1">
-              <span class="flex items-center justify-center w-6 h-6 rounded-lg bg-background/80 shrink-0 {i === highlighted ? 'text-accent' : 'text-textMuted'}">
-                {#if cmd.filePath}
-                  <LanguageLogo filePath={cmd.filePath} size={14} class="shrink-0" />
-                {:else}
-                  <cmd.icon size={14} />
-                {/if}
-              </span>
-              <span class="truncate">
-                {#each parts as part}
-                  {#if part.matched}
-                    <b class="text-accent font-semibold">{part.text}</b>
-                  {:else}
-                    <span>{part.text}</span>
-                  {/if}
-                {/each}
-              </span>
-            </div>
-
-            {#if cmd.shortcut}
-              <kbd class="gp-keycap shrink-0">{cmd.shortcut}</kbd>
-            {/if}
-          </button>
-        {/each}
-        {#if filteredCommands.length === 0}
-          <div class="px-3 py-4 text-xs text-textMuted text-center" role="status">
-            {#if mode === "symbols" && symbolSearchNote}
-              <p class="text-amber-600 dark:text-amber-400">{symbolSearchNote}</p>
-              <button
-                type="button"
-                class="gp-btn text-[11px] mt-2"
-                onclick={() => {
-                  isOpen = false;
-                  openSetupWizard("devmap", "explain");
-                }}
-              >
-                Set up devmap
-              </button>
-            {:else}
-              No matching {mode === "commands" ? "commands" : mode}
-            {/if}
-          </div>
-        {/if}
-      </div>
-
-      <!-- Footer Hints -->
-      <div class="px-3 py-1.5 bg-background/60 border-t border-border/60 gp-section-edge flex items-center justify-between text-[10px] text-textMuted select-none">
-        <div class="flex items-center gap-3">
-          <span><kbd class="gp-keycap font-mono text-[9px]">↑↓</kbd> Navigate</span>
-          <span><kbd class="gp-keycap font-mono text-[9px]">↵</kbd> Select</span>
-          <span><kbd class="gp-keycap font-mono text-[9px]">Esc</kbd> Close</span>
-        </div>
-        <div class="flex items-center gap-2">
-          <span>Prefixes: <b class="font-mono">#</b> commits <b class="font-mono">@</b> branches</span>
-        </div>
-      </div>
+      {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
+      <div id="palette-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
+      <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
+        {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{isMacOS() ? "⌘K" : "Ctrl+K"}</kbd>{/if}
+      </footer>
     </div>
   </div>
 {/if}
+
+<style>
+  .palette-scrim { display:flex; align-items:flex-start; justify-content:center; padding: min(12vh, 100px) 16px 20px; }
+  .palette-card { width: min(680px, 100%); max-height: calc(100dvh - min(12vh, 100px) - 20px); display:flex; flex-direction:column; overflow:hidden; border-radius:18px; }
+  .palette-header { padding:16px 18px 0; flex-shrink:0; }
+  .palette-heading,.palette-brand,.palette-repo,.palette-search,.palette-meta,.palette-footer,.palette-pages { display:flex; align-items:center; }
+  .palette-heading { gap:12px; color:var(--color-textMuted); font-size:11px; }
+  .palette-brand { gap:7px; flex:1; }
+  h2 { font-size:11px; font-weight:600; margin:0; }
+  .palette-repo { gap:5px; max-width:40%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-close,.palette-clear { padding:5px; border-radius:6px; color:var(--color-textMuted); }
+  .palette-search { gap:12px; padding:19px 0 17px; }
+  input { min-width:0; width:100%; background:transparent; border:0; border-radius:5px; font-size:17px; color:var(--color-textPrimary); }
+  input::placeholder { color:var(--color-textMuted); font-size:14px; }
+  .palette-modes { display:flex; gap:3px; overflow-x:auto; padding-bottom:12px; }
+  .palette-modes button { display:flex; align-items:center; gap:5px; padding:5px 7px; font-size:10px; white-space:nowrap; border-radius:6px; color:var(--color-textMuted); }
+  .palette-modes button[aria-pressed="true"] { background:var(--color-surfaceHover); color:var(--color-accent); }
+  .palette-modes kbd { opacity:.65; font-size:9px; }
+  .palette-meta { justify-content:space-between; padding:10px 18px 7px; border-top:1px solid var(--color-border); font-size:10px; color:var(--color-textMuted); }
+  .palette-results { min-height:130px; max-height:390px; overflow-y:auto; overscroll-behavior:contain; padding:0 8px 8px; }
+  .palette-option { display:flex; align-items:center; gap:11px; text-align:left; width:100%; padding:10px; border-radius:9px; color:var(--color-textPrimary); }
+  .palette-option[data-highlighted="true"] { background:var(--color-surfaceHover); box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--color-accent) 24%, transparent); }
+  .palette-icon { display:flex; align-items:center; justify-content:center; flex-shrink:0; width:29px; height:29px; border-radius:8px; background:var(--color-background); color:var(--color-textMuted); }
+  .palette-option[data-highlighted="true"] .palette-icon { color:var(--color-accent); }
+  .palette-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:3px; }
+  .palette-label { font-size:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-label b { color:var(--color-accent); font-weight:600; }
+  .palette-description { font-size:10px; color:var(--color-textMuted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .palette-disabled .palette-label,.palette-disabled .palette-icon { color:var(--color-textMuted); }
+  .palette-trailing { display:flex; align-items:center; gap:10px; color:var(--color-textMuted); font-size:9px; }
+  .palette-empty { min-height:145px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--color-textMuted); font-size:11px; text-align:center; padding:22px; }
+  .palette-empty strong { color:var(--color-textPrimary); font-size:13px; font-weight:500; }
+  .palette-notice { padding:9px 18px; color:var(--color-textMuted); font-size:11px; overflow-wrap:anywhere; max-height:110px; overflow-y:auto; flex-shrink:0; }
+  .palette-notice p { margin:0 0 6px; }
+  .palette-notice button { margin:2px 6px 0 0; font-size:10px; }
+  .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--color-background); }
+  .palette-detail { padding:9px 18px; min-height:34px; font-size:10px; color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
+  .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; background:var(--color-background); font-size:10px; color:var(--color-textMuted); gap:8px; }
+  .palette-footer kbd { margin:0 3px 0 6px; font-size:10px; }
+  .palette-pages { gap:8px; }
+  .palette-pages button { padding:0 6px; }
+  button:focus-visible { outline:2px solid var(--color-accent); outline-offset:-2px; }
+  button:disabled { opacity:.4; }
+  .palette-card :global(.palette-spinner) { animation:palette-spin 1s linear infinite; }
+  @keyframes palette-spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion:reduce) { .palette-card :global(.palette-spinner) { animation:none; } }
+  @media (max-width:540px) { .palette-scrim { padding:16px 8px; } .palette-card { max-height:calc(100dvh - 32px); } .palette-category { display:none; } .palette-header { padding:12px 12px 0; } .palette-results { max-height:none; } }
+</style>

@@ -477,9 +477,31 @@ alone. Each is an accelerator for something that also has a visible control.
 
 | Prefix | Mode | Description |
 | --- | --- | --- |
-| `>` | **Commands** (default) | Run any application action, open views, switch themes, or run audits. |
-| `#` | **Jump to Commit** | Instantly search and jump to a commit by SHA prefix or commit message. |
+| `>` | **Commands** (default) | Search Git actions, every view and section, workspace controls, appearance and setup. Clone and Rebase open the existing dialogs. |
+| `/` | **Files** | Fuzzy-search tracked and untracked, non-ignored file paths and open them in Explorer. |
+| `%` | **Repositories** | Switch open tabs, reopen a closed tab, or open a recent repository. Full paths disambiguate names. |
+| `#` | **Jump to Commit** | Search loaded history by SHA, message or author, then open the selected commit's diff. The palette names the history limit and links to History for older commits. |
 | `@` | **Jump to Branch** | Search local and remote branches and checkout with a single keystroke. |
 | `:` | **Symbols (this repo)** | Search the DevMap symbol index for the active repository. |
 | `::` | **Symbols (workspace)** | Cross-repo symbol search over tabs registered in DevMap's workspace. Append `~` for TF-IDF name ranking. Unavailable repos and truncation are named on the result strip. |
 | `?` | **Help & Shortcuts** | View available keyboard shortcuts and documentation (including Map / docs tips). |
+
+Mode buttons expose every prefix without memorization. Local searches match multiple
+tokens across names and descriptions and rank exact/early label matches ahead of
+fuzzy matches. Successful commands gain a bounded frequency/recency score; cancelled
+or refused actions do not. Empty-query suggestions put available actions first.
+
+Unavailable actions remain searchable with a reason (no repository, loading, a bare
+repository, a parked operation, conflicts, empty stash or clean working tree).
+Async actions show progress and cannot be triggered twice while pending. Failed
+actions remain open with their error; prompts receive focus after the palette closes.
+
+Results use 50-item pages with exact visible/returned counts. `↑` / `↓`, `Home` /
+`End`, `PageUp` / `PageDown`, `Enter`, `Tab` and `Escape` support keyboard operation.
+Symbol searches debounce, expire after 12 seconds, and ignore responses after a
+query, mode, repository or visibility change. Errors and partial coverage remain
+visible alongside results, with Retry and Map/setup recovery. Workspace hits resolve
+through exact registered repository names and verify activation before selecting a file.
+
+See [Command palette architecture and verification](COMMAND_PALETTE.md) for the
+extension contract, regression cases, and limits.

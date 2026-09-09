@@ -166,6 +166,9 @@
   let paletteMounted = $state(false);
   let paletteOpenSignal = $state(0);
 
+  function openCloneDialog() { isCloneModalOpen = true; }
+  function openRebaseDialog() { isRebaseModalOpen = true; }
+
   /** Arms the palette chunk and asks it to open once it is there. */
   function openCommandPalette() {
     paletteMounted = true;
@@ -420,6 +423,14 @@
     window.addEventListener("gitpulse:shortcuts", openShortcuts);
     track(() => window.removeEventListener("gitpulse:shortcuts", openShortcuts));
 
+    // The status bar can request the palette before its lazy chunk exists.
+    // After the first mount, the palette handles this event itself.
+    const openDeferredPalette = () => {
+      if (!paletteMounted) openCommandPalette();
+    };
+    window.addEventListener("gitpulse:palette", openDeferredPalette);
+    track(() => window.removeEventListener("gitpulse:palette", openDeferredPalette));
+
     const openSettings = () => {
       isSettingsModalOpen = true;
     };
@@ -542,9 +553,7 @@
       checkUpdates: () => void checkUpdatesFromMenu(),
       canDispatch: (event) => !exitRequestPending && canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
       open: () => void repoStore.pickAndOpenRepo(),
-      clone: () => {
-        isCloneModalOpen = true;
-      },
+      clone: openCloneDialog,
       settings: () => {
         isSettingsModalOpen = true;
       },
@@ -572,9 +581,7 @@
       resetZoom: () => interfaceStore.resetZoom(),
       fleet: () => interfaceStore.setFleetOpen(true),
       terminalDock: () => interfaceStore.toggleTerminalDock(),
-      rebase: () => {
-        isRebaseModalOpen = true;
-      },
+      rebase: openRebaseDialog,
       palette: () => openCommandPalette(),
       focusFilter: () => void focusCommitSearch(),
       openRecent: (path) => void openFromExternal(path),
@@ -831,7 +838,7 @@
           {#if $interfaceStore.showHeaderActionLabels}<span>Open...</span>{/if}
         </button>
         <button
-          onclick={() => (isCloneModalOpen = true)}
+          onclick={openCloneDialog}
           class="gp-btn py-1! shrink-0"
           title="Clone a repository"
           aria-label="Clone a repository"
@@ -922,7 +929,7 @@
             <FolderOpen size={15} />
             <span>Open Repository</span>
           </button>
-          <button onclick={() => (isCloneModalOpen = true)} class="gp-btn flex-1 py-2.5! px-4!">
+          <button onclick={openCloneDialog} class="gp-btn flex-1 py-2.5! px-4!">
             <Download size={15} />
             <span>Clone Repo</span>
           </button>
@@ -1088,7 +1095,7 @@
       <LazyMount load={loadShortcutsModal} name="The shortcuts sheet" props={{ isOpen: isShortcutsOpen, onClose: () => (isShortcutsOpen = false) }} />
     {/if}
     {#if paletteMounted}
-      <LazyMount load={loadCommandPalette} name="The command palette" props={{ openSignal: paletteOpenSignal }} />
+      <LazyMount load={loadCommandPalette} name="The command palette" props={{ openSignal: paletteOpenSignal, onClone: openCloneDialog, onRebase: openRebaseDialog }} />
     {/if}
     <Tooltip />
   </svelte:boundary>

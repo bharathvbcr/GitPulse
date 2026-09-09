@@ -171,7 +171,14 @@ describe("App overlay code splitting", () => {
     expect(script).toContain("if (!paletteMounted && (e.metaKey || e.ctrlKey) && e.key === \"k\")");
     expect(script).toContain("function openCommandPalette()");
     expect(script).toContain("paletteOpenSignal += 1");
+    expect(script).toContain('window.addEventListener("gitpulse:palette", openDeferredPalette)');
+    expect(script).toContain('window.removeEventListener("gitpulse:palette", openDeferredPalette)');
+    expect(script).toContain("if (!paletteMounted) openCommandPalette()");
     expect(template).toContain("openSignal: paletteOpenSignal");
+    expect(template).toContain("onClone: openCloneDialog");
+    expect(template).toContain("onRebase: openRebaseDialog");
+    expect(script).toContain("clone: openCloneDialog");
+    expect(script).toContain("rebase: openRebaseDialog");
   });
 
   it("routes the native menu's palette action through the same arming path", () => {

@@ -49,6 +49,17 @@ before that tag is pushed.
   validate ignored paths, tracked content, activity and file identities, and
   refuse stale, repeated or incomplete plans.
 
+### Changed
+
+- Rebuild the command palette with eight discoverable search modes, fuzzy ranked
+  commands, file and repository search, complete view/section navigation, Clone and
+  Rebase dialog entry points, contextual availability, result paging and accessible
+  keyboard/focus behavior. Successful-use history is validated and bounded.
+- Keep palette searches current across query/mode/repository changes; show loading,
+  deadlines, failures, retry and partial coverage. Resolve cross-repository symbols
+  through the workspace registry before opening files, preserve help-mode transitions,
+  and make the status-bar palette entry work before its first lazy load.
+
 ## [0.0.9] - 2026-09-08
 
 ### Changed
