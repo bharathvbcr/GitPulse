@@ -350,6 +350,7 @@ export function buildCodeGraphModel(
       degree: Math.max(0, asFinite(row.degree, asFinite(row.val, 1))),
       val: asFinite(row.val), file_count: count(row.file_count), summary: textValue(row.summary),
       line: count(row.line), entry: row.entry === true, flags,
+      documentation: row.documentation === true,
       x: typeof row.x === "number" && Number.isFinite(row.x) && Math.abs(row.x) <= 1e7 ? row.x : undefined,
       y: typeof row.y === "number" && Number.isFinite(row.y) && Math.abs(row.y) <= 1e7 ? row.y : undefined,
     });

@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions } from "../terminal/sessionRegistry";
+  import { terminalLaunchRequests } from "../terminal/launchRequests";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -126,7 +127,9 @@
   // ---------------------------------------------------------------------
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
-  let tabState = $state<TabState>(initialState());
+  let tabState = $state<TabState>(untrack(() =>
+    get(terminalLaunchRequests)?.repoPath === repoPath ? { tabs: [], activeId: null } : initialState(),
+  ));
   const activeId = $derived(tabState.activeId);
   const activeTitle = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.title);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
@@ -142,12 +145,36 @@
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
 
-  function newTab(launcher: LauncherKind) {
-    if (!repoPath || !canCreate) return;
+  function newTab(launcher: LauncherKind, initialPrompt?: string): boolean {
+    if (!repoPath || !canCreate) return false;
     focusTabStrip = false;
-    tabState = openTab(tabState, launcher);
+    tabState = openTab(tabState, launcher, initialPrompt);
     if (splitIds && activeId) splitIds = [splitIds[0], activeId];
+    return true;
   }
+
+  $effect(() => {
+    const request = $terminalLaunchRequests;
+    if (!request || !visible || request.repoPath !== repoPath) return;
+    untrack(() => {
+      const claimed = terminalLaunchRequests.take(request.repoPath);
+      if (!claimed) return;
+      mode = "shell";
+      const opened = newTab(claimed.launcher, claimed.prompt);
+      const id = tabState.activeId;
+      if (opened && id) terminalLaunchRequests.remember({
+        id, repoPath: claimed.repoPath, launcher: claimed.launcher, status: "starting",
+        reveal() {
+          mode = "shell";
+          selectTab(id);
+          void tick().then(() => sessions[id]?.reveal());
+        },
+      });
+      claimed.complete(opened ? undefined : capacityTitle);
+    });
+  });
+
+  onDestroy(() => { for (const tab of tabState.tabs) terminalLaunchRequests.forget(tab.id); });
 
   function selectTab(id: string, keepStripFocus = false) {
     focusTabStrip = keepStripFocus;
@@ -163,6 +190,7 @@
    * that waits to be asked.
    */
   function dropTab(id: string) {
+    terminalLaunchRequests.forget(id);
     focusTabStrip = false;
     if (splitIds?.includes(id)) splitIds = null;
     tabState = closeTab(tabState, id);
@@ -633,10 +661,11 @@
               repoPath={repoPath}
               tabId={tab.id}
               launcher={tab.launcher}
+              initialPrompt={tab.initialPrompt}
               active={visible && tab.id === tabState.activeId && mode === "shell"}
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               onChord={handleChord}
-              onStatus={(status) => (tabStatuses = { ...tabStatuses, [tab.id]: status })}
+              onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
               onActivity={() => { if (visible && mode === "shell" && splitIds?.includes(tab.id)) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
           </div>

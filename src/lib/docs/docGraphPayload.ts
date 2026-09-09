@@ -25,6 +25,7 @@ export function docGraphToVizPayload(graph: DocGraph): GraphVizPayload {
       id: node.path || `doc:${i}`,
       name: node.title || node.path || `doc:${i}`,
       kind: "doc",
+      documentation: true,
       path: node.path,
       community: folder,
       degree: node.degree,

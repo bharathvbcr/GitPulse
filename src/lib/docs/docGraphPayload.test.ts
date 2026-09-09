@@ -6,6 +6,7 @@ import {
 } from "./docGraphPayload";
 import type { DocGraph } from "./client";
 import { buildCodeGraphModel } from "../codeintel/graphPayload";
+import { buildGraphIndex, filterGraphNodes } from "../codeintel/graphNavigation";
 
 const sample: DocGraph = {
   nodes: [
@@ -34,6 +35,13 @@ const sample: DocGraph = {
 };
 
 describe("docGraphToVizPayload", () => {
+  it("carries the note classification through to the visibility filter without changing coverage", () => {
+    const payload = docGraphToVizPayload(sample);
+    const model = buildCodeGraphModel(payload);
+    expect(filterGraphNodes(model,buildGraphIndex(model),{hideNotes:true})).toEqual([]);
+    expect(payload.counts?.nodes_total).toBe(10);
+    expect(payload.counts?.nodes_truncated).toBe(true);
+  });
   it("keeps 1000×1000 coords and truncation honesty for the canvas", () => {
     const payload = docGraphToVizPayload(sample);
     expect(payload.level).toBe("doc");

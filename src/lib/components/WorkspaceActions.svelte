@@ -83,6 +83,11 @@
    */
   function reveal(path: string) {
     const { tab, section } = destinationFor(path);
+    if (tab === "history" && section === "diff") {
+      void repoStore.previewUncommitted(path);
+      detailsOpen = false;
+      return;
+    }
     const open = $repoStore.openTabs.find((entry) => entry.path === path);
     if (open) {
       void repoStore.activateTab(open.id);
@@ -256,6 +261,10 @@
                     {repo.reasons.map((reason) => reason.detail).join(" · ")}
                   </p>
                 </button>
+                {#if repo.severity !== "uncommitted" && repo.reasons.some(reason => reason.kind === "uncommitted")}
+                  <button type="button" class="mt-1 text-amber-600 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {repo.label}"
+                    onclick={() => { void repoStore.previewUncommitted(repo.path); detailsOpen = false; }}>Preview uncommitted changes</button>
+                {/if}
               </li>
             {/each}
           </ul>

@@ -66,6 +66,7 @@ export interface GraphFilters {
   language?: LanguageIconKey | null;
   hideTests?: boolean;
   hideGenerated?: boolean;
+  hideNotes?: boolean;
   connectedOnly?: boolean;
 }
 
@@ -76,6 +77,7 @@ export function filterGraphNodes(model: CodeGraphModel, index: GraphIndex, filte
     if (filters.community && nodeCommunity(node) !== filters.community) return false;
     if (filters.language && nodeLanguageKey(node) !== filters.language) return false;
     if (filters.hideTests && isGraphTestPath(path)) return false;
+    if (filters.hideNotes && node.documentation === true) return false;
     if (filters.hideGenerated && (/(^|\/)(generated|__generated__|vendor|vendored|node_modules|dist|build|target)(\/|$)/i.test(path) || /(?:\.generated|\.g|\.min)\.[^/]+$/i.test(path))) return false;
     if (filters.connectedOnly && !index.incoming.has(node.id) && !index.outgoing.has(node.id) && !index.related.has(node.id)) return false;
     return !query || `${node.name} ${path} ${node.id}`.toLowerCase().includes(query);

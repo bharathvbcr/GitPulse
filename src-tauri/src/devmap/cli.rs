@@ -277,13 +277,55 @@ fn run_devmap(
     let mut cmd = Command::new(&binary.path);
     cmd.current_dir(repo);
     cmd.args(args);
-    // Progress on stderr races with JSON on stdout in some terminals; never
-    // ask for it when we are capturing machine-readable output.
+    // stdout and stderr are independently drained. Plain build progress makes
+    // the active phase diagnosable without changing the JSON payload.
     if args.contains(&"--json") && !args.contains(&"--progress") {
-        cmd.arg("--progress").arg("never");
+        cmd.arg("--progress")
+            .arg(if args.first() == Some(&"build") {
+                "always"
+            } else {
+                "never"
+            });
     }
-    git_cli::run_bounded_capped(cmd, "devmap", deadline, stdin, STDOUT_CAP)?
-        .require_complete("devmap")
+    let effective_args = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut diagnostic =
+        super::diagnostics::CommandLog::start(binary, repo, &effective_args, deadline);
+    let result = git_cli::run_observed(
+        &mut cmd,
+        "devmap",
+        deadline,
+        stdin,
+        STDOUT_CAP,
+        &mut diagnostic,
+    );
+    let protocol_error = result
+        .as_ref()
+        .ok()
+        .filter(|run| {
+            run.success
+                && run.incomplete.is_none()
+                && run.stderr_incomplete.is_none()
+                && args.contains(&"--json")
+        })
+        .and_then(|run| match serde_json::from_slice::<Value>(&run.stdout) {
+            Ok(report) if !report.is_object() => {
+                Some("devmap returned a JSON value instead of a report object".to_string())
+            }
+            Ok(report) if report.get("error").is_some_and(|error| !error.is_null()) => Some(
+                "devmap returned an error report despite exit 0; see DevMap logs for details"
+                    .to_string(),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(format!("devmap returned non-JSON stdout: {error}")),
+        });
+    diagnostic.finish(&result, protocol_error.as_deref());
+    if let Some(error) = protocol_error {
+        return Err(error);
+    }
+    result?.require_complete("devmap")
 }
 
 fn parse_json_stdout(stdout: &str) -> Option<Value> {
@@ -576,6 +618,85 @@ pub fn preview_many(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn devmap_failures_retain_diagnostic_context_without_preview_source() {
+        crate::logging::init();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_fake_devmap(dir.path());
+        fs::write(&path, "#!/bin/sh\necho 'diagnostic-probe: opening index' >&2\nprintf '{\"error\":\"broken store\"}'\nexit 7\n").unwrap();
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        let run = run_devmap(
+            &binary,
+            dir.path(),
+            &["preview", "--json"],
+            Some(b"PRIVATE_PREVIEW_SOURCE"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(run.status_code, 7);
+        let logs = crate::logging::diagnostic_tail(500).join("\n");
+        assert!(
+            logs.contains("diagnostic-probe: opening index"),
+            "DevMap stderr was discarded"
+        );
+        assert!(logs.contains("broken store"));
+        assert!(logs.contains("elapsed_ms"));
+        assert!(logs.contains("exit_code"));
+        assert!(!logs.contains("PRIVATE_PREVIEW_SOURCE"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn devmap_logs_redact_multiline_credentials_before_persistence() {
+        crate::logging::init();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_fake_devmap(dir.path());
+        fs::write(&path, "#!/bin/sh\nprintf '%s\\n' '-----BEGIN PRIVATE KEY-----' 'DEVMAP_PRIVATE_KEY_MATERIAL' '-----END PRIVATE KEY-----' >&2\necho '{}'\n").unwrap();
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        run_devmap(
+            &binary,
+            dir.path(),
+            &["status", "--json"],
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let logs = crate::logging::diagnostic_tail(500).join("\n");
+        assert!(
+            !logs.contains("DEVMAP_PRIVATE_KEY_MATERIAL"),
+            "multiline secret leaked through a progress record"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn devmap_rejects_successful_non_json_payloads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_fake_devmap(dir.path());
+        let binary = ResolvedDevmap {
+            path: path.to_string_lossy().into_owned(),
+            lookup: DevmapLookup::PathSearch,
+        };
+        for payload in ["not JSON", "null", "{\"error\":\"store unavailable\"}"] {
+            fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{payload}'\n")).unwrap();
+            let result = run_devmap(
+                &binary,
+                dir.path(),
+                &["build", "--json"],
+                None,
+                Duration::from_secs(5),
+            );
+            assert!(result.is_err(), "invalid result was accepted: {payload}");
+        }
+    }
 
     #[test]
     #[cfg(unix)]

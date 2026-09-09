@@ -29,6 +29,15 @@ describe("CoverageViewer", () => {
     expect(body).toContain("Copy coverage report");
     expect(body).toContain("disabled");
   });
+
+  it("offers agent prompting independently of scan and MANVI availability", () => {
+    const { body } = render(CoverageViewer);
+    expect(body).toContain("Copy agent prompt");
+    expect(body).toContain("Run in Claude Code");
+    expect(body).toContain("Coverage coding agent");
+    expect(body).toContain("Codex");
+    expect(body).toContain("Preview prompt");
+  });
 });
 describe("CoverageViewer report copy contract", () => {
   it("copies the canonical full coverage snapshot for the current repository", () => {
@@ -202,10 +211,8 @@ describe("CoverageViewer MANVI integration contracts", () => {
       source.indexOf("async function runCoveragePipeline"),
       source.indexOf("async function runCoverageFamily"),
     );
-    const batchBody = source.slice(
-      source.indexOf("async function runMissingCoverage"),
-      source.indexOf("$effect"),
-    );
+    const batchStart = source.indexOf("async function runMissingCoverage");
+    const batchBody = source.slice(batchStart, source.indexOf("$effect", batchStart));
     expect(scriptBody).toContain("Promise<boolean>");
     expect(pipelineBody).toContain("kind: step.kind");
     expect(pipelineBody).toContain('pipeline.mode === "first_success"');
@@ -223,7 +230,7 @@ describe("CoverageViewer flicker contracts", () => {
     expect(source).toContain("report = reportCache.get(repo) ?? null");
   });
 
-  it("only invalidates gutters when the selected file's coverage changed", () => {
+  it("invalidates a new measurement even when the selected file has identical totals", () => {
     // The apply step is now shared by a scan this panel started and a
     // revalidation the file watcher triggered, so the assertion follows it
     // into applyReport rather than staying in scan's body.
@@ -232,6 +239,8 @@ describe("CoverageViewer flicker contracts", () => {
       source.indexOf("async function scan("),
     );
     expect(applyBody).toContain("sameCoverageSummary(prevEntry, nextEntry)");
+    expect(applyBody).toContain("const newMeasurement = measuredAt !== appliedMeasurementAt");
+    expect(applyBody).toContain("if (newMeasurement ||");
   });
 
   it("routes both a self-started scan and a watcher revalidation through one apply step", () => {
@@ -266,8 +275,11 @@ describe("CoverageViewer flicker contracts", () => {
     expect(source).not.toContain('invoke<CoverageReport>("cmd_scan_coverage"');
   });
 
-  it("keeps old source lines visible while a gutter reload is in flight", () => {
+  it("keeps the report visible while fresh file details load without stale gutters", () => {
     expect(source).toContain("{#if isLoadingFile && sourceLines.length === 0}");
+    const fileLoad = source.slice(source.indexOf("const coverageDetailKey"), source.indexOf("function selectFile("));
+    expect(fileLoad).toContain("sourceLines = [];");
+    expect(fileLoad).toContain("hitMap = new Map();");
     // The full-pane scan placeholder stays gated on having no data at all.
     expect(source).toContain("{#if isScanning && !report}");
   });

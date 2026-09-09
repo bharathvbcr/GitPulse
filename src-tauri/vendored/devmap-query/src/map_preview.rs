@@ -192,6 +192,8 @@ fn pairs_json(ranked: &[(String, usize)]) -> Value {
 pub struct FileAttribution {
     /// Language histogram per subsystem area.
     pub by_area: BTreeMap<String, BTreeMap<String, usize>>,
+    /// Documentation files counted before any display caps, by owning area.
+    pub documentation_by_area: BTreeMap<String, usize>,
     /// Language histogram for every indexed file, attributed or not.
     pub repo_languages: BTreeMap<String, usize>,
     /// Kind histogram for every indexed file.
@@ -219,6 +221,7 @@ pub fn attribute_files_to_areas(file_rows: &[Value], areas: &[String]) -> FileAt
     let mut repo_languages: BTreeMap<String, usize> = BTreeMap::new();
     let mut repo_kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut attributed = 0usize;
+    let mut documentation_by_area = BTreeMap::new();
 
     // Longest first so the first prefix hit is the most specific one.
     let mut ordered: Vec<&String> = areas.iter().filter(|a| !a.is_empty()).collect();
@@ -260,12 +263,16 @@ pub fn attribute_files_to_areas(file_rows: &[Value], areas: &[String]) -> FileAt
                     .entry(language)
                     .or_insert(0) += 1;
                 attributed += 1;
+                if crate::viz::is_documentation(row) {
+                    *documentation_by_area.entry((*area).clone()).or_insert(0) += 1;
+                }
                 break;
             }
         }
     }
     FileAttribution {
         by_area,
+        documentation_by_area,
         repo_languages,
         repo_kinds,
         attributed,
@@ -365,6 +372,10 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
         );
         sub.insert("languages".into(), pairs_json(&ranked));
         sub.insert("file_count".into(), json!(total));
+        sub.insert(
+            "documentation".into(),
+            json!(total > 0 && files.documentation_by_area.get(&id).copied().unwrap_or(0) == total),
+        );
     }
 
     let nodes: Vec<Value> = subsystems
@@ -381,6 +392,7 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
                 "val": std::cmp::max(1, neighbors + handoffs + entries),
                 "file_count": s["file_count"],
                 "lang": s["primary_language"],
+                "documentation": s["documentation"],
                 "entry": entries > 0,
             })
         })

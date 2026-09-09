@@ -38,6 +38,8 @@ export interface TerminalTab {
    */
   title: string | null;
   name?: string;
+  /** Supplied as a literal agent CLI argument when this tab starts. */
+  initialPrompt?: string;
 }
 
 export interface TabState {
@@ -68,8 +70,8 @@ function nextTabId(): string {
   return `tab-${sequence}`;
 }
 
-export function createTab(launcher: LauncherKind): TerminalTab {
-  return { id: nextTabId(), launcher, title: null };
+export function createTab(launcher: LauncherKind, initialPrompt?: string): TerminalTab {
+  return { id: nextTabId(), launcher, title: null, ...(initialPrompt === undefined ? {} : { initialPrompt }) };
 }
 
 export function initialState(launcher: LauncherKind = "shell"): TabState {
@@ -87,9 +89,9 @@ export function canOpenTab(state: TabState): boolean {
  * Silent refusal is the caller's cue to have disabled the control already;
  * this returning the same object is what makes "nothing happened" checkable.
  */
-export function openTab(state: TabState, launcher: LauncherKind): TabState {
+export function openTab(state: TabState, launcher: LauncherKind, initialPrompt?: string): TabState {
   if (!canOpenTab(state)) return state;
-  const tab = createTab(launcher);
+  const tab = createTab(launcher, initialPrompt);
   return { tabs: [...state.tabs, tab], activeId: tab.id };
 }
 

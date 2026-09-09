@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse coverage agent verification</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run coverage checks</button>
+    <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      import { mockIPC } from "@tauri-apps/api/mocks";
+      import { emit } from "@tauri-apps/api/event";
+      import "../src/app.css";
+      let mode = "empty";
+      let sequence = 0;
+      const spawned = [], writes = [], errors = [];
+      const totals = { lines_found: 10, lines_hit: 7, percentage: 70 };
+      const overall = { lines_found: 16, lines_hit: 10, percentage: 62.5 };
+      const report = (measured) => ({
+        families: [{ family: "javascript", languages: ["TypeScript"], color_hex: "#3178c6", expected_formats: ["lcov", "istanbul"], expected_paths: ["coverage/lcov.info", "coverage/coverage-final.json"], found: measured, suggested_commands: ["npm run coverage"], setup_commands: [], tool_ready: true, tool_detail: "", duration_hint: "" }],
+        files: measured ? [
+          { path: "src/example.ts", language: "TypeScript", color_hex: "#3178c6", ...totals },
+          { path: "lib/rust.rs", language: "Rust", color_hex: "#d76", lines_found: 4, lines_hit: 1, percentage: 25 },
+          { path: "src/full.ts", language: "TypeScript", color_hex: "#3178c6", lines_found: 2, lines_hit: 2, percentage: 100 },
+          { path: "src/unknown.ts", language: "TypeScript", color_hex: "#3178c6", lines_found: 0, lines_hit: 0, percentage: 0 },
+        ] : [],
+        languages: [], artifacts: measured ? [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals }] : [],
+        overall: measured ? overall : { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false,
+      });
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+      mockIPC((cmd, args) => {
+        switch (cmd) {
+          case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
+          case "cmd_scan_coverage": if (mode === "failed") throw new Error("Fixture scan failed"); return report(mode === "measured" || mode === "redistributed");
+          case "cmd_get_file_coverage": return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [...[1, 4, 5, 6, 7, 8, 9].map(line_no => ({ line_no, hits: 1 })), ...(mode === "redistributed" ? [45, 46, 60] : [2, 3, 60]).map(line_no => ({ line_no, hits: 0 }))], totals, truncated: false, lines_truncated: false };
+          case "cmd_get_file_content": {
+            const content = Array.from({ length: 100 }, (_, i) => `export const line${i + 1} = ${i + 1};`).join("\n");
+            return mode === "slow-detail" ? new Promise(resolve => setTimeout(() => resolve(content), 250)) : content;
+          }
+          case "cmd_terminal_spawn": {
+            if (mode === "spawn-error" && args.program) { mode = "empty"; throw new Error("Fixture agent executable unavailable"); }
+            const id = `coverage-${++sequence}`;
+            spawned.push({ ...args, id });
+            setTimeout(() => void emit("terminal-output", { id, data_b64: btoa("Simulated agent session ready. No commands execute.\r\n") }), 60);
+            return { id, cwd: args.repoPath, shell: args.program ?? "/bin/zsh" };
+          }
+          case "cmd_terminal_write": writes.push(args); return null;
+          case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_kill": return null;
+          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": case "cmd_stash_list": return [];
+          case "cmd_list_tags": return { tags: [], truncated: false };
+          case "cmd_branch_stats": return {};
+          case "cmd_repo_operation": case "cmd_workspace_sync": return null;
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      }, { shouldMockEvents: true });
+      const { mount, tick } = await import("svelte");
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
+      const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry");
+      const { coverageMetric } = await import("../src/lib/metrics/repoMetrics");
+      const { get } = await import("svelte/store");
+      const Host = (await import("./CoverageHost.svelte")).default;
+      interfaceStore.setAutoRunCoverage(false);
+      interfaceStore.setTerminalDockOpen(false);
+      interfaceStore.setTerminalDockHeight(260);
+      await repoStore.openRepo("/fixture/Other");
+      await repoStore.openRepo("/fixture/GitPulse");
+      mount(Host, { target: document.querySelector("#app"), props: { setMode: next => { mode = next; } } });
+
+      const wait = () => new Promise(resolve => setTimeout(resolve, 120));
+      const visible = selector => [...document.querySelectorAll(selector)].filter(node => node.getBoundingClientRect().width > 0);
+      const button = name => visible("button").find(node => (node.getAttribute("aria-label") || node.getAttribute("title") || node.textContent.trim()) === name);
+      const prompt = () => document.querySelector('textarea[aria-label="Coverage agent prompt"]').value;
+      const until = async test => { const end = Date.now() + 8000; while (!test() && Date.now() < end) await wait(); if (!test()) throw new Error("Fixture condition timed out"); };
+      const choose = async (label, value) => {
+        const select = document.querySelector(`select[aria-label="${label}"]`);
+        select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); await tick();
+      };
+      const launch = async agent => { await choose("Coverage coding agent", agent); button(agent === "codex" ? "Run in Codex" : "Run in Claude Code").click(); };
+      const checks = document.querySelector("#checks");
+      checks.disabled = false;
+      checks.onclick = async () => {
+        checks.disabled = true;
+        const results = [];
+        const check = (name, pass) => { results.push({ name, pass: !!pass }); document.querySelector("#result").textContent = JSON.stringify(results, null, 2); if (!pass) throw new Error(name); };
+        const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+        const originalExec = document.execCommand;
+        const slots = [];
+        let copiedText = "";
+        try {
+          await until(() => prompt().includes("TypeScript"));
+          check("empty coverage can copy and run", !button("Copy agent prompt").disabled && !button("Run in Claude Code").disabled);
+          check("empty coverage is unmeasured", prompt().includes("No coverage data"));
+          check("scanner-owned path is included", prompt().includes("coverage/coverage-final.json"));
+          document.querySelector("summary").click(); await tick();
+          check("preview is read-only and visible", document.querySelector("textarea").readOnly && document.querySelector("textarea").getBoundingClientRect().height > 0);
+          Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { copiedText = text; } } });
+          button("Copy agent prompt").click(); await wait();
+          check("copy equals preview", copiedText === prompt());
+          check("copy success is visible", !!button("Agent prompt copied"));
+          button("Measured coverage").click(); button("Rescan coverage artifacts").click(); await until(() => prompt().includes("62.5%"));
+          check("fresh report resets copy feedback", !!button("Copy agent prompt"));
+          check("measured snapshot is included", prompt().includes("10/16 lines"));
+          await until(() => !!button("Next missed block") && !button("Next missed block").disabled);
+          mode = "slow-detail";
+          button("lib/rust.rs, 25.0%, 3 missed lines").click(); await tick();
+          check("file selection disables navigation while loading", button("Next missed block").disabled);
+          repoStore.setError("Fixture unrelated status update"); await new Promise(resolve => setTimeout(resolve, 400));
+          check("store updates do not cancel a pending file load", !button("Next missed block").disabled);
+          repoStore.setError(null); mode = "measured";
+          button("src/example.ts, 70.0%, 3 missed lines").click(); await until(() => !button("Next missed block").disabled);
+          check("scan status distinguishes artifact age", document.body.textContent.includes("Last scanned:") && document.body.textContent.includes("Artifact age unknown"));
+          check("four scanned files are counted", document.body.textContent.includes("Showing 4 of 4 scanned files"));
+          const search = document.querySelector('input[aria-label="Search coverage files"]');
+          search.value = "SRC/"; search.dispatchEvent(new Event("input", { bubbles: true })); await tick();
+          check("file search ignores case", document.body.textContent.includes("Showing 3 of 4 scanned files"));
+          await choose("Filter coverage language", "Rust");
+          check("combined filters expose a recoverable empty state", document.body.textContent.includes("No files match these filters"));
+          button("Show all files").click(); await tick();
+          await choose("Filter coverage gaps", "missed");
+          check("missed filter excludes fully covered and unmeasured files", document.body.textContent.includes("Showing 2 of 4 scanned files"));
+          await choose("Sort coverage files", "coverage");
+          check("lowest coverage sorts first", visible('button[aria-label$="missed lines"]')[0].getAttribute("aria-label").startsWith("lib/rust.rs"));
+          button("Clear filters").click();
+          button("Next missed block").click(); await tick();
+          check("first missed block is highlighted", document.querySelector('[data-coverage-line="2"][data-missed-active="true"]'));
+          button("Next missed block").click(); await tick();
+          check("next missed block scrolls virtual source", document.querySelector('[data-coverage-line="60"][data-missed-active="true"]'));
+          button("Previous missed block").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", altKey: true, bubbles: true })); await tick();
+          check("scoped shortcut navigates backwards", document.querySelector('[data-coverage-line="2"][data-missed-active="true"]'));
+          search.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true })); await tick();
+          check("typing controls do not trigger source shortcuts", document.querySelector('[data-coverage-line="2"][data-missed-active="true"]'));
+          button("Improve this file’s coverage").click(); await tick();
+          check("file action targets selected source and missed blocks", prompt().includes("Selected file: src/example.ts") && prompt().includes("Missed line blocks: 2–3, 60"));
+          check("targeted task keeps accepted output paths", prompt().includes("coverage/lcov.info"));
+          // Same aggregate counts can cover different lines after a new test run.
+          mode = "redistributed"; button("Rescan coverage artifacts").click();
+          await until(() => !button("Rescan coverage artifacts").disabled); await wait();
+          check("same totals still refresh line details", prompt().includes("Missed line blocks: 45–46, 60"));
+          mode = "failed"; await coverageMetric.refresh("/fixture/GitPulse", { force: true }); await tick();
+          check("external scan failure marks retained data stale", prompt().includes("last scan failed") && document.body.textContent.includes("Stale · scan failed"));
+          mode = "measured"; await coverageMetric.refresh("/fixture/GitPulse", { force: true }); await tick();
+          check("external scan recovery clears stale status", !prompt().includes("last scan failed"));
+          button("Failed scan").click(); button("Rescan coverage artifacts").click(); await until(() => prompt().includes("last scan failed"));
+          check("failed scan retains previous snapshot", prompt().includes("62.5%"));
+          check("failed scan keeps actions available", !button("Run in Claude Code").disabled);
+          Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("fixture denied"); } } });
+          document.execCommand = () => false;
+          button("Copy agent prompt").click(); await until(() => document.body.textContent.includes("Could not copy."));
+          check("failed copy exposes manual preview", document.querySelector("details").open && !button("Copy agent prompt").disabled);
+          mode = "empty";
+          const expectedPrompt = prompt();
+          await launch("codex");
+          await until(() => spawned.some(row => row.program === "codex"));
+          const codex = spawned.find(row => row.program === "codex");
+          check("Codex receives exact preview as one literal prompt", JSON.stringify(codex.args) === JSON.stringify(["--", expectedPrompt]));
+          check("Codex runs in the selected checkout", codex.repoPath === "/fixture/GitPulse");
+          check("first launch creates one session", spawned.length === 1);
+          check("prompt is not typed into a shell", writes.length === 0);
+          await launch("claude"); await until(() => spawned.some(row => row.program === "claude"));
+          check("Claude receives same prompt", spawned.find(row => row.program === "claude").args[1] === expectedPrompt);
+          button("Hide the terminal dock").click(); await tick();
+          button("View agent session").click(); await tick();
+          check("view agent reopens existing tab without spawning", spawned.length === 2 && visible('[role="tab"][aria-selected="true"]').some(node => node.textContent.includes("Claude")));
+          const claude = spawned.find(row => row.program === "claude");
+          await emit("terminal-exit", { id: claude.id, exit_code: 0, signal: "", error: null }); await wait();
+          check("completed agent transcript remains reachable", !!button("View agent session") && document.body.textContent.includes("session: exited"));
+          button("Repository Other").click(); await until(() => prompt().includes("Repository: /fixture/Other"));
+          check("repo switch clears old prompt and feedback", !prompt().includes("/fixture/GitPulse") && !document.body.textContent.includes("Agent session opened"));
+          check("repo switch preserves existing agents", spawned.filter(row => row.program).length === 2);
+          check("other repository has no unrelated agent link", !button("View agent session"));
+          button("Repository GitPulse").click(); await until(() => !!button("View agent session"));
+          button("View agent session").click(); await tick();
+          check("return link survives repository changes", spawned.filter(row => row.program).length === 2);
+          button("Repository Other").click(); await until(() => prompt().includes("Repository: /fixture/Other"));
+          button("Fail next agent launch").click(); await launch("codex");
+          await until(() => document.body.textContent.includes("Fixture agent executable unavailable"));
+          check("native spawn failures remain visible", document.body.textContent.includes("Fixture agent executable unavailable"));
+          for (let i = get(terminalSessions).length; i < 16; i++) slots.push(terminalSessions.reserve({ key: `fixture-slot-${i}`, repoPath: "/fixture/busy", label: "Busy", status: "running", close: async () => {} }));
+          const beforeCap = spawned.length;
+          await launch("claude"); await until(() => document.body.textContent.includes("All 16 terminal sessions"));
+          check("capacity refuses without spawning", spawned.length === beforeCap);
+          slots.splice(0).forEach(slot => slot.release());
+          mode = "measured"; button("Rescan coverage artifacts").click(); await until(() => prompt().includes("62.5%"));
+          button("Hide the terminal dock").click();
+          button("Toggle narrow layout").click(); button("Toggle theme").click(); await wait();
+          const section = document.querySelector('section[aria-label="Generate coverage with a coding agent"]');
+          check("narrow prompt controls stay inside panel", section.scrollWidth <= section.clientWidth + 1);
+          button("Toggle narrow layout").click(); await wait();
+          check("compact layout keeps page inside viewport", document.querySelector('[role="region"][aria-label="Test coverage"]').scrollWidth <= document.querySelector('[role="region"][aria-label="Test coverage"]').clientWidth + 1);
+          check("no unhandled runtime errors", errors.length === 0);
+          checks.textContent = `${results.length}/${results.length} coverage checks passed`;
+        } catch (error) {
+          results.push({ name: `Harness failure: ${error.message}`, pass: false });
+          document.querySelector("#result").textContent = JSON.stringify(results, null, 2);
+          checks.textContent = `Coverage checks FAILED: ${error.message}`;
+        } finally {
+          slots.forEach(slot => slot.release());
+          if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard); else delete navigator.clipboard;
+          document.execCommand = originalExec;
+          document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+          const reportPath = new URL(location.href).searchParams.get("report");
+          if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      };
+      if (new URL(location.href).searchParams.get("check") === "1") checks.click();
+    </script>
+  </body>
+</html>

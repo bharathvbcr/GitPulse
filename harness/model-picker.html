@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Header model picker</title>
+  </head>
+  <body class="bg-background text-textPrimary">
+    <header class="flex items-center justify-end border-b border-border p-4">
+      <div id="app"></div>
+    </header>
+    <main class="p-6 space-y-4">
+      <h1>Header model picker</h1>
+      <p>Fixture servers only. No repository or local model server is required.</p>
+      <label class="block"><input id="offline" type="checkbox" /> Servers offline</label>
+      <label class="block"><input id="fail" type="checkbox" /> Fail status requests</label>
+      <label class="block"><input id="slow" type="checkbox" /> Delay status requests</label>
+      <pre id="preference" aria-label="Saved model preference"></pre>
+      <pre id="probe" aria-label="Last model probe"></pre>
+      <pre id="errors" role="alert"></pre>
+    </main>
+    <script type="module">
+      await import("../src/app.css");
+      const errors = document.getElementById("errors");
+      window.addEventListener("error", (event) => { errors.textContent += event.message; });
+      window.addEventListener("unhandledrejection", (event) => { errors.textContent += String(event.reason); });
+      const harness = {
+        available: true, binary: "/fixture/manvi", protocol: 1,
+        posture: "guarded", ops: [], error: "", error_code: "",
+      };
+      const endpoints = [
+        { base_url: "http://localhost:11434/v1", reachable: true, detail: "", models: ["local-chat", "code-model"] },
+        { base_url: "http://localhost:1234/v1", reachable: true, detail: "", models: ["local-chat", "a-long-model-name-that-must-stay-within-the-header"] },
+      ];
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (command, args) => {
+          if (command === "cmd_harness_status") return harness;
+          if (command !== "cmd_ai_status") throw new Error(`Unexpected fixture command: ${command}`);
+          document.getElementById("probe").textContent = JSON.stringify(args);
+          const offline = document.getElementById("offline").checked;
+          const fail = document.getElementById("fail").checked;
+          if (document.getElementById("slow").checked) await new Promise(resolve => setTimeout(resolve, 1500));
+          if (fail) throw new Error("Fixture model server unavailable");
+          return {
+            harness, endpoints: offline ? [] : endpoints,
+            selected: offline ? null : { base_url: args.baseUrl ?? endpoints[0].base_url, model: args.model ?? endpoints[0].models[0] },
+            model_info: null, model_detail: "", ready: !offline,
+            detail: offline ? "No local model server answered." : "Local model ready.",
+          };
+        },
+      };
+      const { mount } = await import("svelte");
+      const { harnessStore } = await import("../src/lib/stores/harnessStore");
+      const HarnessBadge = (await import("../src/lib/components/HarnessBadge.svelte")).default;
+      harnessStore.subscribe((state) => {
+        document.getElementById("preference").textContent = state.preferred
+          ? `${state.preferred.model} at ${state.preferred.base_url}` : "Automatic";
+      });
+      mount(HarnessBadge, { target: document.getElementById("app") });
+    </script>
+  </body>
+</html>

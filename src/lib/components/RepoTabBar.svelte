@@ -490,13 +490,17 @@
             {#if tab.currentBranch}
               <span class="whitespace-nowrap text-[10px] text-textMuted/80 font-mono hidden sm:inline">{tab.currentBranch}</span>
             {/if}
-            {#if tab.isDirty}
-              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0 shadow-[0_0_6px_rgb(251_191_36/0.8)]" title="Uncommitted changes"></span>
-            {/if}
             {#if tab.conflictedCount > 0}
               <span class="text-amber-400 shrink-0">{tab.conflictedCount}</span>
             {/if}
           </button>
+          {#if tab.isDirty}
+            <button type="button" class="shrink-0 grid place-items-center w-5 h-5 rounded-full hover:bg-amber-500/15 focus-visible:ring-1 focus-visible:ring-accent"
+              title="Preview uncommitted changes in {tab.label}" aria-label="Preview uncommitted changes in {tab.label}"
+              onclick={() => void repoStore.previewUncommitted(tab.path)}>
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgb(251_191_36/0.8)]"></span>
+            </button>
+          {/if}
           <button
             type="button"
             tabindex="-1"

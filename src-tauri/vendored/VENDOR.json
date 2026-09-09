@@ -280,14 +280,14 @@
         "src/lib.rs": "d6f3f566976dd09103a288196508fc987b7cbdfe5472df0e1bae4982ccba8a28",
         "src/linguist.rs": "08832b5a4215e7c3242f31af0672391ad9c33b25e1d050e7c365b11b3a418908",
         "src/manifest.rs": "279fdb350bcaee24bddb29123192661d413802afd630eb5dafc06d9a73121437",
-        "src/map_preview.html": "04e15b5c2722ccf260e08cc2b7c05595f5a93c573595add5e49878dfe771ecde",
-        "src/map_preview.rs": "35c0f66cb7b0aae702007be39064c5debcaac95c24f26fa944e5b9fb2d7fe4bf",
+        "src/map_preview.html": "090e7abcb22ca1e091de2f4158f316e481610c2821f7e5c054260c34333aa185",
+        "src/map_preview.rs": "9cf443751fc4333d34bc8726860b635bd26f58aa8523441716ad53c5ba214cda",
         "src/model.rs": "58efcfe224f223d9ec52e8a9514b100bda541aa87328c7201842ff3079a8ddaa",
         "src/query_match.rs": "d3895702cdfac77fe87cfffb7f729555f7da5f20a762c58c7437fa92c51ca51d",
         "src/rung.rs": "e962ef23a3dc51e7595bb0708bb6a132cf5bf3172f8c2b9b1050ffeaf0c7f243",
         "src/semantic.rs": "bf045dad9afd1e87a50872983081db999575d9aae54ece304c2cd9c563fc38e4",
         "src/snapshots.rs": "2021b47ec10f2743c162e453bba882180494b57c99e07139f8e9f7a9c5daa942",
-        "src/viz.rs": "f06edb11498ee017e9e6a377baa601c089a915bdfe5b89cd28d2965a3ae4164b",
+        "src/viz.rs": "2771be757c19e94c40aa27efcf1a26f239e64b437284d6f5b6dbbca6abf11c71",
         "src/workspace.rs": "a143523a44881f0f4589a38d8edf2d0ca676747b41f530a1cd9c5ca56ddb32ee"
       }
     },
@@ -346,7 +346,7 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "28984292244724b7bb3511a64b131fbccdde71e1d60350b2dd84f35fbce9517d",
+        "src/db.rs": "9425849ba37ccba1195581555ad4c12f4be56d0174d7ea0c03ce692f8d273f84",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "a8447e286fe81b754e324ffaacddb818e6b7d0f27477612a18e7fbcd1a3ac693",
         "src/lib.rs": "ef1ca35a4a430336420e32c439e03c348f44052fb81a8dc120547bed400aeaad",

@@ -43,6 +43,86 @@ function outcome(
 }
 
 describe("liveIndex controller", () => {
+  it("a busy repository yields to other work and resumes after becoming visible", async () => {
+    const maybeRefresh = vi.fn(async (repo: string) => outcome(repo === "/busy" ? "skip_building" : "refresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/busy");
+    index.onRepoChanged("/other");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(index.get("/other").phase).toBe("ready");
+    index.setScope({ activeKey: "/busy", retainedKeys: ["/busy"], visible: false });
+    const calls = maybeRefresh.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(calls);
+    expect(vi.getTimerCount()).toBe(0);
+    maybeRefresh.mockResolvedValue(outcome("refresh"));
+    index.setScope({ activeKey: "/busy", retainedKeys: ["/busy"], visible: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(index.get("/busy").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("closing or resetting during a busy result never revives its retry", async () => {
+    for (const close of [false, true]) {
+      let release!: (value: LiveRefreshOutcome) => void;
+      const maybeRefresh = vi.fn(() => new Promise<LiveRefreshOutcome>(resolve => { release = resolve; }));
+      const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+      index.onRepoChanged("/repo");
+      await vi.advanceTimersByTimeAsync(0);
+      if (close) index.setScope({ activeKey: null, retainedKeys: [], visible: true });
+      else index.reset();
+      release(outcome("skip_building"));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(maybeRefresh).toHaveBeenCalledTimes(1);
+      expect(index.get("/repo").phase).toBe("idle");
+      expect(vi.getTimerCount()).toBe(0);
+      index.reset();
+    }
+  });
+
+  it("continuous edit storms cannot postpone all builds until the writer stops", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"));
+    const index = createLiveIndex({ maybeRefresh });
+    for (let tick = 0; tick < 2_000; tick++) {
+      index.onRepoChanged("/repo");
+      await vi.advanceTimersByTimeAsync(5);
+    }
+    expect(maybeRefresh.mock.calls.length).toBeGreaterThanOrEqual(5);
+    expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(10);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("retries a dirty event skipped while a manual build owns the writer", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("refresh"))
+      .mockResolvedValueOnce(outcome("skip_building"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("scheduled");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").revision).toBe(1);
+    index.reset();
+  });
+
+  it("bounds busy retries and reports failure without inventing a publication", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_building"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/busy");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(maybeRefresh.mock.calls.length).toBeGreaterThan(1);
+    expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(31);
+    expect(index.get("/busy").phase).toBe("failed");
+    expect(index.get("/busy").reason).toContain("busy");
+    expect(index.get("/busy").revision).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
   it("retains inactive updates and removes closed snapshots including late completions", async () => {
     let release!: (result: LiveRefreshOutcome) => void;
     const maybeRefresh = vi.fn(() => Promise.resolve(outcome("refresh")))

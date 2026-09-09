@@ -30,6 +30,13 @@ Explorer and Blame are two lenses on one **file** (selection survives the switch
 | **Blame** | Per-line author, age heatmap, coverage gutter. Uncommitted lines render as `uncommitted`, not as a link to a fake commit. Coverage unavailable is marked separately from uncovered. |
 | **Map** | Subsystems / entry points from `.devcouncil/repo_map.json`, code and doc graph canvas, docs search and broken links, cross-repo link candidates. Build/Refresh via the `devmap` CLI; watcher refreshes a stale index. Caps, `walk_incomplete`, and schema mismatch are named. |
 
+The graph filters include **Hide notes & Markdown**, off by default. It hides
+documentation nodes and their edges from the canvas, node browser, and
+connections. In the subsystem view, only areas made entirely of documentation
+are hidden; mixed areas stay visible. **Clear filters** restores the loaded
+nodes. Filters survive a refresh and reset when switching repositories or map
+views. Coverage and truncation counts still describe the original payload.
+
 ## History (`⌘2` / `Ctrl+2`)
 
 Three lenses on one **commit**.

@@ -33,6 +33,16 @@ from 10px to 24px; click the size to reset it to 12px. The chosen size becomes t
 default for future sessions. The new-session launcher and dock height are also
 saved. Shell processes, tab names, and scrollback are not restored after app exit.
 
+From **Coverage**, select **Claude Code** or **Codex** and use **Generate coverage**
+or **Improve coverage** to open a new agent session in that repository. **Preview
+prompt** shows the exact task, detected languages, accepted report paths and
+current coverage snapshot; **Copy agent prompt** lets you use an existing session.
+These actions remain available without coverage or after a scan failure. The
+agent uses its configured permissions and may ask for login or approval in the
+terminal. **View agent session** returns to that tab, including its finished
+transcript; **Rescan results** checks the artifacts after the run.
+See [coverage generation](COVERAGE.md) for details and verification.
+
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+T / Ctrl+Shift+W | New shell / close current session |

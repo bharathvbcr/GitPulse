@@ -11,7 +11,9 @@
     requestManviFocus,
     type ManviFocusId,
   } from "../ui/manviFocus";
-  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles } from "@lucide/svelte";
+  import { ShieldCheck, ShieldAlert, ShieldQuestion, Sparkles, ChevronDown, RefreshCw, CircleAlert } from "@lucide/svelte";
+
+  const instanceId = $props.id();
 
   onMount(() => {
     // One probe at startup: the sweep is a handful of loopback connections and
@@ -20,9 +22,8 @@
   });
 
   /**
-   * Each chip opens the section that owns its subject, not just the view: the
-   * shield, the model and the last verdict live on different panes and rows of
-   * one long page, so "open MANVI" answered none of the three questions.
+   * The harness and verdict chips open the section that owns their subject.
+   * Model selection is global and stays directly in the header.
    */
   function openManvi(target: ManviFocusId) {
     requestManviFocus(target);
@@ -30,12 +31,44 @@
   }
 
   // MANVI is a repository view: with no repository open there is no session to
-  // switch tabs on, so the chips report status without pretending to be links.
+  // switch tabs on, so navigation chips remain disabled until a repo is open.
   let reachable = $derived(Boolean($repoStore.currentPath));
   let unreachableHint = "Open a repository to reach the MANVI view.";
 
   let harness = $derived($harnessStore.harness);
   let ai = $derived($harnessStore.ai);
+  let preferred = $derived($harnessStore.preferred);
+  let endpoints = $derived(ai?.endpoints.filter((endpoint) => endpoint.reachable) ?? []);
+  let preferredKey = $derived(preferred ? JSON.stringify([preferred.base_url, preferred.model]) : "");
+  let preferredListed = $derived(!preferred || endpoints.some((endpoint) =>
+    endpoint.base_url === preferred.base_url && endpoint.models.includes(preferred.model),
+  ));
+  let modelReady = $derived(Boolean(
+    !$harnessStore.isProbing && !$harnessStore.error && ai?.ready && ai.selected &&
+    (!preferred || (preferred.base_url === ai.selected.base_url && preferred.model === ai.selected.model)),
+  ));
+  let modelAttention = $derived(!$harnessStore.isProbing && Boolean($harnessStore.error || (ai && !modelReady)));
+  let modelStatus = $derived(
+    $harnessStore.isProbing
+      ? preferred ? `Checking ${preferred.model}…` : "Refreshing local models…"
+      : $harnessStore.error
+        ? `Model check failed. ${$harnessStore.error} Use Retry to check again.`
+        : modelReady && ai?.selected
+          ? `${preferred ? "Using" : "Automatically using"} ${ai.selected.model}.`
+          : preferred
+            ? `${preferred.model} is unavailable. Choose another model or refresh.`
+            : ai
+              ? "No local models available. Start a local model server, then refresh."
+              : "Local models have not been checked. Refresh to discover models.",
+  );
+  let refreshLabel = $derived($harnessStore.isProbing
+    ? "Refreshing local models"
+    : $harnessStore.error ? "Retry model discovery" : "Refresh local models");
+  let automaticDetail = $derived(preferred ? "" : $harnessStore.isProbing
+    ? " · checking…"
+    : $harnessStore.error ? " · retry needed"
+    : modelReady && ai?.selected ? ` · ${ai.selected.model}`
+    : ai ? " · no models" : " · not checked");
   let verdict = $derived($harnessStore.lastVerdict);
   let permissionMode = $derived(harnessPermissionMode(harness));
 
@@ -44,11 +77,10 @@
   );
 
   let modelTitle = $derived(
-    `${
-      ai?.ready && ai.selected
-        ? `${ai.selected.model} at ${ai.selected.base_url}\n${ai.model_info?.describe ?? "context window not probed"}`
-        : (ai?.detail ?? "Looking for a local model server…")
-    }\n${reachable ? manviFocusHint("model") : unreachableHint}`,
+    `${modelStatus}${preferred ? `\n${preferred.model} at ${preferred.base_url}`
+      : modelReady && ai?.selected ? `\n${ai.selected.base_url}` : ""}${
+      modelReady ? `\n${ai?.model_info?.describe ?? "context window not probed"}` : ""
+    }\nChoose a local model.`,
   );
 
   let verdictTitle = $derived(
@@ -57,20 +89,25 @@
       : unreachableHint,
   );
 
-  let modelLabel = $derived(
-    ai?.ready && ai.selected
-      ? ai.selected.model
-      : ai
-        ? "no local model"
-        : "…"
-  );
+  function pickModel(key: string) {
+    if (key === "") {
+      void harnessStore.selectModel(null);
+      return;
+    }
+    for (const endpoint of endpoints) {
+      const model = endpoint.models.find((model) => JSON.stringify([endpoint.base_url, model]) === key);
+      if (model !== undefined) {
+        void harnessStore.selectModel({ base_url: endpoint.base_url, model });
+        return;
+      }
+    }
+  }
 </script>
 
 <div class="flex items-center gap-1.5">
   <!-- Harness state. The three states are distinct on purpose: connected,
        unavailable, and "a rule fired on the last action" never collapse into
-       one another. Each chip opens the MANVI section that owns its subject,
-       so the three chips are three destinations rather than one. -->
+       one another. -->
   <button
     onclick={() => openManvi("harness")}
     disabled={!reachable}
@@ -94,19 +131,61 @@
     <span class="font-medium">MANVI</span>
   </button>
 
-  <!-- Local model. -->
-  <button
-    onclick={() => openManvi("model")}
-    disabled={!reachable}
-    title={modelTitle}
-    class="px-2.5 py-1 rounded-full border text-[11px] flex items-center gap-1.5 transition-colors max-w-[180px] shadow-xs disabled:cursor-default
-      {ai?.ready
-        ? 'border-accent/30 bg-accent/10 text-accent enabled:hover:bg-accent/20'
-        : 'border-border/80 bg-surfaceHover text-textMuted enabled:hover:text-textPrimary'}"
+  <!-- Native selection supplies keyboard navigation, typeahead and dismissal. -->
+  <div
+    class="flex max-w-[180px] items-center rounded-full border text-[11px] shadow-xs transition-colors
+      {$harnessStore.error && !$harnessStore.isProbing
+        ? 'border-rose-500/30 bg-rose-500/10 text-rose-400'
+        : modelReady
+          ? 'border-accent/30 bg-accent/10 text-accent'
+          : 'border-border/80 bg-surfaceHover text-textMuted'}"
   >
-    <Sparkles size={12} />
-    <span class="truncate">{modelLabel}</span>
-  </button>
+    <div class="relative min-w-0 flex-1">
+      <span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden="true">
+        {#if modelAttention}
+          <CircleAlert size={12} />
+        {:else}
+          <Sparkles size={12} />
+        {/if}
+      </span>
+      <select
+        aria-label="Local model"
+        aria-describedby="{instanceId}-model-status"
+        aria-busy={$harnessStore.isProbing}
+        title={modelTitle}
+        value={preferredKey}
+        onchange={(event) => pickModel(event.currentTarget.value)}
+        class="w-full cursor-pointer appearance-none truncate rounded-l-full bg-transparent py-1 pl-7 pr-5 text-[11px] transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:outline-accent"
+      >
+        <option value="">Automatic{automaticDetail}</option>
+        {#if preferred && !preferredListed}
+          <option value={preferredKey} disabled>{preferred.model} ({$harnessStore.isProbing ? "checking…" : "unavailable"})</option>
+        {/if}
+        {#each endpoints as endpoint}
+          <optgroup label={endpoint.base_url}>
+            {#each endpoint.models as model}
+              <option value={JSON.stringify([endpoint.base_url, model])}>{model}</option>
+            {/each}
+          </optgroup>
+        {/each}
+        {#if endpoints.every((endpoint) => endpoint.models.length === 0)}
+          <option disabled>{$harnessStore.isProbing ? "Looking for local models…" : "No local models available"}</option>
+        {/if}
+      </select>
+      <ChevronDown size={11} class="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2" aria-hidden="true" />
+    </div>
+    <button
+      type="button"
+      aria-label={refreshLabel}
+      title={refreshLabel}
+      disabled={$harnessStore.isProbing}
+      onclick={() => { if (!$harnessStore.isProbing) void harnessStore.refreshAi(); }}
+      class="flex w-7 shrink-0 self-stretch items-center justify-center rounded-r-full border-l border-current/15 transition-colors enabled:hover:bg-accent/10 focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-wait"
+    >
+      <RefreshCw size={11} class={$harnessStore.isProbing ? "animate-spin motion-reduce:animate-none" : ""} aria-hidden="true" />
+    </button>
+  </div>
+  <span id="{instanceId}-model-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{modelStatus}</span>
 
   {#if verdict}
     <button

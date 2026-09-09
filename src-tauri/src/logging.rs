@@ -505,6 +505,14 @@ pub fn diagnostic_tail(max_lines: usize) -> Vec<String> {
     }
 }
 
+/// DevMap subprocess observations share the existing redaction, rotation and
+/// timestamps. Direct dispatch also works in tests without a global log facade.
+pub(crate) fn record_devmap(message: &str) {
+    LOGGER
+        .get_or_init(build_logger)
+        .write_entry(Level::Info, "devmap", message);
+}
+
 /// The durable record, which unlike [`diagnostic_tail`] survives the process
 /// that wrote it — so the lines it returns after a relaunch include the ones
 /// the previous session died producing.

@@ -2891,6 +2891,106 @@ describe("Overview repository-open destinations", () => {
   });
 });
 
+describe("uncommitted previews", () => {
+  it("keeps the current preview when an older repository resolution finishes", async () => {
+    const resolving = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => args?.repoPath === "/slow" ? resolving.promise : { path: args?.repoPath, name: "current", is_bare: false } as never }));
+    await store.openRepo("/current");
+    const olderOpen = store.openRepo("/slow");
+    await store.previewUncommitted();
+    resolving.resolve({ path: "/slow", name: "slow", is_bare: false } as never);
+    await olderOpen;
+    expect(get(store).currentPath).toBe("/current");
+    expect(get(store).selectedDiff).toBe("diff README.md");
+  });
+  it("does not pull the reader back after they leave a loading diff", async () => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_file_diff: () => pending.promise }));
+    await store.openRepo("/r");
+    const preview = store.previewUncommitted();
+    store.setActiveTab("code", "explorer");
+    pending.resolve({ text: "working modifications", truncated: false } as never);
+    await preview;
+    expect(get(store).activeTab).toBe("code");
+  });
+  it("replaces an old commit immediately with a file list and a pending working diff", async () => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_file_diff: () => pending.promise }));
+    await store.openRepo("/r/alpha");
+    await store.selectCommitDiff("old");
+    const preview = store.previewUncommitted();
+    expect(get(store)).toMatchObject({ selectedCommitId: null, selectedFilePath: "README.md", selectedDiff: null, selectedDiffPending: true, activeTab: "history", viewSections: { history: "diff" } });
+    pending.resolve({ text: "working modifications", truncated: false } as never);
+    await preview;
+    expect(get(store).selectedDiff).toBe("working modifications");
+  });
+
+  it.each([true, false])("opens the requested index side (%s) for a partially staged file", async (isStaged) => {
+    const calls: unknown[] = [];
+    const { store } = makeStore(makeInvoke({
+      cmd_get_status: async () => [true, false].map(staged => ({ ...snapshotFor("/r").statuses[0], is_staged: staged })) as never,
+      cmd_get_file_diff: async (_cmd, args) => { calls.push(args); return { text: "patch", truncated: false } as never; },
+    }));
+    await store.openRepo("/r");
+    await store.previewUncommitted(undefined, isStaged);
+    expect(calls).toEqual([{ repoPath: "/r", filePath: "README.md", isStaged, ignoreWhitespace: false }]);
+    expect(get(store).selectedIsStaged).toBe(isStaged);
+  });
+
+  it("clears a clean tree's old commit and ignores its late response", async () => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => [] as never, cmd_get_commit_diff: () => pending.promise }));
+    await store.openRepo("/clean");
+    const old = store.selectCommitDiff("old");
+    await store.previewUncommitted();
+    pending.resolve({ text: "old commit", truncated: false } as never);
+    await old;
+    expect(get(store)).toMatchObject({ selectedDiff: null, selectedCommitId: null, selectedFilePath: null, selectedDiffPending: false, activeTab: "history" });
+  });
+
+  it("shows an error with the new file list instead of stale commit contents", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_get_file_diff: async () => { throw new Error("file disappeared"); } }));
+    await store.openRepo("/r");
+    await store.selectCommitDiff("old");
+    await store.previewUncommitted();
+    expect(get(store)).toMatchObject({ error: "file disappeared", selectedDiff: null, selectedCommitId: null, selectedDiffPending: false, selectedFilePath: "README.md" });
+  });
+
+  it("resolves another worktree and fetches its files, never the previous repository's", async () => {
+    const calls: unknown[] = [];
+    const { store } = makeStore(makeInvoke({
+      cmd_resolve_repo: async (_cmd, args) => ({ path: args?.repoPath === "/alias" ? "/real" : args?.repoPath, name: "repo", is_bare: false }) as never,
+      cmd_get_file_diff: async (_cmd, args) => { calls.push(args); return { text: "patch", truncated: false } as never; },
+    }));
+    await store.openRepo("/previous");
+    await store.previewUncommitted("/alias");
+    expect(get(store).currentPath).toBe("/real");
+    expect(calls).toEqual([{ repoPath: "/real", filePath: "README.md", isStaged: false, ignoreWhitespace: false }]);
+  });
+
+  it("does not navigate after failed hydration", async () => {
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async () => { throw new Error("status unavailable"); } }));
+    await store.previewUncommitted("/failed");
+    expect(get(store).error).toBe("status unavailable");
+    expect(get(store).selectedFilePath).toBeNull();
+  });
+
+  it.each(["repository", "view", "file"])("does not override a newer %s choice during hydration", async (choice) => {
+    const pending = deferred<never>();
+    const { store } = makeStore(makeInvoke({ cmd_get_status: async (_cmd, args) => args?.repoPath === "/slow" ? pending.promise : snapshotFor("/fast").statuses as never }));
+    const preview = store.previewUncommitted("/slow");
+    await vi.waitFor(() => expect(get(store).currentPath).toBe("/slow"));
+    if (choice === "repository") await store.openRepo("/fast");
+    if (choice === "view") store.setActiveTab("code", "explorer");
+    if (choice === "file") await store.selectFileDiff("chosen.ts");
+    pending.resolve(snapshotFor("/slow").statuses as never);
+    await preview;
+    if (choice === "repository") expect(get(store).currentPath).toBe("/fast");
+    if (choice === "view") expect(get(store).activeTab).toBe("code");
+    expect(get(store).selectedFilePath).toBe(choice === "file" ? "chosen.ts" : null);
+  });
+});
+
 it("does not replace a file chosen during repository hydration with an open destination", async () => {
   const pending = deferred<never>();
   const { store } = makeStore(makeInvoke({ cmd_get_status: () => pending.promise }));

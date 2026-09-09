@@ -83,6 +83,9 @@
   } from "../terminal/runResult";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
+  import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
+  import { isImeComposition } from "../keyboard/imeGuard";
 
   let report: CoverageReport | null = $state(null);
   let isScanning = $state(false);
@@ -101,6 +104,48 @@
   /** Measurement time of the report currently applied, so a revalidation
    *  triggered by the watcher is adopted exactly once. */
   let appliedMeasurementAt: number | null = null;
+  let lastScanAt = $state<number | null>(null);
+  let fileQuery = $state("");
+  let languageFilter = $state("");
+  let coverageFilter = $state<CoverageFilter>("all");
+  let fileSort = $state<CoverageSort>("missed");
+  let fileScrollTop = $state(0);
+  let sourceScrollTop = $state(0);
+  let activeMissed = $state<number | null>(null);
+  let selectedScope = $state(false);
+  let coverageRoot = $state<HTMLDivElement>();
+  const visibleFiles = $derived.by(() => filterCoverageFiles(report?.files ?? [], fileQuery, languageFilter, coverageFilter, fileSort));
+  const filterLanguages = $derived.by(() => [...new Set(report?.files.map(file => file.language) ?? [])].sort());
+  const selectedFile = $derived.by(() => report?.files.find(file => file.path.toLowerCase() === selectedPath?.toLowerCase()));
+  const missedBlocks = $derived(isLoadingFile || !fileLoaded || fileError ? [] : missedLineBlocks(hitMap, sourceLines.length));
+  const activeBlockIndex = $derived(missedBlocks.findIndex(block => block.start === activeMissed));
+  const activeBlock = $derived(missedBlocks[activeBlockIndex]);
+  const selectedVisible = $derived(visibleFiles.some(file => file.path === selectedFile?.path));
+
+  $effect(() => { void visibleFiles; fileScrollTop = 0; });
+  $effect(() => { if (!selectedFile) selectedScope = false; });
+
+  function clearFileFilters() {
+    fileQuery = "";
+    languageFilter = "";
+    coverageFilter = "all";
+  }
+
+  function jumpMissed(direction: 1 | -1) {
+    activeMissed = moveMissedBlock(missedBlocks, activeMissed, direction);
+    if (activeMissed !== null) sourceScrollTop = Math.max(0, (activeMissed - 3) * rowHeight("coverageSource", $densityStore));
+  }
+
+  function coverageKey(event: KeyboardEvent) {
+    if (!(event.target instanceof Node) || !coverageRoot?.contains(event.target)) return;
+    if (event.defaultPrevented || isImeComposition(event) || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable=true]")) return;
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (!missedBlocks.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    jumpMissed(event.key === "ArrowDown" ? 1 : -1);
+  }
   let reportCopied = $state(false);
   let reportCopyTimer: number | null = null;
 
@@ -121,7 +166,9 @@
    * measurement it has already applied from a genuinely new one.
    */
   function applyReport(repo: string, next: CoverageReport, measuredAt: number | null) {
+    const newMeasurement = measuredAt !== appliedMeasurementAt;
     appliedMeasurementAt = measuredAt;
+    lastScanAt = measuredAt;
     const prev = report;
     report = next;
     reportCache.set(repo, next);
@@ -138,14 +185,13 @@
       // store so persistence and the other views agree on what is showing.
       if (first) repoStore.selectFilePath(first);
     }
-    // Only invalidate gutters when the selected file's coverage actually
-    // changed: plans/scripts call rescan() after every step, and bumping
-    // unconditionally re-ran the gutter fetch behind a full-pane
-    // "Loading …" swap even when nothing moved.
+    // Identical totals can hide a different set of missed lines. Refresh
+    // details for each new measurement; duplicate publications of the same
+    // measurement still keep the existing gutter.
     const nextEntry = selectedPath ? next.files.find((f) => f.path === selectedPath) : undefined;
     const prevEntry =
       prev && selectedPath ? prev.files.find((f) => f.path === selectedPath) : undefined;
-    if (!prevEntry || !nextEntry || !sameCoverageSummary(prevEntry, nextEntry)) {
+    if (newMeasurement || !prevEntry || !nextEntry || !sameCoverageSummary(prevEntry, nextEntry)) {
       reportVersion += 1;
     }
   }
@@ -168,9 +214,10 @@
       await coverageMetric.refresh(repo, { force: true });
       if (!guard.isLive()) return null;
       const snap = coverageMetric.snapshot(repo);
-      if (snap.value === null) {
+      if (snap.state === "failed" || snap.value === null) {
         // The metric already formatted and logged this through the same
-        // reporter the old catch block used.
+        // reporter the old catch block used. A failed refresh retains its
+        // last good value, which must not be adopted as a successful scan.
         if (snap.state === "failed") scanError = snap.error;
         return null;
       }
@@ -204,6 +251,7 @@
   function adoptExternalMeasurement(repo: string, next: CoverageReport, measuredAt: number | null) {
     if (isScanning) return;
     if (measuredAt === null || measuredAt === appliedMeasurementAt) return;
+    scanError = null;
     applyReport(repo, next, measuredAt);
   }
 
@@ -1168,139 +1216,148 @@
     void runMissingCoverage();
   }
 
-  // Repo-scoped scan lifecycle, memoized on currentPath: poll ticks re-emit
-  // the store object, and an unguarded rerun would blank the report and
-  // restart the scan IPC on every emission.
-  let prevScanRepo: string | null = null;
+  // Repo-scoped scan lifecycle: depend on the scalar path, not every store
+  // emission. An early return after effect cleanup would lose the subscription
+  // on selection/poll updates. Initialization reads must not add dependencies.
+  const coverageRepo = $derived($repoStore.currentPath);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === prevScanRepo) return;
-    prevScanRepo = repo;
-    if (!repo) {
-      scanInflight?.cancel();
-      report = null;
-      selectedPath = null;
-      scanError = null;
-      isScanning = false;
-      resetManvi();
-      return;
-    }
-    // Seed from the persisted per-repo selection instead of null. This effect
-    // runs after the store-sync effect on mount, so an unconditional wipe here
-    // would discard the selection that effect just restored and make the sync
-    // dead code; scan() still validates membership (case-insensitively) when
-    // the report lands.
-    selectedPath = untrack(() => $repoStore.selectedFilePath);
-    fileError = null;
-    contentError = null;
-    sourceLines = [];
-    hitMap = new Map();
-    fileLoaded = false;
-    linesTruncated = false;
-    scanTruncated = false;
-    // Hydrate last-known data synchronously so a revisit renders instantly;
-    // the scan below then refreshes in place behind the visible content.
-    report = reportCache.get(repo) ?? null;
-    resetManvi();
-    // Seed from what the metric already holds so the subscription's immediate
-    // first delivery is a no-op rather than a second scan racing the first.
-    appliedMeasurementAt = coverageMetric.snapshot(repo).measuredAt;
-    const guard = beginScan();
-    void scan(repo, guard).then((fresh) => {
-      if (fresh) maybeAutoRunCoverage(repo, guard);
-    });
-    // Coverage now tracks the repository: a test run in the user's own
-    // terminal writes a new lcov, the watcher fires, and the shared metric
-    // revalidates. Without this the panel would keep showing the report from
-    // whenever it was opened.
-    const unsubscribe = coverageMetric.subscribe(repo, (snap) => {
-      if (snap.state === "ready" && snap.value) {
-        adoptExternalMeasurement(repo, snap.value, snap.measuredAt);
+    const repo = coverageRepo;
+    return untrack(() => {
+      clearFileFilters();
+      fileSort = "missed";
+      selectedScope = false;
+      lastScanAt = null;
+      if (!repo) {
+        scanInflight?.cancel();
+        report = null;
+        selectedPath = null;
+        scanError = null;
+        isScanning = false;
+        resetManvi();
+        return;
       }
-    });
-    return () => {
-      unsubscribe();
-      if (scanInflight === guard) {
-        guard.cancel();
-      }
-    };
-  });
-
-  // Gutter fetch keyed on repo + selected file + report version. Memoized on
-  // exactly that key: reading the store tracks every emission, so without the
-  // guard each poll tick would cancel and refetch the file content and hits.
-  let prevFileLoadKey: string | null = null;
-  $effect(() => {
-    const repo = $repoStore.currentPath;
-    const path = selectedPath;
-    void reportVersion; // read so each successful rescan forces a gutter refetch
-    const loadKey = `${repo ?? "\u0000"}\u0000${path ?? "\u0000"}\u0000${reportVersion}`;
-    if (loadKey === prevFileLoadKey) return;
-    prevFileLoadKey = loadKey;
-    if (!repo || !path) {
+      // Seed from the persisted per-repo selection instead of null. This effect
+      // runs after the store-sync effect on mount, so an unconditional wipe here
+      // would discard the selection that effect just restored and make the sync
+      // dead code; scan() still validates membership (case-insensitively) when
+      // the report lands.
+      selectedPath = untrack(() => $repoStore.selectedFilePath);
+      fileError = null;
+      contentError = null;
       sourceLines = [];
       hitMap = new Map();
+      fileLoaded = false;
+      linesTruncated = false;
+      scanTruncated = false;
+      // Hydrate last-known data synchronously so a revisit renders instantly;
+      // the scan below then refreshes in place behind the visible content.
+      report = reportCache.get(repo) ?? null;
+      resetManvi();
+      // Seed from what the metric already holds so the subscription's immediate
+      // first delivery is a no-op rather than a second scan racing the first.
+      appliedMeasurementAt = coverageMetric.snapshot(repo).measuredAt;
+      lastScanAt = appliedMeasurementAt;
+      const guard = beginScan();
+      void scan(repo, guard).then((fresh) => {
+        if (fresh) maybeAutoRunCoverage(repo, guard);
+      });
+      // Coverage now tracks the repository: a test run in the user's own
+      // terminal writes a new lcov, the watcher fires, and the shared metric
+      // revalidates. Without this the panel would keep showing the report from
+      // whenever it was opened.
+      const unsubscribe = coverageMetric.subscribe(repo, (snap) => {
+        if (snap.state === "ready" && snap.value) {
+          adoptExternalMeasurement(repo, snap.value, snap.measuredAt);
+        } else if (snap.state === "failed" && !isScanning) {
+          scanError = snap.error;
+        }
+      });
+      return () => {
+        unsubscribe();
+        if (scanInflight === guard) {
+          guard.cancel();
+        }
+      };
+    });
+  });
+
+  // Keep a pending detail load alive across unrelated store publications.
+  // Only its repository, selected path or measurement version owns cleanup.
+  const coverageDetailKey = $derived(`${coverageRepo ?? "\u0000"}\u0000${selectedPath ?? "\u0000"}\u0000${reportVersion}`);
+  $effect(() => {
+    void coverageDetailKey;
+    return untrack(() => {
+      const repo = coverageRepo;
+      const path = selectedPath;
+      if (!repo || !path) {
+        sourceLines = [];
+        hitMap = new Map();
+        contentError = null;
+        fileLoaded = false;
+        linesTruncated = false;
+        scanTruncated = false;
+        return;
+      }
+      let cancelled = false;
+      isLoadingFile = true;
+      sourceLines = [];
+      hitMap = new Map();
+      sourceScrollTop = 0;
+      activeMissed = null;
+      fileError = null;
       contentError = null;
       fileLoaded = false;
       linesTruncated = false;
       scanTruncated = false;
-      return;
-    }
-    let cancelled = false;
-    isLoadingFile = true;
-    fileError = null;
-    contentError = null;
-    fileLoaded = false;
-    linesTruncated = false;
-    scanTruncated = false;
-    void (async () => {
-      try {
-        const [detail, contentOutcome] = await Promise.all([
-          fetchFileCoverage(repo, path),
-          invoke<string>("cmd_get_file_content", {
-            repoPath: repo,
-            filePath: path,
-            commitId: null,
-          }).then(
-            (content) => ({ ok: true as const, content }),
-            (err: unknown) => ({ ok: false as const, reason: reportPanelError("coverage", err) })
-          ),
-        ]);
-        if (cancelled) return;
-        hitMap = buildHitMap(detail.lines);
-        linesTruncated = detail.lines_truncated;
-        // The backend flags a capped scan explicitly so absence here reads as
-        // "unknown", not "uncovered"; surfacing it keeps that contract.
-        scanTruncated = detail.truncated;
-        let lines: string[] = [];
-        if (contentOutcome.ok) {
-          fileLoaded = true;
-          if (contentOutcome.content.length > 0) {
-            lines = contentOutcome.content.split("\n").map((l) => l.replace(/\r$/, ""));
-            // content ending in "\n" yields one phantom trailing "" from split
-            if (contentOutcome.content.endsWith("\n")) lines.pop();
+      void (async () => {
+        try {
+          const [detail, contentOutcome] = await Promise.all([
+            fetchFileCoverage(repo, path),
+            invoke<string>("cmd_get_file_content", {
+              repoPath: repo,
+              filePath: path,
+              commitId: null,
+            }).then(
+              (content) => ({ ok: true as const, content }),
+              (err: unknown) => ({ ok: false as const, reason: reportPanelError("coverage", err) })
+            ),
+          ]);
+          if (cancelled) return;
+          hitMap = buildHitMap(detail.lines);
+          linesTruncated = detail.lines_truncated;
+          // The backend flags a capped scan explicitly so absence here reads as
+          // "unknown", not "uncovered"; surfacing it keeps that contract.
+          scanTruncated = detail.truncated;
+          let lines: string[] = [];
+          if (contentOutcome.ok) {
+            fileLoaded = true;
+            if (contentOutcome.content.length > 0) {
+              lines = contentOutcome.content.split("\n").map((l) => l.replace(/\r$/, ""));
+              // content ending in "\n" yields one phantom trailing "" from split
+              if (contentOutcome.content.endsWith("\n")) lines.pop();
+            }
+          } else {
+            contentError = contentOutcome.reason;
           }
-        } else {
-          contentError = contentOutcome.reason;
+          sourceLines = lines;
+        } catch (err: unknown) {
+          if (!cancelled) {
+            fileError = reportPanelError("coverage", err);
+            sourceLines = [];
+            hitMap = new Map();
+            contentError = null;
+            fileLoaded = false;
+            linesTruncated = false;
+            scanTruncated = false;
+          }
+        } finally {
+          if (!cancelled) isLoadingFile = false;
         }
-        sourceLines = lines;
-      } catch (err: unknown) {
-        if (!cancelled) {
-          fileError = reportPanelError("coverage", err);
-          sourceLines = [];
-          hitMap = new Map();
-          contentError = null;
-          fileLoaded = false;
-          linesTruncated = false;
-          scanTruncated = false;
-        }
-      } finally {
-        if (!cancelled) isLoadingFile = false;
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+      })();
+      return () => {
+        cancelled = true;
+      };
+    });
   });
 
   function selectFile(path: string) {
@@ -1328,8 +1385,9 @@
 {/snippet}
 
 
-<div class="flex-1 flex flex-col bg-background h-full text-xs overflow-hidden">
-  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex items-center justify-between font-sans shrink-0">
+<svelte:window onkeydown={coverageKey} />
+<div role="region" aria-label="Test coverage" bind:this={coverageRoot} class="flex-1 min-h-0 min-w-0 flex flex-col bg-background h-full text-xs overflow-hidden">
+  <div class="px-4 py-2 border-b border-border/60 gp-section-edge bg-surface/60 flex flex-wrap gap-2 items-center justify-between font-sans shrink-0">
     <div class="flex items-center gap-3 min-w-0">
       <Percent size={16} class="text-accent shrink-0" />
       {#if report && report.overall.lines_found > 0}
@@ -1353,8 +1411,8 @@
         <span class="text-textMuted">Test coverage</span>
       {/if}
     </div>
-    <div class="flex items-center gap-3">
-      <div class="flex items-center gap-3 text-[11px] text-textMuted">
+    <div class="flex flex-wrap items-center gap-2">
+      <div class="flex items-center gap-2 text-[11px] text-textMuted">
         <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500/50"></span> hit</span>
         <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-red-500/50"></span> missed</span>
         <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-full bg-gray-500/30"></span> uninstrumented</span>
@@ -1410,7 +1468,7 @@
             Running…
           {:else}
             <Play size={11} />
-            Run coverage
+            Run with MANVI
           {/if}
         </button>
       {/if}
@@ -1425,6 +1483,19 @@
       </button>
     </div>
   </div>
+
+  <div aria-label="Coverage scan status" class="px-4 py-1.5 border-b border-border/60 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-sans text-textMuted shrink-0">
+    <span class:text-amber-400={!!scanError || report?.truncated} role="status">{coverageScanStatus(report, isScanning, scanError !== null, coverageExclusions.length > 0)}</span>
+    <span>Last scanned: {lastScanAt === null ? "not yet" : new Date(lastScanAt).toLocaleString()}</span>
+    <span title="The scanner does not receive artifact generation timestamps or test outcomes.">Artifact age unknown · rescanning does not rerun tests</span>
+    {#if scanError}<button type="button" class="gp-btn py-0.5! px-2!" disabled={isScanning} onclick={rescan}>Retry scan</button>{/if}
+  </div>
+
+  {#key $repoStore.currentPath}
+    <CoverageAgentPrompt repoPath={$repoStore.currentPath} {report} exclusions={coverageExclusions} scanFailed={scanError !== null}
+      onRescan={rescan} scanning={isScanning} bind:selectedScope
+      focus={selectedFile ? { file: selectedFile, blocks: missedBlocks, detailAvailable: !isLoadingFile && fileLoaded && !fileError, partial: linesTruncated || scanTruncated || report?.truncated === true } : undefined} />
+  {/key}
 
   {#if report && scanError}
     <div class="px-4 py-1.5 border-b border-border bg-red-500/10 text-red-400 font-sans shrink-0 flex items-center justify-between gap-2">
@@ -1602,21 +1673,46 @@
     </div>
   {/if}
 
-  <div class="flex-1 flex min-h-0">
-    <div class="w-72 shrink-0 border-r border-border/60 flex flex-col bg-surface/40 p-1.5">
+  <div class="flex-1 flex min-h-0 min-w-0">
+    <div class="w-72 max-w-[40%] min-w-40 shrink-0 border-r border-border/60 flex flex-col bg-surface/40 p-1.5 min-h-0">
       {#if isScanning && !report}
         <div class="flex-1 flex items-center justify-center text-textMuted font-sans">Scanning coverage…</div>
       {:else if report && report.files.length > 0}
+        <div class="p-1 space-y-2 font-sans shrink-0">
+          <input type="search" aria-label="Search coverage files" placeholder="Search files…" bind:value={fileQuery} class="w-full rounded border border-border bg-background px-2 py-1.5 text-[11px] text-textPrimary" />
+          <div class="flex flex-wrap gap-1">
+            <select aria-label="Filter coverage language" bind:value={languageFilter} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
+              <option value="">All languages</option>{#each filterLanguages as language}<option value={language}>{language}</option>{/each}
+            </select>
+            <select aria-label="Filter coverage gaps" bind:value={coverageFilter} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
+              <option value="all">All files</option><option value="missed">With missed lines</option><option value="below80">Below 80%</option>
+            </select>
+          </div>
+          <label class="flex items-center gap-2 text-[10px] text-textMuted">Sort
+            <select aria-label="Sort coverage files" bind:value={fileSort} class="flex-1 min-w-0 rounded border border-border bg-background p-1 text-[11px] text-textPrimary">
+              <option value="missed">Most missed lines</option><option value="coverage">Lowest coverage</option><option value="path">File path</option>
+            </select>
+          </label>
+          <div class="flex flex-wrap items-center justify-between gap-1 text-[10px] text-textMuted">
+            <span role="status">Showing {visibleFiles.length} of {report.files.length} scanned files{report.truncated ? " · partial scan" : ""}</span>
+            {#if fileQuery || languageFilter || coverageFilter !== "all"}<button type="button" class="text-accent hover:underline" onclick={clearFileFilters}>Clear filters</button>{/if}
+          </div>
+        </div>
+        {#if visibleFiles.length === 0}
+          <div class="p-3 text-textMuted font-sans">No files match these filters. <button type="button" class="text-accent hover:underline" onclick={clearFileFilters}>Show all files</button></div>
+        {/if}
         <!-- Virtualized: the scan cap allows 4,000 files, and a keyed each of
              that size mounts ~20k nodes and re-diffs them on every selection. -->
-        <VirtualList items={report.files} rowHeight={rowHeight("coverageFile", $densityStore)} overscan={20} class="flex-1">
+        <VirtualList items={visibleFiles} bind:scrollTop={fileScrollTop} rowHeight={rowHeight("coverageFile", $densityStore)} overscan={20} class="flex-1">
           {#snippet row(file)}
             {#if file}
               {@const label = pathLabel(file.path)}
               <button
                 type="button"
                 onclick={() => selectFile(file.path)}
-                style="height: 26px;"
+                aria-label={`${file.path}, ${file.lines_found > 0 ? formatCoveragePercent(file.percentage) : 'unmeasured'}, ${Math.max(0, file.lines_found - file.lines_hit)} missed lines`}
+                aria-current={selectedPath === file.path ? "true" : undefined}
+                style:height={`${rowHeight("coverageFile", $densityStore)}px`}
                 class="w-full px-2.5 rounded-full text-left flex items-center gap-2 transition-colors {selectedPath === file.path ? 'bg-accent/15 ring-1 ring-inset ring-accent/30' : 'hover:bg-surfaceHover'}"
               >
                 <span class="w-2 h-2 rounded-full shrink-0" style="background-color: {file.color_hex}"></span>
@@ -1625,7 +1721,7 @@
                       >{label.dir}</span
                     >{/if}</span
                 >
-                <span class="tabular-nums shrink-0" style="color: {coverageBarColor(file.percentage)}">{formatCoveragePercent(file.percentage)}</span>
+                <span class="tabular-nums shrink-0" title={`${Math.max(0, file.lines_found - file.lines_hit)} missed lines`} style="color: {coverageBarColor(file.percentage)}">{file.lines_found > 0 ? formatCoveragePercent(file.percentage) : "—"}</span>
               </button>
             {/if}
           {/snippet}
@@ -1731,7 +1827,19 @@
       {/if}
     </div>
 
-    <div class="flex-1 min-h-0 font-mono flex flex-col">
+    <div class="flex-1 min-h-0 min-w-0 font-mono flex flex-col">
+      {#if selectedPath}
+        <div class="px-3 py-2 border-b border-border/60 font-sans flex flex-wrap items-center gap-2 shrink-0">
+          <span class="min-w-0 flex-1 truncate text-textPrimary" title={selectedPath}>{selectedPath}</span>
+          {#if selectedFile}<button type="button" class="gp-btn py-0.5! px-2! text-[11px]!" onclick={() => (selectedScope = true)}>Improve this file’s coverage</button>{/if}
+          <div class="flex flex-wrap items-center gap-2 w-full text-[11px] text-textMuted">
+            <button type="button" class="gp-btn py-0.5! px-2!" aria-label="Previous missed block" title="Previous missed block (Alt+Up)" aria-keyshortcuts="Alt+ArrowUp" disabled={!missedBlocks.length} onclick={() => jumpMissed(-1)}>↑ Previous</button>
+            <button type="button" class="gp-btn py-0.5! px-2!" aria-label="Next missed block" title="Next missed block (Alt+Down)" aria-keyshortcuts="Alt+ArrowDown" disabled={!missedBlocks.length} onclick={() => jumpMissed(1)}>↓ Next</button>
+            <span role="status">{isLoadingFile ? "Loading line details…" : !fileLoaded || fileError ? "Line details unavailable" : missedBlocks.length ? `${activeBlockIndex < 0 ? missedBlocks.length : `${activeBlockIndex + 1} of ${missedBlocks.length}`} missed blocks${activeBlock ? ` · lines ${activeBlock.start}–${activeBlock.end}` : ""}` : "No missed lines in available details"}</span>
+            {#if selectedFile && !selectedVisible}<span>Selected file is outside the current filters.</span>{/if}
+          </div>
+        </div>
+      {/if}
       {#if scanTruncated}
         <!-- Cause-neutral on purpose. This flag has three sources — the file
              listing came back a prefix, the entry cap stopped the classifier,
@@ -1752,11 +1860,11 @@
       {:else if fileError}
         <div class="h-full flex items-center justify-center text-rose-400 font-sans p-4">{fileError}</div>
       {:else if sourceLines.length > 0}
-        <VirtualList items={sourceLines} rowHeight={rowHeight("coverageSource", $densityStore)} overscan={15} class="h-full">
+        <VirtualList items={sourceLines} contentWidth bind:scrollTop={sourceScrollTop} rowHeight={rowHeight("coverageSource", $densityStore)} overscan={15} class="flex-1 min-h-0">
           {#snippet row(line, index)}
             {#if line !== undefined}
               {@const hits = hitMap.get(index + 1)}
-              <div class="flex items-center h-6 hover:bg-surfaceHover/40 {coverageHitClass(hits)}" style="height: 24px;">
+              <div data-coverage-line={index + 1} data-missed-active={activeBlock && index + 1 >= activeBlock.start && index + 1 <= activeBlock.end ? "true" : undefined} class="flex items-center hover:bg-surfaceHover/40 {coverageHitClass(hits)}" class:ring-1={activeBlock && index + 1 >= activeBlock.start && index + 1 <= activeBlock.end} class:ring-inset={!!activeBlock} class:ring-accent={!!activeBlock} style:height={`${rowHeight("coverageSource", $densityStore)}px`}>
                 <span class="w-10 px-2 text-right text-textMuted/40 text-[10px] select-none shrink-0">{index + 1}</span>
                 <span class={hitBadgeClass(hits)}>{hits === undefined ? "·" : hits}</span>
                 <span class="px-3 whitespace-pre overflow-hidden text-textPrimary">{line}</span>

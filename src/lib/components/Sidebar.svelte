@@ -268,7 +268,7 @@
             <span>Working tree clean</span>
           </div>
         {:else}
-          <div class="flex items-center gap-1.5 min-w-0">
+          <button type="button" onclick={() => void repoStore.previewUncommitted()} class="flex items-center gap-1.5 min-w-0 w-full text-left hover:text-accent" title="Preview uncommitted files and modifications">
             <span
               class="font-mono text-[11px] shrink-0"
               title="Total added / deleted lines across all changed files"
@@ -288,7 +288,7 @@
                 {conflictedCount} conflict{conflictedCount === 1 ? "" : "s"}
               </span>
             {/if}
-          </div>
+          </button>
         {/if}
 
         <!-- Quick actions -->
@@ -542,14 +542,14 @@
       </button>
       <FolderGit2 size={15} class="text-accent shrink-0" />
       {#if $repoStore.currentPath}
-        <span
+        <button type="button" onclick={() => void repoStore.previewUncommitted()}
           class="text-[9px] font-mono font-bold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
             ? 'bg-amber-500/15 text-amber-400 border border-amber-500/25'
             : 'border border-border/70 bg-surface text-textMuted'}"
           title={`${dirtyCount} changed file${dirtyCount === 1 ? "" : "s"}`}
         >
           {dirtyCount}
-        </span>
+        </button>
       {/if}
     </div>
   {/if}

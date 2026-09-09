@@ -16,6 +16,9 @@ import type { LiveRefreshDecision, LiveRefreshOutcome } from "./types";
 /** Coalesce watcher ticks the same way `handleRepoChanged` does (200ms). */
 export const LIVE_INDEX_DEBOUNCE_MS = 200;
 
+/** Busy writers get at most 30 paced retries before requiring a new request. */
+export const LIVE_INDEX_BUSY_RETRIES = 30;
+
 export type LiveIndexPhase = "idle" | "scheduled" | "running" | "ready" | "skipped" | "failed";
 
 export interface LiveIndexSnapshot {
@@ -70,6 +73,7 @@ export function createLiveIndex(opts?: {
   const maybeRefresh = opts?.maybeRefresh ?? maybeRefreshDevmap;
   const snapshots = writable<Record<string, LiveIndexSnapshot>>({});
   const retained = new Set<string>();
+  const busyRetries = new Map<string, number>();
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -79,6 +83,7 @@ export function createLiveIndex(opts?: {
     scope: opts?.scope,
     run,
     onError: (repoPath, error) => {
+      busyRetries.delete(repoPath);
       patch(repoPath, {
         phase: "failed", decision: null,
         reason: error instanceof Error ? error.message : String(error),
@@ -99,6 +104,22 @@ export function createLiveIndex(opts?: {
     patch(repoPath, { phase: "running", refreshing: true, reason: null });
     const outcome = await maybeRefresh(repoPath, true);
     if (!isCurrent()) return;
+    if (outcome.decision === "skip_building") {
+      const retries = busyRetries.get(repoPath) ?? 0;
+      const retrying = retries < LIVE_INDEX_BUSY_RETRIES && queue.enqueue(repoPath);
+      if (retrying) busyRetries.set(repoPath, retries + 1);
+      else busyRetries.delete(repoPath);
+      patch(repoPath, {
+        phase: retrying ? "scheduled" : "failed",
+        decision: outcome.decision,
+        reason: retrying ? "Index writer is busy; refresh will retry."
+          : "Index writer stayed busy or the refresh queue is full. Refresh the map again.",
+        refreshing: false,
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+    busyRetries.delete(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
     patch(repoPath, {
@@ -122,7 +143,7 @@ export function createLiveIndex(opts?: {
         const closed = Object.keys(map).filter((key) => !open.has(key));
         if (!closed.length) return map;
         const next = { ...map };
-        for (const key of closed) { delete next[key]; retained.delete(key); }
+        for (const key of closed) { delete next[key]; retained.delete(key); busyRetries.delete(key); }
         return next;
       });
     },
@@ -136,6 +157,7 @@ export function createLiveIndex(opts?: {
         if (retained.size <= 65) break;
         if (queue.has(key)) continue;
         retained.delete(key);
+        busyRetries.delete(key);
         snapshots.update((map) => {
           const next = { ...map };
           delete next[key];
@@ -158,6 +180,7 @@ export function createLiveIndex(opts?: {
     reset() {
       queue.reset();
       retained.clear();
+      busyRetries.clear();
       snapshots.set({});
     },
   };

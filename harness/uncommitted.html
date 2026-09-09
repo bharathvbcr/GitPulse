@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Uncommitted preview checks</title>
+<style>body{margin:0}header{padding:12px;display:flex;gap:12px;align-items:center;font:12px system-ui}#surface{height:260px;overflow:auto;display:flex}#preview{display:flex;height:480px}#results{font:12px system-ui;padding:12px;white-space:pre-wrap}</style></head>
+<body><header><button id="run" disabled>Run preview checks</button><button id="theme">Switch theme</button><output id="result">Loading…</output></header>
+<div id="surface"></div><div id="preview"></div><pre id="results"></pre>
+<script type="module">
+import "../src/app.css";
+const crashes=[], unexpected=[], results=[], calls=[];
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const root="/workspace/alpha", other="/workspace/beta";
+const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_code,is_conflicted:false,additions:1,deletions:1});
+let files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];
+const worktrees=[root,other].map((path,i)=>({path,name:path.split("/").pop(),branch:i?"feature":"main",head:"a".repeat(40),is_main:i===0,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:3}));
+const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
+const fixtures={
+ cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
+ cmd_repo_operation:()=>null,cmd_stash_list:()=>[],cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
+ cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
+ cmd_get_file_diff:a=>{calls.push(a);return {text:patch(a.filePath,`${a.repoPath} ${a.isStaged?"staged":"unstaged"} modification`),truncated:false};},
+ cmd_get_commit_diff:()=>({text:patch("old.ts","old commit content"),truncated:false}),
+ cmd_get_commit_files:()=>[{path:"old.ts",status_code:"M",additions:1,deletions:1}],
+ cmd_get_language_stats:()=>({stats:[],truncated:false}),
+ cmd_get_file_content:()=>"fixture content",
+ cmd_codeintel_impact_at_rung:()=>({available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
+ cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
+ cmd_devmap_preview_many:()=>[],
+ cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>worktrees,
+ cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
+ cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[]}),
+ cmd_fleet_snapshot:()=>({repos:[],requested:2,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
+};
+window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured preview command: ${cmd}`);},transformCallback:cb=>cb};
+const {mount,unmount,tick}=await import("svelte");
+const {get}=await import("svelte/store");
+const {repoStore}=await import("../src/lib/stores/repoStore.ts");
+const {layoutStore}=await import("../src/lib/sidebar/layoutStore.ts");
+const {interfaceStore}=await import("../src/lib/stores/interfaceStore.ts");
+const components=Object.fromEntries(await Promise.all(["StatusBar","Sidebar","ViewTabBar","RepoTabBar","WorkspaceActions","WorkView","WorktreesPanel","FleetView","DiffViewer"].map(async name=>[name,(await import(`../src/lib/components/${name}.svelte`)).default])));
+await repoStore.openRepo(other);await repoStore.openRepo(root);
+const surface=document.getElementById("surface"),preview=document.getElementById("preview");
+mount(components.DiffViewer,{target:preview});
+let mounted;
+const step=()=>new Promise(resolve=>requestAnimationFrame(()=>resolve()));
+async function until(test,label){for(let i=0;i<180;i++){await tick();if(test())return;await step();}throw Error(`Timed out: ${label}`);}
+function check(name,pass){results.push({name,pass});if(!pass)throw Error(name);}
+async function show(name){if(mounted)await unmount(mounted);surface.replaceChildren();mounted=mount(components[name],{target:surface});await tick();}
+async function oldCommit(){await repoStore.openRepo(root);await repoStore.selectCommitDiff("old");await tick();}
+async function clickPreview(name,selector,repo=root,staged=true){
+ await oldCommit();await show(name);
+ await until(()=>surface.querySelector(selector),`${name} trigger`);
+ surface.querySelector(selector).click();
+ await until(()=>get(repoStore).selectedCommitId===null&&!get(repoStore).selectedDiffPending,`${name} diff`);
+ check(`${name}: correct repository and index side`,get(repoStore).currentPath===repo&&get(repoStore).selectedIsStaged===staged);
+ check(`${name}: shared file rail`,!!preview.querySelector('[aria-label="Files in this diff"]')&&preview.textContent.includes("shared.ts")&&preview.textContent.includes("notes.md"));
+ check(`${name}: actual modifications`,preview.textContent.includes(`${repo} ${staged?"staged":"unstaged"} modification`)&&!preview.textContent.includes("old commit content"));
+}
+async function run(){
+ document.getElementById("run").disabled=true;
+ try{
+  await clickPreview("StatusBar",'button[title^="View 3 changed"]');
+  await clickPreview("Sidebar",'button[title="Preview uncommitted files and modifications"]');
+  layoutStore.toggleCollapsed();
+  await clickPreview("Sidebar",'button[title="3 changed files"]');
+  layoutStore.toggleCollapsed();
+  await clickPreview("ViewTabBar",'button[aria-label="Preview 3 uncommitted changes"]');
+  await clickPreview("RepoTabBar",'button[aria-label="Preview uncommitted changes in beta"]',other);
+  await clickPreview("WorktreesPanel",'button[title$="in /workspace/beta"]',other);
+  await clickPreview("WorkView",'button[title="Preview staged files and modifications"]');
+  await clickPreview("WorkView",'button[title="Preview unstaged files and modifications"]',root,false);
+  await clickPreview("WorkView",'button[title="Preview uncommitted files in /workspace/beta"]',other);
+  interfaceStore.setFleetOpen(true);
+  await clickPreview("FleetView",'button[title="Preview uncommitted files and modifications in beta"]',other);
+  check("Fleet closes after a preview",get(interfaceStore).fleetOpen===false);
+  await oldCommit();await show("WorkspaceActions");
+  surface.querySelector('[data-workspace-wip-trigger]').click();await tick();
+  const workspace=document.querySelector('[data-workspace-wip]');
+  const beta=[...workspace.querySelectorAll('button')].find(button=>button.textContent.includes("beta"));
+  check("Workspace exposes beta's pending work",!!beta);beta.click();
+  await until(()=>get(repoStore).currentPath===other&&!get(repoStore).selectedCommitId&&!get(repoStore).selectedDiffPending,"Workspace diff");
+  check("Workspace opens beta modifications",preview.textContent.includes(`${other} staged modification`));
+  const rows=[...preview.querySelectorAll('button[title="src/shared.ts"]')];
+  check("Partially staged path has two distinct rows",rows.length===2);
+  rows[1].click();await until(()=>get(repoStore).selectedIsStaged===false&&!get(repoStore).selectedDiffPending,"unstaged file");
+  check("File click opens the other index side",preview.textContent.includes(`${other} unstaged modification`));
+  preview.querySelector('[aria-label="Hide the file list"]').click();await tick();
+  await show("StatusBar");surface.querySelector('button[title^="View 3 changed"]').click();
+  await until(()=>!!preview.querySelector('[aria-label="Files in this diff"]'),"reopened rail");
+  check("Preview restores a collapsed file rail",!!preview.querySelector('[aria-label="Files in this diff"]'));
+  await repoStore.selectCommitDiff("old");await tick();
+  await until(()=>preview.querySelector('button[title="Show recent commits"]'),"commit picker");
+  preview.querySelector('button[title="Show recent commits"]').click();await tick();
+  [...preview.querySelectorAll('button')].find(button=>button.textContent.includes("Uncommitted changes")&&button.title!=="Show recent commits").click();
+  await until(()=>!get(repoStore).selectedCommitId&&!get(repoStore).selectedDiffPending,"diff picker");
+  check("Diff picker reuses uncommitted preview",preview.textContent.includes(`${other} staged modification`));
+  check("No unexpected commands",unexpected.length===0);
+  check("No runtime errors",crashes.length===0);
+ }catch(error){results.push({name:String(error),pass:false});}
+ const result={results,crashes,unexpected};window.__gpResult=result;
+ const encoded=encodeURIComponent(JSON.stringify(result));document.documentElement.dataset.gpResult=encoded;
+ document.getElementById("result").textContent=`${results.filter(r=>r.pass).length}/${results.length} checks passed`;
+ document.getElementById("results").textContent=results.map(r=>`${r.pass?"PASS":"FAIL"} ${r.name}`).join("\n")+"\n"+JSON.stringify({crashes,unexpected});
+ const report=new URLSearchParams(location.search).get("report");if(report)await fetch(report,{method:"POST",body:document.documentElement.outerHTML});
+ document.getElementById("run").disabled=false;
+}
+document.getElementById("theme").onclick=()=>{const dark=document.documentElement.classList.toggle("dark");document.documentElement.classList.toggle("light",!dark);};
+document.getElementById("run").onclick=run;document.getElementById("run").disabled=false;
+document.getElementById("result").textContent="Ready";
+if(new URLSearchParams(location.search).has("check"))await run();else await show("StatusBar");
+</script></body></html>
