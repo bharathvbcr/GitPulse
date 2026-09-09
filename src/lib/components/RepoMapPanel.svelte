@@ -6,6 +6,7 @@
   import { keyedList } from "../ui/eachKeys";
   import { repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
+  import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
     buildDevmap,
     getCodeGraphViz,
@@ -92,6 +93,8 @@
   let mapView = $state<MapView>("navigator");
   let graphLoad = $state<GraphVizLoad | null>(null);
   let graphLoading = $state(false);
+  let copyingLogs = $state(false);
+  let copyLogsNote = $state<string | null>(null);
 
   let docsStatus = $state<DocsStatus | null>(null);
   let docsQuery = $state("");
@@ -166,9 +169,10 @@
   const searchRequests = trackedRequests("search");
   const linkRequests = trackedRequests("links");
   const buildRequests = trackedRequests("build");
+  const copyRequests = trackedRequests("copy-logs");
 
   function cancelRequests() {
-    for (const requests of [mapRequests, graphRequests, docsRequests, searchRequests, linkRequests, buildRequests]) requests.next();
+    for (const requests of [mapRequests, graphRequests, docsRequests, searchRequests, linkRequests, buildRequests, copyRequests]) requests.next();
   }
   onDestroy(cancelRequests);
   onDestroy(detailScope.dispose);
@@ -356,6 +360,29 @@
     }
   }
 
+  async function copyMapLogs() {
+    const repository = currentRepo;
+    if (!repository || copyingLogs) return;
+    const request = copyRequests.next();
+    const live = () => copyRequests.isCurrent(request) && currentRepo === repository;
+    copyingLogs = true;
+    copyLogsNote = null;
+    try {
+      const result = await copyDevmapLogs({
+        repository, view: mapView, building, cli: cliStatus,
+        map: load ? { available: load.available, path: load.path, reason: load.reason } : null,
+        graph: graphLoad ? { available: graphLoad.available, kind: graphLoad.kind, reason: graphLoad.reason } : null,
+        liveIndex: liveIndex.get(repository),
+        errors: [errorMsg, actionNote, docsError, linksError],
+      }, live);
+      if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
+    } catch (error) {
+      if (live()) copyLogsNote = `Could not copy DevMap logs: ${reportMapFailure("copy logs", repository, error)}`;
+    } finally {
+      if (live()) copyingLogs = false;
+    }
+  }
+
   $effect(() => {
     const path = currentRepo;
     untrack(() => {
@@ -372,6 +399,8 @@
       docsError = null;
       linksError = null;
       actionNote = null;
+      copyLogsNote = null;
+      copyingLogs = false;
       loading = building = graphLoading = brokenLoading = docsSearching = linksLoading = false;
       // The view effect below owns the initial subview request.
       if (path) void reload(path, false);
@@ -474,6 +503,14 @@
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
+        disabled={copyingLogs || !currentRepo}
+        onclick={() => void copyMapLogs()}
+      >
+        {copyingLogs ? "Copying logs…" : "Copy DevMap logs"}
+      </button>
+      <button
+        type="button"
+        class="gp-btn text-[11px] px-2 py-0.5"
         disabled={building || !$repoStore.currentPath || cliKnownAbsent}
         title={cliKnownAbsent ? "devmap CLI is not installed — run Setup first" : "Refresh the map index"}
         onclick={() => void runBuild("refresh")}
@@ -491,6 +528,10 @@
       </button>
     </span>
   </div>
+
+  {#if copyLogsNote}
+    <p class="shrink-0 px-3 py-1 text-[11px] text-textMuted" role="status">{copyLogsNote}</p>
+  {/if}
 
   {#if cliStatus && !cliStatus.available}
     <div class="shrink-0 border-b border-border/50 px-3 py-2 space-y-2">

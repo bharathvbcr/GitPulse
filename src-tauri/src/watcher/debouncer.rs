@@ -4,11 +4,30 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
 pub struct RepoFileWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: Option<RecommendedWatcher>,
+    retired: Receiver<()>,
     pub receiver: Receiver<Result<Event, notify::Error>>,
 }
 
 impl RepoFileWatcher {
+    /// Wait for the backend to release its callback and outstanding native
+    /// reads. notify's Windows Drop only queues Stop; dropping its Rust handle
+    /// alone does not mean ReadDirectoryChangesW has relinquished the tree.
+    pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(watcher) = self.watcher.take() {
+            drop(watcher);
+            match self.retired.recv_timeout(Duration::from_secs(2)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                _ => Err(
+                    "Filesystem watcher did not release its native resources within 2 seconds"
+                        .into(),
+                ),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Watches only a resolved git directory recursively (work-tree `.git`,
     /// linked-worktree git dir, or bare repo). See [`Self::watch_repo`] for
     /// the full-repo form.
@@ -65,9 +84,13 @@ impl RepoFileWatcher {
         }
 
         let (tx, rx) = channel();
+        let (lifetime, retired) = channel::<()>();
 
         let mut watcher = RecommendedWatcher::new(
             move |res| {
+                // The sender's lifetime follows every native callback owner.
+                // It is never sent to: disconnect is the shutdown receipt.
+                std::hint::black_box(&lifetime);
                 let _ = tx.send(res);
             },
             Config::default().with_poll_interval(Duration::from_millis(150)),
@@ -120,8 +143,17 @@ impl RepoFileWatcher {
         }
 
         Ok(Self {
-            _watcher: watcher,
+            watcher: Some(watcher),
+            retired,
             receiver: rx,
         })
+    }
+}
+
+impl Drop for RepoFileWatcher {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            log::warn!(target: "watcher", "{error}");
+        }
     }
 }

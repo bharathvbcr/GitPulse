@@ -127,11 +127,24 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
         return;
     };
 
-    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
-        if !type_matches(value, expected) {
+    if let Some(expected) = schema.get("type") {
+        let matches = match expected {
+            Value::String(name) => type_matches(value, name),
+            Value::Array(names) if !names.is_empty() => {
+                names.iter().try_fold(false, |matched, name| {
+                    type_matches(value, name.as_str()?).map(|member| matched || member)
+                })
+            }
+            _ => None,
+        };
+        if matches != Some(true) {
             out.push(Violation::new(
                 path,
-                format!("expected {expected}, got {}", describe(value)),
+                format!(
+                    "expected {}, got {}",
+                    render_scalar(expected),
+                    describe(value)
+                ),
             ));
             // Every other keyword is typed; checking them against the wrong
             // kind of value would only produce noise on top of the real cause.
@@ -254,8 +267,8 @@ fn check(value: &Value, schema: &Value, path: &str, out: &mut Vec<Violation>) {
 /// type, so `1.0` is an integer and `1.5` is not, and serde_json's `is_i64`
 /// answers "was it written without a decimal point", which is a different
 /// question.
-fn type_matches(value: &Value, expected: &str) -> bool {
-    match expected {
+fn type_matches(value: &Value, expected: &str) -> Option<bool> {
+    Some(match expected {
         "object" => value.is_object(),
         "array" => value.is_array(),
         "string" => value.is_string(),
@@ -268,8 +281,8 @@ fn type_matches(value: &Value, expected: &str) -> bool {
         // An unknown type keyword must not silently pass. `unsupported_keywords`
         // cannot catch this (the keyword itself is supported, its value is not),
         // so refusing here is what keeps it honest.
-        _ => false,
-    }
+        _ => return None,
+    })
 }
 
 fn describe(value: &Value) -> String {
@@ -332,6 +345,31 @@ mod tests {
     #[test]
     fn a_valid_call_has_no_violations() {
         assert!(messages(json!({ "repo_path": "/tmp/x", "limit": 10, "mode": "fast" })).is_empty());
+    }
+
+    #[test]
+    fn nullable_types_accept_only_the_declared_alternatives() {
+        let schema = json!({"type": ["boolean", "null"]});
+        for value in [json!(true), json!(false), Value::Null] {
+            assert!(validate(&value, &schema).is_empty());
+        }
+        for value in [json!("true"), json!(1), json!([]), json!({})] {
+            assert_eq!(validate(&value, &schema).len(), 1, "{value}");
+        }
+    }
+
+    #[test]
+    fn malformed_type_declarations_never_disable_validation() {
+        for declaration in [
+            json!([]),
+            json!(42),
+            Value::Null,
+            json!(["string", 42]),
+            json!(["strong"]),
+            json!(["string", "strong"]),
+        ] {
+            assert!(!validate(&json!("x"), &json!({"type": declaration})).is_empty());
+        }
     }
 
     #[test]

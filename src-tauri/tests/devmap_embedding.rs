@@ -194,3 +194,44 @@ fn advisory_status_never_migrates_the_writers_database() {
     assert!(!result.available);
     assert!(result.reason.unwrap().contains("schema"));
 }
+
+/// Explicit opt-in keeps an installed schema-19 binary out of schema-20 tests.
+#[test]
+#[ignore = "requires GITPULSE_DEVMAP_BIN pointing to the candidate CLI"]
+fn candidate_cli_maps_are_isolated_and_readable_by_the_embedding() {
+    let binary = std::env::var("GITPULSE_DEVMAP_BIN").expect("set the candidate binary explicitly");
+    assert_eq!(devmap::cli::resolve_binary().unwrap().path, binary);
+    let repos = [repository(), repository()];
+    for (i, repo) in repos.iter().enumerate() {
+        fs::write(
+            repo.path().join("source.py"),
+            format!(
+                "def worktree_{i}():\n    return 1\ndef caller_{i}():\n    return worktree_{i}()\n"
+            ),
+        )
+        .unwrap();
+        let result = devmap::cli::build(repo.path().to_str().unwrap()).unwrap();
+        assert!(result.ok && !result.timed_out, "{}", result.stderr);
+        assert!(
+            result.report.is_some(),
+            "the CLI must return a complete build report"
+        );
+    }
+    for (i, repo) in repos.iter().enumerate() {
+        let root = repo.path().to_str().unwrap();
+        let status = codeintel::status(root);
+        assert!(status.available, "{:?}", status.reason);
+        let own = codeintel::search(root, &format!("worktree_{i}"), Some(2000));
+        assert!(own.available, "{:?}", own.reason);
+        assert_eq!(own.total, 1);
+        let foreign = codeintel::search(root, &format!("worktree_{}", 1 - i), Some(2000));
+        assert!(foreign.available, "{:?}", foreign.reason);
+        assert_eq!(foreign.total, 0);
+        let impact = codeintel::impact(root, &format!("worktree_{i}"), Some(2000));
+        assert!(impact.available, "{:?}", impact.reason);
+        assert!(
+            !impact.items.is_empty(),
+            "the mapped caller must be discoverable"
+        );
+    }
+}

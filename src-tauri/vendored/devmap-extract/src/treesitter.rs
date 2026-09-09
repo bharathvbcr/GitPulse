@@ -284,6 +284,11 @@ fn parse_within_budget(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXTRACTION_FINISH_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
 pub fn extract_treesitter_with_budget(
     path: &str,
     lang: &str,
@@ -302,7 +307,35 @@ pub fn extract_treesitter_with_budget(
     let started = std::time::Instant::now();
     let deadline = started + budget;
     let _budget = BudgetGuard::arm(deadline);
+    let extraction = extract_treesitter_before_deadline(path, lang, source, budget, deadline);
+    // All tree, parser and parent-index temporaries have been released. A
+    // helper in the final scope/embedded pass can still have stopped early, or
+    // cleanup can have crossed the deadline after the last phase check.
+    if !matches!(
+        extraction.parse_outcome,
+        ParseOutcome::Failed { .. } | ParseOutcome::Skipped { .. }
+    ) && extraction_overran(deadline)
+    {
+        refused_extraction(
+            path,
+            lang,
+            source,
+            format!(
+                "extraction finalization exceeded the {budget:?} budget; no symbols are claimed for this file"
+            ),
+        )
+    } else {
+        extraction
+    }
+}
 
+fn extract_treesitter_before_deadline(
+    path: &str,
+    lang: &str,
+    source: &str,
+    budget: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Extraction {
     // Before anything else: a language whose grammar is deliberately not linked
     // must be refused here, not fall through to `unavailable_extraction`. That
     // path's reason — "no linked tree-sitter grammar for {lang}" — is true but
@@ -427,7 +460,7 @@ pub fn extract_treesitter_with_budget(
             ParseAttempt::Parsed(_) => {}
         }
         if let ParseAttempt::Parsed(tree) = attempt {
-            {
+            return crate::parent_index::with_index(&tree, deadline, || {
                 // The budget covers parse *and* walk *and* everything after it.
                 // Measured: a 4,000-byte C++ file of 2,000 nested braces parses
                 // in 3 ms and then spends 199 s in the walk, so bounding the
@@ -678,8 +711,14 @@ pub fn extract_treesitter_with_budget(
                     lang,
                     deadline,
                 );
-                return extraction;
-            }
+                #[cfg(test)]
+                EXTRACTION_FINISH_HOOK.with(|hook| {
+                    if let Some(finish) = hook.take() {
+                        finish();
+                    }
+                });
+                extraction
+            });
         }
     }
 
@@ -1239,7 +1278,12 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
 /// No declarations are recovered by pattern here. A file whose parse was
 /// abandoned has an unknown structure, and a pattern scan over it would produce
 /// a plausible-looking symbol set that nothing verified.
-fn refused_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+pub(crate) fn refused_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    reason: String,
+) -> Extraction {
     unparsed_extraction(
         path,
         lang,
@@ -5801,6 +5845,8 @@ thread_local! {
     static WALK_OVERRAN: Cell<bool> = const { Cell::new(false) };
     /// Ancestor steps taken since the clock was last read. See `bounded_parent`.
     static PARENT_STEPS: Cell<u32> = const { Cell::new(0) };
+    #[cfg(test)]
+    static NATIVE_PARENT_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Arms the extraction deadline for exactly as long as one file is being
@@ -5830,10 +5876,8 @@ impl BudgetGuard {
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
         WALK_DEADLINE.with(|slot| slot.set(None));
-        // `WALK_OVERRAN` is deliberately *not* cleared here. It is read by
-        // `extract_treesitter_with_budget` after the guard's scope ends to
-        // decide whether the file must be refused, and clearing it here would
-        // erase the one signal that says the answer is incomplete.
+        // Retain the incomplete-walk signal until the next extraction arms
+        // its budget. The publication gate must not lose a helper's refusal.
     }
 }
 
@@ -5884,7 +5928,11 @@ pub(crate) fn bounded_parent(node: Node<'_>) -> Option<Node<'_>> {
     if walk_overran() {
         return None;
     }
-    node.parent()
+    crate::parent_index::parent(node).unwrap_or_else(|| {
+        #[cfg(test)]
+        NATIVE_PARENT_READS.with(|count| count.set(count.get() + 1));
+        node.parent()
+    })
 }
 
 /// Ancestor steps taken between clock reads. See `bounded_parent`.
@@ -6692,6 +6740,53 @@ pub(crate) fn node_span(node: Node) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_finalization_refused(hook: fn()) {
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+            }
+        }
+        let _clear = ClearHook;
+        EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(hook)));
+        let extraction = extract_treesitter_with_budget(
+            "finish.py",
+            "python",
+            "def work():\n    return 1\ndef caller():\n    return work()\n",
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            EXTRACTION_FINISH_HOOK.with(|slot| slot.get().is_none()),
+            "the finalization boundary must be reached"
+        );
+        assert!(
+            matches!(&extraction.parse_outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+            "late finalization published {:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(extraction.symbols.len(), 1, "only the File node may remain");
+        assert!(extraction.calls.is_empty());
+    }
+
+    #[test]
+    fn finalization_cannot_publish_after_deadline_expiry() {
+        fn expire() {
+            let deadline = WALK_DEADLINE.with(|slot| slot.get().expect("armed extraction"));
+            while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        assert_finalization_refused(expire);
+    }
+
+    #[test]
+    fn finalization_cannot_publish_after_a_late_incomplete_walk() {
+        fn incomplete() {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+        }
+        assert_finalization_refused(incomplete);
+    }
 
     /// Every discovered file is addressable, whether or not it parsed. (K1)
     ///
@@ -9663,5 +9758,43 @@ mod tests {
             "linked_grammar_count()={count} is too low for this workspace's grammar set"
         );
         assert_eq!(count, linked_grammar_keys().len());
+    }
+}
+
+#[cfg(test)]
+mod parent_work_regression {
+    use super::*;
+
+    #[test]
+    fn repeated_ancestor_questions_do_not_reconstruct_the_root_walk() {
+        let source: String = (0..500)
+            .map(|i| format!("fn f{i}(a: i32) -> i32 {{ external(a) + {i} }}\n"))
+            .collect();
+        NATIVE_PARENT_READS.with(|count| count.set(0));
+        let extraction = extract_treesitter("wide.rs", "rust", &source);
+        assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+        assert_eq!(
+            extraction
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Function)
+                .count(),
+            500
+        );
+        assert_eq!(
+            extraction
+                .calls
+                .iter()
+                .filter(|c| c.callee_name == "external")
+                .count(),
+            500
+        );
+        let reads = NATIVE_PARENT_READS.with(Cell::get);
+        // This bounds actual expensive native work, independently of CPU speed
+        // and debug/release profiles. Every ancestor is in this small tree.
+        assert!(
+            reads < 500,
+            "reconstructed {reads} root walks for 500 functions"
+        );
     }
 }

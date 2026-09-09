@@ -198,6 +198,9 @@
    * meant going back, finding the commit again, and clicking the next row.
    */
   let railOpen = $state(true);
+  $effect(() => {
+    if ($repoStore.selectedDiffPending && !$repoStore.selectedCommitId) railOpen = true;
+  });
   let railWidth = $state(248);
   /** Owned here so unfolding the change picker survives a file switch. */
   let commitsOpen = $state(false);
@@ -739,18 +742,10 @@
     void repoStore.selectCommitFileDiff(entry.id, first.path);
   }
 
-  /**
-   * Returns to uncommitted work, opening its first changed file.
-   *
-   * A clean tree has nothing to open, so the button does nothing rather than
-   * clearing the diff on screen — leaving the reader looking at a blank pane
-   * they did not ask for is worse than leaving them where they were. The
-   * entry's own "clean" badge already says why.
-   */
+  /** Reuse the same working-tree preview as the workspace's change counts. */
   function pickWorkingTree(): void {
-    const first = $repoStore.statuses[0];
-    if (!first) return;
-    void repoStore.selectFileDiff(first.path, first.is_staged);
+    railOpen = true;
+    void repoStore.previewUncommitted();
   }
 
   /** Opens a rail entry through whichever command its source requires. */

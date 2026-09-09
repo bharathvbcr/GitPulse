@@ -41,6 +41,9 @@ pub struct CodeintelSymbolHit {
     /// it made a hit whose source could not be read render identically to one
     /// whose source is genuinely blank.
     pub source_unavailable_reason: Option<String>,
+    /// Bytes withheld by the query budget, distinct from unreadable source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span_omitted_bytes: Option<u32>,
     pub score: f32,
 }
 
@@ -83,6 +86,10 @@ impl From<RungHistogram> for CodeintelRungHistogram {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeintelResponse<T> {
+    /// Null means this query did not verify whole-tree freshness. Availability
+    /// and complete traversal of a stored snapshot cannot establish it.
+    #[serde(default)]
+    pub source_freshness: Option<bool>,
     pub available: bool,
     pub reason: Option<String>,
     pub items: Vec<T>,
@@ -100,6 +107,7 @@ pub struct CodeintelResponse<T> {
 impl<T> CodeintelResponse<T> {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
+            source_freshness: None,
             available: false,
             reason: Some(reason.into()),
             items: Vec::new(),
@@ -113,6 +121,7 @@ impl<T> CodeintelResponse<T> {
 
     pub fn ok(items: Vec<T>, total: u32, shown: u32, truncated: bool) -> Self {
         Self {
+            source_freshness: None,
             available: true,
             reason: None,
             items,
@@ -128,6 +137,12 @@ impl<T> CodeintelResponse<T> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeintelStatus {
     pub available: bool,
+    #[serde(default)]
+    pub is_fresh: Option<bool>,
+    #[serde(default)]
+    pub freshness_reason: Option<String>,
+    #[serde(default)]
+    pub pending_count: Option<usize>,
     pub db_path: String,
     pub generation_id: Option<u32>,
     pub total_files: Option<u32>,
@@ -188,13 +203,17 @@ fn open_store(repo: &Path) -> Result<Store, String> {
             db_path.to_string_lossy()
         ));
     }
-    Store::open_read_only(&db_path).map_err(|e| {
+    let store = Store::open_read_only(&db_path).map_err(|e| {
         let raw = e.to_string();
         if let Some(friendly) = rewrite_schema_mismatch(&raw) {
             return friendly;
         }
         format!("Failed to open devmap database: {raw}")
-    })
+    })?;
+    store
+        .validate_repo_root(repo)
+        .map_err(|error| error.to_string())?;
+    Ok(store)
 }
 
 /// Opens the store AND requires that it actually hold an indexed generation.
@@ -264,9 +283,10 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
         resolution,
         walk_incomplete,
         rungs,
+        source_freshness,
         ..
     } = response;
-    match resolution {
+    let mut out = match resolution {
         ResolutionAvailability::Unavailable { reason } => CodeintelResponse::unavailable(reason),
         ResolutionAvailability::Available => {
             let mut out = CodeintelResponse::ok(
@@ -279,7 +299,9 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
             out.rungs = rungs.map(CodeintelRungHistogram::from);
             out
         }
-    }
+    };
+    out.source_freshness = source_freshness;
+    out
 }
 
 fn parse_min_rung(min_rung: Option<&str>) -> Result<Option<Rung>, String> {
@@ -368,6 +390,9 @@ pub fn finish_cancellable_query(token: Option<&str>) {
 fn status_unavailable(db_path: String, reason: String) -> CodeintelStatus {
     CodeintelStatus {
         available: false,
+        is_fresh: None,
+        freshness_reason: Some(reason.clone()),
+        pending_count: None,
         db_path,
         generation_id: None,
         total_files: None,
@@ -413,6 +438,9 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
 
     CodeintelStatus {
         available: true,
+        is_fresh: Some(summary.is_fresh()),
+        freshness_reason: summary.freshness_reason(),
+        pending_count: Some(summary.pending_count),
         db_path: db_str,
         generation_id: Some(gen_id),
         total_files: latest_file_count(&store, gen_id),
@@ -479,6 +507,7 @@ pub fn search(
             span_end_line: hit.span.1,
             source_span: hit.source_span,
             source_unavailable_reason: hit.source_unavailable_reason,
+            source_span_omitted_bytes: hit.source_span_omitted_bytes,
             score: hit.score,
         }),
         Err(e) => CodeintelResponse::unavailable(format!("Search failed: {e}")),
@@ -938,44 +967,27 @@ pub fn affected_tests(
     // Querying it and treating the answer as "these are the tests to run"
     // is exactly the failure mode fail_closed exists to prevent.
     let db_str = map_path(&repo).to_string_lossy().into_owned();
-    if let Ok(summary) = store.status(&db_str) {
-        if summary.pending_count > 0 {
-            let reason = format!(
-                "code map is stale: {} pending path(s) not yet indexed",
-                summary.pending_count
-            );
-            return CodeintelAffectedTests {
-                available: true,
-                reason: Some(reason.clone()),
-                targets: targets.to_vec(),
-                tests: CodeintelResponse::unavailable(reason.clone()),
-                blast_radius: CodeintelBlastRadius {
-                    seeds: Vec::new(),
-                    unmatched_targets: targets.to_vec(),
-                    layers: CodeintelResponse::unavailable(reason.clone()),
-                    total_impacted: 0,
-                },
-                fail_closed: true,
-                fail_closed_reason: Some(reason),
-            };
-        }
-        if let Some(degraded) = summary.degraded_reason.filter(|r| !r.is_empty()) {
-            let reason = format!("code map is degraded: {degraded}");
-            return CodeintelAffectedTests {
-                available: true,
-                reason: Some(reason.clone()),
-                targets: targets.to_vec(),
-                tests: CodeintelResponse::unavailable(reason.clone()),
-                blast_radius: CodeintelBlastRadius {
-                    seeds: Vec::new(),
-                    unmatched_targets: targets.to_vec(),
-                    layers: CodeintelResponse::unavailable(reason.clone()),
-                    total_impacted: 0,
-                },
-                fail_closed: true,
-                fail_closed_reason: Some(reason),
-            };
-        }
+    let freshness_failure = match store.status(&db_str) {
+        Ok(summary) => summary
+            .freshness_reason()
+            .map(|reason| (true, format!("code map is stale or degraded: {reason}"))),
+        Err(error) => Some((false, format!("code map freshness check failed: {error}"))),
+    };
+    if let Some((available, reason)) = freshness_failure {
+        return CodeintelAffectedTests {
+            available,
+            reason: Some(reason.clone()),
+            targets: targets.to_vec(),
+            tests: CodeintelResponse::unavailable(reason.clone()),
+            blast_radius: CodeintelBlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: targets.to_vec(),
+                layers: CodeintelResponse::unavailable(reason.clone()),
+                total_impacted: 0,
+            },
+            fail_closed: true,
+            fail_closed_reason: Some(reason),
+        };
     }
     let engine = StoreQueryEngine::new(&store);
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
@@ -1229,6 +1241,19 @@ pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_refuses_a_store_bound_to_another_worktree() {
+        let repo = repo_with_empty_store();
+        let other = tempfile::tempdir().unwrap();
+        let store = open_fixture_store(repo.path());
+        store.bind_repo_root(other.path()).unwrap();
+        drop(store);
+        let error = open_store(repo.path())
+            .err()
+            .expect("cross-worktree store was accepted");
+        assert!(error.contains("belongs to worktree"), "{error}");
+    }
 
     #[test]
     fn supported_schema_matches_linked_store_constant() {
@@ -1851,6 +1876,127 @@ mod tests {
             .source_unavailable_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("changed")));
+    }
+
+    #[test]
+    fn staleness_audit_query_envelopes_preserve_unknown_freshness() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_str().unwrap();
+        let responses = [
+            serde_json::to_value(search(root, "probe", None)).unwrap(),
+            serde_json::to_value(dependencies(root, "src/caller.rs", None)).unwrap(),
+            serde_json::to_value(impact(root, "probe_callee", None)).unwrap(),
+            serde_json::to_value(trace_between(root, "probe_caller", "probe_callee", None))
+                .unwrap(),
+            serde_json::to_value(search(root, "missing", None)).unwrap(),
+            serde_json::to_value(search(root, " ", None)).unwrap(),
+        ];
+        for response in responses {
+            assert_eq!(
+                response.get("source_freshness"),
+                Some(&serde_json::Value::Null),
+                "query availability does not verify source freshness: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn staleness_audit_adapter_preserves_each_engine_freshness_verdict() {
+        let repo = repo_with_one_generation();
+        let store = open_repo_map(repo.path().to_str().unwrap()).unwrap();
+        let engine = StoreQueryEngine::new(&store);
+        for verdict in [None, Some(false), Some(true)] {
+            let mut response = engine
+                .search(Request {
+                    query: "probe_caller".into(),
+                    token_budget: 2000,
+                    min_confidence: 0.0,
+                    max_depth: 1,
+                })
+                .unwrap();
+            response.source_freshness = verdict;
+            let mapped = from_engine(response, |hit| hit.symbol_name);
+            assert_eq!(mapped.source_freshness, verdict);
+            assert_eq!(mapped.items, vec!["probe_caller"]);
+        }
+        let missing = git_repo();
+        let unavailable = status(missing.path().to_str().unwrap());
+        assert!(!unavailable.available);
+        assert_eq!(unavailable.is_fresh, None);
+        assert_eq!(unavailable.pending_count, None);
+        assert!(unavailable.freshness_reason.is_some());
+    }
+
+    #[test]
+    fn staleness_audit_budgeted_source_reports_omitted_bytes() {
+        let repo = repo_with_one_generation();
+        let response = serde_json::to_value(search(
+            repo.path().to_str().unwrap(),
+            "probe_caller",
+            Some(80),
+        ))
+        .unwrap();
+        assert_eq!(response["shown"], 1);
+        let hit = &response["items"][0];
+        assert_eq!(hit["source_unavailable_reason"], serde_json::Value::Null);
+        assert_eq!(
+            hit["source_span"].as_str().unwrap().len()
+                + hit["source_span_omitted_bytes"]
+                    .as_u64()
+                    .expect("budget omission must be preserved") as usize,
+            CALLER_SOURCE.len()
+        );
+    }
+
+    #[test]
+    fn staleness_audit_status_preserves_the_stores_degraded_reason() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_str().unwrap();
+        let response = serde_json::to_value(status(root)).unwrap();
+        assert_eq!(response["available"], true, "stale navigation stays usable");
+        assert_eq!(response.get("is_fresh"), Some(&serde_json::json!(false)));
+        assert!(
+            response["freshness_reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("analyzer")),
+            "fixture analyzer identity cannot be certified by the embedded reader: {response}"
+        );
+        assert_eq!(response.get("pending_count"), Some(&serde_json::json!(0)));
+    }
+
+    #[test]
+    fn staleness_audit_failed_status_cannot_authorize_test_selection() {
+        let repo = repo_with_one_generation();
+        let root = repo.path().to_str().unwrap();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute(
+            "INSERT INTO generation_coverage_gaps (generation_id, gap, path, reason)
+            VALUES (1, 'parse_failed', 'src/caller.rs', X'FF')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = open_repo_map(root).unwrap();
+        let error = store
+            .status("")
+            .expect_err("corrupt status evidence must fail");
+        assert!(error.to_string().contains("Invalid column type"), "{error}");
+        let selected = affected_tests(root, &["probe_callee".to_string()], None, None);
+        assert!(
+            selected.fail_closed,
+            "status read failed but selection was authorized: {selected:?}"
+        );
+        assert!(
+            !selected.tests.available,
+            "unverified test selection must be unavailable"
+        );
+        assert!(
+            selected
+                .fail_closed_reason
+                .as_deref()
+                .is_some_and(|s| s.contains("Invalid column type")),
+            "the actual status failure must be preserved: {selected:?}"
+        );
     }
 
     /* ── Finding 2: the repository path is an argument, not a fact ────────── */

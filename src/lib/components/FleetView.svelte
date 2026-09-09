@@ -975,7 +975,9 @@
                   partialNote="Some status rows could not be parsed, so the line counts are floors."
                 >
                   {#if row.changes.kind === "read"}
-                    <span class="text-textPrimary">{row.changes.value.files}</span>
+                    <button type="button" class="text-textPrimary hover:text-accent hover:underline" title="Preview uncommitted files and modifications in {row.label}"
+                      onclick={() => void repoStore.previewUncommitted(row.path)}>
+                    <span>{row.changes.value.files}</span>
                     <span class="text-textMuted text-[10px]">
                       {#if row.changes.value.conflicted > 0}
                         <span class="text-rose-600 dark:text-rose-400"
@@ -984,6 +986,7 @@
                       {/if}
                       +{row.changes.value.additions}/−{row.changes.value.deletions}
                     </span>
+                    </button>
                   {/if}
                 </FleetCell>
               </td>

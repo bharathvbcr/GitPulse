@@ -11,6 +11,24 @@ const model = buildCodeGraphModel({nodes:[
 ],links:[{source:"a",target:"b"},{source:"b",target:"c"},{source:"c",target:"a"},{source:"d",target:"a"}]});
 
 describe("graph exploration", () => {
+  it("hides only producer-classified documentation and removes its trace edges", () => {
+    const model = buildCodeGraphModel({nodes:[
+      {id:"code",name:"Code",path:"notes/editor.ts",documentation:false},
+      {id:"note",name:"Note",path:"README.md",documentation:true},
+      {id:"mixed",name:"Mixed subsystem",documentation:false},
+      {id:"unknown",name:"Unknown",documentation:"true"},
+    ],links:[{source:"code",target:"note"},{source:"code",target:"mixed"}]});
+    const index = buildGraphIndex(model);
+    expect(filterGraphNodes(model,index,{})).toHaveLength(4);
+    const visible = filterGraphNodes(model,index,{hideNotes:true});
+    expect(visible.map(n=>n.id)).toEqual(["code","mixed","unknown"]);
+    const trace = traceGraph(index,"code","both",3,new Set(visible.map(n=>n.id)));
+    expect([...trace.ids]).toEqual(["code","mixed"]);
+    expect([...trace.edges]).toEqual([1]);
+    expect(filterGraphNodes(model,index,{hideNotes:true,query:"README"})).toEqual([]);
+    expect(filterGraphNodes(model,index,{hideNotes:true,connectedOnly:true})).toHaveLength(2);
+    expect(filterGraphNodes(model,index,{hideNotes:false})).toHaveLength(4);
+  });
   it("fits translated and extreme supplied coordinates into the actual viewport", () => {
     const model = buildCodeGraphModel({nodes:[{id:"a",name:"A",x:-1e7,y:1e7},{id:"b",name:"B",x:1e7,y:-1e7}],links:[]});
     for (const [width,height] of [[320,240],[1440,900]]) {

@@ -1,5 +1,20 @@
 # Runtime harness
 
+## Uncommitted previews
+
+Run `npm run test:browser -- --harness uncommitted` or
+`npm run test:webkit -- --harness uncommitted`. For interactive inspection,
+open `/harness/uncommitted.html` on the development server.
+
+This mounts the existing status bar, sidebars, view/repository tabs, Workspace
+Overview, workspace status, worktree list, Fleet, and `DiffViewer`. Click checks
+start from an old commit and require the requested worktree's changed-file rail
+and actual modifications. They also cover both sides of a partially staged
+file, reopening the collapsed rail, and the diff's change picker. Unexpected
+commands and browser runtime errors fail the run. IPC fixtures do not verify
+the installed native app; store tests separately cover failed loads and late
+repository, view, and diff responses.
+
 ## Code diagnostics
 
 Run `npm run test:browser` for the automated Chrome gate, or

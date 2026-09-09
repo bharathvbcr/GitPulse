@@ -84,6 +84,78 @@ function camera() {
 
 const normalizedViz = normalizeRustFormatJs(vizSource);
 
+describe("DevMap HTML documentation visibility", () => {
+  it("keeps restore data pristine when the renderer replaces edge IDs with node objects", () => {
+    const bootstrap = normalizedViz.match(/const graph = ForceGraph\(\)\(el\)[\s\S]+?;/)?.[0];
+    if (!bootstrap) throw new Error("Missing graph initialization");
+    const source = {nodes:[{id:"a"},{id:"b"}],links:[{source:"a",target:"b"}]};
+    const renderer: object = new Proxy({}, {get:(_target,key) => key === "graphData"
+      ? (data:{links:Array<{source:unknown;target:unknown}>}) => {
+        for (const link of data.links) { link.source={id:link.source}; link.target={id:link.target}; }
+        return renderer;
+      }
+      : () => renderer});
+    runInNewContext(bootstrap, {source,ForceGraph:()=>()=>renderer,el:{},VIEW:{},colorFor:()=>"",showDetail:()=>{}});
+    expect(source.links).toEqual([{source:"a",target:"b"}]);
+  });
+
+  const nodes = [
+    {id:"code",name:"Code",documentation:false},
+    {id:"note",name:"Note",documentation:true},
+    {id:"mixed",name:"Mixed",documentation:false},
+  ];
+  const links = [{source:"code",target:"note"},{source:"code",target:"mixed"}];
+
+  it("filters and restores graph nodes and edges, composes with search, and clears stale detail", () => {
+    let data = {nodes,links};
+    const q = {value:""};
+    const hideNotes = {checked:true};
+    const count = {textContent:""};
+    const detail = {innerHTML:"<h2>Note</h2>"};
+    const noMatch = {hidden:true};
+    const context = {
+      source:{nodes,links}, VIEW:{flag_filters:[]}, flagsOf:()=>[], detail, noMatch,
+      document:{getElementById:(id:string) => id === "q" ? q : id === "hideNotes" ? hideNotes : count},
+      graph:{graphData:(next:typeof data) => {data=next;}},
+      setTimeout:()=>1, clearTimeout:()=>{},
+    };
+    const apply = () => runInNewContext(`{ let filterFitTimer; const FILTER_FIT_DELAY_MS=80; ${functionBody(normalizedViz,"apply")} apply(); }`, context);
+    apply();
+    expect(data.nodes.map(n=>n.id)).toEqual(["code","mixed"]);
+    expect(data.links).toEqual([links[1]]);
+    expect(detail.innerHTML).not.toContain("<h2>Note</h2>");
+    expect(count.textContent).toBe("2 of 3 match filters");
+    q.value="Note"; apply();
+    expect(data.nodes).toEqual([]);
+    expect(data.links).toEqual([]);
+    expect(noMatch.hidden).toBe(false);
+    hideNotes.checked=false; q.value=""; apply();
+    expect(data.nodes).toHaveLength(3);
+    expect(data.links).toEqual(links);
+    expect(noMatch.hidden).toBe(true);
+  });
+
+  it("filters documentation-only subsystems even after force-graph mutates endpoints", () => {
+    const hideNotes = {checked:true};
+    const search = {value:""};
+    const context = {
+      DATA:{nodes,links:links.map(l=>({source:{id:l.source},target:{id:l.target}}))},
+      document:{getElementById:(id:string)=>id==="hideNotes"?hideNotes:search},
+      subsystemById:()=>({}), langFilter:"", result:{nodes:[],links:[]},
+    };
+    const apply = () => {
+      runInNewContext(`${functionBody(mapSource,"lid")} ${functionBody(mapSource,"filtered")} result = filtered();`, context);
+      return context.result;
+    };
+    expect(apply()).toMatchObject({nodes:[nodes[0],nodes[2]],links:[{source:{id:"code"},target:{id:"mixed"}}]});
+    search.value="Note";
+    expect(apply()).toEqual({nodes:[],links:[]});
+    hideNotes.checked=false; search.value="";
+    expect(apply().nodes).toHaveLength(3);
+    expect(apply().links).toHaveLength(2);
+  });
+});
+
 function runGraphFit(nodes: Point[], width = 1000, height = 800) {
   const graph = camera();
   runInNewContext(
@@ -188,7 +260,9 @@ it("cancels a stale code-graph filter before its camera callback runs", () => {
     },
     VIEW: { flag_filters: [] },
     flagsOf: () => [],
+    detail: { innerHTML: "" },
     noMatch: { hidden: false },
+    detail: { innerHTML: "" },
     document: { getElementById: () => q },
     setTimeout: (callback: () => void) => {
       const id = nextTimer++;

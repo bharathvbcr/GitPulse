@@ -153,9 +153,7 @@
   const hasTasks = $derived(projection?.sources.tasks.present === true);
 
   function reviewChanges(): void {
-    const first = $repoStore.statuses[0];
-    if (first) void repoStore.selectFileDiff(first.path, first.is_staged);
-    else repoStore.setActiveTab("history", "graph");
+    void repoStore.previewUncommitted();
   }
 
   /**
@@ -411,10 +409,10 @@
             </button>
           {/if}
           {#if here.staged > 0}
-            <span class="text-emerald-600 dark:text-emerald-400">{here.staged} staged</span>
+            <button type="button" class="text-emerald-600 dark:text-emerald-400 hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, true)} title="Preview staged files and modifications">{here.staged} staged</button>
           {/if}
           {#if here.unstaged > 0}
-            <span class="text-amber-600 dark:text-amber-400">{here.unstaged} unstaged</span>
+            <button type="button" class="text-amber-600 dark:text-amber-400 hover:underline" onclick={() => void repoStore.previewUncommitted(undefined, false)} title="Preview unstaged files and modifications">{here.unstaged} unstaged</button>
           {/if}
           {#if here.staged + here.unstaged + here.conflicted === 0}
             <span class="text-textMuted">working tree clean</span>
@@ -667,6 +665,7 @@
       {#each renderedRows as row, i (row.key || `__unbound:${i}`)}
         {@const chips = noteworthyStatuses(row.verdicts)}
         {@const dirty = dirtySummary(row)}
+        {@const changedWorktree = row.worktrees.find(binding => measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0)?.worktree}
         {@const activity = rowLastActivity(row, $repoStore.branches)}
         <div
           class="overview-work-row rounded-2xl border border-border/70 bg-surface p-4 shadow-card"
@@ -772,10 +771,11 @@
                      cap). Rendering that as 0 would report an unscanned
                      worktree as verified clean. -->
                 {#if dirtyCount(row) > 0}
-                  <span class="flex items-center gap-1 text-amber-700 dark:text-amber-400" title="Uncommitted files">
+                  <button type="button" class="flex items-center gap-1 text-amber-700 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {changedWorktree?.path}"
+                    onclick={() => changedWorktree && void repoStore.previewUncommitted(changedWorktree.path)}>
                     <FileDiff size={12} />
                     {dirty.files} uncommitted
-                  </span>
+                  </button>
                 {:else if dirtyCount(row) === 0}
                   <span class="flex items-center gap-1" title="No uncommitted changes">
                     <FileDiff size={12} />
@@ -867,7 +867,7 @@
               {#if row.kind !== "worktree" && row.worktrees.length > 0}
                 <ul class="space-y-1">
                   {#each row.worktrees as binding, i (`${binding.worktree.path}#${i}`)}
-                    <li>
+                    <li class="flex items-center gap-2">
                       <button
                         type="button"
                         class="flex w-full items-center gap-1.5 rounded font-mono text-[10px] text-textMuted hover:text-accent"
@@ -876,15 +876,14 @@
                       >
                         <GitBranch size={11} class="shrink-0" />
                         <span class="truncate">{binding.worktree.branch ?? "(detached)"}</span>
-                        {#if measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0}
-                          <span class="text-amber-500 dark:text-amber-400"
-                            >·{binding.worktree.dirty_files} dirty</span
-                          >
-                        {/if}
                         {#if binding.worktree.is_locked}
                           <span class="text-textMuted">·locked</span>
                         {/if}
                       </button>
+                      {#if measuredDirty(binding.worktree.dirty_files) && binding.worktree.dirty_files > 0}
+                        <button type="button" class="shrink-0 text-[10px] text-amber-600 dark:text-amber-400 hover:underline" title="Preview uncommitted files in {binding.worktree.path}"
+                          onclick={() => void repoStore.previewUncommitted(binding.worktree.path)}>{binding.worktree.dirty_files} dirty</button>
+                      {/if}
                     </li>
                   {/each}
                 </ul>

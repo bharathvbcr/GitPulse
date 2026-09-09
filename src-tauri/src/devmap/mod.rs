@@ -8,6 +8,7 @@
 //! tree-sitter into the app binary.
 
 pub mod cli;
+mod diagnostics;
 pub mod live;
 pub mod repo_map;
 pub mod viz;

@@ -571,7 +571,9 @@ function redactContextualDiagnosticText(value: string): string {
       redactAssignedValue,
     )
     .replace(
-      /([a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s/?#]+@/gi,
+      // Start once per scheme-shaped run, not once per character in a long
+      // log line. Preserve even malformed numeric prefixes before the scheme.
+      /(?<![a-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:)[^@\s/?#]+@/gi,
       "$1<redacted>@",
     )
     .replace(

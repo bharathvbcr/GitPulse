@@ -101,6 +101,26 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad) => void): Pr
   if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("Caller")) throw new Error("Neighbor activation failed");
   setLoad({...explorer,payload:{nodes:fixtureNodes.filter(n=>n.id!=="caller"),links:[]}}); await settle();
   if (document.querySelector('.map-neighbors')) throw new Error("Removed selection retained a stale inspector");
+  const notes: GraphVizLoad = {available:true,kind:"code_graph",path:"/fixture/notes",payload:{nodes:[
+    {id:"code",name:"Code",path:"notes/editor.ts",documentation:false},
+    {id:"note",name:"Note",path:"README.md",documentation:true},
+    {id:"doc",name:"Doc",path:"guide.mdx",documentation:true},
+  ],links:[{source:"code",target:"note"}]}};
+  setLoad(notes); await settle();
+  await click('input[aria-label="Hide notes & Markdown"]');
+  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "1 of 3 match filters") throw new Error("Notes filter did not hide documentation");
+  await click('.map-actions > button');
+  if (document.querySelector('.map-results')?.textContent?.includes("README.md")) throw new Error("Hidden Markdown remained in node browser");
+  await click('.map-results button');
+  if (document.querySelector('.neighbor-list')?.textContent?.includes("Note")) throw new Error("Hidden note remained in connections");
+  setLoad({...notes,payload:{...notes.payload!,nodes:notes.payload!.nodes.map(n=>({...n,documentation:true}))}}); await settle();
+  if (document.querySelector('.map-neighbors')) throw new Error("Refresh retained a newly hidden selection");
+  if (!document.querySelector('.map-empty')?.textContent?.includes("No nodes match")) throw new Error("All-documentation filter left an unexplained blank canvas");
+  await click('.map-filters button');
+  if (document.querySelector('[data-testid="graph-filter-count"]')?.textContent !== "3 of 3 match filters") throw new Error("Clear filters did not restore documents");
+  await click('input[aria-label="Hide notes & Markdown"]');
+  setLoad({...notes,path:"/fixture/notes-other"}); await settle();
+  if (document.querySelector<HTMLInputElement>('input[aria-label="Hide notes & Markdown"]')?.checked) throw new Error("Repository switch retained notes filter");
   setLoad({available: true, kind: "code_graph", payload: JSON.parse('{"nodes":[null,{"id":"a","name":12,"language":{}},{"id":"b","name":"B"},{"id":"bad"},{"id":"bad"}],"links":[null,{"source":"a","target":"b"},{"source":"bad","target":"b"}]}')});
   await settle();
   if (!document.querySelector('[data-testid="code-graph-nodes-label"]')?.textContent?.includes("2 of 5")) {

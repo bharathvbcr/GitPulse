@@ -14,6 +14,10 @@ const source = readFileSync(
 const bar = () => render(StatusBar).body;
 
 describe("StatusBar", () => {
+  it("opens uncommitted files rather than retaining a previous commit diff", () => {
+    const changes = source.slice(source.indexOf("<!-- Working Tree Changes"), source.indexOf("<!-- Conflicts Indicator"));
+    expect(changes).toContain("repoStore.previewUncommitted()");
+  });
   afterEach(() => interfaceStore.setStatusBarMode("full"));
 
   it("renders status bar role and shortcut indicators", () => {

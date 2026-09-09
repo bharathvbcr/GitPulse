@@ -23,13 +23,17 @@ pub mod languages;
 pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
+mod git_metadata;
 pub mod paths;
 pub mod progress;
 pub mod subprocess;
+pub use git_metadata::{git_metadata, GitMetadata};
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
 #[cfg(feature = "parse")]
 pub mod notebook;
+#[cfg(feature = "parse")]
+mod parent_index;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
@@ -381,8 +385,12 @@ fn ignore_rule_bases(
         rel.parent().unwrap_or_else(|| Path::new(""))
     };
 
+    let exclude = git_metadata(&git_root)?.map_or_else(
+        || git_root.join(".git/info/exclude"),
+        |metadata| metadata.common_dir.join("info/exclude"),
+    );
     let mut rules = vec![
-        (git_root.clone(), git_root.join(".git/info/exclude")),
+        (git_root.clone(), exclude),
         (git_root.clone(), git_root.join(".gitignore")),
     ];
     let mut current = git_root;
@@ -456,6 +464,18 @@ fn matches_ignore(
 
 #[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
+    if source.len() as u64 > MAX_SOURCE_BYTES {
+        return treesitter::refused_extraction(
+            path,
+            detect_language(Path::new(path)),
+            source,
+            format!(
+                "source has {} bytes, over the {} byte input limit",
+                source.len(),
+                MAX_SOURCE_BYTES
+            ),
+        );
+    }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the
     // code has to be reconstructed out of the JSON before any grammar sees it,
@@ -487,10 +507,7 @@ pub fn extract_all_with_progress(
         .map(|f| {
             let extraction = extract_file(f.path, f.source);
             if let Some(progress) = progress {
-                progress.finish_file(
-                    false,
-                    matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }),
-                );
+                progress.finish_file(false, extraction.is_parse_failure());
             }
             extraction
         })
@@ -1113,6 +1130,35 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn uncached_progress_does_not_call_data_files_parse_failures() {
+        let files = [
+            FileRef {
+                path: "notes.md",
+                source: "# Notes",
+            },
+            FileRef {
+                path: "data.json",
+                source: "{}",
+            },
+            FileRef {
+                path: "broken.ipynb",
+                source: "not JSON",
+            },
+        ];
+        let progress = progress::FileProgress::default();
+        let extracted = extract_all_with_progress(&files, Some(&progress));
+        assert_eq!(
+            extracted
+                .iter()
+                .filter(|file| file.is_parse_failure())
+                .count(),
+            1
+        );
+        assert_eq!(progress.snapshot().failed, 1);
+        assert_eq!(progress.snapshot().completed, 3);
+    }
+
+    #[test]
     fn extract_tree_skips_non_source_and_finds_py() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1185,5 +1231,30 @@ mod discovery_bound_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "parse"))]
+mod direct_input_bounds {
+    #[test]
+    fn direct_extraction_obeys_the_same_byte_ceiling_as_discovery() {
+        let source = format!(
+            "def oversized_probe():\n    return 1\n#{}",
+            "x".repeat(super::MAX_SOURCE_BYTES as usize)
+        );
+        let extraction = super::extract_file("large.py", &source);
+        assert!(
+            matches!(extraction.parse_outcome, super::model::ParseOutcome::Failed { ref reason } if reason.contains("byte") && reason.contains("limit")),
+            "{:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(
+            extraction.symbols.len(),
+            1,
+            "only the File node survives refusal"
+        );
+        assert!(extraction.calls.is_empty());
+        let at_limit = "#".repeat(super::MAX_SOURCE_BYTES as usize);
+        assert!(!super::extract_file("boundary.py", &at_limit).is_parse_failure());
     }
 }

@@ -169,7 +169,7 @@
     {#if dirtyCount > 0}
       <button
         type="button"
-        onclick={() => repoStore.setActiveTab("history", "diff")}
+        onclick={() => void repoStore.previewUncommitted()}
         class="inline-flex items-center gap-1 text-textMuted hover:text-textPrimary transition-colors"
         title="View {dirtyCount} changed file{dirtyCount === 1 ? '' : 's'} ({stagedCount} staged)"
       >

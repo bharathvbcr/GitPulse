@@ -1926,7 +1926,8 @@ pub async fn cmd_unwatch_repo(
     state: State<'_, WatcherState>,
     repo_path: String,
 ) -> Result<(), String> {
-    unwatch(&state, repo_path)
+    let watcher_state = state.inner().clone();
+    off_thread(move || unwatch(&watcher_state, repo_path)).await
 }
 
 #[tauri::command(async)]

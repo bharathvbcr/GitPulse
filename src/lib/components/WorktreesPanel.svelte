@@ -395,10 +395,12 @@
             <span class="shrink-0 text-[10px] font-mono text-textMuted truncate max-w-[90px]">
               {wt.branch ?? (wt.is_detached ? wt.head.slice(0, 7) : "")}
             </span>
-            {#if (wt.dirty_files ?? 0) > 0}
-              <span class="shrink-0 w-1.5 h-1.5 rounded-full bg-amber-400" title="{wt.dirty_files} uncommitted change(s)"></span>
-            {/if}
           </button>
+          {#if (wt.dirty_files ?? 0) > 0}
+            <button type="button" class="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400 hover:bg-amber-500/10"
+              title="Preview {wt.dirty_files} uncommitted changes in {wt.path}"
+              onclick={() => void repoStore.previewUncommitted(wt.path)}>{wt.dirty_files} changed</button>
+          {/if}
           <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 shrink-0">
             <button
               onclick={() => open(wt)}

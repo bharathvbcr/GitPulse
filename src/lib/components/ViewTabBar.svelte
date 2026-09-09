@@ -125,15 +125,12 @@
           ></span>
         {/if}
         <span>{formatViewTabLabel(item, conflictedCount)}</span>
-        <!-- The uncommitted-file count rode the Diff tab. Diff is a section
-             of History now, and History is where that count is acted on, so
-             the badge follows the content. -->
-        {#if item.id === "history" && $repoStore.statuses.length > 0}
-          <span class="ml-1 px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-amber-500/20 text-amber-600 dark:text-amber-300 font-semibold">
-            {$repoStore.statuses.length}
-          </span>
-        {/if}
       </button>
+      {#if item.id === "history" && $repoStore.statuses.length > 0}
+        <button type="button" class="px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-600 dark:text-amber-300 font-semibold hover:bg-amber-500/30"
+          title="Preview uncommitted files and modifications" aria-label="Preview {$repoStore.statuses.length} uncommitted changes"
+          onclick={() => void repoStore.previewUncommitted()}>{$repoStore.statuses.length}</button>
+      {/if}
     {/each}
   </div>
   </div>

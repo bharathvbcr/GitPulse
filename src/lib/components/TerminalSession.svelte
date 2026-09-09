@@ -79,6 +79,7 @@
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind } from "../terminal/tabs";
+  import { agentPromptArgs } from "../terminal/launchRequests";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import {
@@ -105,6 +106,7 @@
     repoPath,
     tabId,
     launcher,
+    initialPrompt,
     active,
     onTitle,
     onChord,
@@ -114,6 +116,7 @@
     repoPath: string;
     tabId: string;
     launcher: LauncherKind;
+    initialPrompt?: string;
     active: boolean;
     onTitle: (title: string) => void;
     onStatus?: (status: string) => void;
@@ -248,7 +251,8 @@
     // A bare name, resolved backend-side against the same PATH repair every
     // other GitPulse spawn uses — a GUI-launched app's own PATH does not
     // contain the directories these CLIs install into.
-    return kind === "shell" ? {} : { program: kind, args: [] };
+    const args = agentPromptArgs(kind, initialPrompt);
+    return kind === "shell" ? {} : { program: kind, args: args ?? [] };
   }
 
   function createLifecycle() {

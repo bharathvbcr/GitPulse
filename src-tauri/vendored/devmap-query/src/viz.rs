@@ -20,6 +20,49 @@
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
+/// Visibility classification shared by file/symbol and subsystem payloads.
+/// Directory names alone do not make source code into a note.
+pub(crate) fn is_documentation(node: &Value) -> bool {
+    let kind = node["kind"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let language = node["language"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        kind.as_str(),
+        "doc" | "document" | "documentation" | "note" | "notes"
+    ) || matches!(
+        language.as_str(),
+        "markdown" | "md" | "mdx" | "rst" | "restructuredtext" | "asciidoc"
+    ) {
+        return true;
+    }
+    let path = node["path"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .or_else(|| node["id"].as_str())
+        .unwrap_or("");
+    let path = path
+        .split("::")
+        .next()
+        .unwrap_or(path)
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let name = path.rsplit('/').next().unwrap_or("");
+    matches!(name, "notes" | "notes.txt" | "note.txt")
+        || matches!(
+            name.rsplit_once('.').map(|(_, ext)| ext),
+            Some(
+                "md" | "mdx" | "markdown" | "mdown" | "mkd" | "mkdn" | "rst" | "adoc" | "asciidoc"
+            )
+        )
+}
+
 /// The vendored renderer, embedded so the page works offline and from a file://
 /// URL. force-graph v1.51.4, MIT (<https://github.com/vasturiano/force-graph>).
 ///
@@ -312,6 +355,7 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
                 "area": node.get("area").and_then(Value::as_str).unwrap_or(""),
                 "community": node.get("community").and_then(Value::as_str).unwrap_or(""),
                 "language": node.get("language").and_then(Value::as_str).unwrap_or(""),
+                "documentation": is_documentation(node),
                 "line": node.get("line").and_then(Value::as_u64).unwrap_or(0),
                 "degree": degree.get(id).copied().unwrap_or(0),
                 "flags": flags,
@@ -498,7 +542,9 @@ label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:va
   <div id="controls">
     <input id="q" type="search" placeholder="Filter by name or path…" autocomplete="off"/>
     <div id="flagFilters"></div>
+    <label class="row" title="Hide document and note nodes and their relationships"><input type="checkbox" id="hideNotes"/> Hide notes &amp; Markdown</label>
     <label class="row"><input type="checkbox" id="labels" checked/> Show labels</label>
+    <div class="sub" id="filterCount" role="status"></div>
   </div>
   <div id="legend"></div>
   <div id="notes"></div>
@@ -573,7 +619,7 @@ if (!DATA.nodes.length) {{
     .linkDirectionalArrowLength(2.5)
     .linkDirectionalArrowRelPos(1)
     .onNodeClick(showDetail)
-    .graphData(source);
+    .graphData(JSON.parse(JSON.stringify(source)));
 
   graph.nodeCanvasObjectMode(() => showLabels ? 'after' : undefined)
     .nodeCanvasObject((n, ctx, scale) => {{
@@ -658,6 +704,7 @@ if (!DATA.nodes.length) {{
     clearTimeout(filterFitTimer);
     filterFitTimer = undefined;
     const term = document.getElementById('q').value.trim().toLowerCase();
+    const hideNotes = document.getElementById('hideNotes').checked;
     const required = (VIEW.flag_filters || [])
       .filter(([flag]) => {{
         const box = document.getElementById('flag-' + flag);
@@ -665,6 +712,7 @@ if (!DATA.nodes.length) {{
       }})
       .map(([flag]) => flag);
     const keep = source.nodes.filter(n => {{
+      if (hideNotes && n.documentation === true) return false;
       const f = flagsOf(n);
       if (required.some(r => !f.includes(r))) return false;
       if (!term) return true;
@@ -672,6 +720,8 @@ if (!DATA.nodes.length) {{
     }});
     const ids = new Set(keep.map(n => n.id));
     noMatch.hidden = keep.length > 0;
+    document.getElementById('filterCount').textContent = keep.length + ' of ' + source.nodes.length + ' match filters';
+    detail.innerHTML = '<span class="sub">Click a node for detail.</span>';
     graph.graphData({{
       nodes: JSON.parse(JSON.stringify(keep)),
       links: source.links
@@ -690,6 +740,7 @@ if (!DATA.nodes.length) {{
     }}
   }}
   document.getElementById('q').addEventListener('input', apply);
+  document.getElementById('hideNotes').addEventListener('change', apply);
   for (const [flag, label] of (VIEW.flag_filters || [])) {{
     const wrap = document.createElement('label');
     wrap.className = 'row';

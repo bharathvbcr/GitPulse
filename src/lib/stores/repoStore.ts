@@ -1809,10 +1809,44 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         publish();
       }
     },
+    /** All uncommitted-change entry points share the existing file/diff view. */
+    previewUncommitted: async (repoPath?: string, isStaged?: boolean): Promise<void> => {
+      const session = activeSession();
+      const target = repoPath ?? session?.path;
+      if (!target) return;
+      if (!session || !sameRepo(session.path, target, options) || session.isLoading || session.error) {
+        let preview: Promise<void> | undefined;
+        await store.openRepo(target, {
+          onReady: () => { preview = store.previewUncommitted(undefined, isStaged); },
+        });
+        await preview;
+        return;
+      }
+      const file = session.statuses.find(status => isStaged === undefined || status.is_staged === isStaged)
+        ?? session.statuses[0];
+      openEpoch += 1;
+      // Invalidate late commit/range reads even when this worktree became clean.
+      selectionGeneration.next();
+      applyToSession(session.id, session.generation, {
+        selectedFilePath: file?.path ?? null,
+        selectedCommitId: null,
+        selectedDiff: null,
+        selectedDiffTruncated: false,
+        selectedDiffTruncationReason: null,
+        selectedDiffPending: Boolean(file),
+        selectedIsStaged: file?.is_staged ?? false,
+        selectionKind: "file",
+        activeTab: "history",
+        viewSections: { ...session.viewSections, history: "diff" },
+      });
+      interfaceStore.setFleetOpen(false);
+      if (file) await store.selectFileDiff(file.path, file.is_staged);
+    },
     selectFileDiff: async (filePath: string, isStaged: boolean = false) => {
       const session = activeSession();
       if (!session) return;
       const generation = session.generation;
+      const navigationEpoch = openEpoch;
       // The whitespace preference lives on the session, not on call sites:
       // every refetch of this diff must carry whatever the user last chose.
       const ignoreWhitespace = session.selectedIgnoreWhitespace;
@@ -1841,8 +1875,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedIgnoreWhitespace: ignoreWhitespace,
           selectedDiffPending: false,
           selectionKind: "file",
-          activeTab: "history",
-          viewSections: { ...current.viewSections, history: "diff" },
+          ...(navigationEpoch === openEpoch ? {
+            activeTab: "history" as const,
+            viewSections: { ...current.viewSections, history: "diff" },
+          } : {}),
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;

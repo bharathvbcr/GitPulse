@@ -34,6 +34,7 @@
     cmd_get_file_coverage: () => ({path:"A.md",lines:[],functions:[],branches:[]}),
     cmd_devmap_repo_map: () => ({available:false,reason:"Harness: map not indexed",map:null,path:null}),
     cmd_devmap_status: () => ({available:true,reason:null,status:null}),
+    cmd_external_tools_status: () => ({devmap:{tool:"devmap",installed:false,path:null,lookup:"missing",version:null,reason:"Harness: DevMap missing",source_checkout:null,install_ready:false,install_block:"Harness does not install tools",install_command:""}}),
     cmd_devmap_refresh: () => ({ok:false,binary:"/fixture/devmap",lookup:"test_override",stdout:"",stderr:"BUILD-FAILURE-DETAIL",exit_code:1,timed_out:false}),
     cmd_set_recent_menu: () => null,
     cmd_branch_stats: () => ({updates:[],capped:false,compute_failures:0,compared_to:"main"}),
@@ -103,6 +104,42 @@
     const click = async name => {const button=[...target.querySelectorAll("button")].find(b=>b.textContent.trim()===name);if(!button)throw Error(`Missing button ${name}`);button.click();await settle();};
     await click("Refresh");
     check("build failure remains visible after status reload",target.textContent.includes("BUILD-FAILURE-DETAIL"));
+    const copiedLogs = [];
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const originalExecCommand = document.execCommand;
+    try {
+      Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copiedLogs.push(text);}}});
+      fixture.cmd_diagnostic_log_tail = () => ["now INFO [devmap] native build failure", "now INFO [git] unrelated git log"];
+      await click("Copy DevMap logs");
+      check("map copies native logs and retained failure context",copiedLogs.at(-1)?.includes("native build failure")&&copiedLogs.at(-1)?.includes("BUILD-FAILURE-DETAIL")&&!copiedLogs.at(-1)?.includes("unrelated git log")&&target.textContent.includes("DevMap logs copied."));
+      fixture.cmd_devmap_refresh = a => defer("build",a);
+      await click("Refresh");
+      const building = take("build");
+      await click("Copy DevMap logs");
+      check("map logs remain copyable during a running build",copiedLogs.at(-1)?.includes('"building": true'));
+      building.resolve({ok:false,binary:"/fixture/devmap",lookup:"test_override",stdout:"",stderr:"BUILD-FAILURE-DETAIL",exit_code:1,timed_out:false});await settle();
+      Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async()=>{throw Error("clipboard denied");}}});
+      document.execCommand=()=>false;
+      await click("Copy DevMap logs");
+      check("clipboard denial is visible without claiming success",target.textContent.includes("Could not copy DevMap logs.")&&!target.textContent.includes("DevMap logs copied."));
+      Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{copiedLogs.push(text);}}});
+      fixture.cmd_diagnostic_log_tail = a => defer("copy-log",a);
+      await click("Copy DevMap logs");
+      const staleCopy = take("copy-log"), copiedBefore = copiedLogs.length;
+      host.show("markdown");await settle();
+      staleCopy.resolve(["now INFO [devmap] stale copy"]);await settle();
+      check("leaving map while logs load does not change clipboard",copiedLogs.length===copiedBefore);
+      fixture.cmd_devmap_status=()=>({available:false,reason:"DevMap missing",status:null});
+      fixture.cmd_diagnostic_log_tail=()=>[];
+      host.show("map");await settle();
+      await click("Copy DevMap logs");
+      check("map logs remain copyable when DevMap is unavailable",copiedLogs.at(-1)?.includes("DevMap missing"));
+    } finally {
+      if(clipboardDescriptor)Object.defineProperty(navigator,"clipboard",clipboardDescriptor);else delete navigator.clipboard;
+      document.execCommand=originalExecCommand;
+      fixture.cmd_devmap_status=()=>({available:true,reason:null,status:null});
+      fixture.cmd_diagnostic_log_tail=()=>[];
+    }
     await click("Docs");
     check("250 repeated broken links show the honest 200-row cap",target.querySelectorAll("li").length===200 && target.textContent.includes("250"),target.textContent.slice(-150));
     const priorLoads=calls.get("cmd_devmap_repo_map");

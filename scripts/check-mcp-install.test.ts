@@ -9,6 +9,7 @@ import {
   classify,
   parseArgs,
   parseServerVersion,
+  parseServerManifest,
   probeServer,
   resolveOnPath,
 } from "./check-mcp-install.mjs";
@@ -35,6 +36,25 @@ async function fakeServer(prefix: string, body: string) {
   await writeFile(file, `#!/usr/bin/env node\n${body}\n`);
   await chmod(file, 0o755);
   return file;
+}
+
+async function identityServer(prefix: string, schema: number) {
+  return fakeServer(prefix, `
+    let input = "";
+    process.stdin.on("data", chunk => {
+      input += chunk;
+      let end;
+      while ((end = input.indexOf("\\n")) >= 0) {
+        const request = JSON.parse(input.slice(0, end));
+        input = input.slice(end + 1);
+        if (request.id === 1) {
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "fake", version: "1.2.3" } } }) + "\\n");
+        } else if (request.id === 2 && request.method === "resources/read") {
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType: "application/json", text: JSON.stringify({ storeSchemaVersion: ${schema} }) }] } }) + "\\n");
+        }
+      }
+    });
+  `);
 }
 
 describe("resolveOnPath", () => {
@@ -107,28 +127,63 @@ describe("parseServerVersion", () => {
 
 describe("classify", () => {
   const expected = "0.0.5";
+  const identity = { storeSchema: 20, expectedSchema: 20 };
 
-  it("reports ok only when the reported version matches", () => {
-    expect(classify({ binPath: "/x/gitpulse-mcp", version: "0.0.5", error: null, expected }).status).toBe("ok");
+  it("rejects an older embedded schema even when the application version matches", () => {
+    const observed = { binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, storeSchema: 19, expectedSchema: 20 };
+    expect(classify(observed).status).toBe("stale");
+  });
+
+  it("does not approve a schema check that the server could not answer", () => {
+    const observed = { binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, storeSchema: null, expectedSchema: 20 };
+    expect(classify(observed).status).not.toBe("ok");
+  });
+
+  it("reports ok when both version and schema match", () => {
+    expect(classify({ binPath: "/x/gitpulse-mcp", version: "0.0.5", error: null, expected, ...identity }).status).toBe("ok");
   });
 
   it("separates absent from ok — the collapse this check exists to prevent", () => {
-    const absent = classify({ binPath: null, version: null, error: null, expected });
+    const absent = classify({ binPath: null, version: null, error: null, expected, ...identity });
     expect(absent.status).toBe("absent");
     expect(absent.violations.join(" ")).toContain("no gitpulse-mcp on PATH");
   });
 
   it("names both versions when the installed server is stale", () => {
-    const stale = classify({ binPath: "/x/gitpulse-mcp", version: "0.0.4", error: null, expected });
+    const stale = classify({ binPath: "/x/gitpulse-mcp", version: "0.0.4", error: null, expected, ...identity });
     expect(stale.status).toBe("stale");
     expect(stale.violations.join(" ")).toContain('"0.0.4"');
     expect(stale.violations.join(" ")).toContain('"0.0.5"');
   });
 
   it("distinguishes a server that never answered from one that answered wrong", () => {
-    const dead = classify({ binPath: "/x/gitpulse-mcp", version: null, error: "boom", expected });
+    const dead = classify({ binPath: "/x/gitpulse-mcp", version: null, error: "boom", expected, ...identity });
     expect(dead.status).toBe("unresponsive");
     expect(dead.violations.join(" ")).toContain("boom");
+  });
+});
+
+describe("parseServerManifest", () => {
+  function response(schema: unknown, mimeType = "application/json", id = 2) {
+    return JSON.stringify({ jsonrpc: "2.0", id, result: { contents: [{ uri: "gitpulse://server/manifest", mimeType, text: JSON.stringify({ storeSchemaVersion: schema }) }] } });
+  }
+
+  it("requires the requested resource and response id", () => {
+    expect(parseServerManifest(response(20), 2)).toEqual({ storeSchema: 20, error: null });
+    expect(parseServerManifest(response(20, "application/json", 3), 2)).toBeNull();
+    expect(parseServerManifest(response(20).replace("server/manifest", "server/health"), 2)?.storeSchema).toBeNull();
+  });
+
+  it.each([null, "20", 0, -1, 0.5, true, [], {}, Number.MAX_SAFE_INTEGER + 1])("refuses invalid schema %j", schema => {
+    const result = parseServerManifest(response(schema), 2);
+    expect(result?.storeSchema).toBeNull();
+    expect(result?.error).toBeTruthy();
+  });
+
+  it("distinguishes missing replies, failed replies, and truncated content", () => {
+    expect(parseServerManifest("{partial", 2)).toBeNull();
+    expect(parseServerManifest(JSON.stringify({ id: 2, error: { code: -32601 } }), 2)?.error).toBeTruthy();
+    expect(parseServerManifest(response(20, "text/plain"), 2)?.error).toMatch(/truncated/);
   });
 });
 
@@ -142,15 +197,22 @@ describe("classify", () => {
 const onPosix = it.runIf(process.platform !== "win32");
 
 describe("probeServer", () => {
-  onPosix("reads the version from a server that completes the handshake", async () => {
-    const server = await fakeServer(
-      "ok",
-      `process.stdin.once("data", () => {
-         process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "fake", version: "1.2.3" } } }) + "\\n");
-       });`,
-    );
+  onPosix("reads version and schema through the handshake and manifest", async () => {
+    const server = await identityServer("ok", 20);
     const result = await probeServer(server, 8000);
-    expect(result).toEqual({ version: "1.2.3", error: null });
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 20, error: null });
+  });
+
+  onPosix("observes an older schema instead of inferring it from the version", async () => {
+    const result = await probeServer(await identityServer("older", 19), 8000);
+    expect(result).toEqual({ version: "1.2.3", storeSchema: 19, error: null });
+  });
+
+  onPosix("bounds a server that floods stdout without a response", async () => {
+    const server = await fakeServer("flood", `process.stdout.write("x".repeat(2_000_000)); setInterval(() => {}, 1000);`);
+    const result = await probeServer(server, 8000);
+    expect(result.storeSchema).toBeNull();
+    expect(result.error).toMatch(/exceeded .* bytes/);
   });
 
   onPosix("times out on a server that accepts input and never answers", async () => {

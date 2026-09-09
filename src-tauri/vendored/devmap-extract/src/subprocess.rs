@@ -188,6 +188,44 @@ pub fn git_with_program(program: &OsStr, root: &Path) -> Command {
     command
 }
 
+/// Linux can briefly retain a writer inherited by another concurrent fork
+/// until that process execs. Retry only this pre-exec refusal: no child has
+/// started, and a successful spawn must never be repeated. Persistent writers
+/// stop after eight attempts; the original request deadline also bounds retries.
+fn spawn_with_retry(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
+    program: &str,
+    started: Instant,
+    deadline: Duration,
+) -> Result<std::process::Child, Failure> {
+    const MAX_ATTEMPTS: usize = 8;
+    const RETRY_DELAY: Duration = Duration::from_millis(10);
+    for attempt in 1..=MAX_ATTEMPTS {
+        if started.elapsed() >= deadline {
+            return Err(Failure::Deadline {
+                program: program.to_owned(),
+                deadline,
+            });
+        }
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < MAX_ATTEMPTS =>
+            {
+                thread::sleep(RETRY_DELAY.min(deadline.saturating_sub(started.elapsed())));
+            }
+            Err(error) => {
+                return Err(Failure::Spawn {
+                    program: program.to_owned(),
+                    error,
+                })
+            }
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
 /// Run `command` to completion within `bounds`.
 ///
 /// `stdin`, `stdout` and `stderr` are set here; anything the caller configured
@@ -209,10 +247,7 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|error| Failure::Spawn {
-        program: program.clone(),
-        error,
-    })?;
+    let mut child = spawn_with_retry(|| command.spawn(), &program, started, bounds.deadline)?;
 
     // Both pipes are taken before anything waits: a reader that starts after
     // the child has filled its buffer starts too late.
@@ -404,6 +439,86 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn a_transient_executable_writer_retries_without_duplicating_a_child() {
+        let mut attempts = 0;
+        let mut child = spawn_with_retry(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(ErrorKind::ExecutableFileBusy))
+                } else {
+                    Command::new(std::env::current_exe().unwrap())
+                        .arg("--list")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                }
+            },
+            "fixture",
+            Instant::now(),
+            Duration::from_secs(5),
+        )
+        .expect("transient writer must clear");
+        assert!(child.wait().unwrap().success());
+        assert_eq!(attempts, 3, "success must end retries immediately");
+    }
+
+    #[test]
+    fn a_persistent_executable_writer_has_a_finite_retry_budget() {
+        let mut attempts = 0;
+        let failure = spawn_with_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(ErrorKind::ExecutableFileBusy))
+            },
+            "fixture",
+            Instant::now(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(failure, Failure::Spawn { .. }));
+        assert_eq!(attempts, 8);
+    }
+
+    #[test]
+    fn executable_retries_do_not_reset_the_overall_deadline() {
+        let started = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let mut attempts = 0;
+        let failure = spawn_with_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(ErrorKind::ExecutableFileBusy))
+            },
+            "fixture",
+            started,
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(matches!(failure, Failure::Deadline { .. }));
+        assert_eq!(attempts, 0, "an expired request must not execute");
+    }
+
+    #[test]
+    fn an_ordinary_spawn_error_is_never_retried() {
+        let mut attempts = 0;
+        let failure = spawn_with_retry(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            },
+            "fixture",
+            Instant::now(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure, Failure::Spawn { error, .. } if error.kind() == ErrorKind::PermissionDenied)
+        );
+        assert_eq!(attempts, 1);
+    }
 
     /// A reader that returns a scripted sequence, so `drain`'s error handling
     /// can be exercised without arranging a signal.

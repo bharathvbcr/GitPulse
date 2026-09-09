@@ -51,6 +51,7 @@
   let showLabels = $state(true);
   let selectedLanguage = $state<LanguageIconKey | null>(null);
   let hideTests = $state(false), hideGenerated = $state(false), connectedOnly = $state(false);
+  let hideNotes = $state(false);
   let showNodeList = $state(false);
   let page = $state(0), connectionPage = $state(0);
   let communityPage = $state(0);
@@ -83,7 +84,7 @@
   const index = $derived(buildGraphIndex(model));
   const selectedNode = $derived(selectedId ? index.nodes.get(selectedId) ?? null : null);
 
-  const matches = $derived(filterGraphNodes(model, index, {query, community:activeCommunity, language:selectedLanguage, hideTests, hideGenerated, connectedOnly}));
+  const matches = $derived(filterGraphNodes(model, index, {query, community:activeCommunity, language:selectedLanguage, hideTests, hideGenerated, hideNotes, connectedOnly}));
   const visibleIds = $derived(new Set(matches.map(n => n.id)));
   const inspectedNode = $derived(selectedNode ?? (hoveredId ? index.nodes.get(hoveredId) ?? null : null));
   const openPath = $derived(inspectedNode ? graphNodeOpenPath(inspectedNode) : null);
@@ -293,7 +294,7 @@
 
   function clearFilters() {
     query = ""; activeCommunity = null; selectedLanguage = null;
-    hideTests = false; hideGenerated = false; connectedOnly = false;
+    hideTests = false; hideGenerated = false; hideNotes = false; connectedOnly = false;
     filtersChanged();
   }
 
@@ -313,8 +314,8 @@
           panX += (oldNode.x - newNode.x) * scale;
           panY += (oldNode.y - newNode.y) * scale;
         }
-        if (!newNode) selectedId = null;
-        if (!nextModel.nodes.some(n => n.id === hoveredId)) hoveredId = null;
+        if (!newNode || !visibleIds.has(newNode.id)) selectedId = null;
+        if (hoveredId && !visibleIds.has(hoveredId)) hoveredId = null;
         if (!nextModel.communities.some(c => c.name === activeCommunity)) activeCommunity = null;
       }
       previousScope = nextScope;
@@ -410,8 +411,9 @@
     <label title="Identified by conventional test directory and filename patterns"><input type="checkbox" bind:checked={hideTests} onchange={filtersChanged}/> Hide tests</label>
     <label title="Identified by conventional generated, build, and vendor paths"><input type="checkbox" bind:checked={hideGenerated} onchange={filtersChanged}/> Hide generated/vendor</label>
     <label title="Keep nodes with relationships in the loaded graph"><input type="checkbox" bind:checked={connectedOnly} onchange={filtersChanged}/> Connected only</label>
+    <label title="Hide document and note nodes, or subsystems made entirely of documentation"><input type="checkbox" aria-label="Hide notes & Markdown" bind:checked={hideNotes} onchange={filtersChanged}/> Hide notes &amp; Markdown</label>
     <span role="status" data-testid="graph-filter-count">{matches.length} of {model.nodes.length} match filters</span>
-    {#if query || activeCommunity || selectedLanguage || hideTests || hideGenerated || connectedOnly}<button type="button" onclick={clearFilters}>Clear filters</button>{/if}
+    {#if query || activeCommunity || selectedLanguage || hideTests || hideGenerated || hideNotes || connectedOnly}<button type="button" onclick={clearFilters}>Clear filters</button>{/if}
   </div>
 
   <div class="map-stage flex-1 min-h-0 relative" bind:this={hostEl}>
@@ -472,6 +474,8 @@
 
     {#if !loading && load?.available && model.nodes.length === 0}
       <div class="map-empty"><strong>No nodes to display</strong><span>This graph payload is empty.</span></div>
+    {:else if !loading && load?.available && matches.length === 0}
+      <div class="map-empty"><strong>No nodes match the current filters</strong><span>Clear filters to show all loaded nodes.</span></div>
     {/if}
 
     <div class="map-zoom" aria-label="Graph view controls">

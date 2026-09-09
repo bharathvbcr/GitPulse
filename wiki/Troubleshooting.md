@@ -41,6 +41,21 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 DevMap answers from `.devcouncil/codeintel/devmap.sqlite` (store schema **19**). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
+Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
+lookup, build/background-refresh state, visible errors, and recent DevMap entries
+from GitPulse's session and durable logs. Copy remains available during a build
+and when DevMap is missing. Log-read failures and timeouts are included in the
+report, and clipboard failures are shown in the panel.
+
+Native entries include timestamps, `run_id`, repository, binary, effective
+arguments, deadline, elapsed time, exit status, stderr and selected report
+diagnostics. Only stage numbers are recorded live; full captured stderr is
+redacted together when the command ends, including an explicitly incomplete
+prefix on timeout. Preview source and successful query payloads are excluded.
+The report samples the last 500 backend entries from each log across repositories;
+match the repository on the start entry and its `run_id`. Older entries may have
+rotated out. Each copied section is capped at 64 Ki characters and says when cut.
+
 ## Terminal vanished after switching views
 
 The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switching **repositories** does. Fleet hides the repo pane without unmounting it so PTYs survive Fleet.

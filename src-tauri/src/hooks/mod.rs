@@ -748,8 +748,16 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
     out.push_str(&format!(
         "code graph: {}\n",
         if snapshot.codeintel.available {
+            let freshness = match snapshot.codeintel.is_fresh {
+                Some(true) => "fresh at status check".to_string(),
+                Some(false) => format!(
+                    "freshness not established ({})",
+                    or_unknown(snapshot.codeintel.freshness_reason.as_deref().unwrap_or(""))
+                ),
+                None => "freshness UNVERIFIED".to_string(),
+            };
             format!(
-                "{} symbols across {} files",
+                "{} symbols across {} files; {freshness}",
                 snapshot.codeintel.total_symbols.unwrap_or(0),
                 snapshot.codeintel.total_files.unwrap_or(0)
             )
@@ -1058,6 +1066,9 @@ mod tests {
             },
             codeintel: CodeintelStatus {
                 available: true,
+                is_fresh: Some(true),
+                freshness_reason: None,
+                pending_count: Some(0),
                 db_path: "/repo/.devcouncil/codeintel/devmap.sqlite".to_string(),
                 generation_id: Some(7),
                 total_files: Some(400),
@@ -1555,6 +1566,26 @@ mod tests {
         assert!(brief.contains("collisions: 1 file(s)"));
         assert!(brief.contains("ledger: recording"));
         assert!(brief.contains("11294 symbols"));
+    }
+
+    #[test]
+    fn the_brief_distinguishes_stale_and_unverified_navigation() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.codeintel.is_fresh = Some(false);
+        snapshot.codeintel.freshness_reason = Some("source tree differs".into());
+        let brief = session_brief(&snapshot, "/repo", "startup");
+        assert!(
+            brief.contains("freshness not established (source tree differs)"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("11294 symbols"),
+            "stale navigation is still usable"
+        );
+        snapshot.codeintel.is_fresh = None;
+        snapshot.codeintel.freshness_reason = None;
+        let brief = session_brief(&snapshot, "/repo", "startup");
+        assert!(brief.contains("freshness UNVERIFIED"), "{brief}");
     }
 
     #[test]

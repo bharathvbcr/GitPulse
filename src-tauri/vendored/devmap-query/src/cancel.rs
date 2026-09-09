@@ -54,9 +54,17 @@ impl std::error::Error for QueryCancelled {}
 /// what every non-IPC caller (the CLI, tests) wants: `Cancel::default()` costs
 /// one allocation and one relaxed load per check.
 #[derive(Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+pub struct Cancel(
+    Arc<AtomicBool>,
+    #[cfg(test)] Option<Arc<dyn Fn() + Send + Sync>>,
+);
 
 impl Cancel {
+    #[cfg(test)]
+    pub(crate) fn with_check_probe(mut self, probe: impl Fn() + Send + Sync + 'static) -> Self {
+        self.1 = Some(Arc::new(probe));
+        self
+    }
     /// Iterations between consultations of the flag inside a loop.
     ///
     /// A relaxed atomic load is cheap but not free, and the loops this guards
@@ -84,6 +92,10 @@ impl Cancel {
     /// counts work that actually stopped rather than requests that were
     /// answered with a timeout.
     pub fn check(&self) -> Result<(), QueryCancelled> {
+        #[cfg(test)]
+        if let Some(probe) = &self.1 {
+            probe();
+        }
         if self.is_cancelled() {
             ABANDONED.fetch_add(1, Ordering::Relaxed);
             return Err(QueryCancelled);

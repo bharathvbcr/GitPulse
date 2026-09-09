@@ -52,12 +52,37 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         let mut file = fs::File::create(&tmp)?;
         file.write_all(content)?;
         file.sync_all()?;
+        drop(file);
         if path.exists() {
             let existing = fs::read(path)?;
             if existing == content {
                 return Ok(false);
             }
         }
+        // Windows can transiently deny replacement while another publisher is
+        // completing its rename. Retry only that sharing/permission class,
+        // within both a deadline and an attempt cap; leave the old file intact.
+        #[cfg(windows)]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut attempts = 0;
+            loop {
+                match fs::rename(&tmp, path) {
+                    Ok(()) => break,
+                    Err(error)
+                        if (error.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(error.raw_os_error(), Some(32 | 33)))
+                            && attempts < 100
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        #[cfg(not(windows))]
         fs::rename(&tmp, path)?;
         Ok(true)
     })();
@@ -118,6 +143,10 @@ pub struct ArtifactRecord {
     /// the same reason `freshness::stat_key` carries it.
     #[serde(default = "unknown_ctime")]
     pub ctime_ns: i128,
+    /// Content identity when the platform has no non-restorable change clock.
+    /// Old records without either form of evidence cannot authorize a skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<u64>,
 }
 
 /// A stamp written before `ctime_ns` existed has no value for it. `-1` is the
@@ -131,13 +160,32 @@ fn unknown_ctime() -> i128 {
 impl ArtifactRecord {
     fn of(role: &str, path: &Path) -> std::io::Result<Self> {
         let meta = fs::metadata(path)?;
+        let change_time = ctime_ns(&meta);
+        let content_hash = if change_time < 0 {
+            use std::io::Read;
+            let limit = crate::host::DEFAULT_ARTIFACT_BYTES;
+            let mut content = String::new();
+            fs::File::open(path)?
+                .take(limit + 1)
+                .read_to_string(&mut content)?;
+            if content.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "artifact exceeds the bounded fingerprint read limit",
+                ));
+            }
+            Some(devmap_extract::content_hash(&content))
+        } else {
+            None
+        };
         Ok(Self {
             role: role.to_string(),
             path: path.to_string_lossy().into_owned(),
             len: meta.len(),
             mtime_ns: mtime_ns(&meta),
             ino: ino_of(&meta),
-            ctime_ns: ctime_ns(&meta),
+            ctime_ns: change_time,
+            content_hash,
         })
     }
 
@@ -152,6 +200,9 @@ impl ArtifactRecord {
     /// file is gone" and "the file is the one we wrote" are the two answers this
     /// may never conflate.
     pub fn still_describes_disk(&self) -> bool {
+        if self.ctime_ns < 0 && self.content_hash.is_none() {
+            return false;
+        }
         ArtifactRecord::of(&self.role, Path::new(&self.path)).is_ok_and(|current| &current == self)
     }
 }
@@ -181,8 +232,8 @@ fn ctime_ns(meta: &fs::Metadata) -> i128 {
     meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128
 }
 
-/// No `st_ctime` off unix. `-1` costs a regeneration on every run there and
-/// never a wrong skip, which is the trade the whole sidecar is built on.
+/// No portable non-restorable change clock off Unix. Records hash bounded
+/// content there instead of treating two unknown clocks as evidence of equality.
 #[cfg(not(unix))]
 fn ctime_ns(_meta: &fs::Metadata) -> i128 {
     -1

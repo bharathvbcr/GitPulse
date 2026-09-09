@@ -213,6 +213,7 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
         "manifest" => Ok(json!({
             "name": super::SERVER_NAME,
             "version": super::server_version(),
+            "storeSchemaVersion": crate::codeintel::SUPPORTED_STORE_SCHEMA,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             "readOnly": true,
@@ -489,6 +490,10 @@ mod tests {
             super::super::tools().len()
         );
         assert_eq!(parsed["readOnly"], true);
+        assert_eq!(
+            parsed["storeSchemaVersion"],
+            crate::codeintel::SUPPORTED_STORE_SCHEMA
+        );
     }
 
     #[test]

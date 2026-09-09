@@ -46,6 +46,17 @@ describe("terminal tab model", () => {
     expect(state.tabs[1].launcher).toBe("claude");
   });
 
+  it("keeps the initial prompt on its own agent tab across selection and title changes", () => {
+    const shell = initialState();
+    const opened = openTab(shell, "codex", "Generate coverage\nfor this checkout");
+    const agent = opened.tabs[1];
+    const renamed = setTabTitle(opened, agent.id, "Working");
+    const selected = activateTab(renamed, shell.activeId!);
+    expect(selected.tabs[1].initialPrompt).toBe("Generate coverage\nfor this checkout");
+    expect(selected.tabs[0].initialPrompt).toBeUndefined();
+    expect(shell.tabs).toHaveLength(1);
+  });
+
   it("refuses to open past the backend's session ceiling", () => {
     let state = initialState();
     while (canOpenTab(state)) state = openTab(state, "shell");

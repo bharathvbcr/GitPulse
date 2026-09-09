@@ -239,8 +239,8 @@ for contracts, regression evidence and platform verification limits.
   - `health.rs`: Ecosystem vulnerability checkers (`npm audit`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, GitHub Code Scanning).
 - **`storage/`**: Deep disk-usage auditor (packfiles, loose objects, reflogs, LFS, submodules, caches, oversized files) with time-series history tracking.
 - **`ops.rs`**: Safe, read-only MANVI operation planners for merged branch cleanups, outgoing commit review, and release publishing.
-- **`codeintel/`**: In-process DevMap queries against schema-19 stores (search, impact, layered impact, neighbors, explore, affected tests, clones, dead symbols) with `walk_incomplete` / rung honesty. Schema handshake surfaces readable mismatch reasons.
-- **`devmap/`**: CLI driver for build / refresh / status / preview, repo-map JSON reader, viz payloads, and watcher-gated live refresh (single build per repo).
+- **`codeintel/`**: In-process DevMap queries against schema-20 stores bound to the requested worktree (search, impact, layered impact, neighbors, explore, affected tests, clones, dead symbols) with `walk_incomplete`, rung, and freshness metadata. A readable stale snapshot remains navigable; `source_freshness: null` explicitly means a query did not verify the current tree. Status preserves the store's freshness verdict and reason. Failed or degraded freshness checks prevent affected-test selection from being treated as complete. The parser-free embedder cannot certify compiled grammar identity; that limitation is reported, not inferred away. Schema handshake surfaces readable mismatch reasons.
+- **`devmap/`**: CLI driver for build / refresh / status / preview, repo-map JSON reader, viz payloads, and watcher-gated live refresh (single build per repo). The live-index scheduler retains dirty events during a manual build and retries at the existing one-second minimum spacing, up to 30 retries; exhaustion reports failure. Hidden/inactive repositories retain pending work until eligible, and closed repositories discard it.
 - **`markdown/`** + **`syntax/`**: MarkDev flat-model parse/render and tree-sitter highlight spans for the six MarkDev languages.
 - **`docs/`**: Repo markdown vault from `git ls-files`, search / broken links / backlinks / doc graph, and link-preserving rename (`git mv` + staged rewrites).
 - **`workspace_registry`**: Registers open tabs into DevMap's workspace for cross-repo `::` search.
@@ -292,9 +292,9 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `npm run check:ipc` | Verifies all 187 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 881 data fields, in 50 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 886 data fields, in 50 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
-| **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts the version it reports is this tree's. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
+| **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree. Missing schema identity is unresponsive, never a pass. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 
 ---
 

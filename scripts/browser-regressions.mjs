@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "conflicts", "uncommitted", "coverage"]);
 
 /** A missing/partial verdict is a failure, even when Chrome exits normally.
  * @param {string} html
@@ -32,7 +33,7 @@ async function main() {
   const webkit = process.argv.includes("--webkit");
   const harnessIndex = process.argv.indexOf("--harness");
   const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
-  if (harness !== "diagnostics" && harness !== "conflicts") throw new Error("Unknown browser harness; use diagnostics or conflicts");
+  if (!BROWSER_HARNESSES.includes(harness)) throw new Error(`Unknown browser harness; use ${BROWSER_HARNESSES.join(", ")}`);
   if (webkit && process.platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
   /** @type {import('vite').ViteDevServer | undefined} */
