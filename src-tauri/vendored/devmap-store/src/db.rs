@@ -2786,13 +2786,69 @@ impl Store {
             )));
         }
         #[cfg(unix)]
-        {
+        let links = {
             use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() > 1 {
-                return Err(refusal(format!("database {} has multiple hard links; use an independent store or SQLite backup so WAL and writer ownership cannot diverge", path.display())));
-            }
+            metadata.nlink()
+        };
+        #[cfg(windows)]
+        let links = u64::from(Self::windows_hard_link_count(path).map_err(|error| {
+            refusal(format!(
+                "cannot inspect database hard links at {}: {error}",
+                path.display()
+            ))
+        })?);
+        #[cfg(any(unix, windows))]
+        if links > 1 {
+            return Err(refusal(format!("database {} has multiple hard links; use an independent store or SQLite backup so WAL and writer ownership cannot diverge", path.display())));
         }
         Ok(())
+    }
+
+    /// Stable Rust does not expose MetadataExt::number_of_links on Windows.
+    /// Query the documented Win32 file-information ABI through a live handle;
+    /// zero/failed metadata is unknown, never evidence of a single owner.
+    #[cfg(windows)]
+    fn windows_hard_link_count(path: &Path) -> std::io::Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+
+        // BY_HANDLE_FILE_INFORMATION: DWORD fields and three FILETIME pairs.
+        // FILETIME is two DWORDs, with four-byte alignment on both Win32/Win64.
+        #[repr(C)]
+        struct FileInformation {
+            _attributes: u32,
+            _created: [u32; 2],
+            _accessed: [u32; 2],
+            _written: [u32; 2],
+            _volume: u32,
+            _size_high: u32,
+            _size_low: u32,
+            links: u32,
+            _index_high: u32,
+            _index_low: u32,
+        }
+        const _: [(); 52] = [(); std::mem::size_of::<FileInformation>()];
+        #[link(name = "kernel32")]
+        extern "system" {
+            #[link_name = "GetFileInformationByHandle"]
+            fn file_information(
+                handle: *mut std::ffi::c_void,
+                information: *mut FileInformation,
+            ) -> i32;
+        }
+
+        let file = std::fs::File::open(path)?;
+        let mut information = std::mem::MaybeUninit::<FileInformation>::uninit();
+        // SAFETY: File owns the handle for the whole call; the output pointer
+        // names writable, correctly aligned storage for the documented ABI.
+        if unsafe { file_information(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: success initializes every field of BY_HANDLE_FILE_INFORMATION.
+        let links = unsafe { information.assume_init() }.links;
+        if links == 0 {
+            return Err(std::io::Error::other("file link count was unavailable"));
+        }
+        Ok(links)
     }
 
     /// Open an existing, current-schema store for an embedding reader.
