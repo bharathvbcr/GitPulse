@@ -15,6 +15,8 @@ export interface CodeintelSymbolHit {
    * because the symbol has no body. Without it the two render identically.
    */
   source_unavailable_reason?: string | null;
+  /** Source bytes withheld by the query budget; not an unreadable-file error. */
+  source_span_omitted_bytes?: number;
   score: number;
 }
 
@@ -42,6 +44,8 @@ export interface CodeintelRungHistogram {
 }
 
 export interface CodeintelResponse<T> {
+  /** Null (or absent on older hosts): this query did not verify the current tree. */
+  source_freshness?: boolean | null;
   available: boolean;
   reason?: string | null;
   items: T[];
@@ -56,6 +60,10 @@ export interface CodeintelResponse<T> {
 
 export interface CodeintelStatus {
   available: boolean;
+  /** A stale generation can remain available for navigation. */
+  is_fresh?: boolean | null;
+  freshness_reason?: string | null;
+  pending_count?: number | null;
   db_path: string;
   generation_id?: number | null;
   total_files?: number | null;

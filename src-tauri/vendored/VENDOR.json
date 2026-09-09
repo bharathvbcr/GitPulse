@@ -346,7 +346,7 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "28984292244724b7bb3511a64b131fbccdde71e1d60350b2dd84f35fbce9517d",
+        "src/db.rs": "9425849ba37ccba1195581555ad4c12f4be56d0174d7ea0c03ce692f8d273f84",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "a8447e286fe81b754e324ffaacddb818e6b7d0f27477612a18e7fbcd1a3ac693",
         "src/lib.rs": "ef1ca35a4a430336420e32c439e03c348f44052fb81a8dc120547bed400aeaad",

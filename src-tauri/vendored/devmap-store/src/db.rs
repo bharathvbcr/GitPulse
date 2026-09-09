@@ -552,6 +552,37 @@ pub struct StoreStatus {
     pub coverage_gaps: CoverageGaps,
 }
 
+impl StoreStatus {
+    /// Freshness is independent of whether the persisted graph can be queried.
+    /// This verdict is only as recent as the source verification in Store::status.
+    pub fn is_fresh(&self) -> bool {
+        self.latest_generation.is_some()
+            && self.pending_count == 0
+            && self.degraded_reason.is_none()
+    }
+
+    /// One contract for CLI, daemon and embedded readers. An absent generation
+    /// or a pending queue must explain a false verdict even without store damage.
+    pub fn freshness_reason(&self) -> Option<String> {
+        if let Some(reason) = &self.degraded_reason {
+            return Some(reason.clone());
+        }
+        if self.latest_generation.is_none() {
+            return Some(
+                "this store holds no generation: nothing has been indexed yet — run `devmap build`"
+                    .to_string(),
+            );
+        }
+        if self.pending_count > 0 {
+            return Some(format!(
+                "{} source change(s) are pending",
+                self.pending_count
+            ));
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalCheckpointMode {
     Truncate,
