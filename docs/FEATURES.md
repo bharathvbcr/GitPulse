@@ -247,6 +247,8 @@ rather than presenting a floor as a total.
 - **Git Internals Audit**: Analyzes disk usage across packfiles, loose objects, reflogs, LFS assets, and submodules.
 - **Build & Cache Auditor**: Detects build directories (`target/`, `node_modules/`, `dist/`, `.venv/`, `.build/`) and unignored cache artifacts.
 - **Historical Snapshots**: Records repo size history to plot trend sparklines ("+180 MB this week").
+- **Repository Hygiene**: Reviews stale generated output across Rust, Go, Python, JavaScript, JVM, CMake and .NET projects, with retention, activity checks, expiring previews and cancellation. Shared Go/npm/uv/pnpm caches use their owning tools. Weekly cache review is opt in; deletion always requires a reviewed action. See [Repository hygiene](REPOSITORY_HYGIENE.md) for adapters and limits.
+- **Global build cleaner**: Fleet and Settings share explicit project roots, exclusions, retention, byte/target limits, opt-in schedules, cancellation and durable history. Closed repositories are discovered beneath selected roots. macOS bundles can opt into a per-user headless background job. Partial scans and unavailable checks refuse cleanup; DevCouncil supplies the portable Rust policy and agent guidance.
 
 ---
 

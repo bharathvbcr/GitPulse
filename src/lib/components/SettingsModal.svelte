@@ -13,6 +13,7 @@
   import { LAYERS } from "../ui/layers";
   import {
     Settings,
+    ShieldCheck,
     Palette,
     PanelsTopLeft,
     Eye,
@@ -59,6 +60,7 @@
   import SettingToggle from "./SettingToggle.svelte";
   import SettingSegment from "./SettingSegment.svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import GlobalCleaner from "./GlobalCleaner.svelte";
 
   let {
     isOpen = false,
@@ -247,6 +249,7 @@
     diff: FileCode,
     analysis: FlaskConical,
     agents: Plug,
+    hygiene: ShieldCheck,
     updates: RefreshCw,
   };
 
@@ -959,6 +962,8 @@
                   </button>
                   <ExternalToolsPanel />
                 </div>
+              {:else if entry.id === "hygiene"}
+                <div data-setting="global-cleaner" hidden={!shown("global-cleaner")}><GlobalCleaner active={isOpen && activeSection === "hygiene"} /></div>
               {:else if entry.id === "updates"}
                 <div class="space-y-3">
                   <div data-setting="update-check" hidden={!shown("update-check")}>

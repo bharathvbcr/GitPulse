@@ -1185,6 +1185,48 @@ pub async fn cmd_storage_scan(repo_path: String) -> Result<crate::storage::Stora
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 
+#[tauri::command]
+pub async fn cmd_cache_inventory() -> Result<crate::storage::hygiene::CacheInventory, String> {
+    off_thread(crate::storage::hygiene::cache_inventory).await
+}
+
+#[tauri::command]
+pub async fn cmd_hygiene_prepare(
+    repo_path: String,
+    target: String,
+    min_age_days: u32,
+) -> Result<crate::storage::hygiene::HygienePlan, String> {
+    off_thread(move || crate::storage::hygiene::prepare(&repo_path, &target, min_age_days)).await
+}
+
+#[tauri::command]
+pub async fn cmd_hygiene_cancel(repo_path: String, plan_id: String) -> Result<(), String> {
+    off_thread(move || crate::storage::hygiene::cancel(&repo_path, &plan_id)).await
+}
+
+#[tauri::command]
+pub async fn cmd_hygiene_execute(
+    repo_path: String,
+    plan_id: String,
+) -> Result<Guarded<crate::storage::hygiene::HygieneOutcome>, String> {
+    off_thread(move || {
+        let (policy, output) =
+            crate::storage::hygiene::execute(&repo_path, &plan_id, |argv, path| match argv {
+                Some(argv) => {
+                    let command_policy = guard(
+                        &repo_path,
+                        &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )?;
+                    let file_policy = crate::harness::guard_file(&repo_path, path, "delete")?;
+                    Ok(strictest_verdict(command_policy, file_policy))
+                }
+                None => crate::harness::guard_file(&repo_path, path, "delete"),
+            })?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_branch_cleanup_plan(
     repo_path: String,
@@ -4216,4 +4258,41 @@ mod assemble_tests {
         assert_eq!(snapshots[0].repo_path, main_path.to_string_lossy());
         assert_eq!(snapshots[0].total_commits, 7);
     }
+}
+
+#[tauri::command]
+pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, String> {
+    off_thread(|| crate::storage::hygiene::global::service()?.state()).await
+}
+
+#[tauri::command]
+pub async fn cmd_cleaner_save(
+    config: crate::storage::hygiene::global::CleanerConfig,
+) -> Result<crate::storage::hygiene::global::CleanerState, String> {
+    off_thread(move || crate::storage::hygiene::global::service()?.save(config)).await
+}
+
+#[tauri::command]
+pub async fn cmd_cleaner_scan() -> Result<crate::storage::hygiene::global::CleanerInventory, String>
+{
+    off_thread(|| crate::storage::hygiene::global::service()?.inventory()).await
+}
+
+#[tauri::command]
+pub async fn cmd_cleaner_run(
+    revision: u64,
+) -> Result<crate::storage::hygiene::global::CleanerState, String> {
+    off_thread(move || {
+        crate::storage::hygiene::global::service()?.start(
+            false,
+            revision,
+            crate::storage::hygiene::global::current_time(),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, String> {
+    off_thread(|| crate::storage::hygiene::global::service()?.cancel()).await
 }

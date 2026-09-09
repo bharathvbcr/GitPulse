@@ -32,6 +32,7 @@ export interface SettingEntry {
 export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   { id: "status-icon", section: "layout", label: "Menu bar status icon",
     keywords: "tray background close hide window repository conflicts menu bar" },
+  { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {
     id: "theme",
     section: "appearance",

@@ -38,6 +38,7 @@ const WRITER = readFileSync(
  * A NEW unparseable command fails instead of joining this list quietly.
  */
 const DERIVED_ARGV = Object.freeze({
+  cmd_hygiene_execute: "hygiene::execute owns the backend plan and gives its exact argv or file boundary to the command gate; native hygiene tests cover denial, changed plans, exact scope and single use",
   cmd_rebase_interactive: "derives the planned sequence; rebase_planned_commands_* mirror tests cover it",
   cmd_stash_action: "argv built from the selected stash OID at runtime",
   cmd_cherry_pick: "shares replay_argv with the writer, so drift is impossible",

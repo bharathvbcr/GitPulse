@@ -14,6 +14,7 @@ export const SETTINGS_SECTION_IDS = [
   "diff",
   "analysis",
   "agents",
+  "hygiene",
   "updates",
 ] as const;
 
@@ -62,6 +63,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     id: "agents",
     label: "Agents",
     summary: "MCP for agents, and installing the devmap / manvi CLIs.",
+  },
+  {
+    id: "hygiene",
+    label: "Repo hygiene",
+    summary: "Global project roots, cleanup schedules, limits and run history.",
   },
   {
     id: "updates",

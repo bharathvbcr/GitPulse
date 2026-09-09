@@ -28,6 +28,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod hygiene;
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -379,7 +381,7 @@ fn artifact_kind(dir_name: &str) -> Option<ArtifactKind> {
         // Agent state directories
         ".opencode",
     ];
-    if BUILD.contains(&dir_name) {
+    if BUILD.contains(&dir_name) || dir_name.starts_with("target-") {
         Some(ArtifactKind::Build)
     } else if CACHE.contains(&dir_name) {
         Some(ArtifactKind::Cache)
@@ -416,19 +418,20 @@ fn is_generic_source_name(name: &str) -> bool {
 /// Known monolithic artifact containers that should NEVER open nested child
 /// artifact scopes. Everything inside them belongs entirely to this container.
 fn is_container_artifact(name: &str) -> bool {
-    matches!(
-        name,
-        "target"
-            | "node_modules"
-            | ".venv"
-            | "venv"
-            | "DerivedData"
-            | "cmake-build-debug"
-            | "cmake-build-release"
-            | ".gradle"
-            | ".dart_tool"
-            | ".pnpm-store"
-    )
+    name.starts_with("target-")
+        || matches!(
+            name,
+            "target"
+                | "node_modules"
+                | ".venv"
+                | "venv"
+                | "DerivedData"
+                | "cmake-build-debug"
+                | "cmake-build-release"
+                | ".gradle"
+                | ".dart_tool"
+                | ".pnpm-store"
+        )
 }
 
 /// Generic build subdirectories that should never open as a new child artifact
@@ -727,7 +730,15 @@ fn batch_check_ignore(repo: &Path, candidates: &[String]) -> std::collections::H
         // state. Without it, any directory containing tracked files is
         // silently reported as non-ignored — hiding exactly the
         // "ignored dir with committed content" gap this scan exists to find.
-        &["check-ignore", "--stdin", "-z", "--verbose", "--no-index"],
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "check-ignore",
+            "--stdin",
+            "-z",
+            "--verbose",
+            "--no-index",
+        ],
         &stdin_bytes,
     ) {
         Ok(out) => parse_check_ignore_z(&String::from_utf8_lossy(&out)),
@@ -770,7 +781,7 @@ fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> HashMap<String, u
         .iter()
         .map(|c| format!(":(literal){c}"))
         .collect();
-    let mut argv: Vec<&str> = vec!["ls-files", "-z", "--"];
+    let mut argv: Vec<&str> = vec!["-c", "core.fsmonitor=false", "ls-files", "-z", "--"];
     argv.extend(literal.iter().map(String::as_str));
     let Ok(bytes) = crate::engine::git_cli::git_with_stdin(repo, &argv, &[]) else {
         return counts;
@@ -1195,6 +1206,7 @@ fn build_reclaim(
             continue;
         }
         let committed = artifact.tracked_files > 0;
+        let protected = hygiene::providers::protected_artifact(&artifact.path);
         let category = match artifact.kind {
             ArtifactKind::Build => ReclaimCategory::BuildOutput,
             ArtifactKind::Cache => ReclaimCategory::Cache,
@@ -1206,13 +1218,19 @@ fn build_reclaim(
             confidence: ReclaimConfidence::Measured,
             // Committed content is not regenerable output any more, whatever
             // the directory is named: deleting it changes the working tree.
-            safety: if committed {
+            safety: if committed || protected {
                 ReclaimSafety::NeedsReview
             } else {
                 ReclaimSafety::Safe
             },
-            action: format!("rm -rf {}", artifact.path),
-            detail: if committed {
+            action: if committed || protected {
+                "Review and preserve local state".into()
+            } else {
+                "Preview in Repository hygiene before cleanup".into()
+            },
+            detail: if protected {
+                "This directory may hold environments, dependencies, persistent state or unrecoverable local work. Its name does not prove it is disposable.".into()
+            } else if committed {
                 format!(
                     "{} file(s) inside this directory are tracked by git.",
                     artifact.tracked_files
@@ -1222,8 +1240,9 @@ fn build_reclaim(
             } else {
                 "Regenerable build or cache output.".into()
             },
-            blocked_reason: committed.then(|| {
-                "Tracked in git — removing it is a commit, not a cleanup.".to_string()
+            blocked_reason: (committed || protected).then(|| {
+                if committed { "Tracked in git — removing it is a commit, not a cleanup.".to_string() }
+                else { "Protected content: use the owning tool or review it manually.".to_string() }
             }),
         });
     }
@@ -1340,7 +1359,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
 
     // Discover worktree layout upfront: identify any linked worktrees whose roots
     // live inside the repository (e.g. .claude/worktrees/*, .cursor/worktrees/*, or worktrees/*).
-    let worktree_infos = crate::engine::worktree::list_worktrees(repo_path).unwrap_or_default();
+    let worktree_infos = crate::engine::worktree::list_worktrees_lite(repo_path)?;
     let mut linked_worktrees = std::collections::HashSet::new();
     for wt in worktree_infos.iter().filter(|w| !w.is_main) {
         let p = PathBuf::from(&wt.path);
@@ -1454,7 +1473,8 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         })
         .collect();
     artifacts.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
-    if artifacts.len() > MAX_ARTIFACT_DIRS {
+    let artifacts_truncated = artifacts.len() > MAX_ARTIFACT_DIRS;
+    if artifacts_truncated {
         artifacts.truncate(MAX_ARTIFACT_DIRS);
     }
 
@@ -1485,8 +1505,11 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         .permission_denied
         .saturating_add(git_budget.permission_denied)
         .saturating_add(wt_perms);
-    let is_truncated =
-        worktree_budget.truncated || git_truncated || git_budget.truncated || wt_truncated;
+    let is_truncated = artifacts_truncated
+        || worktree_budget.truncated
+        || git_truncated
+        || git_budget.truncated
+        || wt_truncated;
 
     // The deep audit. Derived from what the walks already measured, plus one
     // cheap read_dir for prunable worktree admin.
