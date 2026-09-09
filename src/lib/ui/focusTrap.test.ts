@@ -63,6 +63,14 @@ describe("FOCUSABLE_SELECTOR", () => {
 });
 
 describe("enumerateFocusables", () => {
+  it("excludes native controls with a negative tab index from the Tab sequence", () => {
+    const selected = new FakeFocusable({ tabindex: "0" });
+    const unselected = new FakeFocusable({ tabindex: "-1" });
+    const programmatic = new FakeFocusable({ tabindex: "-2" });
+    const next = new FakeFocusable({});
+    expect(enumerateFocusables(containerOf([unselected, selected, programmatic, next]))).toEqual([selected, next]);
+  });
+
   it("returns candidates in DOM order", () => {
     installFakeDocument();
     const input = new FakeFocusable({ type: "text" });
