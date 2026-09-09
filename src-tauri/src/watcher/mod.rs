@@ -17,6 +17,7 @@ pub const MAX_WATCHES: usize = 24;
 
 pub struct WatchSession {
     stop: Arc<AtomicBool>,
+    retired: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Path spellings that identified this session when it was created:
     /// the canonical map key plus whatever raw path the caller supplied.
     /// Kept so `unwatch` can still resolve the slot after the watched
@@ -69,6 +70,7 @@ fn insert_watch_session(
     sessions: &mut HashMap<String, WatchSession>,
     key: &str,
     caller_paths: &[String],
+    retired: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 ) -> Result<Option<Arc<AtomicBool>>, String> {
     if sessions.contains_key(key) {
         return Ok(None);
@@ -87,6 +89,7 @@ fn insert_watch_session(
         key.to_string(),
         WatchSession {
             stop: stop.clone(),
+            retired,
             aliases,
         },
     );
@@ -257,7 +260,7 @@ enum WatchLoopExit {
 }
 
 fn run_watch_loop<F>(
-    watcher: RepoFileWatcher,
+    watcher: &RepoFileWatcher,
     ctx: WatchLoopContext,
     stop: Arc<AtomicBool>,
     sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
@@ -454,14 +457,20 @@ where
     };
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: register native backend");
-    let watcher =
+    let mut watcher =
         RepoFileWatcher::watch_repo(&git_dir, worktree_root.as_deref(), common_dir.as_deref())?;
 
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: reserve and launch session");
+    let (retired_tx, retired_rx) = std::sync::mpsc::channel();
     let stop = {
         let mut guard = state.lock_sessions()?;
-        match insert_watch_session(&mut guard, &key, std::slice::from_ref(&repo_path))? {
+        match insert_watch_session(
+            &mut guard,
+            &key,
+            std::slice::from_ref(&repo_path),
+            Some(retired_rx),
+        )? {
             None => return Ok(key),
             Some(stop) => stop,
         }
@@ -491,7 +500,7 @@ where
             // same ptr_eq-guarded reap the DeadRepo path uses.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_watch_loop(
-                    watcher,
+                    &watcher,
                     WatchLoopContext {
                         git_dir,
                         internal_roots,
@@ -533,6 +542,13 @@ where
                     }
                 }
             }
+            // Release the callback and native handles before acknowledging
+            // retirement. No sessions mutex is held while waiting here.
+            let retired = watcher.shutdown();
+            if let Err(error) = &retired {
+                log::warn!(target: "watcher", "{emit_path}: {error}");
+            }
+            let _ = retired_tx.send(retired);
         })
     {
         let _ = state.abandon_watch_slot(&key, &stop);
@@ -568,10 +584,13 @@ fn lexical_normalizations(repo_path: &str) -> Vec<String> {
 pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
     let keys = watch_lookup_keys(&repo_path);
     let mut guard = state.lock_sessions()?;
+    let mut retired = Vec::new();
     // Pass 1: exact matches against map keys. Covers the healthy case where
     // canonicalization still works.
     for key in keys {
-        guard.remove(&key);
+        if let Some(session) = guard.remove(&key) {
+            retired.push(session);
+        }
     }
     // Pass 2: post-deletion recovery. The directory is gone, so the
     // canonicalize()/validate_repo() lookups above failed; fall back to
@@ -588,14 +607,48 @@ pub fn unwatch(state: &WatcherState, repo_path: String) -> Result<(), String> {
         .map(|(key, _)| key.clone())
         .collect();
     for key in stale {
-        guard.remove(&key);
+        if let Some(session) = guard.remove(&key) {
+            retired.push(session);
+        }
     }
-    Ok(())
+    drop(guard);
+    retire_sessions(retired)
 }
 
 pub fn unwatch_all(state: &WatcherState) -> Result<(), String> {
-    state.lock_sessions()?.clear();
-    Ok(())
+    let retired = state
+        .lock_sessions()?
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
+    retire_sessions(retired)
+}
+
+/// Signal every session first, then share one deadline across all receipts.
+/// Reaping and callbacks may use the sessions mutex, so callers release it
+/// before entering this function. A timeout is a failed shutdown, never success.
+fn retire_sessions(mut sessions: Vec<WatchSession>) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    for session in &sessions {
+        session.stop.store(true, Ordering::SeqCst);
+    }
+    let mut errors = Vec::new();
+    for session in &mut sessions {
+        if let Some(retired) = session.retired.take() {
+            match retired.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(error) => {
+                    errors.push(format!("Watcher retirement was not acknowledged: {error}"))
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[cfg(test)]
@@ -665,7 +718,7 @@ mod tests {
     impl WatcherState {
         fn begin_watch_slot(&self, key: &str) -> Result<bool, String> {
             let mut guard = self.lock_sessions()?;
-            Ok(insert_watch_session(&mut guard, key, &[])?.is_some())
+            Ok(insert_watch_session(&mut guard, key, &[], None)?.is_some())
         }
 
         fn watch_count(&self) -> Result<usize, String> {
@@ -963,7 +1016,7 @@ mod tests {
         let git_dir = root.join(".git");
         let key = root.to_string_lossy().into_owned();
         let state = WatcherState::default();
-        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
+        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[], None)
             .unwrap()
             .unwrap();
         let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
@@ -971,7 +1024,7 @@ mod tests {
         drop(sender);
         watcher.receiver = receiver;
         let exit = run_watch_loop(
-            watcher,
+            &watcher,
             WatchLoopContext {
                 git_dir: git_dir.clone(),
                 internal_roots: vec![git_dir],
@@ -1001,20 +1054,21 @@ mod tests {
         let git_dir = root.join(".git");
         let key = root.to_string_lossy().into_owned();
         let state = WatcherState::default();
-        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
+        let stop = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[], None)
             .unwrap()
             .unwrap();
         // Keep the old generation alive while its replacement owns the slot.
         let old_session = state.lock_sessions().unwrap().remove(&key).unwrap();
-        let replacement = insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[])
-            .unwrap()
-            .unwrap();
+        let replacement =
+            insert_watch_session(&mut state.lock_sessions().unwrap(), &key, &[], None)
+                .unwrap()
+                .unwrap();
         let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         drop(sender);
         watcher.receiver = receiver;
         let exit = run_watch_loop(
-            watcher,
+            &watcher,
             WatchLoopContext {
                 git_dir: git_dir.clone(),
                 internal_roots: vec![git_dir],
@@ -1034,6 +1088,79 @@ mod tests {
         assert!(!replacement.load(Ordering::Relaxed));
         drop(old_session);
         unwatch_all(&state).unwrap();
+    }
+
+    #[test]
+    fn unwatch_waits_for_the_retired_callback_to_release_its_resources() {
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let state = WatcherState::default();
+        let released = Arc::new(AtomicBool::new(false));
+        let resource = Released(released.clone());
+        let key = start_watch_inner(
+            &state,
+            dir.path().to_string_lossy().into_owned(),
+            move |_| {
+                std::hint::black_box(&resource);
+            },
+        )
+        .unwrap();
+        unwatch(&state, key).unwrap();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "successful unwatch returned while the retired session still owned resources"
+        );
+    }
+
+    #[test]
+    fn retirement_signals_every_session_before_waiting_and_reports_lost_receipts() {
+        let state = WatcherState::default();
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        let one = insert_watch_session(&mut state.lock_sessions().unwrap(), "one", &[], Some(rx1))
+            .unwrap()
+            .unwrap();
+        let two = insert_watch_session(&mut state.lock_sessions().unwrap(), "two", &[], Some(rx2))
+            .unwrap()
+            .unwrap();
+        let state_for_worker = state.clone();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !(one.load(Ordering::SeqCst) && two.load(Ordering::SeqCst)) {
+                assert!(
+                    Instant::now() < deadline,
+                    "every session must be signalled before waiting"
+                );
+                thread::yield_now();
+            }
+            assert_eq!(
+                state_for_worker.watch_count().unwrap(),
+                0,
+                "retirement cannot hold the sessions mutex"
+            );
+            tx1.send(Ok(())).unwrap();
+            tx2.send(Ok(())).unwrap();
+        });
+        unwatch_all(&state).unwrap();
+        worker.join().unwrap();
+        let (lost, receipt) = std::sync::mpsc::channel();
+        insert_watch_session(
+            &mut state.lock_sessions().unwrap(),
+            "lost",
+            &[],
+            Some(receipt),
+        )
+        .unwrap();
+        drop(lost);
+        assert!(unwatch_all(&state)
+            .unwrap_err()
+            .contains("not acknowledged"));
     }
 
     #[test]
@@ -1228,7 +1355,7 @@ mod tests {
             .name("watch-loop-test".into())
             .spawn(move || {
                 run_watch_loop(
-                    watcher,
+                    &watcher,
                     WatchLoopContext {
                         git_dir: loop_git_dir,
                         internal_roots,

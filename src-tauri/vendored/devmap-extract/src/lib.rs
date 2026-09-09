@@ -462,6 +462,18 @@ fn matches_ignore(
 
 #[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
+    if source.len() as u64 > MAX_SOURCE_BYTES {
+        return treesitter::refused_extraction(
+            path,
+            detect_language(Path::new(path)),
+            source,
+            format!(
+                "source has {} bytes, over the {} byte input limit",
+                source.len(),
+                MAX_SOURCE_BYTES
+            ),
+        );
+    }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the
     // code has to be reconstructed out of the JSON before any grammar sees it,
@@ -1217,5 +1229,30 @@ mod discovery_bound_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "parse"))]
+mod direct_input_bounds {
+    #[test]
+    fn direct_extraction_obeys_the_same_byte_ceiling_as_discovery() {
+        let source = format!(
+            "def oversized_probe():\n    return 1\n#{}",
+            "x".repeat(super::MAX_SOURCE_BYTES as usize)
+        );
+        let extraction = super::extract_file("large.py", &source);
+        assert!(
+            matches!(extraction.parse_outcome, super::model::ParseOutcome::Failed { ref reason } if reason.contains("byte") && reason.contains("limit")),
+            "{:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(
+            extraction.symbols.len(),
+            1,
+            "only the File node survives refusal"
+        );
+        assert!(extraction.calls.is_empty());
+        let at_limit = "#".repeat(super::MAX_SOURCE_BYTES as usize);
+        assert!(!super::extract_file("boundary.py", &at_limit).is_parse_failure());
     }
 }

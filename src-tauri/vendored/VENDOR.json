@@ -120,7 +120,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-extract",
-        "commit": "d9678f331be6e65b271701addfe38a1a4c3e8517"
+        "commit": "db606e8573abbb3b231b1e1311c7208e9d54dfbd"
       },
       "omitted": [
         "tests/",
@@ -229,13 +229,13 @@
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
-        "src/lib.rs": "119d4ef0f630f539fb73c65e40e419d763623a5f1ff4e294cf3fe704c072bd08",
+        "src/lib.rs": "3dae528988efa042c95d73927291698ff2fae499d2146f886b381278bfdb4690",
         "src/model.rs": "0059b938eccbf8f48a2e64ada08ec7cf306a1d61d6cd4debaa6fe831afa9a4e6",
         "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
         "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
         "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
-        "src/treesitter.rs": "d02e765d6fa828d47214e7dd0522cb7a1b05c077a2bd0f60e76a97098dae74bc",
+        "src/treesitter.rs": "b14a53d23f0acbafa94ec7f531bcbf467cb367c67cb7a956b879ca7ba3064d41",
         "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
       }
     },

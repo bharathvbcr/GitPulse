@@ -1239,7 +1239,12 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
 /// No declarations are recovered by pattern here. A file whose parse was
 /// abandoned has an unknown structure, and a pattern scan over it would produce
 /// a plausible-looking symbol set that nothing verified.
-fn refused_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+pub(crate) fn refused_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    reason: String,
+) -> Extraction {
     unparsed_extraction(
         path,
         lang,
