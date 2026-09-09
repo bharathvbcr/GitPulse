@@ -77,7 +77,8 @@ CHANGELOG_DRAFT.md
 *.drawio.dtmp
 *.excalidraw.json.bkp
 
-# DevCouncil local state
+# DevMap and DevCouncil local state
+.devmap/
 .devcouncil/*
 !.devcouncil/
 
