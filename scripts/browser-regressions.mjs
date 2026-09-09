@@ -32,7 +32,7 @@ async function main() {
   const webkit = process.argv.includes("--webkit");
   const harnessIndex = process.argv.indexOf("--harness");
   const harness = harnessIndex === -1 ? "diagnostics" : process.argv[harnessIndex + 1];
-  if (harness !== "diagnostics" && harness !== "conflicts") throw new Error("Unknown browser harness; use diagnostics or conflicts");
+  if (harness !== "diagnostics" && harness !== "conflicts" && harness !== "hygiene") throw new Error("Unknown browser harness; use diagnostics, conflicts or hygiene");
   if (webkit && process.platform !== "darwin") throw new Error("The WebKit regression runner requires macOS");
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
   /** @type {import('vite').ViteDevServer | undefined} */

@@ -19,6 +19,7 @@
   import { describeStaleness, type MetricSnapshot } from "../metrics/freshness";
   import { copyText } from "../desktop/clipboard";
   import Skeleton from "./Skeleton.svelte";
+  import HygienePanel from "./HygienePanel.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
   import {
@@ -607,6 +608,10 @@
           </div>
         </section>
       {/if}
+
+      {#key report.repo_path}
+        <HygienePanel {report} onchanged={() => scan(report?.repo_path)} />
+      {/key}
 
       <!-- Build & cache dirs -->
       {#if report.artifacts.length > 0}

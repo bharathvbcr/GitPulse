@@ -48,6 +48,12 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
             gitpulse_lib::commands::cmd_get_commit_details,
             gitpulse_lib::commands::cmd_get_commit_files,
             gitpulse_lib::commands::cmd_get_reflog,
+            gitpulse_lib::commands::cmd_hygiene_prepare,
+            gitpulse_lib::commands::cmd_hygiene_execute,
+            gitpulse_lib::commands::cmd_hygiene_cancel,
+            gitpulse_lib::commands::cmd_cleaner_state,
+            gitpulse_lib::commands::cmd_cleaner_save,
+            gitpulse_lib::commands::cmd_cleaner_run,
             gitpulse_lib::desktop::cmd_resolve_git_root
         ])
         // The app's own context, from the same accessor run() uses, so the
@@ -116,6 +122,51 @@ fn a_command_reachable_from_the_frontend_round_trips_through_the_bridge() {
         "segment: {}",
         original[0]
     );
+}
+
+#[test]
+fn hygiene_preview_validates_frontend_arguments_before_any_mutation() {
+    let repo = repo_with_change();
+    let error = invoke(
+        "cmd_hygiene_prepare",
+        json!({ "repoPath": repo.path(), "target": "local:../target", "minAgeDays": 0 }),
+    )
+    .expect_err("invalid retention must be rejected");
+    assert!(error.to_string().contains("Retention"), "{error}");
+    let error = invoke(
+        "cmd_hygiene_prepare",
+        json!({ "repoPath": repo.path(), "target": "local:../target", "minAgeDays": 30 }),
+    )
+    .expect_err("a path escape must be rejected");
+    assert!(error.to_string().contains("repository-relative"), "{error}");
+    let error = invoke(
+        "cmd_hygiene_prepare",
+        json!({ "repoPath": repo.path(), "target": "local:target", "minAgeDays": "30" }),
+    )
+    .expect_err("string retention must not be coerced");
+    assert!(error.to_string().contains("minAgeDays"), "{error}");
+}
+
+#[test]
+fn hygiene_execution_requires_a_backend_plan_and_cancel_is_idempotent() {
+    let repo = repo_with_change();
+    let error = invoke(
+        "cmd_hygiene_execute",
+        json!({ "repoPath": repo.path(), "planId": "unissued-plan", "command": "rm -rf /" }),
+    )
+    .expect_err("client commands cannot substitute for a prepared plan");
+    assert!(error.to_string().contains("Preview"), "{error}");
+    for _ in 0..2 {
+        assert_eq!(
+            invoke(
+                "cmd_hygiene_cancel",
+                json!({ "repoPath": repo.path(), "planId": "unissued-plan" }),
+            )
+            .expect("cancellation is idempotent"),
+            json!(null)
+        );
+    }
+    assert!(repo.path().join(".git").is_dir());
 }
 
 #[test]
@@ -817,4 +868,37 @@ fn an_optional_numeric_argument_is_honoured_and_bounded() {
         capped.as_array().expect("an array").len() <= 1,
         "cap ignored: {capped}"
     );
+}
+
+#[test]
+fn global_cleaner_state_crosses_ipc_without_an_open_repository() {
+    let state = invoke("cmd_cleaner_state", json!({})).unwrap();
+    assert_eq!(state["config"]["version"], 1);
+    assert!(state["config"]["roots"].is_array());
+    assert!(state["history"].is_array());
+    assert!(state["background_supported"].is_boolean());
+    assert!(state["agent_rules"]
+        .as_str()
+        .unwrap()
+        .contains("Agents must not enable or widen"));
+}
+
+#[test]
+fn global_cleaner_ipc_rejects_invalid_policies_and_caller_supplied_execution_authority() {
+    let mut config =
+        serde_json::to_value(gitpulse_lib::storage::hygiene::global::CleanerConfig::default())
+            .unwrap();
+    config["retention_days"] = json!(0);
+    let error = invoke("cmd_cleaner_save", json!({"config":config})).unwrap_err();
+    assert!(error.as_str().unwrap().contains("Retention"));
+    config["retention_days"] = json!(30);
+    config["command"] = json!("untrusted command");
+    assert!(invoke("cmd_cleaner_save", json!({"config":config})).is_err());
+    for body in [
+        json!({"paths":["/tmp"]}),
+        json!({"revision":-1}),
+        json!({"revision":"0"}),
+    ] {
+        assert!(invoke("cmd_cleaner_run", body).is_err());
+    }
 }

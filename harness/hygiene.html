@@ -1,0 +1,161 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>GitPulse hygiene</title>
+<style>body{margin:0;background:#10141e;color:#dfe6f5;font:13px system-ui}#app{max-width:1100px;margin:28px auto;padding:20px}#result{white-space:pre-wrap;padding:20px}</style></head>
+<body><div id="app"></div><pre id="result"></pre>
+<script>
+  // Catch module-load errors before the ESM graph runs its own assertions.
+  window.addEventListener("error", function (event) {
+    const result = {results:[{name:"Module/bootstrap error: " + event.message,pass:false}],passed:0,total:1};
+    document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+    document.querySelector("#result").textContent=JSON.stringify(result);
+    const report=new URL(location.href).searchParams.get("report");
+    if(report && report.startsWith("/__gp_result/"))fetch(report,{method:"POST",body:document.documentElement.outerHTML});
+  });
+</script>
+<script type="module">
+  import "../src/app.css";
+  import { mount, unmount } from "svelte";
+  import HygienePanel from "../src/lib/components/HygienePanel.svelte";
+  import GlobalCleaner from "../src/lib/components/GlobalCleaner.svelte";
+  const root=document.querySelector("#app"), results=[], requests=[], crashes=[];
+  let refreshes=0, generation=0;
+  window.addEventListener("error",e=>crashes.push(e.message));
+  window.addEventListener("unhandledrejection",e=>crashes.push(String(e.reason)));
+  const finish=()=>{
+    const result={results,passed:results.filter(r=>r.pass).length,total:results.length};
+    document.querySelector("#result").textContent=JSON.stringify(result,null,2);
+    document.documentElement.setAttribute("data-gp-result",encodeURIComponent(JSON.stringify(result)));
+    document.title=`GitPulse hygiene ${result.passed}/${result.total}`;
+    const path=new URL(location.href).searchParams.get("report");
+    if(path?.startsWith("/__gp_result/"))fetch(path,{method:"POST",body:document.documentElement.outerHTML}).catch(e=>console.error(e));
+  };
+  const deadline=setTimeout(()=>{results.push({name:"harness deadline",pass:false});finish();},45000);
+  const check=(name,pass)=>{results.push({name,pass:Boolean(pass)});document.documentElement.setAttribute("data-gp-progress",name);};
+  const settle=()=>new Promise(r=>setTimeout(r,35));
+  const take=kind=>{const index=requests.findIndex(r=>r.cmd===kind);if(index<0)throw Error(`Missing ${kind}`);return requests.splice(index,1)[0];};
+  const calls=[];
+  window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{
+    calls.push({cmd,args});
+    if(cmd==="cmd_hygiene_cancel" || cmd==="cmd_copy_text")return;
+    if(["cmd_cache_inventory","cmd_hygiene_prepare","cmd_hygiene_execute"].includes(cmd))return new Promise((resolve,reject)=>requests.push({cmd,args,resolve,reject}));
+    throw Error(`Unexpected IPC ${cmd}`);
+  }};
+  const report={repo_path:"/fixture/repo",reclaim:[],scan:{truncated:false},artifacts:[
+    {path:"src-tauri/target",bytes:1200000000,kind:"build",tracked_files:0,unignored:false},
+    {path:"coverage",bytes:12000,kind:"cache",tracked_files:1,unignored:false},
+    {path:"__pycache__",bytes:9000,kind:"cache",tracked_files:0,unignored:true}
+  ]};
+  const preview=()=>({id:`plan-${++generation}`,repo_path:report.repo_path,target:"local:src-tauri/target",label:"Rust / Cargo",path:"/fixture/repo/src-tauri/target",scope:"repository",command:"Remove reviewed output",bytes:1200000000,files:231,expires_at:Math.floor(Date.now()/1000)+300,warning:"Removes the reviewed generated files permanently. Rebuilding costs time."});
+  const verdict={status:"unchecked",checked:false,target:"fixture",rule:"",severity:"",reason:"fixture: gate unavailable",demoted:"",grant_id:"",granted_by:"",widened:"",degraded:[],task_id:"",detail:"",detail_code:""};
+  const outcome={success:true,message:"Maintenance completed",bytes_before:1200000000,bytes_after:0,elapsed_ms:4};
+  const button=text=>[...root.querySelectorAll("button")].find(b=>b.textContent.includes(text));
+  const selectPreview=()=>button("Preview cleanup").click();
+  let component=mount(HygienePanel,{target:root,props:{report,onchanged:async()=>{refreshes++;}}});
+  await settle();
+  if(!new URL(location.href).searchParams.has("check")) { clearTimeout(deadline); document.title="GitPulse hygiene preview"; }
+  else try {
+    check("hygiene is visible",root.textContent.includes("Repository hygiene"));
+    check("inventory is opt in",calls.length===0);
+    check("tracked output is preserved",[...root.querySelectorAll("button")].filter(b=>b.textContent.includes("Preview cleanup"))[1].disabled);
+    check("unignored output requires a rule",[...root.querySelectorAll("button")].filter(b=>b.textContent.includes("Preview cleanup"))[2].disabled);
+    check("an ignore rule can be copied",!!button("Copy ignore rule"));
+    selectPreview();await settle();const first=take("cmd_hygiene_prepare");
+    check("preview uses repository identity",first.args.repoPath===report.repo_path);
+    check("preview uses the exact target",first.args.target==="local:src-tauri/target");
+    check("default retention is 30 days",first.args.minAgeDays===30);
+    check("preview disables duplicate requests",button("Preview cleanup").disabled);
+    const one=preview();first.resolve(one);await settle();
+    check("preview displays exact path",root.textContent.includes(one.path));
+    check("preview explains permanent deletion",root.textContent.includes("permanently"));
+    check("preview alone does not mutate",!calls.some(c=>c.cmd==="cmd_hygiene_execute"));
+    button("Remove reviewed output").click();await settle();
+    check("duplicate execution is disabled",button("Maintaining").disabled);
+    const execution=take("cmd_hygiene_execute");
+    check("execution sends plan id only",execution.args.planId===one.id && !("target" in execution.args));
+    execution.resolve({policy:verdict,output:outcome});await settle();
+    check("completed action refreshes storage",refreshes===1);
+    check("before and after are visible",root.textContent.includes("Before:")&&root.textContent.includes("After:"));
+    check("completed preview is consumed",!button("Remove reviewed output"));
+    selectPreview();await settle();take("cmd_hygiene_prepare").reject("Directory changed; review again");await settle();
+    check("backend refusal is visible",root.querySelector('[role="alert"]').textContent.includes("Directory changed"));
+    selectPreview();await settle();const expired=preview();expired.expires_at=1;take("cmd_hygiene_prepare").resolve(expired);await settle();
+    check("expired previews cannot execute",button("Remove reviewed output").disabled);
+    button("Cancel").click();await settle();
+    check("cancel addresses the correct plan",calls.some(c=>c.cmd==="cmd_hygiene_cancel"&&c.args.planId===expired.id));
+    button("Inspect shared caches").click();await settle();
+    check("cache inspection shows loading",root.textContent.includes("Inspecting"));
+    take("cmd_cache_inventory").resolve({measured_at:Math.floor(Date.now()/1000),entries:[
+      {id:"go",label:"Go build cache",path:"/fixture/cache/go-build",bytes:450000000,action:"Clear build cache",note:"Shared by all repositories",error:null},
+      {id:"uv",label:"uv cache",path:null,bytes:null,action:null,note:"Use uv to prune unused entries",error:"Tool unavailable"}
+    ]});await settle();
+    check("missing tools remain unavailable",root.textContent.includes("Unavailable: Tool unavailable"));
+    check("missing measurement is not zero",root.textContent.includes("Not measured"));
+    button("Clear build cache").click();await settle();const shared=preview();shared.scope="shared";shared.path="/fixture/cache/go-build";shared.target="cache:go";take("cmd_hygiene_prepare").resolve(shared);await settle();
+    check("shared scope is explicit",!!button("Run shared cache maintenance"));
+    button("Run shared cache maintenance").click();await settle();take("cmd_hygiene_execute").resolve({policy:verdict,output:{...outcome,success:false,message:"Tool failed; partial cleanup",bytes_after:null}});await settle();
+    check("partial failure is not success",root.textContent.includes("Maintenance incomplete"));
+    check("failed remeasurement is explicit",root.textContent.includes("measurement unavailable"));
+    selectPreview();await settle();const late=take("cmd_hygiene_prepare");await unmount(component);late.resolve(preview());await settle();
+    check("late preview is cancelled after unmount",calls.at(-1).cmd==="cmd_hygiene_cancel");
+    window.__TAURI_INTERNALS__.invoke=async(cmd,args)=>{
+      calls.push({cmd,args});
+      if(cmd==="cmd_pick_folder")return "/fixture/code";
+      if(["cmd_cleaner_state","cmd_cleaner_save","cmd_cleaner_scan","cmd_cleaner_run","cmd_cleaner_cancel"].includes(cmd))return new Promise((resolve,reject)=>requests.push({cmd,args,resolve,reject}));
+      throw Error(`Unexpected global IPC ${cmd}`);
+    };
+    const globalState={config:{version:1,revision:0,roots:[],exclusions:[],enabled:false,run_when_closed:false,interval_hours:168,next_run_at:0,retention_days:30,max_run_bytes:10737418240,max_targets:20},history:[],running:false,supported:true,background_supported:false,background_error:null,agent_rules:"Preserve source and local state. Agents must not enable or widen cleanup schedules."};
+    component=mount(GlobalCleaner,{target:root});await settle();take("cmd_cleaner_state").resolve(globalState);await settle();
+    check("global cleaner loads without an open repository",root.textContent.includes("Global build cleaner"));
+    check("scheduling defaults off",!root.querySelector('[aria-label="Enable scheduled cleanup"]').checked);
+    check("closed-app scheduling defaults off", !root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').checked);
+    check("unsupported background registration cannot be enabled", root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').disabled);
+    check("global inspections require saved roots",button("Inspect saved roots").disabled);
+    check("global scheduling explains its app lifetime",root.textContent.includes("while GitPulse is open"));
+    button("Add project root").click();await settle();
+    check("folder picker adds a root",root.querySelector('[aria-label="Project roots"]').value==="/fixture/code");
+    const exclusions=root.querySelector('[aria-label="Excluded directories"]');exclusions.value="/fixture/code/important";exclusions.dispatchEvent(new Event("input",{bubbles:true}));
+    root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
+    check("edited policy cannot be inspected before saving",button("Inspect saved roots").disabled);
+    button("Save cleanup policy").click();await settle();const save=take("cmd_cleaner_save");
+    check("save carries exact roots and exclusions",save.args.config.roots[0]==="/fixture/code"&&save.args.config.exclusions[0]==="/fixture/code/important");
+    check("scheduling is explicit saved consent",save.args.config.enabled===true&&save.args.config.next_run_at>Date.now()/1000);
+    check("retention and limits reach the backend",save.args.config.retention_days===30&&save.args.config.max_targets===20&&save.args.config.max_run_bytes===10737418240);
+    check("saving disables policy inputs",root.querySelector('fieldset').disabled);
+    globalState.config={...save.args.config,revision:1};save.resolve(structuredClone(globalState));await settle();
+    check("saved policy enables inspection",!button("Inspect saved roots").disabled);
+    check("saving does not execute cleanup",!calls.some(c=>c.cmd==="cmd_cleaner_run"));
+    button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").reject("Root unavailable");await settle();
+    check("global inventory failure is recoverable",root.textContent.includes("Root unavailable")&&!button("Inspect saved roots").disabled);
+    const scan={repositories:2,visited_entries:100,partial:true,issues:["Partial repository scan"],candidates:[{repo_path:"/fixture/code/closed",path:"target",provider:"Rust / Cargo",bytes:1000}]};
+    button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve(scan);await settle();
+    check("partial inventory blocks global cleanup",button("Clean eligible output now").disabled);
+    check("closed repository scope is visible",root.textContent.includes("/fixture/code/closed/target"));
+    button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve({...scan,partial:false,issues:[]});await settle();
+    check("complete inventory allows explicit cleanup",!button("Clean eligible output now").disabled);
+    button("Clean eligible output now").click();await settle();const run=take("cmd_cleaner_run");
+    check("run sends revision rather than paths or commands",Object.keys(run.args).join(",")==="revision"&&run.args.revision===1);
+    check("duplicate global execution is disabled",button("Clean eligible output now").disabled);
+    run.resolve({...structuredClone(globalState),running:true});await settle();
+    check("running cleanup has a stop action",!!button("Stop cleanup"));
+    button("Stop cleanup").click();await settle();take("cmd_cleaner_cancel").resolve({...structuredClone(globalState),running:true});await settle();
+    check("cancel explains partial deletion",root.textContent.includes("Removed entries cannot be restored"));
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),history:[{id:"run-1",trigger:"scheduled",started_at:1,finished_at:2,status:"completed_with_skips",repositories:2,partial:false,issues:[],items:[{repo_path:"/fixture/code/closed",path:"target",status:"skipped",message:"Repository has active task leases",bytes_before:1000,bytes_after:null}]}]});await settle();
+    check("skipped scheduled targets remain visible",root.textContent.includes("active task leases")&&root.textContent.includes("completed with skips"));
+    check("unmeasured results are not reported as zero",root.textContent.includes("After unavailable"));
+    check("portable agent guidance is visible",root.textContent.includes("Agents must not enable or widen"));
+    root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();button("Save cleanup policy").click();await settle();take("cmd_cleaner_save").reject("Settings changed in another window; reload before saving");await settle();
+    check("stale policy save does not erase the draft",root.textContent.includes("another window")&&!button("Save cleanup policy").disabled);
+    button("Discard changes and reload").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),config:{...globalState.config,revision:2}});await settle();
+    check("stale draft can reload the saved revision",button("Save cleanup policy").disabled&&root.textContent.includes("Unsaved edits were discarded"));
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,background_error:"launchd unavailable",config:{...globalState.config,enabled:false,run_when_closed:false,revision:3}});await settle();
+    check("background registration failures disable the schedule visibly",root.textContent.includes("schedule disabled")&&root.textContent.includes("launchd unavailable"));
+    root.querySelector('[aria-label="Run cleanup when GitPulse is closed"]').click();root.querySelector('[aria-label="Enable scheduled cleanup"]').click();await settle();
+    button("Save cleanup policy").click();await settle();const closedSave=take("cmd_cleaner_save");
+    check("closed-app scheduling requires explicit saved consent",closedSave.args.config.run_when_closed===true&&closedSave.args.config.enabled===true);
+    closedSave.resolve({...structuredClone(globalState),background_supported:true,config:{...closedSave.args.config,revision:4}});await settle();
+    button("Refresh status").click();await settle();take("cmd_cleaner_state").resolve({...structuredClone(globalState),background_supported:true,config:{...closedSave.args.config,revision:4}});await settle();
+    await unmount(component);
+    check("global view unmount does not cancel a saved schedule",calls.at(-1).cmd==="cmd_cleaner_state");
+    check("no browser crashes or rejected promises",crashes.length===0);
+  }catch(error){check(String(error),false);}finally{clearTimeout(deadline);finish();}
+</script></body></html>

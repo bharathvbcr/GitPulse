@@ -257,6 +257,8 @@ break before it is written."
     ];
     lines.extend(important_surfaces(map, map_rel));
     lines.push(String::new());
+    lines.push(crate::hygiene::AGENT_RULES.to_owned());
+    lines.push(String::new());
     lines.push(
         "If the map and source disagree, trust the source and re-run `devmap build`.".to_string(),
     );

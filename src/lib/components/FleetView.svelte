@@ -33,6 +33,8 @@
 </script>
 
 <script lang="ts">
+  import GlobalCleaner from "./GlobalCleaner.svelte";
+  let cleanerOpen = $state(false);
   /**
    * The Fleet dashboard: every open repository, and every recent one, on a
    * single grid.
@@ -613,6 +615,11 @@
          let five cards become one line. -->
     <FleetTotals totals={totalStrip} />
   </header>
+
+  <div class="shrink-0 px-4 py-2 border-b border-border">
+    <button class="gp-btn" aria-expanded={cleanerOpen} onclick={() => cleanerOpen = !cleanerOpen}>Global build cleaner</button>
+    {#if cleanerOpen}<div class="max-h-[60vh] overflow-auto py-4"><GlobalCleaner /></div>{/if}
+  </div>
 
   <!-- Fleet Pulse: the workspace's rhythm, from what the cheap sweep already read. -->
   <FleetPulsePanel

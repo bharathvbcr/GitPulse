@@ -100,11 +100,11 @@ jobs:
 
       - name: Svelte Browser Regressions (Chrome)
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
-        run: npm run test:browser
+        run: npm run test:browser && npm run test:browser -- --harness hygiene
 
       - name: Native Renderer Regressions (WKWebView)
         if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
-        run: npm run test:webkit
+        run: npm run test:webkit && npm run test:webkit -- --harness hygiene
 
       # Backlog B2, investigated and declined. The frontend bundle is
       # platform-independent, so in principle one leg could build it and share

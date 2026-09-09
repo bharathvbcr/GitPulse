@@ -107,6 +107,8 @@ const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
 const ts = (...parts) => path.join(REPO_ROOT, "src", "lib", ...parts);
 
 export const CONTRACTS = Object.freeze([
+  { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
+  { label: "hygiene", rustPath: rust("storage", "hygiene", "mod.rs"), tsPath: ts("storage", "hygiene", "types.ts"), structs: ["CacheEntry", "CacheInventory", "HygienePlan", "HygieneOutcome"] },
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },

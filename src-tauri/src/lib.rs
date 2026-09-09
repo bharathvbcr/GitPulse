@@ -91,6 +91,9 @@ pub fn run() {
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
             crate::tool_install::set_app_handle(app.handle().clone());
+            if let Err(error) = storage::hygiene::global::start_scheduler() {
+                log::error!("Cleaner scheduler failed to start: {error}");
+            }
             if let Err(e) = desktop::install_menu(app.handle()) {
                 log::error!(target: "setup", "menu installation failed: {e}");
                 return Err(e.into());
@@ -154,6 +157,15 @@ pub fn run() {
             cmd_get_file_coverage,
             cmd_scan_deps_health,
             cmd_storage_scan,
+            cmd_cache_inventory,
+            cmd_cleaner_state,
+            cmd_cleaner_save,
+            cmd_cleaner_scan,
+            cmd_cleaner_run,
+            cmd_cleaner_cancel,
+            cmd_hygiene_prepare,
+            cmd_hygiene_cancel,
+            cmd_hygiene_execute,
             cmd_branch_cleanup_plan,
             cmd_tag_cleanup_plan,
             cmd_review_outgoing_commits,

@@ -30,6 +30,7 @@ export interface SettingEntry {
 }
 
 export const SETTINGS_CATALOG: readonly SettingEntry[] = [
+  { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {
     id: "theme",
     section: "appearance",

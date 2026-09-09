@@ -11,6 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Add a global build cleaner to Fleet and Settings, with selected roots,
+  exclusions, retention and run budgets, opt-in native scheduling, closed-repo
+  discovery, durable history and an optional macOS headless LaunchAgent.
+- Reuse DevCouncil's Rust hygiene policy and generated agent guidance. Harden
+  traversal, case-insensitive preservation, partial scans, revision revocation,
+  lock release, registration failures and Git filesystem-monitor suppression.
+- Add Repository hygiene to Storage: stale-output previews across supported
+  language ecosystems, shared-cache inspection and tool-owned maintenance,
+  saved retention/weekly-review preferences, cancellation and explicit outcomes.
+
+### Fixed
+
+- Stop labeling untracked environments, agent state, dependency stores, logs
+  and scratch directories as automatically safe to reclaim. Cleanup previews
+  validate ignored paths, tracked content, activity and file identities, and
+  refuse stale, repeated or incomplete plans.
+
 ## [0.0.9] - 2026-09-08
 
 ### Changed

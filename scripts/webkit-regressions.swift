@@ -6,7 +6,7 @@ import WebKit
 guard CommandLine.arguments.count == 2,
       let url = URL(string: CommandLine.arguments[1]),
       url.scheme == "http", url.host == "127.0.0.1",
-      ["/harness/diagnostics.html", "/harness/conflicts.html"].contains(url.path) else {
+      ["/harness/diagnostics.html", "/harness/conflicts.html", "/harness/hygiene.html"].contains(url.path) else {
     fputs("Expected a supported local GitPulse harness URL\n", stderr)
     exit(2)
 }
@@ -14,6 +14,10 @@ guard CommandLine.arguments.count == 2,
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let config = WKWebViewConfiguration()
+// The app under test may lose focus while the agent reports progress. Keep
+// fixture timers running; otherwise a hidden webview can suspend mid-assertion.
+// This affects only the ephemeral test view, not GitPulse's runtime settings.
+if #available(macOS 14.0, *) { config.preferences.inactiveSchedulingPolicy = .none }
 config.websiteDataStore = .nonPersistent()
 let frame = NSRect(x: 0, y: 0, width: 1400, height: 1000)
 let webview = WKWebView(frame: frame, configuration: config)
