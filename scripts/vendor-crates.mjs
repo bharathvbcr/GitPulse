@@ -621,51 +621,64 @@ export function check(env = process.env) {
   const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
   const bySource = new Map(sources(env).map((s) => [s.id, s]));
 
+  // Framework ports have pinned upstream provenance and reviewed local patches.
+  // Their refresh policy differs from sibling snapshots, but file integrity is
+  // the same contract and must remain part of the canonical vendor check.
+  const frameworkDir = path.join(REPO, "src-tauri", "framework");
+  const appManifest = path.join(REPO, "src-tauri", "Cargo.toml");
+  const requiresFramework = existsSync(appManifest) && /\bpath\s*=\s*["']framework\//.test(readManifest(appManifest));
+  const snapshots = [{ dir: VENDOR_DIR, manifest }];
+  if (existsSync(frameworkDir) || requiresFramework) {
+    snapshots.push({ dir: frameworkDir, manifest: JSON.parse(readManifest(path.join(frameworkDir, "PATCHES.json"))) });
+  }
+
   /** @type {CrateCheck[]} */
   const crates = [];
-  for (const crate of manifest.crates) {
-    const dir = path.join(VENDOR_DIR, crate.name);
-    /** @type {string[]} */
-    const edited = [];
+  for (const snapshot of snapshots) {
+    for (const crate of snapshot.manifest.crates) {
+      const dir = path.join(snapshot.dir, crate.name);
+      /** @type {string[]} */
+      const edited = [];
 
-    const present = new Set(walk(dir));
-    for (const [rel, hash] of Object.entries(crate.files)) {
-      if (!present.has(rel)) edited.push(`${rel} (missing)`);
-      else if (sha256(readFileSync(path.join(dir, rel))) !== hash) edited.push(rel);
-      present.delete(rel);
-    }
-    for (const extra of present) edited.push(`${extra} (not vendored)`);
+      const present = new Set(walk(dir));
+      for (const [rel, hash] of Object.entries(crate.files)) {
+        if (!present.has(rel)) edited.push(`${rel} (missing)`);
+        else if (sha256(readFileSync(path.join(dir, rel))) !== hash) edited.push(rel);
+        present.delete(rel);
+      }
+      for (const extra of present) edited.push(`${extra} (not vendored)`);
 
-    const source = bySource.get(crate.origin.repo);
-    /** @type {CrateCheck} */
-    const result = { name: crate.name, edited, upstream: "unavailable", drifted: [], reason: "" };
+      const source = bySource.get(crate.origin.repo);
+      /** @type {CrateCheck} */
+      const result = { name: crate.name, edited, upstream: "unavailable", drifted: [], reason: "" };
 
-    const from = source ? path.join(source.root, crate.origin.path) : "";
-    if (!source || !from || !existsSync(from)) {
-      // The distinction this whole mode exists for: not compared is not clean.
-      result.reason = `${crate.origin.repo} is not checked out here`;
-    } else {
-      const current = gitCommit(source.root);
-      const scratch = mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-check-"));
-      try {
-        const workspace = readToml(readManifest(path.join(source.root, source.workspace, "Cargo.toml")));
-        const expected = prepareCrate(source, crate.name, scratch, workspace, current);
-        // Compare upstream's transformed snapshot with the hashes recorded at
-        // the last refresh. Local edits are an independent verdict above and
-        // must not be misreported as upstream drift.
-        const files = new Set([...Object.keys(crate.files), ...Object.keys(expected.files)]);
-        for (const rel of [...files].sort()) {
-          if (crate.files[rel] !== expected.files[rel]) result.drifted.push(rel);
+      const from = source ? path.join(source.root, crate.origin.path) : "";
+      if (!source || !from || !existsSync(from)) {
+        // The distinction this whole mode exists for: not compared is not clean.
+        result.reason = `${crate.origin.repo} is not checked out here`;
+      } else {
+        const current = gitCommit(source.root);
+        const scratch = mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-check-"));
+        try {
+          const workspace = readToml(readManifest(path.join(source.root, source.workspace, "Cargo.toml")));
+          const expected = prepareCrate(source, crate.name, scratch, workspace, current);
+          // Compare upstream's transformed snapshot with the hashes recorded at
+          // the last refresh. Local edits are an independent verdict above and
+          // must not be misreported as upstream drift.
+          const files = new Set([...Object.keys(crate.files), ...Object.keys(expected.files)]);
+          for (const rel of [...files].sort()) {
+            if (crate.files[rel] !== expected.files[rel]) result.drifted.push(rel);
+          }
+        } finally {
+          rmSync(scratch, { recursive: true, force: true });
         }
-      } finally {
-        rmSync(scratch, { recursive: true, force: true });
+        result.upstream = result.drifted.length === 0 ? "matches" : "drifted";
+        if (current && current !== crate.origin.commit) {
+          result.reason = `upstream has moved to ${current.slice(0, 8)} since vendoring at ${String(crate.origin.commit).slice(0, 8)}`;
+        }
       }
-      result.upstream = result.drifted.length === 0 ? "matches" : "drifted";
-      if (current && current !== crate.origin.commit) {
-        result.reason = `upstream has moved to ${current.slice(0, 8)} since vendoring at ${String(crate.origin.commit).slice(0, 8)}`;
-      }
+      crates.push(result);
     }
-    crates.push(result);
   }
 
   const allowDrift = env.GITPULSE_ALLOW_DRIFT === "1" || env.GITPULSE_ALLOW_DRIFT === "true";

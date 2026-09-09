@@ -1,0 +1,703 @@
+--- a/tauri/Cargo.toml
++++ b/tauri/Cargo.toml
+@@ -96,7 +96,7 @@
+ 
+ # linux
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+-gtk = { version = "0.18", features = ["v3_24"] }
++gtk = { version = "0.19", features = ["v3_24"] }
+ webkit2gtk = { version = "2", features = ["v2_40"], optional = true }
+ 
+ # darwin
+--- a/tauri/rustfmt.toml
++++ b/tauri/rustfmt.toml
+@@ -0,0 +1,15 @@
++max_width = 100
++hard_tabs = false
++tab_spaces = 2
++newline_style = "Unix"
++use_small_heuristics = "Default"
++reorder_imports = true
++reorder_modules = true
++remove_nested_parens = true
++edition = "2021"
++merge_derives = true
++use_try_shorthand = false
++use_field_init_shorthand = false
++force_explicit_abi = true
++# normalize_comments = true
++# wrap_comments = true
+--- a/tauri/src/test/mock_runtime.rs
++++ b/tauri/src/test/mock_runtime.rs
+@@ -503,7 +503,7 @@
+     target_os = "netbsd",
+     target_os = "openbsd"
+   ))]
+-  fn transient_for(self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
++  fn transient_for(self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> Self {
+     self
+   }
+ 
+--- a/tauri/src/webview/webview_window.rs
++++ b/tauri/src/webview/webview_window.rs
+@@ -768,7 +768,7 @@
+     target_os = "openbsd"
+   ))]
+   #[must_use]
+-  pub fn transient_for_raw(mut self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
++  pub fn transient_for_raw(mut self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> Self {
+     self.window_builder = self.window_builder.transient_for_raw(parent);
+     self
+   }
+--- a/tauri/src/window/mod.rs
++++ b/tauri/src/window/mod.rs
+@@ -759,7 +759,7 @@
+     target_os = "openbsd"
+   ))]
+   #[must_use]
+-  pub fn transient_for_raw(mut self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
++  pub fn transient_for_raw(mut self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> Self {
+     self.window_builder = self.window_builder.transient_for(parent);
+     self
+   }
+--- a/tauri-runtime/Cargo.toml
++++ b/tauri-runtime/Cargo.toml
+@@ -43,7 +43,7 @@
+ webview2-com = "0.38"
+ 
+ [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
+-gtk = { version = "0.18", features = ["v3_24"] }
++gtk = { version = "0.19", features = ["v3_24"] }
+ webkit2gtk = { version = "=2.0", features = ["v2_40"] }
+ 
+ [target."cfg(target_os = \"android\")".dependencies]
+--- a/tauri-runtime/rustfmt.toml
++++ b/tauri-runtime/rustfmt.toml
+@@ -0,0 +1,15 @@
++max_width = 100
++hard_tabs = false
++tab_spaces = 2
++newline_style = "Unix"
++use_small_heuristics = "Default"
++reorder_imports = true
++reorder_modules = true
++remove_nested_parens = true
++edition = "2021"
++merge_derives = true
++use_try_shorthand = false
++use_field_init_shorthand = false
++force_explicit_abi = true
++# normalize_comments = true
++# wrap_comments = true
+--- a/tauri-runtime/src/window.rs
++++ b/tauri-runtime/src/window.rs
+@@ -455,7 +455,7 @@
+     target_os = "netbsd",
+     target_os = "openbsd"
+   ))]
+-  fn transient_for(self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self;
++  fn transient_for(self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> Self;
+ 
+   /// Enables or disables drag and drop support.
+   #[cfg(windows)]
+--- a/tauri-runtime-wry/Cargo.toml
++++ b/tauri-runtime-wry/Cargo.toml
+@@ -40,7 +40,7 @@
+ ]
+ 
+ [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
+-gtk = { version = "0.18", features = ["v3_24"] }
++gtk = { version = "0.19", features = ["v3_24"] }
+ webkit2gtk = { version = "=2.0", features = ["v2_40"] }
+ percent-encoding = "2"
+ 
+--- a/tauri-runtime-wry/rustfmt.toml
++++ b/tauri-runtime-wry/rustfmt.toml
+@@ -0,0 +1,15 @@
++max_width = 100
++hard_tabs = false
++tab_spaces = 2
++newline_style = "Unix"
++use_small_heuristics = "Default"
++reorder_imports = true
++reorder_modules = true
++remove_nested_parens = true
++edition = "2021"
++merge_derives = true
++use_try_shorthand = false
++use_field_init_shorthand = false
++force_explicit_abi = true
++# normalize_comments = true
++# wrap_comments = true
+--- a/tauri-runtime-wry/src/lib.rs
++++ b/tauri-runtime-wry/src/lib.rs
+@@ -1101,7 +1101,7 @@
+     target_os = "netbsd",
+     target_os = "openbsd"
+   ))]
+-  fn transient_for(mut self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
++  fn transient_for(mut self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> Self {
+     self.inner = self.inner.with_transient_for(parent);
+     self
+   }
+--- a/wry/Cargo.toml
++++ b/wry/Cargo.toml
+@@ -201,11 +201,11 @@
+ version = "6"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11]
+-version = "0.18"
++version = "0.19"
+ optional = true
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gtk]
+-version = "0.18"
++version = "0.19"
+ optional = true
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.javascriptcore-rs]
+@@ -217,7 +217,7 @@
+ version = "2.3"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.soup3]
+-version = "0.5"
++version = "0.9"
+ optional = true
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.webkit2gtk]
+--- a/wry/src/webkitgtk/mod.rs
++++ b/wry/src/webkitgtk/mod.rs
+@@ -16,7 +16,7 @@
+ use gtk::{
+   gdk::{self},
+   gio::Cancellable,
+-  glib::{Cast, IsA},
++  glib::prelude::{Cast, IsA},
+   prelude::*,
+ };
+ use http::Request;
+@@ -235,7 +235,11 @@
+ 
+     // Gtk.Window
+     let window = gtk::Window::new(gtk::WindowType::Toplevel);
+-    window.connect_realize(glib::clone!(@weak gdk_window as wd => move |w| w.set_window(wd)));
++    window.connect_realize(glib::clone!(
++      #[weak(rename_to = wd)]
++      gdk_window,
++      move |w| w.set_window(wd)
++    ));
+     window.set_has_window(true);
+     window.realize();
+ 
+--- a/wry/src/webkitgtk/web_context.rs
++++ b/wry/src/webkitgtk/web_context.rs
+@@ -5,7 +5,7 @@
+ //! Unix platform extensions for [`WebContext`](super::WebContext).
+ 
+ use crate::{Error, RequestAsyncResponder};
+-use gtk::glib::{self, MainContext, ObjectExt};
++use gtk::glib::{self, prelude::ObjectExt, MainContext};
+ use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Request, Response as HttpResponse};
+ use soup::{MessageHeaders, MessageHeadersType};
+ use std::{
+--- a/tao/Cargo.toml
++++ b/tao/Cargo.toml
+@@ -266,14 +266,14 @@
+ version = "0.8.0"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkwayland-sys]
+-version = "0.18.0"
++version = "0.19"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11-sys]
+-version = "0.18"
++version = "0.19"
+ optional = true
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gtk]
+-version = "0.18"
++version = "0.19"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.parking_lot]
+ version = "0.12"
+@@ -413,3 +413,7 @@
+ 
+ [target.'cfg(target_os = "windows")'.dev-dependencies.softbuffer]
+ version = "0.4"
++
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.async-channel]
++version = "2.5"
++
+--- a/tao/src/platform/unix.rs
++++ b/tao/src/platform/unix.rs
+@@ -119,7 +119,7 @@
+   fn with_skip_taskbar(self, skip: bool) -> WindowBuilder;
+   /// Set this window as a transient dialog for `parent`
+   /// <https://gtk-rs.org/gtk3-rs/stable/latest/docs/gdk/struct.Window.html#method.set_transient_for>
+-  fn with_transient_for(self, parent: &impl gtk::glib::IsA<gtk::Window>) -> WindowBuilder;
++  fn with_transient_for(self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> WindowBuilder;
+ 
+   /// Whether to enable or disable the internal draw for transparent window.
+   ///
+@@ -163,8 +163,8 @@
+     self
+   }
+ 
+-  fn with_transient_for(mut self, parent: &impl gtk::glib::IsA<gtk::Window>) -> WindowBuilder {
+-    use gtk::glib::Cast;
++  fn with_transient_for(mut self, parent: &impl gtk::glib::prelude::IsA<gtk::Window>) -> WindowBuilder {
++    use gtk::glib::prelude::Cast;
+     self.platform_specific.parent = Parent::ChildOf(parent.clone().upcast());
+     self
+   }
+--- a/tao/src/platform_impl/linux/device.rs
++++ b/tao/src/platform_impl/linux/device.rs
+@@ -3,7 +3,6 @@
+   ptr,
+ };
+ 
+-use gtk::glib;
+ use x11_dl::{xinput2, xlib};
+ 
+ use crate::event::{DeviceEvent, ElementState, RawKeyEvent};
+@@ -11,7 +10,7 @@
+ use super::keycode_from_scancode;
+ 
+ /// Spawn Device event thread. Only works on x11 since wayland doesn't have such global events.
+-pub fn spawn(device_tx: glib::Sender<DeviceEvent>) {
++pub fn spawn(device_tx: super::main_context_channel::Sender<DeviceEvent>) {
+   std::thread::spawn(move || unsafe {
+     let xlib = xlib::Xlib::open().unwrap();
+     let xinput2 = xinput2::XInput2::open().unwrap();
+--- a/tao/src/platform_impl/linux/event_loop.rs
++++ b/tao/src/platform_impl/linux/event_loop.rs
+@@ -59,7 +59,7 @@
+   /// Window Ids of the application
+   pub(crate) windows: Rc<RefCell<HashSet<WindowId>>>,
+   /// Window requests sender
+-  pub(crate) window_requests_tx: glib::Sender<(WindowId, WindowRequest)>,
++  pub(crate) window_requests_tx: super::main_context_channel::Sender<(WindowId, WindowRequest)>,
+   /// Draw event sender
+   pub(crate) draw_tx: crossbeam_channel::Sender<WindowId>,
+   _marker: std::marker::PhantomData<T>,
+@@ -187,6 +187,8 @@
+ }
+ 
+ pub struct EventLoop<T: 'static> {
++  /// Main-context receivers are cancelled with the event loop.
++  _sources: Vec<super::main_context_channel::AttachedReceiver>,
+   /// Window target.
+   window_target: RootELW<T>,
+   /// User event sender for EventLoopProxy
+@@ -241,7 +243,7 @@
+     let user_event_tx = event_tx.clone();
+ 
+     // Create event loop window target.
+-    let (window_requests_tx, window_requests_rx) = glib::MainContext::channel(Priority::default());
++    let (window_requests_tx, window_requests_rx) = super::main_context_channel::channel(Priority::default());
+     let display = gdk::Display::default()
+       .expect("GdkDisplay not found. This usually means `gkt_init` hasn't called yet.");
+     let window_target = EventLoopWindowTarget {
+@@ -253,15 +255,17 @@
+       _marker: std::marker::PhantomData,
+     };
+ 
++    let mut sources = Vec::new();
++
+     // Spawn x11 thread to receive Device events.
+     #[cfg(feature = "x11")]
+     let run_device_thread = if window_target.is_x11() {
+-      let (device_tx, device_rx) = glib::MainContext::channel(glib::Priority::default());
++      let (device_tx, device_rx) = super::main_context_channel::channel(glib::Priority::default());
+       let user_event_tx = user_event_tx.clone();
+       let run_device_thread = Rc::new(AtomicBool::new(true));
+       let run = run_device_thread.clone();
+       device::spawn(device_tx);
+-      device_rx.attach(Some(&context), move |event| {
++      sources.push(device_rx.attach(Some(&context), move |event| {
+         if let Err(e) = user_event_tx.send(Event::DeviceEvent {
+           device_id: DEVICE_ID,
+           event,
+@@ -273,7 +277,7 @@
+         } else {
+           glib::ControlFlow::Break
+         }
+-      });
++      }));
+       Some(run_device_thread)
+     } else {
+       None
+@@ -288,13 +292,14 @@
+     #[cfg(feature = "dbus")]
+     {
+       let tx_requests_clone = window_target.window_requests_tx.clone();
+-      if let Err(e) = super::portal::receive_theme_changed(tx_requests_clone) {
+-        log::debug!("Unable to receive theme changed events: {e}");
++      match super::portal::receive_theme_changed(tx_requests_clone) {
++        Ok(source) => sources.push(source),
++        Err(e) => log::debug!("Unable to receive theme changed events: {e}"),
+       }
+     }
+ 
+     // Window Request
+-    window_requests_rx.attach(Some(&context), move |(id, request)| {
++    sources.push(window_requests_rx.attach(Some(&context), move |(id, request)| {
+       if let Some(window) = app_.window_by_id(id.0) {
+         match request {
+           WindowRequest::Title(title) => window.set_title(&title),
+@@ -982,10 +987,11 @@
+         }
+       }
+       glib::ControlFlow::Continue
+-    });
++    }));
+ 
+     // Create event loop itself.
+     let event_loop = Self {
++      _sources: sources,
+       window_target: RootELW {
+         p: window_target,
+         _marker: std::marker::PhantomData,
+--- a/tao/src/platform_impl/linux/main_context_channel.rs
++++ b/tao/src/platform_impl/linux/main_context_channel.rs
+@@ -0,0 +1,63 @@
++// Copyright 2026 GitPulse contributors
++// SPDX-License-Identifier: Apache-2.0
++
++//! Replacement for the removed GLib channel API. The receiver stays on its
++//! owning main context; senders never execute GTK callbacks on another thread.
++use gtk::glib::{self, ControlFlow, MainContext, Priority};
++use std::{sync::mpsc::SendError, time::Duration};
++
++pub(crate) struct Sender<T>(async_channel::Sender<T>);
++pub(crate) struct Receiver<T>(async_channel::Receiver<T>, Priority);
++pub(crate) struct AttachedReceiver(glib::JoinHandle<()>);
++
++impl<T> Clone for Sender<T> {
++    fn clone(&self) -> Self {
++        Self(self.0.clone())
++    }
++}
++
++impl<T> Sender<T> {
++    pub(crate) fn send(&self, value: T) -> Result<(), SendError<T>> {
++        // Keep the former channel's nonblocking, ordered, unbounded send contract.
++        self.0
++            .try_send(value)
++            .map_err(|e| SendError(e.into_inner()))
++    }
++}
++
++pub(crate) fn channel<T>(priority: Priority) -> (Sender<T>, Receiver<T>) {
++    let (tx, rx) = async_channel::unbounded();
++    (Sender(tx), Receiver(rx, priority))
++}
++
++impl<T: 'static> Receiver<T> {
++    pub(crate) fn attach(
++        self,
++        context: Option<&MainContext>,
++        mut callback: impl FnMut(T) -> ControlFlow + 'static,
++    ) -> AttachedReceiver {
++        let context = context.cloned().unwrap_or_default();
++        AttachedReceiver(context.spawn_local_with_priority(self.1, async move {
++            let mut dispatched = 0;
++            while let Ok(value) = self.0.recv().await {
++                if callback(value) == ControlFlow::Break {
++                    break;
++                }
++                dispatched += 1;
++                // A continuous producer must not monopolize the GTK main context.
++                if dispatched == 64 {
++                    glib::timeout_future_with_priority(self.1, Duration::ZERO).await;
++                    dispatched = 0;
++                }
++            }
++        }))
++    }
++}
++
++impl Drop for AttachedReceiver {
++    fn drop(&mut self) {
++        // Dropping an event loop closes its channels even if a window or portal
++        // still holds a sender. GLib JoinHandle alone detaches on drop.
++        self.0.abort();
++    }
++}
+--- a/tao/src/platform_impl/linux/mod.rs
++++ b/tao/src/platform_impl/linux/mod.rs
+@@ -9,6 +9,7 @@
+ mod keyboard;
+ mod keycode;
+ mod monitor;
++mod main_context_channel;
+ #[cfg(feature = "dbus")]
+ mod portal;
+ mod util;
+--- a/tao/src/platform_impl/linux/portal.rs
++++ b/tao/src/platform_impl/linux/portal.rs
+@@ -5,7 +5,8 @@
+   message::MatchRule,
+   Error,
+ };
+-use gtk::glib::{ControlFlow, MainContext, Priority, Sender};
++use gtk::glib::{ControlFlow, Priority};
++use super::main_context_channel::{channel, AttachedReceiver, Sender};
+ use log::warn;
+ use std::{thread, time::Duration};
+ 
+@@ -31,10 +32,10 @@
+   Ok(color_scheme_to_theme(result.0 .0 .0))
+ }
+ 
+-pub fn receive_theme_changed(window_tx: Sender<(WindowId, WindowRequest)>) -> Result<(), Error> {
++pub fn receive_theme_changed(window_tx: Sender<(WindowId, WindowRequest)>) -> Result<AttachedReceiver, Error> {
+   let conn = SyncConnection::new_session()?;
+   let match_rule = MatchRule::new_signal("org.freedesktop.portal.Settings", "SettingChanged");
+-  let (tx, rx) = MainContext::channel(Priority::DEFAULT);
++  let (tx, rx) = channel(Priority::DEFAULT);
+ 
+   conn.add_match(match_rule, move |_: (), _, msg| {
+     let mut iter = msg.iter_init();
+@@ -50,7 +51,7 @@
+     true
+   })?;
+ 
+-  rx.attach(None, move |theme| {
++  let source = rx.attach(None, move |theme| {
+     if let Err(e) = window_tx.send((WindowId::dummy(), WindowRequest::SetTheme(Some(theme)))) {
+       warn!("Failed to send theme change request: {}", e);
+       ControlFlow::Break
+@@ -66,7 +67,7 @@
+     }
+   });
+ 
+-  Ok(())
++  Ok(source)
+ }
+ 
+ fn color_scheme_to_theme(color_scheme: u32) -> Theme {
+--- a/tao/src/platform_impl/linux/util.rs
++++ b/tao/src/platform_impl/linux/util.rs
+@@ -10,7 +10,7 @@
+     Display,
+   },
+   glib::{self},
+-  traits::{GtkWindowExt, WidgetExt},
++  prelude::{GtkWindowExt, WidgetExt},
+ };
+ use std::{cell::RefCell, rc::Rc};
+ 
+--- a/tao/src/platform_impl/linux/window.rs
++++ b/tao/src/platform_impl/linux/window.rs
+@@ -52,7 +52,7 @@
+   pub(crate) window: gtk::ApplicationWindow,
+   pub(crate) default_vbox: Option<gtk::Box>,
+   /// Window requests sender
+-  pub(crate) window_requests_tx: glib::Sender<(WindowId, WindowRequest)>,
++  pub(crate) window_requests_tx: super::main_context_channel::Sender<(WindowId, WindowRequest)>,
+   scale_factor: Rc<AtomicI32>,
+   inner_position: Rc<(AtomicI32, AtomicI32)>,
+   outer_position: Rc<(AtomicI32, AtomicI32)>,
+--- a/muda/Cargo.toml
++++ b/muda/Cargo.toml
+@@ -91,7 +91,7 @@
+ version = "0.45"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk]
+-version = "0.18"
++version = "0.19"
+ optional = true
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.libxdo]
+--- a/webkit2gtk/Cargo.toml
++++ b/webkit2gtk/Cargo.toml
+@@ -135,38 +135,38 @@
+ version = "^1.0"
+ 
+ [dependencies.cairo-rs]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.ffi]
+ version = "2.0.1"
+ package = "webkit2gtk-sys"
+ 
+ [dependencies.gdk]
+-version = "^0.18.0"
++version = "0.19"
+ 
+ [dependencies.gdk-sys]
+-version = "^0.18.0"
++version = "0.19"
+ 
+ [dependencies.gio]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.gio-sys]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.glib]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.glib-sys]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.gobject-sys]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [dependencies.gtk]
+-version = "^0.18.0"
++version = "0.19"
+ 
+ [dependencies.gtk-sys]
+-version = "^0.18.0"
++version = "0.19"
+ 
+ [dependencies.java_script_core]
+ version = "=1.1"
+@@ -179,5 +179,5 @@
+ version = "1.8"
+ 
+ [dependencies.soup]
+-version = "0.5"
++version = "0.9"
+ package = "soup3"
+--- a/webkit2gtk/src/web_context.rs
++++ b/webkit2gtk/src/web_context.rs
+@@ -4,7 +4,7 @@
+ use super::{NetworkProxyMode, NetworkProxySettings};
+ #[cfg(feature = "v2_6")]
+ use glib::translate::{FromGlibPtrNone, IntoGlib, ToGlibPtr, ToGlibPtrMut};
+-use glib::IsA;
++use glib::prelude::IsA;
+ 
+ use super::WebContext;
+ 
+--- a/webkit2gtk/src/web_view.rs
++++ b/webkit2gtk/src/web_view.rs
+@@ -5,7 +5,7 @@
+ #[cfg(feature = "v2_6")]
+ use crate::WebContext;
+ use crate::WebView;
+-use glib::IsA;
++use glib::prelude::IsA;
+ 
+ pub trait WebViewExtManual {
+   #[cfg(feature = "v2_6")]
+@@ -27,7 +27,7 @@
+     use glib::{
+       object::Cast,
+       translate::{FromGlibPtrNone, IntoGlib, ToGlibPtr},
+-      StaticType,
++      prelude::StaticType,
+     };
+     use std::{ffi::CString, ptr};
+     assert_initialized_main_thread!();
+--- a/webkit2gtk-sys/Cargo.toml
++++ b/webkit2gtk-sys/Cargo.toml
+@@ -140,27 +140,27 @@
+ version = "^1.0"
+ 
+ [dependencies.cairo]
+-version = "0.18"
++version = "0.22"
+ package = "cairo-sys-rs"
+ 
+ [dependencies.gdk]
+-version = "0.18"
++version = "0.19"
+ package = "gdk-sys"
+ 
+ [dependencies.gio]
+-version = "0.18"
++version = "0.22"
+ package = "gio-sys"
+ 
+ [dependencies.glib]
+-version = "0.18"
++version = "0.22"
+ package = "glib-sys"
+ 
+ [dependencies.gobject]
+-version = "0.18"
++version = "0.22"
+ package = "gobject-sys"
+ 
+ [dependencies.gtk]
+-version = "0.18"
++version = "0.19"
+ package = "gtk-sys"
+ 
+ [dependencies.java_script_core]
+@@ -171,7 +171,7 @@
+ version = "0.2"
+ 
+ [dependencies.soup]
+-version = "0.5"
++version = "0.9"
+ package = "soup3-sys"
+ 
+ [dev-dependencies.shell-words]
+--- a/javascriptcore-rs/Cargo.toml
++++ b/javascriptcore-rs/Cargo.toml
+@@ -45,7 +45,7 @@
+ package = "javascriptcore-rs-sys"
+ 
+ [dependencies.glib]
+-version = "^0.18.0"
++version = "0.22"
+ 
+ [features]
+ default = ["v2_38"]
+--- a/javascriptcore-rs-sys/Cargo.toml
++++ b/javascriptcore-rs-sys/Cargo.toml
+@@ -50,11 +50,11 @@
+ name = "javascriptcore_rs_sys"
+ 
+ [dependencies.glib]
+-version = "^0.18"
++version = "0.22"
+ package = "glib-sys"
+ 
+ [dependencies.gobject]
+-version = "^0.18"
++version = "0.22"
+ package = "gobject-sys"
+ 
+ [dependencies.libc]
+--- a/libappindicator/Cargo.toml
++++ b/libappindicator/Cargo.toml
+@@ -23,13 +23,13 @@
+ license = "Apache-2.0 OR MIT"
+ 
+ [dependencies.glib]
+-version = "0.18"
++version = "0.22"
+ 
+ [dependencies.gtk]
+-version = "0.18"
++version = "0.19"
+ 
+ [dependencies.gtk-sys]
+-version = "0.18"
++version = "0.19"
+ 
+ [dependencies.libappindicator-sys]
+ version = "0.9"
+--- a/libappindicator-sys/Cargo.toml
++++ b/libappindicator-sys/Cargo.toml
+@@ -22,7 +22,7 @@
+ license = "Apache-2.0 OR MIT"
+ 
+ [dependencies.gtk-sys]
+-version = "0.18"
++version = "0.19"
+ 
+ [dependencies.libloading]
+ version = "0.7"

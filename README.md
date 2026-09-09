@@ -267,7 +267,7 @@ npm run tauri dev
 | --- | --- |
 | `npm run tauri dev` | Launch desktop app with frontend hot-reload and backend live-rebuild |
 | `npm run dev` | Run Vite development server only (browser UI mode) |
-| `npm run check` | Run `svelte-check` (classic TypeScript 6) and `tsgo` on `tsconfig.node.json` |
+| `npm run check` | Run `svelte-check` (TypeScript 6 compatibility API) and stable TypeScript 7 `tsc` on `tsconfig.node.json` |
 | `npm run check:ipc` | Verify 187 Rust commands match frontend `invoke()` calls with zero drift |
 | `npm run check:vendor-schema` | Pin vendored DevMap store schema against the installed `devmap` CLI |
 | `npm run check:types` | Validate that Rust serde structs match TypeScript interfaces field-for-field (coverage & terminal) |
@@ -281,6 +281,9 @@ npm run tauri dev
 | `npm run check:workflows` | Lint `.github/workflows/*` with actionlint — the only gate that reads `release.yml`, which CI otherwise sees only on a tag |
 | `npm run build` | Build frontend production bundle |
 | `npm run tauri build` | Bundle native installers for the host platform |
+
+See [Dependency health](docs/DEPENDENCY_HEALTH.md) for the TypeScript 6/7
+compatibility setup, uncapped audit results, and unresolved GTK3 advisories.
 
 For a release, commit the candidate and run `npm run ci:local`, then push the
 commit and wait for both **CI** and **Code Coverage** to pass for that exact SHA.

@@ -1,0 +1,965 @@
+{
+  "note": "Pinned framework consumers ported locally to GTK3 0.19 and GLib 0.22. No package versions are spoofed. See README.md for maintenance and verification.",
+  "crates": [
+    {
+      "name": "tauri",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/tauri",
+        "commit": "406feea75283545496ef7398c5e2f0fb9b306b64",
+        "path": "crates/tauri"
+      },
+      "rewrites": [
+        "package.authors = [\"Tauri Programme within The Commons Conservancy\"]",
+        "package.homepage = \"https://tauri.app/\"",
+        "package.repository = \"https://github.com/tauri-apps/tauri\"",
+        "package.categories = [\"gui\", \"web-programming\"]",
+        "package.license = \"Apache-2.0 OR MIT\"",
+        "package.edition = \"2021\"",
+        "package.rust-version = \"1.90\"",
+        "dependencies.tauri-runtime from the workspace",
+        "dependencies.tauri-macros from the workspace",
+        "dependencies.tauri-utils from the workspace",
+        "dependencies.tauri-runtime-wry from the workspace",
+        "build-dependencies.tauri-build from the workspace",
+        "build-dependencies.tauri-utils from the workspace",
+        "dropped [dev-dependencies]",
+        "omitted external workspace examples"
+      ],
+      "files": {
+        "CHANGELOG.md": "2349f6a4b8660b4085ee4a9a1d293539b5485395ec64cf2d7bda618fcf073ca4",
+        "Cargo.toml": "934584564815992336042a56f5deea4389dc309d56a6a44c53a70b6b359817cc",
+        "LICENSE-APACHE-2.0": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "LICENSE-MIT": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d",
+        "README.md": "d53737b76e569ea9d7af01d69be6fb729959b97bc08d0564a421c3917b584070",
+        "build.rs": "62d1a1e16affe3c9b59d6766159a568255e385cab969ce4149ad6081276715bd",
+        "mobile/android/.gitignore": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+        "mobile/android/build.gradle.kts": "8e4adffd0df87ac320422b1a0cb095fc76a6df4f03bd1934a5c955324992792f",
+        "mobile/android/consumer-rules.pro": "07ae2ffe37f0f484c46401f510ef003e1bbe9f708d1d2597546c729eb9956cca",
+        "mobile/android/src/androidTest/java/app/tauri/ExampleInstrumentedTest.kt": "1e7c0c6f613431962750a2f80dcf8a0c231c4b5fb2f569bfd55b5fa0e80f2e7d",
+        "mobile/android/src/main/AndroidManifest.xml": "8ef94a6aec2218c5fd02408d018f6d52602c0ef4473dd1c115c5c6964f1e63e1",
+        "mobile/android/src/main/java/app/tauri/AppPlugin.kt": "931d4a7636b75c81e7daed48e1822fa8bf02d2993d620592ed7febca94702555",
+        "mobile/android/src/main/java/app/tauri/FsUtils.kt": "217851c9539c6171c46354fb24c8af9501babd045a122e239f01009794d122c9",
+        "mobile/android/src/main/java/app/tauri/JniMethod.kt": "ece2f2b7179edeb9cf0a62acb116390f53c23a32e51520b6e4c2d7601a581a88",
+        "mobile/android/src/main/java/app/tauri/Logger.kt": "771fa4822dec7cc95aab726ee1c176c17970c4ffee737ad53959fea1fa26ef7d",
+        "mobile/android/src/main/java/app/tauri/PathPlugin.kt": "fe5a98a6ed0ca6e34aa1ea0ee190c16e8e07766e59938f5fb22cf1b5e8f8ed41",
+        "mobile/android/src/main/java/app/tauri/PermissionHelper.kt": "7df0ea86bfa5159a5fbbf7660687c36d15d7cf2cd167d051144e4447a650cb8e",
+        "mobile/android/src/main/java/app/tauri/PermissionState.kt": "c38e1f200db71faf05f8d7acf643b2f1d6dd8970b8ae51a6a7c842743a596be2",
+        "mobile/android/src/main/java/app/tauri/annotation/ActivityCallback.kt": "aec0ebccfe66d7b857606a9244e717d5aa3b02324f50fbdfe4b4ee1a67ad8637",
+        "mobile/android/src/main/java/app/tauri/annotation/InvokeArg.kt": "6b747509a75a7c8f1c31c03a23a80b4f83cd226f87033a318db1782505b2aeab",
+        "mobile/android/src/main/java/app/tauri/annotation/Permission.kt": "bca04adb46a3de1c36da755fb62a5efb40481a7a529dd0f727eadd95466ecbd7",
+        "mobile/android/src/main/java/app/tauri/annotation/PermissionCallback.kt": "d0a63179ca048629d37e9efe696d2c6554095b7de64bbbc1450a8f07d3888d8e",
+        "mobile/android/src/main/java/app/tauri/annotation/PluginMethod.kt": "aee7aef7a3f59ad67ca3a2cfbcb2a2c2cacfa28bddf4b2f565ed6e930f92c8c1",
+        "mobile/android/src/main/java/app/tauri/annotation/TauriPlugin.kt": "361783a7baf30a33192c22f922f50fb2c97d8a7d9ae9dc774d8b637f9eeea04a",
+        "mobile/android/src/main/java/app/tauri/plugin/Channel.kt": "f6f5c2dcc442b9e81165f55f80d363129bc91b130586abb8489cd3006af00011",
+        "mobile/android/src/main/java/app/tauri/plugin/InvalidPluginMethodException.kt": "90d2dddfb918447ed8fd35c44be7f00e41b89fcd586eeca995e0ead56c38b6c4",
+        "mobile/android/src/main/java/app/tauri/plugin/Invoke.kt": "05cadb94907dbd3979d8c7eaad7bd8f540c38cc9d988a5513777eadd18330028",
+        "mobile/android/src/main/java/app/tauri/plugin/JSArray.kt": "fca8b72a6bf357b6cc57aa21ac787dbe3d69fca27f927b0c3f598567dc17f52f",
+        "mobile/android/src/main/java/app/tauri/plugin/JSObject.kt": "234a9afa4da858b3dbd8d5a688209a640984166482e040ab908b34ed577726b5",
+        "mobile/android/src/main/java/app/tauri/plugin/Plugin.kt": "c5dc0d1b59ac2024399afd0893f1182ae583b4d4f2cc88a5ba7864d365f77f7c",
+        "mobile/android/src/main/java/app/tauri/plugin/PluginHandle.kt": "628b69f19d03b861765a2f7f3140e5b6a79bd991966019bb250bf7ae79bfd301",
+        "mobile/android/src/main/java/app/tauri/plugin/PluginManager.kt": "e8db79298a14abbea1924006084125db0652bfa04f6295c6aeab3657141e7a49",
+        "mobile/android/src/main/java/app/tauri/plugin/PluginMethodData.kt": "c3024eb23b038fdd1566e69db725c8c5d39fb66909baf45d258ccfe8449daedf",
+        "mobile/android/src/main/java/app/tauri/plugin/PluginResult.kt": "437f44a6ccf5354a5ec1a3a3c894609f6df90999f397e52dfaafb6e74d30c006",
+        "mobile/android-codegen/TauriActivity.kt": "575a5890676bcc363294d2e3ec6ebe0a3943358fac4bc168e7ea2df0b7bc3640",
+        "mobile/ios-api/.gitignore": "bc9466a4cd82cf38d2a4471c15c5c6b8153182f361a72c9926a9f422d966e3b0",
+        "mobile/ios-api/Package.swift": "bd322622d84f3538b512646267fcf063734ad3dcede35480950cfd95c2ed392a",
+        "mobile/ios-api/README.md": "a06a181db430708640f970ac98611e3feea64430d5b4ab82c15d778604937591",
+        "mobile/ios-api/Sources/Tauri/Channel.swift": "850e8239ccb561ea7177f0f66b33d5b63e97faeefcb79b60640007934c3894a4",
+        "mobile/ios-api/Sources/Tauri/Invoke.swift": "afc9ee63daafe1754969b6dfd104d49d2ca09fd41e7c6343063c13d9e56f7d3e",
+        "mobile/ios-api/Sources/Tauri/JSTypes.swift": "bce9da78d74d495a2d05176cb0b68bd9a40ebfcac8c8e9cb1678d4ca142bd653",
+        "mobile/ios-api/Sources/Tauri/JsonValue.swift": "a22a4bad5788132955a63160bda00eeb62a6e138993d46504f6f96e2fb94246d",
+        "mobile/ios-api/Sources/Tauri/Logger.swift": "9624719792f6ce0baf6df0aaf2928efc8c0aef77972a3fb638ce67e3a6dfb918",
+        "mobile/ios-api/Sources/Tauri/Plugin/Plugin.swift": "e5d2e0e6f6c178b0ea2745dcd88f68b6a142154c3b245845bb6b9026b3a76d69",
+        "mobile/ios-api/Sources/Tauri/Tauri.swift": "4c7aa0b830e17851784fd14ca6941d2d53bd3b902e0477e7416f90da4488333c",
+        "mobile/ios-api/Sources/Tauri/UiUtils.swift": "c12b2a5a3bde289c45dd6c348cc41d7072c81a1559eac76339ea061c4fa5d89c",
+        "mobile/ios-api/Tests/TauriTests/TauriTests.swift": "ef1e10dafc147b1d6b145f19ab0a81cb44eb80d7b989abfae4e2447209a88a34",
+        "mobile/proguard-tauri.pro": "9f6f2555912c6b984ab9be8e4766da646b175dd33c3a193a4d72c4a56a1b6a2c",
+        "permissions/app/autogenerated/reference.md": "904d5a966cb1b4000f401a29ab734e4dcb2842e9659b8adcf7831167e16ea634",
+        "permissions/event/autogenerated/reference.md": "018766e1817884ed384b525480e58e63d1860994441c114d1a2517967a267d49",
+        "permissions/image/autogenerated/reference.md": "e3fe93fbb7e62c0139592f4b030d50254c1fbbcc518785bb98ab1f037e251e5c",
+        "permissions/menu/autogenerated/reference.md": "4bed65930223d505c3fc3295d299f07165d5b355b7a5ba910501fc089b2f0044",
+        "permissions/path/autogenerated/reference.md": "8be6a806aaaf1a081fe25aadabf253b74337c5f31b5f356c078ce43ddd47a098",
+        "permissions/resources/autogenerated/reference.md": "593941263d28df065d95a9db260220fad053d4c5aca3b74a9d58977199127210",
+        "permissions/tray/autogenerated/reference.md": "f17969a556be8c3788821cc5eaffa3a2604ab78f647aaae294305a93b67c0178",
+        "permissions/webview/autogenerated/reference.md": "5ee143504a878ca35dcd1277310c152fc93668da50573c1acfab051fa9cfe8ec",
+        "permissions/window/autogenerated/reference.md": "11e9af4caef9cec04c891022d3fd9996d7a6f5ece1d55455fe2cf7ff89ee172c",
+        "rustfmt.toml": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c",
+        "scripts/bundle.global.js": "5baf76da329fd3d6b1428249efc178378169b561019a2e56eb3f213a25ea7448",
+        "scripts/core.js": "71056442a732cca1f03572ccae96d68e16104c3a591c64de9618cd304e063070",
+        "scripts/freeze_prototype.js": "599745f0da51f0ba6c7dcbb7c770d6f538f337f6df7f1bf420e4043b9e4b6bf9",
+        "scripts/init.js": "2a062abc65bc99ac458dd9a78701a8a9e3f473aa1f25afa64dc810036932f973",
+        "scripts/ipc-protocol.js": "68ae690606006f733bde75dd8bb6748464954a22c7e83914a93b1abc221d7072",
+        "scripts/ipc.js": "3e3766fc90efa68003096cbf0a07c6a00cb31c5756d55b5a68ebbfd2930c4865",
+        "scripts/isolation.js": "58e79828ba6d68c79eceb276d62f766710f77df70c5fec1f79176bd6aa6d0ae1",
+        "scripts/pattern.js": "149570459687f1636c02e41ede8b40efe52378965eeddb6dbfebc0c525a3551b",
+        "scripts/process-ipc-message-fn.js": "d51917f89e4d3d318d63f1f4f5a7ac7ea1399a5b85c81a840c4d606597f29132",
+        "src/app/plugin.rs": "cc0d3d578800388a64f1ec1dec8602923214d19c7e6115a54b2fbac06009480c",
+        "src/app.rs": "e0840fe2df0d45aa5a62da7fd3ea4ed39d8bc1df18ae02b5ca84f684c799898b",
+        "src/async_runtime.rs": "ccee9dc653f37366a4060d64c6b447ccb98c08300316298be3afc7a98b1301af",
+        "src/error.rs": "ad60a8f6bf79b474ca14b3014fc0b8c2f8d6d4d06632dae2d6a801752d152594",
+        "src/event/event-system-spec.md": "ca15ed691a62d531b790f1fab1d3b07f6e5dad3711c14e6c821d64b802038e02",
+        "src/event/event_name.rs": "982908c70b4d51378d2298f8446fbbf1dbb253856b46c591c680303affd4765e",
+        "src/event/init.js": "8946488895cc9879f2bf8fee98be454d0f21949b946c264b47d2a2fc84eb1df0",
+        "src/event/listener.rs": "86f85a4e6c6a04596bf6badbe757bf2327f0e1ff8ea1e2dce53146f57c739758",
+        "src/event/mod.rs": "0032a7345ef649e4e5d06638194f99ea1c7565790d85cd8a3b0f56fd645eceab",
+        "src/event/plugin.rs": "90f6bb584d14d572ded405942165e38ef4b9be9de68e75ecf19ee83fe2a9091f",
+        "src/image/mod.rs": "85f4f11c242f5ee0def9ef143b728dfdb6469dab84b8fe75f80717aa72c02bc6",
+        "src/image/plugin.rs": "7fd503f749e652244ead7711be14f242e1e7b691839e496176645ca518365bdb",
+        "src/ios.rs": "a9c1512a4ff26f6a443c04ab2740cac7583b13e2c4288f04a6b631fceece4344",
+        "src/ipc/authority.rs": "96c0bbe0f3840daec831b0997b5785f3117d38cc23a28279cb8b6d7aa9299813",
+        "src/ipc/capability_builder.rs": "9b4ccd15b7aa406950347cce5d5dd234ce44a96c3697316d98e6ae017598cd61",
+        "src/ipc/channel.rs": "8533436b36afb959401052ab0bd7990c63817e9d984fe0daa49a80bc6ed35e5f",
+        "src/ipc/command.rs": "d611effb696608cf698d25c203fae99b05f862ef2321fef1d71ee75aa54e470b",
+        "src/ipc/format_callback.rs": "e9de68956b9437f440291d37292bb9544b6c0b180029e6d2772685aa768a494d",
+        "src/ipc/mod.rs": "ce5cf626d9ea63ab7bc2dd8e1b9bb991fd76f0c47f4c0d34ef723133ea1ca80b",
+        "src/ipc/protocol.rs": "d5e98aef7b7cd3d4648653285a76cc2ee34643f554795b361486ecf4509a705d",
+        "src/lib.rs": "e23567b700df577036ed066ae6b703b503f69f042c9d1987cfed9ca984517ee9",
+        "src/manager/menu.rs": "99d0ad67b6f78aff399ae61836eddb24e6c68b286297237807edfad8d13a86a1",
+        "src/manager/mod.rs": "01f0d11e7c2bd1a6976ebeebb4e3dae0115a7ab86f0deb86128cad5759f32cb5",
+        "src/manager/tray.rs": "86532853de71fa7f8df35913df0b4ebc4579acfebdcd4ec67ae64509a030451e",
+        "src/manager/webview.rs": "988ad16a04158de5eef7a7a71917c5bcdc7f52536f536978880af24ba1d2f4c5",
+        "src/manager/window.rs": "882caf1fdd15f3cd93c6b419ae19748d91387ba5e8283ee2b7b89bc7187a1535",
+        "src/menu/builders/check.rs": "42161bbfaf3ddeebff6559cb8857aa9a1b03abb1351bcb6fec3e4cff060f5ee0",
+        "src/menu/builders/icon.rs": "ef2d073d0effc15e3868ff3bc853785cfe55dcca59ae915197cf83873c8f1e0b",
+        "src/menu/builders/menu.rs": "76c9e24f9447b5b3476feb2c5959441a4fdd647f1dc973e86aee79145c83e266",
+        "src/menu/builders/mod.rs": "8e47f079550864a58a0a9b3e0dcce452ccc210ac303861bb91b92b7553b497ea",
+        "src/menu/builders/normal.rs": "56e0293e84241b8464eb7c9f1090bff8c0ede32255f30ccddabb36c76cb2dccc",
+        "src/menu/check.rs": "8759713b5e3d15dc48bc9f2e8641b646a9ace5f2b06a76102d865b5c70546323",
+        "src/menu/icon.rs": "660a87ecc8efe7552aa34c0bffa5100b58cdd1abda05ba2a4959310f176bcb10",
+        "src/menu/menu.rs": "72fc8bf0c415cb579631da773ede64f9b92077e0afe09dc41253f42178ca139b",
+        "src/menu/mod.rs": "ffec688d7d04a73a5dc64d8ad95c6727e496c7b33b67168f2d29899952b0bafa",
+        "src/menu/normal.rs": "087aec7dbb524767ff5d61ece9f555fe0745b6ee65454c316133354b38e726f6",
+        "src/menu/plugin.rs": "103ad143c7d99e4fda79f14d0a307e324f85455a82e4bde66b1609042775ad4f",
+        "src/menu/predefined.rs": "b0d12497d743a9f484c2ff848b5d86eb3251b89e7520b701354c86ef4aebd383",
+        "src/menu/submenu.rs": "d3c1b060911c9f4294e127a5db7a1161baa25231b8665006c14b0ed115fae41b",
+        "src/path/android.rs": "6a2c11e8cb6474503a30527bc32e8ae068fd85edeb63b47067258f156a70b80d",
+        "src/path/desktop.rs": "11bb4f74c6053cc0eca33a54da00a4a31aff85c5164e7260cd573b5efec18ebc",
+        "src/path/init.js": "6ecfef8c9078a591f04c5eb7ed355721efcba1eb820a0b5067be1dcca7748ef3",
+        "src/path/mod.rs": "1876463ce16aa8a0284d437f5efdba579fbb097be195642e222514550174c42b",
+        "src/path/plugin.rs": "a7c07346b4e10607038e9d5783607626502dd7e6910fab8a445ed5552c032cb2",
+        "src/pattern.rs": "2d5bd790939732f66b88966564da8925e4d92c4829122f8f6d246dfad6a8e701",
+        "src/plugin/mobile.rs": "c175ef237b9e996e372cad2230ef32b43b071215cf59aeb2496702f661a45e99",
+        "src/plugin.rs": "d55588347d1bd293411ddb571691faf1093d023be1c679dc8c7153591de3e707",
+        "src/process.rs": "9c413b0b6b74df553028f826ee0bc60164db533dceb96d79bf6c47b6358aa8ba",
+        "src/protocol/asset.rs": "a9dd1849f372444086ccf1e9ac3157106ac88fbb9ed5b654ddcf9a86b8529c10",
+        "src/protocol/isolation.rs": "22a2bf36732a2659bd927d29ed8094e7a8fbeeab65848764474913d4ce5628de",
+        "src/protocol/mod.rs": "269be0cb57035748bde9903c64eac2dd8659923497f4e2bdf7a115e93aeaad6f",
+        "src/protocol/tauri.rs": "54f375940676fe774a1bc0f2303781472f24de9bc69dcafc32f80025201bc1ea",
+        "src/resources/mod.rs": "3507904bdd2dea58fe5449ea10d41cc427e4e5a8855d389032824ae40e9f0df1",
+        "src/resources/plugin.rs": "712c19110baa20e9ee59af79322bfc14818b7d622b5140307368e555381ffc49",
+        "src/scope/fs.rs": "52246bc0ac38cd14225838316f8f7a6116647abb67c41aef8e0bc79af18b1039",
+        "src/scope/mod.rs": "63118615042cc4f3e053ac8406e8216cf6522396f3a9acda860b074a7dc7e9bb",
+        "src/state.rs": "20041c13642b51f1bbe272e94af0a936fa20059259f48523f54ef2ddfe509e4a",
+        "src/test/mock_runtime.rs": "8d10a080fc16a6ab5404de062d597e02cd2f11bb4c0ecaf3a17c827ddb698d42",
+        "src/test/mod.rs": "96ccda85b638ebbdb6a7ea30d5cfdf435cc69e62d0bbf7f9bdc03454c7e177fb",
+        "src/tray/mod.rs": "ce5a1c6a2fc9058c90288eed8fdb8ca749e680bc0aef306541b7dbcc245947d2",
+        "src/tray/plugin.rs": "512d1ba65734c67e87ecb0103e0107b926737e551048a4894c477ded363a3d77",
+        "src/vibrancy/macos.rs": "787fc8ba6950944434590fc66e3e0ee366da1d78af953ab332501a87c95bc352",
+        "src/vibrancy/mod.rs": "60ae894de47a232a33e2e095f1f851716d63e00c4d8bc0ca9114cff26141a745",
+        "src/vibrancy/windows.rs": "7cc46026788b31a9d08f7820d73fe69957ed5289b7ef6e3692cea885a1245522",
+        "src/webview/mod.rs": "f03d5ac3a6253427a74fbf9f36e6ef6690b8d1d44c6a283ab84ec9a1121493fe",
+        "src/webview/plugin.rs": "defea87e3f7e8488a77048432e287f9ed7a45151fe307d5495a3671d83a93bd7",
+        "src/webview/scripts/print.js": "2a7c344c3c7285cc30ae14b741484db1acf24f03a22bda6ffe6c6d16d8acbf0b",
+        "src/webview/scripts/toggle-devtools.js": "433c08901992823a37396ce72a695636bd034c1b960364b7d9c75f261f771770",
+        "src/webview/scripts/zoom-hotkey.js": "3a29990c1551bbb7bbca34e318dd6a044963c6d8b7cc14c1600db6e6f45fdc97",
+        "src/webview/webview_window.rs": "9714cd08980ecfcb939e2baae63dbf2c0d19d2ae5268d2622117f0a992716739",
+        "src/window/mod.rs": "ccfbcb88213b624d6950e4d870f69d5787376ba4fec9782836cb047fc59c3993",
+        "src/window/plugin.rs": "4eaed8f66c0d33cccde4b883e277352cca4d9cacb1b0ce7cf940645cfe1c2491",
+        "src/window/scripts/drag.js": "2d47d2e302512024af4ded95b89f8b1f5c8d83530d287c252052112901a59888"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "d84ceb3a059d0da564cae5013ed69d9a945eb40e4dbcff337b51072033e8c496",
+          "patched": "934584564815992336042a56f5deea4389dc309d56a6a44c53a70b6b359817cc"
+        },
+        "rustfmt.toml": {
+          "upstream": null,
+          "patched": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c"
+        },
+        "src/test/mock_runtime.rs": {
+          "upstream": "8d3a97c67ff5ec567fb7099625dd222abd6b1600944347d0a12d6bea31d962eb",
+          "patched": "8d10a080fc16a6ab5404de062d597e02cd2f11bb4c0ecaf3a17c827ddb698d42"
+        },
+        "src/webview/webview_window.rs": {
+          "upstream": "c2eb030a51e8e30e8ea419d9ae60b207c804baebe8f9bad537ffdaf502dc2b99",
+          "patched": "9714cd08980ecfcb939e2baae63dbf2c0d19d2ae5268d2622117f0a992716739"
+        },
+        "src/window/mod.rs": {
+          "upstream": "10fb480e8c3e6f6a27ec3468010b0a2aac114c10cbfaca53f77dc3974b294964",
+          "patched": "ccfbcb88213b624d6950e4d870f69d5787376ba4fec9782836cb047fc59c3993"
+        }
+      }
+    },
+    {
+      "name": "tauri-runtime",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/tauri",
+        "commit": "406feea75283545496ef7398c5e2f0fb9b306b64",
+        "path": "crates/tauri-runtime"
+      },
+      "rewrites": [
+        "package.authors = [\"Tauri Programme within The Commons Conservancy\"]",
+        "package.homepage = \"https://tauri.app/\"",
+        "package.repository = \"https://github.com/tauri-apps/tauri\"",
+        "package.categories = [\"gui\", \"web-programming\"]",
+        "package.license = \"Apache-2.0 OR MIT\"",
+        "package.edition = \"2021\"",
+        "package.rust-version = \"1.90\"",
+        "dependencies.tauri-utils from the workspace",
+        "omitted external workspace examples"
+      ],
+      "files": {
+        "CHANGELOG.md": "5f038146b1ac918f67936b98d6ec91c6e9908742e1448f18355dc4076fe37104",
+        "Cargo.toml": "20e38a6d1e78aa22c477a85163cf45dabd5f4122971add1a751a75018cd16555",
+        "LICENSE-APACHE-2.0": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "LICENSE-MIT": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d",
+        "README.md": "28a88dafa1492da0f0819f2f88f019e9580d7c61331165904ce4cd6bf1818778",
+        "build.rs": "68b2727346e58a9963803a75ac29695b500aaa7d0673e18551465502b60cbf11",
+        "rustfmt.toml": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c",
+        "src/dpi.rs": "06cbfeb4698b1508ddcb631efc55bc1fa6e0ecd9253f0c5314577e16f5aecfb5",
+        "src/lib.rs": "9728faa7e922004142124e052c404a078b512e7e0925fc768080ecc6b661a46e",
+        "src/monitor.rs": "6dfa5598df36ab45c6f3730b530aa627ec1cd2c1ef744c756f8ffa16d0e91fdc",
+        "src/webview.rs": "84ce85767d92d7a97a6e21d83f00f9fb640dd7ab724897a270297a025d70f568",
+        "src/webview_permissions.rs": "cf15e6db520eefb80753dbb416d4d23af882fd2bd76be528014dbc0af72abf1e",
+        "src/window.rs": "3cfde01dfca09d6dd6cb0abee7255d98b0cb60a5d0c18a9515f5a24a3002f37c"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "72e3107defed82cff265d338e2da7b5505032afc5268a1fbf6f670b24827e855",
+          "patched": "20e38a6d1e78aa22c477a85163cf45dabd5f4122971add1a751a75018cd16555"
+        },
+        "rustfmt.toml": {
+          "upstream": null,
+          "patched": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c"
+        },
+        "src/window.rs": {
+          "upstream": "a6a3b5d646f47e861fd3a611de6635216635921ee06c9c713f394b85dd303299",
+          "patched": "3cfde01dfca09d6dd6cb0abee7255d98b0cb60a5d0c18a9515f5a24a3002f37c"
+        }
+      }
+    },
+    {
+      "name": "tauri-runtime-wry",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/tauri",
+        "commit": "406feea75283545496ef7398c5e2f0fb9b306b64",
+        "path": "crates/tauri-runtime-wry"
+      },
+      "rewrites": [
+        "package.authors = [\"Tauri Programme within The Commons Conservancy\"]",
+        "package.homepage = \"https://tauri.app/\"",
+        "package.repository = \"https://github.com/tauri-apps/tauri\"",
+        "package.categories = [\"gui\", \"web-programming\"]",
+        "package.license = \"Apache-2.0 OR MIT\"",
+        "package.edition = \"2021\"",
+        "package.rust-version = \"1.90\"",
+        "dependencies.tauri-runtime from the workspace",
+        "dependencies.tauri-utils from the workspace",
+        "omitted external workspace examples"
+      ],
+      "files": {
+        "CHANGELOG.md": "2fab920936ee3d8f85092d651823d07ee56f4818b9bbe130f1123ead5cee76e6",
+        "Cargo.toml": "d19d8d1f9fd71d717348bd3f3e9ceffc0e166eec9a0a808349ec04f8d7d8e84e",
+        "LICENSE-APACHE-2.0": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "LICENSE-MIT": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d",
+        "README.md": "cf468efdcd6eb86ef6a2c0b1fbe6aca80f0df6a9d3016f77c0bfdb64dc4091c0",
+        "build.rs": "68b2727346e58a9963803a75ac29695b500aaa7d0673e18551465502b60cbf11",
+        "rustfmt.toml": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c",
+        "src/dialog/mod.rs": "ed391f94760a3f257ea7244fa62ad9b536e41f52f83b3994dedde23e5bbd287d",
+        "src/dialog/windows.rs": "07acf2fb60489d06ad08194d4eda621eb683fe828aa199bf7e6f286aa7eaa57c",
+        "src/lib.rs": "c909c96940459501e6877dc4538212b5357cab164c43df4453b5bfa9f7a71081",
+        "src/monitor/linux.rs": "ebf2b48ebe0fa8facd0457fc5d16dc3156842e65a6c6334b1e0e4daa439160b2",
+        "src/monitor/macos.rs": "31bfae5bf45dff98c68a1f2f19d8787cba5e3f0575d7d13ec564e524d79abae8",
+        "src/monitor/mod.rs": "f3a4161b3306afa32edb416d6c81773749d32f3068018eb83e32f055ae4c31c2",
+        "src/monitor/windows.rs": "c177f8f1d7d7f40350076a89d495511c1fd24d79d2f44fb6a1efd0d7e1726657",
+        "src/undecorated_resizing.rs": "f3640f76c76736464881b2518a0a974a426f15e439e7d0f07521043a3b7e0c3c",
+        "src/util.rs": "a14a4987445fd6e9b0ee32234081e7a152ac9598916bad6f7e939b798cb62119",
+        "src/webview.rs": "e38ffe02336ee9bd558b444b6c6efa6a6a9fdfbaebfa8b441e925a37ae1828c8",
+        "src/webview_permissions.rs": "84b1285e40854edb12286731cc2232955fd95ac3bc881f7d5ebb6376a3cab3f3",
+        "src/window/linux.rs": "8cae057b27bd9576aefada130cb68eb0e39ce0e73af3dad793bab7d03b269ce2",
+        "src/window/macos.rs": "23568a452b8e0da7b6627929e6ae05dd54b8bcec16cf91cff7ce2b1a7f818142",
+        "src/window/mod.rs": "8f61d6436681791f011367948eef559192e8bee441446525c76c4917f15e5185",
+        "src/window/windows.rs": "734622475b78dbf0c7ac6bd780c893e6cad6cfe034d84fa5f6397b92ede139ab"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "650a751f7e115eac3899be168f8bdaba81277f821f18b0e935b7870c8f0ba4f4",
+          "patched": "d19d8d1f9fd71d717348bd3f3e9ceffc0e166eec9a0a808349ec04f8d7d8e84e"
+        },
+        "rustfmt.toml": {
+          "upstream": null,
+          "patched": "d210b615eab291afa10e8da6a38e07964e579cf1048fc10c86661cbbdcb2ef3c"
+        },
+        "src/lib.rs": {
+          "upstream": "f607900183c492ef5cf4a3fff63dc90fd08059675203746615a30418d58443a4",
+          "patched": "c909c96940459501e6877dc4538212b5357cab164c43df4453b5bfa9f7a71081"
+        }
+      }
+    },
+    {
+      "name": "wry",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/wry",
+        "version": "0.56.1",
+        "archive": "https://static.crates.io/crates/wry/wry-0.56.1.crate",
+        "sha256": "375becb4aded9913f736443cf88000c6311478db69814cc06070465e4cc44c98",
+        "vcs": {
+          "git": {
+            "sha1": "14be44842747a62c4110bd982f61f6c1acd705c3",
+            "dirty": true
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo/audit.toml": "26f5e627f768cce1687f4460d56a18b4725817d5ae392dfd154541ef39c40e3b",
+        ".cargo/config.toml": "0c9559057a73238c99857c7bc3b58243306ebcfe3dcc4c90027da2502186eb11",
+        ".cargo_vcs_info.json": "badab132c98d5363d2a9e8a667be6b6e2fd0e656a2ee2c93a1bf221f11cea7d0",
+        ".gitignore": "dadf1c3dd73d49c9bce82d54a2a141e2712ab11df1d97b0d6ae99bb591ff440c",
+        ".license_template": "9aca48869404894538e54a881bcc2ece2142a709b665ced1fd2d284ae7c44595",
+        "CHANGELOG.md": "05b8a983fceacd47b7f9d67e2987f616197772e991ccbc7c95568d5ceac9f4e5",
+        "Cargo.toml": "218abec25c9c916e23feee9f9c995672d76b7e043d0bc11c6546c5a9dd39108f",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "ef88893533af22ffbb68ceef0724ba1389518df26165a34f3c99ad30b884df4f",
+        "LICENSE.spdx": "26235c41e314fb0da35b33b2bb5bcbc4dd523839f8eeca52efcd43586f441fb5",
+        "MOBILE.md": "7e4311eb2128c6605b51b3f4c3578f8e49c2595ada41986a8bc09bf20950fd08",
+        "README.md": "cfa18c4d0e5a72d02b71e28c381de76d870d2adac8acf7b077071a5431ee536d",
+        "SECURITY.md": "84ed305e72c0348770feb82dacd98478ad7fc024eedd29e9e9794025f8e04bfe",
+        "build.rs": "689c618b57d95f2d9e4578744c8126615d93c5624d9b3747af20650e577ccb1b",
+        "examples/async_custom_protocol.rs": "7fcc3cb22197f41da43b18550a705690cac5fa4f07942f4cb36dcd279a7903b8",
+        "examples/cookies.rs": "ef2f4464f9fa5c536e17f3f9ff46f557e99ad6e3aa5e46e37d53ae96f50a412f",
+        "examples/custom_protocol/index.html": "86a935667a25d8cc7d4ccbff68b6067c702efc6bc435dc62ce46a498a87678e7",
+        "examples/custom_protocol/script.js": "6e08b96e8e1e0a3acb924a4ea63d45f45544ed82b253b8b9e33aace1e323656e",
+        "examples/custom_protocol/subpage.html": "39a21e00664d114f7d6a0c841be473deb0c5e142712decb711377e86c48afd51",
+        "examples/custom_protocol/wasm.wasm": "2cb1a33779de77d7cc016d934f91262b0984ec695e1f8dda9ba3c33725f5ef1b",
+        "examples/custom_protocol.rs": "a36b0a6f50f23a09e3a452f21688ea6372f525f2bcf90a4228aea369a429613d",
+        "examples/custom_titlebar.rs": "40b62be794d0e2fd2d5ae548a1dfdc94f48290260c8f6d4fdab8920420614107",
+        "examples/gtk_multiwebview.rs": "38f818480c5710420d3a0f83ba575d2c3ac9b71255aa8475337c04696ab4a813",
+        "examples/gtk_opengl.rs": "c9f9e1319709264c90a98bd2238294b743537857dc2cb4d6df22c92c59aa30d5",
+        "examples/multiwebview.rs": "435326c3fc182084f774bd0924d7eadffe2ead8fad9c9c2656450ea7978710ca",
+        "examples/multiwindow.rs": "86a8dbe10e1913c5b67b0667998ca005886323cce13edc3ac65261b5c5d87723",
+        "examples/permission_handler.rs": "4ce919e92462170937ef0b1f20f18e7e91f68c85160aad021b1449e00f19fc25",
+        "examples/reparent.rs": "9ad2e4b46eeab665bee9cfb19f8407f5f5fd7cce34cb010d56e043ff36c6a534",
+        "examples/simple.rs": "dd060533de836fae76add7185a6c41a7577271aed7cb38e6e55d612512a75c09",
+        "examples/streaming/index.html": "7eb6977535c62e269b91f85ea6fd5e2ac0da4e8afd33d925e6ffeebe2f1b31d3",
+        "examples/streaming.rs": "ab7e7e1559ebb22d2f40e06e98ccc40adbd209a2281facb36d56646a3bba36c3",
+        "examples/transparent.rs": "0f1f428e5ae771725b886108fa595892b5d3303146d761e86c31d700920eee08",
+        "examples/wgpu.rs": "90f6b825602370c90ff5781a1e82f6b7a9e2d09e62be0249418f9a98935dbf88",
+        "examples/window_border.rs": "fa859ac7bdf738ec5f620c15aa3e3cec07409fcbc9d5ef72fa757635e83c1f53",
+        "examples/winit.rs": "fd1263474c2dd3057beeab2d3e582f6d35df8b049c37655d86a4ddba5c4b94cd",
+        "renovate.json": "32cf3c60bb8d28e5bb05d6564f413edcf8440261de9c6d9e2882f948a61a26a2",
+        "rustfmt.toml": "355f303583e15d1518e0c89eeaf2a4034bcc7c2a292087dfc17d00dc8173a5fd",
+        "src/android/binding.rs": "97afdd339a5d6736af1a767201d6ef0cfb7526bc4d5e35577842739447dad587",
+        "src/android/kotlin/Ipc.kt": "80232ae2df8264b7855ef21aafff772d8563aae6b2374c49394421cb085c0b10",
+        "src/android/kotlin/Logger.kt": "6ef1209ea4a45ef236fd4e2b0d1c2b086bc99ddb31a4e1d9da171f45c06a51fe",
+        "src/android/kotlin/PermissionHelper.kt": "15fbd8ac2606c9f930cfd047a1074cedec286b7257e2a644e5caa45fdcab74e4",
+        "src/android/kotlin/Rust.kt": "ed069b83c5d9acfd6ce241ff25797362ba3d058cf7356a713165d5f5bc506deb",
+        "src/android/kotlin/RustWebChromeClient.kt": "5e225fc1a85e769e4a666b7cd47946356e742190060803ecb31a12a68bf1ce06",
+        "src/android/kotlin/RustWebView.kt": "0c4e6e8bde658f0e2ac7563a0cc2c164d0d39af369998ddd7f5c8fd9745b4236",
+        "src/android/kotlin/RustWebViewClient.kt": "1e5ec43b3ae2315aeaa4d5721435076c3a26b84276ac9e83fe3b331f4277f4f8",
+        "src/android/kotlin/WryActivity.kt": "585a83565bfdf924600d0f0b40eda26bce76d2947653a4fec9a87b09e21dc11d",
+        "src/android/kotlin/proguard-wry.pro": "6b10700539fe7f2d20616387a79fc6c1ebfa729691031feb2952f368ade73f51",
+        "src/android/main_pipe.rs": "81fa4d9b38df667cc4a84f784ae3a9a990eec8a3bc0029ceb14a483bee982f40",
+        "src/android/mod.rs": "87136468504e92e0d1011c823ec7b3c9000cff13046b1513ee165d3109727028",
+        "src/custom_protocol_workaround.rs": "6910a753ea354938168b91b6d7985e9cc4a1de76ce57b90f76d42fa695e96e25",
+        "src/error.rs": "d25cb6ee2aeb38fce037e02b1ab410aacfe4cd087ba58849cd109ae4fb838bba",
+        "src/inject_initialization_scripts.rs": "eff563eee5ff7b1f57fbf84268f8bc4a5853391ab64ed200a9ad60ca537b2f4b",
+        "src/lib.rs": "f5c9e28fbb1b6a4ddfed7ddface796a9e91689e8663457ed69b651ad00149ba7",
+        "src/permissions.rs": "4d933418850508a0423cdbe45fd091d0f8eeb3ccab06c9ee70dbf354032552ea",
+        "src/proxy.rs": "c72606d68787704fa91088d81f6b495fc05ce92ba77845339819b4d0c004a8f0",
+        "src/util.rs": "5f1b64eab6c81dea1c6ce7f955d2a7888b368ef9fcbe574bb1187e4046135e98",
+        "src/web_context.rs": "dd9912d669f3a5de10aeda7b8e1361751a1137a602385d31964439f101773aac",
+        "src/webkitgtk/drag_drop.rs": "e3e52b6c32543c7e415244766a4a9da1decb028b50ccaaf3d981f8566acc8ed8",
+        "src/webkitgtk/mod.rs": "7fd362e0abbb46100d78450002a8a4e9cfbe53fa745264be8cf870c47498a417",
+        "src/webkitgtk/synthetic_mouse_events.rs": "e534ed5d79d3b0e79a6341cefa57bb20438ec34db32983522bf6816bdbdab2b0",
+        "src/webkitgtk/web_context.rs": "5f1df21629f3e01cb84bb811986fa454e7402a6105243c6fd9b4c931b1627f50",
+        "src/webview2/drag_drop.rs": "ec03770d82dbbf47cbc3932a1b709bd8aed5a0914e20b6afdcc6629fed99c7ee",
+        "src/webview2/mod.rs": "49a668eedc4fad25fe65741722ccf724e17080867d8157a3be1e312ab479db7a",
+        "src/webview2/util.rs": "068edfbcda4060a789f9e1f6dea83ba748e560a33c17179aa7839425f52ade39",
+        "src/wkwebview/class/document_title_changed_observer.rs": "7e09f34f232f7838ecfa11c0d75d0361d32df91aa9ce9e041915e316f0784af8",
+        "src/wkwebview/class/mod.rs": "f20048d06e0098d25eee0c549eb7fe26b20d041ada2fe1daf7771125fd44a7b8",
+        "src/wkwebview/class/url_scheme_handler.rs": "09a55a1804dbf40c0bc2ed2e19a53199136c53cc143c393bb6d0123736aa2af4",
+        "src/wkwebview/class/wry_download_delegate.rs": "d52460df67678eccb4c5d409c9d24a81d5c63ff04eee6a76e5558c9ccd341756",
+        "src/wkwebview/class/wry_navigation_delegate.rs": "e858a92f23ddb5d67d117ed5c64c31782a49e3d6234a96c364e0c06ab5e16cb6",
+        "src/wkwebview/class/wry_web_view.rs": "692b4420ace30fafece0707533d68b40b82c20ee7f5843eb17e04a7c6fcb4656",
+        "src/wkwebview/class/wry_web_view_delegate.rs": "97559a443b53682d98858effed722774b309b7d72aac1aacc573f1d989fae093",
+        "src/wkwebview/class/wry_web_view_parent.rs": "c405e3ea1d2e062a43847c6d7c91be6da36026f3230bf47f2661bddc6852012a",
+        "src/wkwebview/class/wry_web_view_ui_delegate.rs": "931ad3ca6e303963e4d2c4267e2cd9fb94a0eef1ac8af8e6602b30cdcc324cc3",
+        "src/wkwebview/download.rs": "3b67113c3d13a2082992d284a1e995e07c06a9b892b3ed2dae9b7370daa0f6c0",
+        "src/wkwebview/drag_drop.rs": "10bf1524a41d586810cae18d318629da3768e69a1b0ab59ad04dfd69840d83c7",
+        "src/wkwebview/ios/WKWebView.rs": "4ff8588c4d8773c244c228e5aa1cce3af8d62e4de1fb08cb80dfb31ae9a2dbb0",
+        "src/wkwebview/ios/mod.rs": "03823ce7c572f1ed345ae4ef6ec63e8ce4df1f0a7d3ad0efebb36dd6a7c18dd1",
+        "src/wkwebview/mod.rs": "795ccc47abc947dbf474a7b0265ffb76538bc3cd4b875b4629550075d249f473",
+        "src/wkwebview/navigation.rs": "1898665e051edf10124178aa596b02dd121b33e1ccf7bb48b54d859d46e73aae",
+        "src/wkwebview/proxy.rs": "f7ee208069b3d4d045540c46b842c71f0fa2bba905b20463e67679471f58ad20",
+        "src/wkwebview/synthetic_mouse_events.rs": "729487a4009431c29633c0ada6d78c513a18af148c118aefa9b0279c322c7cb2",
+        "src/wkwebview/util.rs": "c7be7b4421d3d4ba06a61d39f4efc3ada0eb3e2d691078aa842c3ae76f95e755"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "9c1afeefd4adce505a194703556770388f7dafb111adc9040724d1f5e782d7d5",
+          "patched": "218abec25c9c916e23feee9f9c995672d76b7e043d0bc11c6546c5a9dd39108f"
+        },
+        "src/webkitgtk/mod.rs": {
+          "upstream": "fd3f3763101bd82a30cfb210bbf5c17d64abfdbc2f4a8401dd00cf87c702ebb9",
+          "patched": "7fd362e0abbb46100d78450002a8a4e9cfbe53fa745264be8cf870c47498a417"
+        },
+        "src/webkitgtk/web_context.rs": {
+          "upstream": "ef43edb59e19e60743c7858be846cac23ce8e7a188f77b12ac7e0a82a907628f",
+          "patched": "5f1df21629f3e01cb84bb811986fa454e7402a6105243c6fd9b4c931b1627f50"
+        }
+      }
+    },
+    {
+      "name": "tao",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/tao",
+        "version": "0.37.0",
+        "archive": "https://static.crates.io/crates/tao/tao-0.37.0.crate",
+        "sha256": "5d12c8607b01516c5d4a37e471a9cfb40b4a25cebce8fecbc6a559e125e51b6b",
+        "vcs": {
+          "git": {
+            "sha1": "2f9eecf236f4f6a8acfa03329c57039224a3ce99",
+            "dirty": true
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "607ab3081d8ee28f8ad92eb68ef5559d49b5c73e27ef685ff3cb1095fb0ebe64",
+        "Cargo.toml": "a3486c3bf1680e31cecc51df3e2f9d223bff5297e85eb9940be1d9318a3569de",
+        "LICENSE": "6dc0e068dcf3a5bc8e054205b85b7720e1d49265bbc64bf515d2cf79197df69a",
+        "LICENSE.spdx": "02b6448337b757772d90e5f31caaa0f9e6afaad2221c01771d0a3deaa4d4196c",
+        "README.md": "4e146f3b5b6997cb709a97b417f69516f43ff0c35cbb636c55158160ecfa5090",
+        "examples/background_color.rs": "b65943969a754a1a3f808c2b216c2af2ce74a369b89230d8d7299b73e643b7ff",
+        "examples/control_flow.rs": "53c1cd3e063ffa386475097a3b8c0e14a3392250c896567987f896b9fbca5a79",
+        "examples/cursor.rs": "71aa0256191d6d8a7b1cf8e8e9de4de4dfe4a3e19e6b300a51df4439f1703182",
+        "examples/cursor_grab.rs": "a42b58e7c02aeb4dd7f3d67ebd2c221fbeeaffc04495f140c2248088446297fc",
+        "examples/custom_events.rs": "f30b1245e8ef838280462cd90d76e7c0cedeffdf22cf9ad014aafa07b72e4acc",
+        "examples/decorations.rs": "1e1b55be6664797e1cd26093b5f5735d4329464b6e9b047c81aa3d0decca506b",
+        "examples/drag_window.rs": "e0213c177e8412dd2945de23edc840516216b368cccd896805f6f974b7cef81f",
+        "examples/fullscreen.rs": "301b43054faed677d1532618686a542ec486604ada059f43f60f56a83d77a5fb",
+        "examples/handling_close.rs": "1b28873ecc56136e807cac19f2d67c62e5b8df8235d2ffaa911127f833df334b",
+        "examples/min_max_size.rs": "f01bd4497688e168afc5857e191d06edbb7b32ddee2fa06df2ac191405b90228",
+        "examples/minimize.rs": "58a4ceae8a5dbefc8b3234df344a7731df269ddbfa3142e25e37c21cc6e33a51",
+        "examples/monitor_list.rs": "7491f21d3d033e0d1a7e87c64160a0f9c00c2b508c63aa2dd35ef703b7cafae9",
+        "examples/mouse_wheel.rs": "1920b96a74d2b995ff47109af154330a44e7e11974f2bc920e3c173115a21225",
+        "examples/multithreaded.rs": "38124c3ec67bafc38c1e799c3f604b989888d5a449fedc8953bd646f710cfc07",
+        "examples/multiwindow.rs": "044d05dd2babb1bf8b4897ae9c34422cb5580b0e74bfb6ce10e350ce24a00ab4",
+        "examples/overlay.rs": "3fa3359e19868c67539cbbb1e64e1edb64a65cce38ff145f984fbd63c9df07c4",
+        "examples/parentwindow.rs": "8f09ef706b688c5aff7b0c02312470037bfb0a608fea9d6c11c13affaf47809a",
+        "examples/progress_bar.rs": "d1b3b927b3394346c868e1d8d52456a02b1f183a2f223808da6d28505d8c3cac",
+        "examples/reopen_event.rs": "be071c4cfb5a1a1137c9c488fd490a7b0154323a91c3916a193e14b7c0fc6ace",
+        "examples/request_redraw.rs": "028f97f519150c8941d3a883e7c8e6f090bfd347cfb64393df61234cab40118e",
+        "examples/request_redraw_threaded.rs": "f850e57a8a9af9896dc8c51146721386e0e4fc9785d9837d5f4090fa55b7593d",
+        "examples/resizable.rs": "ef07f975bf2472a7f37dbdb6b08c16f6873bc5089c13e1ae3310365522faadc4",
+        "examples/set_ime_position.rs": "573ebc222209cfc2b2298fcdef651e47c378652636cee98b111d780e648e4530",
+        "examples/theme.rs": "985f7890f4a745011412ac080fc321d210145206add3564f5c62de88afba562d",
+        "examples/timer.rs": "a1f13e358a7283a7b8062e8840c23e1e8ace574712ea2d7f3099e2bd80577ec8",
+        "examples/transparent.rs": "4089ac549dd7b7a9b86b0c523d098e0df49d5a63c08739bf6d289c63c3cfa552",
+        "examples/video_modes.rs": "4fcd9044f87a7cffad79c2164f5170150566fb8822739b7dbb8b8eb1a3676cc2",
+        "examples/window.rs": "0d96bb2f48b2bf65074e988c6cf8d43c5b95d88d651d7545a090bbb466ec3fb8",
+        "examples/window_debug.rs": "7e3d6314ffd3e69967cc2b5a46e36aeb88e53aae02e55f42ccdc3dd9e6429201",
+        "examples/window_icon.rs": "19587bfe60a0589c09c30d694ffd439668fc1444c7370334b2788d6a4b731321",
+        "examples/window_run_return.rs": "6c2590afafbabf64da2a2af31e3e91e54de53330b670a2421f738d7edf839493",
+        "src/error.rs": "9b25813361acabf8db7244bb49a94c39c0cb8dd59162a82a3e490d4069bdedb5",
+        "src/event.rs": "c4e9f54b06dd5e67a2bbc0f2a1c6304e8a6e8bd0ded7c705c39216a2f6c25911",
+        "src/event_loop.rs": "ee258ba899e5b15746f2354c84cc62bc084e581e448eaba800af9a426cf45313",
+        "src/icon.rs": "6f5295f2172fa8ff65907a6aa64da476848ca73d70c7737f6c45c4c0f9c54932",
+        "src/keyboard.rs": "15d617134e6bf5baf499c7e68bb29d5c268649ade44976bc3a22cb50580fc584",
+        "src/lib.rs": "f2a0b9d671520164a5b5d0f1f4473ec5d651cccd42ca6d9c2cd5d50ad8f9374f",
+        "src/monitor.rs": "fd1e62c8ad8b559836e585c9d1c715f79d645e3ad81960fa479c0579e2b1740f",
+        "src/platform/android.rs": "5aefb7ab80d5a8e66c89aac44990fbb8ced82703146af0b2813e6f512e115454",
+        "src/platform/ios.rs": "b71729db5e5414e9b48cb299b6b9e65b7704677b04ca3378468b8aa4b328c065",
+        "src/platform/linux.rs": "b9568e3b09217b00e1f5d2a01318e6f0b0da1a41d1c34aac94adba7ef1a61e95",
+        "src/platform/macos.rs": "d1993f47ff4958ff98ba35a8560d7b0230e0ee527e8d01d54f28f3cb3b6c8c42",
+        "src/platform/mod.rs": "95e29649dbd5cd6b78645380452e5521579c68b4bd51214dbfb0d09c754e617f",
+        "src/platform/run_return.rs": "295b76e76b34211442248d1d610bdcadecc08b7837df4fd5927afaba97293d91",
+        "src/platform/unix.rs": "80e672239baf26b290e15bb50d851aeabe1b3a0d38c8df1a32b629ba4ef93cb5",
+        "src/platform/windows.rs": "13447d0e84dfb76d472cba917975c8c31c8d2bf24f08e3ab98ac27e8906d5f03",
+        "src/platform_impl/android/mod.rs": "b7c9a384d064288386a6f7230d7f7d5f317aed7a90ae9cb6156fc5d3adf7b13e",
+        "src/platform_impl/android/ndk_glue.rs": "f9e59aaf1b2517a9ed02373b5c09fb56ba3a4fc45fbe1b59f3c09681a622c74f",
+        "src/platform_impl/ios/app_state.rs": "c5c61e80401a4e177420a49629af958b558e97dc8792ec86dda87e62455b5e06",
+        "src/platform_impl/ios/badge.rs": "958253e8ddce825dd2ff8edb7a69176818997e60437e23ced8f1abb91b6095d3",
+        "src/platform_impl/ios/event_loop.rs": "9982aa205ec0ceb338e13885a2bbecf3d6a41618be02ae469bd7bde0374051e1",
+        "src/platform_impl/ios/ffi.rs": "487ccc0de6f0e0d24fd4e71b170fb4e9bbe54321eca24884fba5d70d20f78bd6",
+        "src/platform_impl/ios/keycode.rs": "ea44358c77ec7ce425fd29f0568f564bb9d142af75d562ebced08c6a67da19af",
+        "src/platform_impl/ios/mod.rs": "ccad41ab7e7f70bbcc69da70c7c6738da4d6fec2a29b98a64d29bb27a6ff5a78",
+        "src/platform_impl/ios/monitor.rs": "cb15ddca19b76861bf88627ffc24b44c05c19583bb84c8f297cf3c47be288092",
+        "src/platform_impl/ios/scene.rs": "500e62b379dfed5941cd2266e91ebe97e61da875671757690588d44d06f2cf81",
+        "src/platform_impl/ios/view.rs": "047356f7d5b9464e430940b2a4042bee764374759ce517be6d8dc8cd7fbea190",
+        "src/platform_impl/ios/window.rs": "6f5e70b1515a836eeafe089c380ae225b515e7e51336c68d2dc043e2ae5416e5",
+        "src/platform_impl/linux/device.rs": "74b524efe38df033c41bec763fb96c93a1ff7c9cf0cca156fb0afc6b95df7554",
+        "src/platform_impl/linux/event_loop.rs": "f55a90aa03dd35fd38b6d376aecee473daa16a5b0b48a5ccbeb3f05c0f37c2f9",
+        "src/platform_impl/linux/icon.rs": "543205aae66b9321b2f375f4516c5f6996b5a1ab875549bbb667d24be8eda0c8",
+        "src/platform_impl/linux/keyboard.rs": "c0e797f5962d44329db0ecb688b5e9cb00e7e273d4b04ee1aff8ef73c28f1709",
+        "src/platform_impl/linux/keycode.rs": "4da52c38ac623aef850d55a321a5890a7b3ae3211abd22b4f15b6b5454653041",
+        "src/platform_impl/linux/main_context_channel.rs": "a8e291d78619dd8784d9df32675d5f1315bbca9663aa0e8a6bf77040710ba2be",
+        "src/platform_impl/linux/mod.rs": "3c4d7620193e1bf640fa4ea9793dfc344302fc7f3262873a294b5a08402a6257",
+        "src/platform_impl/linux/monitor.rs": "e763bd0aa9e2168c2a3d93f2916fead57f2b6f4bddf965e10fd109037e1c4ce8",
+        "src/platform_impl/linux/portal.rs": "b8be00ce1ae76937e83051f57f507ae5912f48bcbdb00cb5d6ba3fa29331d20e",
+        "src/platform_impl/linux/taskbar.rs": "26ce8560338b6ee13020cd7a130ace367f7c3e1cf49cf27903c746012651c1a6",
+        "src/platform_impl/linux/util.rs": "e9d6d473498d9cbdc95b30e5074d1ee6fb487471a9e741c131f37dbda8253e8b",
+        "src/platform_impl/linux/window.rs": "8566db23a604555c54ae2f10186139a5d00d6ee80b460074901b4cce3d10d0b3",
+        "src/platform_impl/linux/x11/ffi.rs": "629a5aaf4973a8b7295623582b8c2c21ee1b13b8b5454f4e3c7a7de1be115f76",
+        "src/platform_impl/linux/x11/mod.rs": "8f576518fe12bb21c7ac3db0e75b969babc1035288bfd618cc85d354b362f964",
+        "src/platform_impl/linux/x11/xdisplay.rs": "fb64d39a851557b5f6a6e3e54c510473d62d13d3afd18c7be4d6f592824e9591",
+        "src/platform_impl/macos/app.rs": "102c21b90c4d09a8c1831d47b8b4418b2844e1c758c159db11ae14d9921cfd43",
+        "src/platform_impl/macos/app_delegate.rs": "a66447b76f880b559042133ca939305df8a3dd71b1e5a30f530a2d0cb8d16da4",
+        "src/platform_impl/macos/app_state.rs": "493be209ef786af3e1d25d3631d18a3faaf96be210f83da2980a14dadfd60a7f",
+        "src/platform_impl/macos/badge.rs": "41943ee395e667104594d1e8c79515689e938a0b1dd0abdb7c4a8fe0d2dfc9ce",
+        "src/platform_impl/macos/dock.rs": "fb1a30c5e891465ecced4e1f78856e4e6b3b6a283032a48d378525242a4f5bea",
+        "src/platform_impl/macos/event.rs": "874e96604892fe63c1beda1627f2a12763573a3e5347fa6630c672b995fb56eb",
+        "src/platform_impl/macos/event_loop.rs": "53a6a0b315527a233cf02160e2eda94f1158f95481c1119367b159cfddea05d6",
+        "src/platform_impl/macos/ffi.rs": "6e85ece908839c2c9d58077ec32e2d7835f1cffad200969f871f05a0aacaae9c",
+        "src/platform_impl/macos/icon.rs": "8f5a7f00f96462683b4378702a61d78a30814d538a3111bad24ef4c556f35627",
+        "src/platform_impl/macos/keycode.rs": "f4ba5a8948ab839eec2515586c48c41c9acc967f1a65d8ed7680ef231d0c1b63",
+        "src/platform_impl/macos/mod.rs": "a60a9bcf84c7bd51f744450674702e6bb88b3e17fc744751b4c4a202544423f8",
+        "src/platform_impl/macos/monitor.rs": "3ef62d6dc6902798fe31b8d57e07bfdfc0a530cdf9a321460e84e4dc62427963",
+        "src/platform_impl/macos/observer.rs": "4d801f48b3badc805770b9cfe63114d4b03b8803d3b1f35eaf1538564516e52a",
+        "src/platform_impl/macos/progress_bar.rs": "baa49c76ca0b0914a5eadfab0b3b352f0f073d3daa6b1c933fa1d02a57470ed1",
+        "src/platform_impl/macos/util/async.rs": "f53f5c3a4ec989fbe4126a38553328d3c03286ab9f29376b7854fb6feafdc5c8",
+        "src/platform_impl/macos/util/cursor.rs": "481fe6a34e1547449d8ee7b1a8a1cd93c304f15c2b62f6a6a71aba6d995b903d",
+        "src/platform_impl/macos/util/mod.rs": "e8df577333134debdc0731a5198f5876ffb41a70df75b10f1f732874daa8cc1a",
+        "src/platform_impl/macos/view.rs": "42b961529295790e6e9084c5a910c4116d1b6ac5f8f2af96a893b722d9dc59b2",
+        "src/platform_impl/macos/window.rs": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
+        "src/platform_impl/macos/window_delegate.rs": "e03fdcefe8962a5f64147325782bb6ca1d0aaf51c239453d527a1c4a07a902b8",
+        "src/platform_impl/mod.rs": "50486214dc0ed94d7b3e9e9b13016af8cdae8e2069f081081b2926602a99a81e",
+        "src/platform_impl/windows/dark_mode.rs": "820f7708dd7c853036d20a6f7f9b6abeb85ea8eb9837cca88fc3025f02595527",
+        "src/platform_impl/windows/dpi.rs": "506105d9b1b67f347947712033d5aaccfc5f306009ecacdca395f3f592130b92",
+        "src/platform_impl/windows/drop_handler.rs": "b751798398859badaace1bda5820ae40b946d60f9c93c51c67cef525cb389395",
+        "src/platform_impl/windows/event.rs": "5e658dbc39645a312c3939a2ecf649ed3abcd9e222ea5bad6bbbcad38826e664",
+        "src/platform_impl/windows/event_loop/runner.rs": "03851663144985dd22b249ff3fcc58a6582ae19620dd665ac0b7325c979f8ffc",
+        "src/platform_impl/windows/event_loop.rs": "776c6a223f0aba9c371a1f28d67d3a9a02b074d0180306749125af3fb6b5d6be",
+        "src/platform_impl/windows/icon.rs": "f91b8e79954ab25bae80d16cc0fc20e0bd3dc2d84c9a1cc5e7fb5e78578724e4",
+        "src/platform_impl/windows/ime.rs": "ddec49613d632f92ecade81ce0d5d4d9f2882bf04c295d910894bde818b3254b",
+        "src/platform_impl/windows/keyboard.rs": "d938ba8f899fcf5d7af2c5ff92dcf578f4663f522ebaa3906844971fa368ed8a",
+        "src/platform_impl/windows/keyboard_layout.rs": "320781ef4cb6f7b45ae11e728b68d03edc822b6f507b43f42feb14917bb82d17",
+        "src/platform_impl/windows/keycode.rs": "addf12a3ecc7f8075b18cadbf1f82823170d8567a4a71555ac9c6a5bc626c172",
+        "src/platform_impl/windows/mod.rs": "3040f04ed6e832b1217f589864a0eae24d2143f3344c94a141a84cec7c67c431",
+        "src/platform_impl/windows/monitor.rs": "b96a3f8db1c2ac6397be535831c6c4ca9341505370176b4c90dc872930f65051",
+        "src/platform_impl/windows/raw_input.rs": "3fbd6ac35b1f068d1da2a30759a797d30af10e61d1ba7d1236d7afc75840466d",
+        "src/platform_impl/windows/util.rs": "6997aacb633b9f6c2660761077844fb75d8bcdc3ed1eab12ec8308a3e44d9f38",
+        "src/platform_impl/windows/window.rs": "94c412f81388b1737704d107b8b03d7ecdbd3dbaacabf7dd8a015a65d0b6cad9",
+        "src/platform_impl/windows/window_state.rs": "3360fcf3b7e4d323cd4c02dfd99f37f405570d64614ea20869fc203439c2db94",
+        "src/window.rs": "6b3c2ffff49fe87ddbf9919d1558082b32fb18d166cd84631dd2c7a170f590ee"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "aee5bcfbf7e91bc3a92de122091756a9b079d613f620beaca6da2a9d1f04de8e",
+          "patched": "a3486c3bf1680e31cecc51df3e2f9d223bff5297e85eb9940be1d9318a3569de"
+        },
+        "src/platform/unix.rs": {
+          "upstream": "019fa7e1b4c891c442545f32921e8c66602cd27712c54329bc9a6608482e4be5",
+          "patched": "80e672239baf26b290e15bb50d851aeabe1b3a0d38c8df1a32b629ba4ef93cb5"
+        },
+        "src/platform_impl/linux/device.rs": {
+          "upstream": "28dcda6b173c92eb3673bd64b6a2aac38b78224c34cd7480a28a9258992a1097",
+          "patched": "74b524efe38df033c41bec763fb96c93a1ff7c9cf0cca156fb0afc6b95df7554"
+        },
+        "src/platform_impl/linux/event_loop.rs": {
+          "upstream": "7c06809b11dc8fa5daa676766773e782a02d17fe769c5fface1907f354604722",
+          "patched": "f55a90aa03dd35fd38b6d376aecee473daa16a5b0b48a5ccbeb3f05c0f37c2f9"
+        },
+        "src/platform_impl/linux/main_context_channel.rs": {
+          "upstream": null,
+          "patched": "a8e291d78619dd8784d9df32675d5f1315bbca9663aa0e8a6bf77040710ba2be"
+        },
+        "src/platform_impl/linux/mod.rs": {
+          "upstream": "151a497c996656eed00a12fda3c64973897edc2f78257fb4c5561f4ce9b19d9c",
+          "patched": "3c4d7620193e1bf640fa4ea9793dfc344302fc7f3262873a294b5a08402a6257"
+        },
+        "src/platform_impl/linux/portal.rs": {
+          "upstream": "06d04bf56d22327874a8b10bd93d5b18ffda1560f5605c153e542df96f7d14cc",
+          "patched": "b8be00ce1ae76937e83051f57f507ae5912f48bcbdb00cb5d6ba3fa29331d20e"
+        },
+        "src/platform_impl/linux/util.rs": {
+          "upstream": "3deb2f4f4883b4698415f553a3a90116d404739960d25c89dfcc56ae096164e8",
+          "patched": "e9d6d473498d9cbdc95b30e5074d1ee6fb487471a9e741c131f37dbda8253e8b"
+        },
+        "src/platform_impl/linux/window.rs": {
+          "upstream": "0532977ea20321f19e205f7c58d51077995b4f52878ca4979c5865c517625092",
+          "patched": "8566db23a604555c54ae2f10186139a5d00d6ee80b460074901b4cce3d10d0b3"
+        }
+      }
+    },
+    {
+      "name": "muda",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/muda",
+        "version": "0.19.3",
+        "archive": "https://static.crates.io/crates/muda/muda-0.19.3.crate",
+        "sha256": "1dd04e60bc0b07438a6771710ee1698f98f6ebbc7f89b61264af1563b8aeb878",
+        "vcs": {
+          "git": {
+            "sha1": "a375127ff39aded0804924026bf554682291d972"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "26033aff442acf9ac49622e6db301222bf158edcc8e00afc97cde7b2b1278d9b",
+        "Cargo.toml": "1c03c233d5417ca904f1428d80f542a012c174f63b30d6083ab68f25901b4013",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "2ab5537b8c0cb1d475e2145b6a7994b04e7c71e6e5bd836f7f9c47c221a5ad9a",
+        "LICENSE.spdx": "b99f9d43803f2ac979c50949df630bd8eeaf2fcd1b9fdb9093710d70f5dfb63d",
+        "README.md": "78f304ad16cebeeec63fad7186e768bf9ff61576fbfc9b23f3327398b0dbc439",
+        "src/about_metadata.rs": "3fd360ae17130bb4fc3f597aa759e26dc18115413075b2106bf62d8f4647ed8f",
+        "src/accelerator.rs": "fa5b4c6d77dca2a99f108fcc5aa8bc4f2251d401816c530a762af4a01f06aeba",
+        "src/builders/check.rs": "ed69146b897412214318eac90fe23c38daec461274178b35fe279ba181896d43",
+        "src/builders/icon.rs": "cb71d56a106721d441415bbbbaa9d68285949e45ad65057fd8a2caeeae4fb3cb",
+        "src/builders/mod.rs": "a59fef91da37b077fd1974f17388efb54b3e46ad10340e0cd31cf93435b0d346",
+        "src/builders/normal.rs": "c90d97aa95c32cf0bf52cd86801e61bfeccbd3cdf6399155b19f2c9e02a67b9b",
+        "src/builders/submenu.rs": "2007c17272b20069178230cf708a32d81ae9853214ce66d1b6a22879f5f3ac9c",
+        "src/error.rs": "d6ce02ff15d6c54bc40234a66d0c38eda4564add1760f830433605f041a33ce2",
+        "src/icon.rs": "4e08d14b04cd5213895f8e82949451d21b9c94391d81dc1f7f1724e36a887870",
+        "src/items/check.rs": "366118e5a76054aa3d3358c8db46f925312666d564d49672fdd4c5e253783f49",
+        "src/items/icon.rs": "2e8b7fa035848a70fee97980e705290ae19528f10c8fae07ea83d935fc6a655c",
+        "src/items/mod.rs": "989a09d7c03f1e74f6e4ef1e91aba6ca832c58f7468df121fa0550458d5ff686",
+        "src/items/normal.rs": "83767d7375e3a11b18a3822192ef564a15f4267323c15b23039d3549432fa3a5",
+        "src/items/predefined.rs": "2ec319276ed2e3d5867cd6912e4c9c9dffef346b83945f1b87ac0fa8780d635d",
+        "src/items/submenu.rs": "52f96636beac99ff66b6cad5dbcae21350aaf1169d653f39c23be2bdddb5ba13",
+        "src/lib.rs": "a3406853d70f177fd89398d38af5381ca82d25b0de80b9b6f4fcadbf0f26d935",
+        "src/menu.rs": "66451aefe353e208e72a421a97cce2bc5e48fca405a9f8553ce0800ff9ee7f9e",
+        "src/menu_id.rs": "d57c7c4555f1f4a74b265f19fdf6680faee4fc1c1091fb1a237b03bee115bf6f",
+        "src/platform_impl/gtk/accelerator.rs": "415a8eefb441c1cc9ea58f6634d8aef0afec8819239ce6b17e4acc3771bba9da",
+        "src/platform_impl/gtk/icon.rs": "71fbbf29f2aef2cbd6cebc093cf13a808d7d45dabfb883faa7198c43bb52e893",
+        "src/platform_impl/gtk/mod.rs": "9b870f2366837784cfb0cf81038c6e76e754cb3d18d8d7c664a3ef9cf5254d02",
+        "src/platform_impl/macos/accelerator.rs": "7d9123a9cf8027c8446391f508cf8618fdc018f5ddef714b8dc33d00940285aa",
+        "src/platform_impl/macos/icon.rs": "c82702a05b3149845e16a2a8f097e03c863e433b410611066c60972a645e145c",
+        "src/platform_impl/macos/mod.rs": "3bec7b9ea8b76d1653158ba320e5fe44da57a3cd7172a54222435afa50f083dd",
+        "src/platform_impl/macos/util.rs": "0ac95957495b59039063f27b9172ece51e712c38b292be6685686bbe612c694d",
+        "src/platform_impl/mod.rs": "1dfc1e2e99a1f5c2a48ee520e3184725a8a9ed1a62b467e939f1c7a526465653",
+        "src/platform_impl/windows/accelerator.rs": "22846819c6740662aaf87533ef632862b219f556978da6cbeb1b5e36e0c50243",
+        "src/platform_impl/windows/dark_menu_bar.rs": "afb8be0559e3a02af8c444a4eb18ea6f7ab94c77e568d639827498d37cb6fd40",
+        "src/platform_impl/windows/icon.rs": "9a2d6473a02052e67d1f7ea7300d09031b265ba4b0ba26839b6051f37038ba0e",
+        "src/platform_impl/windows/mod.rs": "cb52f8c9cae530f83741be6bf8e3b797d5de8d4854225139640b29e0ebd98552",
+        "src/platform_impl/windows/util.rs": "ab18b7d64942437b6906276df2aaaf9bdce0ba0cdbb57811dd9ee4a40cecd6fe",
+        "src/util.rs": "e46d06c6e67fb073b31a39e4d736146a344037099fc1220ec51e1385a6f1ecbd"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "05925e996dda3c2fd15c295fc1701ba15ba4d6ac9b876e77dc9706cdcdb9a38b",
+          "patched": "1c03c233d5417ca904f1428d80f542a012c174f63b30d6083ab68f25901b4013"
+        }
+      }
+    },
+    {
+      "name": "webkit2gtk",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/webkit2gtk-rs",
+        "version": "2.0.2",
+        "archive": "https://static.crates.io/crates/webkit2gtk/webkit2gtk-2.0.2.crate",
+        "sha256": "a1027150013530fb2eaf806408df88461ae4815a45c541c8975e61d6f2fc4793",
+        "vcs": {
+          "git": {
+            "sha1": "8de4e245df5c08562a28348e77bcf51cb01e67ea"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "19c4b0edd6a82c60f6efb4d43f2deeb5969feed5af62d4934f265f7cc9a7a44f",
+        "CHANGELOG.md": "94d8bf5e43af8abd7f51779b193222a7d1ac543df10792e395976197a8b32221",
+        "Cargo.toml": "069f126efea65ba4f9efb6b5f90facde84c3a2d68fa439fe8b2b096571c96dc4",
+        "LICENSE": "3f39c032be4639be635da96d77c4d0f4393c3595a164450ffd86f3d17701ec10",
+        "README.md": "d7af5b6d1a7209a418e944de95c620d559b9da423f7316fcb4952d76056bd468",
+        "src/auto/application_info.rs": "c9f57731d42353c723a7ea7c2221693b5bf2126417674bd5df9e4aba674c15d0",
+        "src/auto/authentication_request.rs": "0ce67caa2b8c6d61e5fdb277020fb1caaf71023a0c1b6126acde1865a5cc3819",
+        "src/auto/automation_session.rs": "7bd1b71ad9bc53674cefdf1103ba49cd7e2b47c2caa2b1fe7c02e7694e7c098c",
+        "src/auto/back_forward_list.rs": "21541b2bde2468b370281e07d4b7903bfe378f44ab2ac497f29948055603dec5",
+        "src/auto/back_forward_list_item.rs": "56adb1f26ac561089891b6964ac60c035ce301f70bc828b6e57c480273b75f5c",
+        "src/auto/color_chooser_request.rs": "4cd2ba6ecb518d276a764991e316414b1f34a134c94f65413517c49cd56530ea",
+        "src/auto/context_menu.rs": "cd84dbabac96297eebadb11b9249456ef335ed3bc70829fa8cf0d49d7f47d1c7",
+        "src/auto/context_menu_item.rs": "2e482ee363079183d3ec9d460661961ca10f4b6c70cb966d85d21510f3d362d2",
+        "src/auto/cookie_manager.rs": "e19b87ebcb2fe436a9ddc8ee0e9133dbb1dace4b2424d392814ea27f983a65d9",
+        "src/auto/credential.rs": "36ee25c73c753be3e6ed7e2155f6fd888a20c445c1e0030f3e69fd613af64c91",
+        "src/auto/device_info_permission_request.rs": "69a499201a98d8cbdfcb891dec9959a91f1916b8586f20b52975410af3c9ad56",
+        "src/auto/download.rs": "253f7a03e4b5b3755441c62fe4bd15e234af86dd02eaa376507350382c09baad",
+        "src/auto/editor_state.rs": "3d8fe5225f79d126e97f4d41cebc965f976981c69fe2e0dd7e2d29517a38b5af",
+        "src/auto/enums.rs": "12cb9417430390f7fa3cd52c9f678fdf6b2a8196db0d76e5a1679e5e753e517a",
+        "src/auto/favicon_database.rs": "d56b88e6c877e0ea67d05b64111969ebe59b9f5b173d527ebf4d18d94c4fa6c8",
+        "src/auto/file_chooser_request.rs": "2f21e602c5dc8082c95a1c76d7ea153598d796cb5b7386b154b63f0f11bb3213",
+        "src/auto/find_controller.rs": "082493ee3ea6c6ef6faa965ca15ae9699591611d7b27f25cc83dfab4819cd94c",
+        "src/auto/flags.rs": "0cc085f4d93fce413d291df825fa508939516dd83d5065b2b47b54706c3a20fa",
+        "src/auto/form_submission_request.rs": "1611fb22b94ba1346559c3036d60b7e614f25b962adeb09fa9b2ef0dcbf4d5aa",
+        "src/auto/geolocation_manager.rs": "859cc5d617a2e442d4c8cf0cd39376204919a7a296acb5b9ecefab7d8db19ce5",
+        "src/auto/geolocation_permission_request.rs": "fd49506a01999d239c111d362b83819d42d907a8177961e58ea6449fa167cea8",
+        "src/auto/geolocation_position.rs": "5bf31a0be2aed9e0d4dbaa57c690d96cc6ad775638d44f9058ed3126d1d7a673",
+        "src/auto/hit_test_result.rs": "3bf321fd1841158f3ac552510255edc56dc76cc3c23d18be5629f47a86ce3064",
+        "src/auto/input_method_context.rs": "f953f4d142528d6faa6edbb629fadaab080f8c6bc051721748e8079d3fcd45c3",
+        "src/auto/input_method_underline.rs": "08c05c26d9e57b7ee3fae836676a5002666e29e5fe1d55073b30784fcd778c8c",
+        "src/auto/install_missing_media_plugins_permission_request.rs": "3322e8d3057a5c20af76038b7f8ece319dfb330481a6d02a1288aba3ee2b04e9",
+        "src/auto/itp_first_party.rs": "1a105bc9b08e23825400445bf191e60d3deb49d1439b058a407d35b70e195b28",
+        "src/auto/itp_third_party.rs": "a853aa4a3447d46374b15d099df8294ed84f11aacdc81cd8fefdc3fafef32975",
+        "src/auto/javascript_result.rs": "99fc659243ac20f059a40a97b83af98db109ac4827df42dba6c4770669a5f627",
+        "src/auto/media_key_system_permission_request.rs": "0cfcd641ee7cddce67d80cfff3ec78aa407147ee59250d4205819f98166deee4",
+        "src/auto/memory_pressure_settings.rs": "d8fcd67b8631bebfa3a24dc8a9d5eada320754fac4ab48e3399e9cde3069994f",
+        "src/auto/mime_info.rs": "edbc809405f4ffe687266da63188f0d1a3e9f68fd66efeeedd63c3ac7ba52d8e",
+        "src/auto/mod.rs": "eae9b4c2d0ac832a70e8eaccf23b216d3628cfeebc7e47dea6738a3a46f623e4",
+        "src/auto/navigation_action.rs": "be3b9fd196204f19cf76613a1b03297d276885dbae7019bce690d54918883920",
+        "src/auto/navigation_policy_decision.rs": "9303122de93f215de53e8232fd172bba6a56e94723be2fb97d53cd7b9e847608",
+        "src/auto/network_proxy_settings.rs": "7ccc9633091d02e64a10f7403f5e5694d5b1d74bcddb79176194e63d755717e8",
+        "src/auto/notification.rs": "8e75e9e4972019e6eebf50354e4c09f47818103154b52eb6026e371f913a2b9d",
+        "src/auto/notification_permission_request.rs": "d0b3049c90775c3659f8a909474f1930307a84267f8d468c8c9c99d4d77443f5",
+        "src/auto/option_menu.rs": "b77642bd98f45f77e1bf3d05c035ab4c970404d9917e7e7b474fecb25caa618f",
+        "src/auto/option_menu_item.rs": "1286c778e9d9876a9c303af42d708cf4117fd4611f1a97bf8bca46d18db0fb3b",
+        "src/auto/permission_request.rs": "0ac1275debcf91ca8c8b1a45f6f875be31a96f779dd261f1f2929ebc18bdc9a7",
+        "src/auto/plugin.rs": "abd3e6ab5edd37c8a5324c9c37ff64281710a9e5ab0331997c2694d7fababc76",
+        "src/auto/pointer_lock_permission_request.rs": "b7898a398485c2a01dd51a843fde4a5fbb08dface45fb54f65f6b72f769cba94",
+        "src/auto/policy_decision.rs": "7ed7fface82bc00632252716a3c010902765ce3ee3e2e9a65d1b71a59537dfb2",
+        "src/auto/print_custom_widget.rs": "4b74c948d5c8686e20cdf15f6ecbc8b20fb37402aaa072119e6a5d6a19088246",
+        "src/auto/print_operation.rs": "f0c2559af4cde8a46cc59946f5689ee0bcd722c96fb4bd0ce91ecd32054bd649",
+        "src/auto/response_policy_decision.rs": "0bf6c18960849a0281c761a473071e0f03c6aebfe02961d871260171e208152d",
+        "src/auto/script_dialog.rs": "ea669e11935b72adb422144680be0e9f683951bfb4142f1644c7dc9c53800772",
+        "src/auto/security_manager.rs": "00b3239c89710defdfafa3c62e15fe4e8673f00d1c279cc4366ccaf9b316875d",
+        "src/auto/security_origin.rs": "a20ff6744e79af4b0381537063638d6b63ffd6308e1f27ed0c91b01d15e6c0c8",
+        "src/auto/settings.rs": "a9df4b0ca92bb1e76cf3e91e9f74411e8185e92b8ed4c4d4616c23e1edf97446",
+        "src/auto/uri_request.rs": "5c110566557be40feaff6c47634e06b6b14aed9f144620a44db7ef0377f1e18b",
+        "src/auto/uri_response.rs": "11974264dab38898443edb28e3e083aae69da97f252cdaab1a8bb1d4cd716882",
+        "src/auto/uri_scheme_request.rs": "98269c14fbfac53df5fe890a6ede06404ff58e8dc33ed49155c6540df56c0a85",
+        "src/auto/uri_scheme_response.rs": "c4c716ba7564acf30ad4e865622b685d99cd50e28337a3d1f87df066c53033da",
+        "src/auto/user_content_manager.rs": "7f255abb14a177de840ad4c5e818c18f74e9c1dd35669ebe72ab02e596563106",
+        "src/auto/user_media_permission_request.rs": "a8540c9715b18d72b0e5b7d7db94e01e4ff551701d1a09dc6703ea1ef4f29bce",
+        "src/auto/user_message.rs": "fab7c40528833810410f07ca652e7c7f2c12f58e64c52e5ad8f4e4475e1e758d",
+        "src/auto/user_script.rs": "95ab0e3104bb5de65fa6bfa15eeab248475acf29e4df736d1e8826a1de00ce11",
+        "src/auto/user_style_sheet.rs": "7175079d1f583abfd500c8098ecfc2ad21b989d4d8c6dcbfb48f3a9b69ff3e52",
+        "src/auto/web_context.rs": "2782277daa63a68d61fc3c4c5ed7d74b9ece31ed18e1a02d8a36138308c4a3b7",
+        "src/auto/web_inspector.rs": "38e532c709a91dd6fa6c77d2f3167779943692af76fdee03e6406eebec6b1630",
+        "src/auto/web_resource.rs": "3405d34fed0450615538bd644d73978bfa7af548c590c4bf15e7fa1c3355aee1",
+        "src/auto/web_view.rs": "d69acf9837d12be9021383254bb06dea3cb0450af1d8fae4e1dfaeee33b3b776",
+        "src/auto/web_view_base.rs": "ffeb3c89977db29e89e53f11dd946cf4501697b35476d35640ad15c809d23745",
+        "src/auto/web_view_session_state.rs": "ff9b62da07828e401fcf7c16a58855c2dff02c59a4347fd3b2a06a2f0221c1c8",
+        "src/auto/website_data.rs": "346c0b48fcf33e41880e1a46c5eecc107cdb3cfb6aa1383d9e1a513c84247f5f",
+        "src/auto/website_data_access_permission_request.rs": "677ca86a726ce7ad0b6e92a8808edc20fa312fb982b58180027599e566813d1f",
+        "src/auto/website_data_manager.rs": "795c857d60c713191fca9a2e58eafd77c62d4ddf2fbbd13181e3cc1adc180c74",
+        "src/auto/website_policies.rs": "9c6af48a880768294e37139455e161e83edb8af5ea102f1c2712adcb427662f2",
+        "src/auto/window_properties.rs": "84aaada208b440742b34b5bbad7e23c661a67dd2d64678d62e854d7728d0dc26",
+        "src/credential.rs": "ad4fb6bd28189a74b1eeeff512085e0aa68fa8b560980a7c3b633dcac01fe9e1",
+        "src/javascript_result.rs": "1fe75c47e09dc17bc876a72ec54767e4bf850927ad425f00b03e2e375758e269",
+        "src/lib.rs": "763b5c16d528bdf8f4534c1d85bf53b4d412a697d60ba70dcedf6e00e92b8f3a",
+        "src/rt.rs": "dd949b1ec6c550f00d9326bf7150e2ff478e7566c9149fd042611bce8571529f",
+        "src/web_context.rs": "32da3aff512fa8dca6d818b1f2c6127c616a05030fff9b2556e036e402b691ba",
+        "src/web_view.rs": "85757fee84ae81ff8a3d130c41892f31c59291c05a2d83629024bef50df3598b",
+        "src/website_data_manager.rs": "42d145d773e1532a9df8a9c9ec04cbf39f55c33bfa2efe91cabc67e22f301a88"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "f22fa00693fc7db89921417b8fd9bfac08cae8b4649f0f942055996b3194e47d",
+          "patched": "069f126efea65ba4f9efb6b5f90facde84c3a2d68fa439fe8b2b096571c96dc4"
+        },
+        "src/web_context.rs": {
+          "upstream": "f55cac812a5c157b2b7a008d9b2d11b50a0b47dd8731f85c7fb47ca07eb57ea7",
+          "patched": "32da3aff512fa8dca6d818b1f2c6127c616a05030fff9b2556e036e402b691ba"
+        },
+        "src/web_view.rs": {
+          "upstream": "e6c28d4bf31f7bad8bb3903b85c55f1595b37bb3a60b0b5f1040422d6a9b522a",
+          "patched": "85757fee84ae81ff8a3d130c41892f31c59291c05a2d83629024bef50df3598b"
+        }
+      }
+    },
+    {
+      "name": "webkit2gtk-sys",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/webkit2gtk-rs",
+        "version": "2.0.2",
+        "archive": "https://static.crates.io/crates/webkit2gtk-sys/webkit2gtk-sys-2.0.2.crate",
+        "sha256": "916a5f65c2ef0dfe12fff695960a2ec3d4565359fdbb2e9943c974e06c734ea5",
+        "vcs": {
+          "git": {
+            "sha1": "8de4e245df5c08562a28348e77bcf51cb01e67ea"
+          },
+          "path_in_vcs": "sys"
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "e0ff0ece1dcbb3af8607d1434e000c912e49042c09d9a6c00d75c33003ff84f1",
+        "CHANGELOG.md": "7b57a0cf9bf874ad5dd4b118ac841959b2fb9a5dfdca9ddec6d0fd115d8bbdc6",
+        "Cargo.toml": "83d6675c29a42f4b171d72acb2705571c30795a9dc3a12640c3d80ca51ecc002",
+        "LICENSE": "281b72cb008466810da31680e72005b9899c7e9d7705b909c86098260e12aa7d",
+        "build.rs": "e2cd089c2953b43e3d6ec4b9ef098110b6f093f1a6f8a9b3bd1e73051c05ae0b",
+        "src/lib.rs": "145720d11d2e76d2df456470c74c4edf527f79f7ec8128a95928be827b9e6eac"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "df606562f1939bb47f616e177193830cafbb4877d277ff3c8b207d906bf9387c",
+          "patched": "83d6675c29a42f4b171d72acb2705571c30795a9dc3a12640c3d80ca51ecc002"
+        }
+      }
+    },
+    {
+      "name": "javascriptcore-rs",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/javascriptcore-rs",
+        "version": "1.1.2",
+        "archive": "https://static.crates.io/crates/javascriptcore-rs/javascriptcore-rs-1.1.2.crate",
+        "sha256": "ca5671e9ffce8ffba57afc24070e906da7fc4b1ba66f2cabebf61bf2ea257fcc",
+        "vcs": {
+          "git": {
+            "sha1": "1f7bba0bcf6a3c1cf69bc990b8f746ae06c3c6be"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "8f60c74789b0d85c759c77e8680813ecde7c1887b5a9ff9f6228932a42a6421f",
+        ".changes/config.json": "1c2e558420c8b4c91ace1a729cf086ff63b72065efa00744f582075b16058ef9",
+        ".changes/readme.md": "f362141d1ec0a1efc7c3da8056be9fa8cf104aecf5f6ec7ec64e4c06cef3c1aa",
+        ".github/CODEOWNERS": "1525064e12cb99794b0c8fa408bc337da725643d1576cfa076e91cb0e92fd4c0",
+        ".github/CODE_OF_CONDUCT.md": "4ab8117a3f99524999fee1689e9b620ad9eff48d7b3cf763fbeb349b922a49ba",
+        ".github/CONTRIBUTING.md": "765314dadfbdccd65b1b9c582c3528a69a1b8a1bb12340d69e3240fff398ec32",
+        ".github/FUNDING.yml": "79ce93ce40873a93be59032fd1c4290e0b0ed148ca39947d31a3e05705841986",
+        ".github/ISSUE_TEMPLATE/bug_report.md": "ee2095c589fd3d23d8032ed6be742ccd364841c03e1e4139acb596becef8781f",
+        ".github/ISSUE_TEMPLATE/feature_request.md": "987db993b91be765528958577552cc098142e7deb08b2de55bf98ec4948f0290",
+        ".github/PULL_REQUEST_TEMPLATE.md": "1aba65158a6ca8f5540eca53ce4e49d6e74cde3b3d3275e8d4c4d2c5ed1555e2",
+        ".github/workflows/build.yml": "f9340ab2d7164f18f2150f6c64f0b58227f6349537a9ce3181816455a5d890be",
+        ".github/workflows/covector-status.yml": "06d3f703271706b3933c0c186242d735d783ea2206dcd664e9ef0230ef12524d",
+        ".github/workflows/covector-version-or-publish.yml": "4e9b51b43546117271060cd2b62903f7934d9d37f12be2ca7518613108d4ac16",
+        ".gitignore": "d898589a957522afd2ae556f37ac96a54ff5853dc6258d0ce7813f1a6aead69a",
+        ".gitmodules": "63d198300ed2cf667e897414d10e39c63aac1f98477455d6fa3b23d71080da7a",
+        ".license_template": "a06eff33f5e5e6494ac572770e594c48a10949b4f01e4a1aba38e3c00f7eca54",
+        "CHANGELOG.md": "00a3fc28fed57762cc538a12fac394556c9ae7187dad11c61bb2c4c12d97d9e0",
+        "Cargo.toml": "8a81c954bc8885d98cb77323c698fd8def6b34927d757d8c2b87b27a8a9338c0",
+        "Gir.toml": "89df87e05da9dcd6ad1aeac7b93f733101a26e7f41b8ec5f82fce35f44861cb6",
+        "LICENSE": "5444779e62a6f136892955bab2727694509b2cc1c0cd0f394d5edc7ff9203cd1",
+        "README.md": "cd27723a79dc8047ab05bc2b5a85ef0cd302bf3dfa1840f8fd649ffacf909670",
+        "rustfmt.toml": "93f1c19e680720e38add5c24a1b4ab98736d2ac43e3cccb6f9e2975f56022e76",
+        "src/auto/class.rs": "db96c87d56ad63d40fc83d6d020c4e4d2f898bc4e50ef5c41bd260ba6ba8a7aa",
+        "src/auto/context.rs": "77211975ba69764358485831e37fb8286489c8731a01bae571c4a6c5e1d99f49",
+        "src/auto/enums.rs": "e0cd1b0f9111e6c2858144fe7c2f85c4a425172439864fa86dadb3167b1799eb",
+        "src/auto/exception.rs": "5834158b0bc10277665f18fc653b5cd52840df63ece504a7cc31fb7e3f377759",
+        "src/auto/flags.rs": "af3c1ea02c3d60524b9edea4c0ff01ed1ce95773b99612ae90c75764ddc32d8d",
+        "src/auto/mod.rs": "4de528d465bc6e88019e1f6f997deb6734d53dcdfc5f5aaa72574b447093d413",
+        "src/auto/value.rs": "9e58305f4b7e26f768d5af211e071c15d4486d0339887b012d1248533ed97537",
+        "src/auto/versions.txt": "af779e685a6e64ae0958c9a0327d64e1a430eab89a50dfc67fee1c3a72e16858",
+        "src/auto/virtual_machine.rs": "68a3052499b90181b629a7ebeded00b7e2428a28b8ff263ca5be22c0f2fad1c1",
+        "src/auto/weak_value.rs": "fbac90acd0eaa9566260f10ac7974d63a2614a5b3b485019e1147bf8f4418c17",
+        "src/lib.rs": "43cf91ff4d66e75557890018c064f3a030b549d1c680657f41dbb433587109f2",
+        "src/value.rs": "56e5847081245927bac9c81f719a9e78b62db4f0eb84bb9411269ba93fe7b24e"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "625dd19f32685bcd307f8ad56583b90babf64c81b05f7a456e6e8929b0b8359b",
+          "patched": "8a81c954bc8885d98cb77323c698fd8def6b34927d757d8c2b87b27a8a9338c0"
+        }
+      }
+    },
+    {
+      "name": "javascriptcore-rs-sys",
+      "origin": {
+        "repo": "https://github.com/tauri-apps/javascriptcore-rs",
+        "version": "1.1.1",
+        "archive": "https://static.crates.io/crates/javascriptcore-rs-sys/javascriptcore-rs-sys-1.1.1.crate",
+        "sha256": "af1be78d14ffa4b75b66df31840478fef72b51f8c2465d4ca7c194da9f7a5124",
+        "vcs": {
+          "git": {
+            "sha1": "1f7bba0bcf6a3c1cf69bc990b8f746ae06c3c6be"
+          },
+          "path_in_vcs": "sys"
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "227e3aa230a1a87bdb973a97df29ab8367e3bb67edaa6504ef625f1773b3f0ec",
+        "CHANGELOG.md": "e93423ef861c99b87e55100e8e5b8e9184a769a066716560f6769f5d728f7ea9",
+        "Cargo.toml": "a8a910642da6ad14cbccd15b98194ea543eefc576535721b7140cd597e8ffb17",
+        "Gir.toml": "e12dd32d1ee4cbba8b68f731465e82bd6d459752f9d6d80a96661d0717bb0277",
+        "LICENSE": "7ade43ec5e1a5e43000aa871d290dff4c0e9e2e16b7f6bea2ecf091e3d056d31",
+        "build.rs": "45fe0a19a52b95c841e806198ca959a2061883c5bc0b8eb72da9845a9342eb89",
+        "src/lib.rs": "39db4f8839661d4dbd1cff9f9e3060a57140c6883b8de0aecbbd52907128adc4",
+        "tests/abi.rs": "cfc9c5cfcab2e6fd68e61e3baa905e8ef93aa36acc0b86c6d5753b6ccb952018",
+        "tests/constant.c": "5907d210fef18122bde6e1ca2be12571ba9e8d8c5019ee9e3c4606edad4cfb8a",
+        "tests/layout.c": "094d55c7f049dc08819e39576077e06557f9b461a1eec6e6677c52c79d2fd4e5",
+        "tests/manual.h": "77b6fdcd20de96fb4475a9bc6f928d2dd591cdcd50a490ca349e76fcfaebaf05"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "83edcefbf4919fab952792eaa7fa5b38f464c99891832c7f031a8d3b4d776279",
+          "patched": "a8a910642da6ad14cbccd15b98194ea543eefc576535721b7140cd597e8ffb17"
+        }
+      }
+    },
+    {
+      "name": "libappindicator",
+      "origin": {
+        "repo": "https://crates.io/crates/libappindicator",
+        "version": "0.9.0",
+        "archive": "https://static.crates.io/crates/libappindicator/libappindicator-0.9.0.crate",
+        "sha256": "03589b9607c868cc7ae54c0b2a22c8dc03dd41692d48f2d7df73615c6a95dc0a",
+        "vcs": {
+          "git": {
+            "sha1": "eafd1e3682a1247f595410266091e9684021cb6f"
+          },
+          "path_in_vcs": ""
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "415a0343e684487048df8f40b710fd06e06860988d3b379821a574b19108b104",
+        ".changes/config.json": "ee9b18965998cca81faf9d6ee4b20f77329f5c4ba965b8e21d6606b70ee5da00",
+        ".changes/readme.md": "f362141d1ec0a1efc7c3da8056be9fa8cf104aecf5f6ec7ec64e4c06cef3c1aa",
+        ".github/CODEOWNERS": "1525064e12cb99794b0c8fa408bc337da725643d1576cfa076e91cb0e92fd4c0",
+        ".github/CODE_OF_CONDUCT.md": "4ab8117a3f99524999fee1689e9b620ad9eff48d7b3cf763fbeb349b922a49ba",
+        ".github/CONTRIBUTING.md": "765314dadfbdccd65b1b9c582c3528a69a1b8a1bb12340d69e3240fff398ec32",
+        ".github/FUNDING.yml": "79ce93ce40873a93be59032fd1c4290e0b0ed148ca39947d31a3e05705841986",
+        ".github/ISSUE_TEMPLATE/bug_report.md": "ee2095c589fd3d23d8032ed6be742ccd364841c03e1e4139acb596becef8781f",
+        ".github/ISSUE_TEMPLATE/feature_request.md": "987db993b91be765528958577552cc098142e7deb08b2de55bf98ec4948f0290",
+        ".github/PULL_REQUEST_TEMPLATE.md": "9c449da1f65070c03dcc6a00c74df4068553c748a67c7c2539b4b29403611145",
+        ".github/workflows/build.yml": "b941a5a8e7c0486eb1188bd644bffd293b0f9a2b85c0dcbf2cb1b6a0ef5b7f2b",
+        ".github/workflows/covector-status.yml": "06d3f703271706b3933c0c186242d735d783ea2206dcd664e9ef0230ef12524d",
+        ".github/workflows/covector-version-or-publish.yml": "b426d827453f9eb5b0f3ec5c84d8799fc5850a6f817581c849a38409c7de834d",
+        ".gitignore": "f9b1ca6ae27d1c18215265024629a8960c31379f206d9ed20f64e0b2dcf79805",
+        ".license_template": "9aca48869404894538e54a881bcc2ece2142a709b665ced1fd2d284ae7c44595",
+        "CHANGELOG.md": "9b3496d9231d61737ed228cc7ef0a67b1ae857dbc9baacae4b54e819dd4c3030",
+        "Cargo.toml": "c377ebb6ce9d8f03c7cf3024a80a40125fb294cec7c96a8fbbaddae28d80d2ff",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "eb227437252b2a7a9c1fc342c93ade1f3d7ce38cc6dd754f613db07d53ceff0b",
+        "README.md": "57f3c2133c3b3c388a96512c1a447c94118b22cf37c7099a65563b3d0c408383",
+        "examples/hello.rs": "72f817125f6adf90e27e7ede32ca246178b91f3bec8df9b0d0d84b4bae734944",
+        "examples/rust-logo.png": "f6839dffe09e69d1cf6b822dc87c1c6153b308bb888f63b24ebfa76d32c19503",
+        "rustfmt.toml": "355f303583e15d1518e0c89eeaf2a4034bcc7c2a292087dfc17d00dc8173a5fd",
+        "src/lib.rs": "a7ebb47555d628d88e2e048d7bda5977136d234604c00b37a9d27c01bb463c4b"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "ab35819c217045d7a83b724ed25f85c5aacd3927cc3cfe558886a1a794c351cf",
+          "patched": "c377ebb6ce9d8f03c7cf3024a80a40125fb294cec7c96a8fbbaddae28d80d2ff"
+        }
+      }
+    },
+    {
+      "name": "libappindicator-sys",
+      "origin": {
+        "repo": "https://crates.io/crates/libappindicator-sys",
+        "version": "0.9.0",
+        "archive": "https://static.crates.io/crates/libappindicator-sys/libappindicator-sys-0.9.0.crate",
+        "sha256": "6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf",
+        "vcs": {
+          "git": {
+            "sha1": "eafd1e3682a1247f595410266091e9684021cb6f"
+          },
+          "path_in_vcs": "sys"
+        }
+      },
+      "rewrites": [],
+      "files": {
+        ".cargo_vcs_info.json": "2eb6d78db3efbbb1c498618238bad1377e08f43f12e9ba7e1fb128a8aedfe2c5",
+        "CHANGELOG.md": "bdcb483931833f9e6a9ec584655212aa4e502b11541f330a186a284aae80647d",
+        "Cargo.toml": "5fd957472563fe9ec93d2c369b64e9a9767c988bd910e4fead6c6b6474665d26",
+        "src/lib.rs": "742a25cd2a4c09762f57c3dfaa8958e6c62c771e28916a58b45a85fae84aea6d"
+      },
+      "changes": {
+        "Cargo.toml": {
+          "upstream": "5f1a49e786206ea35dca5d45a82b84cfb99839ecaff47f579ae3b63496586e86",
+          "patched": "5fd957472563fe9ec93d2c369b64e9a9767c988bd910e4fead6c6b6474665d26"
+        }
+      }
+    }
+  ]
+}

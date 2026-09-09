@@ -68,9 +68,9 @@ path = "src/bin/gitpulse-hook.rs"
 # there builds on macOS and fails on Linux and Windows. Off macOS the feature is
 # inert (every guard in `tauri` reads `any(not(target_os = "macos"), feature =
 # "macos-private-api")`), so declaring it everywhere costs nothing.
-# Latest crates.io is 2.11.5 (2026-07-01). `dev` (rev below) is the unpublished
-# 2.12 line: urlpattern 0.6 and wry 0.56. GTK3 is still the Linux webview.
-tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = ["macos-private-api"] }
+# Based on the pinned Tauri revision below, locally ported to GTK3 0.19 /
+# GLib 0.22. Upstream provenance and local changes: framework/PATCHES.json.
+tauri = { path = "framework/tauri", features = ["macos-private-api"] }
 tauri-plugin-opener = "2.5.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -148,7 +148,12 @@ tempfile = "3.27"
 # dependency — it enables a feature of the tauri crate already in
 # [dependencies] — and it is what lets tests drive commands through the real
 # IPC bridge instead of calling the functions directly.
-tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = ["test"] }
+tauri = { path = "framework/tauri", features = ["test"] }
+
+# Exercise the same GTK/GLib instance used by Tauri on its real main thread.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gtk = "0.19"
+async-channel = "2.5"
 
 # `build_native_menu` can only run on the process main thread (muda creates
 # NSMenuItem there and panics anywhere else), and a libtest harness runs every
@@ -156,6 +161,10 @@ tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496
 # which IS the main thread — so the menu builder is reachable from a test.
 [[test]]
 name = "native_menu_main_thread"
+harness = false
+
+[[test]]
+name = "gtk_runtime"
 harness = false
 
 # Wall-clock measurement, not a pass/fail gate. `test = false` keeps it out of
@@ -189,17 +198,30 @@ strip = "debuginfo"
 # shipped as tauri-utils 2.10 / tauri 2.12. Patch the parent crate from that
 # unpublished line rather than spoofing a leaf version.
 #
-# GTK3 (gtk 0.18 / glib 0.18.5, RUSTSEC-2024-0411–0420 / 0429) is unchanged on
-# this rev: wry 0.56.1 and tauri `dev` still depend on gtk 0.18. The gtk4/webkit6
-# ports (wry#1767, tao#1258, tauri#14684) are unmerged as of 2026-09-07.
+# GTK3 0.19 uses maintained GLib 0.22 and removes proc-macro-error. Carry the
+# consumer port until Tauri/WRY/TAO adopt that line. Keep a single Runtime trait
+# and a single GTK/GLib native links graph for the app and registry plugins.
+# These are source patches, not republished crates or advisory exclusions.
 [patch.crates-io]
-# One git rev for the whole Tauri family so crates.io plugins (opener) and
-# unpublished 2.12 crates share a single `tauri_runtime::Runtime` trait.
-tauri = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
 tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
 tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
 tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
 tauri-plugin = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
-tauri-runtime = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
-tauri-runtime-wry = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
 tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64" }
+javascriptcore-rs = { path = "framework/javascriptcore-rs" }
+javascriptcore-rs-sys = { path = "framework/javascriptcore-rs-sys" }
+libappindicator = { path = "framework/libappindicator" }
+libappindicator-sys = { path = "framework/libappindicator-sys" }
+muda = { path = "framework/muda" }
+tao = { path = "framework/tao" }
+tauri = { path = "framework/tauri" }
+tauri-runtime = { path = "framework/tauri-runtime" }
+tauri-runtime-wry = { path = "framework/tauri-runtime-wry" }
+webkit2gtk = { path = "framework/webkit2gtk" }
+webkit2gtk-sys = { path = "framework/webkit2gtk-sys" }
+wry = { path = "framework/wry" }
+
+[patch."https://github.com/tauri-apps/tauri"]
+tauri = { path = "framework/tauri" }
+tauri-runtime = { path = "framework/tauri-runtime" }
+tauri-runtime-wry = { path = "framework/tauri-runtime-wry" }

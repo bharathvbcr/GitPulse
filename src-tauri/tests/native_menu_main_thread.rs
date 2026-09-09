@@ -39,6 +39,8 @@ fn check(name: &str, passed: bool, detail: &str, failures: &mut Vec<String>) {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    gtk::init().expect("native menu tests require a display (use xvfb-run)");
     let mut failures: Vec<String> = Vec::new();
     let app = mock_app();
 

@@ -2,6 +2,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, wri
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 
 function fixture() {
@@ -34,6 +35,39 @@ it("detects upstream deletions and inherited manifest changes", () => {
     expect(report.crates[0].upstream).toBe("drifted");
     expect(report.crates[0].drifted).toEqual(expect.arrayContaining(["Cargo.toml", "src/lib.rs"]));
     expect(report.crates[0].edited).toEqual([]);
+  } finally { f.cleanup(); }
+});
+
+it.each(["edited", "missing", "extra"])("checks locally maintained framework snapshots for %s files", (mode) => {
+  const f = fixture();
+  try {
+    const dir = path.join(f.root, "src-tauri/framework/gtk-consumer");
+    mkdirSync(dir, { recursive: true });
+    const original = "pub const VERSION: u8 = 1;\n";
+    writeFileSync(path.join(dir, "lib.rs"), original);
+    writeFileSync(path.join(f.root, "src-tauri/framework/PATCHES.json"), JSON.stringify({ crates: [{
+      name: "gtk-consumer", origin: { repo: "https://example.com/upstream", commit: "pinned" },
+      files: { "lib.rs": createHash("sha256").update(original).digest("hex") },
+    }] }));
+    expect(f.run("--check", "--allow-drift").status).toBe(0);
+    if (mode === "edited") writeFileSync(path.join(dir, "lib.rs"), "changed\n");
+    if (mode === "missing") rmSync(path.join(dir, "lib.rs"));
+    if (mode === "extra") writeFileSync(path.join(dir, "extra.rs"), "unrecorded\n");
+    const result = f.run("--check", "--allow-drift");
+    expect(result.status, result.stderr).toBe(1);
+    expect(JSON.parse(result.stdout).crates).toContainEqual(expect.objectContaining({
+      name: "gtk-consumer", upstream: "unavailable", edited: expect.arrayContaining([expect.stringMatching(/\.rs/)]),
+    }));
+  } finally { f.cleanup(); }
+});
+
+it("refuses a missing framework tree required by the application manifest", () => {
+  const f = fixture();
+  try {
+    writeFileSync(path.join(f.root, "src-tauri/Cargo.toml"), '[dependencies]\ntauri = { path = "framework/tauri" }\n');
+    const result = f.run("--check", "--allow-drift");
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("PATCHES.json");
   } finally { f.cleanup(); }
 });
 
