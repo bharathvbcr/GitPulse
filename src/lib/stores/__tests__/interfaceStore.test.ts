@@ -4,6 +4,16 @@ import { interfaceStore } from "../interfaceStore";
 import { memoryStorage } from "../../repos/persist";
 
 describe("interfaceStore", () => {
+  it("selects one global surface and preserves the terminal dock", () => {
+    interfaceStore.setTerminalDockOpen(true);
+    interfaceStore.setGlobalSurface("tasks");
+    expect(get(interfaceStore).globalSurface).toBe("tasks");
+    interfaceStore.toggleFleet();
+    expect(get(interfaceStore).globalSurface).toBe("fleet");
+    interfaceStore.setFleetOpen(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
+    expect(get(interfaceStore).terminalDockOpen).toBe(true);
+  });
   beforeEach(() => {
     interfaceStore.reset();
   });
@@ -122,19 +132,19 @@ describe("interfaceStore", () => {
 
   it("starts with the Fleet dashboard closed", () => {
     interfaceStore.reset();
-    expect(get(interfaceStore).fleetOpen).toBe(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
   });
 
   it("opens, closes and toggles the Fleet dashboard", () => {
     interfaceStore.reset();
     interfaceStore.setFleetOpen(true);
-    expect(get(interfaceStore).fleetOpen).toBe(true);
+    expect(get(interfaceStore).globalSurface).toBe("fleet");
     interfaceStore.toggleFleet();
-    expect(get(interfaceStore).fleetOpen).toBe(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
     interfaceStore.toggleFleet();
-    expect(get(interfaceStore).fleetOpen).toBe(true);
+    expect(get(interfaceStore).globalSurface).toBe("fleet");
     interfaceStore.setFleetOpen(false);
-    expect(get(interfaceStore).fleetOpen).toBe(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
   });
 
   it("persists the Fleet surface across a reload", async () => {
@@ -153,7 +163,7 @@ describe("interfaceStore", () => {
       });
       vi.resetModules();
       const reloaded = (await import("../interfaceStore")).interfaceStore;
-      expect(get(reloaded).fleetOpen).toBe(true);
+      expect(get(reloaded).globalSurface).toBe("fleet");
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");

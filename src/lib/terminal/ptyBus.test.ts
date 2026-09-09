@@ -54,7 +54,7 @@ function fakeTransport() {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const output = (id: string, data_b64: string) => ({ id, data_b64 });
-const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "", error: null });
+const exit = (id: string): TerminalExitEvent => ({ id, exit_code: 0, signal: "", error: null, reaped: true });
 
 describe("ptyBus routing", () => {
   it("delivers each session only its own output", () => {
@@ -281,6 +281,18 @@ it("rejects malformed exit events without breaking other terminal sessions", () 
   transport.emit("terminal-exit", { id: "a", exit_code: "success", signal: 7 });
   expect(onExit).not.toHaveBeenCalled();
   expect(onError).toHaveBeenCalledTimes(2);
+});
+
+it("refuses unknown reaping evidence and preserves a reported wait failure", () => {
+  const transport = fakeTransport(), bus = createPtyBus(transport.listen), onError = vi.fn(), onExit = vi.fn();
+  bus.subscribe("a", { onOutput: vi.fn(), onExit, onError });
+  transport.emit("terminal-exit", { ...exit("a"), reaped: undefined });
+  transport.emit("terminal-exit", { ...exit("a"), reaped: false });
+  expect(onExit).not.toHaveBeenCalled();
+  expect(onError).toHaveBeenCalledTimes(2);
+  const failed = { ...exit("a"), reaped: false, exit_code: null, error: "Could not confirm process exit: wait failed" };
+  transport.emit("terminal-exit", failed);
+  expect(onExit).toHaveBeenCalledWith(failed);
 });
 
 it("bounds listener setup time and releases listeners that arrive after timeout", async () => {

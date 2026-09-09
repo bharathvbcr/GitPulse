@@ -1,0 +1,64 @@
+<!doctype html>
+<html class="dark"><head><meta charset="utf-8" /><title>GitPulse workbench — disposable fixture</title><style>html,body{margin:0;height:100%}#app{height:100vh;display:flex;flex-direction:column}#fixture{padding:5px 12px;font:11px system-ui;background:#26354d;color:#dbe7f5}#errors{color:#ff8484}</style></head>
+<body><div id="app"><div id="fixture">Disposable test profile · Real Manvi storage · Browser transport adapter <span id="errors" role="status">Runtime errors: 0</span> <button id="lose-reply" type="button">Lose next acceptance reply</button> <span id="fault" role="status">No injected failure</span></div><div id="board" style="flex:1;display:flex;min-height:0"></div></div>
+<script type="module">
+  await import("../src/app.css");
+  let errors = 0;
+  const report = () => { document.getElementById("errors").textContent = `Runtime errors: ${++errors}`; };
+  window.addEventListener("error", report); window.addEventListener("unhandledrejection", report);
+  const capture = document.createElement("button");
+  capture.textContent = "Capture copies in fixture";
+  const copied = document.createElement("pre");
+  copied.id = "captured-brief";
+  copied.style.cssText = "max-height:180px;overflow:auto;white-space:pre-wrap";
+  copied.setAttribute("aria-label", "Captured task brief");
+  capture.onclick = () => {
+    // Keep this disposable test's task text out of the user's OS clipboard.
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: async (text) => { copied.textContent = text; copied.dataset.copies = String(Number(copied.dataset.copies ?? 0) + 1); },
+    } });
+    capture.disabled = true;
+    copied.textContent = "Copies will appear here. The OS clipboard is unchanged.";
+  };
+  document.getElementById("fixture").append(capture, copied);
+  let loseReply = false;
+  document.getElementById("lose-reply").onclick = () => {
+    loseReply = true;
+    document.getElementById("fault").textContent = "Next successful acceptance reply will be lost";
+  };
+  window.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      if (cmd === "cmd_pick_folder") return null;
+      if (cmd === "cmd_workbench_request" && ["notifications.native.status", "notifications.native.authorize"].includes(args.method)) return JSON.stringify({ available: false, authorization: "unavailable", error: "This browser fixture cannot request OS permission or display native notifications." });
+      if (cmd === "cmd_workbench_request" && args.method === "notifications.native.pending") args = { method: "notifications.activations.list", input: JSON.stringify({ limit: 1 }) };
+      if (cmd !== "cmd_workbench_request") throw new Error(`Unconfigured fixture command: ${cmd}`);
+      const result = await fetch("/__workbench", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(args) }).then((r) => r.json());
+      if (result.ok !== true) throw { code: result.code, message: result.error };
+      if (loseReply && args.method === "enhancements.accept") {
+        loseReply = false;
+        document.getElementById("fault").textContent = "Acceptance committed; reply deliberately lost";
+        throw { code: "transport_error", message: "Fixture lost the acceptance reply after storage committed it." };
+      }
+      return JSON.stringify(result);
+    },
+  };
+  const { mount } = await import("svelte");
+  const TaskBoard = (await import("../src/lib/components/TaskBoard.svelte")).default;
+  mount(TaskBoard, { target: document.getElementById("board") });
+  const NativeNotificationBridge = (await import("../src/lib/components/NativeNotificationBridge.svelte")).default;
+  mount(NativeNotificationBridge, { target: document.getElementById("board") });
+  const run = document.createElement("button");
+  run.textContent = "Run enhancement checks";
+  const verdict = document.createElement("pre");
+  verdict.setAttribute("role", "status");
+  document.getElementById("fixture").append(run, verdict);
+  run.onclick = async () => {
+    run.disabled = true; verdict.textContent = "Running real-store enhancement checks…";
+    try {
+      const { runWorkbenchChecks } = await import("./workbenchChecks.ts");
+      const checks = await runWorkbenchChecks();
+      verdict.textContent = `${checks.length}/${checks.length} enhancement checks passed\n${checks.join("\n")}`;
+    } catch (error) { verdict.textContent = `Enhancement checks failed: ${error.message}`; }
+    finally { run.disabled = false; }
+  };
+</script></body></html>

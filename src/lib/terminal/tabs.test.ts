@@ -25,6 +25,22 @@ const chord = (key: string, mods: Partial<Record<"ctrlKey" | "metaKey" | "altKey
 });
 
 describe("terminal tab model", () => {
+  it("initializes a task terminal without also opening a shell", () => {
+    const state = initialState("codex", { runId: "run-1", title: "Preserve E42" });
+    expect(state.tabs).toHaveLength(1);
+    expect(state.tabs[0]).toMatchObject({ launcher: "codex", taskRunId: "run-1", name: "Preserve E42" });
+    expect(state.activeId).toBe(state.tabs[0].id);
+  });
+  it("focuses a repeated task even at capacity and keeps distinct attempts separate", () => {
+    let state = openTab(initialState(), "codex", { runId: "a", title: "Task A" });
+    const first = state.activeId;
+    state = openTab(state, "codex", { runId: "b", title: "Task B" });
+    expect(state.activeId).not.toBe(first);
+    while (canOpenTab(state)) state = openTab(state, "shell");
+    const repeated = openTab(state, "codex", { runId: "a", title: "Task A" });
+    expect(repeated.tabs).toBe(state.tabs);
+    expect(repeated.activeId).toBe(first);
+  });
   it("starts with exactly one focused shell", () => {
     const state = initialState();
     expect(state.tabs).toHaveLength(1);

@@ -50,6 +50,7 @@
   import { VIEW_PANE_ID } from "./lib/views/viewRegistry";
   import Tooltip from "./lib/components/Tooltip.svelte";
   import ToastContainer from "./lib/components/ToastContainer.svelte";
+  import NativeNotificationBridge from "./lib/components/NativeNotificationBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   import SetupWizard from "./lib/components/onboarding/SetupWizard.svelte";
@@ -90,6 +91,7 @@
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
+  const loadTaskBoard = () => import("./lib/components/TaskBoard.svelte");
 
   // Overlays. None of these is on screen at startup and most sessions open
   // none of them, yet all six were parsed at boot because App mounted them
@@ -195,8 +197,10 @@
   // Rendering Fleet as an {:else} of the repo block would destroy the
   // repository surface on every toggle, which kills the live terminal
   // PTY it contains and re-hydrates every open tab on the way back.
-  const fleetOpen = $derived($interfaceStore.fleetOpen);
+  const fleetOpen = $derived($interfaceStore.globalSurface === "fleet");
   let fleetMounted = $state(false);
+  let tasksMounted = $state(false);
+  $effect(() => { if ($interfaceStore.globalSurface === "tasks") tasksMounted = true; });
   $effect(() => {
     if (fleetOpen) fleetMounted = true;
   });
@@ -857,9 +861,10 @@
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />
+  <NativeNotificationBridge />
 
   <!-- The repository surface. Hidden, not unmounted, while Fleet is open. -->
-  <div class="flex-1 flex flex-col min-h-0" class:hidden={fleetOpen}>
+  <div class="flex-1 flex flex-col min-h-0" class:hidden={$interfaceStore.globalSurface !== "repository"}>
   {#if !$repoStore.currentPath}
     <!-- Welcome & Open Repository Screen -->
     <div class="gp-welcome flex-1 flex flex-col items-center justify-center p-8 bg-background select-none relative overflow-hidden">
@@ -1010,6 +1015,14 @@
   </div>
 
   <SetupWizard />
+
+  {#if tasksMounted}
+    <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("tasks", error)}>
+      <div class="flex-1 flex flex-col min-h-0" class:hidden={$interfaceStore.globalSurface !== "tasks"}>
+        <LazyView load={loadTaskBoard} name="Tasks" props={{ active: $interfaceStore.globalSurface === "tasks" }} />
+      </div>
+    </svelte:boundary>
+  {/if}
 
   {#if fleetMounted}
     <!-- Workspace-scoped, so it survives repository switches; hidden rather

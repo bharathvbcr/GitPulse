@@ -105,6 +105,7 @@
     repoPath,
     tabId,
     launcher,
+    taskRunId,
     active,
     onTitle,
     onChord,
@@ -114,6 +115,7 @@
     repoPath: string;
     tabId: string;
     launcher: LauncherKind;
+    taskRunId?: string;
     active: boolean;
     onTitle: (title: string) => void;
     onStatus?: (status: string) => void;
@@ -254,10 +256,14 @@
   function createLifecycle() {
     return createSessionLifecycle({
       key: tabId, repoPath, label: launcherLabel(launcher), bus: ptyBus, registry: terminalSessions,
+      singleAttempt: !!taskRunId,
       transport: {
         spawn: () => {
           const dims = fitAddon?.proposeDimensions();
           const cfg = launcherConfig(launcher);
+          if (taskRunId) return invoke<TerminalSpawned>("cmd_workbench_launch_terminal", {
+            input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2) }),
+          });
           return invoke<TerminalSpawned>("cmd_terminal_spawn", {
             repoPath, rows: Math.max(dims?.rows ?? 24, 2), cols: Math.max(dims?.cols ?? 80, 2),
             program: cfg.program, args: cfg.args,
@@ -540,11 +546,11 @@
         <AlertCircle size={13} class="text-rose-400 shrink-0" />
         <span class="text-rose-300 flex-1 min-w-0 truncate text-[11px]" title={error}>{error}</span>
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
-          <RotateCw size={12} /> Retry
+          <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
         </button>
       {:else if exited}
         <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
-        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
+        <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>
           <RotateCw size={12} /> Restart
         </button>
       {:else}

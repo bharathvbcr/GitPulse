@@ -163,6 +163,13 @@
 
   const commands = [
     {
+      id: "tasks",
+      label: "Open Tasks — global and workspace Kanban boards",
+      icon: LayoutGrid,
+      shortcut: undefined,
+      action: () => interfaceStore.setGlobalSurface("tasks"),
+    },
+    {
       // Workspace-scoped rather than a view, so it is listed here rather than
       // derived from VIEW_REGISTRY — and it works with nothing open.
       id: "fleet",

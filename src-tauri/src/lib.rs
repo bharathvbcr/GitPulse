@@ -36,6 +36,7 @@ pub mod tool_config;
 pub mod tool_install;
 pub mod updates;
 pub mod watcher;
+pub mod workbench;
 pub mod workspace_registry;
 
 use commands::*;
@@ -86,10 +87,12 @@ pub fn run() {
         .manage(crate::watcher::WatcherState::default())
         .manage(crate::terminal::TerminalSessions::default())
         .manage(desktop::DesktopState::default())
+        .manage(workbench::WorkbenchState::default())
         .setup(|app| {
             // Installed before anything can mutate, so the first guarded action
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());
+            workbench::notifications::install(app.handle());
             crate::tool_install::set_app_handle(app.handle().clone());
             if let Err(e) = desktop::install_menu(app.handle()) {
                 log::error!(target: "setup", "menu installation failed: {e}");
@@ -104,6 +107,9 @@ pub fn run() {
             desktop::handle_window_event(window, event);
         })
         .invoke_handler(tauri::generate_handler![
+            workbench::cmd_workbench_request,
+            workbench::cmd_workbench_register_repository,
+            workbench::cmd_workbench_launch_terminal,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,

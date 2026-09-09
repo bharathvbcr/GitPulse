@@ -8,6 +8,7 @@
   const view = "work" as const;
   import WorkView from "./WorkView.svelte";
   import LazyView, { type ViewLoader } from "./LazyView.svelte";
+  const loadTasks = () => import("./RepositoryTasks.svelte");
 
   /**
    * Work: everything in flight, and the surfaces that act on it.
@@ -61,7 +62,9 @@
   </ViewSectionBar>
   <ViewSectionPanel {view} {section}>
 
-    {#if section === "resolve"}
+    {#if section === "tasks"}
+      <LazyView load={loadTasks} name="repository tasks" />
+    {:else if section === "resolve"}
       <LazyView load={loadConflict} name="the conflict editor" />
     {:else if section === "remote"}
       <LazyView load={loadGitHub} name="GitHub" />

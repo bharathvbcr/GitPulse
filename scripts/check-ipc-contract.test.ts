@@ -285,7 +285,10 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    expect(found.size).toBe(187);
+    expect(found.size).toBe(190);
+    expect(found.has("cmd_workbench_request")).toBe(true);
+    expect(found.has("cmd_workbench_register_repository")).toBe(true);
+    expect(found.has("cmd_workbench_launch_terminal")).toBe(true);
     expect(found.has("cmd_stage_file")).toBe(true);
     for (const [, site] of found) {
       expect(site.file).toMatch(/^src-tauri\/src\//);

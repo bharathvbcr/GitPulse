@@ -33,6 +33,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub mod json;
 pub mod schema;
+pub mod workbench;
 
 /// The lease-schema revision this build understands.
 ///

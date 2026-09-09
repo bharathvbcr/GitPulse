@@ -9,9 +9,11 @@ import { repoStore } from "../stores/repoStore";
 const source = readFileSync(new URL("./RepoTabBar.svelte", import.meta.url), "utf8");
 
 describe("RepoTabBar", () => {
-  it("renders nothing when no tabs are open", () => {
+  it("keeps global Tasks and Fleet reachable when no repositories are open", () => {
     const { body } = render(RepoTabBar);
-    expect(body).not.toContain('title="Open repository"');
+    expect(body).toContain('data-testid="tasks-tab-chip"');
+    expect(body).toContain('data-testid="fleet-tab-chip"');
+    expect(body).toContain('title="Open repository"');
   });
 
   it("renders tab bar when tabs are open", async () => {
@@ -138,4 +140,3 @@ describe("RepoTabBar", () => {
     expect(recentsMenu).toContain("shrink-0");
   });
 });
-

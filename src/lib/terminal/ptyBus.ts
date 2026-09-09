@@ -128,6 +128,7 @@ export function createPtyBus(listen: EventListen): PtyBus {
 
   function handleExit(payload: TerminalExitEvent) {
     if (!payload || typeof payload.id !== "string" || typeof payload.signal !== "string" ||
+        typeof payload.reaped !== "boolean" || (!payload.reaped && (typeof payload.error !== "string" || !payload.error.trim())) ||
         !(payload.exit_code === null || (Number.isInteger(payload.exit_code) && Number.isFinite(payload.exit_code))) ||
         (payload.error != null && typeof payload.error !== "string")) {
       report("Invalid terminal exit event");

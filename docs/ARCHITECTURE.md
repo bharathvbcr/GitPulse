@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (187 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (190 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -85,7 +85,7 @@ Every view is registered in [`src/lib/views/viewRegistry.ts`](file:///Users/bhar
 2. Adding its metadata to `VIEW_REGISTRY` in `viewRegistry.ts`.
 3. Adding the render branch in `App.svelte`.
 
-### The one workspace-scoped surface
+### Workspace surfaces
 
 **Fleet** ([`src/lib/components/FleetView.svelte`](file:///Users/bharath/Code/devtools/gitpulse/src/lib/components/FleetView.svelte)) is deliberately outside that registry. A `ViewTab` is stored on the *active repository's* session and its pane is rendered inside `{#key currentPath}`; Fleet answers a question about the whole workspace, so being a view would both scope it wrongly and destroy and rebuild it on every repository switch.
 
@@ -150,7 +150,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +187 Registered Handlers
+        +190 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -291,8 +291,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 187 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 881 data fields, in 50 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 190 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 884 data fields, in 51 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts the version it reports is this tree's. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 
@@ -440,3 +440,120 @@ QoS assignment.
 
 See [Performance diagnostics](PERFORMANCE.md) for capture instructions and
 verification limits.
+
+## Agentic workbench (implementation in progress)
+
+`TaskBoard.svelte` presents global, persistent-workspace and repository scopes over
+one profile task store. `src/lib/workbench/client.ts` validates responses and sends
+typed operations through `cmd_workbench_request`. The native adapter bounds request
+admission and runs storage off the UI thread. Manvi's vendored `dc-store` owns all
+schemas, row transactions, revisions, receipts, membership and proposal lifecycle;
+these profile records are separate from repository execution tasks and leases.
+
+`items.brief.get` generates the canonical task export inside the store's read
+transaction. It requires the editor's saved revision and includes the exact task
+plus all ordered repository references and the home workspace, each with a
+revision. Copying no longer depends on the frontend's paginated repository list.
+The operation omits repository identities/remotes, refuses stale or incomplete
+snapshots, and starts no model worker.
+
+Schema-five run records retain one immutable brief per attempt, bounded active
+reservations, and a one-use launch claim. `workbench/terminal_launch.rs` adds
+native `runs.prepare_terminal` through existing workbench IPC, observing actual
+cwd, Git directories, commit and branch before preparation. Native `runs.claim`
+rechecks those observations and then delegates snapshot/CAS validation to Manvi.
+An exact claim replay returns `claim_consumed`; process exit never accepts a task.
+Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
+checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
+commit. Observations do not lock external Git writers or identify an otherwise
+identical clone substituted at the same path.
+
+`TaskRuns.svelte` prepares a selected saved revision and opens a task-bound tab in
+the existing terminal dock. `cmd_workbench_launch_terminal` probes the installed
+provider's version/help and requested option values, writes a private temporary
+brief, and delegates to the existing PTY manager with a native run observer.
+The observer consumes the one-use claim immediately before spawn and records the
+actual PID and OS creation identity before output can be delivered. Repeating a
+launch attaches to the same live native binding; it cannot consume another claim.
+The frontend's reconnect path preserves that process and its scrollback. Ended
+attempts require an explicit new launch from task details.
+
+Task launches normalize conflicting Git roots and child-only `DEVCOUNCIL_ROOT`
+without changing global configuration or ordinary shells. Requested permission
+modes are explicit argv; advanced bypass needs acknowledgment on each new attempt.
+CLI help proves advertised controls, not effective account policy or containment
+of an unrestricted child. These terminals remain user-controlled; managed Codex
+uses the separate verified-configuration protocol below.
+
+Manvi schema eight supplies the durable request binding for those protocols.
+`AgentDecisions.svelte` reads one run's bounded request pages and verifies the
+captured payload hash before saving Allow once, Deny or an answer. Saved decisions,
+one-use delivery claims and provider resolution stay distinct. The renderer
+cannot capture callbacks, consume claims or write provider resolution. The Go
+client hashes exact capture/claim payloads; the canonical store owns revision,
+identity and expiry checks shared by the inspector and notification eligibility.
+Existing terminal handoffs have no structured callback producer yet. Opening the
+request panel starts no model or process and reuses the visible run refresh.
+
+Schema ten retains the terminal/managed distinction introduced in schema nine. Native
+`workbench/managed_run.rs` prepares through the existing checkout validator,
+spawns Codex through the profile Manvi host, requires preparation protocol version
+two, and observes its process birth before initialization. Manvi then verifies
+effective settings before sending one model turn. The UI cannot supply process evidence or
+write provider progress. Manvi owns the stdio connection, effective configuration,
+callback capture, one-use response and completion receipts. Managed launch retries
+reuse the saved attempt; a stopped/restarted host cannot replay a consumed claim.
+Known unstarted failures release capacity; uncertain launches retain it. A failed
+handshake retains native process identity and a separate provider failure state.
+Run history renders that failure without inventing a thread ID, and the durable
+inbox classifies it as failure even when the helper's exit code is zero.
+
+The inspector presents structured question fields and one-time approval/denial.
+Complete request text remains available unchanged. Run lists omit output and
+settings; those are loaded only when requested, with explicit retention limits.
+The installed Codex 0.153.4 read-only path passed both direct-protocol and native
+GitPulse-to-Manvi-to-provider tests. Actual account approval variants, escaped
+process descendants, managed Claude and full crash recovery remain unqualified.
+
+Process reaping evidence is carried separately from exit status. An unconfirmed
+exit stays unresolved in the store. During shutdown, new work is refused while
+already-owned native observers may persist receipts into the existing store; PTY
+cleanup retains its slot until the callback returns. Private brief files are
+removed on normal cleanup. Crash-file cleanup, durable retries after receipt
+storage failure, process-tree reconciliation, and termination proof for uncertain
+starts remain open. Run history uses bounded newest-first metadata pages and
+polls active attempts only while the inspector is visible.
+
+Board counts use indexed repository links, deduplicated workspace membership and
+FTS hits with explicit bound filters. Scoped searches evaluate their full-text
+match set once. Page selection precedes body formatting and includes at most one
+lookahead row; sorting discarded candidates cannot expand detail-field processing
+across the profile. The native adapter consumes this same canonical query code.
+See [the data-layer measurements](AGENTIC_WORKSPACES_BENCHMARK.md) for normal and
+stress fixtures, regression evidence and the remaining desktop resource checks.
+
+Text saves persist a debounced queue entry before a coalesced wake hint reaches
+the lazy profile Manvi host. A failed wake is shown separately from the successful
+save. Manvi owns provider selection, one active generation, quota, cancellation and
+restart recovery. GitPulse's profile controls select automatic settings and expose
+status; visible boards share one active-work timer, with none for idle, paused or
+hidden views. Activating the board resumes previously queued work. Newest-first
+proposal history exposes automatic results for explicit selected-field acceptance.
+
+Manvi schema six records private activity entries with their source transaction;
+schema seven adds profile notification settings and durable delivery/activation
+records. One native coordinator claims an eligible notice before the macOS API
+call. Uncertain submissions cannot automatically replay. Saved activations open
+current task data in a separate review view; closing it does not accept work.
+Preferences include local quiet hours, sound, hidden/minimized delivery and
+workspace/repository/task mutes. Disabled delivery has no periodic wake; enabled
+delivery checks five-second batches of at most three. See
+[native notifications](NATIVE_NOTIFICATIONS_ADAPTER.md) for the callback crash
+window, installed-platform qualification and explicit unsupported platforms.
+
+The current implementation includes controlled-provider browser verification and
+real native-to-Go/provider transport tests. Broader managed-agent qualification,
+installed OS notification proof,
+the complete workspace/task interaction set and whole-application performance
+qualification remain open. See [the implementation contract](AGENTIC_WORKSPACES_PLAN.md)
+for the complete scope and exact verification boundaries.
