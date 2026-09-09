@@ -1043,7 +1043,25 @@ CREATE TABLE IF NOT EXISTS generation_file_digests (
 ///
 /// v19 is that rung — [`MIGRATION_V18_TO_V19`] — and it went where this
 /// paragraph pointed rather than where the schema's shape suggested.
-pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+/// Durable queue identity and revisions replace wall-clock acknowledgement.
+/// The epoch prevents a claim from one store acknowledging another store's
+/// identically named path. A counter survives deletion of the last queue row.
+pub const MIGRATION_V19_TO_V20: &str = r#"
+ALTER TABLE pending_paths ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(revision) = 'integer' AND revision >= 0);
+CREATE TABLE pending_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    epoch TEXT NOT NULL CHECK (length(epoch) = 32),
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
+    repo_root TEXT
+);
+INSERT INTO pending_state (singleton, epoch, revision, repo_root)
+VALUES (1, lower(hex(randomblob(16))), 1,
+        (SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1));
+UPDATE pending_paths SET revision = 1;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1075,6 +1093,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     VALIDITY_RANGE_TABLES,
     COVERAGE_GAPS_TABLE,
     MIGRATION_V18_TO_V19,
+    MIGRATION_V19_TO_V20,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

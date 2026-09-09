@@ -44,10 +44,10 @@ use crate::schema::{
     MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16,
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
-    MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
-    VALIDITY_RANGE_TABLES,
+    MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
+    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6,
+    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
+    PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -365,26 +365,213 @@ pub struct PendingReconcile {
 #[derive(Debug, Clone, Copy)]
 pub enum PendingSupersede<'a> {
     /// A build with no `--affected` narrowing: it walked the whole tree, so it
-    /// answered every request queued at or before the instant it started.
-    /// Carries that instant on [`Store::queue_clock_now`]'s clock.
-    WholeTreeBuiltAt(f64),
+    /// answered every request through the durable watermark captured before
+    /// reading source. Wall-clock adjustments cannot move this boundary.
+    WholeTreeThrough(&'a PendingWatermark),
     /// A narrowed build: it read only the paths it was handed, so only those
     /// rows are answered.
-    IndexedPaths(&'a [String]),
+    IndexedPathsThrough(&'a [String], &'a PendingWatermark),
+}
+
+/// A position in one store's durable event stream, never a wall-clock time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWatermark {
+    epoch: String,
+    revision: i64,
 }
 
 /// One pending row claimed for a drain attempt.
 ///
-/// Carries `queued_at` because that is what makes the acknowledgement safe: a
-/// watcher event arriving mid-drain re-enqueues the path with a *new*
-/// `queued_at`, so clearing the claim leaves the newer request queued. The
-/// previous mechanism used `attempts > 0`, which forced the drain to bump the
-/// attempt counter of every path it was about to succeed at — the accounting
-/// that made one store-level failure quarantine an entire batch (K1(d)).
+/// `queued_at` is diagnostic only. The store epoch and monotonic revision
+/// distinguish re-enqueues even on equal or backwards wall-clock ticks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingClaim {
     pub path: String,
     pub queued_at: f64,
+    watermark: PendingWatermark,
+}
+
+#[cfg(test)]
+mod agentic_queue_regressions {
+    use super::*;
+
+    fn enqueue_at(store: &Store, path: &str, time: f64) {
+        let conn = lock_conn(&store.conn).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        Store::upsert_pending(&tx, std::iter::once(path), time).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn equal_clock_ticks_cannot_acknowledge_a_new_edit() {
+        let store = Store::open_in_memory().unwrap();
+        enqueue_at(&store, "main.py", 100.0);
+        let old = store.claim_pending_batch(1).unwrap();
+        enqueue_at(&store, "main.py", 100.0);
+        assert_eq!(store.clear_claimed_pending_paths(&old).unwrap(), 0);
+        assert_eq!(store.get_pending_paths().unwrap(), vec!["main.py"]);
+    }
+
+    #[test]
+    fn a_build_cannot_discard_a_newer_head_event() {
+        let store = Store::open_in_memory().unwrap();
+        let path = "\0devmap:git-head-changed";
+        let through = store.pending_watermark().unwrap();
+        enqueue_at(&store, path, 101.0);
+        let cleared = store
+            .clear_pending_superseded(PendingSupersede::WholeTreeThrough(&through))
+            .unwrap();
+        assert!(
+            cleared.is_empty(),
+            "a later checkout was never read: {cleared:?}"
+        );
+        assert_eq!(store.get_pending_paths().unwrap(), vec![path]);
+    }
+
+    #[test]
+    fn repair_cannot_delete_an_event_that_arrived_during_inspection() {
+        let root = std::env::temp_dir();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue_pending_paths(&["agentic-missing-file.py".into()])
+            .unwrap();
+        let result = store
+            .reconcile_pending_paths_with(&root, &|| {
+                store
+                    .enqueue_pending_paths(&["agentic-missing-file.py".into()])
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            store.get_pending_paths().unwrap(),
+            vec!["agentic-missing-file.py"]
+        );
+        assert!(result.dropped.is_empty());
+    }
+
+    #[test]
+    fn backwards_clock_and_delete_reinsert_do_not_reuse_a_claim() {
+        let store = Store::open_in_memory().unwrap();
+        enqueue_at(&store, "a.py", 100.0);
+        let old = store.claim_pending_batch(1).unwrap();
+        store.clear_claimed_pending_paths(&old).unwrap();
+        enqueue_at(&store, "a.py", 10.0);
+        assert_eq!(store.clear_claimed_pending_paths(&old).unwrap(), 0);
+        store.bump_pending_attempts(&old).unwrap();
+        assert_eq!(store.pending_attempts("a.py").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn a_failed_old_attempt_cannot_quarantine_a_repaired_edit() {
+        let store = Store::open_in_memory().unwrap();
+        enqueue_at(&store, "a.py", 100.0);
+        let old = store.claim_pending_batch(1).unwrap();
+        enqueue_at(&store, "a.py", 100.0);
+        for _ in 0..MAX_PENDING_ATTEMPTS {
+            store.bump_pending_attempts(&old).unwrap();
+        }
+        assert_eq!(store.pending_attempts("a.py").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn acknowledgements_cannot_cross_store_boundaries() {
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        for store in [&a, &b] {
+            enqueue_at(store, "a.py", 100.0);
+        }
+        let claims = a.claim_pending_batch(1).unwrap();
+        let through = a.pending_watermark().unwrap();
+        assert!(b.clear_claimed_pending_paths(&claims).is_err());
+        assert!(b.bump_pending_attempts(&claims).is_err());
+        assert!(b
+            .clear_pending_superseded(PendingSupersede::WholeTreeThrough(&through))
+            .is_err());
+        assert_eq!(b.pending_attempts("a.py").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn pending_admission_restores_the_query_timeout_and_rolls_back_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let before = store.pending_watermark().unwrap();
+        let error: Result<()> =
+            store.with_pending_transaction(std::time::Duration::from_millis(25), |tx| {
+                Store::upsert_pending(tx, std::iter::once("refused.py"), 1.0)?;
+                Err(refusal("injected write failure"))
+            });
+        assert!(error
+            .unwrap_err()
+            .to_string()
+            .contains("injected write failure"));
+        assert!(store.get_pending_paths().unwrap().is_empty());
+        assert_eq!(store.pending_watermark().unwrap(), before);
+        let timeout: i64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
+        store
+            .enqueue_pending_paths(&["accepted.py".into()])
+            .unwrap();
+        let timeout: i64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
+    }
+
+    #[test]
+    fn revision_exhaustion_rolls_back_the_entire_enqueue() {
+        let store = Store::open_in_memory().unwrap();
+        lock_conn(&store.conn)
+            .unwrap()
+            .execute(
+                "UPDATE pending_state SET revision = 9223372036854775806",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .enqueue_pending_paths(&["a.py".into(), "b.py".into()])
+            .is_err());
+        assert!(store.get_pending_paths().unwrap().is_empty());
+        assert_eq!(store.pending_watermark().unwrap().revision, i64::MAX - 1);
+    }
+
+    #[test]
+    fn canonical_repair_invalidates_claims_for_both_spellings() {
+        let root = std::env::temp_dir();
+        let store = Store::open_in_memory().unwrap();
+        // Directories are real work even without indexable files.
+        enqueue_at(&store, ".", 100.0);
+        enqueue_at(&store, root.to_str().unwrap(), 100.0);
+        let claims = store.claim_pending_batch(2).unwrap();
+        let result = store.reconcile_pending_paths(&root).unwrap();
+        assert_eq!(result.rewritten.len(), 1);
+        assert_eq!(store.clear_claimed_pending_paths(&claims).unwrap(), 0);
+        assert_eq!(store.get_pending_paths().unwrap(), vec!["."]);
+    }
+
+    #[test]
+    fn a_narrow_build_cannot_retire_an_unread_quarantined_path() {
+        let store = Store::open_in_memory().unwrap();
+        enqueue_at(&store, "unread.py", 100.0);
+        for _ in 0..MAX_PENDING_ATTEMPTS {
+            store
+                .bump_pending_attempts(&store.claim_pending_batch(1).unwrap())
+                .unwrap();
+        }
+        let cleared = store
+            .clear_pending_superseded(PendingSupersede::IndexedPathsThrough(
+                &["other.py".into()],
+                &store.pending_watermark().unwrap(),
+            ))
+            .unwrap();
+        assert!(cleared.is_empty(), "unread work disappeared: {cleared:?}");
+        assert_eq!(
+            store.pending_attempts("unread.py").unwrap(),
+            Some(MAX_PENDING_ATTEMPTS)
+        );
+    }
 }
 
 /// Fail closed: poisoned mutex is an error, never a panic.
@@ -550,6 +737,37 @@ pub struct StoreStatus {
     /// from a broken one without opening the database by hand. Each list is
     /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
     pub coverage_gaps: CoverageGaps,
+}
+
+impl StoreStatus {
+    /// Freshness is independent of whether the persisted graph can be queried.
+    /// This verdict is only as recent as the source verification in Store::status.
+    pub fn is_fresh(&self) -> bool {
+        self.latest_generation.is_some()
+            && self.pending_count == 0
+            && self.degraded_reason.is_none()
+    }
+
+    /// One contract for CLI, daemon and embedded readers. An absent generation
+    /// or a pending queue must explain a false verdict even without store damage.
+    pub fn freshness_reason(&self) -> Option<String> {
+        if let Some(reason) = &self.degraded_reason {
+            return Some(reason.clone());
+        }
+        if self.latest_generation.is_none() {
+            return Some(
+                "this store holds no generation: nothing has been indexed yet — run `devmap build`"
+                    .to_string(),
+            );
+        }
+        if self.pending_count > 0 {
+            return Some(format!(
+                "{} source change(s) are pending",
+                self.pending_count
+            ));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1637,7 +1855,14 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "updated_at",
         ],
     ),
-    ("pending_paths", &["path", "queued_at", "attempts"]),
+    (
+        "pending_paths",
+        &["path", "queued_at", "attempts", "revision"],
+    ),
+    (
+        "pending_state",
+        &["singleton", "epoch", "revision", "repo_root"],
+    ),
     ("nodes_fts", &["name", "qualified_name", "path"]),
     ("nodes_fts_map", &["rowid_ref", "generation_id"]),
     (
@@ -1715,6 +1940,10 @@ impl Store {
     /// different wait from every other, and nothing would fail. Stated once
     /// and applied at both openers instead.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Bursts from hundreds of sessions must be admitted behind a temporary
+    /// writer. This bounds only pending-event admission; reader timeouts stay
+    /// at five seconds. Refusal remains an error the daemon must reconcile.
+    const PENDING_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// How many quarantined paths [`Store::status`] names in its degraded
     /// reason. Bounded because the reason is a one-line diagnostic, not a
@@ -2053,6 +2282,19 @@ impl Store {
             }
         }
 
+        let identity_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_state WHERE singleton = 1
+             AND length(epoch) = 32 AND epoch NOT GLOB '*[^0-9a-f]*'
+             AND typeof(revision) = 'integer' AND revision >= 0",
+            [],
+            |row| row.get(0),
+        )?;
+        if identity_count != 1 {
+            return Err(refusal(
+                "pending queue identity is missing or invalid; refusing an unexamined queue",
+            ));
+        }
+
         // Indexes, which this gate did not look at until an absent one cost
         // every migrated store a full scan of `file_payloads` per cache miss.
         //
@@ -2175,69 +2417,60 @@ impl Store {
     }
 
     fn migrate(conn: &mut Connection, store: &str) -> Result<()> {
+        // Hold one SQLite writer transaction from the version read through
+        // validation. Per-rung transactions let a slow opener stamp an older
+        // version over a peer's completed upgrade. Failure rolls back the whole
+        // migration; no reader can observe a partially upgraded schema.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::migrate_locked(&tx, store)?;
+        tx.commit()
+    }
+
+    fn migrate_locked(conn: &Connection, store: &str) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if !Self::schema_is_migratable(version) {
             return Err(Self::unsupported_schema(store, version));
         }
         let mut version = version;
         if version == 0 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // SC28: re-read inside the write lock. `version` was sampled before
-            // the transaction, so two processes racing to create the same store
-            // both observed 0 — the second then reached the unconditional
-            // `ADD COLUMN repo_root` below and died with "duplicate column
-            // name". `Immediate` serialises the writers but does not make a
-            // stale read current, and a fresh store is exactly when a daemon,
-            // an editor hook and a manual build are most likely to collide.
-            let observed: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if observed == 0 {
-                tx.execute_batch(CREATE_SCHEMA_V3)?;
-                tx.execute_batch(BUILD_HISTORY_TABLE)?;
-                // Probed rather than unconditional, for the same reason the
-                // v6→v7 step probes: `ADD COLUMN` is not idempotent, so a
-                // partially-created store must not make this fatal.
-                if !Self::has_column(&tx, "generations", "repo_root")? {
-                    tx.execute_batch(MIGRATION_V6_TO_V7)?;
-                }
-                // A fresh database stamps CURRENT_SCHEMA_VERSION directly and
-                // never runs the migration chain, so every table added by a
-                // later migration must also be created here.
-                //
-                // `VALIDITY_RANGE_TABLES` stands where `UNRESOLVED_TABLE` used
-                // to: since v18 the unresolved ledger *is* a view over
-                // `unresolved_rows`, and applying the v9 batch here would try to
-                // index that view. `UNRESOLVED_TABLE` remains the v8→v9 rung for
-                // stores old enough to need it.
-                tx.execute_batch(VALIDITY_RANGE_TABLES)?;
-                tx.execute_batch(COVERAGE_GAPS_TABLE)?;
-                tx.execute_batch(MIGRATION_V18_TO_V19)?;
-                Self::validate_schema(&tx)?;
-                tx.execute(
-                    &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
-                    [],
-                )?;
-                tx.commit()?;
-                return Ok(());
+            let tx = conn;
+            tx.execute_batch(CREATE_SCHEMA_V3)?;
+            tx.execute_batch(BUILD_HISTORY_TABLE)?;
+            // Probed rather than unconditional, for the same reason the
+            // v6→v7 step probes: `ADD COLUMN` is not idempotent, so a
+            // partially-created store must not make this fatal.
+            if !Self::has_column(tx, "generations", "repo_root")? {
+                tx.execute_batch(MIGRATION_V6_TO_V7)?;
             }
-            // Another process created the schema while this one waited for the
-            // write lock. Continue down the chain from what it actually left,
-            // rather than from the stale zero.
-            tx.rollback()?;
-            if observed > CURRENT_SCHEMA_VERSION {
-                return Err(Self::unsupported_schema(store, observed));
-            }
-            version = observed;
+            // A fresh database stamps CURRENT_SCHEMA_VERSION directly and
+            // never runs the migration chain, so every table added by a
+            // later migration must also be created here.
+            //
+            // `VALIDITY_RANGE_TABLES` stands where `UNRESOLVED_TABLE` used
+            // to: since v18 the unresolved ledger *is* a view over
+            // `unresolved_rows`, and applying the v9 batch here would try to
+            // index that view. `UNRESOLVED_TABLE` remains the v8→v9 rung for
+            // stores old enough to need it.
+            tx.execute_batch(VALIDITY_RANGE_TABLES)?;
+            tx.execute_batch(COVERAGE_GAPS_TABLE)?;
+            tx.execute_batch(MIGRATION_V18_TO_V19)?;
+            tx.execute_batch(MIGRATION_V19_TO_V20)?;
+            Self::validate_schema(tx)?;
+            tx.execute(
+                &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
+                [],
+            )?;
+            return Ok(());
         }
         if version == 3 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             tx.execute_batch(CREATE_SCHEMA_V3)?;
             tx.execute_batch(MIGRATION_V3_TO_V4)?;
             tx.execute("PRAGMA user_version = 4", [])?;
-            tx.commit()?;
             version = 4;
         }
         if version == 4 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             tx.execute_batch(CREATE_SCHEMA_V3)?;
             tx.execute_batch(MIGRATION_V4_TO_V5)?;
             // v5's two edge indexes name `generation_edges`, which v18 turned
@@ -2245,7 +2478,7 @@ impl Store {
             // no-op. Same probe, same reason, as the v12→v13 step below: this
             // rung meets whatever `CREATE_SCHEMA_V3` above left, and on a store
             // that already carries the current shape that is a view.
-            if Self::relation_is_table(&tx, "generation_edges")? {
+            if Self::relation_is_table(tx, "generation_edges")? {
                 tx.execute_batch(MIGRATION_V4_TO_V5_EDGE_INDEXES)?;
             }
             let has_analysis_json = {
@@ -2271,40 +2504,37 @@ impl Store {
             // moving target would mark this database as carrying every later
             // migration's tables while creating none of them.
             tx.execute("PRAGMA user_version = 5", [])?;
-            tx.commit()?;
             version = 5;
         }
         if version == 5 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             tx.execute_batch(MIGRATION_V5_TO_V6)?;
             tx.execute("PRAGMA user_version = 6", [])?;
             // No validation mid-chain: `validate_schema` asserts the *current*
             // schema, which a v6 database legitimately does not satisfy yet.
             // The end-of-migration check below is the authoritative gate.
-            tx.commit()?;
             version = 6;
         }
         if version == 6 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // `ADD COLUMN` is not idempotent, and a database can reach this step
             // already carrying the column (a re-stamped user_version, or a fresh
             // create that applied the current schema before migrating). Probe
             // first so re-running the step is safe rather than fatal.
-            if !Self::has_column(&tx, "generations", "repo_root")? {
+            if !Self::has_column(tx, "generations", "repo_root")? {
                 tx.execute_batch(MIGRATION_V6_TO_V7)?;
             }
             tx.execute("PRAGMA user_version = 7", [])?;
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, which a v7 database legitimately does not satisfy yet.
-            tx.commit()?;
             version = 7;
         }
         if version == 7 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Same idempotency probe as v7: `ADD COLUMN` is not repeatable, and
             // a database can arrive here already carrying the columns from a
             // fresh create that applied the current schema before migrating.
-            if !Self::has_column(&tx, "generation_files", "grammar_version")? {
+            if !Self::has_column(tx, "generation_files", "grammar_version")? {
                 tx.execute_batch(MIGRATION_V7_TO_V8)?;
             }
             tx.execute("PRAGMA user_version = 8", [])?;
@@ -2312,29 +2542,27 @@ impl Store {
             // `validate_schema` asserts the *current* schema, and a v8 database
             // legitimately does not satisfy it until v9 adds
             // `generation_unresolved`. The final validation below covers it.
-            tx.commit()?;
             version = 8;
         }
         if version == 8 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
             // probe — but the two indexes beside it are not: since v18
             // `generation_unresolved` may already be a view, and indexing one
             // is an error. Skipped whole rather than split, because the table
             // and its indexes are one shape: if the relation is not a table,
             // none of this batch applies.
-            if !Self::relation_exists(&tx, "generation_unresolved")? {
+            if !Self::relation_exists(tx, "generation_unresolved")? {
                 tx.execute_batch(MIGRATION_V8_TO_V9)?;
             }
             tx.execute("PRAGMA user_version = 9", [])?;
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, and a v9 database legitimately lacks the v10
             // `classification` column until the next step adds it.
-            tx.commit()?;
             version = 9;
         }
         if version == 9 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Same idempotency probe as v7/v8: `ADD COLUMN` is not repeatable,
             // and a fresh create applies the current `UNRESOLVED_TABLE`, which
             // already carries the column, before this chain runs.
@@ -2342,43 +2570,40 @@ impl Store {
             // The `relation_is_table` half is v18's: the batch both adds a
             // column and creates an index, and neither is legal against the
             // view `generation_unresolved` became.
-            if Self::relation_is_table(&tx, "generation_unresolved")?
-                && !Self::has_column(&tx, "generation_unresolved", "classification")?
+            if Self::relation_is_table(tx, "generation_unresolved")?
+                && !Self::has_column(tx, "generation_unresolved", "classification")?
             {
                 tx.execute_batch(MIGRATION_V9_TO_V10)?;
             }
             tx.execute("PRAGMA user_version = 10", [])?;
             // No mid-chain validation: a v10 database legitimately lacks the
             // v11 `receiver` column until the next step adds it.
-            tx.commit()?;
             version = 10;
         }
         if version == 10 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if Self::relation_is_table(&tx, "generation_unresolved")?
-                && !Self::has_column(&tx, "generation_unresolved", "receiver")?
+            let tx = conn;
+            if Self::relation_is_table(tx, "generation_unresolved")?
+                && !Self::has_column(tx, "generation_unresolved", "receiver")?
             {
                 tx.execute_batch(MIGRATION_V10_TO_V11)?;
             }
             tx.execute("PRAGMA user_version = 11", [])?;
             // No mid-chain validation: a v11 database legitimately lacks the
             // v12 body-signature columns until the next step adds them.
-            tx.commit()?;
             version = 11;
         }
         if version == 11 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !Self::has_column(&tx, "generation_nodes", "body_exact")? {
+            let tx = conn;
+            if !Self::has_column(tx, "generation_nodes", "body_exact")? {
                 tx.execute_batch(MIGRATION_V11_TO_V12)?;
             }
             tx.execute("PRAGMA user_version = 12", [])?;
             // No mid-chain validation: v13 adds the extraction-cache index
             // below, and the end-of-chain check is the authoritative one.
-            tx.commit()?;
             version = 12;
         }
         if version == 12 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // `CREATE INDEX IF NOT EXISTS` is idempotent, but it is not legal
             // on a view, and `generation_files` became one in v17. A fresh
             // store applies `CREATE_SCHEMA_V3` — which carries the current
@@ -2387,36 +2612,34 @@ impl Store {
             // The index it creates has a successor there:
             // `idx_file_payloads_identity`, on the same four columns, over one
             // row per distinct payload instead of one per generation and file.
-            if Self::relation_is_table(&tx, "generation_files")? {
+            if Self::relation_is_table(tx, "generation_files")? {
                 tx.execute_batch(MIGRATION_V12_TO_V13)?;
             }
             tx.execute("PRAGMA user_version = 13", [])?;
             // No mid-chain validation: v14 adds the coverage-gap inventory and
             // the edge resolution column below, and the end-of-chain check is
             // the authoritative one.
-            tx.commit()?;
             version = 13;
         }
         if version == 13 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
             // probe — unlike the ADD COLUMN migrations above.
             tx.execute_batch(COVERAGE_GAPS_TABLE)?;
             tx.execute("PRAGMA user_version = 14", [])?;
             // No mid-chain validation: v15 adds the edge resolution column
             // below, and the end-of-chain check is the authoritative one.
-            tx.commit()?;
             version = 14;
         }
         if version == 14 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Same idempotency probe as v7/v8/v10/v11: `ADD COLUMN` is not
             // repeatable, and a fresh create applies `CREATE_SCHEMA_V3`, which
             // already carries the column, before this chain runs.
             // The `relation_is_table` half is v18's: `ALTER TABLE ... ADD
             // COLUMN` cannot name the view `generation_edges` became.
-            if Self::relation_is_table(&tx, "generation_edges")?
-                && !Self::has_column(&tx, "generation_edges", "resolution")?
+            if Self::relation_is_table(tx, "generation_edges")?
+                && !Self::has_column(tx, "generation_edges", "resolution")?
             {
                 tx.execute_batch(MIGRATION_V14_TO_V15)?;
             }
@@ -2430,14 +2653,13 @@ impl Store {
             // stamped 5 through 14, which is every installation that had not
             // already been migrated. The end-of-chain check below is the
             // authoritative gate, and `migration_ladder.rs` walks every rung.
-            tx.commit()?;
             version = 15;
         }
         if version == 15 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Same idempotency probe as v7/v8/v10/v11/v14.
-            if Self::relation_is_table(&tx, "generation_edges")?
-                && !Self::has_column(&tx, "generation_edges", "candidate_total")?
+            if Self::relation_is_table(tx, "generation_edges")?
+                && !Self::has_column(tx, "generation_edges", "candidate_total")?
             {
                 tx.execute_batch(MIGRATION_V15_TO_V16)?;
             }
@@ -2447,11 +2669,10 @@ impl Store {
             // because `REQUIRED_SCHEMA` names no v17-only column — which is an
             // accident of that list, not a property of the schema, and is
             // exactly the kind of accident the rule exists to stop relying on.
-            tx.commit()?;
             version = 16;
         }
         if version == 16 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Not an `ADD COLUMN`, so the idempotency probe is different: the
             // step is complete exactly when `generation_files` has become a
             // view. A fresh create applies `CREATE_SCHEMA_V3`, which already
@@ -2471,11 +2692,10 @@ impl Store {
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, and a v17 database legitimately has `generation_edges` as
             // a table and no `edge_rows` until the step below runs.
-            tx.commit()?;
             version = 17;
         }
         if version == 17 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Each relation is asked about separately, and "is it still a
             // base table?" is the whole question: absent means there is
             // nothing to carry, a view means this rung already ran, and only a
@@ -2487,8 +2707,8 @@ impl Store {
             // `generation_unresolved` at rung 9 and never acquires a
             // `generation_edges` at all, and the single probe read that as
             // "already migrated" and left the store with no edge relation.
-            let carry_edges = Self::relation_is_table(&tx, "generation_edges")?;
-            let carry_unresolved = Self::relation_is_table(&tx, "generation_unresolved")?;
+            let carry_edges = Self::relation_is_table(tx, "generation_edges")?;
+            let carry_unresolved = Self::relation_is_table(tx, "generation_unresolved")?;
             if carry_edges {
                 tx.execute_batch(MIGRATION_V17_TO_V18_RENAME_EDGES)?;
             }
@@ -2508,11 +2728,10 @@ impl Store {
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, and a v18 database legitimately has no
             // `generation_file_digests` until the step below runs.
-            tx.commit()?;
             version = 18;
         }
         if version == 18 {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn;
             // Purely additive, and idempotent by `IF NOT EXISTS`. There is no
             // backfill and there deliberately cannot be one: a digest is a
             // function of the resolver's output for a file, and SQL cannot
@@ -2524,10 +2743,23 @@ impl Store {
             // correct starting state rather than a gap to be filled.
             tx.execute_batch(MIGRATION_V18_TO_V19)?;
             tx.execute("PRAGMA user_version = 19", [])?;
-            Self::heal_declared_indexes(&tx)?;
-            Self::validate_schema(&tx)?;
-            tx.commit()?;
             version = 19;
+        }
+        if version == 19 {
+            if !Self::has_column(conn, "generations", "repo_root")? {
+                return Err(refusal("required column generations.repo_root is missing"));
+            }
+            if !Self::has_column(conn, "pending_paths", "revision")? {
+                conn.execute_batch(MIGRATION_V19_TO_V20)?;
+            } else if !Self::relation_is_table(conn, "pending_state")? {
+                return Err(refusal(
+                    "pending revisions exist without their durable store identity",
+                ));
+            }
+            // A re-entered migration must preserve an already established epoch
+            // and counter, including claims held by another process.
+            conn.execute("PRAGMA user_version = 20", [])?;
+            version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2539,6 +2771,38 @@ impl Store {
         Ok(())
     }
 
+    fn validate_database_file(path: &Path) -> Result<()> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(refusal(format!(
+                    "cannot inspect database {}: {error}",
+                    path.display()
+                )))
+            }
+            Ok(_) => std::fs::metadata(path).map_err(|error| {
+                refusal(format!(
+                    "cannot resolve database {}: {error}",
+                    path.display()
+                ))
+            })?,
+        };
+        if !metadata.is_file() {
+            return Err(refusal(format!(
+                "database {} is not a regular file",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                return Err(refusal(format!("database {} has multiple hard links; use an independent store or SQLite backup so WAL and writer ownership cannot diverge", path.display())));
+            }
+        }
+        Ok(())
+    }
+
     /// Open an existing, current-schema store for an embedding reader.
     ///
     /// Unlike `open`, this cannot create, migrate, repair indexes, switch the
@@ -2547,6 +2811,7 @@ impl Store {
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
+        Self::validate_database_file(path)?;
         let metadata = std::fs::metadata(path).map_err(|error| {
             refusal(format!(
                 "cannot inspect devmap store {}: {error}",
@@ -2593,6 +2858,7 @@ impl Store {
 
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
+        Self::validate_database_file(path)?;
         // Before the connection exists: SQLite maps the `-shm` sidecar as it
         // opens a WAL database, with whatever mode the sidecar has, so a
         // repair after `Connection::open` is a repair the connection never
@@ -2650,6 +2916,8 @@ impl Store {
         Self::enable_wal(&conn)?;
         if !read_only {
             Self::migrate(&mut conn, &store)?;
+        } else {
+            Self::validate_schema(&conn)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -2808,6 +3076,8 @@ impl Store {
 
     /// Path of the advisory writer lock guarding `db_path`.
     pub fn writer_lock_path(db_path: &Path) -> std::path::PathBuf {
+        let canonical = db_path.canonicalize().ok();
+        let db_path = canonical.as_deref().unwrap_or(db_path);
         let mut name = db_path.file_name().map_or_else(
             || std::ffi::OsString::from("devmap-store"),
             |name| name.to_os_string(),
@@ -2838,6 +3108,7 @@ impl Store {
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
         use std::io::{Seek, Write};
 
+        Self::validate_database_file(db_path)?;
         let lock_path = Self::writer_lock_path(db_path);
         if let Some(parent) = lock_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -3065,14 +3336,31 @@ impl Store {
     /// normalisation and no containment check, which is exactly what made the
     /// queue rot: see K1 on `enqueue_pending_paths_under_root`.
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
-        self.refuse_if_read_only()?;
         let now = Self::now_secs();
-        let conn = lock_conn(&self.conn)?;
-        let tx = conn.unchecked_transaction()?;
-        for path in paths {
-            Self::upsert_pending(&tx, path, now)?;
-        }
-        tx.commit()
+        self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
+            Self::upsert_pending(tx, paths.iter().map(String::as_str), now)
+        })
+    }
+
+    /// Acquire the writer before reading queue identity, and restore the
+    /// ordinary busy policy on success and failure. One immediate transaction
+    /// gives the whole batch one admission wait rather than a timeout per path.
+    fn with_pending_transaction<T>(
+        &self,
+        wait: std::time::Duration,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.refuse_if_read_only()?;
+        let mut conn = lock_conn(&self.conn)?;
+        conn.busy_timeout(wait)?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = write(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })();
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        result
     }
 
     fn now_secs() -> f64 {
@@ -3082,15 +3370,135 @@ impl Store {
             .as_secs_f64()
     }
 
-    fn upsert_pending(tx: &rusqlite::Transaction<'_>, path: &str, now: f64) -> Result<()> {
-        tx.prepare_cached(
-            "INSERT INTO pending_paths (path, queued_at, attempts) VALUES (?1, ?2, 0)
+    fn upsert_pending<'a>(
+        tx: &rusqlite::Transaction<'_>,
+        paths: impl ExactSizeIterator<Item = &'a str>,
+        now: f64,
+    ) -> Result<()> {
+        if paths.len() == 0 {
+            return Ok(());
+        }
+        // Allocate once per batch while holding the same transaction as its
+        // inserts. Every edit still gets a distinct revision, including repeated
+        // paths. A refused insert rolls back the reservation and every row.
+        let mut revision = Self::reserve_pending_revisions(tx, paths.len())?;
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO pending_paths (path, queued_at, attempts, revision) VALUES (?1, ?2, 0, ?3)
              ON CONFLICT(path) DO UPDATE SET
                queued_at=excluded.queued_at,
+               revision=excluded.revision,
                attempts=0",
-        )?
-        .execute(params![path, now])?;
+        )?;
+        for path in paths {
+            revision += 1; // the reservation proved the entire range fits i64
+            insert.execute(params![path, now, revision])?;
+        }
         Ok(())
+    }
+
+    /// Reserve `count` revisions and return the position before the range.
+    /// One cached UPDATE avoids preparing two statements for every path while
+    /// hundreds of sessions contend for SQLite's single writer.
+    fn reserve_pending_revisions(conn: &Connection, count: usize) -> Result<i64> {
+        let count =
+            i64::try_from(count).map_err(|_| refusal("pending revision batch is too large"))?;
+        if count <= 0 {
+            return Err(refusal("pending revision batch must be nonempty"));
+        }
+        conn.prepare_cached(
+            "UPDATE pending_state SET revision = revision + ?1
+             WHERE singleton = 1 AND revision <= 9223372036854775807 - ?1
+             RETURNING revision - ?1",
+        )?
+        .query_row([count], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| refusal("pending queue revision exhausted or its state is missing"))
+    }
+
+    fn pending_watermark_in(conn: &Connection) -> Result<PendingWatermark> {
+        conn.query_row(
+            "SELECT epoch, revision FROM pending_state WHERE singleton = 1",
+            [],
+            |r| {
+                Ok(PendingWatermark {
+                    epoch: r.get(0)?,
+                    revision: r.get(1)?,
+                })
+            },
+        )
+    }
+
+    pub fn pending_watermark(&self) -> Result<PendingWatermark> {
+        let conn = lock_conn(&self.conn)?;
+        Self::pending_watermark_in(&conn)
+    }
+
+    fn check_pending_epoch(conn: &Connection, watermark: &PendingWatermark) -> Result<()> {
+        if Self::pending_watermark_in(conn)?.epoch != watermark.epoch {
+            return Err(refusal(
+                "pending acknowledgement belongs to a different store",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check a reader's requested worktree without changing the store.
+    pub fn validate_repo_root(&self, root: &Path) -> Result<()> {
+        let root = Self::normalized_repo_root(root)?;
+        let conn = lock_conn(&self.conn)?;
+        Self::check_repo_root_in(&conn, &root)
+    }
+
+    fn normalized_repo_root(root: &Path) -> Result<String> {
+        let absolute = root
+            .canonicalize()
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    std::path::absolute(root)
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| refusal(format!("cannot resolve worktree root: {error}")))?;
+        absolute
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| refusal("worktree root is not valid UTF-8"))
+    }
+
+    fn check_repo_root_in(conn: &Connection, root: &str) -> Result<()> {
+        let owner: Option<String> = conn.query_row(
+            "SELECT repo_root FROM pending_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if let Some(owner) = owner {
+            let owner = Self::normalized_repo_root(Path::new(&owner))?;
+            if owner != root {
+                return Err(refusal(format!(
+                    "DevMap store belongs to worktree {owner:?}, not {root:?}; use a separate --db or DEVMAP_HOME for each worktree")));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_repo_root_in(conn: &Connection, root: &str) -> Result<()> {
+        Self::check_repo_root_in(conn, root)?;
+        conn.execute(
+            "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
+            [root],
+        )?;
+        Ok(())
+    }
+
+    /// Bind writes to one canonical worktree, including before its first build.
+    pub fn bind_repo_root(&self, root: &Path) -> Result<()> {
+        self.refuse_if_read_only()?;
+        let root = Self::normalized_repo_root(root)?;
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::bind_repo_root_in(&tx, &root)?;
+        tx.commit()
     }
 
     /// Enqueue changed paths in the queue's canonical form: repo-relative,
@@ -3163,15 +3571,15 @@ impl Store {
                 )),
             }
         }
-        let now = Self::now_secs();
-        {
-            let conn = lock_conn(&self.conn)?;
-            let tx = conn.unchecked_transaction()?;
-            for entry in &canonical {
-                Self::upsert_pending(&tx, entry, now)?;
-            }
-            tx.commit()?;
+        if canonical.is_empty() {
+            return Ok(report);
         }
+        let owner = Self::normalized_repo_root(root)?;
+        let now = Self::now_secs();
+        self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
+            Self::bind_repo_root_in(tx, &owner)?;
+            Self::upsert_pending(tx, canonical.iter().map(String::as_str), now)
+        })?;
         report.enqueued = canonical.into_iter().collect();
         Ok(report)
     }
@@ -3210,13 +3618,25 @@ impl Store {
     /// name something inside the root, so a queue written by the old absolute
     /// path producer converges instead of being thrown away.
     pub fn reconcile_pending_paths(&self, root: &Path) -> Result<PendingReconcile> {
+        self.reconcile_pending_paths_with(root, &|| {})
+    }
+
+    fn reconcile_pending_paths_with(
+        &self,
+        root: &Path,
+        before_apply: &dyn Fn(),
+    ) -> Result<PendingReconcile> {
+        self.bind_repo_root(root)?;
         let indexed: BTreeSet<String> = self.latest_file_hashes()?.into_keys().collect();
-        let rows: Vec<(String, f64, u32)> = {
+        let rows: Vec<(String, f64, u32, i64)> = {
             let conn = lock_conn(&self.conn)?;
-            let mut stmt =
-                conn.prepare("SELECT path, queued_at, attempts FROM pending_paths ORDER BY path")?;
+            let mut stmt = conn.prepare(
+                "SELECT path, queued_at, attempts, revision FROM pending_paths ORDER BY path",
+            )?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
                 .collect::<Result<Vec<_>>>()?;
             rows
         };
@@ -3225,9 +3645,9 @@ impl Store {
         // One memo for the whole sweep: 51,136 rows were measured on the live
         // store, and without it each would re-`open` every ancestor's tag.
         let mut caches = devmap_extract::CacheDirectoryCache::default();
-        let mut deletes: Vec<String> = Vec::new();
-        let mut rewrites: Vec<(String, String, f64, u32)> = Vec::new();
-        for (stored, queued_at, attempts) in rows {
+        let mut deletes: Vec<(String, i64)> = Vec::new();
+        let mut rewrites: Vec<(String, String, f64, u32, i64)> = Vec::new();
+        for (stored, queued_at, attempts, revision) in rows {
             if is_control_token(&stored) {
                 outcome.retained += 1;
                 continue;
@@ -3235,7 +3655,7 @@ impl Store {
             let canonical = match canonical_pending_entry(root, &stored) {
                 PendingEntry::Canonical(entry) => entry,
                 PendingEntry::Outside => {
-                    deletes.push(stored.clone());
+                    deletes.push((stored.clone(), revision));
                     outcome.dropped.push((
                         stored,
                         format!("escapes the repository root {}", root.display()),
@@ -3253,39 +3673,51 @@ impl Store {
             };
             match classify_pending_entry(root, &canonical, &indexed, &mut caches) {
                 Err(reason) => {
-                    deletes.push(stored.clone());
+                    deletes.push((stored.clone(), revision));
                     outcome.dropped.push((stored, reason));
                 }
                 Ok(()) => {
                     if canonical != stored {
-                        rewrites.push((stored, canonical, queued_at, attempts));
+                        rewrites.push((stored, canonical, queued_at, attempts, revision));
                     }
                     outcome.retained += 1;
                 }
             }
         }
 
+        before_apply();
         if !deletes.is_empty() || !rewrites.is_empty() {
             let mut conn = lock_conn(&self.conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for path in &deletes {
-                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
-                    .execute(params![path])?;
+            for (path, revision) in &deletes {
+                if tx
+                    .prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND revision = ?2")?
+                    .execute(params![path, revision])?
+                    == 0
+                {
+                    outcome.dropped.retain(|(dropped, _)| dropped != path);
+                    outcome.retained += 1;
+                }
             }
-            for (stored, canonical, queued_at, attempts) in &rewrites {
-                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
-                    .execute(params![stored])?;
-                // Preserve the work: the row still names real pending work,
-                // only under the wrong spelling. `MIN` on attempts so a
-                // rewritten row cannot inherit a *worse* history than the
-                // canonical row it merges into.
+            for (stored, canonical, queued_at, attempts, observed_revision) in &rewrites {
+                if tx
+                    .prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND revision = ?2")?
+                    .execute(params![stored, observed_revision])?
+                    == 0
+                {
+                    continue;
+                }
+                // A merge is a new event. Claims taken before either spelling
+                // was repaired cannot acknowledge the merged work.
+                let revision = Self::reserve_pending_revisions(&tx, 1)? + 1;
                 tx.prepare_cached(
-                    "INSERT INTO pending_paths (path, queued_at, attempts) VALUES (?1, ?2, ?3)
+                    "INSERT INTO pending_paths (path, queued_at, attempts, revision) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(path) DO UPDATE SET
-                       queued_at=MIN(pending_paths.queued_at, excluded.queued_at),
+                       queued_at=MAX(pending_paths.queued_at, excluded.queued_at),
+                       revision=excluded.revision,
                        attempts=MIN(pending_paths.attempts, excluded.attempts)",
                 )?
-                .execute(params![canonical, queued_at, attempts])?;
+                .execute(params![canonical, queued_at, attempts, revision])?;
                 outcome.rewritten.push((stored.clone(), canonical.clone()));
             }
             tx.commit()?;
@@ -3325,55 +3757,41 @@ impl Store {
     /// reconcile correctly kept them and `repair --pending` could not touch
     /// them either — `status` simply reported NOT FRESH forever.
     ///
-    /// Quarantined rows and control tokens go in both cases: the first are work
-    /// five drains could not do and a build has now either done or proved
-    /// unnecessary, the second is the daemon's git-HEAD sentinel, which a
-    /// generation written at the current HEAD answers by construction.
+    /// Quarantined rows and control tokens obey the same revision and coverage
+    /// boundary as every other event; unread or newer work must survive.
     pub fn clear_pending_superseded(&self, rule: PendingSupersede<'_>) -> Result<Vec<String>> {
-        let indexed: BTreeSet<&str> = match rule {
-            PendingSupersede::IndexedPaths(paths) => paths.iter().map(String::as_str).collect(),
-            PendingSupersede::WholeTreeBuiltAt(_) => BTreeSet::new(),
+        self.refuse_if_read_only()?;
+        let (indexed, through) = match rule {
+            PendingSupersede::IndexedPathsThrough(paths, through) => (
+                Some(paths.iter().map(String::as_str).collect::<BTreeSet<_>>()),
+                through,
+            ),
+            PendingSupersede::WholeTreeThrough(through) => (None, through),
         };
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows: Vec<(String, f64, u32)> = {
-            let mut stmt = tx.prepare("SELECT path, queued_at, attempts FROM pending_paths")?;
+        Self::check_pending_epoch(&tx, through)?;
+        let rows: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT path FROM pending_paths WHERE revision <= ?1 ORDER BY path")?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<Vec<_>>>()?;
+                .query_map([through.revision], |row| row.get(0))?
+                .collect::<Result<_>>()?;
             rows
         };
         let mut cleared = Vec::new();
-        for (path, queued_at, attempts) in rows {
-            let answered = match rule {
-                // The build read the whole tree, so it answered every request
-                // that existed when it started — whatever that request named.
-                // Strictly `<=` against the *start*, never the finish: a
-                // watcher event that arrived while the build was extracting
-                // describes an edit the build may not have seen, and deleting
-                // it would drop a real change on the floor.
-                PendingSupersede::WholeTreeBuiltAt(started) => queued_at <= started,
-                // A narrowed build only read what it was told to read.
-                PendingSupersede::IndexedPaths(_) => indexed.contains(path.as_str()),
-            };
-            if answered || attempts >= MAX_PENDING_ATTEMPTS || is_control_token(&path) {
-                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
-                    .execute(params![path])?;
+        for path in rows {
+            if indexed
+                .as_ref()
+                .is_none_or(|paths| paths.contains(path.as_str()))
+            {
+                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND revision <= ?2")?
+                    .execute(params![path, through.revision])?;
                 cleared.push(path);
             }
         }
         tx.commit()?;
         Ok(cleared)
-    }
-
-    /// Wall clock in the units `pending_paths.queued_at` is written in.
-    ///
-    /// Public so a build can stamp "I started here" on the same clock the queue
-    /// uses, which is what makes [`PendingSupersede::WholeTreeBuiltAt`]
-    /// comparable at all. `Instant` cannot be used: it is monotonic and process
-    /// local, while the queue is durable and written by other processes.
-    pub fn queue_clock_now() -> f64 {
-        Self::now_secs()
     }
 
     /// Every queued path a drain may still retry, oldest first.
@@ -3391,7 +3809,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT path FROM pending_paths
              WHERE attempts < ?2
-             ORDER BY queued_at ASC, path ASC
+             ORDER BY revision ASC, path ASC
              LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![sqlite_limit(limit), MAX_PENDING_ATTEMPTS], |row| {
@@ -3407,7 +3825,7 @@ impl Store {
     /// Claim up to `limit` retryable pending rows for one drain attempt.
     ///
     /// Same selection as [`Store::get_pending_paths_limited`], but each row
-    /// carries the `queued_at` it was claimed at so the acknowledgement can be
+    /// carries the durable revision it was claimed at so the acknowledgement can be
     /// conditional on the row not having been re-enqueued meanwhile. See
     /// [`PendingClaim`].
     pub fn claim_pending_batch(&self, limit: usize) -> Result<Vec<PendingClaim>> {
@@ -3416,9 +3834,10 @@ impl Store {
         }
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
-            "SELECT path, queued_at FROM pending_paths
-             WHERE attempts < ?2
-             ORDER BY queued_at ASC, path ASC
+            "SELECT path, queued_at, pending_paths.revision, pending_state.epoch
+             FROM pending_paths CROSS JOIN pending_state
+             WHERE pending_state.singleton = 1 AND attempts < ?2
+             ORDER BY pending_paths.revision ASC, path ASC
              LIMIT ?1",
         )?;
         let rows = stmt
@@ -3426,6 +3845,10 @@ impl Store {
                 Ok(PendingClaim {
                     path: row.get(0)?,
                     queued_at: row.get(1)?,
+                    watermark: PendingWatermark {
+                        revision: row.get(2)?,
+                        epoch: row.get(3)?,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -3434,31 +3857,36 @@ impl Store {
 
     /// Acknowledge claimed work, leaving anything re-enqueued since the claim.
     ///
-    /// The `queued_at` guard replaces the old `attempts > 0` one, which only
+    /// The revision guard replaces timestamp and `attempts > 0` guards, which only
     /// worked because the drain bumped the attempt counter of every path in the
     /// batch *before* doing any work — so a single failure in a later,
     /// batch-wide step (a persist, a prune) charged an attempt to all 64 paths
     /// in the batch and five such failures quarantined the lot. See K1(d).
     pub fn clear_claimed_pending_paths(&self, claims: &[PendingClaim]) -> Result<usize> {
-        let conn = lock_conn(&self.conn)?;
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cleared = 0;
         for claim in claims {
+            Self::check_pending_epoch(&tx, &claim.watermark)?;
             cleared += tx
-                .prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND queued_at = ?2")?
-                .execute(params![claim.path, claim.queued_at])?;
+                .prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND revision = ?2")?
+                .execute(params![claim.path, claim.watermark.revision])?;
         }
         tx.commit()?;
         Ok(cleared)
     }
 
-    pub fn bump_pending_attempts(&self, paths: &[String]) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        let tx = conn.unchecked_transaction()?;
-        for path in paths {
+    /// Charge only the claimed revision; a repaired/re-enqueued path starts anew.
+    pub fn bump_pending_attempts(&self, claims: &[PendingClaim]) -> Result<()> {
+        self.refuse_if_read_only()?;
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for claim in claims {
+            Self::check_pending_epoch(&tx, &claim.watermark)?;
             tx.execute(
-                "UPDATE pending_paths SET attempts = attempts + 1 WHERE path = ?1",
-                params![path],
+                "UPDATE pending_paths SET attempts = attempts + 1
+                 WHERE path = ?1 AND revision = ?2 AND attempts < ?3",
+                params![claim.path, claim.watermark.revision, MAX_PENDING_ATTEMPTS],
             )?;
         }
         tx.commit()
@@ -3565,6 +3993,14 @@ impl Store {
         }
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
+        if let Some(root) = &opts.repo_root {
+            Self::bind_repo_root_in(&tx, &Self::normalized_repo_root(Path::new(root))?)?;
+        }
+        let repo_root: Option<String> = tx.query_row(
+            "SELECT repo_root FROM pending_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
         // One path-id memo for the whole generation write. See
         // `ensure_path_id_cached`: the edge loop alone asks for two ids per
         // edge drawn from a file set two orders of magnitude smaller.
@@ -3583,7 +4019,7 @@ impl Store {
         tx.execute(
             "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
              VALUES (?1, ?2, ?3, ?4)",
-            params![now, head_sha, analysis_json, opts.repo_root],
+            params![now, head_sha, analysis_json, repo_root],
         )?;
         let gen_id: u32 = tx.last_insert_rowid() as u32;
 
@@ -5309,7 +5745,7 @@ impl Store {
             let mut stmt = snapshot.prepare(
                 "SELECT path FROM pending_paths
                  WHERE attempts >= ?1
-                 ORDER BY queued_at ASC, path ASC
+                 ORDER BY revision ASC, path ASC
                  LIMIT ?2",
             )?;
             let rows = stmt
@@ -8402,6 +8838,7 @@ mod git_head_tests {
     /// drain batch behind it. The bounded runner kills at
     /// [`GIT_HEAD_DEADLINE`]; this test proves the error arrives near the
     /// deadline rather than after the sleeper's own 30s exit.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_git_is_killed_at_the_deadline() {
         let stamp = std::time::SystemTime::now()
@@ -8434,7 +8871,6 @@ mod git_head_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_real_git_head_still_validates_normally() {
         // Positive control: the deadline path must not have broken honest git.

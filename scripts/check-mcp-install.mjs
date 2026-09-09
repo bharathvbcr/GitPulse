@@ -10,15 +10,15 @@
  * happens to be on PATH, which no build step owns. A binary copied there by
  * hand keeps answering handshakes long after the repo has moved on, and the
  * handshake it answers *looks* healthy: the staleness is only visible if you
- * compare the version it reports against the version this tree carries.
+ * compare its version and store schema against this tree.
  *
  * So the comparison is the check. The four outcomes are kept distinct on
  * purpose — "no binary on PATH" and "binary matches" are the two that a
  * naive check would collapse into one silent pass:
  *
- *   ok           the server on PATH reports this repo's version
- *   stale        it answered, with a different version than this tree
- *   unresponsive it is on PATH but did not complete an MCP handshake
+ *   ok           the server reports this repo's version and store schema
+ *   stale        it answered, with a different version or store schema
+ *   unresponsive it did not provide a usable handshake and schema identity
  *   absent       nothing named gitpulse-mcp is on PATH at all
  *
  * Not part of `ci:local`: CI has no reason to install the server, and a check
@@ -38,6 +38,7 @@ import { accessSync, constants, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
+import { readVendoredSchema } from "./check-vendor-schema.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -46,6 +47,8 @@ export const SERVER_BIN = "gitpulse-mcp";
 
 /** Handshake budget. An unresponsive server must fail, never hang a release. */
 export const DEFAULT_TIMEOUT_MS = 10_000;
+const MAX_RESPONSE_BYTES = 1_048_576;
+const MANIFEST_URI = "gitpulse://server/manifest";
 
 /**
  * Resolve `name` against PATH without shelling out to `which`, so the answer
@@ -118,6 +121,46 @@ export function parseServerVersion(stdout, id) {
   return null;
 }
 
+/** @param {unknown} value @returns {value is Record<string, unknown>} */
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A missing reply is distinct from a reply whose schema identity is unavailable.
+ * @param {string} stdout
+ * @param {number} id
+ * @returns {{ storeSchema: number | null, error: string | null } | null}
+ */
+export function parseServerManifest(stdout, id) {
+  for (const line of stdout.split(/\r?\n/)) {
+    /** @type {unknown} */
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    if (!isRecord(message) || message.id !== id) continue;
+    if (!isRecord(message.result) || !Array.isArray(message.result.contents)
+        || message.result.contents.length !== 1) {
+      return { storeSchema: null, error: "server did not return its manifest resource" };
+    }
+    const content = message.result.contents[0];
+    if (!isRecord(content) || content.uri !== MANIFEST_URI
+        || content.mimeType !== "application/json" || typeof content.text !== "string") {
+      return { storeSchema: null, error: "server manifest is missing or truncated" };
+    }
+    /** @type {unknown} */
+    let manifest;
+    try { manifest = JSON.parse(content.text); } catch {
+      return { storeSchema: null, error: "server manifest is invalid JSON" };
+    }
+    const schema = isRecord(manifest) ? manifest.storeSchemaVersion : null;
+    if (typeof schema !== "number" || !Number.isSafeInteger(schema) || schema <= 0) {
+      return { storeSchema: null, error: "server manifest has no valid storeSchemaVersion" };
+    }
+    return { storeSchema: schema, error: null };
+  }
+  return null;
+}
+
 /**
  * Complete a legacy `initialize` handshake and report the version claimed.
  *
@@ -127,7 +170,7 @@ export function parseServerVersion(stdout, id) {
  *
  * @param {string} binPath
  * @param {number} timeoutMs
- * @returns {Promise<{ version: string | null, error: string | null }>}
+ * @returns {Promise<{ version: string | null, storeSchema: number | null, error: string | null }>}
  */
 export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -136,12 +179,16 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
     try {
       child = spawn(binPath, [], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ version: null, error: /** @type {Error} */ (err).message });
+      resolve({ version: null, storeSchema: null, error: /** @type {Error} */ (err).message });
       return;
     }
     let stdout = "";
+    let receivedBytes = 0;
+    /** @type {string | null} */
+    let version = null;
+    let requestedManifest = false;
     let settled = false;
-    const finish = (/** @type {{ version: string | null, error: string | null }} */ outcome) => {
+    const finish = (/** @type {{ version: string | null, storeSchema: number | null, error: string | null }} */ outcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -149,24 +196,34 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       resolve(outcome);
     };
     const timer = setTimeout(
-      () => finish({ version: null, error: `no handshake response within ${timeoutMs}ms` }),
+      () => finish({ version, storeSchema: null, error: `no complete identity response within ${timeoutMs}ms` }),
       timeoutMs,
     );
 
-    child.on("error", (err) => finish({ version: null, error: err.message }));
+    child.on("error", (err) => finish({ version, storeSchema: null, error: err.message }));
+    child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      receivedBytes += Buffer.byteLength(chunk, "utf8");
+      if (receivedBytes > MAX_RESPONSE_BYTES) {
+        finish({ version, storeSchema: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
+        return;
+      }
       stdout += chunk;
-      const version = parseServerVersion(stdout, 1);
-      if (version !== null) finish({ version, error: null });
+      version ??= parseServerVersion(stdout, 1);
+      if (version !== null && !requestedManifest) {
+        requestedManifest = true;
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: MANIFEST_URI } })}\n`);
+      }
+      const manifest = requestedManifest ? parseServerManifest(stdout, 2) : null;
+      if (manifest !== null) finish({ version, ...manifest });
     });
     child.on("close", () => {
-      const version = parseServerVersion(stdout, 1);
-      finish(
-        version !== null
-          ? { version, error: null }
-          : { version: null, error: "server exited without a usable initialize response" },
-      );
+      finish({ version, storeSchema: null, error: version === null
+        ? "server exited without a usable initialize response"
+        : "server exited without its manifest schema identity" });
     });
 
     child.stdin.on("error", () => {
@@ -179,7 +236,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: "2025-06-18",
+          protocolVersion: "2024-11-05",
           capabilities: {},
           clientInfo: { name: "gitpulse-mcp-doctor", version: "1" },
         },
@@ -189,10 +246,10 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, error: string | null, expected: string }} observed
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, error: string | null, expected: string, expectedSchema: number }} observed
  * @returns {{ status: "ok" | "stale" | "unresponsive" | "absent", violations: string[] }}
  */
-export function classify({ binPath, version, error, expected }) {
+export function classify({ binPath, version, storeSchema, error, expected, expectedSchema }) {
   if (binPath === null) {
     return {
       status: "absent",
@@ -217,17 +274,31 @@ export function classify({ binPath, version, error, expected }) {
       ],
     };
   }
+  if (storeSchema === null || error !== null) {
+    return {
+      status: "unresponsive",
+      violations: [`${binPath} did not provide a usable schema identity${error ? ` (${error})` : ""}`],
+    };
+  }
+  if (storeSchema !== expectedSchema) {
+    return {
+      status: "stale",
+      violations: [`${binPath} reads store schema ${storeSchema} but this tree reads ${expectedSchema}`, "refresh it with: npm run mcp:install"],
+    };
+  }
   return { status: "ok", violations: [] };
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, expected: string, status: string, violations: string[] }} result
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[] }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
   lines.push(`  ${"executable on PATH".padEnd(26)} : ${result.binPath ?? "<not found>"}`);
   lines.push(`  ${"version it reports".padEnd(26)} : ${result.version ?? "<no handshake>"}`);
   lines.push(`  ${"version this tree carries".padEnd(26)} : ${result.expected}`);
+  lines.push(`  ${"store schema it reports".padEnd(26)} : ${result.storeSchema ?? "<unavailable>"}`);
+  lines.push(`  ${"store schema this tree reads".padEnd(26)} : ${result.expectedSchema}`);
   if (result.violations.length > 0) {
     lines.push("", "  violations:");
     for (const violation of result.violations) lines.push(`    - ${violation}`);
@@ -235,7 +306,7 @@ export function formatReport(result) {
   lines.push(
     "",
     result.status === "ok"
-      ? `OK: the ${SERVER_BIN} on PATH is this tree's ${result.expected}.`
+      ? `OK: the ${SERVER_BIN} on PATH matches version ${result.expected} and store schema ${result.expectedSchema}.`
       : `FAIL (${result.status}): the server an agent would connect to is not this tree's build.`,
   );
   return lines.join("\n");
@@ -305,10 +376,11 @@ export async function main(argv = process.argv.slice(2)) {
 
   try {
     const expected = opts.expect ?? expectedVersion();
+    const expectedSchema = readVendoredSchema();
     const binPath = opts.bin ?? resolveOnPath(SERVER_BIN);
-    const probe = binPath === null ? { version: null, error: null } : await probeServer(binPath, opts.timeoutMs);
-    const { status, violations } = classify({ binPath, version: probe.version, error: probe.error, expected });
-    const result = { binPath, version: probe.version, expected, status, violations, ok: status === "ok" };
+    const probe = binPath === null ? { version: null, storeSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
+    const { status, violations } = classify({ binPath, ...probe, expected, expectedSchema });
+    const result = { binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema, status, violations, ok: status === "ok" };
     if (opts.json) console.log(JSON.stringify(result, null, 2));
     else console.log(formatReport(result));
     return result.ok ? 0 : 1;

@@ -40,7 +40,7 @@ function usage() {
   });
 }
 
-function readVendoredSchema() {
+export function readVendoredSchema() {
   if (!existsSync(SCHEMA_RS)) {
     throw new Error(`missing ${SCHEMA_RS}; run npm run vendor`);
   }

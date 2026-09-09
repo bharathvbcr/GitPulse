@@ -23,9 +23,11 @@ pub mod languages;
 pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
+mod git_metadata;
 pub mod paths;
 pub mod progress;
 pub mod subprocess;
+pub use git_metadata::{git_metadata, GitMetadata};
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
 #[cfg(feature = "parse")]
@@ -381,8 +383,12 @@ fn ignore_rule_bases(
         rel.parent().unwrap_or_else(|| Path::new(""))
     };
 
+    let exclude = git_metadata(&git_root)?.map_or_else(
+        || git_root.join(".git/info/exclude"),
+        |metadata| metadata.common_dir.join("info/exclude"),
+    );
     let mut rules = vec![
-        (git_root.clone(), git_root.join(".git/info/exclude")),
+        (git_root.clone(), exclude),
         (git_root.clone(), git_root.join(".gitignore")),
     ];
     let mut current = git_root;

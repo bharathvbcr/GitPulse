@@ -180,6 +180,7 @@
         "src/embedded.rs": "cbefdd2a2e2f27c4f6b088aa3675cd1aef5bcfe824e6c3dfc7bca676b80748a6",
         "src/fallback.rs": "35c7bb1dde061964e8ecfb92fae823ea191abcba7a20c0a5f38dd24a14635e62",
         "src/frameworks.rs": "1899508a57f6b4a06c01fc9b9852ce5a667573460619e9ac18582f97a3b4d4e0",
+        "src/git_metadata.rs": "38bd4f6e6703e140c699d9a93751bfbd812cad10965a59d03101fb3b4c7d4f22",
         "src/gomod.rs": "21b120ec0bfd4bdc4c5bb8cf34d0058537bb03cfcc7b1df65741b6b311771a56",
         "src/heritage.rs": "6f4682ef7cb0d5e5e57aa6543df57a23ab4d7133288968fb474993496b7b4ff0",
         "src/langcalls/csharp.rs": "cccad4267800c472c1a43bd06b460a5c42e3143d1ee97f0ec8329ebbc531a05c",
@@ -228,12 +229,12 @@
         "src/langimports/scala.rs": "bf9547407a203103ddef0c4cdaa72daa353f632115131ca973ac43e105786a1e",
         "src/langimports/solidity.rs": "1b95efc86a6d1a74876a33e4c23fb5a3920f3ef9a54eae92840326ae44b37112",
         "src/languages.rs": "50992c69d9378a2c132d80d8c8e5c20521a3066150fd4fd7bbf723a9e65925b7",
-        "src/lib.rs": "845afbf26475a84984f65c3f6b5afd67acab12208e0e9e143ba7e1871727ab19",
+        "src/lib.rs": "ade15ca01a81541f7f7c569d8d569a5481830748ce6a9b90e1f586d1148b0642",
         "src/model.rs": "0059b938eccbf8f48a2e64ada08ec7cf306a1d61d6cd4debaa6fe831afa9a4e6",
         "src/notebook.rs": "854c6ca121d3c75bb72755070236241d3fb9a4eea47da27daa07d33c12e6c26b",
-        "src/paths.rs": "06688ac3493f464e8a3d594ab3c120cd92c7bdbac67ee2ad50fae1a724cecaeb",
+        "src/paths.rs": "b3d22d94e1dcd752b0908d7dac059f5bdffe06335b0b0a05cf24e03d849dc71e",
         "src/progress.rs": "b7de434d9647a53e124e478b10e7c4bd9214445c98a6ec3ce4ff3477d51d1a4e",
-        "src/subprocess.rs": "0a6575cc0f667bf2f75be636e391397685a1e29c842df7b6e81954fb49092c60",
+        "src/subprocess.rs": "3df93eb228ff663224c9a13cf45780b7939fa0b7513bde7978e6cc6ce1a27156",
         "src/treesitter.rs": "d02e765d6fa828d47214e7dd0522cb7a1b05c077a2bd0f60e76a97098dae74bc",
         "src/wiring.rs": "c966f2df3eea1629ac97b93214713eee21e2239c41dd587eee097ec84ebe4546"
       }
@@ -346,11 +347,11 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "28984292244724b7bb3511a64b131fbccdde71e1d60350b2dd84f35fbce9517d",
+        "src/db.rs": "e3380b51a596c6775ac541bfbf282767f9b279494a1f198b244a01b60a650f25",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "a8447e286fe81b754e324ffaacddb818e6b7d0f27477612a18e7fbcd1a3ac693",
-        "src/lib.rs": "ef1ca35a4a430336420e32c439e03c348f44052fb81a8dc120547bed400aeaad",
-        "src/schema.rs": "70730b88b19ee5de68e54bc7d337a8b822532a07cb2cc7c4eed4197e7474ddce"
+        "src/lib.rs": "25d0b62fa04bc399620b16a92b8615deb0abdbb5b255518326db5b74a9c19de1",
+        "src/schema.rs": "872e889252bafc98f6b5dd4ee4c18cd9aaf5ed5a502db18bd8f1759484764d7a"
       }
     },
     {

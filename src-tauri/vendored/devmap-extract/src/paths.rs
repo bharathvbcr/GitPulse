@@ -309,7 +309,9 @@ mod tests {
         // directory and a consumer will read a different generation than the
         // one the build wrote.
         let root = Path::new("/repo");
-        let dir = resolve_state_dir(root, None, dirs(&[]));
+        // Use the same environment and filesystem as the artifact calls. A
+        // container can have a real /repo with an existing legacy directory.
+        let dir = state_dir(root);
         for path in [
             store_path(root),
             repo_map_path(root),
