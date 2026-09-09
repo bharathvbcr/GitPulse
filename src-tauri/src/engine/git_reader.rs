@@ -1,7 +1,8 @@
 use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, sandbox_join_canonical, validate_repo, Incomplete,
+    self, git, git_text, git_text_capped, sandbox_join, sandbox_join_canonical, sandbox_join_entry,
+    validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::graph::lane_solver::RawCommitNode;
@@ -9,6 +10,7 @@ use crate::graph::RefScope;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -721,13 +723,12 @@ impl GitReader {
         let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
         let count_arg = format!("-n{}", count);
         let skip_arg = format!("--skip={}", skipped);
-        // Canonical join resolves existing prefixes through symlinks and keeps
-        // not-yet-tracked leaves lexical, so a symlinked directory cannot
-        // redirect the walk outside the repository; the literal pathspec stops
-        // glob characters in a real file name from widening it.
+        // History reads Git objects, not today's filesystem. A historical
+        // file may now be a dangling link or live below a replaced directory.
+        // Lexical confinement and a literal pathspec bound the object query.
         let spec = match path {
             Some(file_path) => {
-                sandbox_join_canonical(&repo, file_path)?;
+                sandbox_join(&repo, file_path)?;
                 Some(literal_pathspec(file_path))
             }
             None => None,
@@ -1073,9 +1074,11 @@ impl GitReader {
         ignore_whitespace: bool,
     ) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
-        // Canonical join resolves existing prefixes through symlinks and keeps
-        // not-yet-tracked leaves lexical (see get_file_blame).
-        sandbox_join_canonical(&repo, file_path)?;
+        if is_staged {
+            sandbox_join(&repo, file_path)?;
+        } else {
+            sandbox_join_entry(&repo, file_path)?;
+        }
         if !is_staged {
             // `git diff` emits nothing for untracked paths, which rendered a
             // blank diff pane for brand-new files. Synthesize git-shaped
@@ -1141,7 +1144,7 @@ impl GitReader {
     ) -> Result<DiffPayload, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        sandbox_join_canonical(&repo, file_path)?;
+        sandbox_join(&repo, file_path)?;
         let spec = literal_pathspec(file_path);
         Self::capped_diff(
             &repo,
@@ -1210,7 +1213,7 @@ impl GitReader {
         commit_id: Option<&str>,
     ) -> Result<FileBlob, String> {
         let repo = validate_repo(repo_path)?;
-        let dest = sandbox_join_canonical(&repo, file_path)?;
+        sandbox_join(&repo, file_path)?;
         let bytes = if let Some(id) = commit_id {
             crate::engine::git_writer::validate_oid_or_revision(id)?;
             if id.contains(':') {
@@ -1218,11 +1221,13 @@ impl GitReader {
             }
             let spec = format!("{}:{}", id, file_path);
             git(&repo, &["show", &spec])?
-        } else if dest.exists() {
-            check_working_tree_size(&dest, MAX_WORKING_TREE_BYTES)?;
-            std::fs::read(&dest).map_err(|e| format!("Failed to read from disk: {}", e))?
         } else {
-            git(&repo, &["show", &format!(":{}", file_path)])?
+            let dest = sandbox_join_canonical(&repo, file_path)?;
+            if dest.exists() {
+                read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?
+            } else {
+                git(&repo, &["show", &format!(":{}", file_path)])?
+            }
         };
 
         let lang = LanguageDetector::detect_from_bytes(file_path, &bytes);
@@ -1452,8 +1457,10 @@ impl GitReader {
         )?;
 
         let mut candidates = Vec::new();
-        for rel_path in stdout.split('\0') {
-            let rel_path = LanguageDetector::normalize_rel_path(rel_path);
+        // Git can list one conflicted path in multiple index stages. Preserve
+        // its exact filename bytes for disk access; normalization is only for
+        // language classification, never for opening the file.
+        for rel_path in parse_ls_files_entries(&stdout) {
             if rel_path.is_empty() || LanguageDetector::is_ignored_source_path(&rel_path) {
                 continue;
             }
@@ -1471,44 +1478,33 @@ impl GitReader {
             HashMap::new();
         let mut total_lines = 0usize;
         let mut scanned_files = 0usize;
-        let mut attempted_files = 0usize;
         let mut deadline_hit = false;
+        let mut incomplete = selected_len < candidate_files;
 
         for (rel_path, path_info) in selected {
             if expired() {
                 deadline_hit = true;
                 break;
             }
-            attempted_files += 1;
             // Resolve through symlinks so a tracked file that is really a link
             // pointing outside the repo is refused instead of read.
             let full_path = match git_cli::sandbox_join_canonical(&repo, &rel_path) {
                 Ok(path) => path,
                 Err(_) => {
+                    incomplete = true;
                     record_lang(&mut lang_counts, path_info, 0);
                     continue;
                 }
             };
-            // Stat before reading: a tracked multi-gigabyte file must not be
-            // pulled into memory just to discover it exceeds the budget. The
-            // post-read length check stays as defense against growth between
-            // stat and read.
-            if check_working_tree_size(&full_path, 1_048_576).is_err() {
-                record_lang(&mut lang_counts, path_info, 0);
-                continue;
-            }
-            let bytes = match std::fs::read(&full_path) {
+            let bytes = match read_working_tree_file(&full_path, 1_048_576) {
                 Ok(bytes) => bytes,
                 Err(_) => {
+                    incomplete = true;
                     record_lang(&mut lang_counts, path_info, 0);
                     continue;
                 }
             };
             scanned_files += 1;
-            if bytes.len() > 1_048_576 {
-                record_lang(&mut lang_counts, path_info, 0);
-                continue;
-            }
             if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
                 continue;
             }
@@ -1552,7 +1548,7 @@ impl GitReader {
             stats,
             // Deadline hit, or the 10k prioritization cap dropped candidates,
             // mean the reported numbers cover only part of the worktree.
-            truncated: deadline_hit || attempted_files < selected_len,
+            truncated: deadline_hit || incomplete,
             scanned_files,
             candidate_files,
         })
@@ -2761,13 +2757,25 @@ fn untracked_new_file_diff(repo: &Path, file_path: &str) -> Result<Option<String
         return Ok(None);
     }
 
-    // Same read discipline as get_file_blob's working-tree branch: validate
-    // containment (resolving symlinks), cap on metadata BEFORE reading, then
-    // read whole.
-    let dest = sandbox_join_canonical(repo, file_path)?;
-    check_working_tree_size(&dest, MAX_WORKING_TREE_BYTES)?;
-    let bytes = std::fs::read(&dest).map_err(|e| format!("Failed to read from disk: {}", e))?;
-    Ok(Some(render_new_file_diff(file_path, &bytes)))
+    let entry = sandbox_join_entry(repo, file_path)?;
+    let meta =
+        std::fs::symlink_metadata(&entry).map_err(|e| format!("Cannot inspect file entry: {e}"))?;
+    let is_symlink = meta.file_type().is_symlink();
+    let bytes = if is_symlink {
+        let target = std::fs::read_link(&entry).map_err(|e| format!("Cannot read symlink: {e}"))?;
+        target.as_os_str().as_encoded_bytes().to_vec()
+    } else {
+        let dest = sandbox_join_canonical(repo, file_path)?;
+        read_working_tree_file(&dest, MAX_WORKING_TREE_BYTES)?
+    };
+    if !LanguageDetector::looks_binary(&bytes) && std::str::from_utf8(&bytes).is_err() {
+        return Err("Cannot render a lossless text diff: file content is not valid UTF-8".into());
+    }
+    Ok(Some(if is_symlink {
+        render_new_file_diff_mode(file_path, &bytes, "120000")
+    } else {
+        render_new_file_diff(file_path, &bytes)
+    }))
 }
 
 /// Renders an untracked file as a unified new-file diff in git's output shape.
@@ -2776,13 +2784,19 @@ fn untracked_new_file_diff(repo: &Path, file_path: &str) -> Result<Option<String
 /// ([`LanguageDetector::looks_binary`]) and collapse to git's single-line
 /// binary notice. An empty file keeps a zero-count hunk header and no body.
 fn render_new_file_diff(path: &str, bytes: &[u8]) -> String {
-    let mut out = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n");
+    render_new_file_diff_mode(path, bytes, "100644")
+}
+
+fn render_new_file_diff_mode(path: &str, bytes: &[u8], mode: &str) -> String {
+    let old_path = quote_diff_path(&format!("a/{path}"));
+    let new_path = quote_diff_path(&format!("b/{path}"));
+    let mut out = format!("diff --git {old_path} {new_path}\nnew file mode {mode}\n");
     if LanguageDetector::looks_binary(bytes) {
-        out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
+        out.push_str(&format!("Binary files /dev/null and {new_path} differ\n"));
         return out;
     }
     out.push_str("--- /dev/null\n");
-    out.push_str(&format!("+++ b/{path}\n"));
+    out.push_str(&format!("+++ {new_path}\n"));
     if bytes.is_empty() {
         out.push_str("@@ -0,0 +0,0 @@\n");
         return out;
@@ -2807,6 +2821,33 @@ fn render_new_file_diff(path: &str, bytes: &[u8]) -> String {
         out.push_str("\\ No newline at end of file\n");
     }
     out
+}
+
+/// Git's C-quoted header paths. Raw UTF-8 follows core.quotepath=off;
+/// structural bytes must be escaped or a filename can become patch syntax.
+fn quote_diff_path(path: &str) -> String {
+    if !path
+        .bytes()
+        .any(|b| b < 32 || b == 127 || b == b'"' || b == b'\\')
+    {
+        return path.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    for ch in path.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if (ch as u32) < 32 || ch == '\u{7f}' => {
+                quoted.push_str(&format!("\\{:03o}", ch as u32));
+            }
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn validate_oid(oid: &str) -> Result<(), String> {
@@ -2893,6 +2934,46 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Read a regular file with a hard allocation bound, including if it grows
+/// after stat. Never open a FIFO in blocking mode on Unix, and recheck the
+/// opened handle so replacing a file cannot bypass the metadata check.
+fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot inspect '{}': {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err("Expected a regular working-tree file".into());
+    }
+    check_working_tree_size(path, max_bytes)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("Cannot open file: {e}"))?;
+    if !file
+        .metadata()
+        .map_err(|e| format!("Cannot inspect open file: {e}"))?
+        .is_file()
+    {
+        return Err("Expected a regular working-tree file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed to read from disk: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "file exceeds the {} MB working-tree size limit",
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Pure parser for NUL-separated `ls-files -z` output.

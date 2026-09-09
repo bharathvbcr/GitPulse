@@ -96,6 +96,100 @@ function counting(values: number[] = []) {
 }
 
 describe("metric freshness", () => {
+  it("defers hidden and inactive automatic scans and resumes only the active repository", async () => {
+    const c = fakeClock();
+    const source = counting();
+    const metric = createMetric({ name: "loc", measure: source.measure, debounceMs: 10, minIntervalMs: 50 }, c.clock);
+    const registry = createMetricRegistry();
+    registry.register(metric as never);
+    const scope = { activeKey: REPO, retainedKeys: [REPO, "/repos/other"], visible: false };
+    registry.setScope(scope);
+    metric.subscribe(REPO, () => {});
+    metric.subscribe("/repos/other", () => {});
+    for (let i = 0; i < 1000; i += 1) {
+      metric.invalidate(REPO);
+      metric.invalidate("/repos/other");
+      c.advance(100);
+    }
+    expect(source.calls).toHaveLength(0);
+    expect(c.pendingTimers).toBe(0);
+    registry.setScope({ ...scope, visible: true });
+    c.advance(10);
+    await metric.refresh(REPO);
+    expect(source.calls).toEqual([REPO]);
+    registry.setScope({ ...scope, activeKey: "/repos/other", visible: true });
+    c.advance(10);
+    await metric.refresh("/repos/other");
+    expect(source.calls).toEqual([REPO, "/repos/other"]);
+    registry.dispose();
+    expect(c.pendingTimers).toBe(0);
+  });
+
+  it("bounds a thousand forced rescans to one running scan and one fresh follow-up", async () => {
+    const source = deferredMeasure<number>();
+    const metric = createMetric({ name: "loc", measure: source.measure, debounceMs: 0, minIntervalMs: 0 });
+    const initial = metric.refresh(REPO);
+    const requests = Array.from({ length: 1000 }, () => metric.refresh(REPO, { force: true }));
+    expect(source.calls).toHaveLength(1);
+    await source.settle(1);
+    await initial;
+    expect(source.calls).toHaveLength(2);
+    await source.settle(2);
+    await Promise.all(requests);
+    expect(metric.snapshot(REPO).value).toBe(2);
+    metric.dispose();
+  });
+
+  it("does not restart automatic scans after the last subscriber leaves", async () => {
+    const c = fakeClock();
+    const source = deferredMeasure<number>();
+    const metric = createMetric({ name: "loc", measure: source.measure, debounceMs: 10, minIntervalMs: 50 }, c.clock);
+    const off = metric.subscribe(REPO, () => {});
+    metric.invalidate(REPO);
+    off();
+    await source.settle(1);
+    for (let i = 0; i < 1000; i += 1) {
+      metric.invalidate(REPO);
+      c.advance(100);
+    }
+    expect(source.calls).toHaveLength(1);
+    expect(c.pendingTimers).toBe(0);
+    metric.subscribe(REPO, () => {});
+    c.advance(100);
+    expect(source.calls).toHaveLength(2);
+    await source.settle(2);
+    expect(metric.snapshot(REPO).stale).toBeNull();
+    metric.dispose();
+  });
+
+  it("keeps a measurement stale when a repository change arrived during its scan", async () => {
+    const c = fakeClock();
+    const source = deferredMeasure<number>();
+    const metric = createMetric({ name: "loc", measure: source.measure, debounceMs: 10, minIntervalMs: 50 }, c.clock);
+    metric.subscribe(REPO, () => {});
+    metric.invalidate(REPO);
+    await source.settle(1);
+    expect(metric.snapshot(REPO).stale).toBe("repository-changed");
+    c.advance(50);
+    await source.settle(2);
+    expect(metric.snapshot(REPO).stale).toBeNull();
+    metric.dispose();
+  });
+
+  it("recovers after a measurement throws synchronously before returning a promise", async () => {
+    const measure = vi.fn((): Promise<number> => {
+      if (measure.mock.calls.length === 1) throw new Error("sync failure");
+      return Promise.resolve(42);
+    });
+    const metric = createMetric({ name: "loc", measure, debounceMs: 0, minIntervalMs: 0 });
+    await metric.refresh(REPO);
+    expect(metric.snapshot(REPO).state).toBe("failed");
+    await metric.refresh(REPO);
+    expect(measure).toHaveBeenCalledTimes(2);
+    expect(metric.snapshot(REPO).value).toBe(42);
+    metric.dispose();
+  });
+
   it("measures once for many subscribers and shares the result", async () => {
     const c = fakeClock();
     const source = counting([42]);
@@ -307,14 +401,14 @@ describe("metric freshness", () => {
     );
 
     const stale = metric.refresh(REPO);
-    await metric.refresh(REPO, { force: true });
-    expect(metric.snapshot(REPO).value).toBe(999);
+    const fresh = metric.refresh(REPO, { force: true });
+    expect(call).toBe(1);
 
-    // The first, slower measurement now finishes. It must not overwrite the
-    // newer answer.
+    // Native IPC cannot be cancelled. Drain the superseded scan before the
+    // fresh one starts, and still reject its value rather than publishing it.
     await first.settle(111);
     await stale;
-    await Promise.resolve();
+    await fresh;
     expect(metric.snapshot(REPO).value).toBe(999);
   });
 
@@ -631,9 +725,10 @@ describe("freshness soak", () => {
     };
   }
 
-  it("holds its invariants under 2000 random operations across many repos", async () => {
+  it.each([0x5eed, 1, 7, 42, 0xdeadbeef, 0xc0ffee, 0x12345678, 0xffffffff])(
+    "holds its invariants under 2000 random operations across many repos (seed %i)", async (seed) => {
     const c = fakeClock();
-    const rand = seededRandom(0x5eed);
+    const rand = seededRandom(seed);
     const repos = Array.from({ length: 12 }, (_, i) => `/repos/r${i}`);
     let calls = 0;
     let failNext = false;

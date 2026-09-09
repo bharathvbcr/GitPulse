@@ -359,6 +359,7 @@
       apply: (scope) => {
         liveIndex.setScope(scope);
         setDocsVaultRefreshScope(scope);
+        repoMetrics.setScope(scope);
       },
     }));
 

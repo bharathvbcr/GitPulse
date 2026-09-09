@@ -245,6 +245,29 @@ pub fn sandbox_join_canonical(repo: &Path, file_path: &str) -> Result<PathBuf, S
     Ok(current)
 }
 
+/// Resolve the parent of a Git entry without following the entry itself.
+/// A symlink is a blob of mode 120000 in Git, including dangling links. This
+/// path is only for operations that inspect that entry (Git diff or read_link),
+/// never for reading or writing its target. Parent escapes remain forbidden.
+pub fn sandbox_join_entry(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+    sandbox_join(repo, file_path)?;
+    let rel = Path::new(file_path);
+    if file_path.ends_with('/') || file_path.ends_with("/.") {
+        return Err("Expected a file entry, not a directory traversal".into());
+    }
+    let name = rel.file_name().ok_or("Expected a file entry")?;
+    let parent = rel.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => {
+            sandbox_join_canonical(repo, parent.to_str().ok_or("Invalid file parent")?)?
+        }
+        None => repo
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve repository: {e}"))?,
+    };
+    Ok(parent.join(name))
+}
+
 pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), String> {
     let repo = validate_repo(repo_path)?;
     let dest = sandbox_join_canonical(&repo, file_path)?;

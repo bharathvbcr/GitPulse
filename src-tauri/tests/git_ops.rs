@@ -1148,9 +1148,9 @@ fn test_glob_shaped_paths_match_literally() {
         .all(|l| l.content.contains("literal star") || l.content.contains("edited")));
 }
 
-/// Regression (item 6): reader commands resolve paths through symlinks only
-/// while staying inside the repository; a symlinked directory pointing out is
-/// refused before git ever runs.
+/// Working-tree readers refuse external symlink traversal. History queries
+/// inspect only Git objects; an untracked outside path has no history and
+/// must never cause the external file's contents to be read.
 #[cfg(unix)]
 #[test]
 fn test_reader_read_paths_refuse_symlink_escape() {
@@ -1174,8 +1174,14 @@ fn test_reader_read_paths_refuse_symlink_escape() {
         Some("leak/secret.txt"),
         RefScope::Named
     )
-    .is_err());
+    .expect("Git-only history query")
+    .is_empty());
     assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
+    assert!(GitReader::get_file_content(&path, "leak/secret.txt", None).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "top secret"
+    );
 }
 
 /// Regression (m3c): a failing `git show --numstat` must surface through
