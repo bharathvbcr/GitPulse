@@ -1,7 +1,7 @@
 use super::actions::{self, NativeAction};
 use tauri::menu::{
-    AboutMetadata, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID,
-    WINDOW_SUBMENU_ID,
+    AboutMetadata, CheckMenuItem, IsMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem,
+    Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID,
 };
 use tauri::{AppHandle, Runtime};
 
@@ -39,8 +39,25 @@ fn item<R: Runtime>(
     id: &str,
     title: &str,
     accelerator: Option<&str>,
-) -> tauri::Result<MenuItem<R>> {
-    MenuItem::with_id(app, id, title, true, accelerator)
+) -> tauri::Result<MenuItemKind<R>> {
+    if super::state::checkable(id) {
+        Ok(MenuItemKind::Check(CheckMenuItem::with_id(
+            app,
+            id,
+            title,
+            true,
+            false,
+            accelerator,
+        )?))
+    } else {
+        Ok(MenuItemKind::MenuItem(MenuItem::with_id(
+            app,
+            id,
+            title,
+            true,
+            accelerator,
+        )?))
+    }
 }
 
 fn recent_label(path: &str) -> String {
@@ -55,6 +72,7 @@ fn recent_label(path: &str) -> String {
 pub fn build_native_menu<R: Runtime>(
     app: &AppHandle<R>,
     recents: &[String],
+    state: &super::state::MenuState,
 ) -> tauri::Result<Menu<R>> {
     let pkg = app.package_info();
     let about = AboutMetadata {
@@ -79,7 +97,16 @@ pub fn build_native_menu<R: Runtime>(
             recent_items.push(MenuItem::with_id(
                 app,
                 NativeAction::recent_menu_id(path),
-                recent_label(path),
+                super::state::menu_text(&if recents
+                    .iter()
+                    .filter(|other| recent_label(other) == recent_label(path))
+                    .count()
+                    > 1
+                {
+                    path.clone()
+                } else {
+                    recent_label(path)
+                }),
                 true,
                 None::<&str>,
             )?);
@@ -91,6 +118,41 @@ pub fn build_native_menu<R: Runtime>(
         .collect();
     let open_recent =
         Submenu::with_id_and_items(app, "open-recent-menu", "Open Recent", true, &recent_refs)?;
+
+    open_recent.append(&PredefinedMenuItem::separator(app)?)?;
+    open_recent.append(&item(
+        app,
+        actions::CLEAR_RECENTS,
+        "Clear Recent Repositories",
+        None,
+    )?)?;
+
+    let open_repositories = Submenu::with_id_and_items(
+        app,
+        "open-repositories-menu",
+        "Open Repositories",
+        true,
+        &[],
+    )?;
+    if state.repositories.is_empty() {
+        open_repositories.append(&MenuItem::with_id(
+            app,
+            "repositories:empty",
+            "No Open Repositories",
+            false,
+            None::<&str>,
+        )?)?;
+    }
+    for repo in &state.repositories {
+        open_repositories.append(&CheckMenuItem::with_id(
+            app,
+            format!("{}{}", actions::REPOSITORY_PREFIX, repo.path),
+            super::state::menu_text(&repo.label),
+            true,
+            repo.active,
+            None::<&str>,
+        )?)?;
+    }
 
     let open_item = item(app, actions::OPEN, "Open Repository…", Some("CmdOrCtrl+O"))?;
     let clone_item = item(
@@ -138,6 +200,7 @@ pub fn build_native_menu<R: Runtime>(
         &open_item,
         &clone_item,
         &open_recent,
+        &open_repositories,
         &file_sep_tabs,
         &close_tab_item,
         &reopen_tab_item,
@@ -172,7 +235,7 @@ pub fn build_native_menu<R: Runtime>(
     // The unrolled form silently required the list to be exactly nine long:
     // shortening it by one panics at startup, and lengthening it drops the
     // extra view from the menu with nothing to say so.
-    let view_tab_items: Vec<MenuItem<R>> = VIEW_TAB_BINDINGS
+    let view_tab_items: Vec<MenuItemKind<R>> = VIEW_TAB_BINDINGS
         .iter()
         .map(|(id, title, accel)| item(app, id, title, Some(accel)))
         .collect::<tauri::Result<_>>()?;
@@ -202,6 +265,10 @@ pub fn build_native_menu<R: Runtime>(
     )?;
     let sep_four = PredefinedMenuItem::separator(app)?;
     let fullscreen = PredefinedMenuItem::fullscreen(app, None)?;
+    let zoom_in = item(app, actions::ZOOM_IN, "Zoom In", Some("CmdOrCtrl+="))?;
+    let zoom_out = item(app, actions::ZOOM_OUT, "Zoom Out", Some("CmdOrCtrl+-"))?;
+    let reset_zoom = item(app, actions::RESET_ZOOM, "Actual Size", Some("CmdOrCtrl+0"))?;
+    let zoom_separator = PredefinedMenuItem::separator(app)?;
 
     let mut view_items: Vec<&dyn IsMenuItem<R>> = Vec::new();
     for entry in &view_tab_items {
@@ -229,9 +296,36 @@ pub fn build_native_menu<R: Runtime>(
     view_items.push(&theme_dark);
     view_items.push(&theme_toggle);
     view_items.push(&sep_four);
+    view_items.push(&zoom_in);
+    view_items.push(&zoom_out);
+    view_items.push(&reset_zoom);
+    view_items.push(&zoom_separator);
     view_items.push(&fullscreen);
 
     let view_menu = Submenu::with_items(app, "View", true, &view_items)?;
+
+    // Sections are destinations within the four views, not new top-level
+    // views. Keep the existing view accelerators and per-repository selection.
+    let section_menus: Vec<Submenu<R>> = actions::SECTION_MENUS
+        .iter()
+        .map(|group| {
+            let entries: Vec<MenuItemKind<R>> = group
+                .entries
+                .iter()
+                .map(|(id, title)| item(app, id, title, None))
+                .collect::<tauri::Result<_>>()?;
+            let refs: Vec<&dyn IsMenuItem<R>> = entries
+                .iter()
+                .map(|entry| entry as &dyn IsMenuItem<R>)
+                .collect();
+            Submenu::with_items(app, group.title, true, &refs)
+        })
+        .collect::<tauri::Result<_>>()?;
+    let section_refs: Vec<&dyn IsMenuItem<R>> = section_menus
+        .iter()
+        .map(|entry| entry as &dyn IsMenuItem<R>)
+        .collect();
+    let go_menu = Submenu::with_items(app, "Go", true, &section_refs)?;
 
     let repo_menu = Submenu::with_items(
         app,
@@ -245,8 +339,31 @@ pub fn build_native_menu<R: Runtime>(
             &item(app, actions::STASH, "Stash Working Tree", None)?,
             &item(app, actions::STASH_POP, "Pop Stash", None)?,
             &PredefinedMenuItem::separator(app)?,
+            &item(app, actions::STAGE_ALL, "Stage All", None)?,
+            &item(app, actions::UNSTAGE_ALL, "Unstage All", None)?,
             &item(app, actions::QUICK_COMMIT, "Quick Commit…", None)?,
             &item(app, actions::REBASE, "Interactive Rebase…", None)?,
+            &item(app, actions::CREATE_BRANCH, "Create Branch…", None)?,
+            &item(app, actions::RENAME_BRANCH, "Rename Current Branch…", None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &item(app, actions::OPERATION_CONTINUE, "Continue Operation", None)?,
+            &item(app, actions::OPERATION_ABORT, "Abort Operation…", None)?,
+            &item(app, actions::OPERATION_SKIP, "Skip Operation…", None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &item(app, actions::COPY_REPO_PATH, "Copy Repository Path", None)?,
+            &item(app, actions::COPY_BRANCH, "Copy Branch Name", None)?,
+            &item(app, actions::COPY_COMMIT, "Copy HEAD SHA", None)?,
+            &item(
+                app,
+                actions::REVEAL_REPO,
+                if cfg!(target_os = "macos") {
+                    "Reveal Repository in Finder"
+                } else {
+                    "Reveal Repository in File Manager"
+                },
+                None,
+            )?,
+            &item(app, actions::OPEN_REMOTE, "Open Remote Website", None)?,
         ],
     )?;
 
@@ -271,6 +388,21 @@ pub fn build_native_menu<R: Runtime>(
         &[
             #[cfg(not(target_os = "macos"))]
             &PredefinedMenuItem::about(app, None, Some(about.clone()))?,
+            &item(app, actions::DOCUMENTATION, "GitPulse Help", None)?,
+            &item(
+                app,
+                actions::SHORTCUTS,
+                "Keyboard Shortcuts…",
+                Some("CmdOrCtrl+/"),
+            )?,
+            &PredefinedMenuItem::separator(app)?,
+            &item(app, actions::DIAGNOSTICS, "Diagnostics…", None)?,
+            &item(app, actions::SETUP_TOOLS, "Set Up Optional Tools…", None)?,
+            &PredefinedMenuItem::separator(app)?,
+            #[cfg(not(target_os = "macos"))]
+            &item(app, actions::CHECK_UPDATES, "Check for Updates…", None)?,
+            &item(app, actions::RELEASE_NOTES, "Release Notes", None)?,
+            &item(app, actions::REPORT_ISSUE, "Report an Issue…", None)?,
         ],
     )?;
 
@@ -283,6 +415,7 @@ pub fn build_native_menu<R: Runtime>(
             &PredefinedMenuItem::about(app, None, Some(about))?,
             &PredefinedMenuItem::separator(app)?,
             &item(app, actions::SETTINGS, "Settings…", Some(SETTINGS_ACCEL))?,
+            &item(app, actions::CHECK_UPDATES, "Check for Updates…", None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::services(app, None)?,
             &PredefinedMenuItem::separator(app)?,
@@ -302,6 +435,7 @@ pub fn build_native_menu<R: Runtime>(
             &file_menu,
             &edit_menu,
             &view_menu,
+            &go_menu,
             &repo_menu,
             &window_menu,
             &help_menu,
@@ -315,13 +449,63 @@ pub fn build_native_menu<R: Runtime>(
             &file_menu,
             &edit_menu,
             &view_menu,
+            &go_menu,
             &repo_menu,
             &window_menu,
             &help_menu,
         ],
     )?;
 
+    apply_presentation(&menu, state)?;
     Ok(menu)
+}
+
+/// Updates in place so a status refresh does not replace an open native menu.
+pub fn apply_presentation<R: Runtime>(
+    menu: &Menu<R>,
+    state: &super::state::MenuState,
+) -> tauri::Result<()> {
+    fn visit<R: Runtime>(
+        items: Vec<MenuItemKind<R>>,
+        state: &super::state::MenuState,
+    ) -> tauri::Result<()> {
+        for entry in items {
+            let id = entry.id().as_ref();
+            let dynamic = id.starts_with(actions::RECENT_PREFIX)
+                || id.starts_with(actions::REPOSITORY_PREFIX);
+            let label = state.labels.iter().find(|label| label.id == id);
+            match &entry {
+                MenuItemKind::Submenu(sub) => visit(sub.items()?, state)?,
+                MenuItemKind::MenuItem(item) if !dynamic && NativeAction::parse(id).is_some() => {
+                    item.set_enabled(state.enabled(id))?;
+                    if let Some(label) = label {
+                        item.set_text(super::state::menu_text(&label.text))?;
+                    }
+                }
+                MenuItemKind::Check(item) if id.starts_with(actions::REPOSITORY_PREFIX) => {
+                    let path = id
+                        .strip_prefix(actions::REPOSITORY_PREFIX)
+                        .unwrap_or_default();
+                    item.set_checked(
+                        state
+                            .repositories
+                            .iter()
+                            .any(|repo| repo.path == path && repo.active),
+                    )?;
+                }
+                MenuItemKind::Check(item) if !dynamic => {
+                    item.set_enabled(state.enabled(id))?;
+                    item.set_checked(state.checked.iter().any(|checked| checked == id))?;
+                    if let Some(label) = label {
+                        item.set_text(super::state::menu_text(&label.text))?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    visit(menu.items()?, state)
 }
 
 #[cfg(test)]

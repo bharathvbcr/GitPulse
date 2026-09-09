@@ -29,6 +29,11 @@
     syncRecentMenu,
     takePendingOpen,
   } from "./lib/desktop/nativeShell";
+  import { gitActionCount, waitForGitIdle } from "./lib/desktop/exitGuard";
+  import { nativeMenuState } from "./lib/desktop/menuStateStore";
+  import { canDispatchMenuEvent } from "./lib/desktop/menuState";
+  import { createMenuSync } from "./lib/desktop/menuSync";
+  import { createMenuCommands, checkUpdatesFromMenu } from "./lib/desktop/menuCommands";
   import { repoWindowTitle, syncWindowChrome } from "./lib/desktop/windowChrome";
   import Logo from "./lib/components/Logo.svelte";
   import ScrollCue from "./lib/components/ScrollCue.svelte";
@@ -106,7 +111,6 @@
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
   import PromptModal from "./lib/components/PromptModal.svelte";
-  import { promptQuickCommit } from "./lib/commit/quickCommit";
   import {
     RefreshCw,
     FolderOpen,
@@ -128,6 +132,7 @@
     maybeNotifyUpdate,
   } from "./lib/updates/updateCheck";
   import { openExternal } from "./lib/desktop/openExternal";
+  import { shouldSkipWebviewShortcut } from "./lib/ui/webviewShortcuts";
   import { applyUiScale, nativeZoomSetter } from "./lib/ui/uiScale";
   import { applyAccent } from "./lib/ui/accents";
   import { applyTabWidth } from "./lib/ui/codeDisplay";
@@ -291,6 +296,15 @@
   async function answerNativeExitRequest() {
     if (exitRequestPending) return;
     exitRequestPending = true;
+    const gitActions = gitActionCount(get(repoStore.mutationActivity));
+    if (gitActions > 0) {
+      const wait = await askConfirm({ title: "Finish Git Actions Before Quit?",
+        message: `${gitActions} Git action${gitActions === 1 ? " is" : "s are"} still running. Wait for them before quitting.`,
+        confirmLabel: "Wait and Quit", cancelLabel: "Keep Working" });
+      if (!wait) { exitRequestPending = false; return; }
+      try { await waitForGitIdle(repoStore.mutationActivity); }
+      catch (error) { toastStore.error(formatError(error)); exitRequestPending = false; return; }
+    }
 
     if (editorFileSaveQueue.pending > 0) {
       const pending = editorFileSaveQueue.pending;
@@ -329,6 +343,11 @@
       }
     }
 
+    if (gitActionCount(get(repoStore.mutationActivity)) > 0) {
+      toastStore.info("A Git action started while confirming quit. Try again when it finishes.");
+      exitRequestPending = false;
+      return;
+    }
     conflictSessions.flush();
     exitApproved = true;
     try {
@@ -412,6 +431,7 @@
     void refreshToolConfig();
 
     const handleGlobalKeydown = (e: KeyboardEvent) => {
+      if (shouldSkipWebviewShortcut(e, isTauri())) return;
       const isInput =
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement ||
@@ -494,7 +514,32 @@
       (error) => diagnostics.warn("boot:window-state", error),
     );
 
+    const openHelpPage = (path: string) => {
+      void openExternal(`https://github.com/bharathvbcr/GitPulse/${path}`).catch((error) => {
+        toastStore.error(`Could not open help: ${formatError(error)}`);
+      });
+    };
+
+    if (isTauri()) {
+      let notified = false;
+      const sync = createMenuSync(
+        (state) => invoke<void>("cmd_set_menu_state", { presentation: state }),
+        (error) => {
+          diagnostics.error("desktop:menu-state", error);
+          if (!notified) {
+            notified = true;
+            toastStore.error(`Native menu update failed: ${formatError(error)}`);
+          }
+        },
+      );
+      track(nativeMenuState.subscribe((state) => sync.update(state)));
+      track(() => sync.dispose());
+    }
+
     const shellHandlers: NativeShellHandlers = {
+      ...createMenuCommands(),
+      checkUpdates: () => void checkUpdatesFromMenu(),
+      canDispatch: (event) => !exitRequestPending && canDispatchMenuEvent(event, get(nativeMenuState), get(repoStore)),
       open: () => void repoStore.pickAndOpenRepo(),
       clone: () => {
         isCloneModalOpen = true;
@@ -507,37 +552,28 @@
       themeSystem: () => themeStore.setPreference("system"),
       themeLight: () => themeStore.setTheme("light"),
       themeDark: () => themeStore.setTheme("dark"),
-      setTab: (tab) => repoStore.setActiveTab(tab),
+      setTab: (tab, section) => {
+        if (!$repoStore.currentPath) {
+          toastStore.info("Open a repository to navigate its views.");
+          return;
+        }
+        interfaceStore.setFleetOpen(false);
+        repoStore.setActiveTab(tab, section);
+      },
+      shortcuts: openShortcuts,
+      diagnostics: openDiagnostics,
+      documentation: () => openHelpPage("blob/main/docs/FEATURES.md"),
+      releaseNotes: () => openHelpPage("releases"),
+      reportIssue: () => openHelpPage("issues/new/choose"),
+      setupTools: openToolsSetup,
+      zoomIn: () => interfaceStore.zoomIn(),
+      zoomOut: () => interfaceStore.zoomOut(),
+      resetZoom: () => interfaceStore.resetZoom(),
       fleet: () => interfaceStore.setFleetOpen(true),
       terminalDock: () => interfaceStore.toggleTerminalDock(),
-      fetch: () => {
-        repoStore.fetch().then(() => toastStore.info("Fetched remote updates"));
-      },
-      pull: () => {
-        repoStore.pull().then(() => toastStore.success("Pulled changes from remote"));
-      },
-      push: () => {
-        repoStore.push().then(() => toastStore.success("Pushed commits to remote"));
-      },
-      stash: () => {
-        repoStore.stashSave().then(() => {
-          toastStore.action("Stashed uncommitted changes", "Pop", () => {
-            void repoStore.stashPop().then((outcome) => {
-              if (!outcome.ok) toastStore.error(outcome.error ?? "Pop failed");
-            });
-          });
-        });
-      },
-      stashPop: () => {
-        repoStore.stashPop().then((outcome) => {
-          if (outcome.ok) toastStore.success("Popped latest stash");
-          else toastStore.error(outcome.error ?? "Pop failed");
-        });
-      },
       rebase: () => {
         isRebaseModalOpen = true;
       },
-      quickCommit: () => void promptQuickCommit(),
       palette: () => openCommandPalette(),
       focusFilter: () => void focusCommitSearch(),
       openRecent: (path) => void openFromExternal(path),
@@ -561,7 +597,7 @@
         takePendingOpen,
         restoreWorkspace: () => repoStore.restoreWorkspace(),
         openRepo: openFromExternal,
-        syncRecentMenu,
+        syncRecentMenu: () => syncRecentMenu([...get(repoStore).recentRepos]),
         handleRepoChanged: (path) => {
           void repoStore.handleRepoChanged(path);
           // The same event drives the metric panels. Each metric applies its

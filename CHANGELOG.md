@@ -11,6 +11,31 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Expand the native application menu with Go submenus for all 15 view sections,
+  zoom controls, and Help entries for documentation, shortcuts, diagnostics,
+  optional-tool setup, release notes and issue reporting. Section navigation
+  reveals the repository pane from Fleet. Repository commands disable when unavailable.
+- Add live menu checkmarks and progress labels, an open-repository switcher,
+  clear-recents, staging and branch actions, parked-operation controls,
+  copy/reveal/remote utilities and manual update checks.
+- Add an optional icon-only macOS status item opening a compact light/dark
+  popover: repository switching, changed/staged/conflict cards, last-fetch sync
+  counts, expandable details and contextual review/recovery actions. Refresh
+  stays in the panel. Open GitPulse restores the main window; closing the main
+  window while enabled preserves its session. Right-click retains native app
+  controls, and Quit preserves draft and running-work checks.
+
+### Fixed
+
+- Keep bulk staging and Quick Commit attached to their original repository
+  across tab changes and dialogs. Track interactive rebase through the same
+  guarded mutation owner and reject stale plans.
+- Preserve the latest native menu update through transient bridge failures.
+- Keep native menu shortcuts from also executing in the webview. Match the
+  platform's Command/Control binding so alternate webview shortcuts still work.
+
 ## [0.0.9] - 2026-09-08
 
 ### Changed

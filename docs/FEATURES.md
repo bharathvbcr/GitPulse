@@ -4,6 +4,18 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 
 On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
+The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
+and Help**. **Go** opens all 15 sections directly. **View** includes Zoom In,
+Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
+diagnostics, optional-tool setup, release notes and issue reporting. Commands
+reflect repository availability and running work; checkmarks follow selection
+and appearance. Repository menus include staging, branches, parked-operation
+actions and copy/reveal/remote utilities. Enable the compact pulse icon in
+**Settings → Layout → Menu bar status icon** for a compact popover with repository switching,
+changed/staged/conflict cards, last-fetch sync counts, expandable details and
+contextual review/recovery actions. Refresh stays in the panel; Open GitPulse
+restores the main window. See the [menu inventory](MACOS_MENUS.md).
+
 ```mermaid
 flowchart TD
     subgraph ViewGroup["The four views"]
@@ -15,7 +27,7 @@ flowchart TD
 
     subgraph NotViews["Not views — available under every view"]
         Terminal["<b>Terminal dock</b> (<code>⌃`</code>)<br/>Embedded PTY beneath the active view"]
-        Fleet["<b>Fleet</b> (<code>⇧F10</code>)<br/>Every open and recent repository at once"]
+        Fleet["<b>Fleet</b> (<code>⌘⇧F</code>)<br/>Every open and recent repository at once"]
     end
 ```
 
@@ -269,7 +281,7 @@ Health remediation plan, a failing test, the diff you are about to commit.
 - **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
 - **Settings**: copies `.codex-plugin/plugin.json` / `.mcp.json` and names the binary path, or why it could not be found.
 
-### 5.3 Fleet — the whole workspace at once (`Shift+F10`)
+### 5.3 Fleet — the whole workspace at once (`⌘⇧F`)
 
 Fleet is not a view. Every view in the catalog above answers a question about
 *one* repository, is persisted on that repository's session, and lives inside
@@ -409,13 +421,14 @@ GitPulse provides comprehensive keyboard navigation accelerators across the enti
 | **Code** | `⌘ 1` | `Ctrl+1` |
 | **History** | `⌘ 2` | `Ctrl+2` |
 | **Insights** | `⌘ 3` | `Ctrl+3` |
-| **Fleet** | `⇧ F10` | `Shift+F10` |
+| **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Code's Explorer / Blame / Map, History's Graph / Diff /
 Reflog, Insights' Pulse / Coverage / Health / Storage — are switched by that
 view's segmented control (`⌥` + section digit while the view is active),
-or by name from the command palette.
+or by name from the command palette. **Go → view → section** also opens every
+section directly, including all five Work sections.
 
 ### 6.3 Inside Fleet
 

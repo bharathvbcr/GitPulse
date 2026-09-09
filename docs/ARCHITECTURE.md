@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (187 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (193 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core + Control-Plane Subsystems"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -84,6 +84,28 @@ Every view is registered in [`src/lib/views/viewRegistry.ts`](file:///Users/bhar
 1. Adding the identifier to the `ViewTab` union in `persist.ts`.
 2. Adding its metadata to `VIEW_REGISTRY` in `viewRegistry.ts`.
 3. Adding the render branch in `App.svelte`.
+
+The native menu is built in `src-tauri/src/desktop/menu.rs` during Tauri startup.
+`actions.rs` parses IDs, `desktop/mod.rs` emits `gitpulse-menu`, and
+`nativeActions.ts` dispatches to App's handlers. Section navigation uses a
+native projection of `viewRegistry.ts`, with a bidirectional ID/label contract
+test. It calls `setActiveTab(view, section)` and reveals the repository pane
+when Fleet is open. App and RepoTabBar share platform-aware native shortcut
+ownership in `webviewShortcuts.ts`. `menuStateStore.ts` derives availability,
+checks, labels and optional status-icon contents from the existing stores.
+`menuSync.ts` serializes and coalesces updates to `cmd_set_menu_state`; Rust
+validates the payload and updates menu/tray objects on the GUI thread. Events
+capture repository identity and `menuCommands.ts` revalidates context after
+prompts. Git work remains in the guarded `repoStore` mutation owner, which also
+publishes activity for menu state and bounded quit waits. With the icon enabled,
+window close hides the main window; icon removal reveals it before removing the
+escape path. `popover.rs` owns a separate, lazily created status window anchored
+under the tray icon. Its `status.html` / `StatusApp.svelte` entry receives validated
+presentation snapshots and routes a limited set of actions to the existing main
+webview. It creates no repository store or polling loop. The status capability
+grants only event listen/unlisten; its snapshot/action/resize commands validate
+the calling window and action context. `StatusPopover.svelte` renders compact
+metric cards and expandable details. See [macOS menus](MACOS_MENUS.md).
 
 ### The one workspace-scoped surface
 
@@ -150,7 +172,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +187 Registered Handlers
+        +193 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -291,8 +313,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `npm run check:ipc` | Verifies all 187 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 881 data fields, in 50 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `npm run check:ipc` | Verifies all 193 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `npm run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 910 data fields, in 51 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `npm run check:release` | Validates that `package.json`, `package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `npm run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts the version it reports is this tree's. Reports *absent*, *unresponsive*, and *stale* as distinct failures. |
 

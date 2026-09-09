@@ -14,6 +14,7 @@ export const QUICK_COMMIT_BLANK_MESSAGE = "Commit message must not be empty.";
 
 export interface QuickCommitState {
   currentPath: string | null;
+  generation?: number;
   currentBranch: string | null;
   statuses: Pick<FileStatus, "is_conflicted">[];
   commitDraft: string;
@@ -85,8 +86,18 @@ export async function promptQuickCommit(
     deps.setError(QUICK_COMMIT_BLANK_MESSAGE);
     return { ok: false, error: QUICK_COMMIT_BLANK_MESSAGE };
   }
+  const latest = deps.getState();
+  if (latest.currentPath !== state.currentPath || latest.currentBranch !== state.currentBranch || latest.generation !== state.generation) {
+    const error = "Repository changed while the commit dialog was open. Run Quick Commit again.";
+    deps.setError(error);
+    return { ok: false, error };
+  }
+  if (latest.statuses.some((file) => file.is_conflicted)) {
+    deps.setError(QUICK_COMMIT_CONFLICTS);
+    return { ok: false, error: QUICK_COMMIT_CONFLICTS };
+  }
   const outcome = await deps.commitAll(message);
-  if (outcome.ok) {
+  if (outcome.ok && deps.getState().currentPath === state.currentPath && deps.getState().generation === state.generation) {
     deps.setDraft("");
     deps.setAmending(false);
   }

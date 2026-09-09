@@ -29,3 +29,8 @@ export async function openInDefaultApp(repo: string, relative: string): Promise<
 export async function revealInFileManager(repo: string, relative: string): Promise<void> {
   await invoke("cmd_reveal_worktree_path", { repo, relative });
 }
+
+/** Reveals the canonical Git root; file paths retain their stricter containment API. */
+export async function revealRepository(repo: string): Promise<void> {
+  await invoke("cmd_reveal_repository", { repo });
+}

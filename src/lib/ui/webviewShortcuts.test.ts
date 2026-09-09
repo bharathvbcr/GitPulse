@@ -63,9 +63,24 @@ describe("classifyShortcut", () => {
 });
 
 describe("shouldSkipWebviewShortcut", () => {
+  it("lets the native menu own its new zoom and shortcuts chords exactly once", () => {
+    for (const value of ["=", "-", "0", "/"]) {
+      for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+        const event = key({ key: value, ...modifier });
+        expect(shouldSkipWebviewShortcut(event, true, "metaKey" in modifier)).toBe(true);
+        expect(shouldSkipWebviewShortcut(event, true, !("metaKey" in modifier))).toBe(false);
+        expect(shouldSkipWebviewShortcut(event, false)).toBe(false);
+        expect(shouldSkipWebviewShortcut({ ...event, altKey: true }, true, "metaKey" in modifier)).toBe(false);
+        expect(shouldSkipWebviewShortcut({ ...event, shiftKey: true }, true, "metaKey" in modifier)).toBe(false);
+      }
+    }
+    // Shift+= is an existing webview alias; the menu binds the unshifted key.
+    expect(shouldSkipWebviewShortcut(key({ key: "+", metaKey: true, shiftKey: true }), true)).toBe(false);
+    expect(shouldSkipWebviewShortcut(key({ key: "?", shiftKey: true }), true)).toBe(false);
+  });
   it("stands down for native-owned chords under Tauri (double-fire guard)", () => {
     expect(
-      shouldSkipWebviewShortcut(key({ key: "w", metaKey: true, shiftKey: true }), true),
+      shouldSkipWebviewShortcut(key({ key: "w", metaKey: true, shiftKey: true }), true, true),
     ).toBe(true);
     expect(
       shouldSkipWebviewShortcut(key({ key: "Tab", code: "Tab", ctrlKey: true }), true),
@@ -88,6 +103,12 @@ describe("shouldSkipWebviewShortcut", () => {
     expect(shouldSkipWebviewShortcut(key({ key: "t", metaKey: true }), true)).toBe(
       false,
     );
+  });
+
+  it("does not swallow a webview alias the native menu cannot receive", () => {
+    expect(shouldSkipWebviewShortcut(key({ key: "w", ctrlKey: true, shiftKey: true }), true, true)).toBe(false);
+    expect(shouldSkipWebviewShortcut(key({ key: "w", metaKey: true, shiftKey: true }), true, false)).toBe(false);
+    expect(shouldSkipWebviewShortcut(key({ key: "w", metaKey: true, shiftKey: true, altKey: true }), true, true)).toBe(false);
   });
 
   it("never skips in plain browser builds", () => {

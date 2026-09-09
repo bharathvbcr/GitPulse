@@ -2359,6 +2359,12 @@ pub async fn cmd_ai_coverage_report(
         .await
 }
 
+/// Fresh HEAD identity for menu copy actions, including detached HEAD.
+#[tauri::command(async)]
+pub async fn cmd_get_head_id(repo_path: String) -> Result<String, String> {
+    off_thread(move || GitReader::head_id(&repo_path)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

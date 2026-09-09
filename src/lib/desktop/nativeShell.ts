@@ -19,11 +19,7 @@ export async function takePendingOpen(): Promise<string | null> {
 
 export async function syncRecentMenu(paths: string[]): Promise<void> {
   if (!isTauri()) return;
-  try {
-    await invoke("cmd_set_recent_menu", { paths });
-  } catch {
-    /* menu rebuild is best-effort outside a packaged window */
-  }
+  await invoke("cmd_set_recent_menu", { paths });
 }
 
 export async function resolveGitRoot(path: string): Promise<string> {

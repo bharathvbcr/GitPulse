@@ -30,6 +30,8 @@ export interface SettingEntry {
 }
 
 export const SETTINGS_CATALOG: readonly SettingEntry[] = [
+  { id: "status-icon", section: "layout", label: "Menu bar status icon",
+    keywords: "tray background close hide window repository conflicts menu bar" },
   {
     id: "theme",
     section: "appearance",

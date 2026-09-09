@@ -21,6 +21,53 @@ fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
         .expect("mock app builds")
 }
 
+#[test]
+fn added_menu_commands_emit_the_exact_frontend_payload_once() {
+    use std::sync::{Arc, Mutex};
+    use tauri::Listener;
+
+    let app = mock_app();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let listener_received = Arc::clone(&received);
+    let listener = app.listen(gitpulse_lib::desktop::MENU_EVENT, move |event| {
+        let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+        listener_received.lock().unwrap().push(payload);
+    });
+    let ids = [
+        "shortcuts",
+        "diagnostics",
+        "documentation",
+        "release-notes",
+        "report-issue",
+        "setup-tools",
+        "zoom-in",
+        "zoom-out",
+        "check-updates",
+    ];
+    for id in ids {
+        handle_menu_event(app.handle(), id);
+    }
+    for id in [
+        "section:work:diff",
+        "section:history:diff:extra",
+        "section:",
+        "unknown",
+        "reset-zoom",
+        "section:history:diff",
+        "stage-all",
+        "activate-repo:/not-open",
+        "open-recent:/not-recent",
+    ] {
+        handle_menu_event(app.handle(), id);
+    }
+    let expected: Vec<_> = ids
+        .iter()
+        .map(|id| serde_json::json!({"id": id, "path": null, "repo_path": null}))
+        .collect();
+    assert_eq!(*received.lock().unwrap(), expected);
+    app.unlisten(listener);
+}
+
 fn init_repo(dir: &Path) {
     for args in [
         vec!["init", "-b", "main"],
@@ -39,7 +86,7 @@ fn init_repo(dir: &Path) {
 // `install_menu` is not exercised here: muda creates menu items on the main
 // thread only, and Rust test harnesses run cases on worker threads, so calling
 // it panics inside the platform layer rather than telling us anything about
-// this code. It stays covered by running the application.
+// this code. The separate native_menu_main_thread target exercises it.
 
 #[test]
 fn an_unrecognised_menu_id_is_ignored_rather_than_panicking() {

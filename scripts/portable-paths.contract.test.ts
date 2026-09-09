@@ -47,22 +47,36 @@ const FILES = ROOTS.flatMap((root) => sourceFiles(join(REPO_ROOT, root)));
  * that lands here later.
  */
 function code(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // Preserve quoted URLs: the third slash in file:/// is not a comment.
+  return text.replace(
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+    (_match: string, quoted: string | undefined) => quoted ?? " ",
+  );
 }
 
 /**
  * True when `source` treats a file URL's pathname property as a filesystem
  * path. Regex literals that mention `\.pathname` (this file) do not count:
- * the tell is an unescaped `.pathname` property read.
+ * the tell is an unescaped property read.
  */
 export function usesFileUrlPathname(source: string): boolean {
   const body = code(source);
+  // Browser URLs legitimately use pathname (e.g. a Git remote website).
+  // Keep this filesystem rule scoped to file-URL bases or filesystem code.
+  const filesystemContext = /\bimport\.meta\.url\b|["']file:|["'](?:node:)?(?:fs|path)(?:\/promises)?["']/.test(body);
+  if (!filesystemContext) return false;
   if (/new URL\([^\n]*?\)\s*\.pathname/.test(body)) return true;
   if (!/\bimport\.meta\.url\b/.test(body) && !/new URL\s*\(/.test(body)) return false;
   return /(?<!\\)\.pathname\b/.test(body);
 }
 
 describe("filesystem paths are derived portably", () => {
+  it("permits browser URL paths while still catching explicit file URL paths", () => {
+    const prop = "pathname";
+    expect(usesFileUrlPathname(`const url = new URL(input); url.${prop} = "/repo";`)).toBe(false);
+    expect(usesFileUrlPathname(`const url = new URL("file:///tmp"); read(url.${prop});`)).toBe(true);
+    expect(usesFileUrlPathname(`import { readFile } from "node:fs/promises"; const url = new URL(input); readFile(url.${prop});`)).toBe(true);
+  });
   it("scans a real tree, so a passing run is not a vacuous one", () => {
     expect(FILES.length).toBeGreaterThan(100);
   });

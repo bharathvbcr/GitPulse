@@ -1,6 +1,7 @@
+import { isMacOS } from "../platform";
+
 /**
- * Classification of the RepoTabBar webview shortcuts, shared by the handler
- * in RepoTabBar.svelte and its unit tests.
+ * Native shortcut ownership shared by App and RepoTabBar.
  *
  * Under Tauri the native application menu registers accelerators for a
  * subset of these (see src-tauri/src/desktop/menu.rs):
@@ -17,6 +18,8 @@ export type ShortcutFamily =
   | "closeActiveTab"
   | "jumpToTab"
   | "cycleTabs"
+  | "zoom"
+  | "shortcuts"
   | "openRepo";
 
 export interface ShortcutKeyState {
@@ -32,10 +35,18 @@ export interface ShortcutKeyState {
 const NATIVE_OWNED_FAMILIES: ReadonlySet<ShortcutFamily> = new Set([
   "closeActiveTab",
   "cycleTabs",
+  "zoom",
+  "shortcuts",
 ]);
 
 export function classifyShortcut(e: ShortcutKeyState): ShortcutFamily | null {
   const meta = e.metaKey || e.ctrlKey;
+  // Only the exact native accelerators stand down. Shift+= remains a
+  // webview alias for zoom in, and plain '?' still opens the shortcuts sheet.
+  if (meta && !e.altKey && !e.shiftKey) {
+    if (e.key === "=" || e.key === "-" || e.key === "0") return "zoom";
+    if (e.key === "/") return "shortcuts";
+  }
   if (meta && e.shiftKey && e.key.toLowerCase() === "w") {
     return "closeActiveTab";
   }
@@ -58,8 +69,16 @@ export function classifyShortcut(e: ShortcutKeyState): ShortcutFamily | null {
 export function shouldSkipWebviewShortcut(
   event: ShortcutKeyState,
   tauri: boolean,
+  macOS = isMacOS(),
 ): boolean {
   if (!tauri) return false;
   const family = classifyShortcut(event);
-  return family !== null && NATIVE_OWNED_FAMILIES.has(family);
+  if (family === null || !NATIVE_OWNED_FAMILIES.has(family)) return false;
+  // Ctrl+Tab is Control everywhere. CmdOrCtrl resolves to Command on macOS
+  // and Control elsewhere; the other modifier remains a webview alias.
+  if (family === "cycleTabs") return true;
+  const nativeModifier = macOS
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+  return nativeModifier && !event.altKey;
 }

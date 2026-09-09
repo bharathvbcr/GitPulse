@@ -2,8 +2,6 @@
   import { repoStore } from "../stores/repoStore";
   import { guardedDismiss } from "./modalGuard";
   import { graphStore } from "../stores/graphStore";
-  import { filterStore } from "../stores/filterStore";
-  import { invoke } from "@tauri-apps/api/core";
   import { fade, scale } from "svelte/transition";
   import {
     backdropFade,
@@ -11,7 +9,7 @@
     cardScale,
     cardScaleOut,
   } from "../ui/transitions";
-  import { seedRebasePlan, shouldReseed } from "../rebase/planner";
+  import { seedRebasePlan, shouldReseed, type RebaseStep } from "../rebase/planner";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
   import { reportPanelError } from "../diagnostics/report";
@@ -36,12 +34,9 @@
   let isExecuting = $state(false);
   let errorMsg = $state<string | null>(null);
 
-  type RebaseActionPayload =
-    | "Pick"
-    | "Squash"
-    | "Fixup"
-    | "Drop"
-    | { Reword: string };
+  let planRepoPath = $state<string | null>(null);
+  let planGeneration = $state(0);
+  const planCurrent = $derived(planRepoPath === $repoStore.currentPath && planGeneration === $repoStore.generation);
 
   let wasOpen = false;
   let planDirty = $state(false);
@@ -56,7 +51,9 @@
     const current = planSignature($graphStore.commits);
     // Rebuild the plan only when it cannot destroy user work: on opening, or
     // while pristine and the underlying history actually moved.
-    if (shouldReseed({ isOpen, wasOpen, dirty: planDirty, currentSignature: current, seededSignature })) {
+    if ((!wasOpen || planCurrent) && shouldReseed({ isOpen, wasOpen, dirty: planDirty, currentSignature: current, seededSignature })) {
+      planRepoPath = $repoStore.currentPath;
+      planGeneration = $repoStore.generation;
       errorMsg = null;
       ontoBranch = $repoStore.defaultBranch || "main";
       items = seedRebasePlan($graphStore.commits);
@@ -71,13 +68,13 @@
     // redirect the completion effects ($repoStore.currentPath re-read after
     // the awaits would target whatever tab is now active).
     const repoPath = $repoStore.currentPath;
-    if (!repoPath || items.length === 0) return;
+    if (!repoPath || items.length === 0 || isExecuting || !planCurrent) return;
     isExecuting = true;
     errorMsg = null;
 
     try {
       const steps = items.map((it) => {
-        const action: RebaseActionPayload =
+        const action: RebaseStep["action"] =
           it.action === "Reword" ? { Reword: it.summary } : it.action;
         return {
           commit_id: it.id,
@@ -85,20 +82,11 @@
         };
       });
 
-      await invoke("cmd_rebase_interactive", {
-        repoPath,
-        ontoCommit: ontoBranch,
-        steps,
-      });
-
-      // Both effects are scoped to the captured path, so they land on the
-      // rebased repo's session even if the active tab moved mid-run.
-      await repoStore.refresh(repoPath);
-      // The bare loadGraph(repoPath) form reset the view to query=""/HEAD
-      // while FilterBar still showed the selected filter, and the scheduler
-      // memo then blocked the correction. Reload with the visible context;
-      // the backend applies every query term.
-      await graphStore.loadGraph(repoPath, $filterStore.searchQuery, $filterStore.selectedBranch);
+      const result = await repoStore.rebaseInteractive(ontoBranch, steps);
+      if (!result.ok) {
+        errorMsg = result.error ?? "The rebase did not complete.";
+        return;
+      }
       onClose?.();
     } catch (err: unknown) {
       errorMsg = reportPanelError("rebase", err);
@@ -148,6 +136,9 @@
         </div>
       </div>
 
+      {#if !planCurrent}
+        <p role="alert" class="text-xs text-amber-500">Repository changed. Close and reopen this plan before rebasing.</p>
+      {/if}
       {#if errorMsg}
         <div class="mx-4 mt-3 p-2 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-xs flex items-center gap-2">
           <AlertCircle size={14} class="shrink-0" />
@@ -184,7 +175,7 @@
         <button onclick={requestClose} disabled={isExecuting} class="gp-btn">Cancel</button>
         <button
           onclick={executeRebase}
-          disabled={isExecuting || items.length === 0}
+          disabled={isExecuting || items.length === 0 || !planCurrent}
           class="gp-btn-primary"
         >
           <Check size={14} />

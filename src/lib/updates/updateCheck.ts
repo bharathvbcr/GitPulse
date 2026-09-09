@@ -8,6 +8,7 @@
  * Nothing here fires on its own. `shouldAutoCheck` is the single gate, and it
  * returns false unless the user has explicitly enabled the preference.
  */
+import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
 /** Mirrors `crate::updates::UpdateCheck` (serde `camelCase`). */
@@ -107,7 +108,24 @@ const defaultInvoker: UpdateInvoker = () => invoke<UpdateCheck>(APP_UPDATE_COMMA
  * result rather than a thrown error, so no caller can accidentally render a
  * transport failure as "up to date".
  */
-export async function checkForAppUpdate(
+export const updateCheckInFlight = writable(false);
+let currentCheck: Promise<UpdateCheck> | null = null;
+
+export function checkForAppUpdate(
+  invokeFn: UpdateInvoker = defaultInvoker,
+): Promise<UpdateCheck> {
+  // Settings, menu and automatic checks share one network request.
+  if (invokeFn !== defaultInvoker) return performUpdateCheck(invokeFn);
+  if (currentCheck) return currentCheck;
+  updateCheckInFlight.set(true);
+  currentCheck = performUpdateCheck(invokeFn).finally(() => {
+    currentCheck = null;
+    updateCheckInFlight.set(false);
+  });
+  return currentCheck;
+}
+
+async function performUpdateCheck(
   invokeFn: UpdateInvoker = defaultInvoker,
 ): Promise<UpdateCheck> {
   try {

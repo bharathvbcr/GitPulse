@@ -1,3 +1,4 @@
+import type { RebaseStep } from "../rebase/planner";
 import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { formatError } from "../ui/formatError";
@@ -859,9 +860,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const recentsJson = JSON.stringify(pending.recents);
     if (recentsJson !== lastSentRecentsJson) {
       lastSentRecentsJson = recentsJson;
-      void invokeFn("cmd_set_recent_menu", { paths: pending.recents }).catch(
-        () => {},
-      );
+      void invokeFn("cmd_set_recent_menu", { paths: pending.recents }).catch((error) => {
+        if (lastSentRecentsJson === recentsJson) lastSentRecentsJson = null;
+        diagnostics.warn("desktop:recent-menu", error);
+      });
     }
   }
 
@@ -1334,8 +1336,26 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     timer();
   }
 
+  const mutationActivity = writable<Record<string, string[]>>({});
+  const mutations = new Map<number, { path: string; kind: string }>();
+  let mutationSequence = 0;
+  function beginMutation(path: string, kind: string): () => void {
+    const token = ++mutationSequence;
+    const publishActivity = () => {
+      const activity: Record<string, string[]> = {};
+      for (const entry of mutations.values()) {
+        (activity[entry.path] ??= []).push(entry.kind);
+      }
+      mutationActivity.set(activity);
+    };
+    mutations.set(token, { path, kind });
+    publishActivity();
+    return () => { mutations.delete(token); publishActivity(); };
+  }
+
   const store = {
     subscribe,
+    mutationActivity: { subscribe: mutationActivity.subscribe },
     contentRevisions: { subscribe: contentRevisions.subscribe },
     setError: (error: string | null) => {
       // Every user-facing error funnels through here; mirror it into the
@@ -1681,6 +1701,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const path = internal.workspace.lastClosed[0];
       if (!path) return;
       await store.openRepo(path, { activate: true });
+    },
+    clearRecents: () => {
+      replaceWorkspace({ ...internal.workspace, recents: [] });
+      publish();
+      flushPersist();
     },
     removeRecent: (path: string) => {
       replaceWorkspace(
@@ -2038,49 +2063,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         );
       }
     },
-    stageAll: async () => {
-      const session = activeSession();
-      if (!session) return { ok: false, error: "No active repository" };
-      const unstaged = session.statuses.filter((s) => !s.is_staged);
-      // One refresh cycle after the whole batch: per-file refreshes ran N
-      // sequential spinner/progress storms for what is one user action.
-      const outcomes: MutationOutcome[] = [];
-      for (const f of unstaged) {
-        outcomes.push(
-          await runMutating(
-            "stage",
-            f.path,
-            (path) =>
-              invokeFn("cmd_stage_file", { repoPath: path, filePath: f.path }),
-            { skipRefresh: true },
-          ),
-        );
-      }
-      if (unstaged.length > 0) await store.refresh(session.path);
-      return summarizeBulkOutcome(outcomes, "staged");
-    },
-    unstageAll: async () => {
-      const session = activeSession();
-      if (!session) return { ok: false, error: "No active repository" };
-      const staged = session.statuses.filter((s) => s.is_staged);
-      const outcomes: MutationOutcome[] = [];
-      for (const f of staged) {
-        outcomes.push(
-          await runMutating(
-            "unstage",
-            f.path,
-            (path) =>
-              invokeFn("cmd_unstage_file", {
-                repoPath: path,
-                filePath: f.path,
-              }),
-            { skipRefresh: true },
-          ),
-        );
-      }
-      if (staged.length > 0) await store.refresh(session.path);
-      return summarizeBulkOutcome(outcomes, "unstaged");
-    },
+    stageAll: () => runStageBatch("stage"),
+    unstageAll: () => runStageBatch("unstage"),
     discardChanges: async (filePath: string) =>
       runMutating("discard", filePath, (path) =>
         invokeFn("cmd_discard_changes", { repoPath: path, filePath }),
@@ -2330,6 +2314,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         invokeFn("cmd_repo_operation_action", { repoPath: path, action }),
       ),
 
+    rebaseInteractive: (ontoCommit: string, steps: RebaseStep[]) =>
+      runMutating("rebase", ontoCommit, (path) =>
+        invokeFn("cmd_rebase_interactive", { repoPath: path, ontoCommit, steps })),
+
     mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
       runMutating("merge", branchName, (path) =>
         invokeFn("cmd_merge_branch", { repoPath: path, branchName, ffOnly }),
@@ -2530,16 +2518,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return repoFacts().map(toWipInput);
   }
 
+  async function runStageBatch(kind: "stage" | "unstage"): Promise<MutationOutcome> {
+    const session = activeSession();
+    if (!session) return { ok: false, error: "No active repository" };
+    const files = session.statuses.filter((file) => file.is_staged === (kind === "unstage"));
+    const finish = beginMutation(session.path, `${kind}-all`);
+    try {
+      const outcomes: MutationOutcome[] = [];
+      for (const file of files) {
+        outcomes.push(await runMutating(kind, file.path, (path) => kind === "stage"
+          ? invokeFn("cmd_stage_file", { repoPath: path, filePath: file.path })
+          : invokeFn("cmd_unstage_file", { repoPath: path, filePath: file.path }),
+        { skipRefresh: true, session, trackActivity: false }));
+      }
+      if (files.length > 0) await store.refresh(session.path);
+      return summarizeBulkOutcome(outcomes, kind === "stage" ? "staged" : "unstaged");
+    } finally { finish(); }
+  }
+
   async function runMutating<T = unknown>(
     kind: string,
     label: string,
     action: (path: string) => Promise<unknown>,
-    opts: { skipRefresh?: boolean } = {},
+    opts: { skipRefresh?: boolean; session?: RepoSession; trackActivity?: boolean } = {},
   ): Promise<MutationOutcome<T>> {
-    const session = activeSession();
+    const session = opts.session ?? activeSession();
     if (!session) return { ok: false, error: "No repository is open." };
     const path = session.path;
     const generation = session.generation;
+    const finishActivity = opts.trackActivity === false ? () => {} : beginMutation(path, kind);
     try {
       const result = await action(path);
       // Arm the echo window BEFORE anything downstream observes the change:
@@ -2564,6 +2571,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         // neither does a closed diff pane: refetching one unconditionally
         // would yank the user back to Diff from wherever they navigated.
         if (
+          internal.workspace.activeId === session.id &&
           REFETCH_SELECTION_KINDS.has(kind) &&
           still.selectionKind === "file" &&
           still.selectedFilePath &&
@@ -2588,6 +2596,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, generation, { error: formatError(err) });
       harnessStore.recordAction({ repoPath: path, kind, label, ok: false });
       return { ok: false, error: formatError(err) };
+    } finally {
+      finishActivity();
     }
   }
 
