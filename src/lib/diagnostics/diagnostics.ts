@@ -106,6 +106,13 @@ const DIAGNOSTIC_SECRET_PREFIXES: readonly {
   { prefix: "sk-", minLength: 45, alphanumericBody: true },
 ];
 
+// The vocabulary is fixed for this build. Construct matchers once; global
+// String.replace resets lastIndex before each scan, including nested calls.
+const DIAGNOSTIC_SECRET_MATCHERS = DIAGNOSTIC_SECRET_PREFIXES.map(spec => ({
+  ...spec,
+  matcher: new RegExp(`(^|[^A-Za-z0-9_])(${escapeRegExp(spec.prefix)}[^\\s"',;]*)`, "g"),
+}));
+
 /**
  * Field names whose *value* is a credential, whatever syntax carries them.
  *
@@ -502,6 +509,16 @@ const SECRET_ASSIGNMENT_NAMES = SECRET_FIELD_NAMES
   .map(name => escapeRegExp(name).replaceAll("_", "[_-]?"))
   .join("|");
 
+const SECRET_EMBEDDED_DOUBLE_ASSIGNMENT = new RegExp(
+  String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")`, "gi",
+);
+const SECRET_EMBEDDED_ASSIGNMENT = new RegExp(
+  String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])`, "gi",
+);
+const SECRET_SCALAR_ASSIGNMENT = new RegExp(
+  String.raw`(["']?(?:${SECRET_ASSIGNMENT_NAMES})["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)`, "gi",
+);
+
 function redactContextualDiagnosticText(value: string): string {
   let out = value
     // A private-key body has no reliable prefix of its own, so remove the
@@ -577,15 +594,15 @@ function redactContextualDiagnosticText(value: string): string {
       "$1<redacted>@",
     )
     .replace(
-      new RegExp(String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)((?:\\.|[^"\\\r\n])+?)(")`, "gi"),
+      SECRET_EMBEDDED_DOUBLE_ASSIGNMENT,
       redactEmbeddedAssignment,
     )
     .replace(
-      new RegExp(String.raw`((?:${SECRET_ASSIGNMENT_NAMES})\s*[:=]\s*)([^"'\\\r\n]+?)(\\?["'])`, "gi"),
+      SECRET_EMBEDDED_ASSIGNMENT,
       redactEmbeddedAssignment,
     )
     .replace(
-      new RegExp(String.raw`(["']?(?:${SECRET_ASSIGNMENT_NAMES})["']?\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\\"'\]]+)`, "gi"),
+      SECRET_SCALAR_ASSIGNMENT,
       redactAssignedValue,
     )
     .replace(
@@ -597,11 +614,7 @@ function redactContextualDiagnosticText(value: string): string {
       redactAssignedValue,
     );
 
-  for (const { prefix, minLength, alphanumericBody } of DIAGNOSTIC_SECRET_PREFIXES) {
-    const matcher = new RegExp(
-      `(^|[^A-Za-z0-9_])(${escapeRegExp(prefix)}[^\\s"',;]*)`,
-      "g",
-    );
+  for (const { prefix, minLength, alphanumericBody, matcher } of DIAGNOSTIC_SECRET_MATCHERS) {
     out = out.replace(matcher, (match, boundary: string, token: string) => {
       if (token.length < minLength) return match;
       const body = token.slice(prefix.length);

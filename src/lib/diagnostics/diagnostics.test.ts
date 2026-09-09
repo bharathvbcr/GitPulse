@@ -31,6 +31,30 @@ function makeStore(now: number[] = [], storage = memoryStorage()) {
 }
 
 describe("createDiagnostics", () => {
+  it("does not rebuild credential matchers for each navigation field", () => {
+    const constructors = vi.spyOn(globalThis, "RegExp");
+    const outputs: string[] = [];
+    let constructed = 0;
+    try {
+      for (let cycle = 0; cycle < 100; cycle++) {
+        outputs.push(redactDiagnosticText(`file-${cycle}.md`));
+        outputs.push(redactDiagnosticText("https://user:private-value@example.test/r"));
+        outputs.push(redactDiagnosticText("api_key=private-value"));
+        outputs.push(redactDiagnosticText("ghp_0123456789abcdefghijklmnopqrstuvwxyzA"));
+      }
+      constructed = constructors.mock.calls.length;
+    } finally {
+      constructors.mockRestore();
+    }
+    expect(constructed).toBe(0);
+    for (let cycle = 0; cycle < 100; cycle++) {
+      expect(outputs[cycle * 4]).toBe(`file-${cycle}.md`);
+      expect(outputs[cycle * 4 + 1]).toBe("https://user:<redacted>@example.test/r");
+      expect(outputs[cycle * 4 + 2]).toBe("api_key=<redacted>");
+      expect(outputs[cycle * 4 + 3]).not.toContain("0123456789abcdefghijklmnopqrstuvwxyzA");
+    }
+  });
+
   it("redacts credentials before they reach memory, localStorage, or reports", () => {
     const storage = memoryStorage();
     const store = createDiagnostics({ storage, now: () => 5 });
