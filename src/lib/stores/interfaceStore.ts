@@ -27,6 +27,8 @@ import {
 } from "../ui/codeDisplay";
 import { isTimestampStyle, type TimestampStyle } from "../ui/timestampStyle";
 
+export type GlobalSurface = "repository" | "fleet" | "tasks";
+
 export interface InterfacePrefs {
   /**
    * Which accent tint the window wears. Applied as an inline `--c-accent`
@@ -84,7 +86,7 @@ export interface InterfacePrefs {
   /** When the header's diagnostics button is drawn. */
   diagnosticsButton: DiagnosticsButtonMode;
   /**
-   * Whether the workspace-wide Fleet dashboard is the surface on screen.
+   * One exclusive application surface, independent of repository tab lifetime.
    *
    * Persisted so reopening the app returns you where you left, and it lives
    * here rather than in the workspace blob because it is a UI preference, not
@@ -92,7 +94,7 @@ export interface InterfacePrefs {
    * boolean would make an older build fall back to its legacy recovery keys
    * and lose the user's tabs.
    */
-  fleetOpen: boolean;
+  globalSurface: GlobalSurface;
   /**
    * Whether the Fleet Pulse panel is expanded above the Fleet grid.
    *
@@ -173,7 +175,7 @@ const DEFAULTS: InterfacePrefs = {
   autoHideRepoTabs: false,
   showStatusIcon: false,
   diagnosticsButton: "always",
-  fleetOpen: false,
+  globalSurface: "repository",
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
   fleetCompact: false,
@@ -242,7 +244,7 @@ function readPrefs(): InterfacePrefs {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return freshDefaults();
-    const parsed = JSON.parse(raw) as Partial<InterfacePrefs>;
+    const parsed = JSON.parse(raw) as Partial<InterfacePrefs> & { fleetOpen?: unknown };
     return {
       accent: isAccentId(parsed.accent) ? parsed.accent : DEFAULTS.accent,
       reduceMotion: bool(parsed.reduceMotion, DEFAULTS.reduceMotion),
@@ -288,7 +290,9 @@ function readPrefs(): InterfacePrefs {
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
-      fleetOpen: bool(parsed.fleetOpen, DEFAULTS.fleetOpen),
+      globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "repository"
+        ? parsed.globalSurface
+        : parsed.fleetOpen === true ? "fleet" : "repository",
       fleetPulseOpen: bool(parsed.fleetPulseOpen, DEFAULTS.fleetPulseOpen),
       fleetHiddenColumns: columnKeys(parsed.fleetHiddenColumns, DEFAULTS.fleetHiddenColumns),
       fleetCompact: bool(parsed.fleetCompact, DEFAULTS.fleetCompact),
@@ -408,8 +412,9 @@ function createInterfaceStore() {
     zoomOut: () => patch((prefs) => ({ uiFontScale: clampScale(prefs.uiFontScale - 0.05) })),
     resetZoom: () => patch({ uiFontScale: DEFAULTS.uiFontScale }),
     setAutoRunCoverage: (enabled: boolean) => patch({ autoRunCoverage: enabled }),
-    setFleetOpen: (open: boolean) => patch({ fleetOpen: open }),
-    toggleFleet: () => patch((prefs) => ({ fleetOpen: !prefs.fleetOpen })),
+    setGlobalSurface: (globalSurface: GlobalSurface) => patch({ globalSurface }),
+    setFleetOpen: (open: boolean) => patch({ globalSurface: open ? "fleet" : "repository" }),
+    toggleFleet: () => patch((prefs) => ({ globalSurface: prefs.globalSurface === "fleet" ? "repository" : "fleet" })),
     toggleFleetPulse: () => patch((prefs) => ({ fleetPulseOpen: !prefs.fleetPulseOpen })),
     toggleFleetColumn: (key: string) =>
       patch((prefs) => ({

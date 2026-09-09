@@ -6,7 +6,7 @@ import type { PtySessionHandlers } from "./ptyBus";
 
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-function fixture(overrides: Partial<SessionTransport> = {}, registry = createSessionRegistry(), key = "tab-a") {
+function fixture(overrides: Partial<SessionTransport> = {}, registry = createSessionRegistry(), key = "tab-a", singleAttempt = false) {
   let handlers: PtySessionHandlers | null = null;
   const readyRelease = vi.fn(), unsubscribe = vi.fn();
   const prepare = vi.fn<() => Promise<() => void>>(async () => readyRelease);
@@ -15,13 +15,67 @@ function fixture(overrides: Partial<SessionTransport> = {}, registry = createSes
     write: vi.fn(overrides.write ?? (async () => {})), resize: vi.fn(overrides.resize ?? (async () => {})), kill: vi.fn(overrides.kill ?? (async () => {})),
   };
   const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
-  const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks,
+  const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt,
     bus: { prepare, pendingCount: () => 0, subscribe(_id, h) { handlers = h; return unsubscribe; } },
   });
-  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(s), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null }) };
+  return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string) => handlers?.onOutput(s), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
 }
 
 describe("terminal lifecycle races", () => {
+  it("reconnects a task attempt without killing its live process or clearing output", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.owner.fail("Transport disconnected");
+    await f.owner.restart();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.hooks.reset).not.toHaveBeenCalled();
+    expect(f.transport.spawn).toHaveBeenCalledTimes(2);
+    expect(f.owner.isCurrent("native-a")).toBe(true);
+    expect(f.owner.write("continue\n")).toBe(true);
+    expect(get(f.registry)).toHaveLength(1);
+    f.owner.dispose(); await flush();
+  });
+  it("keeps a slow task launch attached to the same attempt without cancelling a late success", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = deferred<{ id: string; shell: string; cwd: string }>();
+      const f = fixture({ spawn: () => pending.promise }, createSessionRegistry(), "task", true);
+      const started = f.owner.start(); await flush();
+      await vi.advanceTimersByTimeAsync(15000);
+      expect(get(f.registry)).toHaveLength(1);
+      expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("still pending"));
+      pending.resolve({ id: "late", shell: "codex", cwd: "/repo" }); await started;
+      expect(f.transport.kill).not.toHaveBeenCalled();
+      expect(f.owner.isCurrent("late")).toBe(true);
+      expect(f.hooks.started).toHaveBeenCalledTimes(1);
+      f.owner.dispose(); await flush();
+    } finally { vi.useRealTimers(); }
+  });
+  it("retains a live task on failed reconnect and refuses an ended attempt", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.transport.spawn.mockRejectedValueOnce(new Error("Disconnected"));
+    await f.owner.restart();
+    expect(f.owner.isCurrent("native-a")).toBe(true);
+    expect(get(f.registry)).toHaveLength(1);
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    f.exit();
+    await f.owner.restart();
+    expect(f.transport.spawn).toHaveBeenCalledTimes(2);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("attempt ended"));
+    f.owner.dispose(); await flush();
+  });
+  it("rejects a changed process identity during task reconnect without discarding its owner", async () => {
+    const f = fixture({}, createSessionRegistry(), "task", true);
+    await f.owner.start();
+    f.transport.spawn.mockResolvedValueOnce({ id: "other", shell: "codex", cwd: "/repo" });
+    await f.owner.restart();
+    expect(f.owner.isCurrent("native-a")).toBe(true);
+    expect(get(f.registry)).toHaveLength(1);
+    expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("different terminal"));
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    f.owner.dispose(); await flush();
+  });
   it("prepares listeners before spawning and releases the temporary lease", async () => {
     const f = fixture(); await f.owner.start();
     expect(f.prepare.mock.invocationCallOrder[0]).toBeLessThan(f.transport.spawn.mock.invocationCallOrder[0]);

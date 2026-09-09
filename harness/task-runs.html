@@ -1,0 +1,188 @@
+<!doctype html>
+<html class="dark"><head><meta charset="utf-8" /><title>Task terminal handoff verification</title></head>
+<body style="margin:0"><div id="app"></div><button id="check" style="position:fixed;top:8px;right:8px;z-index:100">Run handoff checks</button><pre id="result" style="position:fixed;top:42px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:650px;white-space:pre-wrap"></pre>
+<script type="module">
+  import { mockIPC } from "@tauri-apps/api/mocks";
+  import { emit } from "@tauri-apps/api/event";
+  import "../src/app.css";
+  const task = { id:"task", revision:2, updated_at:1, title:"Preserve E42 when reconnecting", description:"Retain the original process and repository.", acceptance_criteria:["No duplicate process"], kind:"bug", status:"ready", priority:1, severity:null, owner:null, due_at:null, labels:[], repository_ids:["repo"], primary_repository_id:"repo", home_workspace_id:null, position:0 };
+  const repository = { id:"repo", revision:3, updated_at:1, name:"GitPulse", identity_key:"fixture", remote_url:null };
+  const runs = new Map(), sessions = new Map(), prepared = new Map();
+  const decisions = new Map(), decisionReceipts = new Map(), decisionWrites = [];
+  let loseDecision = false;
+  const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, errors:[], checks:[] };
+  let loseManagedLaunch = true;
+  let loseLaunch = true, losePreparation = false;
+  const preparations = [];
+  const show = () => document.getElementById("result").textContent = JSON.stringify(report, null, 2);
+  addEventListener("error", event => { report.errors.push(event.message); show(); });
+  addEventListener("unhandledrejection", event => { report.errors.push(String(event.reason)); show(); });
+  const record = item => JSON.stringify({ok:true,item});
+  mockIPC(async (cmd, args) => {
+    if (cmd === "cmd_pick_folder") return "/fixture/GitPulse";
+    if (cmd === "cmd_workbench_request") {
+      const input = JSON.parse(args.input);
+      if (args.method === "decisions.list") {
+        const items=[...decisions.values()].filter(item=>item.run_id===input.run_id);
+        return JSON.stringify({ok:true,items,shown:items.length,total:items.length,has_more:false,next_cursor:null});
+      }
+      if (args.method === "decisions.decide") {
+        decisionWrites.push(args.input);
+        if(decisionReceipts.has(input.request_id))return decisionReceipts.get(input.request_id);
+        const item=decisions.get(input.id);
+        if(!item?.actionable||item.revision!==input.expected_revision||item.payload_digest!==input.payload_digest)throw {code:"decision_stale",message:"Fixture request changed"};
+        Object.assign(item,{revision:item.revision+1,state:"decided",decision:input.decision,answer:input.answer??null,actionable:false});
+        const receipt=record(item);decisionReceipts.set(input.request_id,receipt);
+        if(loseDecision){loseDecision=false;throw {code:"transport_error",message:"Decision committed; fixture reply lost"};}
+        return receipt;
+      }
+      if (args.method === "repositories.get") return record(repository);
+      if (args.method === "runs.list") {
+        report.lists++; show();
+        const items = [...runs.values()].reverse().map(({output,effective_configuration,...summary})=>summary);
+        return JSON.stringify({ok:true,items,shown:items.length,total:items.length,has_more:false,next_cursor:null});
+      }
+      if (args.method === "runs.prepare_terminal" || args.method === "runs.prepare_managed") {
+        preparations.push(args.input);
+        if (prepared.has(input.request_id)) return record(prepared.get(input.request_id));
+        const run = {kind:args.method === "runs.prepare_managed" ? "managed" : "external_terminal",id:input.id,revision:1,updated_at:1,task_id:task.id,source_revision:task.revision,task_title:task.title,repository_id:repository.id,provider:input.provider,permission_mode:input.permission_mode,state:"prepared",cwd:input.repo_path,created_at:Math.floor(Date.now()/1000),expires_at:Math.floor(Date.now()/1000)+300,session_id:null,exit_code:null,reason:"",outcome_uncertain:false};
+        runs.set(run.id,run); prepared.set(input.request_id,{...run});
+        if (losePreparation) { losePreparation=false; throw {code:"transport_error",message:"Prepared successfully; reply lost by fixture"}; }
+        return record(run);
+      }
+      if (args.method === "runs.launch_managed") {
+        const run=runs.get(input.id);
+        if (run.state === "prepared") {
+          report.managedSpawns++;Object.assign(run,{state:"running",session_id:"managed-session",revision:4,provider_state:"running",provider_thread_id:"managed-thread",provider_turn_id:"managed-turn",effective_configuration:'{"sandbox":{"type":"readOnly"},"approvalPolicy":"on-request"}',output:"Managed fixture output",output_truncated:false});
+        }
+        if(loseManagedLaunch){loseManagedLaunch=false;throw {code:"transport_error",message:"Managed launch reply lost"};}
+        show();return record(run);
+      }
+      if (args.method === "runs.get") {report.detailReads++;show();return record(runs.get(input.id));}
+      if (args.method === "runs.stop_managed") {report.managedStops++;Object.assign(runs.get(input.id),{state:"exited",provider_state:"interrupted"});show();return JSON.stringify({ok:true});}
+      if (args.method === "runs.cancel") { const run=runs.get(input.id); run.state="cancelled";run.revision++;return record(run); }
+      throw new Error(`Unconfigured task method: ${args.method}`);
+    }
+    if (cmd === "cmd_workbench_launch_terminal") {
+      const input=JSON.parse(args.input), run=runs.get(input.id);
+      if (!run || !["prepared","running"].includes(run.state)) throw new Error("Attempt has ended");
+      report.launchCalls++;
+      if (!run.session_id) { run.session_id=`task-session-${++report.taskSpawns}`;run.state="running";run.revision=3;sessions.set(run.session_id,run.id); }
+      show();
+      if (loseLaunch) { loseLaunch=false; throw new Error("Launch reply lost by fixture; reconnect the same attempt"); }
+      const id=run.session_id;
+      setTimeout(() => emit("terminal-output",{id,data_b64:btoa("Task terminal ready. Same attempt, same repository.\r\n")}), 30);
+      return {id,cwd:run.cwd,shell:run.provider};
+    }
+    switch (cmd) {
+      case "cmd_resolve_repo":return {path:args.repoPath,name:"GitPulse",is_bare:false};
+      case "cmd_terminal_spawn":report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};
+      case "cmd_terminal_kill":report.kills++;show();return null;
+      case "cmd_terminal_ack":case "cmd_terminal_resize":case "cmd_terminal_write":case "cmd_workspace_sync":return null;
+      case "cmd_list_branches":case "cmd_get_status":case "cmd_list_remotes":case "cmd_list_submodules":case "cmd_stash_list":return [];
+      case "cmd_list_tags":return {tags:[],truncated:false};
+      case "cmd_branch_stats":return {};
+      case "cmd_repo_operation":return null;
+      default:throw new Error(`Unconfigured native command: ${cmd}`);
+    }
+  },{shouldMockEvents:true});
+  const {mount}=await import("svelte");
+  const {interfaceStore}=await import("../src/lib/stores/interfaceStore");
+  interfaceStore.setTerminalDockOpen(false);interfaceStore.setTerminalDockHeight(500);
+  const Host=(await import("./TaskRunsHost.svelte")).default;
+  mount(Host,{target:document.getElementById("app"),props:{task,repositories:[repository]}});
+  show();
+  const wait=async condition => {const deadline=performance.now()+6000;while(!condition()){if(performance.now()>deadline)throw new Error("UI condition timed out");await new Promise(r=>setTimeout(r,25));}};
+  const pause=ms=>new Promise(r=>setTimeout(r,ms));
+  const button=name=>[...document.querySelectorAll("button")].find(el=>el.textContent.trim()===name);
+  const field=name=>[...document.querySelectorAll("label")].find(el=>el.textContent.trim().startsWith(name))?.querySelector("select,input");
+  const set=(name,value)=>{const el=field(name);if(!el)throw new Error(`Missing ${name}`);el.value=value;el.dispatchEvent(new Event("change",{bubbles:true}));};
+  const check=(name,pass)=>{if(!pass)throw new Error(name);report.checks.push(name);show();};
+  const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emit("terminal-exit",{id:run.session_id,exit_code:0,signal:"",error:null,reaped:true});}};
+  document.getElementById("check").onclick=async event=>{
+    event.currentTarget.disabled=true;
+    try {
+      await wait(()=>report.lists>0);const idle=report.lists;await pause(250);
+      check("Idle run history performs no repeated fetches",report.lists===idle);
+      button("Browse…").click();await wait(()=>field("Checkout path").value==="/fixture/GitPulse");
+      button("Launch in Codex").click();await wait(()=>button("Reconnect attempt"));
+      check("Lost launch response retains one task process and starts no shell",report.taskSpawns===1&&report.shellSpawns===0);
+      button("Reconnect attempt").click();await wait(()=>document.querySelector('textarea[aria-label="Terminal input"]')&&!button("Reconnect attempt"));
+      check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
+      button("Open terminal").click();await pause(250);
+      check("Repeated Open terminal focuses its existing tab",report.launchCalls===2&&report.taskSpawns===1);
+      check("Requested settings reset to Ask after launch",field("Permission mode").value==="ask");
+      button("Suspend run updates").click();await pause(100);const suspended=report.lists;await pause(1700);
+      check("Hidden task inspector stops run polling",report.lists===suspended);
+      button("Resume run updates").click();await wait(()=>report.lists>suspended);
+      check("Visible inspector refreshes immediately after resume",true);
+      const current=[...runs.values()][0], now=Math.floor(Date.now()/1000);
+      const exactPayload='{"command":"git status","number":9007199254740993,"context":"first","context":"second"}';
+      for(const [id,kind,payload] of [["allow","permission",exactPayload],["deny","permission",'{"command":"git push"}'],["question","question",'{"question":"Which tests?"}'],["stale","permission",'{"command":"git diff"}']]){
+        const hash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(payload));
+        const digest=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join("");
+        decisions.set(id,{id,revision:1,updated_at:now,run_id:current.id,task_id:task.id,source_revision:task.revision,repository_id:repository.id,repository_revision:repository.revision,owner_id:"fixture",session_id:current.session_id,provider_thread_id:"thread",provider_turn_id:"turn",protocol_request_id:`s:${id}`,provider:"codex",permission_mode:"ask",policy_revision:1,cwd:current.cwd,kind,payload,payload_digest:digest,created_at:now,expires_at:now+300,state:"pending",decision:null,answer:null,actionable:true,reason:""});
+      }
+      button("Review requests").click();await wait(()=>document.querySelector('[aria-label="Complete agent request"]'));
+      const panel=()=>document.querySelector('[aria-label="Agent requests"]');
+      check("Permission review preserves the exact request including large numbers and duplicate fields",panel().querySelector('textarea').value===exactPayload);
+      loseDecision=true;button("Allow once").click();await wait(()=>button("Retry saved decision"));
+      check("An uncertain decision disables alternative responses",[...panel().querySelectorAll('fieldset button')].every(b=>b.matches(':disabled')));
+      button("Retry saved decision").click();await wait(()=>!button("Retry saved decision")&&panel().textContent.includes("Saved response: Allow once"));
+      check("Decision retry preserves the request and records one saved response",decisionWrites.length===2&&decisionWrites[0]===decisionWrites[1]&&decisions.get("allow").revision===2);
+      check("Saving a decision does not claim provider delivery",panel().textContent.includes("Decision saved · delivery pending")&&!panel().textContent.includes("Provider confirmed"));
+      button("Deny request").click();await wait(()=>panel().textContent.includes("Saved response: Deny"));
+      const answer=panel().querySelector('label textarea');answer.value="Run the workbench tests";answer.dispatchEvent(new Event("input",{bubbles:true}));
+      await wait(()=>!button("Save answer").disabled);button("Save answer").click();await wait(()=>panel().textContent.includes("Saved response: Run the workbench tests"));
+      check("Questions and denials save distinct responses",decisions.get("deny").decision==="deny"&&decisions.get("question").decision==="answer");
+      decisions.get("stale").actionable=false;button("Refresh requests").click();await wait(()=>panel().textContent.includes("expired or its target changed"));
+      check("Stale requests expose no approval controls",!button("Allow once")&&!button("Deny request"));
+      button("Hide requests").click();await wait(()=>!panel());button("Review requests").click();await wait(()=>panel()?.textContent.includes("Saved response: Allow once"));
+      check("Reopening review retains receipts without accepting the task",decisions.get("allow").revision===2&&task.revision===2&&task.status==="ready");
+      button("Hide requests").click();
+      await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
+      check("Process completion remains separate from task acceptance",task.status==="ready");
+      set("Permission mode","bypass");await pause(30);
+      check("Bypass requires acknowledgment on this attempt",button("Launch in Codex").disabled);
+      document.querySelector('label.bypass input').click();await pause(30);
+      button("Launch in Codex").click();await wait(()=>report.taskSpawns===2);
+      check("Bypass acknowledgment resets after its explicit launch",field("Permission mode").value==="ask"&&!document.querySelector('label.bypass input'));
+      await finish();button("Refresh").click();await pause(100);
+      losePreparation=true;button("Launch in Codex").click();await wait(()=>button("Retry preparation"));
+      const uncertain=preparations.at(-1);
+      check("Lost preparation reply locks launch fields",field("Coding agent").matches(":disabled"));
+      button("Retry preparation").click();await wait(()=>report.taskSpawns===3);
+      check("Preparation retry preserves the exact saved request",preparations.at(-1)===uncertain);
+      await finish();button("Refresh").click();await pause(100);
+      set("Connection","managed");await pause(30);
+      button("Start managed Codex").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
+      check("A lost managed launch response retains one provider session",report.managedSpawns===1);
+      button("Start or recover managed launch").click();await wait(()=>document.body.textContent.includes("Managed Codex started"));
+      check("Managed retry reuses the original session",report.managedSpawns===1);
+      check("Run history does not fetch full output or effective settings",report.detailReads===0);
+      const managed=[...runs.values()].find(run=>run.kind==="managed");
+      const multiPayload=JSON.stringify({method:"item/tool/requestUserInput",params:{questions:[{id:"scope",question:"Which test scope?",options:[{label:"Focused",description:"Run focused tests"}]},{id:"format",question:"Which output format?"}]}});
+      const multiHash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(multiPayload));
+      decisions.set("multi",{...decisions.get("question"),id:"multi",revision:1,run_id:managed.id,session_id:managed.session_id,provider_thread_id:"managed-thread",provider_turn_id:"managed-turn",protocol_request_id:"s:multi",payload:multiPayload,payload_digest:[...new Uint8Array(multiHash)].map(b=>b.toString(16).padStart(2,"0")).join(""),state:"pending",decision:null,answer:null,actionable:true});
+      button("Refresh requests").click();await wait(()=>button("Save answers"));
+      check("Each managed question has an independent answer field",[...panel().querySelectorAll("label")].filter(label=>label.querySelector("textarea")).length===2);
+      button("Focused").click();
+      const format=[...panel().querySelectorAll("label")].find(label=>label.textContent.includes("Which output format?")).querySelector("textarea");format.value="Markdown";format.dispatchEvent(new Event("input",{bubbles:true}));
+      await wait(()=>!button("Save answers").disabled);button("Save answers").click();await wait(()=>decisions.get("multi").state==="decided");
+      check("Structured answers retain question identities",decisions.get("multi").answer==='{"scope":["Focused"],"format":["Markdown"]}');
+      button("View output and settings").click();await wait(()=>document.querySelector('[aria-label="Managed agent output"]'));
+      check("Output loads only when opened",report.detailReads===1&&document.querySelector('[aria-label="Managed agent output"]').value==="Managed fixture output");
+      button("Stop managed run").click();await wait(()=>report.managedStops===1);button("Refresh").click();await wait(()=>document.body.textContent.includes("Provider turn: interrupted"));
+      check("Stopping a managed run retains the task for review",task.status==="ready"&&task.revision===2);
+      const failed={...managed,id:"failed-initialization",state:"exited",provider_state:"failed",reason:"Provider handshake rejected; process reaped",exit_code:0};
+      for(const key of ["provider_thread_id","provider_turn_id","effective_configuration","output","output_truncated"])delete failed[key];
+      runs.set(failed.id,failed);button("Refresh").click();await wait(()=>document.body.textContent.includes(failed.reason));
+      check("Initialization failure renders without a fabricated provider thread",document.body.textContent.includes("Provider turn: failed"));
+      check("Reading failed initialization starts no replacement agent",report.managedSpawns===1&&task.status==="ready"&&task.revision===2);
+      check("No unrelated shell was started",report.shellSpawns===0);
+      check("No browser runtime errors",report.errors.length===0);
+      document.documentElement.dataset.gpTaskRunsResult="passed";
+    }catch(error){report.errors.push(error.message);document.documentElement.dataset.gpTaskRunsResult="failed";show();}
+    finally{await finish();show();}
+  };
+</script></body></html>

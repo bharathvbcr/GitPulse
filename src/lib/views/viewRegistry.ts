@@ -109,6 +109,12 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
           "MANVI gates, verdicts and cleanup: what is allowed to merge, and branches that are safe to delete.",
         paletteCommand: "Open MANVI — gates, verdicts and branch cleanup",
       },
+      {
+        id: "tasks",
+        label: "Tasks",
+        summary: "Track this repository's issues, bugs, features and shared tasks on a Kanban board.",
+        paletteCommand: "Open repository Tasks — issues, bugs and features",
+      },
     ],
   },
   code: {

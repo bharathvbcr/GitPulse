@@ -82,7 +82,7 @@ describe("Fleet is swapped by hiding, never by unmounting", () => {
     // An `{#if fleetOpen}` / `{:else}` swap would destroy that subtree on
     // every toggle: the PTY dies with its pane, and coming back re-hydrates
     // every open tab from scratch.
-    expect(app).toContain('class:hidden={fleetOpen}');
+    expect(app).toContain('class:hidden={$interfaceStore.globalSurface !== "repository"}');
     expect(app).toContain('class:hidden={!fleetOpen}');
   });
 

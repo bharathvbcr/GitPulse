@@ -100,10 +100,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # another — so this is a copy of that table, re-vendored, never a reimplementation.
 dc-verify = { path = "vendored/dc-verify" }
 
-# Read-only view of DevCouncil's task and lease store. Manvi owns the schema
-# (crates/dc-store/src/schema.rs) and the migrations; GitPulse links the crate
-# rather than reimplementing the queries, and never writes: a UI process that
-# takes a lease can strand a task when the window closes.
+# Manvi owns storage schemas and transactions. Repository execution tasks and
+# leases remain read-only in GitPulse; profile workspaces/items use the separate
+# workbench database and its CRUD API. The UI never takes an execution lease.
 dc-store = { path = "vendored/dc-store" }
 
 # Code-graph queries, answered in-process against DevCouncil's persisted map.
@@ -138,6 +137,38 @@ markdev = { path = "vendored/markdev", default-features = false, features = ["hi
 # rusqlite and tauri, so this adds a direct edge, not a crate to the build.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Native activity notifications. Keep platform bindings macOS-only and enable
+# only the APIs needed for delivery, settings, actions and delegate activation.
+# Request construction needs UNNotificationTrigger even for immediate delivery.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSSet",
+    "NSString",
+    "NSValue",
+] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "UNError",
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
 
 [build-dependencies]
 tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "406feea75283545496ef7398c5e2f0fb9b306b64", features = [] }

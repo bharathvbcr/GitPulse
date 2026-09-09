@@ -44,10 +44,27 @@
       ],
       "files": {
         "Cargo.toml": "fa8aa74dc9c3ed57ba63d7c77e2b8698995256a003226e844bd0eb813848fe3b",
-        "src/bin/dcstore.rs": "de410a3deed09c7587d1e8d7cc3cb74fb246cd0726bd10d6f165db69443821a7",
+        "src/bin/dcstore.rs": "a712dc2014af4310991e764464e130ce22450171d806c35573e6a6f63acaff2c",
         "src/json.rs": "00fad17a5c902c59eafce74ca45c8bd68859ee898bbeb898854cded0a5d6f2ea",
-        "src/lib.rs": "a619c0a08a2594b6f91583f363e0f38e5a37c72a5e7928505d07a65ed1dcd69a",
-        "src/schema.rs": "bca17c5cf94e26392f6d6ed9e7090c092a8fb27d579da29d579ef62f7d5cb8d7"
+        "src/lib.rs": "6c05cb0fe68b6012bf1775d492017c86cff6bbaaf059473a6ff76ceec52b16c2",
+        "src/schema.rs": "bca17c5cf94e26392f6d6ed9e7090c092a8fb27d579da29d579ef62f7d5cb8d7",
+        "src/workbench/attention.rs": "397f944e3257ab186c3a5db7c90cd30811e7e493e41c934fde289bdce67fdf08",
+        "src/workbench/attention.sql": "09b96497ba44f1141a64b2a5a86aff06114cb13b1c0b2a3bdab2345ce4915ad3",
+        "src/workbench/automation.rs": "c9d6c9a46cacb725654090ea4cf0e4800d926e5c1e799067e490622ecb528a79",
+        "src/workbench/automation.sql": "dd8d201b530e49fa7fe1a245ca267d879be35298ab7703723d0c2eb33ac514df",
+        "src/workbench/briefs.rs": "8d7e46d87b6986fa39fd72c296cc9763a5f26a82863df1170d363b2e12f833b9",
+        "src/workbench/decisions.rs": "859234197b0b0438c02e5e005f926b4903f6bf81a6457db8b56487f5a86aff04",
+        "src/workbench/decisions.sql": "e4acc6c419065ac479262a6ef861e4c1cec9b0234a9662641d48743fa2c25985",
+        "src/workbench/enhancements.rs": "8b81d390aaa6b0abb3061fb8a0e63900facd41c5ac27c2276e25a92969f4fe35",
+        "src/workbench/enhancements.sql": "fea69b449c9e7122df25e0f0bb24517e9f17b1ec5472b034f6cc534eaf616372",
+        "src/workbench/input.rs": "0a9599d30eabaf3771c0d7d145e98ac06efe79177598c082dbf7b0db536bf20d",
+        "src/workbench/item_query_tests.rs": "f0138fd5856b7a9100571149e9d1def15317c940caab0d0f6e7db6ac171cb3d5",
+        "src/workbench/mod.rs": "ded6a8680aa08bedb74c590fed13951ba9326a187fb6659af7e42df53d8ec30b",
+        "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",
+        "src/workbench/notifications.sql": "35d39f5bcd61a1750aeeee661b053fa1ee7298271c90b6f4357180b7323489c5",
+        "src/workbench/runs.rs": "1d7b254412ceb8b107b2b36d54f771ee63f2f849e7536d2b666d579579b86dae",
+        "src/workbench/runs.sql": "03b207aafb7c99df78b3ab465314b322e36e8056f339c3db26af001bd92cbe59",
+        "src/workbench/schema.sql": "d1e7452b7a5eb0e5bf2fdf71aa0b6a0590cd0f130665dfd2f00e9bfd511b2c19"
       }
     },
     {

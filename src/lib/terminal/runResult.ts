@@ -137,4 +137,6 @@ export interface TerminalExitPayload {
   exit_code: number | null;
   signal: string;
   error: string | null;
+  /** False when the native host could not confirm process termination. */
+  reaped: boolean;
 }

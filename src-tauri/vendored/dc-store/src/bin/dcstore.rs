@@ -116,6 +116,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "token",
     "expected",
     "appended",
+    "method",
+    "input",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -257,6 +259,14 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
     };
 
     match command {
+        "work" => match store.workbench_request(required("method")?, required("input")?) {
+            Ok(reply) => Ok(reply),
+            Err(error) => Ok(object(&[
+                ("ok", &json_bool(false)),
+                ("code", &quote(error.code)),
+                ("error", &quote(&error.message)),
+            ])),
+        },
         "acquire" => {
             let ttl = match flag("ttl-seconds") {
                 Some(raw) => Some(raw.parse::<i64>().map_err(|_| {

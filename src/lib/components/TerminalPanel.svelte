@@ -4,6 +4,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
+  import { taskTerminalRequests, consumeTaskTerminal } from "../terminal/taskLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
   import { invoke } from "@tauri-apps/api/core";
@@ -127,9 +128,12 @@
   // ---------------------------------------------------------------------
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
-  let tabState = $state<TabState>(untrack(() =>
-    get(terminalLaunchRequests)?.repoPath === repoPath ? { tabs: [], activeId: null } : initialState(),
-  ));
+  function initialTabs(): TabState {
+    if (get(terminalLaunchRequests)?.repoPath === repoPath) return { tabs: [], activeId: null };
+    const request = get(taskTerminalRequests).find((request) => request.repoPath === repoPath);
+    return request ? initialState(request.provider, { runId: request.runId, title: request.title }) : initialState();
+  }
+  let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
   const activeTitle = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.title);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
@@ -144,6 +148,14 @@
   const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${MAX_TERMINAL_TABS} terminal sessions are open — close one in Sessions`);
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
+
+  $effect(() => {
+    const request = $taskTerminalRequests.find((request) => request.repoPath === repoPath);
+    if (!request || (!canCreate && !tabState.tabs.some((tab) => tab.taskRunId === request.runId))) return;
+    tabState = openTab(tabState, request.provider, { runId: request.runId, title: request.title });
+    mode = "shell";
+    consumeTaskTerminal(request.runId);
+  });
 
   function newTab(launcher: LauncherKind, initialPrompt?: string): boolean {
     if (!repoPath || !canCreate) return false;
@@ -657,6 +669,7 @@
             aria-label={tabLabel(tab)}
           >
             <TerminalSession
+              taskRunId={tab.taskRunId}
               bind:this={sessions[tab.id]}
               repoPath={repoPath}
               tabId={tab.id}

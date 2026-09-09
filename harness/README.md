@@ -26,6 +26,73 @@ focus handoff, unavailable actions and duplicate execution. Missing completion a
 runtime errors fail the gate. Open `/harness/palette.html` on the development server
 for manual inspection; `?theme=light` selects light appearance. No Git mutation is
 performed by these fixtures. See `docs/COMMAND_PALETTE.md` for contracts and limits.
+## Agentic task boards
+
+Run `node scripts/workbench-preview.mjs /absolute/path/to/dcstore` using the built
+Manvi `dcstore` binary. The script prints an ephemeral loopback URL ending in
+`/harness/workbench.html`. It creates a disposable profile database with three
+repositories, a shared workspace and six tasks through the public workbench API;
+normal shutdown removes that fixture. It does not open or mutate user repositories.
+
+The page mounts the production `TaskBoard`, task editor and workspace editor.
+Check global/workspace/repository counts, create a task with multiple repository
+links, edit its title and status, change group membership, reload, and verify the
+saved description, acceptance criteria and revisions. Use the visible runtime
+error count as part of the result. Current interaction evidence is recorded in
+[the implementation plan](../docs/AGENTIC_WORKSPACES_PLAN.md).
+
+For brief checks, first enable **Capture copies in fixture**. Then open a task and
+use **Copy saved brief**. The harness captures the text in its visible output
+instead of writing to the OS clipboard. Check both repository references, task
+revision and metadata. Unsaved edits must stay out of the captured text and the
+copy status must say so. A concurrent saved update must refuse a stale copy and
+leave the capture unchanged. This checks the rendered copy workflow with real
+storage; it does not qualify the installed application's OS clipboard behavior.
+
+For enhancement generation, append `/absolute/path/to/manvi` as a second binary
+argument. The fixture starts that actual host with a disposable profile and a
+scripted loopback model, using an isolated configuration root. No live provider
+is contacted. Opening Manvi enhancements should show `local` / `fixture-model`.
+The **Run enhancement checks** button creates a task through the editor and checks
+generation, editing a suggestion while retaining original model text, selected
+acceptance after an intentionally lost reply, undo, unsaved edit protection,
+saved field locks, acknowledged cancellation, automatic generation after Save,
+and persisted Stop controls that preserve ready reviews. Fixture seeding disables
+automatic work; the checks explicitly enable it through the production UI.
+It reports nine checks and a
+visible pass/fail verdict. **Lose next acceptance reply** can also be armed
+manually: the write commits, then the adapter throws a transport failure. Retry
+must reconcile the original receipt and leave the task at one new revision.
+
+The scripted response deliberately marks itself as test output. These checks
+establish workflow behavior, not semantic rewrite quality. Startup failure and
+normal shutdown close the model listener and Manvi child; process-lifecycle
+regressions also run in the ordinary unit suite.
+
+This harness sends requests to a real Manvi store through a bounded local HTTP
+adapter. Storage calls create a CLI process per request; generation/configuration
+reuse one real Manvi host. This is not a native IPC or
+performance benchmark. Native folder picking and event delivery are unavailable
+here; a live-update-unavailable message is expected. Native registration is
+covered separately by Rust tests using disposable Git repositories. Installed
+desktop activation, notifications and managed-agent execution need their own
+qualification.
+
+To verify the native adapter against real Manvi binaries, set
+`GITPULSE_WORKBENCH_TEST_MANVI` and `GITPULSE_WORKBENCH_TEST_DCSTORE` to their
+absolute built paths and run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  real_profile_host_shares_native_revisions_and_refuses_a_stale_generation -- --ignored
+```
+
+This explicit integration test is ignored in the ordinary suite because it
+requires separately built Manvi artifacts. When invoked, absent artifacts fail
+the test. It uses a disposable profile and a child-scoped wrapper; configuration
+must not open storage, and Manvi must observe a native task revision change and
+refuse a stale generation before provider resolution. It does not launch the
+installed desktop app or evaluate a live model.
 
 ## Code diagnostics
 
@@ -176,6 +243,43 @@ three appliers `App.svelte` runs. `window.__gp` exposes the stores and
 
 ## Terminal
 
+The real-store workbench fixture also exposes **Activity inbox**. Use
+`node scripts/workbench-preview.mjs /absolute/path/to/dcstore` with a freshly
+built Manvi store binary. The printed profile path is disposable. Create
+enhancement/run outcomes through that profile's store API, then check the
+global, workspace and repository scopes, read/unread filters, snooze,
+dismiss/restore, linked task opening and persistence after reload. These
+controls must leave the task and proposal states unchanged.
+
+Expand **Desktop notifications** to exercise the real store settings: sound,
+local quiet hours, background preference and workspace/repository/task mutes.
+Open a task for its mute control. Clearing saved scope mutes edits the draft;
+verify the stored settings remain unchanged until Save, and that saving retains
+sound/quiet hours. The browser adapter reports native authorization and delivery
+as unavailable; it never pretends that a banner was displayed.
+
+To test recovery, use the disposable profile's public store API to enable
+notifications, create a new eligible enhancement/run outcome, claim its notice
+and activate the returned exact native identity. Reloading the fixture should
+open a task review; change/delete the task before activation to exercise stale
+target explanations. Closing acknowledges the activation only. Confirm current
+task/proposal states are unchanged and the activation queue is empty. These
+seeded records test durable recovery, not a real OS callback. Native permission,
+banners, click-after-quit and the optional provider/event bus are separate tests.
+The fixture isolates its Vite cache and cleans it after cancelled optimizer
+writes drain; its lifecycle regression checks both SIGTERM and failed startup.
+
+Open `/harness/task-runs.html` on the development server and select **Run handoff
+checks** to exercise the task Runs panel, repository opening and terminal dock.
+Its 21 interaction checks cover lost launch/preparation replies, same-attempt
+reconnection, duplicate tab refusal, per-attempt bypass acknowledgment, suspended
+polling, exact request text, decision retry after a lost reply, separate answers
+and denials, stale request controls, and receipt recovery when reopening review.
+This fixture simulates the native process/database transport;
+it does not launch a coding agent. Real PTY/store tests live in
+`src-tauri/src/workbench/terminal_run.rs`. Installed CLI help checks are explicitly
+ignored by default and probe version/help only, without sending a coding task.
+
 Open `/harness/terminal.html` on the development server and run **Run terminal
 checks**, followed by **Run input stress checks**. This mounts the real dock,
 panels, sessions and xterm with Tauri's official mock IPC; no shell commands
@@ -186,3 +290,13 @@ report spawns, kills, writes, resizes, runtime errors and individual assertions.
 
 Native PTY stress tests are separate. See [the terminal audit](../docs/TERMINAL_AUDIT.md)
 for commands, ownership contracts, reproduced failures and platform limits.
+
+Managed Codex is also covered by `/harness/task-runs.html`: the retained checks
+exercise a lost managed launch reply, one-session retry, output loaded on demand,
+multiple question answers, Stop without task acceptance, and failed initialization
+without a provider thread or automatic replacement (30 checks total).
+The transport is simulated. For the real native/provider path, explicitly run the
+ignored `installed_managed_codex_crosses_native_host_and_store_without_accepting_task`
+Rust test with `GITPULSE_WORKBENCH_TEST_MANVI`,
+`GITPULSE_WORKBENCH_TEST_DCSTORE` and `GITPULSE_WORKBENCH_TEST_CODEX` set to absolute
+binary paths. That test sends one read-only marker turn to the installed provider.

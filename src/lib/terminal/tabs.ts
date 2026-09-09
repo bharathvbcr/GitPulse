@@ -40,6 +40,7 @@ export interface TerminalTab {
   name?: string;
   /** Supplied as a literal agent CLI argument when this tab starts. */
   initialPrompt?: string;
+  taskRunId?: string;
 }
 
 export interface TabState {
@@ -74,9 +75,8 @@ export function createTab(launcher: LauncherKind, initialPrompt?: string): Termi
   return { id: nextTabId(), launcher, title: null, ...(initialPrompt === undefined ? {} : { initialPrompt }) };
 }
 
-export function initialState(launcher: LauncherKind = "shell"): TabState {
-  const tab = createTab(launcher);
-  return { tabs: [tab], activeId: tab.id };
+export function initialState(launcher: LauncherKind = "shell", task?: { runId: string; title: string }): TabState {
+  return openTab({ tabs: [], activeId: null }, launcher, task);
 }
 
 export function canOpenTab(state: TabState): boolean {
@@ -89,9 +89,15 @@ export function canOpenTab(state: TabState): boolean {
  * Silent refusal is the caller's cue to have disabled the control already;
  * this returning the same object is what makes "nothing happened" checkable.
  */
-export function openTab(state: TabState, launcher: LauncherKind, initialPrompt?: string): TabState {
+export function openTab(state: TabState, launcher: LauncherKind, launch?: string | { runId: string; title: string }): TabState {
+  const task = typeof launch === "object" ? launch : undefined;
+  if (task) {
+    const existing = state.tabs.find((tab) => tab.taskRunId === task.runId);
+    if (existing) return { ...state, activeId: existing.id };
+  }
   if (!canOpenTab(state)) return state;
-  const tab = createTab(launcher, initialPrompt);
+  const tab = createTab(launcher, typeof launch === "string" ? launch : undefined);
+  if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
   return { tabs: [...state.tabs, tab], activeId: tab.id };
 }
 

@@ -223,10 +223,18 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
                 api.prevent_exit();
                 request_exit_confirmation(app);
             } else {
+                if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
+                    workbench.shutdown();
+                }
                 crate::harness::sidecar::shutdown();
             }
         }
-        RunEvent::Exit => crate::harness::sidecar::shutdown(),
+        RunEvent::Exit => {
+            if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
+                workbench.shutdown();
+            }
+            crate::harness::sidecar::shutdown();
+        }
         _ => {}
     }
 }

@@ -34,6 +34,14 @@ describe("command catalog and context", () => {
       }
     }
   });
+  it("opens global task boards without an active repository", async () => {
+    const navigate = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    const command = buildCommands(snapshot({ currentPath: null }), () => {}).find(item => item.id === "tasks");
+    expect(command).toBeDefined();
+    expect(command?.disabledReason).toBeUndefined();
+    await command?.action();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("tasks");
+  });
   it("keeps global actions reachable while unavailable repository commands explain why", () => {
     const commands = buildCommands(snapshot({ currentPath: null }), () => {});
     for (const id of ["fleet", "open_repo", "settings", "theme", "shortcuts", "optional_tools_setup"]) {

@@ -400,16 +400,15 @@
   });
 </script>
 
-{#if $repoStore.openTabs.length > 0}
   <div class="gp-glass gp-repo-tabs relative z-20 h-10 bg-surface/60 border-b border-border/60 gp-section-edge flex items-center select-none shrink-0 text-[11px] px-2 gap-1">
     <!-- Fleet sits left of the tabs because it is above them: one surface for
          the whole workspace, not another repository. -->
     <button
       type="button"
-      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-colors {$interfaceStore.fleetOpen
+      class="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-colors {$interfaceStore.globalSurface === "fleet"
         ? 'border-accent/60 bg-accent/10 text-accent'
         : 'border-transparent text-textMuted hover:bg-surfaceHover hover:text-textPrimary'}"
-      aria-pressed={$interfaceStore.fleetOpen}
+      aria-pressed={$interfaceStore.globalSurface === "fleet"}
       data-testid="fleet-tab-chip"
       onclick={() => interfaceStore.toggleFleet()}
       title="Fleet — every open repository at a glance: changes, sync, worktrees, agents and, on demand, size and health."
@@ -417,6 +416,7 @@
       <LayoutGrid size={12} />
       <span>Fleet</span>
     </button>
+    <button type="button" class="shrink-0 px-2 py-1 rounded-lg border border-transparent text-textMuted hover:bg-surfaceHover" aria-pressed={$interfaceStore.globalSurface === "tasks"} data-testid="tasks-tab-chip" onclick={() => interfaceStore.setGlobalSurface($interfaceStore.globalSurface === "tasks" ? "repository" : "tasks")} title="Tasks — global, workspace and repository Kanban boards">Tasks</button>
     <div class="h-3.5 w-1 rounded-full bg-border/50 shrink-0" aria-hidden="true"></div>
     <div class="relative min-w-0 flex-1 self-stretch">
     <div
@@ -605,7 +605,6 @@
     <WorkspaceActions />
     <div class="sr-only" role="status" aria-live="polite">{moveAnnouncement}</div>
   </div>
-{/if}
 
 {#if menu}
   {@const tab = $repoStore.openTabs.find((item) => item.id === menu?.id)}

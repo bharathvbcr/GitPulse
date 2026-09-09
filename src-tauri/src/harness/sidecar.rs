@@ -153,6 +153,7 @@ struct Sidecar {
     /// [`WRITE_DEADLINE`]; it is a field only so tests can shrink the deadline
     /// and exercise the stall path inside a unit-test budget.
     write_deadline: Duration,
+    shutdown_grace: Duration,
 }
 
 impl Drop for Sidecar {
@@ -165,7 +166,7 @@ impl Drop for Sidecar {
         // Recorded through the registration so `procguard`'s shutdown sweep
         // cannot signal this pid after `shutdown_child` has waited on it.
         self.guard
-            .reap(|| shutdown_child(&mut child, stdin, SHUTDOWN_GRACE));
+            .reap(|| shutdown_child(&mut child, stdin, self.shutdown_grace));
     }
 }
 
@@ -775,11 +776,21 @@ fn sidecar_command(binary: &str, dir: &Path) -> Command {
 }
 
 fn spawn() -> Result<Sidecar, HarnessError> {
+    spawn_with_profile(None)
+}
+
+fn spawn_with_profile(profile: Option<&Path>) -> Result<Sidecar, HarnessError> {
     let binary =
         resolve_binary().ok_or_else(|| HarnessError::NotInstalled(resolve_binary_absence()))?;
 
     let dir = scratch_dir()?;
     let mut command = sidecar_command(&binary, &dir);
+    if let Some(profile) = profile {
+        command.args([std::ffi::OsStr::new("--workbench-db"), profile.as_os_str()]);
+        // The profile path is host-owned. Repository root overrides must not
+        // redirect this session's configuration or initialization elsewhere.
+        command.env("DEVCOUNCIL_ROOT", &dir);
+    }
     // Its own process group, and registered, so this long-lived child dies
     // with us rather than outliving the app that started it.
     let (mut child, guard) = crate::procguard::spawn(&mut command, "manvi serve").map_err(|e| {
@@ -842,6 +853,11 @@ fn spawn() -> Result<Sidecar, HarnessError> {
         binary: binary.clone(),
         next_id: 0,
         write_deadline: WRITE_DEADLINE,
+        shutdown_grace: if profile.is_some() {
+            Duration::from_secs(6)
+        } else {
+            SHUTDOWN_GRACE
+        },
     };
 
     let raw = sidecar.call(
@@ -868,6 +884,8 @@ struct Slot {
     sidecar: Option<Sidecar>,
     last_error: Option<HarnessError>,
     backoff_until: Option<Instant>,
+    profile: Option<PathBuf>,
+    closed: bool,
 }
 
 fn slot() -> &'static Mutex<Slot> {
@@ -877,6 +895,8 @@ fn slot() -> &'static Mutex<Slot> {
             sidecar: None,
             last_error: None,
             backoff_until: None,
+            profile: None,
+            closed: false,
         })
     })
 }
@@ -893,6 +913,13 @@ fn slot() -> &'static Mutex<Slot> {
 fn recover_slot(
     poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, Slot>>,
 ) -> std::sync::MutexGuard<'_, Slot> {
+    recover_slot_for(slot(), poisoned)
+}
+
+fn recover_slot_for<'a>(
+    owner: &Mutex<Slot>,
+    poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, Slot>>,
+) -> std::sync::MutexGuard<'a, Slot> {
     let mut guard = poisoned.into_inner();
     guard.sidecar = None;
     guard.last_error = None;
@@ -902,12 +929,17 @@ fn recover_slot(
     // forgets to recover would hang or fail on wreckage that no longer exists.
     // The guarded state above has just been made consistent, so the flag can
     // honestly go back down.
-    slot().clear_poison();
+    owner.clear_poison();
     guard
 }
 
 impl Slot {
     fn ensure(&mut self) -> Result<&mut Sidecar, HarnessError> {
+        if self.closed {
+            return Err(HarnessError::Unavailable(
+                "this harness session has been closed".into(),
+            ));
+        }
         if self.sidecar.is_none() {
             if let Some(until) = self.backoff_until {
                 if Instant::now() < until {
@@ -916,7 +948,11 @@ impl Slot {
                     }));
                 }
             }
-            match spawn() {
+            let started = match &self.profile {
+                Some(profile) => spawn_with_profile(Some(profile)),
+                None => spawn(),
+            };
+            match started {
                 Ok(s) => {
                     self.sidecar = Some(s);
                     self.last_error = None;
@@ -945,11 +981,20 @@ impl Slot {
 /// `None` means the slot was held for the entire budget. That is a real fault
 /// worth reporting; merely being second in line is not.
 fn acquire_slot(deadline: Instant) -> Option<std::sync::MutexGuard<'static, Slot>> {
+    acquire_slot_for(slot(), deadline)
+}
+
+fn acquire_slot_for(
+    owner: &Mutex<Slot>,
+    deadline: Instant,
+) -> Option<std::sync::MutexGuard<'_, Slot>> {
     use std::sync::TryLockError;
     loop {
-        match slot().try_lock() {
+        match owner.try_lock() {
             Ok(guard) => return Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => return Some(recover_slot(poisoned)),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                return Some(recover_slot_for(owner, poisoned))
+            }
             Err(TryLockError::WouldBlock) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -975,13 +1020,38 @@ fn acquire_slot(deadline: Instant) -> Option<std::sync::MutexGuard<'static, Slot
 /// budget. A Busy here is still a distinct, structured error: the harness may
 /// be perfectly healthy, just mid-dispatch.
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
-    let mut guard = acquire_slot(Instant::now() + timeout).ok_or_else(|| {
+    call_in_slot(slot(), op, params, timeout, None)
+}
+
+fn call_in_slot(
+    owner: &Mutex<Slot>,
+    op: &str,
+    params: Option<Value>,
+    timeout: Duration,
+    closing: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Value, HarnessError> {
+    let mut guard = acquire_slot_for(owner, Instant::now() + timeout).ok_or_else(|| {
         HarnessError::Busy(format!(
             "another gated action held the harness for the whole {timeout:?} budget; \
              '{op}' was not sent. Retry once the current commit/push/pull settles."
         ))
     })?;
+    if closing.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(HarnessError::Unavailable(
+            "the profile worker is shutting down".into(),
+        ));
+    }
+    let requires_capability = guard.profile.is_some();
     let sidecar = guard.ensure()?;
+    if requires_capability && !serves(&sidecar.hello, op) {
+        return Err(HarnessError::Refused(WireError {
+            code: "unsupported_operation".into(),
+            message: format!(
+                "This Manvi binary does not advertise {op}. Update Manvi to use task enhancements."
+            ),
+            retryable: false,
+        }));
+    }
     match sidecar.call(op, params, timeout) {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -995,6 +1065,75 @@ pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value,
             }
             Err(e)
         }
+    }
+}
+
+/// One lazy profile session using the same bounded transport as the policy
+/// harness. Older Manvi binaries can refuse this optional session independently.
+pub(crate) struct ProfileConnection {
+    slot: Mutex<Slot>,
+    closing: std::sync::atomic::AtomicBool,
+}
+
+impl ProfileConnection {
+    pub(crate) fn new(profile: PathBuf) -> Result<Self, HarnessError> {
+        if !profile.is_absolute() {
+            return Err(HarnessError::Protocol(
+                "workbench database path must be absolute".into(),
+            ));
+        }
+        Ok(Self {
+            slot: Mutex::new(Slot {
+                sidecar: None,
+                last_error: None,
+                backoff_until: None,
+                profile: Some(profile),
+                closed: false,
+            }),
+            closing: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn call(&self, op: &str, params: Value) -> Result<Value, HarnessError> {
+        if !matches!(
+            op,
+            "work.enhancements.generate"
+                | "work.enhancements.configuration"
+                | "work.enhancements.wake"
+                | "work.enhancements.worker"
+                | "work.runs.managed.prepare"
+                | "work.runs.managed.activate"
+                | "work.runs.managed.stop"
+        ) {
+            return Err(HarnessError::Protocol(
+                "unsupported profile worker operation".into(),
+            ));
+        }
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(HarnessError::Unavailable(
+                "the profile worker is shutting down".into(),
+            ));
+        }
+        call_in_slot(
+            &self.slot,
+            op,
+            Some(params),
+            DEFAULT_CALL_TIMEOUT,
+            Some(&self.closing),
+        )
+    }
+
+    pub(crate) fn shutdown(&self) -> bool {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let Some(mut guard) =
+            acquire_slot_for(&self.slot, Instant::now() + Duration::from_millis(1200))
+        else {
+            return false;
+        };
+        guard.closed = true;
+        guard.sidecar = None;
+        true
     }
 }
 
@@ -1372,6 +1511,7 @@ mod tests {
             binary: "scripted".into(),
             next_id: 0,
             write_deadline,
+            shutdown_grace: SHUTDOWN_GRACE,
         }
     }
 
@@ -1583,6 +1723,85 @@ done
                 fallback.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_connection_is_lazy_reuses_transport_and_refuses_unadvertised_ops() {
+        use std::os::unix::fs::PermissionsExt;
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        let binary = dir.path().join("profile-sidecar");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  case "$line" in
+    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration"],"posture":"host"}' ;;
+    *) result='{"ok":true,"provider":"local","model":"fixture-model","model_source":"none","providers":["local"]}' ;;
+  esac
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$result"
+done
+"#;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        set_test_binary(&serial, Some(binary.to_str().unwrap().into()));
+        let connection =
+            ProfileConnection::new(dir.path().join("profile with spaces.sqlite")).unwrap();
+        assert!(connection.slot.lock().unwrap().sidecar.is_none());
+        let result = connection
+            .call("work.enhancements.configuration", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(result["model"], "fixture-model");
+        let first_pid = connection
+            .slot
+            .lock()
+            .unwrap()
+            .sidecar
+            .as_ref()
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .id();
+        connection
+            .call("work.enhancements.configuration", serde_json::json!({}))
+            .unwrap();
+        let second_pid = connection
+            .slot
+            .lock()
+            .unwrap()
+            .sidecar
+            .as_ref()
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .id();
+        assert_eq!(first_pid, second_pid);
+        let error = connection
+            .call("work.enhancements.generate", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(error, HarnessError::Refused(WireError { code, .. }) if code == "unsupported_operation")
+        );
+        assert!(connection.shutdown());
+        assert!(connection.slot.lock().unwrap().sidecar.is_none());
+        assert!(connection
+            .call("work.enhancements.configuration", serde_json::json!({}))
+            .is_err());
+        set_test_binary(&serial, None);
+    }
+
+    #[test]
+    fn profile_connection_refuses_unscoped_or_foreign_operations_before_spawn() {
+        assert!(ProfileConnection::new(PathBuf::from("relative.sqlite")).is_err());
+        let dir = tempfile::TempDir::new().unwrap();
+        let connection = ProfileConnection::new(dir.path().join("profile.sqlite")).unwrap();
+        assert!(connection
+            .call("policy.check.command", serde_json::json!({}))
+            .is_err());
+        assert!(connection.slot.lock().unwrap().sidecar.is_none());
+        assert!(connection.shutdown());
     }
 
     #[test]

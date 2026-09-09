@@ -106,6 +106,17 @@ pub struct TerminalExitPayload {
     pub exit_code: Option<i32>,
     pub signal: String,
     pub error: Option<String>,
+    pub reaped: bool,
+}
+
+/// Task-run bookkeeping at the existing PTY boundary. The observer cannot
+/// replace argv or execute a second child. A refused claim prevents spawning.
+pub(crate) trait SessionObserver: Send + Sync {
+    fn run_id(&self) -> &str;
+    fn before_spawn(&self, session_id: &str) -> Result<(), String>;
+    fn started(&self, session_id: &str, process_id: Option<u32>) -> Result<(), String>;
+    fn spawn_failed(&self, session_id: &str, reason: &str);
+    fn finished(&self, payload: &TerminalExitPayload);
 }
 
 struct SessionEntry {
@@ -114,6 +125,8 @@ struct SessionEntry {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     dead: Arc<AtomicBool>,
     flow: Arc<OutputFlow>,
+    tracked_run: Option<String>,
+    spawned: TerminalSpawned,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -334,6 +347,113 @@ fn build_pty_command(
 
 static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+fn normalize_task_environment(cmd: &mut CommandBuilder, cwd: &std::path::Path) {
+    // Apply only to an explicitly task-linked launch. No user shell/global
+    // settings are rewritten, and credentials remain inherited by the provider.
+    let names: Vec<String> = cmd
+        .iter_full_env_as_str()
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    for name in names {
+        if matches!(
+            name.as_str(),
+            "GIT_DIR"
+                | "GIT_WORK_TREE"
+                | "GIT_INDEX_FILE"
+                | "GIT_COMMON_DIR"
+                | "GIT_OBJECT_DIRECTORY"
+                | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                | "GIT_NAMESPACE"
+                | "GIT_PREFIX"
+                | "GIT_CONFIG"
+                | "GIT_CONFIG_GLOBAL"
+                | "GIT_CONFIG_SYSTEM"
+                | "GIT_CONFIG_COUNT"
+                | "GIT_CONFIG_PARAMETERS"
+                | "CLAUDECODE"
+                | "CLAUDE_CODE_ENTRYPOINT"
+        ) || name.starts_with("GIT_CONFIG_KEY_")
+            || name.starts_with("GIT_CONFIG_VALUE_")
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("DEVCOUNCIL_ROOT", cwd);
+    cmd.env("PWD", cwd);
+}
+
+#[cfg(test)]
+#[test]
+fn task_environment_replaces_root_overrides_but_preserves_auth_and_parent_settings() {
+    use std::ffi::OsStr;
+    let mut command = CommandBuilder::new("codex");
+    command.env_clear();
+    let roots = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ];
+    for name in roots {
+        command.env(name, "fixture-conflict");
+    }
+    for name in [
+        "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "SSH_AUTH_SOCK",
+        "HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        command.env(name, "fixture-preserved");
+    }
+    command.env("DEVCOUNCIL_ROOT", "fixture-parent-root");
+    let ordinary = command.clone();
+    normalize_task_environment(&mut command, std::path::Path::new("/selected checkout"));
+    for name in roots {
+        assert!(
+            command.get_env(name).is_none(),
+            "conflicting setting {name}"
+        );
+        assert_eq!(ordinary.get_env(name), Some(OsStr::new("fixture-conflict")));
+    }
+    for name in [
+        "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "SSH_AUTH_SOCK",
+        "HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        assert_eq!(command.get_env(name), Some(OsStr::new("fixture-preserved")));
+    }
+    assert_eq!(
+        command.get_env("DEVCOUNCIL_ROOT"),
+        Some(OsStr::new("/selected checkout"))
+    );
+    assert_eq!(
+        command.get_env("PWD"),
+        Some(OsStr::new("/selected checkout"))
+    );
+    assert_eq!(
+        ordinary.get_env("DEVCOUNCIL_ROOT"),
+        Some(OsStr::new("fixture-parent-root"))
+    );
+}
+
 /// Snapshot of the parts of [`portable_pty::ExitStatus`] the exit event
 /// reports, extracted so the finalize logic is unit-testable without
 /// spawning a real PTY-backed process.
@@ -369,24 +489,32 @@ where
     W: FnOnce() -> std::io::Result<ExitStatusLike>,
     E: FnMut(TerminalExitPayload),
 {
-    let (exit_code, signal) = match wait() {
+    let (exit_code, signal, error, reaped) = match wait() {
         Ok(status) => (
             Some(i32::try_from(status.code).unwrap_or(-1)),
             status.signal.unwrap_or_default(),
+            None,
+            true,
         ),
         Err(e) => {
             log::warn!(
                 target: "terminal",
                 "could not reap shell process: {e}"
             );
-            (None, String::new())
+            (
+                None,
+                String::new(),
+                Some(format!("Could not confirm process exit: {e}")),
+                false,
+            )
         }
     };
     emit(TerminalExitPayload {
         id: session_id.to_string(),
         exit_code,
         signal,
-        error: None,
+        error,
+        reaped,
     });
 }
 
@@ -454,6 +582,57 @@ pub fn spawn_session<R: tauri::Runtime>(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
 ) -> Result<TerminalSpawned, String> {
+    spawn_session_inner(app, state, repo_path, rows, cols, program, args, env, None)
+}
+
+/// A live native binding repairs a lost launch response without issuing another
+/// process. The binding is created by the PTY host, never supplied by storage.
+pub(crate) fn tracked_session(state: &TerminalSessions, run_id: &str) -> Option<TerminalSpawned> {
+    state
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .find(|s| s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire))
+        .map(|s| s.spawned.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    rows: u16,
+    cols: u16,
+    program: String,
+    args: Vec<String>,
+    observer: Arc<dyn SessionObserver>,
+) -> Result<TerminalSpawned, String> {
+    spawn_session_inner(
+        app,
+        state,
+        repo_path,
+        rows,
+        cols,
+        Some(program),
+        Some(args),
+        None,
+        Some(observer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_session_inner<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    observer: Option<Arc<dyn SessionObserver>>,
+) -> Result<TerminalSpawned, String> {
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let repo = validate_repo(repo_path)?;
     let reservation = reserve_session(state)?;
@@ -469,7 +648,7 @@ pub fn spawn_session<R: tauri::Runtime>(
     // shell.
     let is_default_shell = requested.is_none();
     let shell = requested.unwrap_or_else(default_shell);
-    let PtyCommand { cmd, resolved } = build_pty_command(
+    let PtyCommand { mut cmd, resolved } = build_pty_command(
         &shell,
         is_default_shell,
         args.as_deref(),
@@ -477,6 +656,9 @@ pub fn spawn_session<R: tauri::Runtime>(
         &repo,
         &PtyEnv::from_process(),
     );
+    if observer.is_some() {
+        normalize_task_environment(&mut cmd, &repo);
+    }
 
     // The shared child handle serializes termination with reaping. The reader
     // owns the capacity reservation until the child has been reaped.
@@ -497,17 +679,29 @@ pub fn spawn_session<R: tauri::Runtime>(
         .master
         .take_writer()
         .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn process '{shell}': {e}"))?;
+    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session_id = format!("term-{}-{:x}", std::process::id(), count);
+    if let Some(observer) = &observer {
+        observer.before_spawn(&session_id)?;
+    }
+    let child = match pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            let reason = format!("Failed to spawn process '{shell}': {error}");
+            if let Some(observer) = &observer {
+                observer.spawn_failed(&session_id, &reason);
+            }
+            return Err(reason);
+        }
+    };
+    let start_error = observer
+        .as_ref()
+        .and_then(|observer| observer.started(&session_id, child.process_id()).err());
     let child = Arc::new(Mutex::new(child));
 
     // Drop slave explicitly; master remains open.
     drop(pair.slave);
 
-    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let session_id = format!("term-{}-{:x}", std::process::id(), count);
     let dead = Arc::new(AtomicBool::new(false));
     let output_flow = Arc::new(OutputFlow::default());
     let master = Arc::new(Mutex::new(pair.master));
@@ -517,6 +711,12 @@ pub fn spawn_session<R: tauri::Runtime>(
         child: child.clone(),
         dead: dead.clone(),
         flow: output_flow.clone(),
+        tracked_run: observer.as_ref().map(|o| o.run_id().to_owned()),
+        spawned: TerminalSpawned {
+            id: session_id.clone(),
+            shell: resolved.clone(),
+            cwd: repo.to_string_lossy().into_owned(),
+        },
     };
 
     {
@@ -535,6 +735,14 @@ pub fn spawn_session<R: tauri::Runtime>(
     let sessions_map = state.sessions.clone();
     let thread_child = child.clone();
     let thread_master = master.clone();
+    let thread_observer = observer.clone();
+    if start_error.is_some() {
+        dead.store(true, Ordering::Release);
+        output_flow.stop();
+        if let Err(error) = terminate_pty_child(&child, &master) {
+            log::error!(target: "terminal", "could not stop a task session after bookkeeping failure: {error}");
+        }
+    }
 
     let reader_thread = thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
@@ -609,12 +817,15 @@ pub fn spawn_session<R: tauri::Runtime>(
                     }
                 },
                 |mut payload| {
+                    if payload.error.is_none() { payload.error = failure.take(); }
+                    // Shutdown waits for session removal. Persist the owned
+                    // process's outcome before telling shutdown it is cleaned up.
+                    if let Some(observer) = &thread_observer { observer.finished(&payload); }
                     drop(reservation.take());
                     sessions_map
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&sid_for_exit);
-                    payload.error = failure.take();
                     if let Err(e) = app_handle.emit("terminal-exit", payload) {
                         log::warn!(target: "terminal", "failed to emit terminal-exit event: {e}");
                     }
@@ -629,11 +840,32 @@ pub fn spawn_session<R: tauri::Runtime>(
         guard.remove(&session_id);
         drop(guard);
         terminate_pty_child(&child, &master)?;
-        let _ = child
+        let exit = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .wait();
+        if let Some(observer) = &observer {
+            let payload = TerminalExitPayload {
+                reaped: exit.is_ok(),
+                id: session_id.clone(),
+                exit_code: exit
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| i32::try_from(s.exit_code()).ok()),
+                signal: exit
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s.signal())
+                    .unwrap_or_default()
+                    .to_owned(),
+                error: Some(format!("PTY reader failed: {e}")),
+            };
+            observer.finished(&payload);
+        }
         return Err(format!("Failed to spawn PTY reader thread: {e}"));
+    }
+    if let Some(error) = start_error {
+        return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}"));
     }
 
     let actor_kind = if shell.contains("claude")
@@ -3400,6 +3632,10 @@ mod tests {
             "failed reap must not invent a status"
         );
         assert_eq!(emitted[0].signal, "");
+        assert!(emitted[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("waitpid failed")));
     }
 
     /// The adapter must mirror the vendored portable-pty ExitStatus exactly:

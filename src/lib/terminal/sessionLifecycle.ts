@@ -27,6 +27,8 @@ export function createSessionLifecycle(options: {
   registry: ReturnType<typeof createSessionRegistry>;
   transport: SessionTransport;
   hooks: SessionHooks;
+  /** Native spawn reconnects this durable attempt; it can never create a successor. */
+  singleAttempt?: boolean;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -39,6 +41,7 @@ export function createSessionLifecycle(options: {
   let input: ReturnType<typeof createTerminalInput> | null = null;
   let pendingSize: { rows: number; cols: number } | null = null;
   let resizing = false;
+  let attemptEnded = false;
 
   function state(status: "starting" | "running" | "exited" | "error", message?: string) {
     slot?.update(message ?? status);
@@ -62,6 +65,7 @@ export function createSessionLifecycle(options: {
     slot?.update("closing");
     closing = terminalDeadline(transport.kill(target), 5000, "Closing terminal").then(() => {
       if (id === target) {
+        attemptEnded = true;
         release();
         if (!disposed) hooks.state("exited");
       }
@@ -76,38 +80,48 @@ export function createSessionLifecycle(options: {
     if (starting) await starting;
     await closeCurrent();
   }
-  async function launch() {
-    if (disposed || id) return;
+  async function launch(reconnect: boolean) {
+    if (disposed || (id && !reconnect)) return;
     let ready: (() => void) | null = null;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     try {
-      slot = registry.reserve({ key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close });
+      slot ??= registry.reserve({ key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close });
       state("starting");
       ready = await bus.prepare();
       if (disposed) { release(); return; }
       // A timeout is visible, but an unresolved spawn still owns its slot. A
       // retry must not spawn a duplicate, and a late success must be reclaimed.
-      watchdog = setTimeout(() => { timedOut = true; state("error", "Starting terminal timed out; awaiting native cleanup"); }, 15000);
+      watchdog = setTimeout(() => {
+        timedOut = !options.singleAttempt;
+        state("error", options.singleAttempt
+          ? "Task terminal launch is still pending. Reconnect waits for this same attempt."
+          : "Starting terminal timed out; awaiting native cleanup");
+      }, 15000);
       const spawned = await transport.spawn();
       clearTimeout(watchdog); watchdog = null;
+      if (id && id !== spawned.id) throw new Error("Reconnect returned a different terminal. The existing session remains owned.");
+      const reattached = id === spawned.id;
       id = spawned.id;
       if (disposed || timedOut) {
         await closeCurrent();
         if (timedOut) state("error", "Starting terminal timed out; the late process was closed. Retry to start again.");
         return;
       }
+      input?.dispose();
+      subscription?.(); subscription = null;
       input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
         if (fatal) fail(message);
         else if (!disposed) hooks.warning(message);
       });
       state("running");
-      hooks.started(spawned);
+      if (!reattached) hooks.started(spawned);
       subscription = bus.subscribe(spawned.id, {
         onOutput(data) { if (!disposed && id === spawned.id) hooks.output(data, spawned.id); },
         onError(message) { if (id === spawned.id) fail(message); },
         onExit(event) {
           if (id !== spawned.id) return;
+          attemptEnded = true;
           release();
           if (!disposed) { hooks.exit(event); hooks.state(event.error ? "error" : "exited", event.error ?? undefined); }
         },
@@ -123,10 +137,14 @@ export function createSessionLifecycle(options: {
       ready?.();
     }
   }
-  function start(): Promise<void> {
+  function start(reconnect = false): Promise<void> {
     if (starting) return starting;
-    if (disposed || id) return Promise.resolve();
-    starting = launch().finally(() => { starting = null; });
+    if (disposed || (id && !reconnect)) return Promise.resolve();
+    if (options.singleAttempt && attemptEnded) {
+      state("error", "This attempt ended. Launch a new attempt from the task details.");
+      return Promise.resolve();
+    }
+    starting = launch(reconnect).finally(() => { starting = null; });
     return starting;
   }
   async function resizeLatest() {
@@ -148,6 +166,7 @@ export function createSessionLifecycle(options: {
       restarting = (async () => {
         if (starting) await starting;
         if (disposed) return;
+        if (options.singleAttempt) { await start(true); return; }
         await closeCurrent();
         await terminalDeadline(Promise.resolve(hooks.reset()), 5000, "Draining terminal renderer");
         await start();
