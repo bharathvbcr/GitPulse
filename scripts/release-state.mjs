@@ -73,8 +73,9 @@ export function runReleaseStage(options, run = runCommand) {
     // object, and a ref name is not a second pin.
     //
     // After those uploads GitHub can also detach the git tag from the draft and
-    // rewrite tag_name to untagged-<hex>. v0.1.0 died on that. The peel is the
-    // pin; finalize writes the intended tag name back with the notes.
+    // rewrite tag_name to untagged-<hex>. That rewrite aborted finalize once
+    // every installer was already on the draft. The peel is the pin; finalize
+    // writes the intended tag name back with the notes.
     if (typeof release.tag_name !== "string" || (release.tag_name !== tag && !/^untagged-[0-9a-f]+$/i.test(release.tag_name))) {
       throw new Error(`Draft tag differs from preflight (${String(release.tag_name)})`);
     }
