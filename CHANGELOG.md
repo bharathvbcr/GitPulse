@@ -83,9 +83,6 @@ workbench board land together on `main`.
 - Keep Swift coverage `--package-path` inside the repository. Plan Go coverage
   from a root `go.work` or each nested module, and prefer a JavaScript project's
   declared coverage script or runner instead of inventing `npx` commands.
-- Identify a draft release by its git tag when GitHub rewrites `target_commitish`
-  to a branch name, and upload assets by release ID only so tauri-action cannot
-  retarget the tag. v0.0.9 failed verify after every installer had uploaded.
 - Identify a GitHub release draft by its tag and release ID. GitHub often
   rewrites `target_commitish` to a branch name after associating an existing
   tag, which aborted v0.0.9 after every installer had uploaded. A SHA in that
