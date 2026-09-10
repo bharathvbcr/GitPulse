@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { createServer as createHTTPServer } from "node:http";
 import { createServer } from "vite";
 import { previewWorker } from "./workbench-preview-worker.mjs";
+/** @param {string} message */
 function announce(message) {
   writeSync(1, `${message}\n`);
 }
