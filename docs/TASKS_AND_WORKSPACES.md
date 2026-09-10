@@ -53,16 +53,30 @@ succeed; the board reports failures. They are not a transaction across all tasks
 In the editor, **Draft with Manvi** uses notes; **Improve with Manvi** uses the
 task text. GitPulse saves the task first, then asks the configured Manvi provider
 and model for title and/or description suggestions. A linked repository and a
-title or notes are required. Provider/configuration errors are shown in the editor.
+title or notes are required. **Save task** also works with notes alone: the first
+line supplies a missing title and the notes are appended to an existing
+description. Extracted notes are cleared so a later save cannot reapply them over
+accepted wording. Oversized combined descriptions are refused without discarding
+the notes.
+
+**Task model settings** lets you choose a provider and model for suggestions in
+this editor and reload Manvi's configuration. This uses Manvi's task provider
+configuration, independently of the application header's model selection. Missing
+configuration is shown before generation; no model or endpoint is substituted.
 
 The proposed title and description appear beside their editable fields. Choose
 **Use this title**, **Use this description** or **Use both**. **Not now** hides the
 suggestion while retaining it in Manvi history. Field locks prevent enhancement
-of the locked title or description; acceptance checks the saved task revision.
+of the locked title or description; acceptance requires saved edits and checks
+the saved task revision. A running suggestion blocks another generation from the
+same surface. If an action's reply is lost, **Retry pending action** reconciles
+the same request before editing or closing. Once acceptance is confirmed, a failed
+task refresh retries only the read.
 
 **Quick Enhance** opens a separate sheet for an existing task. It exposes details
 omitted from compact cards, lets you select unlocked fields, and shows proposal
-history with **Accept selected** and dismissal controls. Automatic suggestion
+history with **Apply enhancement** and dismissal controls. It shares the editor's
+enhancement review and retry lifecycle. Automatic suggestion
 settings are separate from this manual request; generated text still needs review.
 
 ## Copy or launch an agent
@@ -71,7 +85,7 @@ settings are separate from this manual request; generated text still needs revie
 
 | Copy source | What is copied |
 | --- | --- |
-| New, unsaved task | Current draft fields, explicitly labeled as an unsaved draft |
+| New, unsaved task | Current draft fields with extracted notes, explicitly labeled as an unsaved draft |
 | Saved task editor | The saved revision; unsaved edits are excluded and the copy feedback says so |
 | Board selection | Up to eight saved task briefs per action, with partial results reported |
 | Context menu → Copy → Saved brief | The canonical saved brief without the extra agent instructions |

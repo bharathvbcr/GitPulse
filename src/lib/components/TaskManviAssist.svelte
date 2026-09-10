@@ -263,7 +263,7 @@
     if (!pending || busy || disabled) return;
     busy = true; epoch++; error = "";
     try {
-      const result = await action.run(pending.method, pending.input);
+      const result = await action.run(pending.method, pending.input, pending.taskID);
       if (disposed) return;
       proposal = result.proposal;
       if (result.task) onApplied(result.task);
@@ -337,7 +337,7 @@
     if (!input) { error = "Save or reload the task, then request a fresh suggestion."; return; }
     busy = true; epoch++; error = "";
     try {
-      const result = await action.run("enhancements.accept", input);
+      const result = await action.run("enhancements.accept", input, task.id);
       if (disposed) return;
       proposal = result.proposal;
       if (result.task) onApplied(result.task);

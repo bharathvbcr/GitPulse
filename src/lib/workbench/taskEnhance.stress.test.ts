@@ -26,13 +26,13 @@ describe("enhancement transaction adversarial boundaries", () => {
     const change = vi.fn().mockRejectedValueOnce(new WorkbenchError(code, "lost reply")).mockResolvedValue(accepted);
     const action = new EnhancementAction({change, read: vi.fn().mockResolvedValue(saved)});
     const original = structuredClone(input);
-    await expect(action.run("enhancements.accept", original)).rejects.toThrow("lost reply");
+    await expect(action.run("enhancements.accept", original, task.id)).rejects.toThrow("lost reply");
     original.fields.push("description");
     original.expected_task_revision = 99;
     expect(action.pending?.input).toEqual(input);
-    await expect(action.run("enhancements.accept", {...input, request_id: "different"})).rejects.toThrow(/pending/);
+    await expect(action.run("enhancements.accept", {...input, request_id: "different"}, task.id)).rejects.toThrow(/pending/);
     const pending = action.pending!;
-    expect((await action.run(pending.method, pending.input)).task).toEqual(saved);
+    expect((await action.run(pending.method, pending.input, pending.taskID)).task).toEqual(saved);
     expect(change.mock.calls[1]).toEqual(change.mock.calls[0]);
     expect(action.pending).toBeNull();
   });
@@ -41,9 +41,9 @@ describe("enhancement transaction adversarial boundaries", () => {
     const change = vi.fn().mockResolvedValue(accepted);
     const read = vi.fn().mockRejectedValueOnce(new WorkbenchError("transport_error", "read offline")).mockResolvedValue(saved);
     const action = new EnhancementAction({change, read});
-    await expect(action.run("enhancements.accept", input)).rejects.toThrow("read offline");
+    await expect(action.run("enhancements.accept", input, task.id)).rejects.toThrow("read offline");
     const pending = action.pending!;
-    await action.run(pending.method, pending.input);
+    await action.run(pending.method, pending.input, pending.taskID);
     expect(change).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledTimes(2);
   });
@@ -55,10 +55,10 @@ describe("enhancement transaction adversarial boundaries", () => {
     });
     const action = new EnhancementAction({change, read: vi.fn()});
     const create = {id: "e", request_id: "create", expected_revision: 0, task_id: "t", source_revision: 4};
-    await expect(action.run("enhancements.create", create)).rejects.toThrow("lost");
+    await expect(action.run("enhancements.create", create, task.id)).rejects.toThrow("lost");
     const pending = action.pending!;
     expect(pending.method).toBe(`enhancements.${phase}`);
-    expect((await action.run(pending.method, pending.input)).proposal.state).toBe("running");
+    expect((await action.run(pending.method, pending.input, pending.taskID)).proposal.state).toBe("running");
     const repeats = change.mock.calls.filter(([method]) => method === `enhancements.${phase}`);
     expect(repeats[0]).toEqual(repeats[1]);
     expect(change).toHaveBeenCalledTimes(3);
@@ -68,8 +68,8 @@ describe("enhancement transaction adversarial boundaries", () => {
     let release: (value: Enhancement) => void = () => { throw new Error("not started"); };
     const change = vi.fn(() => new Promise<Enhancement>(resolve => { release = resolve; }));
     const action = new EnhancementAction({change, read: vi.fn().mockResolvedValue(saved)});
-    const first = action.run("enhancements.accept", input);
-    const burst = await Promise.allSettled(Array.from({length: 100}, () => action.run("enhancements.accept", input)));
+    const first = action.run("enhancements.accept", input, task.id);
+    const burst = await Promise.allSettled(Array.from({length: 100}, () => action.run("enhancements.accept", input, task.id)));
     expect(burst.every(result => result.status === "rejected")).toBe(true);
     release(accepted); await first;
     expect(change).toHaveBeenCalledTimes(1);
@@ -78,31 +78,31 @@ describe("enhancement transaction adversarial boundaries", () => {
   it("bounds a stalled mutation and keeps its original identity for reconciliation", async () => {
     vi.useFakeTimers();
     const action = new EnhancementAction({change: vi.fn(() => new Promise<Enhancement>(() => {})), read: vi.fn()});
-    const result = expect(action.run("enhancements.accept", input)).rejects.toThrow(/timed out/);
+    const result = expect(action.run("enhancements.accept", input, task.id)).rejects.toThrow(/timed out/);
     await vi.advanceTimersByTimeAsync(TASK_ACTION_TIMEOUT_MS);
     await result;
     expect(action.pending?.input).toEqual(input);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each([{...accepted, id: "foreign"}, {...accepted, revision: 3}])("rejects mismatched mutation confirmations", async result => {
+  it.each([{...accepted, id: "foreign"}, {...accepted, task_id: "foreign"}, {...accepted, revision: 3}])("rejects mismatched mutation confirmations", async result => {
     const read = vi.fn();
     const action = new EnhancementAction({change: vi.fn().mockResolvedValue(result), read});
-    await expect(action.run("enhancements.accept", input)).rejects.toThrow(/confirmation/);
+    await expect(action.run("enhancements.accept", input, task.id)).rejects.toThrow(/confirmation/);
     expect(action.pending).not.toBeNull();
     expect(read).not.toHaveBeenCalled();
   });
 
   it.each([{...saved, id: "foreign"}, {...saved, revision: 4}])("rejects wrong or stale task confirmations", async result => {
     const action = new EnhancementAction({change: vi.fn().mockResolvedValue(accepted), read: vi.fn().mockResolvedValue(result)});
-    await expect(action.run("enhancements.accept", input)).rejects.toThrow(/confirmation/);
+    await expect(action.run("enhancements.accept", input, task.id)).rejects.toThrow(/confirmation/);
     expect(action.pending?.result).toEqual(accepted);
   });
 
   it("a definite revision conflict releases the pending mutation without retries", async () => {
     const change = vi.fn().mockRejectedValue(new WorkbenchError("revision_conflict", "Task changed"));
     const action = new EnhancementAction({change, read: vi.fn()});
-    await expect(action.run("enhancements.accept", input)).rejects.toThrow("Task changed");
+    await expect(action.run("enhancements.accept", input, task.id)).rejects.toThrow("Task changed");
     expect(action.pending).toBeNull();
     expect(change).toHaveBeenCalledTimes(1);
   });
