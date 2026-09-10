@@ -67,6 +67,14 @@ pub fn no_symlinks(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
+        // A volume prefix is not a filesystem object. Stating `C:` or
+        // `\\?\C:` is ERROR_INVALID_FUNCTION (os error 1) on Windows, which
+        // made every hygiene fixture that canonicalize()'d a temp path fail
+        // before any policy ran. RootDir (`C:\`) and each Normal component
+        // are still checked.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         if fs::symlink_metadata(&current)
             .map_err(|e| format!("{}: {e}", current.display()))?
             .file_type()
@@ -327,5 +335,20 @@ pub fn remove_reviewed(
             "Local artifact cleanup is unavailable on this platform; use the native build tool"
                 .into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_symlinks;
+    use std::fs;
+
+    #[test]
+    fn no_symlinks_walks_a_canonical_temp_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("owned");
+        fs::create_dir_all(&path).unwrap();
+        no_symlinks(&path)
+            .expect("canonical paths start with a volume prefix; that prefix is not statted");
     }
 }

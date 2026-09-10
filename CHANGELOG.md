@@ -128,6 +128,9 @@ workbench board land together on `main`.
   `GITHUB_ENV`. `${{ env.ImageOS }}` is empty in the workflow env context, so
   the previous prefix never applied and Windows kept restoring mixed MSVC
   artifacts.
+- Skip the volume prefix when hygiene walks a path for symlinks. Stating
+  `\\?\C:` is `ERROR_INVALID_FUNCTION`, so every Windows `--lib` hygiene
+  fixture failed once the comctl32 harness actually loaded.
 
 ### Changed
 
