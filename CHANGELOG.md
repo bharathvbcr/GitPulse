@@ -100,6 +100,9 @@ workbench board land together on `main`.
 - Attach a daemon stdout pipe before closing the read end, and keep that
   reader out of the child with `FD_CLOEXEC`, so `--help` cannot treat an
   inherited descriptor as a successful delivery.
+- Keep Windows clippy from treating the unix-only hygiene worker waiter as unused.
+- Capture panic-redaction diagnostics from the child stderr pipe so Windows
+  observes the hook instead of an inherited file handle that never received it.
 
 ### Changed
 

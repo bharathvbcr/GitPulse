@@ -354,26 +354,35 @@ fn blocking_full_stderr_cannot_stall_logging_or_panic_recovery() {
 #[test]
 fn panic_diagnostics_never_bypass_redaction_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("stderr.txt");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "logging_child", "--nocapture"])
         .env(CHILD_MODE, "panic")
+        .env("RUST_TEST_NOCAPTURE", "1")
         .env(gitpulse_lib::logging::LOG_DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(File::create(&path).unwrap())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain while the child runs: a file-backed stderr on Windows never
+    // showed the hook, and an unread pipe can fill on a long backtrace.
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut stderr = String::new();
+        stderr_pipe.read_to_string(&mut stderr).unwrap();
+        stderr
+    });
     child.stdin.take().unwrap().write_all(b"x").unwrap();
-    assert!(wait_for_probe(&mut child).success());
-    let stderr = fs::read_to_string(path).unwrap();
+    let status = wait_for_probe(&mut child);
+    let stderr = drain.join().expect("stderr drain");
+    assert!(status.success(), "probe exited {status}; stderr={stderr:?}");
     assert!(
         stderr.contains("logging-panic-probe"),
-        "panic must remain observable"
+        "panic must remain observable: {stderr:?}"
     );
     assert!(
         !stderr.contains("synthetic-panic-secret-123456789"),
-        "raw panic payload bypassed the redaction boundary"
+        "raw panic payload bypassed the redaction boundary: {stderr:?}"
     );
 }
 

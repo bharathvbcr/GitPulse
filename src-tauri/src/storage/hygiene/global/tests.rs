@@ -226,6 +226,7 @@ fn dirty_repositories_and_unreadable_task_state_are_refused() {
         .contains("Task activity"));
 }
 
+#[cfg(unix)]
 fn wait(cleaner: &Cleaner) -> super::CleanerState {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
