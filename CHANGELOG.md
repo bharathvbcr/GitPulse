@@ -115,6 +115,8 @@ workbench board land together on `main`.
   unlinking `current_exe()` cannot fail `unwatch(".")` with `NotFound`.
 - Give sidecar isolation tests coverage-relaxed deadlines so llvm-cov load
   cannot kill an EOF child or miss a 400ms policy retry.
+- Keep sidecar hello at 90s when llvm-cov is running so the parallel
+  instrumented lib suite cannot fail a live fixture handshake.
 - Key the CI Rust cache on the runner image so Windows native artifacts are
   not reused across Visual Studio upgrades.
 

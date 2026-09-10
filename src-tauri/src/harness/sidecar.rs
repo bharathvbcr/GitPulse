@@ -37,6 +37,20 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Handshake budget. A cold `manvi serve` has to resolve its configuration
 /// before it answers, so this is deliberately looser than a warm call.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn hello_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        // llvm-cov plus the parallel lib suite can stall a fixture spawn
+        // past 20s without the child being wedged.
+        if std::env::var_os("CARGO_LLVM_COV").is_some()
+            || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+        {
+            return Duration::from_secs(90);
+        }
+    }
+    HELLO_TIMEOUT
+}
 /// How long one write to the child's stdin may take before the child is
 /// considered wedged mid-line. Only the child can drain its request pipe, so a
 /// child that stops reading would block `write_all` forever — and with the
@@ -863,7 +877,7 @@ fn spawn_with_profile(profile: Option<&Path>) -> Result<Sidecar, HarnessError> {
     let raw = sidecar.call(
         OP_HELLO,
         Some(serde_json::json!({"protocol": PROTOCOL_VERSION, "host": "gitpulse"})),
-        HELLO_TIMEOUT,
+        hello_timeout(),
     )?;
     let hello: HelloResult = serde_json::from_value(raw)
         .map_err(|e| HarnessError::Protocol(format!("could not decode hello: {}", e)))?;
