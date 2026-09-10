@@ -51,7 +51,6 @@
   let configurationError = $state<string | null>(null);
   let proposal = $state<Enhancement | null>(null);
   let requested = $state<EnhancementField[]>(["title", "description"]);
-  let selected = $state<EnhancementField[]>([]);
   let busy = $state(false);
   let error = $state("");
   let note = $state("");
@@ -61,6 +60,7 @@
   let flash = $state<EnhancementField[]>([]);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let notesEl: HTMLTextAreaElement | undefined = $state();
+  const ready = $derived(proposal?.state === "ready");
   const titleSuggestion = $derived(ready && proposal ? proposal.proposed.title : "");
   const descriptionSuggestion = $derived(ready && proposal ? proposal.proposed.description : "");
   const showTitleSuggestion = $derived(Boolean(ready && proposal?.fields.includes("title") && suggestionDiffers(title, titleSuggestion)));
@@ -69,7 +69,6 @@
   const gate = $derived(canAskManvi({ title, description, repository_ids: repositoryIds }, notes));
   const manviGate = $derived(task ? canQuickEnhance(task, configuration, configurationError) : { ok: false as const, reason: configurationError ?? "Save a draft for Manvi to read." });
   const available = $derived(requested.filter((field) => !lockedFields.includes(field)));
-  const ready = $derived(proposal?.state === "ready");
   const askLabel = $derived(busy ? "Asking Manvi…" : notes.trim() ? "Draft with Manvi" : "Improve with Manvi");
   const askDisabled = $derived(disabled || busy || available.length === 0 || Boolean(gate));
 
@@ -113,7 +112,6 @@
       const summary = page.items.find((item) => item.id === id);
       if (summary && summary.revision !== proposal.revision) {
         proposal = await getEnhancement(id);
-        if (proposal) selected = proposal.fields.filter((field) => !lockedFields.includes(field));
       }
     } catch (cause) {
       if (!disposed) error = `Status refresh failed: ${explainError(cause)}`;
@@ -139,7 +137,6 @@
       const started = await startQuickEnhance(saved, available, configuration);
       if (disposed) return;
       proposal = started.proposal;
-      selected = started.proposal.fields.filter((field) => !lockedFields.includes(field));
       const changed = started.proposal.state === "ready" && (
         suggestionDiffers(title, started.proposal.proposed.title) ||
         suggestionDiffers(description, started.proposal.proposed.description)

@@ -26,6 +26,30 @@ focus handoff, unavailable actions and duplicate execution. Missing completion a
 runtime errors fail the gate. Open `/harness/palette.html` on the development server
 for manual inspection; `?theme=light` selects light appearance. No Git mutation is
 performed by these fixtures. See `docs/COMMAND_PALETTE.md` for contracts and limits.
+
+## Tasks page and sheets
+
+Run `npm run test:browser -- --harness tasks` or
+`npm run test:webkit -- --harness tasks` on macOS. Both CI browser jobs and
+`ci:local` include this gate. For interactive inspection, open
+`/harness/tasks.html`; `?theme=light` selects light appearance.
+
+The fixture mounts the production board and sheets with explicit simulated IPC.
+It exercises repository switching, workspace defaults, task/workspace draft
+protection, in-flight and uncertain saves, malformed save receipts, idempotent
+retry, custom types, incremental pagination, status changes and conflicts,
+search races, failure/recovery, and keyboard focus. Unexpected requests and
+runtime errors fail the run. These checks do not launch an agent or verify
+native IPC. The real-store enhancement fixture below tests that separate path.
+
+The sheet keeps Save visible above its scrolling content. Core fields are title,
+status, priority, type, primary repository and description; optional fields,
+repository links, AI preferences, notifications and agent runs have named groups.
+Custom type names remain supported. Cards expose status choices alongside drag
+and arrow-key movement. Adding from a column uses that status. Load more keeps
+existing cards and displays the loaded/total count. Repository switches preserve
+open drafts, including their original repository selection.
+
 ## Agentic task boards
 
 Run `node scripts/workbench-preview.mjs /absolute/path/to/dcstore` using the built

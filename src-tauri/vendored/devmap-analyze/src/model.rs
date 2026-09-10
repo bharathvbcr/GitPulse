@@ -38,8 +38,20 @@ pub struct AnalysisDisclosure {
     pub total_symbols: usize,
     pub total_edges: usize,
     pub status: AnalysisStatus,
+    /// Missing in older summaries is unmeasured, not zero.
     #[serde(default)]
-    pub unresolved_calls: usize,
+    pub unresolved_calls: Option<usize>,
+    /// Read the existing rate's counters without materializing its language map.
+    #[serde(default)]
+    pub resolution_rate: Option<AttributionCoverage>,
+}
+
+/// Scalar projection of `ResolutionRate`, computed by the existing rate owner.
+/// No defaults on the counters: a partial breakdown cannot imply zero gaps.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttributionCoverage {
+    pub unresolved_sites: usize,
+    pub explained_sites: usize,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -200,9 +212,19 @@ mod disclosure_tests {
             assert_eq!(disclosure.total_symbols, full.total_symbols);
             assert_eq!(disclosure.total_edges, full.total_edges);
             assert_eq!(
-                disclosure.unresolved_calls, full.unresolved_calls,
+                disclosure.unresolved_calls,
+                Some(full.unresolved_calls),
                 "unresolved_calls drifting to its default would turn \"13 calls \
                  are unattributed\" into \"this list is complete\""
+            );
+            let coverage = disclosure.resolution_rate.as_ref().expect("recorded rate");
+            assert_eq!(
+                coverage.unresolved_sites,
+                full.resolution_rate.unresolved_sites
+            );
+            assert_eq!(
+                coverage.explained_sites,
+                full.resolution_rate.explained_sites
             );
             assert_eq!(
                 format!("{:?}", disclosure.status),

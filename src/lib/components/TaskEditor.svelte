@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
+  import { bounded } from "../workbench/taskActions";
   import { Clipboard } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import TaskRuns from "./TaskRuns.svelte";
@@ -45,6 +46,9 @@
   let notes = $state("");
   let copied = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  let confirming = $state(false);
+  let reloading = $state(false);
+  let sheet: HTMLElement;
   let disposed = false;
   onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
   const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim()));
@@ -74,26 +78,23 @@
     draft.locked_fields = checked ? [...new Set([...fields, field])] : fields.filter((value) => value !== field);
     dirty = true;
   }
-  async function close() {
-    if (enhancementBusy) return;
-    if ((dirty || pending || pendingDelete) && !await askConfirm({
-      title: "Close this task?",
-      message: pendingDelete
-        ? "A delete is still uncertain. Closing discards the retry."
-        : "Unsaved edits will be discarded.",
-      confirmLabel: "Discard",
-      cancelLabel: "Keep editing",
-      destructive: true,
-    })) return;
-    onClose();
+  export async function canLeave(): Promise<boolean> {
+    if (saving || adding || reloading || confirming || enhancementBusy) return false;
+    if (pending || pendingDelete) { error = "Retry the pending action before closing this task."; return false; }
+    if (!dirty && !notes.trim()) return true;
+    confirming = true;
+    try { return await askConfirm({title:"Discard task edits?",message:"Your unsaved changes will be lost.",confirmLabel:"Discard edits",cancelLabel:"Keep editing",destructive:true}); }
+    finally { confirming = false; }
   }
+  async function close() { if (await canLeave()) onClose(); }
   function membership(id: string, checked: boolean) {
     draft.repository_ids = checked ? [...new Set([...draft.repository_ids, id])] : draft.repository_ids.filter((r) => r !== id);
     if (!draft.repository_ids.includes(draft.primary_repository_id)) draft.primary_repository_id = draft.repository_ids[0] ?? "";
     dirty = true;
   }
   async function save(): Promise<Task | null> {
-    if (saving) return null;
+    if (saving || adding || reloading || confirming || pendingDelete) return null;
+    if (!pending && new TextEncoder().encode(draft.description).length > 65_536) { error = "Description is too long. Keep it below 64 KB."; return null; }
     saving = true; error = ""; note = "";
     try {
       if (!pending) {
@@ -106,13 +107,15 @@
         draft.labels = labels.split(",").map((s) => s.trim()).filter(Boolean);
         pending = taskWrite(id, current?.revision ?? 0, draft);
       }
-      const saved = await putTask(pending);
+      const saved = await bounded(putTask(pending));
+      if (saved.id !== id || saved.revision !== Number(pending.expected_revision) + 1) throw new WorkbenchError("protocol_error", "Task update confirmation does not match the request.");
+      if (disposed) return null;
       current = saved; draft = taskDraft(saved); dirty = false; pending = null;
       note = "Saved"; onSaved(saved);
       return saved;
     } catch (cause) {
       error = explainError(cause);
-      if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code)) pending = null;
+      if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error", "protocol_error"].includes(cause.code)) pending = null;
       return null;
     } finally { saving = false; }
   }
@@ -141,7 +144,7 @@
     try {
       if (current) {
         const revision = current.revision;
-        const saved = await getTaskBrief(id, revision);
+        const saved = await bounded(getTaskBrief(id, revision));
         if (disposed) return;
         if (current.revision !== revision) throw new Error("The saved task changed while loading its brief. Copy the latest revision again.");
         const packet = wrapSavedBriefForAgent(saved.markdown);
@@ -185,7 +188,7 @@
     if (!pendingDelete) return;
     saving = true; error = "";
     try {
-      await deleteTask(pendingDelete.id, pendingDelete.expected_revision, pendingDelete.request_id);
+      await bounded(deleteTask(pendingDelete.id, pendingDelete.expected_revision, pendingDelete.request_id));
       pendingDelete = null;
       onSaved(current);
       onClose();
@@ -200,7 +203,20 @@
   }
 </script>
 
-<aside class="task-editor gp-glass" aria-label={current ? "Task details" : "New task"}>
+<svelte:window onkeydown={(e) => {
+    if (!active || !(e.target instanceof Node) || !sheet?.contains(e.target)) return;
+    if (e.key === "Escape") { e.preventDefault(); void close(); return; }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void save();
+      }
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        void copyForAgent();
+      }
+    }} />
+
+<aside bind:this={sheet} class="task-editor gp-glass" aria-label={current ? "Task details" : "New task"}>
   <header>
     <div>
       <h2>{current ? "Task details" : "New task"}</h2>
@@ -210,22 +226,13 @@
       <button type="button" class="gp-btn" onclick={() => void copyForAgent()} disabled={!copyable || copying || saving || enhancementBusy || pending !== null} aria-label="Copy task for an AI agent" title={copyable ? "Copy a packet an AI agent can paste" : "Add a title, description, or notes first"}>
         <Clipboard size={12} /> {copying ? "Copying…" : copied ? "Copied" : "Copy for agent"}
       </button>
-      <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy} aria-label="Close task details">✕</button>
+      <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
     </div>
   </header>
   <form
     onsubmit={(e) => { e.preventDefault(); void save(); }}
     oninput={() => { dirty = true; }}
-    onkeydown={(e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
-        e.preventDefault();
-        void save();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c") {
-        e.preventDefault();
-        void copyForAgent();
-      }
-    }}
+
   >
     <fieldset disabled={saving || pending !== null || pendingDelete !== null || enhancementBusy}>
       <TaskManviAssist

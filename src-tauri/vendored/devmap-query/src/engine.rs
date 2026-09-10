@@ -1,6 +1,6 @@
 use devmap_analyze::clones::group_clones;
 use devmap_analyze::traversal::{
-    traverse_graph, traverse_graph_indexed, TraversalLimits, TraversalOptions, TraversalStop,
+    traverse_graph_indexed, AdjacencyIndex, TraversalLimits, TraversalOptions, TraversalStop,
 };
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
@@ -50,6 +50,7 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
+    coverage_gap: Option<String>,
 }
 
 /// Query facade over the latest durable SQLite generation. Unlike
@@ -127,19 +128,7 @@ impl<'a> StoreQueryEngine<'a> {
         // building a hit reads the file off disk. So a ten-times wider pool
         // costs ten times the string comparisons and not one extra file read —
         // `page`, not `pool`, bounds what is materialised.
-        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = Vec::with_capacity(rows.len());
-        for (index, row) in rows.into_iter().enumerate() {
-            self.cancel.check_every(index)?;
-            ranked.push((name_match_score(&row, &query), row));
-        }
-        ranked.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .total_cmp(left_score)
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.span_start.cmp(&right.span_start))
-                .then_with(|| left.span_end.cmp(&right.span_end))
-        });
+        let ranked = rank_symbol_rows(rows, &query, &self.cancel)?;
         let mut hits = Vec::with_capacity(ranked.len().min(page));
         for (score, row) in ranked.into_iter().take(page) {
             // Every iteration here opens a file. Checked per row rather than
@@ -164,12 +153,7 @@ impl<'a> StoreQueryEngine<'a> {
         // was computed over a sample, which it cannot otherwise know. It is
         // `None` whenever every match was ranked, which on any ordinary query
         // is every time.
-        let ranked_over_a_sample = (total as usize > pool).then(|| {
-            format!(
-                "ranked the first {pool} of {total} matches, in the store's \
-                 relevance order; a closer match may sit outside that page"
-            )
-        });
+        let ranked_over_a_sample = ranking_coverage_gap(total, pool);
         // Two independent qualifications, composed rather than ranked — the
         // same shape `dependencies` and the traversals use. One is about the
         // *ordering* of what was found; the other is about whether the corpus
@@ -200,23 +184,24 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        let Some(file) = self.store.latest_file(&req.query)? else {
+        self.cancel.check()?;
+        let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{} is not indexed", req.query),
             }));
         };
-        if matches!(file.parse_outcome, ParseOutcome::Failed { .. }) {
+        if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{} could not be parsed", req.query),
             }));
         }
-        // Computed before the rows are read so the caveat and the edges come
-        // from the same `latest_file` row, not from two looks at the store.
-        let coverage_gap = file_edge_coverage_gap(&file.parse_outcome);
-        let rows = self
-            .store
-            .latest_edges_for_file(&req.query, req.min_confidence)?;
-        let edges = rows
+        let coverage_gap = devmap_analyze::combine_reasons(
+            file_edge_coverage_gap(&snapshot.file.parse_outcome),
+            analysis_coverage_gap(snapshot.analysis.as_ref()),
+        );
+        self.cancel.check()?;
+        let edges = snapshot
+            .edges
             .into_iter()
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -392,25 +377,42 @@ impl<'a> StoreQueryEngine<'a> {
         // resolves nearly all of them; a second straddle is reported on every
         // direction instead of being smoothed over, because a caller that
         // cannot tell is the actual defect.
+        self.read_composed(
+            || self.neighbors_once(targets, token_budget, min_confidence, max_depth, min_rung),
+            |answers, note| {
+                for entry in answers {
+                    qualify_response(&mut entry.callers, note);
+                    qualify_response(&mut entry.callees, note);
+                }
+            },
+        )
+    }
+
+    /// Bound retry work without holding the writer's lock across a fan-out.
+    /// A second straddle qualifies every independently consumable response.
+    fn read_composed<T>(
+        &self,
+        mut read: impl FnMut() -> anyhow::Result<T>,
+        qualify: impl Fn(&mut T, &str),
+    ) -> anyhow::Result<T> {
         for attempt in 0..2 {
+            self.cancel.check()?;
             let before = self.store.latest_generation_id()?;
-            let mut answers =
-                self.neighbors_once(targets, token_budget, min_confidence, max_depth, min_rung)?;
+            let mut answer = read()?;
             let after = self.store.latest_generation_id()?;
             if before == after {
-                return Ok(answers);
+                return Ok(answer);
             }
             if attempt == 1 {
-                let note = format!(
-                    "the index moved from generation {before:?} to {after:?} while this \
+                qualify(
+                    &mut answer,
+                    &format!(
+                        "the index moved from generation {before:?} to {after:?} while this \
                      composed answer was being assembled, twice in a row; its parts may \
                      describe different snapshots"
+                    ),
                 );
-                for entry in &mut answers {
-                    entry.callers.walk_incomplete = Some(note.clone());
-                    entry.callees.walk_incomplete = Some(note.clone());
-                }
-                return Ok(answers);
+                return Ok(answer);
             }
         }
         unreachable!("the loop returns on both attempts")
@@ -603,11 +605,19 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         req: Request<(String, String)>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        if self.store.latest_generation_id()?.is_none() {
+        self.cancel.check()?;
+        devmap_store::checked_min_confidence(req.min_confidence)?;
+        let Some(index) = self.generation_edges()? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
-        }
+        };
+        let coverage_gap = analysis_coverage_gap(index.analysis());
+        let unavailable = |reason: String| {
+            let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
+            response.walk_incomplete = coverage_gap.clone();
+            response
+        };
         let (from, to) = req.query;
         let from = from.trim();
         let to = to.trim();
@@ -630,7 +640,7 @@ impl<'a> StoreQueryEngine<'a> {
                 ),
             }));
         }
-        let edges = self.resolved_edges(req.min_confidence)?;
+        let edges = self.resolved_edges(&index, req.min_confidence)?;
         let path = match shortest_path(
             &edges,
             from,
@@ -642,9 +652,9 @@ impl<'a> StoreQueryEngine<'a> {
             PathSearch::Found(path) => path,
             // The only outcome that is a claim about the graph.
             PathSearch::NoPath => {
-                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                    reason: format!("no indexed path from {from:?} to {to:?}"),
-                }))
+                return Ok(unavailable(format!(
+                    "no indexed path from {from:?} to {to:?}"
+                )))
             }
             // A limit stopped the walk, so the graph was never asked. Saying
             // "no path" here is how an agent concludes two symbols are
@@ -668,16 +678,16 @@ impl<'a> StoreQueryEngine<'a> {
                 } else {
                     limits.join(" and ")
                 };
-                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                    reason: format!(
-                        "search from {from:?} to {to:?} stopped at {limits} after visiting \
+                return Ok(unavailable(format!(
+                    "search from {from:?} to {to:?} stopped at {limits} after visiting \
                          {visited} nodes without reaching the target; whether a path exists \
                          is unknown — retry with a larger --depth"
-                    ),
-                }));
+                )));
             }
         };
-        Ok(atomic_budget_take(path, req.token_budget, |_| 25))
+        let mut response = atomic_budget_take(path, req.token_budget, |_| 25);
+        response.walk_incomplete = coverage_gap;
+        Ok(response)
     }
 
     /// Every edge in the latest generation at or above `min_confidence`, in
@@ -691,11 +701,12 @@ impl<'a> StoreQueryEngine<'a> {
     /// it. Only `trace_between` still needs the whole set; everything else
     /// asks [`Self::generation_edges`] for the adjacency and pays for the
     /// edges it reaches.
-    fn resolved_edges(&self, min_confidence: f32) -> anyhow::Result<Vec<ResolvedEdge>> {
+    fn resolved_edges(
+        &self,
+        index: &GenerationEdges,
+        min_confidence: f32,
+    ) -> anyhow::Result<Vec<ResolvedEdge>> {
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
-        let Some(index) = self.generation_edges()? else {
-            return Ok(Vec::new());
-        };
         let mut edges = Vec::new();
         for id in 0..index.len() as u32 {
             self.cancel.check_every(id as usize)?;
@@ -814,14 +825,19 @@ impl<'a> StoreQueryEngine<'a> {
             let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: reason.clone(),
             });
-            response.walk_incomplete = coverage_gap;
+            response.walk_incomplete = coverage_gap.clone();
             // "Nothing looked" and "nothing was found" must not render alike on
             // either half: the bands go out `Unavailable` with the target named,
             // never as a radius of zero.
             let bands = band_budget.map(|_| BlastRadius {
                 seeds: Vec::new(),
                 unmatched_targets: vec![target.to_string()],
-                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                layers: {
+                    let mut layers =
+                        unavailable_response(ResolutionAvailability::Unavailable { reason });
+                    layers.walk_incomplete = coverage_gap.clone();
+                    layers
+                },
                 total_impacted: 0,
             });
             return Ok((response, bands));
@@ -861,6 +877,8 @@ impl<'a> StoreQueryEngine<'a> {
         // every banded node is an endpoint of an edge this answer measured —
         // the two halves partition one set, and a node can appear in one and not
         // the other only if the budgeter trimmed it, which the budgeter counts.
+        let incomplete =
+            devmap_analyze::combine_reasons(walk.stop.reason(max_depth, max_nodes), coverage_gap);
         let bands = band_budget.map(|budget| {
             blast_radius_from_edges(
                 &start,
@@ -868,7 +886,7 @@ impl<'a> StoreQueryEngine<'a> {
                 reverse,
                 max_depth,
                 budget,
-                walk.stop.reason(max_depth, max_nodes),
+                incomplete.clone(),
             )
         });
         let mut response = budget_take(traversed, req.token_budget, |_| EDGE_TOKENS);
@@ -887,10 +905,7 @@ impl<'a> StoreQueryEngine<'a> {
         // that gets a live symbol deleted, and it read identically in both
         // cases. The disclosure rides on the index so it describes the same
         // generation the edges came from.
-        response.walk_incomplete = devmap_analyze::combine_reasons(
-            walk.stop.reason(max_depth, max_nodes),
-            analysis_coverage_gap(index.analysis()),
-        );
+        response.walk_incomplete = incomplete;
         Ok((response, bands))
     }
 
@@ -923,6 +938,27 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<ExploreReport> {
+        self.read_composed(
+            || self.explore_once(query, limit, token_budget, min_confidence, max_depth),
+            |report, note| {
+                qualify_response(&mut report.definitions, note);
+                qualify_response(&mut report.blast_radius.layers, note);
+                for definition in &mut report.definitions.items {
+                    qualify_response(&mut definition.callers, note);
+                    qualify_response(&mut definition.callees, note);
+                }
+            },
+        )
+    }
+
+    fn explore_once(
+        &self,
+        query: &str,
+        limit: usize,
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+    ) -> anyhow::Result<ExploreReport> {
         // Refused here, before the empty-report shapes below can absorb it: a
         // threshold no comparison can evaluate is a bad request, not a
         // repository with nothing in it.
@@ -930,29 +966,34 @@ impl<'a> StoreQueryEngine<'a> {
         let budget = explore_budget(token_budget);
         let empty = |reason: String| ExploreReport {
             query: query.to_string(),
-            definitions: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+            definitions: unavailable_response(ResolutionAvailability::Unavailable {
+                reason: reason.clone(),
+            }),
             limit: u32::try_from(limit).unwrap_or(u32::MAX),
             blast_radius: BlastRadius {
                 seeds: Vec::new(),
                 unmatched_targets: Vec::new(),
-                layers: budget_take(Vec::new(), budget.blast_radius, blast_layer_tokens),
+                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
                 total_impacted: 0,
             },
             budget,
         };
-        if self.store.latest_generation_id()?.is_none() {
-            return Ok(empty("no persisted generation is available".to_string()));
-        }
         if query.trim().is_empty() {
             return Ok(empty("explore requires a non-empty query".to_string()));
         }
 
-        // Rank first. `count_search_symbols` measures the whole index, so
-        // `total` below describes what matched rather than what fit.
-        let total = self.store.count_search_symbols(query)?;
-        let page = budget_page_size(budget.definitions).max(limit);
-        let rows = self.store.search_symbols(query, page)?;
-        let repo_root = self.store.latest_repo_root()?;
+        let page = budget_page_size(budget.definitions);
+        let pool = search_rank_pool_size(budget.definitions);
+        let Some(snapshot) = self.store.search_page(query, pool)? else {
+            return Ok(empty("no persisted generation is available".to_string()));
+        };
+        let total = snapshot.total;
+        let coverage_gap = devmap_analyze::combine_reasons(
+            search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
+            ranking_coverage_gap(total, pool),
+        );
+        let rows = snapshot.rows;
+        let repo_root = snapshot.repo_root;
         let lowered = query.to_lowercase();
         // Rank the *rows*, then read files for the survivors only.
         //
@@ -961,20 +1002,8 @@ impl<'a> StoreQueryEngine<'a> {
         // cutting afterwards would open one file per candidate — 401 of them at
         // the default budget — in order to keep `limit` of them, which is the
         // amplification `search_semantic` was repaired for.
-        let mut scored: Vec<(f32, StoredSymbol)> = rows
-            .into_iter()
-            .map(|row| (name_match_score(&row, &lowered), row))
-            .collect();
-        scored.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .total_cmp(left_score)
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| {
-                    (left.span_start, left.span_end).cmp(&(right.span_start, right.span_end))
-                })
-        });
-        scored.truncate(limit);
+        let mut scored = rank_symbol_rows(rows, &lowered, &self.cancel)?;
+        scored.truncate(limit.min(page));
         // `qualified_name` is carried out of the row before `hit_from_stored`
         // consumes it: the hit keeps only the bare name, and a definition that
         // reported no qualified name would be indistinguishable from one whose
@@ -997,7 +1026,11 @@ impl<'a> StoreQueryEngine<'a> {
             .map(|(qualified_name, hit)| ExploreDefinition {
                 // `file::name` — the identity every devmap traversal surface
                 // already resolves, and the one `graph_query` sends today.
-                id: node_id_of(&hit.file_path, &hit.symbol_name),
+                id: if qualified_name.is_empty() {
+                    node_id_of(&hit.file_path, &hit.symbol_name)
+                } else {
+                    qualified_name.clone()
+                },
                 qualified_name,
                 symbol_name: hit.symbol_name,
                 file_path: hit.file_path,
@@ -1015,9 +1048,10 @@ impl<'a> StoreQueryEngine<'a> {
         let mut definitions = budget_take(shells, budget.definitions, explore_definition_tokens);
         // `budget_take` counts the page it was handed; the index-wide count is
         // the honest denominator, exactly as `search` reports it.
-        definitions.total = total.max(definitions.shown);
+        definitions.total = total;
         definitions.hidden = definitions.total.saturating_sub(definitions.shown);
         definitions.truncated = definitions.hidden > 0;
+        definitions.walk_incomplete = coverage_gap;
         // Looked up only for the definitions that survived the budget, and left
         // `None` when the generation holds no row for the file — a definition
         // whose language was never recorded must not be labelled with a guess.
@@ -1071,9 +1105,15 @@ impl<'a> StoreQueryEngine<'a> {
             .iter()
             .map(|definition| definition.id.clone())
             .collect();
-        let blast_radius = self
+        let mut blast_radius = self
             .blast_walk(&index, &seeds, max_depth, min_confidence)?
             .into_radius(budget.blast_radius);
+        if definitions.hidden > 0 {
+            qualify_response(&mut blast_radius.layers, &format!(
+                "this radius uses {} shown definition(s) of {} matches; omitted definitions may have additional callers",
+                definitions.shown, definitions.total,
+            ));
+        }
         Ok(ExploreReport {
             query: query.to_string(),
             definitions,
@@ -1106,11 +1146,13 @@ impl<'a> StoreQueryEngine<'a> {
         let list_budget = token_budget.saturating_sub(layer_budget);
         let empty_report = |reason: String| AffectedTestsReport {
             targets: targets.to_vec(),
-            tests: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+            tests: unavailable_response(ResolutionAvailability::Unavailable {
+                reason: reason.clone(),
+            }),
             blast_radius: BlastRadius {
                 seeds: Vec::new(),
                 unmatched_targets: targets.to_vec(),
-                layers: budget_take(Vec::new(), layer_budget, blast_layer_tokens),
+                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
                 total_impacted: 0,
             },
         };
@@ -1223,6 +1265,7 @@ impl<'a> StoreQueryEngine<'a> {
             stop: TraversalStop::default(),
             depth_cap,
             unresolved_seeds: false,
+            coverage_gap: analysis_coverage_gap(index.analysis()),
         };
         if walk.seeds.is_empty() {
             walk.unresolved_seeds = true;
@@ -1438,14 +1481,18 @@ impl<'a> StoreQueryEngine<'a> {
         query: &str,
         token_budget: u32,
     ) -> anyhow::Result<Response<SymbolHit>> {
-        if self.store.latest_generation_id()?.is_none() {
+        self.cancel.check()?;
+        let Some(snapshot) = self.store.all_symbols_page()? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
-        }
-        let symbols = self.store.all_symbols()?;
+        };
+        let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
+        let symbols = snapshot.rows;
         if symbols.is_empty() || query.trim().is_empty() {
-            return Ok(budget_take(Vec::new(), token_budget, |_| 0));
+            let mut response = budget_take(Vec::new(), token_budget, |_| 0);
+            response.walk_incomplete = coverage_gap;
+            return Ok(response);
         }
         // Both names, so a query can match either the bare symbol or the path
         // and type it sits under.
@@ -1455,7 +1502,7 @@ impl<'a> StoreQueryEngine<'a> {
             .collect();
         let index = crate::semantic::SemanticIndex::build(&texts, &self.cancel)?;
 
-        let repo_root = self.store.latest_repo_root()?;
+        let repo_root = snapshot.repo_root;
         let scored = index.score(query, &self.cancel)?;
         let total = u32::try_from(scored.len()).unwrap_or(u32::MAX);
         // Materialise only as far down the ranking as the budget could reach.
@@ -1464,18 +1511,16 @@ impl<'a> StoreQueryEngine<'a> {
         // a common term opened every file it matched in order to discard almost
         // all of them. The ranking is already sorted, so the page bound is the
         // same one keyword search uses.
-        let hits: Vec<SymbolHit> = scored
-            .into_iter()
-            .take(budget_page_size(token_budget))
-            .map(|(position, score)| {
-                hit_from_stored(
-                    symbols[position].clone(),
-                    repo_root.as_deref(),
-                    token_budget,
-                    score,
-                )
-            })
-            .collect();
+        let mut hits = Vec::new();
+        for (position, score) in scored.into_iter().take(budget_page_size(token_budget)) {
+            self.cancel.check()?;
+            hits.push(hit_from_stored(
+                symbols[position].clone(),
+                repo_root.as_deref(),
+                token_budget,
+                score,
+            ));
+        }
         // `total` is the whole ranked corpus, not the page: budgeting a page
         // and reporting its length as the total is how a capped sample comes
         // back labelled complete.
@@ -1483,6 +1528,7 @@ impl<'a> StoreQueryEngine<'a> {
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
+        response.walk_incomplete = coverage_gap;
         Ok(response)
     }
 
@@ -2680,9 +2726,19 @@ fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
 
 impl<'a> QueryEngine<'a> {
     pub fn new(extractions: &'a [Extraction], resolution: &'a ResolutionResult) -> Self {
+        let rate = devmap_analyze::resolution_rate(extractions, resolution);
+        let attribution = devmap_analyze::AttributionCoverage {
+            unresolved_sites: rate.unresolved_sites,
+            explained_sites: rate.explained_sites,
+        };
+        let coverage_gap = devmap_analyze::combine_reasons(
+            devmap_analyze::extraction_coverage(extractions).degraded_reason(),
+            attribution_coverage_gap(Some(resolution.unresolved.len()), Some(&attribution)),
+        );
         Self {
             extractions,
             resolution,
+            coverage_gap,
         }
     }
 
@@ -2792,6 +2848,11 @@ impl<'a> QueryEngine<'a> {
     }
 
     pub fn dependencies(&self, req: Request<String>) -> Response<ResolvedEdge> {
+        if let Err(error) = devmap_store::checked_min_confidence(req.min_confidence) {
+            return unavailable_response(ResolutionAvailability::Unavailable {
+                reason: error.to_string(),
+            });
+        }
         let file_path = &req.query;
         let availability = match self
             .extractions
@@ -2814,11 +2875,12 @@ impl<'a> QueryEngine<'a> {
         // The same statement the store-backed engine makes, from the same
         // owner: a file whose calls and imports were never extracted answers
         // here in the exact shape of one that genuinely has none.
-        let coverage_gap = self
+        let file_gap = self
             .extractions
             .iter()
             .find(|extraction| &extraction.file_path == file_path)
             .and_then(|extraction| file_edge_coverage_gap(&extraction.parse_outcome));
+        let coverage_gap = devmap_analyze::combine_reasons(file_gap, self.coverage_gap.clone());
         let mut deps = Vec::new();
 
         for edge in &self.resolution.edges {
@@ -2846,6 +2908,11 @@ impl<'a> QueryEngine<'a> {
 
     /// Inbound blast radius (impact) with parametric depth (closes G8).
     pub fn impact(&self, req: Request<String>) -> Response<ResolvedEdge> {
+        if let Err(error) = devmap_store::checked_min_confidence(req.min_confidence) {
+            return unavailable_response(ResolutionAvailability::Unavailable {
+                reason: error.to_string(),
+            });
+        }
         let target = req.query.trim();
         let start: Vec<String> = self
             .resolution
@@ -2861,16 +2928,20 @@ impl<'a> QueryEngine<'a> {
             .map(|edge| edge.target_symbol.clone())
             .collect();
         if start.is_empty() {
-            return unavailable_response(ResolutionAvailability::Unavailable {
+            let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed inbound target"),
             });
+            response.walk_incomplete = self.coverage_gap.clone();
+            return response;
         }
         let opts = TraversalOptions {
-            max_depth: req.max_depth,
+            max_depth: req.max_depth.min(MAX_TRAVERSAL_DEPTH),
             max_nodes: 5000,
             reverse: true,
         };
-        let walk = traverse_graph(&start, &self.resolution.edges, &opts);
+        let index = AdjacencyIndex::build(&self.resolution.edges, opts.reverse)
+            .with_min_confidence(req.min_confidence);
+        let walk = traverse_graph_indexed(&start, &index, opts.limits());
         let mut inbound =
             traversed_resolution_edges(&walk, &self.resolution.edges, req.min_confidence);
         inbound.sort_by(|a, b| {
@@ -2891,12 +2962,20 @@ impl<'a> QueryEngine<'a> {
         // `impact` in particular that is the reading that gets a live symbol
         // deleted — an incomplete blast radius is indistinguishable from a small
         // one.
-        response.walk_incomplete = walk.stop.reason(opts.max_depth, opts.max_nodes);
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            walk.stop.reason(opts.max_depth, opts.max_nodes),
+            self.coverage_gap.clone(),
+        );
         response
     }
 
     /// Outbound trace with parametric depth (closes G8).
     pub fn trace(&self, req: Request<String>) -> Response<ResolvedEdge> {
+        if let Err(error) = devmap_store::checked_min_confidence(req.min_confidence) {
+            return unavailable_response(ResolutionAvailability::Unavailable {
+                reason: error.to_string(),
+            });
+        }
         let target = req.query.trim();
         let start: Vec<String> = self
             .resolution
@@ -2912,16 +2991,20 @@ impl<'a> QueryEngine<'a> {
             .map(|edge| edge.source_symbol.clone())
             .collect();
         if start.is_empty() {
-            return unavailable_response(ResolutionAvailability::Unavailable {
+            let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed outbound source"),
             });
+            response.walk_incomplete = self.coverage_gap.clone();
+            return response;
         }
         let opts = TraversalOptions {
-            max_depth: req.max_depth,
+            max_depth: req.max_depth.min(MAX_TRAVERSAL_DEPTH),
             max_nodes: 5000,
             reverse: false,
         };
-        let walk = traverse_graph(&start, &self.resolution.edges, &opts);
+        let index = AdjacencyIndex::build(&self.resolution.edges, opts.reverse)
+            .with_min_confidence(req.min_confidence);
+        let walk = traverse_graph_indexed(&start, &index, opts.limits());
         let mut outbound =
             traversed_resolution_edges(&walk, &self.resolution.edges, req.min_confidence);
         outbound.sort_by(|a, b| {
@@ -2934,7 +3017,10 @@ impl<'a> QueryEngine<'a> {
         });
         let mut response = budget_take(outbound, req.token_budget, |_| 25);
         // Same signal, same reason as `impact` above.
-        response.walk_incomplete = walk.stop.reason(opts.max_depth, opts.max_nodes);
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            walk.stop.reason(opts.max_depth, opts.max_nodes),
+            self.coverage_gap.clone(),
+        );
         response
     }
 }
@@ -3220,12 +3306,16 @@ struct BlastWalk {
     /// True when no target resolved to a traversal start at all — an answer of
     /// "nothing is impacted" that nothing actually looked for.
     unresolved_seeds: bool,
+    coverage_gap: Option<String>,
 }
 
 impl BlastWalk {
     /// Why the walk is a lower bound, or `None` when it ran to completion.
     fn incomplete_reason(&self) -> Option<String> {
-        self.stop.reason(self.depth_cap, TRAVERSAL_MAX_NODES)
+        devmap_analyze::combine_reasons(
+            self.stop.reason(self.depth_cap, TRAVERSAL_MAX_NODES),
+            self.coverage_gap.clone(),
+        )
     }
 
     /// Sample each band and pack the bands into `token_budget`.
@@ -3691,6 +3781,11 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
     }
 }
 
+fn qualify_response<T>(response: &mut Response<T>, reason: &str) {
+    response.walk_incomplete =
+        devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(reason.to_string()));
+}
+
 /// Why an answer derived from one generation's graph is a lower bound.
 ///
 /// Two independent reasons, joined rather than ranked — a reader deciding
@@ -3713,16 +3808,143 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
 fn analysis_coverage_gap(
     analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
 ) -> Option<String> {
-    let unresolved = analysis
-        .filter(|analysis| analysis.unresolved_calls > 0)
-        .map(|analysis| {
-            format!(
-                "{} call(s) in this generation are unattributed: the graph behind this answer \
-                 is missing that many edges, so it is a lower bound",
-                analysis.unresolved_calls
-            )
-        });
+    let unresolved = analysis.and_then(|analysis| {
+        attribution_coverage_gap(analysis.unresolved_calls, analysis.resolution_rate.as_ref())
+    });
     devmap_analyze::combine_reasons(analysis_status_gap(analysis), unresolved)
+}
+
+/// Unresolved sites include known external targets and are not an edge count.
+/// Use the persisted rate's existing classification, with conservative fallback
+/// for older or inconsistent summaries. These are repository-wide measurements;
+/// no attribution data establishes how many missing links affect this target.
+fn attribution_coverage_gap(
+    total: Option<usize>,
+    coverage: Option<&devmap_analyze::AttributionCoverage>,
+) -> Option<String> {
+    let Some(total) = total else {
+        return Some("the unresolved attribution count was not recorded for this generation; call-graph coverage is unknown".to_string());
+    };
+    match coverage {
+        Some(coverage) if coverage.unresolved_sites == total && coverage.explained_sites <= total => {
+            let remaining = total - coverage.explained_sites;
+            (remaining > 0).then(|| format!(
+                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies",
+                coverage.explained_sites,
+            ))
+        }
+        None if total == 0 => None,
+        _ => Some(format!(
+            "this generation records {total} unresolved attribution site(s), but their classification breakdown is unavailable or inconsistent; these repository-wide counts are not specific to this target, so call-graph coverage is unknown"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod attribution_disclosure_tests {
+    use super::analysis_coverage_gap;
+    #[cfg(feature = "parse")]
+    use super::{qualify_response, Request, StoreQueryEngine};
+    use devmap_analyze::AnalysisDisclosure;
+    use serde_json::{json, Value};
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn a_composed_read_retries_once_and_keeps_all_existing_qualifications() {
+        for moving_reads in [0, 1, 2, usize::MAX] {
+            let store = devmap_store::Store::open_in_memory().unwrap();
+            let resolution = devmap_resolve::Resolver::new().resolve_all(&[]);
+            let analysis = devmap_analyze::AnalysisSummary {
+                status: devmap_analyze::AnalysisStatus::Partial {
+                    reason: "parse coverage gap".into(),
+                },
+                ..Default::default()
+            };
+            store.save_generation(&[], &resolution, &analysis).unwrap();
+            let engine = StoreQueryEngine::new(&store);
+            let mut reads = 0;
+            let response = engine
+                .read_composed(
+                    || {
+                        reads += 1;
+                        let answer = engine.impact(Request {
+                            query: "missing".into(),
+                            token_budget: 2000,
+                            min_confidence: 0.0,
+                            max_depth: 3,
+                        })?;
+                        if reads <= moving_reads {
+                            store.save_generation(&[], &resolution, &analysis)?;
+                        }
+                        Ok(answer)
+                    },
+                    qualify_response,
+                )
+                .unwrap();
+            assert_eq!(reads, if moving_reads == 0 { 1 } else { 2 });
+            let reason = response.walk_incomplete.unwrap();
+            assert!(reason.contains("parse coverage gap"), "{reason}");
+            assert_eq!(
+                reason.contains("index moved"),
+                moving_reads >= 2,
+                "{reason}"
+            );
+        }
+    }
+
+    fn gap(fields: Value) -> Option<String> {
+        let mut summary =
+            json!({"total_files": 1, "total_symbols": 2, "total_edges": 1, "status": "Ok"});
+        summary
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let disclosure: AnalysisDisclosure = serde_json::from_value(summary).unwrap();
+        analysis_coverage_gap(Some(&disclosure))
+    }
+
+    #[test]
+    fn legacy_or_inconsistent_counters_cannot_claim_complete_coverage() {
+        for fields in [
+            json!({}),
+            json!({"unresolved_calls": null}),
+            json!({"unresolved_calls": 4}),
+            json!({"unresolved_calls": 4, "resolution_rate": null}),
+            json!({"unresolved_calls": 4, "resolution_rate": {"unresolved_sites": 0, "explained_sites": 0}}),
+            json!({"unresolved_calls": 4, "resolution_rate": {"unresolved_sites": 4, "explained_sites": 5}}),
+            json!({"unresolved_calls": 0, "resolution_rate": {"unresolved_sites": 2, "explained_sites": 2}}),
+        ] {
+            let reason =
+                gap(fields.clone()).unwrap_or_else(|| panic!("must remain uncertain: {fields}"));
+            assert!(reason.contains("unknown"), "{fields}: {reason}");
+            assert!(!reason.contains("missing that many edges"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn recorded_zero_and_fully_explained_counts_do_not_invent_a_gap() {
+        for fields in [
+            json!({"unresolved_calls": 0}),
+            json!({"unresolved_calls": 0, "resolution_rate": {"unresolved_sites": 0, "explained_sites": 0}}),
+            json!({"unresolved_calls": 4, "resolution_rate": {"unresolved_sites": 4, "explained_sites": 4}}),
+        ] {
+            assert_eq!(gap(fields), None);
+        }
+    }
+
+    #[test]
+    fn explained_calls_do_not_erase_parse_failures_or_timeouts() {
+        for status in [
+            json!({"Partial": {"reason": "file not parsed"}}),
+            json!({"Timeout": {"reason": "analysis deadline"}}),
+        ] {
+            let reason = gap(json!({"status": status, "unresolved_calls": 4, "resolution_rate": {"unresolved_sites": 4, "explained_sites": 4}})).unwrap();
+            assert!(
+                reason.contains("file not parsed") || reason.contains("analysis deadline"),
+                "{reason}"
+            );
+        }
+    }
 }
 
 /// The corpus half of [`analysis_coverage_gap`], on its own.
@@ -3784,6 +4006,33 @@ fn search_coverage_gap(corpus_gap: Option<String>) -> Option<String> {
              indexed: {gap}"
         )
     })
+}
+
+fn ranking_coverage_gap(total: u32, pool: usize) -> Option<String> {
+    (total as usize > pool).then(|| format!(
+        "ranked the first {pool} of {total} matches, in the store's relevance order; a closer match may sit outside that page"
+    ))
+}
+
+fn rank_symbol_rows(
+    rows: Vec<StoredSymbol>,
+    query_lower: &str,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<(f32, StoredSymbol)>> {
+    let mut ranked = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        cancel.check_every(index)?;
+        ranked.push((name_match_score(&row, query_lower), row));
+    }
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.span_start.cmp(&right.span_start))
+            .then_with(|| left.span_end.cmp(&right.span_end))
+    });
+    Ok(ranked)
 }
 
 /// Rank of one stored symbol against an already-lowercased query.
@@ -4875,7 +5124,8 @@ mod indexed_start_equivalence_tests {
                             max_nodes: TRAVERSAL_MAX_NODES,
                             reverse,
                         };
-                        let scanned = traverse_graph(&start, &edges, &opts);
+                        let scanned =
+                            devmap_analyze::traversal::traverse_graph(&start, &edges, &opts);
                         let walked = traverse_graph_indexed(
                             &start,
                             &index.directed(reverse, floor),

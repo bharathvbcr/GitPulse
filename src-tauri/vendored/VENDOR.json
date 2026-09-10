@@ -99,7 +99,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-analyze",
-        "commit": "fe357ac89b25aabfc6cd62f6da5d77f0bd771038"
+        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
       },
       "omitted": [
         "tests/",
@@ -124,11 +124,11 @@
         "src/graph_intel.rs": "5771edd83891421a06916e04f352d6bc0e74312dc8817ef46f8fce5f31a6cad9",
         "src/lib.rs": "032fff9d6d58012f0823a472f2227ec41d1a76f0efa30bdb65d2390a83dfb39b",
         "src/liveness.rs": "506e80e8515a069da9ec3fb9544dcb9a19c7831de14e8962b36f4ec7ce04ec98",
-        "src/model.rs": "1f5c1a19c4341ff540e56054cad9ddfe4ed1cec4ec83015d05cc1c76e51fb7b8",
+        "src/model.rs": "20e3b4e89dfd75da9d57ef960b1a4b4beb7890fa2a0a5f32751166b77f99cd8e",
         "src/pdg.rs": "412e148c3837acdded9f6e467347b877afed88fc19f2978ac28936b9a49cc786",
         "src/pdgsrc.rs": "ca5d3dea9cb36a8d4a0e162b15a3b28ec0d419f96e0779e62df878e95fa8902e",
         "src/resolution_rate.rs": "26acf697f690a8d10a9326ac819eef6f56eb6d4ff0413681013d5656406c747a",
-        "src/traversal.rs": "36fc0548b7a2e992a34a4734e0b105b25f71fd78948a154146e4835be4a4198d"
+        "src/traversal.rs": "3f65b8f2b849e69fcc9fbbbb612e9adb44d0764f21e62d752150e80f010ad626"
       }
     },
     {
@@ -263,7 +263,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-query",
-        "commit": "d9678f331be6e65b271701addfe38a1a4c3e8517"
+        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
       },
       "omitted": [
         "tests/",
@@ -289,7 +289,7 @@
         "src/code_graph.rs": "0c6650916e7a1af7bb49ffd8dfc9dc3680e1db0ed5e9cd932ebe2ba24374e24c",
         "src/cypher.rs": "b76a45dee1205833d2cb042c8d1e1ecc161675cf19a8fe0e1b62d2b62c9678d5",
         "src/digest.rs": "400ce85d492added4723f5f0b01ffd858a2837bb77b3f4adf214ce0a9cb44fb1",
-        "src/engine.rs": "b7ec92c5edf8c47fc4d08e46aae21c291e038230889e07e786104cde0a9e59db",
+        "src/engine.rs": "451a7c15517d22941de23f4875a2e6e123a2055aeba5f13befee10fb27f24f3c",
         "src/escape.rs": "d87b290b8613736bf735d4424495b33dfbbda99e1d944abb5507ef63a9b8b27e",
         "src/export.rs": "3bfb15986ff49dba6ebbf4af82d9050c34931e6397a04e2c8031aa2fcb4b529d",
         "src/freshness.rs": "5492ea2bf9aaeb0c5a408c7a33f12f3c0c972beb3cda9ed08a53f4031de702c7",
@@ -346,7 +346,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust-port/crates/devmap-store",
-        "commit": "1c2ea113a359b8edcef889cd350f1dddce7759c5"
+        "commit": "4ccadc604f40e21a3a14471d0af3c7674265e15f"
       },
       "omitted": [
         "tests/",
@@ -366,10 +366,10 @@
       "files": {
         "Cargo.toml": "250c7950f0cbf68ac89b179caa44c98331e84795db515eb58024d24056ad3c3f",
         "src/coverage.rs": "760239ebdfdfd460863af102da560da0ca863086e9c06275bae8423e77fe8191",
-        "src/db.rs": "16b374fa2ebfbac2b9efdef0e87a1ff32512870c83d3fd0617aabb8e7305488c",
+        "src/db.rs": "e5dc425795f69001658e1a5408ffa8af7bfa2685277936767ab5b8b8ba46c1e5",
         "src/edge_index.rs": "b17f0049ff9922999b1d367860a547ff64076731df90671924a7ae3ecce3de5a",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
-        "src/lib.rs": "2d86459f879e5eb3d7f73d536d6f747a0d8b4509b391a9b2c2b1360df5aa750f",
+        "src/lib.rs": "189e97c932a71f282967282540b103003c5c927021e2fe238ce47745ddea892e",
         "src/schema.rs": "872e889252bafc98f6b5dd4ee4c18cd9aaf5ed5a502db18bd8f1759484764d7a"
       }
     },

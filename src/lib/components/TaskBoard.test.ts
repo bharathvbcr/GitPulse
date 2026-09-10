@@ -104,14 +104,14 @@ describe("TaskBoard", () => {
   });
 
   it("uses in-app confirms, a task context menu, liquid glass, and Quick Enhance", () => {
-    expect(source).toContain("askConfirm");
+    expect(source).toContain("canLeave");
     expect(source).not.toContain("window.confirm");
     expect(source).toContain("oncontextmenu");
     expect(source).toContain("TaskContextMenu");
     expect(source).toContain("QuickEnhanceSheet");
     expect(source).toContain("gp-glass");
     expect(source).toContain("gp-btn-danger");
-    expect(source).toContain("deleteTasks");
+    expect(source).toContain("TaskActionDialog");
     expect(source).toContain("removeSelected");
     expect(source).toContain("isContextMenuKey");
     expect(source).toContain("aria-label=\"Task layout\"");

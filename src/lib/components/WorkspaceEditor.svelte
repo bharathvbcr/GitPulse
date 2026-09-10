@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { askConfirm } from "../stores/modalStore";
   import { untrack } from "svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
-  import { askConfirm } from "../stores/modalStore";
   import SettingToggle from "./SettingToggle.svelte";
   import { deleteWorkspace, explainError, newID, putWorkspace, registerRepository, workspaceDraft, WorkbenchError, type Repository, type Workspace, type WorkspaceDraft } from "../workbench/client";
   import { addableOpenTabs, openMembershipCandidates, withRepositoryId, type OpenTabRef } from "../workbench/openMembership";
@@ -10,6 +10,17 @@
   } = $props();
   const initial = untrack(() => value);
   let draft = $state<WorkspaceDraft>(initial ? workspaceDraft(initial) : { name: "", description: "", icon: "", color: "", position: Date.now(), pinned: false, archived: false, repository_ids: [] });
+  const originalDraft = JSON.stringify(untrack(() => draft));
+  let confirming = $state(false);
+  export async function canLeave(): Promise<boolean> {
+    if (saving || adding || confirming) return false;
+    if (pending) { error = "Retry the save before closing this workspace."; return false; }
+    if (JSON.stringify(draft) === originalDraft) return true;
+    confirming = true;
+    try { return await askConfirm({title:"Discard workspace edits?",message:"Your unsaved changes will be lost.",confirmLabel:"Discard edits",cancelLabel:"Keep editing"}); }
+    finally { confirming = false; }
+  }
+  async function close() { if (await canLeave()) onClose(); }
   let extras = $state<Repository[]>([]);
   let error = $state(""); let saving = $state(false); let adding = $state(false); let pending = $state<Record<string, unknown> | null>(null);
   const id = initial?.id ?? newID();
@@ -33,10 +44,10 @@
     finally { adding = false; }
   }
   async function save() {
-    if (adding) return;
+    if (adding || saving || confirming) return;
     saving = true; error = "";
     try { pending ??= { ...draft, id, expected_revision: value?.revision ?? 0, request_id: newID() }; await putWorkspace(pending); onSaved(); onClose(); }
-    catch (cause) { error = explainError(cause); if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code)) pending = null; }
+    catch (cause) { error = explainError(cause); if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error", "protocol_error"].includes(cause.code)) pending = null; }
     finally { saving = false; }
   }
   async function remove() {
@@ -54,9 +65,9 @@
   }
 </script>
 <aside class="workspace-editor gp-glass" aria-label="Workspace settings">
-  <header><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={onClose} type="button" aria-label="Close workspace settings">✕</button></header>
+  <header><h2>{value ? "Workspace settings" : "New workspace"}</h2><button onclick={close} disabled={saving || adding || confirming || pending !== null} type="button" aria-label="Close workspace settings">✕</button></header>
   <form onsubmit={(e) => { e.preventDefault(); void save(); }}>
-    <fieldset disabled={saving || pending !== null}>
+    <fieldset disabled={saving || adding || confirming || pending !== null}>
       <label>Name<input bind:value={draft.name} required maxlength="300" /></label>
       <label>Description<textarea bind:value={draft.description} rows="3" maxlength="16384" ></textarea></label>
       <label>Icon<input bind:value={draft.icon} maxlength="64" placeholder="Optional emoji" /></label>

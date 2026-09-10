@@ -480,9 +480,17 @@ function mutationOk(response: unknown): void {
   if (object(response).ok !== true) return invalid();
 }
 
-/** Soft-delete. History is kept; the same id cannot be reused or restored from the board. */
-export async function deleteTask(id: string, expectedRevision: number, requestId: string): Promise<void> {
-  mutationOk(await request("items.delete", { id, expected_revision: expectedRevision, request_id: requestId }));
+/** Both task action callers share the same deletion receipt validation. */
+export function deleteTask(input: Record<string, unknown>): Promise<void>;
+export function deleteTask(id: string, expectedRevision: number, requestId: string): Promise<void>;
+export async function deleteTask(inputOrId: Record<string, unknown> | string, expectedRevision?: number, requestId?: string): Promise<void> {
+  const input = typeof inputOrId === "string"
+    ? { id: inputOrId, expected_revision: expectedRevision, request_id: requestId }
+    : inputOrId;
+  const receipt = object(await request("items.delete", input));
+  const saved = object(receipt.item);
+  if (receipt.ok !== true || saved.deleted !== true || saved.id !== input.id ||
+      typeof input.expected_revision !== "number" || saved.revision !== input.expected_revision + 1) return invalid();
 }
 
 export async function deleteWorkspace(id: string, expectedRevision: number, requestId: string): Promise<void> {

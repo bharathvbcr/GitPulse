@@ -45,6 +45,7 @@
   const { mount } = await import("svelte");
   const TaskBoard = (await import("../src/lib/components/TaskBoard.svelte")).default;
   mount(TaskBoard, { target: document.getElementById("board") });
+  mount((await import("../src/lib/components/PromptModal.svelte")).default, {target:document.getElementById("board")});
   const NativeNotificationBridge = (await import("../src/lib/components/NativeNotificationBridge.svelte")).default;
   mount(NativeNotificationBridge, { target: document.getElementById("board") });
   const run = document.createElement("button");

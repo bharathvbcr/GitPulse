@@ -1,27 +1,29 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { Clipboard, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2 } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { repoStore } from "../stores/repoStore";
-  import { askConfirm } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { copyText } from "../desktop/clipboard";
   import { LAYERS } from "../ui/layers";
   import { shouldDismissOverlay } from "../ui/dismiss";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove, visibleStatuses } from "../workbench/boardDrag";
   import {
-    deleteTask, explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, putWorkspace, registerRepository,
-    STATUSES, STATUS_LABELS, taskDraft, taskWrite, workspaceDraft,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putWorkspace, registerRepository,
+    STATUSES, STATUS_LABELS, taskDraft, workspaceDraft,
     type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskStatus, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, membershipAfterAttach, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, type BoardLayout, type TaskFacet } from "../workbench/taskOrganize";
-  import { deleteConfirmCopy, deleteRefusal, deleteSummary, deleteTasks, removeFromColumns } from "../workbench/taskDelete";
+  import { removeFromColumns } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
+  import { reorderPlan } from "../workbench/taskOrganization";
+  import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
   import AutomaticEnhancements from "./AutomaticEnhancements.svelte";
@@ -41,6 +43,16 @@
   let error = $state(""); let catalogError = $state(""); let announce = $state("");
   let taskEditor = $state<{ value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
+  let editorHandle = $state<{ canLeave: () => Promise<boolean> }>();
+  let workspaceHandle = $state<{ canLeave: () => Promise<boolean> }>();
+  let pendingUpdate = $state<TaskBatch | null>(null);
+  let actionDialog = $state<{ cards: TaskCard[]; action: TaskAction } | null>(null);
+  let loadedKey = $state("");
+  let unreadError = $state("");
+  let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
+  const boardKey = $derived(JSON.stringify([scope, search]));
+  const displayColumns = $derived(loadedKey === boardKey ? columns : {});
+  $effect(() => { boardKey; facet; selected = new Set(); selectionAnchor = null; menu = null; });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
   let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; x: number; y: number } | null>(null);
@@ -75,13 +87,13 @@
       ? workspaces.find((w) => w.id === target.id)?.name ?? "Workspace"
       : repositories.find((r) => r.id === target.id)?.name ?? "Repository";
   });
-  const total = $derived(STATUSES.reduce((sum, status) => sum + (columns[status]?.total ?? 0), 0));
-  const loadedCards = $derived(allLoadedCards(columns));
+  const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
+  const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
   const filtering = $derived(facetActive(facet) || search.trim().length > 0);
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
-  const selectedCards = $derived(cardsById(columns, selected));
-  const busy = $derived(moving || opening || deleting);
+  const selectedCards = $derived(cardsById(displayColumns, selected));
+  const busy = $derived(moving || opening || deleting || actionDialog !== null || pendingUpdate !== null);
   const shown = $derived.by(() => {
     const counts = Object.fromEntries(STATUSES.map((status) => [status, visibleIn(status).length])) as Partial<Record<TaskStatus, number>>;
     return visibleStatuses(counts, drag !== null);
@@ -89,7 +101,7 @@
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
   function visibleIn(status: TaskStatus): TaskCard[] {
-    return (columns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
+    return (displayColumns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
   }
 
   async function catalog() {
@@ -100,11 +112,11 @@
     catalogError = "";
   }
   async function loadBoard(target: Scope = scope, query: string = search) {
-    const generation = ++revision; loading = true; error = "";
+    const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
     try {
       const pages = await Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query)] as const));
-      if (generation !== revision || disposed) return;
-      columns = Object.fromEntries(pages);
+      if (generation !== revision || disposed || key !== boardKey) return;
+      columns = Object.fromEntries(pages); loadedKey = key;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
@@ -112,11 +124,14 @@
   function loadedHas(id: string, pages: Partial<Record<TaskStatus, Page<TaskCard>>>): boolean {
     return Object.values(pages).some((page) => page?.items.some((item) => item.id === id));
   }
-  async function loadUnread() {
+  async function loadUnread(target: Scope = scope) {
+    const ticket = ++unreadRevision, key = JSON.stringify(target);
     try {
-      const page = await listAttention(scope, "unread");
-      if (!disposed) unread = page.total;
-    } catch { /* keep the last badge rather than invent a zero */ }
+      const page = await listAttention(target, "unread");
+      if (!disposed && ticket === unreadRevision && key === JSON.stringify(scope)) { unread = page.total; unreadError = ""; }
+    } catch (cause) {
+      if (!disposed && ticket === unreadRevision && key === JSON.stringify(scope)) unreadError = explainError(cause);
+    }
   }
   async function refresh() {
     try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
@@ -127,16 +142,19 @@
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { void refresh(); }, 200);
   }
-  async function initialize() {
-    loading = true; catalogError = "";
+  async function initialize(path: string | null = repositoryPath) {
+    const ticket = ++initializationRevision;
+    revision++; unreadRevision++; initialized = false; loading = true; catalogError = "";
     try {
-      if (repositoryPath) { const repo = await registerRepository(repositoryPath); if (disposed) return; scope = { kind: "repository", id: repo.id }; }
+      const repo = path ? await registerRepository(path) : null;
+      if (disposed || ticket !== initializationRevision) return;
+      scope = repo ? { kind: "repository", id: repo.id } : { kind: "global" };
       await catalog();
-      if (!disposed) initialized = true;
-    } catch (cause) { if (!disposed) { catalogError = explainError(cause); loading = false; } }
+      if (!disposed && ticket === initializationRevision) initialized = true;
+    } catch (cause) { if (!disposed && ticket === initializationRevision) { catalogError = explainError(cause); loading = false; } }
   }
+  $effect(() => { const path = repositoryPath; untrack(() => { void initialize(path); }); });
   onMount(() => {
-    void initialize();
     let unlisten: (() => void) | undefined;
     if (isTauri()) void listen("workbench-changed", scheduleRefresh).then((stop) => { if (disposed) stop(); else unlisten = stop; }).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
     const onPointerDown = (event: PointerEvent) => { if (addMenu && shouldDismissOverlay(event.target, "[data-add-repo]")) addMenu = false; };
@@ -148,7 +166,7 @@
     window.addEventListener("pointerdown", onPointerDown, true);
     window.addEventListener("keydown", onKey);
     return () => {
-      disposed = true; revision++; clearTimeout(refreshTimer); unlisten?.(); window.clearInterval(clock);
+      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); unlisten?.(); window.clearInterval(clock);
       window.removeEventListener("focus", scheduleRefresh);
       window.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("keydown", onKey);
@@ -158,7 +176,7 @@
     if (!initialized || !active) return;
     const target = scope, query = search;
     loading = true;
-    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(); }, 250);
+    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
   $effect(() => {
@@ -167,6 +185,7 @@
       return;
     }
     const id = scope.id;
+    workspaceMemberIds = null;
     void getWorkspace(id).then((full) => {
       if (disposed || scope.kind !== "workspace" || scope.id !== id) return;
       workspaceMemberIds = full.repository_ids;
@@ -237,30 +256,46 @@
     try { const next = await listWorkspaces(workspaceCursor); workspaces = [...workspaces, ...next.items.filter((r) => !workspaces.some((old) => old.id === r.id))]; workspaceCursor = next.next_cursor; workspaceTotal = next.total; }
     catch (cause) { catalogError = explainError(cause); }
   }
-  async function editWorkspace(id: string) {
-    opening = true;
-    try {
-      if (!(await confirmDiscard("Open workspace settings? Unsaved task edits will be discarded."))) return;
-      const full = await getWorkspace(id);
-      taskEditor = null; enhanceId = null; workspaceEditor = { value: full };
-    }
-    catch (cause) { error = explainError(cause); } finally { opening = false; }
+  async function confirmDiscard(_message: string): Promise<boolean> {
+    return (!taskEditor || await editorHandle?.canLeave() === true) && (!workspaceEditor || await workspaceHandle?.canLeave() === true);
   }
-  async function confirmDiscard(message: string): Promise<boolean> {
-    if (!taskEditor) return true;
-    return askConfirm({ title: "Discard unsaved task edits?", message, confirmLabel: "Discard", cancelLabel: "Keep editing", destructive: true });
+  async function newWorkspace() {
+    if (busy || !await confirmDiscard("Open a new workspace?") || disposed) return;
+    workspaceEditor = { value: null }; taskEditor = null; enhanceId = null;
+  }
+  async function editWorkspace(id: string) {
+    if (busy) return;
+    opening = true; const ticket = ++openingRevision;
+    try {
+      if (!await confirmDiscard("Open workspace settings?")) return;
+      const full = await bounded(getWorkspace(id));
+      if (disposed || ticket !== openingRevision) return;
+      taskEditor = null; enhanceId = null; workspaceEditor = { value: full };
+    } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
+    finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
   async function openTask(id: string) {
-    if (!(await confirmDiscard("Open another task? Unsaved edits in the current editor will be discarded."))) return;
-    opening = true;
-    try { const full = await getTask(id); workspaceEditor = null; enhanceId = null; taskEditor = { value: full }; }
-    catch (cause) { error = explainError(cause); } finally { opening = false; }
+    if (busy || taskEditor?.value?.id === id) return;
+    opening = true; const ticket = ++openingRevision;
+    try {
+      if (!await confirmDiscard("Open another task?")) return;
+      const full = await bounded(getTask(id));
+      if (disposed || ticket !== openingRevision) return;
+      workspaceEditor = null; enhanceId = null; taskEditor = { value: full };
+    } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
+    finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
   async function pageColumn(status: TaskStatus, cursor?: string) {
-    const generation = revision; loading = true;
-    try { const result = await listTasks(scope, status, search, cursor); if (generation === revision && !disposed) columns = { ...columns, [status]: result }; }
-    catch (cause) { if (generation === revision) error = explainError(cause); }
-    finally { if (generation === revision) loading = false; }
+    if (loading || moving || loadedKey !== boardKey) return;
+    const generation = revision, key = boardKey;
+    loading = true; error = "";
+    try {
+      const result = await listTasks(scope, status, search, cursor);
+      if (generation !== revision || disposed || key !== boardKey) return;
+      const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
+      columns = { ...columns, [status]: { ...result, items, shown: items.length } };
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    finally { if (generation === revision && !disposed) loading = false; }
   }
   function statusAtPoint(x: number, y: number): TaskStatus | null {
     const node = document.elementFromPoint(x, y);
@@ -310,7 +345,12 @@
     if (!shouldCommitMove(current.card.status, over, { moving, fromIndex, insertIndex: current.insertIndex })) return;
     const items = columns[over]?.items ?? [];
     const { before, after } = insertionNeighbors(items, current.card.id, current.insertIndex);
-    void moveCard(current.card, over, insertionPosition(before, after));
+    const position = insertionPosition(before,after);
+    if (after !== null && (position >= after || before !== null && position <= before)) {
+      const plan = reorderPlan(items,current.card,current.insertIndex);
+      if (columns[over]?.next_cursor || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
+      void applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
+    } else void moveCard(current.card, over, position);
   }
   function onCardClick(e: MouseEvent, card: TaskCard) {
     if (skipClick) return;
@@ -340,7 +380,7 @@
       selected = new Set([card.id]);
       selectionAnchor = card.id;
     }
-    menu = { cards: cardsById(columns, selected), column: status, x, y };
+    menu = { cards: cardsById(displayColumns, selected), column: status, x, y };
   }
   function onCardContextMenu(e: MouseEvent, card: TaskCard, status: TaskStatus) {
     e.preventDefault();
@@ -429,61 +469,47 @@
       void removeSelected();
     }
   }
-  async function moveCard(card: TaskCard, status: TaskStatus, position: number) {
-    if (moving) return;
-    if (card.status === status && card.position === position) return;
-    moving = true; error = "";
+  async function applyUpdate(batch: TaskBatch) {
+    if (moving || pendingUpdate && pendingUpdate !== batch) return;
+    moving = true; error = ""; pendingUpdate = batch;
     try {
-      const full = await getTask(card.id);
-      if (full.revision !== card.revision) throw new Error("This task changed while you were moving it. Refresh and try again.");
-      await putTask(taskWrite(full.id, full.revision, { ...taskDraft(full), status, position }));
-      announce = `Moved to ${STATUS_LABELS[status]}`;
-      await loadBoard();
-    } catch (cause) { error = explainError(cause); } finally { moving = false; }
-  }
-  async function patchCards(cards: TaskCard[], patch: { status?: TaskStatus; priority?: number }) {
-    if (moving || cards.length === 0) return;
-    moving = true; error = "";
-    const failed: string[] = [];
-    try {
-      for (const card of cards) {
-        try {
-          const full = await getTask(card.id);
-          if (full.revision !== card.revision) throw new Error("changed");
-          await putTask(taskWrite(full.id, full.revision, { ...taskDraft(full), ...patch }));
-        } catch (cause) {
-          failed.push(`${card.title}: ${explainError(cause)}`);
-        }
-      }
-      if (failed.length) error = failed.join(" ");
-      announce = failed.length ? `Updated ${cards.length - failed.length} of ${cards.length}.` : `Updated ${cards.length === 1 ? "task" : `${cards.length} tasks`}.`;
-      await loadBoard();
+      await batch.run();
+      if (disposed) return;
+      const rows = batch.snapshot();
+      if (!rows.some(row => row.state === "uncertain" || row.state === "waiting")) pendingUpdate = null;
+      const done = rows.filter(row => row.state === "done").length;
+      announce = `${done} of ${rows.length} tasks updated`;
+      if (done) await loadBoard();
+      const failure = rows.find(row => row.state === "uncertain" || row.state === "failed");
+      if (failure) error = failure.error;
     } finally { moving = false; }
   }
+  async function moveCard(card: TaskCard, status: TaskStatus, position: number) {
+    if (busy || card.status === status && card.position === position) return;
+    await applyUpdate(new TaskBatch([card], {kind:"update", changes:{status,position}}));
+  }
+  async function patchCards(cards: TaskCard[], patch: { status?: TaskStatus; priority?: number }) {
+    if (busy || !cards.length) return;
+    if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
+    await applyUpdate(new TaskBatch(cards, {kind:"update", changes:patch}));
+  }
   async function createTask(status: TaskStatus = "inbox") {
+    if (busy) return;
     if (!(await confirmDiscard("Start a new task and discard the current unsaved edits?"))) return;
     workspaceEditor = null; enhanceId = null; taskEditor = { value: null, status };
   }
   async function removeSelected() {
-    const cards = selectedCards.length ? selectedCards : [];
-    const refusal = deleteRefusal({ moving, opening, deleting, enhancing: enhanceId !== null && cards.some((card) => card.id === enhanceId), selected: cards.length });
-    if (refusal) { error = refusal; return; }
-    const copy = deleteConfirmCopy(cards);
-    if (!await askConfirm({ title: copy.title, message: copy.message, confirmLabel: copy.confirmLabel, cancelLabel: "Keep", destructive: true })) return;
-    deleting = true; error = "";
-    try {
-      const result = await deleteTasks(cards, (attempt) => deleteTask(attempt.id, attempt.expected_revision, attempt.request_id), { newID });
-      columns = removeFromColumns(columns, new Set(result.deleted));
-      selected = new Set([...selected].filter((id) => !result.deleted.includes(id)));
-      if (taskEditor?.value && result.deleted.includes(taskEditor.value.id)) taskEditor = null;
-      if (enhanceId && result.deleted.includes(enhanceId)) enhanceId = null;
-      announce = deleteSummary(result);
-      if (result.failed.length) error = deleteSummary(result);
-      else toastStore.success(announce);
-      await loadBoard();
-      await loadUnread();
-    } catch (cause) { error = explainError(cause); }
-    finally { deleting = false; }
+    const cards = selectedCards;
+    if (busy || !cards.length || !await confirmDiscard("Delete selected tasks?")) return;
+    if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
+    actionDialog = { cards: [...cards], action: {kind:"delete"} };
+  }
+  function tasksChanged(ids: string[]) {
+    columns = removeFromColumns(columns, new Set(ids));
+    selected = new Set([...selected].filter(id => !ids.includes(id)));
+    if (taskEditor?.value && ids.includes(taskEditor.value.id)) taskEditor = null;
+    if (enhanceId && ids.includes(enhanceId)) enhanceId = null;
+    if (ids.length) { void loadBoard(); void loadUnread(); }
   }
   async function copyValues(text: string, ok: string) {
     if (await copyText(text)) { announce = ok; toastStore.success(ok); }
@@ -607,7 +633,7 @@
 <div bind:this={boardEl} class="workbench" class:is-dragging={drag !== null} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" aria-label="Task scopes">
-      <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={() => { workspaceEditor = { value: null }; taskEditor = null; enhanceId = null; }}><Plus size={12} /></button></div>
+      <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
       <button type="button" class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>All</button>
       {#each [...visibleWorkspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
         <div class="nav-row"><button type="button" class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title={group.name}>{group.icon} {group.name}{group.archived ? " · Archived" : ""}</button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
@@ -646,9 +672,9 @@
         </div>
         {#if initialized}<AutomaticEnhancements {active} compact />{/if}
         {#if initialized}
-          <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title="Inbox" onclick={() => { showInbox = !showInbox; }}>
+          <button type="button" class="gp-icon-btn" aria-pressed={showInbox} aria-label="Inbox" title={unreadError ? `Notifications unavailable: ${unreadError}` : "Inbox"} onclick={() => { showInbox = !showInbox; }}>
             <Inbox size={13} />
-            {#if unread > 0}<span class="gp-pill">{unread}</span>{/if}
+            {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
           </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => initialized ? refresh() : initialize()} disabled={loading}><RefreshCw size={13} /></button>
@@ -706,6 +732,7 @@
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
     {/if}
+    {#if pendingUpdate && !moving}<div class="banner error" role="alert">Confirm the interrupted task update before making another change.<button class="gp-btn" onclick={() => { if(pendingUpdate) void applyUpdate(pendingUpdate); }}>Retry task update</button></div>{/if}
     {#if showInbox}<AttentionInbox {scope} {active} onopen={openTask} />{/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
@@ -838,9 +865,11 @@
       onOpenEditor={(task) => { enhanceId = null; taskEditor = { value: task }; }}
     />
   {/if}
-  {#if taskEditor}{#key taskEditor}<TaskEditor {active} value={taskEditor.value} seed={taskEditor.seed ?? null} initialStatus={taskEditor.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
-  {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
+  {#if taskEditor}{#key taskEditor}<TaskEditor bind:this={editorHandle} active={active && !actionDialog} value={taskEditor.value} seed={taskEditor.seed ?? null} initialStatus={taskEditor.status ?? "inbox"} {repositories} {workspaces} openTabs={openTabRefs} primary={scope.kind === "repository" ? scope.id : repositories[0]?.id ?? ""} home={scope.kind === "workspace" ? scope.id : null} onSaved={() => { void loadBoard(); }} onClose={() => { taskEditor = null; }} />{/key}{/if}
+  {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
+
+{#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
 
 <style>
   .workbench{position:relative;display:flex;flex:1;min-height:0;min-width:0;color:rgb(var(--c-text));background:transparent;overflow:hidden}
