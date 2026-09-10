@@ -54,8 +54,8 @@ describe("TaskBoard", () => {
     expect(source).not.toContain("Drop a task here");
     expect(source).not.toContain("Activity inbox");
     expect(source).not.toContain("Add repositories to start creating linked tasks");
-    expect(source).toContain(">New<");
-    expect(source).toContain('aria-label="Inbox"');
+    expect(source).toContain("New task</button>");
+    expect(source).toContain('aria-label="Task notifications"');
   });
 
   it("does not wipe columns before fetch and keeps previous cards while busy", () => {
@@ -79,7 +79,8 @@ describe("TaskBoard", () => {
     expect(source).toContain("visibleStatuses");
     expect(source).toContain("insertionPosition");
     expect(source).toContain("shouldCommitMove");
-    expect(source).not.toContain("PRIORITY_LABELS[card.priority]");
+    expect(source).toContain("PRIORITY_LABELS[card.priority]");
+    expect(source).toContain("Change status of ${card.title}");
     expect(source).not.toContain("repoNames(");
   });
 

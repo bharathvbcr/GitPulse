@@ -12,7 +12,7 @@ pub use coverage::{
     COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED,
 };
 pub use db::{
-    checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage,
+    checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
     GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport, PendingReconcile,
     PendingSupersede, PendingWatermark, SearchPage, Store, StoreStatus, StoredEdge, StoredFile,
     StoredSymbol, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,

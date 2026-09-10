@@ -476,6 +476,13 @@ export async function putTask(input: Record<string, unknown>): Promise<Task> {
 }
 export async function putWorkspace(input: Record<string, unknown>): Promise<Workspace> { return record(await request("workspaces.put", input), workspace); }
 
+export async function deleteTask(input: Record<string, unknown>): Promise<void> {
+  const receipt = object(await request("items.delete", input));
+  const saved = object(receipt.item);
+  if (receipt.ok !== true || saved.deleted !== true || saved.id !== input.id ||
+      typeof input.expected_revision !== "number" || saved.revision !== input.expected_revision + 1) return invalid();
+}
+
 export function automationSettings(value: unknown): AutomationSettings {
   const raw = object(value), base = version(raw), provider = nullableText(raw.provider), model = nullableText(raw.model);
   if (base.id !== "profile" || (provider === null) !== (model === null) ||

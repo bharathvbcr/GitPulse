@@ -288,18 +288,15 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
     } = response;
     let mut out = match resolution {
         ResolutionAvailability::Unavailable { reason } => CodeintelResponse::unavailable(reason),
-        ResolutionAvailability::Available => {
-            let mut out = CodeintelResponse::ok(
-                items.into_iter().map(map).collect(),
-                total,
-                shown,
-                truncated,
-            );
-            out.walk_incomplete = walk_incomplete;
-            out.rungs = rungs.map(CodeintelRungHistogram::from);
-            out
-        }
+        ResolutionAvailability::Available => CodeintelResponse::ok(
+            items.into_iter().map(map).collect(),
+            total,
+            shown,
+            truncated,
+        ),
     };
+    out.walk_incomplete = walk_incomplete;
+    out.rungs = rungs.map(CodeintelRungHistogram::from);
     out.source_freshness = source_freshness;
     out
 }
@@ -896,7 +893,7 @@ pub struct CodeintelAffectedTests {
     pub targets: Vec<String>,
     pub tests: CodeintelResponse<CodeintelAffectedTest>,
     pub blast_radius: CodeintelBlastRadius,
-    /// True when the map was stale, a walk incomplete, or a seed unmatched —
+    /// True when the map was stale, an answer incomplete or truncated, or a seed unmatched —
     /// callers must fall back to the full suite and say why.
     pub fail_closed: bool,
     pub fail_closed_reason: Option<String>,
@@ -989,50 +986,56 @@ pub fn affected_tests(
             fail_closed_reason: Some(reason),
         };
     }
-    let engine = StoreQueryEngine::new(&store);
-    let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
-    let depth = max_depth.unwrap_or(10);
-    let mut all_tests = Vec::new();
-    let mut walk_incomplete: Option<String> = None;
+    affected_tests_from_store(
+        &store,
+        targets,
+        token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
+        max_depth.unwrap_or(10),
+    )
+}
+
+fn affected_tests_from_store(
+    store: &Store,
+    targets: &[String],
+    budget: u32,
+    depth: usize,
+) -> CodeintelAffectedTests {
+    let engine = StoreQueryEngine::new(store);
+    let mut tests = None;
+    let mut layers = None;
     let mut unmatched = Vec::new();
     let mut seeds = Vec::new();
     let mut total_impacted = 0u32;
-    let mut layers_items = Vec::new();
-    let mut any_unavailable = false;
-    let mut unavailable_reason = None;
-
-    for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
-        match engine.affected_tests(chunk, budget, 0.0, depth) {
+    let chunks = targets.chunks(MAX_NEIGHBOR_TARGETS);
+    let chunk_count = u32::try_from(chunks.len()).unwrap_or(u32::MAX).max(1);
+    for (index, chunk) in chunks.enumerate() {
+        // One caller budget across all batches, including the remainder.
+        let chunk_budget =
+            budget / chunk_count + u32::from(index < (budget % chunk_count) as usize);
+        match engine.affected_tests(chunk, chunk_budget, 0.0, depth) {
             Ok(report) => {
                 unmatched.extend(report.blast_radius.unmatched_targets);
                 seeds.extend(report.blast_radius.seeds);
                 total_impacted = total_impacted.saturating_add(report.blast_radius.total_impacted);
-                let tests = from_engine(report.tests, |t| CodeintelAffectedTest {
-                    path: t.path,
-                    depth: t.depth,
-                    symbols: t.symbols,
-                    reached_symbols: t.reached_symbols,
-                });
-                if !tests.available {
-                    any_unavailable = true;
-                    unavailable_reason = tests.reason.clone();
-                }
-                if let Some(reason) = tests.walk_incomplete {
-                    walk_incomplete = Some(match walk_incomplete {
-                        Some(existing) => format!("{existing}; {reason}"),
-                        None => reason,
-                    });
-                }
-                all_tests.extend(tests.items);
-                let mapped_layers =
+                append_affected_response(
+                    &mut tests,
+                    from_engine(report.tests, |t| CodeintelAffectedTest {
+                        path: t.path,
+                        depth: t.depth,
+                        symbols: t.symbols,
+                        reached_symbols: t.reached_symbols,
+                    }),
+                );
+                append_affected_response(
+                    &mut layers,
                     from_engine(report.blast_radius.layers, |layer| CodeintelBlastLayer {
                         depth: layer.depth,
                         nodes: layer.nodes,
                         node_count: layer.node_count,
                         nodes_omitted: layer.nodes_omitted,
                         lowest_confidence: layer.lowest_confidence,
-                    });
-                layers_items.extend(mapped_layers.items);
+                    }),
+                );
             }
             Err(e) => {
                 return CodeintelAffectedTests {
@@ -1054,40 +1057,98 @@ pub fn affected_tests(
             }
         }
     }
-
-    let shown = u32::try_from(all_tests.len()).unwrap_or(u32::MAX);
-    let mut tests = CodeintelResponse::ok(all_tests, shown, shown, false);
-    tests.walk_incomplete = walk_incomplete.clone();
-
-    let fail_closed = any_unavailable || !unmatched.is_empty() || walk_incomplete.is_some();
-    let fail_closed_reason = if any_unavailable {
-        unavailable_reason
-            .clone()
-            .or_else(|| Some("query unavailable".into()))
-    } else if !unmatched.is_empty() {
-        Some(format!(
-            "{} seed(s) matched nothing in the map",
-            unmatched.len()
-        ))
-    } else {
-        walk_incomplete.clone()
-    };
-
-    let layer_shown = u32::try_from(layers_items.len()).unwrap_or(u32::MAX);
+    let mut tests = tests.unwrap_or_else(|| CodeintelResponse::unavailable("no target batches"));
+    let mut layers = layers.unwrap_or_else(|| CodeintelResponse::unavailable("no target batches"));
+    if chunk_count > 1 {
+        // Batches can overlap and observe different generations. Do not claim
+        // a unique, coherent union from their independently bounded answers.
+        let scope = format!("combined {chunk_count} independently queried target batches; totals count occurrences across batches and may repeat symbols or files");
+        append_affected_reason(&mut tests.walk_incomplete, Some(scope.clone()));
+        append_affected_reason(&mut layers.walk_incomplete, Some(scope));
+    }
+    let available = tests.available && layers.available;
+    let mut reason = tests.reason.clone();
+    append_affected_reason(&mut reason, layers.reason.clone());
+    let mut fail_closed_reason = reason.clone();
+    append_affected_reason(&mut fail_closed_reason, tests.walk_incomplete.clone());
+    append_affected_reason(&mut fail_closed_reason, layers.walk_incomplete.clone());
+    if tests.truncated || layers.truncated {
+        append_affected_reason(
+            &mut fail_closed_reason,
+            Some("query budget omitted affected tests or blast-radius layers".into()),
+        );
+    }
+    if !unmatched.is_empty() {
+        append_affected_reason(
+            &mut fail_closed_reason,
+            Some(format!(
+                "{} seed(s) matched nothing in the map",
+                unmatched.len()
+            )),
+        );
+    }
+    if !available && fail_closed_reason.is_none() {
+        fail_closed_reason = Some("query unavailable".into());
+    }
     CodeintelAffectedTests {
-        available: !any_unavailable,
-        reason: unavailable_reason,
+        available,
+        reason,
         targets: targets.to_vec(),
         tests,
         blast_radius: CodeintelBlastRadius {
             seeds,
             unmatched_targets: unmatched,
-            layers: CodeintelResponse::ok(layers_items, layer_shown, layer_shown, false),
+            layers,
             total_impacted,
         },
-        fail_closed,
+        fail_closed: fail_closed_reason.is_some(),
         fail_closed_reason,
     }
+}
+
+fn append_affected_reason(target: &mut Option<String>, incoming: Option<String>) {
+    if let Some(incoming) = incoming {
+        match target {
+            Some(existing) if *existing != incoming => {
+                existing.push_str("; ");
+                existing.push_str(&incoming);
+            }
+            None => *target = Some(incoming),
+            _ => {}
+        }
+    }
+}
+
+/// Both lists in an affected-test answer retain the same envelope semantics.
+fn append_affected_response<T>(
+    target: &mut Option<CodeintelResponse<T>>,
+    incoming: CodeintelResponse<T>,
+) {
+    let Some(existing) = target else {
+        *target = Some(incoming);
+        return;
+    };
+    existing.available &= incoming.available;
+    existing.total = existing.total.saturating_add(incoming.total);
+    existing.shown = existing.shown.saturating_add(incoming.shown);
+    existing.truncated |= incoming.truncated;
+    existing.items.extend(incoming.items);
+    append_affected_reason(&mut existing.reason, incoming.reason);
+    append_affected_reason(&mut existing.walk_incomplete, incoming.walk_incomplete);
+    existing.source_freshness = match (existing.source_freshness, incoming.source_freshness) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    };
+    existing.rungs = match (existing.rungs.take(), incoming.rungs) {
+        (Some(left), Some(right)) => Some(CodeintelRungHistogram {
+            deterministic: left.deterministic.saturating_add(right.deterministic),
+            high: left.high.saturating_add(right.high),
+            speculative: left.speculative.saturating_add(right.speculative),
+            filtered_out: left.filtered_out.saturating_add(right.filtered_out),
+        }),
+        _ => None,
+    };
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1661,6 +1722,127 @@ mod tests {
     }
 
     /* ── Finding 1: a refusal must not render as an answer ────────────────── */
+
+    #[test]
+    fn affected_test_aggregation_keeps_budget_omissions_and_refusals() {
+        let repo = repo_with_one_generation();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute(
+            "UPDATE paths SET path = 'tests/probe_test.rs' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_read_only(map_path(repo.path())).unwrap();
+        let targets = vec!["probe_callee".to_owned()];
+        let raw = StoreQueryEngine::new(&store)
+            .affected_tests(&targets, 0, 0.0, 10)
+            .unwrap();
+        assert!(raw.tests.truncated);
+        assert_eq!(raw.tests.total, 1);
+        assert!(raw.blast_radius.layers.truncated);
+        let report = affected_tests_from_store(&store, &targets, 0, 10);
+        assert_eq!(report.tests.total, 1);
+        assert_eq!(report.tests.shown, 0);
+        assert!(report.tests.truncated);
+        assert_eq!(
+            report.blast_radius.layers.total,
+            raw.blast_radius.layers.total
+        );
+        assert!(report.blast_radius.layers.truncated);
+        assert!(report.fail_closed);
+        assert!(report.fail_closed_reason.is_some());
+
+        let empty = Store::open_in_memory().unwrap();
+        let refused = affected_tests_from_store(&empty, &targets, 2000, 10);
+        assert!(!refused.tests.available);
+        assert!(!refused.blast_radius.layers.available);
+        assert!(refused.fail_closed);
+    }
+
+    #[test]
+    fn affected_test_batches_share_budget_and_disclose_overlap() {
+        let repo = repo_with_one_generation();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute(
+            "UPDATE paths SET path = 'tests/probe_test.rs' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_read_only(map_path(repo.path())).unwrap();
+        let targets = vec!["probe_callee".to_owned(); MAX_NEIGHBOR_TARGETS + 1];
+        let report = affected_tests_from_store(&store, &targets, 100, 10);
+        let engine = StoreQueryEngine::new(&store);
+        let mut expected_shown = 0;
+        let mut tokens = 0;
+        for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
+            let part = engine.affected_tests(chunk, 50, 0.0, 10).unwrap();
+            tokens += part.tests.tokens_used + part.blast_radius.layers.tokens_used;
+            expected_shown += part.tests.shown;
+        }
+        assert!(tokens <= 100);
+        assert_eq!(report.tests.shown, expected_shown);
+        assert_eq!(report.tests.total, 2);
+        assert!(report
+            .tests
+            .walk_incomplete
+            .as_deref()
+            .unwrap()
+            .contains("count occurrences"));
+        assert!(report.blast_radius.layers.walk_incomplete.is_some());
+        assert!(report.fail_closed);
+    }
+
+    #[test]
+    fn affected_response_merge_keeps_independent_failure_metadata() {
+        let mut first = CodeintelResponse::ok(vec![1], 2, 1, true);
+        first.walk_incomplete = Some("parse loss".into());
+        first.source_freshness = Some(true);
+        let mut second = CodeintelResponse::unavailable("index unavailable");
+        second.walk_incomplete = Some("depth capped".into());
+        second.source_freshness = Some(false);
+        let mut combined = Some(first);
+        append_affected_response(&mut combined, second);
+        let result = combined.unwrap();
+        assert!(!result.available);
+        assert_eq!(result.reason.as_deref(), Some("index unavailable"));
+        assert_eq!(result.total, 2);
+        assert_eq!(result.shown, 1);
+        assert!(result.truncated);
+        assert_eq!(result.source_freshness, Some(false));
+        let reason = result.walk_incomplete.unwrap();
+        assert!(reason.contains("parse loss") && reason.contains("depth capped"));
+    }
+
+    #[test]
+    fn unavailable_answers_preserve_coverage_and_resolution_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        let mut response = StoreQueryEngine::new(&store)
+            .impact(Request {
+                query: "missing".into(),
+                token_budget: 2000,
+                min_confidence: 0.0,
+                max_depth: 3,
+            })
+            .unwrap();
+        response.walk_incomplete = Some("repository-wide attribution coverage is unknown".into());
+        response.source_freshness = Some(false);
+        response.rungs = Some(RungHistogram {
+            deterministic: 2,
+            high: 1,
+            speculative: 3,
+            filtered_out: 4,
+        });
+        let mapped = from_engine(response, |edge| edge.source_symbol);
+        assert!(!mapped.available);
+        assert_eq!(mapped.source_freshness, Some(false));
+        assert_eq!(
+            mapped.walk_incomplete.as_deref(),
+            Some("repository-wide attribution coverage is unknown")
+        );
+        assert_eq!(mapped.rungs.unwrap().filtered_out, 4);
+    }
 
     /// The defect this whole module's honesty rests on.
     ///

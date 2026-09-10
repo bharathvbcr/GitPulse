@@ -853,6 +853,15 @@ pub struct SearchPage {
     pub analysis: Option<AnalysisDisclosure>,
 }
 
+/// File parse state, touching edges, and coverage from one pinned generation.
+#[derive(Debug, Clone)]
+pub struct FileEdges {
+    pub generation: u32,
+    pub file: StoredFile,
+    pub edges: Vec<StoredEdge>,
+    pub analysis: Option<AnalysisDisclosure>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredSymbol {
     pub name: String,
@@ -6049,6 +6058,27 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::all_symbols_in(&snapshot, gen)
+    }
+
+    /// Semantic ranking needs all symbols, qualified by the same snapshot's
+    /// source root and analysis. No lock is held while the caller ranks them.
+    pub fn all_symbols_page(&self) -> Result<Option<SearchPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let rows = Self::all_symbols_in(&snapshot, generation)?;
+        Ok(Some(SearchPage {
+            generation,
+            total: u32::try_from(rows.len()).map_err(|_| refusal("symbol count exceeds u32"))?,
+            rows,
+            repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+            analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+        }))
+    }
+
+    fn all_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<StoredSymbol>> {
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
@@ -6108,24 +6138,28 @@ impl Store {
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
-        let repo_root: Option<Option<String>> = snapshot
-            .query_row(
-                "SELECT repo_root FROM generations WHERE id = ?1",
-                params![generation],
-                |row| row.get(0),
-            )
-            .optional()?;
         Ok(Some(SearchPage {
             generation,
             total: Self::count_search_symbols_locked(&snapshot, generation, query)?,
             rows: Self::search_symbols_locked(&snapshot, generation, query, limit)?,
-            repo_root: repo_root.flatten().filter(|root| !root.is_empty()),
+            repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
             // Inside the same snapshot as the rows and the count, through the
             // one reader that strips the summary's two vectors in SQLite. A
             // search that finds nothing is only a completed check if the corpus
             // it searched was complete, and that is the fact this carries.
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
         }))
+    }
+
+    fn generation_repo_root_in(snapshot: &Connection, generation: u32) -> Result<Option<String>> {
+        let root: Option<Option<String>> = snapshot
+            .query_row(
+                "SELECT repo_root FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(root.flatten().filter(|root| !root.is_empty()))
     }
 
     fn search_symbols_locked(
@@ -6229,6 +6263,10 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        Self::file_in(&snapshot, gen, path)
+    }
+
+    fn file_in(snapshot: &Connection, gen: u32, path: &str) -> Result<Option<StoredFile>> {
         let raw: Option<(String, String, i64, String, String)> = snapshot
             .query_row(
                 "SELECT p.path, f.language, f.content_hash,
@@ -6532,6 +6570,33 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::edges_for_file_in(&snapshot, gen, path, min_confidence)
+    }
+
+    /// Dependencies must not attach an old parse outcome to a newer edge set.
+    pub fn file_edges(&self, path: &str, min_confidence: f32) -> Result<Option<FileEdges>> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let Some(file) = Self::file_in(&snapshot, generation, path)? else {
+            return Ok(None);
+        };
+        Ok(Some(FileEdges {
+            generation,
+            file,
+            edges: Self::edges_for_file_in(&snapshot, generation, path, min_confidence)?,
+            analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+        }))
+    }
+
+    fn edges_for_file_in(
+        snapshot: &Connection,
+        gen: u32,
+        path: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<StoredEdge>> {
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
                     e.edge_kind, e.confidence, e.resolution

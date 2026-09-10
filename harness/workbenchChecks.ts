@@ -14,7 +14,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
     return element;
   };
   const field = (name: string, selector: string, root: ParentNode = editor()) => {
-    const label = [...root.querySelectorAll("label")].find((label) => label.textContent?.trim() === name && label.querySelector(selector));
+    const label = [...root.querySelectorAll("label")].find((label) => (label.textContent?.trim() === name || label.querySelector(selector)?.getAttribute("aria-label") === name) && label.querySelector(selector));
     const element = label?.querySelector(selector);
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) throw new Error(`Missing field: ${name}`);
     return element;
@@ -54,8 +54,9 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   fill("Description", "textarea", description);
   fill("Acceptance criteria", "textarea", "Both repository checks remain available");
   check("GitPulse").click();
+  await wait(() => !button("Save task", editor()).disabled);
   button("Save task", editor()).click();
-  await wait(() => editor().querySelector("header small")?.textContent === "Revision 1");
+  await wait(() => editor().dataset.taskRevision === "1");
   button("Manvi enhancements +", editor()).click();
   await wait(() => field("Model", "input").value === "fixture-model");
   button("Generate suggestion", editor()).click();
@@ -71,7 +72,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => !button("Save suggestion edits", editor()).matches(":disabled"));
   button("Save suggestion edits", editor()).click();
   await wait(() => editor().textContent?.includes("Suggestion saved. The task has not changed.") === true);
-  assert(editor().querySelector("header small")?.textContent === "Revision 1", "Suggestion editing changed the task revision");
+  assert(editor().dataset.taskRevision === "1", "Suggestion editing changed the task revision");
   assert(field("Title", "input").value === title, "Suggestion editing changed the task title");
   assert(review().textContent?.includes(`${title} (clarified)`) === true && review().textContent?.includes(revisedTitle) === true, "Original or edited suggestion was lost");
   results.push("Suggestion edits preserve original model text and await task acceptance");
@@ -81,14 +82,14 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   await wait(() => editor().textContent?.includes("The result needs reconciliation") === true);
   assert(field("Title", "input").matches(":disabled"), "Uncertain acceptance allowed task edits");
   button("Retry pending action", editor()).click();
-  await wait(() => editor().querySelector("header small")?.textContent === "Revision 2" && state("Accepted"));
+  await wait(() => editor().dataset.taskRevision === "2" && state("Accepted"));
   assert(field("Title", "input").value === revisedTitle, "Selected edited title was not applied");
   assert(field("Description", "textarea").value === description, "Unselected description changed");
   assert(field("Acceptance criteria", "textarea").value === "Both repository checks remain available", "Acceptance criteria changed");
   assert(check("Title", review()).checked && !check("Description", review()).checked, "Accepted review marks an unaccepted field as accepted");
   results.push("Lost acceptance reply reconciles once and displays only accepted fields");
   button("Undo accepted fields", editor()).click();
-  await wait(() => editor().querySelector("header small")?.textContent === "Revision 3" && state("Undone"));
+  await wait(() => editor().dataset.taskRevision === "3" && state("Undone"));
   assert(field("Title", "input").value === title && field("Description", "textarea").value === description, "Undo did not restore the selected field");
   results.push("Undo preserves unrelated description and task evidence");
   await wait(() => !field("Title", "input").matches(":disabled") && !button("Save task", editor()).matches(":disabled"));
@@ -97,7 +98,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   results.push("Unsaved edits prevent generation from an outdated task snapshot");
   check("Keep description during enhancements").click();
   button("Save task", editor()).click();
-  await wait(() => editor().querySelector("header small")?.textContent === "Revision 4");
+  await wait(() => editor().dataset.taskRevision === "4");
   assert(check("Rewrite description (locked)").disabled && !check("Rewrite description (locked)").checked, "Saved field lock was not applied");
   button("Generate suggestion", editor()).click();
   await wait(() => state("Ready for review") && review().textContent?.includes("source revision 4") === true);
@@ -124,7 +125,7 @@ export async function runWorkbenchChecks(): Promise<string[]> {
   const automaticTitle = `${title} after saved evidence`;
   fill("Title", "input", automaticTitle);
   button("Save task", editor()).click();
-  await wait(() => editor().querySelector("header small")?.textContent === "Revision 5");
+  await wait(() => editor().dataset.taskRevision === "5");
   await wait(() => [...editor().querySelectorAll(".history button")].some((entry) => entry.textContent?.includes("Ready for review") && entry.textContent.includes("Task revision 5 · Automatic suggestion")));
   const automaticEntry = [...editor().querySelectorAll<HTMLButtonElement>(".history button")].find((entry) => entry.textContent?.includes("Task revision 5 · Automatic suggestion"));
   if (!automaticEntry) throw new Error("Automatic suggestion was not exposed for review");

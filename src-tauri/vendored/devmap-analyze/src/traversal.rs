@@ -196,6 +196,7 @@ pub trait GraphIndex {
 /// DevCouncil's ~944,000-edge graph copied the whole graph first.
 pub struct AdjacencyIndex<'a> {
     reverse: bool,
+    min_confidence: Option<f32>,
     edges: &'a [ResolvedEdge],
     /// A B-tree, not a hash map, and measured: `traversal_allocation` holds
     /// this index to a *flat* per-input-edge allocation, and a hash map's
@@ -239,11 +240,19 @@ impl<'a> AdjacencyIndex<'a> {
         }
         Self {
             reverse,
+            min_confidence: None,
             edges,
             adjacency,
             labels,
             empty: Vec::new(),
         }
+    }
+
+    /// Filter before traversal so an excluded bridge cannot expose nodes on
+    /// its far side. The query boundary validates the requested threshold.
+    pub fn with_min_confidence(mut self, min_confidence: f32) -> Self {
+        self.min_confidence = Some(min_confidence);
+        self
     }
 }
 
@@ -271,8 +280,9 @@ impl GraphIndex for AdjacencyIndex<'_> {
         &self.labels[&self.edges[id as usize].edge_kind]
     }
 
-    fn admits(&self, _id: u32) -> bool {
-        true
+    fn admits(&self, id: u32) -> bool {
+        self.min_confidence
+            .is_none_or(|floor| self.edges[id as usize].confidence.0 >= floor)
     }
 }
 

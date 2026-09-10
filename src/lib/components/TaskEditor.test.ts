@@ -11,7 +11,7 @@ describe("TaskEditor", () => {
   });
 
   it("shows title, description, and status immediately; folds locks, notifications, repos, and copy-brief", () => {
-    const markup = source.slice(source.indexOf("<aside"));
+    const markup = source.slice(source.indexOf("<form class:concealed"));
     const detailsAt = markup.indexOf("<details");
     expect(detailsAt).toBeGreaterThan(0);
     const before = markup.slice(0, detailsAt);
