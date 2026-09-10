@@ -25,11 +25,11 @@ fn main() {
 /// copy too, so the unresolved import is something else. Naming it would take
 /// another run against a Windows host; the fix is the same either way.
 ///
-/// `rustc-link-arg-tests` covers `--test` binaries. This package also builds a
-/// Windows `cdylib` (`crate-type` includes it for the GUI), and `cargo test
-/// --lib` loads that library: without the same manifest the lib test harness
-/// died at process start with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) while
-/// integration tests that received `-tests` flags still ran.
+/// `rustc-link-arg-tests` covers integration binaries. The lib unit-test
+/// harness is a separate executable (`unittests src/lib.rs`) that still
+/// reaches muda/wry and died at load with STATUS_ENTRYPOINT_NOT_FOUND
+/// (0xc0000139) after those suites already passed. Pass the same manifest
+/// as a bin and catch-all link arg so that harness is not a third class.
 fn embed_test_manifest() {
     println!("cargo:rerun-if-changed=tests.manifest");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
@@ -39,7 +39,12 @@ fn embed_test_manifest() {
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests.manifest");
     let path = manifest.display();
-    for kind in ["rustc-link-arg-tests", "rustc-cdylib-link-arg"] {
+    for kind in [
+        "rustc-link-arg-tests",
+        "rustc-cdylib-link-arg",
+        "rustc-link-arg-bins",
+        "rustc-link-arg",
+    ] {
         println!("cargo:{kind}=/MANIFEST:EMBED");
         println!("cargo:{kind}=/MANIFESTINPUT:{path}");
     }

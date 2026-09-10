@@ -26,7 +26,12 @@ describe("Windows test binaries and the lib cdylib share the comctl32 manifest",
     expect(buildRs).toContain("tests.manifest");
     const kinds = [...buildRs.matchAll(/"(rustc-[^"]+)"/g)].map((m) => m[1]);
     expect(kinds).toEqual(
-      expect.arrayContaining(["rustc-link-arg-tests", "rustc-cdylib-link-arg"]),
+      expect.arrayContaining([
+        "rustc-link-arg-tests",
+        "rustc-cdylib-link-arg",
+        "rustc-link-arg-bins",
+        "rustc-link-arg",
+      ]),
     );
   });
 
