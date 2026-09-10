@@ -418,7 +418,7 @@ static WINDOW_CLASS: Lazy<WindowClass> = Lazy::new(|| unsafe {
     sel!(canBecomeKeyWindow),
     is_focusable as extern "C" fn(_, _) -> _,
   );
-  decl.add_method(sel!(sendEvent:), send_event as extern "C" fn(_, _, _));
+  decl.add_method(sel!(sendEvent:), send_event as extern "C-unwind" fn(_, _, _));
   // progress bar states, follows ProgressState
   decl.add_ivar::<Bool>(CStr::from_bytes_with_nul(b"focusable\0").unwrap());
   WindowClass(decl.register())
@@ -431,7 +431,9 @@ extern "C" fn is_focusable(this: &Object, _: Sel) -> Bool {
   }
 }
 
-extern "C" fn send_event(this: &Object, _sel: Sel, event: &NSEvent) {
+// Like TaoApp's sendEvent:, this forwards into AppKit, whose exceptions must
+// be able to unwind back to the native event-dispatch handler.
+extern "C-unwind" fn send_event(this: &Object, _sel: Sel, event: &NSEvent) {
   unsafe {
     let event_type = event.r#type();
     if event_type == NSEventType::LeftMouseDown {

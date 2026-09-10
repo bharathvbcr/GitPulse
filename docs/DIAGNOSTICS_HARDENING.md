@@ -1,4 +1,194 @@
-# Code pane diagnostics and hardening audit
+# Diagnostics and runtime hardening audit
+
+## Native crashes on 2026-09-09
+
+Starting revision: `d2d8713`. The installed GitPulse 0.1.0 crashed at
+15:13:19 CDT on macOS 27.0 build `26A5425a`.
+
+- **Verified:** `gitpulse-2026-09-09-151321.ips` records `SIGABRT`,
+  `panic_cannot_unwind`, and `tao::platform_impl::platform::app::send_event`
+  on the main thread. The durable log records the same boundary panic.
+  The macOS unified log records `NSCampoLightweightUIController.m:1429`
+  asserting after “Mouse entered” immediately before the abort.
+- **Inferred:** that AppKit assertion raised an Objective-C exception which
+  hit TAO's non-unwinding `sendEvent:` callback. Native subprocess tests
+  independently reproduce that abort mechanism through both actual TAO
+  overrides. The private assertion's specific UI preconditions remain unverified.
+- **Verified:** contemporaneous MCP crash reports and the durable log show
+  `RingLogger::write_entry` panicking on `failed printing to stderr: Broken
+  pipe (os error 32)`, then aborting when the panic hook writes there again.
+
+The application and window forwarding callbacks now use `extern "C-unwind"`
+in both their definitions and Objective-C registrations. Exceptions propagate
+to the native catcher; they are not swallowed or retried. The Command-key
+release and window-drag dispatch branches are retained. See
+[Rust's FFI guidance](https://doc.rust-lang.org/nomicon/ffi.html#ffi-and-unwinding)
+and [objc2's method implementation type](https://docs.rs/objc2/0.6.4/objc2/runtime/type.Imp.html).
+
+## Expanded adversarial audit
+
+The audit followed the shared failure paths through native dispatch, logging,
+panic recovery, durable files, hooks, MCP, daemon output, and preview shutdown.
+It also ran the complete existing native and frontend suites and all seven
+browser harnesses. This is a bounded qualification of those contracts, not
+an assertion that every subsystem or every possible external failure is safe.
+
+| Verified finding | Fix and regression evidence |
+| --- | --- |
+| Closed or nonblocking-full stderr could abort a native callback or cause a second panic during unwinding. | Fallible shared output, one disable notice in the ring/disk, and continued logging. Original OS-pipe subprocess tests aborted before the fix. |
+| A blocking-full stderr pipe froze the logger even after write errors were handled. | `output::BoundedOutput` isolates host-owned writes with bounded admission and acknowledgement. Real full-pipe tests timed out before the change and now preserve normal operation and panic recovery. |
+| The chained default panic hook printed the raw payload outside redaction. | The installed hook owns payload, location, and bounded-backtrace diagnostics end to end. Reinstating the original hook reproduced a leak using a recognized synthetic `access_token`. Panic propagation remains intact. |
+| Native prose redaction had an incomplete name list despite the shared credential table already containing `token`. | Generate the three assignment regexes from the canonical names/suffixes. Table-driven tests failed on `token=value` before the fix and retain quoted/embedded, idempotence, and benign-neighbor checks. Header/PEM parsers retain their distinct grammars. |
+| Log files followed symlinks and hardlinks and changed foreign bytes/permissions. FIFO targets blocked opening or reading. The directory itself could be a symlink. | Validate opened regular-file handles and link counts before I/O or permission changes; refuse final-component links and directory aliases. Unix opens are nonblocking. Child-process tests preserve foreign sentinels and exercise both log generations. |
+| Failed rotation could truncate a substituted foreign target. | Disable disk writes with a recorded degradation instead of truncating. The original rotation body destroyed the test sentinel; the fixed body preserves it. |
+| Independent loggers kept stale byte counts and file handles across shared rotations. | A stable sidecar lock coordinates cooperating processes; reopen and measure the current generation while holding it. A pre-fix test exceeded the active size bound between rotations. Eight simultaneous processes also verify 800 complete worker records without interleaving or omissions. |
+| Diagnostic tails held the generation lock while decoding and redacting, starving simultaneous writers until their bounded lock wait expired. | Snapshot bounded bytes under the lock, then release it before decoding/redaction. A repeated eight-process test reproduced missing records and explicit lock-deadline failures; 30 repetitions after the fix preserved all 24,000 expected worker records. |
+| A dense sub-megabyte legacy log decoded and redacted 100,001 lines before returning only the tail. | Cap line decoding/redaction at 500 per generation, preserving newest-first selection and final chronological ordering. The retained test failed on the original 100,001-line result and now verifies exact tail size and credential redaction. |
+| Cleanup could label a completed run as interrupted when completion happened between reading history and probing the run lock. | Establish ownership before reading. Idle snapshots retain the run lease; busy snapshots may conservatively remain busy for one poll. The controlled interleaving test reproduced the false interrupted status before the fix. All 25 cleanup tests passed, followed by 100 forced interleavings and 480 actual cleanup runs. |
+| A watcher test changed process-wide cwd while unrelated Git commands were being spawned, allowing a child clone to inherit a subsequently deleted temporary directory. | Run the existing cwd-sensitive assertions in a child with a 15-second deadline. The complete suite exposed `getcwd: cannot access parent directories` and a failed checkout; 30 repeated paired watcher/real-clone runs pass after isolation. Production Git behavior and watcher assertions remain intact. |
+| Dropping a lock descriptor did not release the lock while forked/duplicated descriptors retained its open file description. | Use an explicit-unlock guard and surface release failures through the sink's degraded state. A retained duplicate reproduced the extended lock lifetime before the fix. |
+| A 100 ms disk-lock admission budget permanently disabled a logger during healthy startup contention. | Allow one second for competing owners to finish, retaining bounded failure. A lock released after 250 ms failed the old regression; a permanently held lock still fails closed within the tested bound. This is a deliberate disk-admission policy change; the 100 ms stderr deadline is unchanged. |
+| Hook input had no byte or wall-clock ceiling; missing/invalid input could panic when stderr was closed. | Bound complete JSON documents at 4 MiB and input waiting at five seconds. Reuse the existing hook budget helper with fallible thread creation. All diagnostic branches use the canonical logger; failures retain empty stdout and exit 0. Pre-fix real-process and oversized-document tests failed. |
+| Daemon stdout could panic or stall on a closed/full pipe. | Use the shared bounded writer for help and reports; log failure and exit 1 without retries. Argument errors still exit 2 with closed stderr. Both old error paths exited 101 in the new regressions. |
+| MCP stdout could stall request handling indefinitely; an asynchronous write failure could leave the main thread waiting on open stdin. | Bound wire writes and use a bounded input worker whose consumer observes output cancellation. The valid modern-request fixture asserts it takes the asynchronous path. The original input reader then timed out; the fixed path exits. Existing framing, EOF drain, concurrency and exactly-one-response tests remain applicable. |
+| Preview cleanup raced late optimizer writes and failed with `ENOTEMPTY`. | Use Node's bounded removal retry support, retaining persistent errors. The original complete frontend run reproduced the failure; the lifecycle regression passes after the fix. |
+| Documentation claimed 985 compared fields while the checker measured 989. | Correct the two tracked claims. The existing documented-counts contract failed before correction. |
+
+Security impact: diagnostic output is more consistently redacted, and unsafe
+log targets are refused. No authentication, authorization, repository mutation
+policy, credential configuration, or access grant was widened. No dependency
+was added. Hook failure continues to mean “no decision”; it never emits `allow`.
+
+## Bounds and retained invariants
+
+- The output worker owns no logger state and cannot recurse through logging.
+  It accepts at most 64 queued records; records have an explicit byte cap.
+  Stderr allows 32 KiB plus its newline and a 100 ms acknowledgement budget.
+  Hook/daemon/MCP stdout allow 4 MiB per record and a one-second budget.
+  An output failure or uncertain partial write permanently disables that
+  writer. It spawns no replacement and retries no record. At most one blocked
+  worker remains per inherited output until process exit.
+- Ring and disk writes precede the optional stderr mirror. Panic-hook clones
+  share its disabled state. No prior panic hook is chained; the owned hook
+  records a redacted payload, location, and a labelled, capped backtrace.
+- The in-memory ring retains 1,000 entries, diagnostic tails at most 500 lines,
+  and individual log entries at most 32 KiB. Cooperating current writers use
+  two generations of at most 1 MiB each and an empty lock sidecar. Lock
+  acquisition waits at most one second, then reports degradation and disables disk
+  writes. A tail that cannot acquire the lock reports itself unavailable. Raw
+  snapshots are taken under the lock; decoding and redaction run after release,
+  with at most 500 lines processed per generation. Explicit unlock prevents
+  forked/duplicated descriptors from extending the lease; release failures are
+  retained and refuse subsequent admission without recursive logging.
+- Regular-file validation precedes reading, appending, or changing permissions.
+  Unix checks descriptor link counts and uses `O_NOFOLLOW | O_NONBLOCK`.
+  Windows opens reparse points themselves and checks handle metadata/link
+  counts. Unix directory permissions are set through the opened directory.
+- Hook input preserves multiline JSON, checks actual bytes beyond the cap,
+  and rejects invalid documents without producing a decision. Its existing
+  operation budget remains separate from the new input and output budgets.
+- MCP input queues at most two 8 KiB chunks before the existing 4 MiB frame
+  reader. Healthy idle connections remain open. Output failure cancels the
+  consumer within its 100 ms polling interval. EOF still drains accepted work
+  under the existing call deadline.
+
+The shared output worker uses standard-library bounded channels and file
+coordination uses [standard-library file locks](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock).
+Preview removal uses [Node's documented retry options](https://nodejs.org/api/fs.html#fspromisesrmpath-options):
+five retries with 100 ms linear backoff, at most 1.5 seconds of retry delay.
+
+## Reproduction and qualification
+
+```sh
+GITPULSE_CODEINTEL_TEST_REPO="$PWD" cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast
+cargo test --manifest-path src-tauri/Cargo.toml --locked --test logging_process --test cli_io_process --test native_event_unwind
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+npm run check
+npm test
+npm run build
+npm run test:browser
+npm run test:webkit
+```
+
+Select other browser contracts with `npm run test:browser -- --harness NAME`:
+`conflicts`, `uncommitted`, `coverage`, `branches`, `hygiene`, and `palette`.
+Each harness rejects missing, incomplete, failed, or late verdicts.
+
+The native exception regression uses two real Tauri-created Objective-C
+receivers. Each now survives 256 injected exceptions interleaved with 256
+normal events (1,024 total calls). The original ABI aborted both cases. The
+probe restores superclass methods before disposing its isolated window. Other
+platforms explicitly report the target as inapplicable. Inspection also found
+that Wry replaces the original Tao content view; discarded probe experiments
+against a presumed Tao view were fixture failures, not evidence of another
+production exception defect. Other native callback families were not rewritten.
+
+Before the final credential-table unification, the complete native run passed
+**2,204 tests across 65 result-bearing targets, with 14 explicitly ignored**;
+the library contributed 1,612 passed and six ignored. The separate native main-
+thread harness passed both cases. The complete frontend run passed **5,626
+tests in 427 files, one skipped**; Svelte/type checking and production build
+also passed. Chrome browser counts were 29 diagnostics, 43 conflicts,
+39 uncommitted, 44 coverage, 51 branches, 58 hygiene, and 44 palette: **308/308**.
+Native WKWebView diagnostics additionally passed **29/29**.
+
+The cleanup failure initially passed in isolation; subsequent parallel failures
+and a controlled completion interleaving established the snapshot race above.
+No completion assertion was weakened. Ten repeated fault rounds passed all
+logging and CLI subprocess cases and both native cases, totaling 10,240 native
+event forwards with 5,120 injected exceptions. Separate cleanup stress passed
+100 forced completion interleavings and 20 repetitions of the 24-run real
+worker/history test.
+
+Ten opt-in tests were also qualified: the candidate DevMap CLI against disposable
+indexes, deep graph fuzzing (6,800 generated DAGs), five real-repository graph
+and status checks, one Pulse real-repository scan, one real Go cleanup against
+an isolated temporary cache, and the repeated document-refresh workload. The
+Pulse scan reported its knowledge sample honestly: 128 of 1,903 files. The
+remaining four opt-in tests require live GitHub or explicitly selected installed
+Manvi/Codex/Claude environments; they were not counted as passing.
+
+A separate native run used the real-store test's default external DevCouncil
+checkout while its index was empty (generation 1341, zero files/edges). Final
+qualification uses the test's existing `GITPULSE_CODEINTEL_TEST_REPO` override
+with this worktree's stable index; no external index was modified to make the
+test pass.
+
+IPC/wire-type, release-version, workflow lint, vendor-schema, Cargo formatting,
+and all-target Clippy checks passed. Vendor checks confirm local snapshot
+integrity while explicitly reporting external DevMap upstream drift and
+unavailable framework upstream comparison. The two native patch hunks were
+applied to the exact cached Tao 0.37.0 upstream files and reproduced the modified
+files byte for byte. Existing vendored framework warnings remain.
+
+The platform-neutral output module compiled to metadata for Windows, Linux,
+and Intel macOS; Windows log-file validation also compiled independently.
+These are type/conditional-compilation checks, not native runtime validation.
+Evidence, including red tests and final transcripts, is retained locally under
+`.build-evidence/crash-hardening-20260909/expanded/`.
+
+## Current qualification limits
+
+The installed application has not been replaced. This work does not reproduce
+the private AppKit assertion's exact UI trigger, qualify every native callback,
+or prove arbitrary AppKit state remains recoverable after every exception.
+The fixed disk wait is an admission limit, not a promise of lossless logging
+under arbitrary load; exceeding it remains an explicit degraded outcome.
+Windows/Linux runtime, live external providers, signing/notarization, and
+release installation still require their corresponding environments.
+
+The file lock coordinates patched cooperating writers. Older binaries or
+uncooperative writers do not honor it; it does not retroactively bound a
+pre-existing oversized legacy file. Parent directories are trusted: final
+component checks do not promise protection from a hostile same-user process
+replacing ancestors concurrently. Regular-file operations remain synchronous,
+so a stalled/network filesystem or hardware failure has no portable I/O deadline.
+Rust treats invalid stderr handles as discarded successful writes on some
+platforms; such cases retain ring/disk evidence without promising a mirror
+failure notice. These limits are not counted as passing coverage.
+
+## Earlier Code-pane audit
 
 Audit date: 2026-09-08. Starting revision: `a4a1d33d93d353ba03be52658e028d6182b62548`.
 

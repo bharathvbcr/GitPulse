@@ -28,6 +28,7 @@
 //! `systemMessage`, and no path ever emits `allow` — an approval this hook did
 //! not earn would silently override the user's own permission rules.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -51,6 +52,30 @@ use crate::insights::{self, CollisionRisk, InsightsSnapshot};
 /// check — exactly the failure this module exists to prevent. Giving up here
 /// instead lets us give up *loudly*.
 pub const BUDGET: Duration = Duration::from_secs(5);
+
+pub const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read one complete JSON document, including pretty-printed input. This is
+/// for the one-shot hook executable: on timeout it exits and tears down the
+/// single reader that may still be waiting for the host to close stdin.
+pub fn read_input(reader: impl std::io::Read + Send + 'static) -> Result<HookInput, String> {
+    within_budget(BUDGET, move || {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_INPUT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("could not read hook stdin: {e}"))?;
+        if bytes.len() > MAX_INPUT_BYTES {
+            return Err("hook stdin exceeded its 4 MiB limit".into());
+        }
+        let input =
+            std::str::from_utf8(&bytes).map_err(|e| format!("hook stdin is not UTF-8: {e}"))?;
+        parse_input(input)
+    })
+    .ok_or_else(|| {
+        "hook stdin deadline exceeded or reader could not run; no decision".to_string()
+    })?
+}
 
 /// Hard cap on the SessionStart brief, in bytes.
 ///
@@ -121,9 +146,12 @@ fn string_at(parent: Option<&Value>, key: &str) -> String {
 
 /// Parses the hook payload the host wrote to our stdin.
 ///
-/// The only hard failure is stdin that is not a JSON object at all; every other
-/// shape surprise is absorbed by [`HookInput::from_value`].
+/// Refuse oversized or invalid documents before interpreting fields; other
+/// shape surprises are absorbed by [`HookInput::from_value`].
 pub fn parse_input(stdin: &str) -> Result<HookInput, String> {
+    if stdin.len() > MAX_INPUT_BYTES {
+        return Err("hook stdin exceeded its 4 MiB limit".into());
+    }
     let value: Value = serde_json::from_str(stdin.trim())
         .map_err(|e| format!("hook stdin is not valid JSON: {e}"))?;
     if !value.is_object() {
@@ -843,9 +871,12 @@ fn within_budget<T: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     // A send onto a dropped receiver is an error, not a panic, so the worker
     // outliving our patience cannot take the process down with it.
-    thread::spawn(move || {
-        let _ = tx.send(work());
-    });
+    thread::Builder::new()
+        .name("gitpulse-hook-check".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .ok()?;
     rx.recv_timeout(budget).ok()
 }
 

@@ -21,7 +21,7 @@
 //!   2 and so still blocks nothing, and which the host already knows about
 //!   because it sent it.
 
-use std::io::{self, Read, Write};
+use std::io;
 
 use gitpulse_lib::hooks::{self, SUBCOMMANDS};
 
@@ -45,16 +45,15 @@ fn decide() {
     let _ = gitpulse_lib::procguard::install_signal_handlers();
 
     let Some(subcommand) = std::env::args().nth(1) else {
-        eprintln!(
+        log::warn!(target: "hook",
             "gitpulse-hook: no subcommand given; expected one of {}",
             SUBCOMMANDS.join(", ")
         );
         return;
     };
 
-    let mut stdin = String::new();
-    if let Err(error) = io::stdin().read_to_string(&mut stdin) {
-        eprintln!("gitpulse-hook: could not read stdin: {error}");
+    if !SUBCOMMANDS.contains(&subcommand.as_str()) {
+        log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
         return;
     }
 
@@ -62,10 +61,10 @@ fn decide() {
     // decision from input we could not read would be the worst of both worlds:
     // neither a check that ran nor an admission that one did not. Exiting 0
     // with no stdout leaves the host's own permission flow exactly as it was.
-    let input = match hooks::parse_input(&stdin) {
+    let input = match hooks::read_input(io::stdin()) {
         Ok(input) => input,
         Err(error) => {
-            eprintln!("gitpulse-hook {subcommand}: {error}");
+            log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
             return;
         }
     };
@@ -73,11 +72,18 @@ fn decide() {
     match hooks::dispatch(&subcommand, &input) {
         Ok(output) => {
             if let Some(json) = output.render() {
-                let mut stdout = io::stdout();
-                let _ = writeln!(stdout, "{json}");
-                let _ = stdout.flush();
+                let result = gitpulse_lib::output::BoundedOutput::new(
+                    io::stdout(),
+                    "gitpulse-hook-stdout",
+                    hooks::MAX_INPUT_BYTES,
+                    std::time::Duration::from_secs(1),
+                )
+                .and_then(|output| output.write(format!("{json}\n").as_bytes()));
+                if let Err(error) = result {
+                    log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
+                }
             }
         }
-        Err(error) => eprintln!("gitpulse-hook: {error}"),
+        Err(error) => log::warn!(target: "hook", "gitpulse-hook: {error}"),
     }
 }

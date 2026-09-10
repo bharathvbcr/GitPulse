@@ -19,7 +19,12 @@ console.log(`Disposable fixture directory: ${root}`);
 // resolves. Remove the disposable profile/cache only once those writes drain.
 // The normal close path also removes it eagerly for top-level startup errors,
 // where Node may exit without a beforeExit event.
-async function removeFixture() { await rm(root, { recursive: true, force: true }); }
+async function removeFixture() {
+  // The optimizer may finish its last write while removal walks the cache.
+  // Retry only the transient filesystem errors handled by Node, with a
+  // finite 1.5 second backoff budget. Persistent failures remain visible.
+  await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
 process.once("beforeExit", async () => {
   try { await removeFixture(); }
   catch (error) { console.error(error); process.exitCode = 1; }

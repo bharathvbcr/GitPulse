@@ -1,5 +1,5 @@
 {
-  "note": "Pinned framework consumers ported locally to GTK3 0.19 and GLib 0.22. No package versions are spoofed. See README.md for maintenance and verification.",
+  "note": "Pinned framework consumers with reviewed GTK3 0.19 / GLib 0.22 ports and macOS native lifecycle fixes. No package versions are spoofed. See README.md for maintenance and verification.",
   "crates": [
     {
       "name": "tauri",
@@ -506,7 +506,7 @@
         "src/platform_impl/linux/x11/ffi.rs": "629a5aaf4973a8b7295623582b8c2c21ee1b13b8b5454f4e3c7a7de1be115f76",
         "src/platform_impl/linux/x11/mod.rs": "8f576518fe12bb21c7ac3db0e75b969babc1035288bfd618cc85d354b362f964",
         "src/platform_impl/linux/x11/xdisplay.rs": "fb64d39a851557b5f6a6e3e54c510473d62d13d3afd18c7be4d6f592824e9591",
-        "src/platform_impl/macos/app.rs": "102c21b90c4d09a8c1831d47b8b4418b2844e1c758c159db11ae14d9921cfd43",
+        "src/platform_impl/macos/app.rs": "aeb85caa9147860cda08d6392b68e2a25e4570c72298282f6791ca8e1d6676b5",
         "src/platform_impl/macos/app_delegate.rs": "a66447b76f880b559042133ca939305df8a3dd71b1e5a30f530a2d0cb8d16da4",
         "src/platform_impl/macos/app_state.rs": "493be209ef786af3e1d25d3631d18a3faaf96be210f83da2980a14dadfd60a7f",
         "src/platform_impl/macos/badge.rs": "41943ee395e667104594d1e8c79515689e938a0b1dd0abdb7c4a8fe0d2dfc9ce",
@@ -524,7 +524,7 @@
         "src/platform_impl/macos/util/cursor.rs": "481fe6a34e1547449d8ee7b1a8a1cd93c304f15c2b62f6a6a71aba6d995b903d",
         "src/platform_impl/macos/util/mod.rs": "e8df577333134debdc0731a5198f5876ffb41a70df75b10f1f732874daa8cc1a",
         "src/platform_impl/macos/view.rs": "42b961529295790e6e9084c5a910c4116d1b6ac5f8f2af96a893b722d9dc59b2",
-        "src/platform_impl/macos/window.rs": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
+        "src/platform_impl/macos/window.rs": "eb254ae034462b4ab42c463b095ba667efce0a6162ae68b0ddd1f7a979fa4bb5",
         "src/platform_impl/macos/window_delegate.rs": "e03fdcefe8962a5f64147325782bb6ca1d0aaf51c239453d527a1c4a07a902b8",
         "src/platform_impl/mod.rs": "50486214dc0ed94d7b3e9e9b13016af8cdae8e2069f081081b2926602a99a81e",
         "src/platform_impl/windows/dark_mode.rs": "820f7708dd7c853036d20a6f7f9b6abeb85ea8eb9837cca88fc3025f02595527",
@@ -582,6 +582,14 @@
         "src/platform_impl/linux/window.rs": {
           "upstream": "0532977ea20321f19e205f7c58d51077995b4f52878ca4979c5865c517625092",
           "patched": "8566db23a604555c54ae2f10186139a5d00d6ee80b460074901b4cce3d10d0b3"
+        },
+        "src/platform_impl/macos/app.rs": {
+          "upstream": "102c21b90c4d09a8c1831d47b8b4418b2844e1c758c159db11ae14d9921cfd43",
+          "patched": "aeb85caa9147860cda08d6392b68e2a25e4570c72298282f6791ca8e1d6676b5"
+        },
+        "src/platform_impl/macos/window.rs": {
+          "upstream": "d299bf58c503715c6aab15aee48194f566385e652b0003511ae34f7d5d60e0b0",
+          "patched": "eb254ae034462b4ab42c463b095ba667efce0a6162ae68b0ddd1f7a979fa4bb5"
         }
       }
     },
@@ -958,6 +966,47 @@
         "Cargo.toml": {
           "upstream": "5f1a49e786206ea35dca5d45a82b84cfb99839ecaff47f579ae3b63496586e86",
           "patched": "5fd957472563fe9ec93d2c369b64e9a9767c988bd910e4fead6c6b6474665d26"
+        }
+      }
+    },
+    {
+      "name": "notify",
+      "origin": {
+        "repo": "https://github.com/notify-rs/notify",
+        "version": "8.2.0",
+        "archive": "https://static.crates.io/crates/notify/notify-8.2.0.crate",
+        "sha256": "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3",
+        "vcs": {
+          "git": {
+            "sha1": "a1d7c2d8f80786679d58ec6d5986a1d4278bc8cf"
+          },
+          "path_in_vcs": "notify"
+        }
+      },
+      "rewrites": [
+        "FSEvents startup propagation and sticky shutdown source adapted from zed-industries/notify commit 6566ae63331ffd1f2025b18dc00c3049fb8588c9",
+        "Preserve existing stream flags; validate stream/source allocation; release callback ownership on failed spawn; remove volume-history purge RPC",
+        "Upstream tests retained; GitPulse native_watcher_faults exercises the shipped dependency through process-isolated native faults"
+      ],
+      "files": {
+        "Cargo.toml": "c387b0552855e5e3d8581b58581f3c3282426b5d9e7d3366bb9cca7ede678a8f",
+        "Cargo.toml.orig": "03b078ea73664c6cdeab55cd3b9e8e953f5eab14a7399e67b26f0c8f66a56d9d",
+        "LICENSE-CC0": "e0456cbab4f7b5e7203e678faff37eadbdfef02e822db3b7a52a1dd9d3dc514a",
+        "README.md": "cf2ca593d96e9f7bcb0461c13bad76a62f0565280288b93c2033c11b04b72b9a",
+        "src/config.rs": "a1b1cefde56f80aa2853998dd6d8e1ff5d0c072e5e3668226d6992383e072272",
+        "src/error.rs": "d5ac4ba74604ab3541c9cf73b872097586dcadf500aa12bb0c314de6c71de201",
+        "src/fsevent.rs": "c749e59b8c2599785067bb4d89ea7c7be54584fdb1cfb93a386d1741c8fd31da",
+        "src/inotify.rs": "41ba905f19f2c9f1ca80ed5f7d481690a07458e2e3e6280516c57e1e5dd7a228",
+        "src/kqueue.rs": "07844f9220d1c79c768df27b2ce40bbacc8467ffcbafe34683dd07661de3eb6c",
+        "src/lib.rs": "ce2f43eb5d58780d4f1c0a04a8b12ecc12969cef1b6509cfcd90e4ea66b61d90",
+        "src/null.rs": "1cfc54cf19b54726de82204a4456a68c1a9b5a4a614350ba2a0870fb43e1d67d",
+        "src/poll.rs": "20c0e5b65e13f56e843e66d06866ca727330461cd91d0b1104ed870fea5a2d01",
+        "src/windows.rs": "cf53732c805266977136622371a1273eaa0bf3148f734893f393fe752c37b168"
+      },
+      "changes": {
+        "src/fsevent.rs": {
+          "upstream": "6b969f5a18454cfa764e7fd797861dc3495abe739db5fe834de6da57a69c7880",
+          "patched": "c749e59b8c2599785067bb4d89ea7c7be54584fdb1cfb93a386d1741c8fd31da"
         }
       }
     }
